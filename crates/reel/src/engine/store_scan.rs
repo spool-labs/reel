@@ -8,6 +8,7 @@ use reel_api::units::WritePlace;
 
 use crate::engine::cue::MOST_CUES;
 use crate::engine::engine_state::EngineState;
+use crate::engine::scan_path::ScanWant;
 use crate::engine::scan_state::{ScanRange, ScanState};
 use crate::io::Io;
 
@@ -44,7 +45,7 @@ impl<Backend: Io> StoreScan<Backend> {
         let Some(scan) = &mut self.scan else {
             return Ok(ScanStep::End);
         };
-        self.state.step_scan(scan, key, Some(value))
+        self.state.step_scan(scan, key, ScanWant::Value(value))
     }
 
     /// Fill the buffer with the next key
@@ -52,7 +53,7 @@ impl<Backend: Io> StoreScan<Backend> {
         let Some(scan) = &mut self.scan else {
             return Ok(ScanStep::End);
         };
-        self.state.step_scan(scan, key, None)
+        self.state.step_scan(scan, key, ScanWant::Key)
     }
 }
 

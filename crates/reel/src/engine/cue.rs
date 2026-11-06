@@ -9,7 +9,7 @@ use reel_api::column_id::ColumnId;
 use reel_api::direction::Direction;
 use reel_api::reads::ValueWindow;
 use reel_api::store_error::StoreError;
-use reel_api::units::WritePlace;
+use reel_api::units::{ByteCount, RowCount, WritePlace};
 use reel_api::value_list::ValueList;
 
 use crate::engine::engine_state::EngineState;
@@ -222,6 +222,18 @@ impl<Backend: Io> Cue<Backend> {
     pub fn iter_prefix(&self, column: ColumnId, prefix: &[u8]) -> Result<StoreScan<Backend>, StoreError> {
         self.check_open()?;
         StoreScan::at_cue(Arc::clone(&self.state), &under_prefix(column, prefix), self.point)
+    }
+
+    /// Count the keys under a prefix at this cue, reading no values
+    pub fn count_prefix(&self, column: ColumnId, prefix: &[u8]) -> Result<RowCount, StoreError> {
+        self.check_open()?;
+        self.state.counted(self.state.count_at(column, prefix, self.point))
+    }
+
+    /// Add up the bytes the values under a prefix take on disk at this cue, reading no values
+    pub fn bytes_prefix(&self, column: ColumnId, prefix: &[u8]) -> Result<ByteCount, StoreError> {
+        self.check_open()?;
+        self.state.counted(self.state.bytes_at(column, prefix, self.point))
     }
 
     /// Refuse a read once the store is going, whose files are closing under it

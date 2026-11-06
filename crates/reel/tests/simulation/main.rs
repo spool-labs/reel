@@ -10,6 +10,7 @@ mod damage;
 mod dead_walk;
 mod io_contract;
 mod place_limit;
+mod prefix_counts;
 mod range_deletes;
 mod range_apply;
 mod rewrite;

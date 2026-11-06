@@ -234,6 +234,18 @@ impl ColumnTail {
         key[..key.len().min(known)].cmp(&self.shared_head.0[..known])
     }
 
+    /// Build a bound at or above every key whose bytes past the shared ones start at or below a prefix
+    pub fn bound_above(&self, prefix: KeyPrefix) -> KeyBound {
+        let shared = self.shared_length as usize;
+        let known = shared.min(SHARED_HEAD_BYTES);
+        let mut bound = [u8::MAX; KEY_BOUND_BYTES];
+        bound[..known].copy_from_slice(&self.shared_head.0[..known]);
+        if shared <= SHARED_HEAD_BYTES {
+            bound[known..known + KEY_PREFIX_BYTES].copy_from_slice(&prefix.0);
+        }
+        KeyBound(bound)
+    }
+
     /// Build the bounds of the column's keys, which hold every key it has and can be wider
     pub fn key_bounds(&self) -> (KeyBound, KeyBound) {
         let shared = self.shared_length as usize;

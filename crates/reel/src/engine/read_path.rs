@@ -99,6 +99,15 @@ impl Located {
         }
     }
 
+    /// Read the bytes the row's record takes on disk
+    pub fn length(&self) -> ByteCount {
+        match self {
+            Located::Absent => ByteCount(0),
+            Located::Open(row) => row.length,
+            Located::Sealed(sealed) => sealed.row.length,
+        }
+    }
+
     /// Check whether the key's newest row says it has a value
     pub fn has_value(&self) -> bool {
         match self {

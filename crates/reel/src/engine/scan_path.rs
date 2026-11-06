@@ -9,11 +9,11 @@ use reel_api::column_id::ColumnId;
 use reel_api::direction::Direction;
 use reel_api::scan::ScanStep;
 use reel_api::store_error::StoreError;
-use reel_api::units::WritePlace;
+use reel_api::units::{ByteCount, RowCount, WritePlace};
 
 use crate::engine::engine_state::EngineState;
 use crate::engine::read_path::{KeyRead, Located, MOST_READ_TRIES, RecordWant, SealedRow, newest_of};
-use crate::engine::scan_state::{MOST_SCANS, NO_GENERATION, ScanRange, ScanState, SegmentSource};
+use crate::engine::scan_state::{BlockTake, MOST_SCANS, NO_GENERATION, ScanRange, ScanState, SegmentSource, under_prefix};
 use crate::engine::volume::Volume;
 use crate::guard::hold;
 use crate::index::write_shard::WalkBound;
@@ -54,6 +54,27 @@ pub struct SeatAt<'key> {
     pub is_inclusive: bool,
     pub direction: Direction,
     pub point: WritePlace,
+    pub is_counting: bool,
+}
+
+/// What a step does with the key it lands on
+#[derive(Debug)]
+pub enum ScanWant<'value> {
+    /// Count it
+    Key,
+    /// Read its value
+    Value(&'value mut Vec<u8>),
+    /// Add up the bytes its value takes on disk
+    Bytes,
+}
+
+/// Which total a walk over a prefix adds up
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScanWantKind {
+    /// Keys
+    Key,
+    /// Stored bytes
+    Bytes,
 }
 
 /// What a step keeps while it answers a key
@@ -97,7 +118,7 @@ impl<Backend: Io> EngineState<Backend> {
         &self,
         scan: &mut ScanState,
         key: &mut Vec<u8>,
-        mut value: Option<&mut Vec<u8>>,
+        mut want: ScanWant,
     ) -> Result<ScanStep, StoreError> {
         let info = self.column(scan.column)?;
         let volume = &self.volumes[info.volume.0 as usize];
@@ -109,7 +130,7 @@ impl<Backend: Io> EngineState<Backend> {
             }
             let many = if tries >= MOST_READ_TRIES && scan.point.is_none() { self.many_read(volume) } else { None };
             let pinned = many.and_then(|many| many.pin.map(|slot| (many, slot)));
-            let outcome = self.try_step(volume, directory, scan, pinned.map(|(many, _slot)| many.point), key, value.as_deref_mut());
+            let outcome = self.try_step(volume, directory, scan, pinned.map(|(many, _slot)| many.point), key, want.reborrow());
             if let Some((many, slot)) = pinned {
                 self.unpin(slot, many.counts);
             }
@@ -138,12 +159,16 @@ impl<Backend: Io> EngineState<Backend> {
         scan: &mut ScanState,
         pin_point: Option<WritePlace>,
         key: &mut Vec<u8>,
-        value: Option<&mut Vec<u8>>,
+        want: ScanWant,
     ) -> Result<StepOutcome, StoreError> {
         let generation = directory.map_or(0, ColumnDirectory::generation);
         let fixed_point = scan.point.or(pin_point);
         let point = fixed_point.unwrap_or_else(|| self.read_point());
         if generation != scan.generation {
+            // a block taken by its line has no key to seek from, so a count that took one starts over and steps every row
+            if scan.taken > 0 {
+                scan.restart_count();
+            }
             scan.reseat(generation);
         }
         self.place_heads(volume, scan);
@@ -157,15 +182,22 @@ impl<Backend: Io> EngineState<Backend> {
             candidate.extend_from_slice(closest);
             true
         });
-        if let Some(directory) = directory.filter(|_directory| scan.is_spilled) {
-            has_key = self.spilled_key(volume, directory, scan, point, has_key, &mut candidate)?;
-        }
-        has_key &= !scan.is_past_limit(&candidate);
+        let spilled = match directory.filter(|_directory| scan.is_spilled) {
+            Some(directory) => self.spilled_key(volume, directory, scan, point, has_key, &mut candidate),
+            None => Ok(has_key),
+        };
+        has_key = match spilled {
+            Ok(has_key) => has_key && !scan.is_past_limit(&candidate),
+            Err(error) => {
+                scan.key = candidate;
+                return Err(error);
+            },
+        };
 
         let outcome = match self.check_reach(volume, scan, has_key.then_some(&candidate)) {
             Ok(()) if has_key => {
                 let at = StepAt { directory, generation, fixed_point };
-                self.answer_key(volume, scan, &candidate, at, key, value)
+                self.answer_key(volume, scan, &candidate, at, key, want)
             },
             Ok(()) => Ok(StepOutcome::Answer(ScanStep::End)),
             Err(error) => Err(error),
@@ -182,7 +214,7 @@ impl<Backend: Io> EngineState<Backend> {
         candidate: &[u8],
         at: StepAt,
         key: &mut Vec<u8>,
-        value: Option<&mut Vec<u8>>,
+        want: ScanWant,
     ) -> Result<StepOutcome, StoreError> {
         // the counts come before the point, as a get takes them
         let counts = self.cues.counts();
@@ -207,9 +239,16 @@ impl<Backend: Io> EngineState<Backend> {
             return Ok(StepOutcome::Passed);
         }
 
-        let answer = match value {
-            Some(value) => self.read_located(volume, &read, &located, value),
-            None => Ok(true),
+        let answer = match want {
+            ScanWant::Value(value) => self.read_located(volume, &read, &located, value),
+            ScanWant::Key => {
+                scan.counted += 1;
+                Ok(true)
+            },
+            ScanWant::Bytes => {
+                scan.counted += located.length().0;
+                Ok(true)
+            },
         };
         let is_bad = matches!(answer, Err(StoreError::Corruption { .. }));
         // a free can only fail a record check: its row was replaced, and the next try finds the replacement
@@ -348,6 +387,7 @@ impl<Backend: Io> EngineState<Backend> {
                     is_inclusive: scan.is_inclusive,
                     direction: scan.direction,
                     point,
+                    is_counting: scan.is_counting,
                 };
                 let source = &mut scan.sources[scan.source_count];
                 source.segment = segment;
@@ -394,6 +434,7 @@ impl<Backend: Io> EngineState<Backend> {
                     is_inclusive: scan.is_inclusive,
                     direction: scan.direction,
                     point,
+                    is_counting: scan.is_counting,
                 };
                 scan.spill.segment = segment;
                 if self.seat_source(volume, &mut scan.spill, &at)? == SourceMove::Row
@@ -422,6 +463,7 @@ impl<Backend: Io> EngineState<Backend> {
         let (column, direction) = (scan.column, scan.direction);
         let mut index = 0;
         while index < scan.source_count {
+            let mut take = (scan.is_counting && !scan.is_spilled).then(|| BlockTake { gate: scan.gate_without(index), rows: 0 });
             let source = &mut scan.sources[index];
             if source.key != key {
                 index += 1;
@@ -436,8 +478,11 @@ impl<Backend: Io> EngineState<Backend> {
                         block_offset: source.line.block_offset,
                     });
                 }
-                step = self.step_source(volume, column, source, direction, point)?;
+                step = self.step_source(volume, column, source, direction, point, take.as_mut())?;
             }
+            let taken = take.map_or(0, |take| take.rows);
+            scan.counted += taken;
+            scan.taken += taken;
             match step {
                 SourceMove::Row => index += 1,
                 // a segment leaves its list before the table, so the step's look at the list sees this
@@ -455,6 +500,7 @@ impl<Backend: Io> EngineState<Backend> {
         source: &mut SegmentSource,
         direction: Direction,
         point: WritePlace,
+        mut take: Option<&mut BlockTake>,
     ) -> Result<SourceMove, StoreError> {
         loop {
             let (segment, line) = (source.segment, source.line);
@@ -469,7 +515,7 @@ impl<Backend: Io> EngineState<Backend> {
                     return Ok(SourceMove::Row);
                 },
                 Some(None) => {
-                    let crossed = self.cross_block(volume, source, direction, point);
+                    let crossed = self.cross_block(volume, source, direction, point, take.as_deref_mut());
                     if crossed != SourceMove::Row {
                         return Ok(crossed);
                     }
@@ -486,6 +532,7 @@ impl<Backend: Io> EngineState<Backend> {
         source: &mut SegmentSource,
         direction: Direction,
         point: WritePlace,
+        mut take: Option<&mut BlockTake>,
     ) -> SourceMove {
         loop {
             match direction {
@@ -505,6 +552,12 @@ impl<Backend: Io> EngineState<Backend> {
             let Some((line, replacement)) = volume.table.block_line(source.segment, source.block) else {
                 return SourceMove::Left;
             };
+            if let Some(take) = take.as_deref_mut()
+                && self.can_take_line(volume, source, take)
+            {
+                take.rows += u64::from(line.live_rows);
+                continue;
+            }
             if line.live_rows > 0 || replacement > point {
                 source.enter_block(line);
                 return SourceMove::Row;
@@ -523,10 +576,13 @@ impl<Backend: Io> EngineState<Backend> {
             return Ok(SourceMove::Left);
         };
         source.place_base = pin.head.place_base;
+        let can_take = at.is_counting && pin.is_walked && pin.head.places.highest <= at.point;
         drop(pin);
         let Some(tail) = volume.table.column_tail(source.segment, at.column) else {
             return Ok(SourceMove::Done);
         };
+        source.is_countable = can_take && has_no_live_graves(volume, source.segment, at.column);
+        source.tail = tail;
         source.first_block = tail.first_block;
         source.end_block = tail.first_block + tail.block_count.0;
         let spot = self.column_spot(volume, source, &tail, at)?;
@@ -546,7 +602,7 @@ impl<Backend: Io> EngineState<Backend> {
         source.block = start;
         source.enter_block(line);
         if line.live_rows == 0 && replacement <= at.point {
-            let crossed = self.cross_block(volume, source, at.direction, at.point);
+            let crossed = self.cross_block(volume, source, at.direction, at.point, None);
             if crossed != SourceMove::Row {
                 return Ok(crossed);
             }
@@ -564,13 +620,69 @@ impl<Backend: Io> EngineState<Backend> {
                     return Ok(SourceMove::Row);
                 },
                 Some(None) => {
-                    let crossed = self.cross_block(volume, source, at.direction, at.point);
+                    let crossed = self.cross_block(volume, source, at.direction, at.point, None);
                     if crossed != SourceMove::Row {
                         return Ok(crossed);
                     }
                 },
             }
         }
+    }
+
+    /// Check a block can count by its line: its span ends before anything else the walk knows of, so its live rows are keys
+    /// no other row has a say in
+    pub fn can_take_line(
+        &self,
+        volume: &Volume<Backend>,
+        source: &SegmentSource,
+        take: &BlockTake,
+    ) -> bool {
+        if !source.is_countable {
+            return false;
+        }
+        let next = source.block + 1;
+        let after = (next < source.end_block).then(|| volume.table.block_line(source.segment, next)).flatten();
+        let upper = after.map_or(source.tail.highest, |(line, _replacement)| line.first_key);
+        source.tail.bound_above(upper) < take.gate
+    }
+
+    /// Count the keys under a prefix at a point, with a block inside it taken by its line where that is exact
+    pub fn count_at(&self, column: ColumnId, prefix: &[u8], point: WritePlace) -> Result<RowCount, StoreError> {
+        let info = self.column(column)?;
+        let volume = &self.volumes[info.volume.0 as usize];
+        let mut scan = self.take_scan(&under_prefix(column, prefix), Some(point))?;
+        scan.is_counting = volume.covers.is_empty() && volume.damage.is_empty();
+        let outcome = self.walk_prefix(&mut scan, ScanWantKind::Key);
+        let count = RowCount(scan.counted);
+        self.give_back_scan(scan);
+        outcome.map(|()| count)
+    }
+
+    /// Add up the stored bytes of the values under a prefix at a point, stepping rows and reading no record
+    pub fn bytes_at(&self, column: ColumnId, prefix: &[u8], point: WritePlace) -> Result<ByteCount, StoreError> {
+        let mut scan = self.take_scan(&under_prefix(column, prefix), Some(point))?;
+        let outcome = self.walk_prefix(&mut scan, ScanWantKind::Bytes);
+        let bytes = ByteCount(scan.counted);
+        self.give_back_scan(scan);
+        outcome.map(|()| bytes)
+    }
+
+    /// Walk a prefix to its end, leaving the total in the scan
+    pub fn walk_prefix(&self, scan: &mut ScanState, kind: ScanWantKind) -> Result<(), StoreError> {
+        let mut key = mem::take(&mut scan.out_key);
+        let outcome = loop {
+            let want = match kind {
+                ScanWantKind::Key => ScanWant::Key,
+                ScanWantKind::Bytes => ScanWant::Bytes,
+            };
+            match self.step_scan(scan, &mut key, want) {
+                Ok(ScanStep::Found | ScanStep::Corrupt) => {},
+                Ok(ScanStep::End) => break Ok(()),
+                Err(error) => break Err(error),
+            }
+        };
+        scan.out_key = key;
+        outcome
     }
 
     /// Place a walk's key against the bytes a column's keys share, which the block index leaves out. A prefix longer than the
@@ -627,6 +739,35 @@ impl<Backend: Io> EngineState<Backend> {
             Err(source) => Err(read_error(source)),
         })
     }
+}
+
+impl ScanWant<'_> {
+    /// Lend this for one try
+    pub fn reborrow(&mut self) -> ScanWant<'_> {
+        match self {
+            ScanWant::Key => ScanWant::Key,
+            ScanWant::Value(value) => ScanWant::Value(value),
+            ScanWant::Bytes => ScanWant::Bytes,
+        }
+    }
+}
+
+/// Check a segment's row says a column holds no live grave and no cover, so a block's live rows are all values
+pub fn has_no_live_graves<Backend: Io>(volume: &Volume<Backend>, segment: SegmentNumber, column: ColumnId) -> bool {
+    let rows = hold(&volume.summary);
+    let Some(row) = rows.get(segment).filter(|row| !row.facts.has_covers) else {
+        return false;
+    };
+    let mut cursor = row.cursor();
+    for _column in 0..row.column_count {
+        let Some(facts) = cursor.column() else {
+            return false;
+        };
+        if facts.column == column {
+            return facts.grave_count.0 <= facts.dead_graves.0;
+        }
+    }
+    false
 }
 
 /// Report a failed read of a row block

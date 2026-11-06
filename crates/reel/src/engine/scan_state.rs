@@ -10,7 +10,7 @@ use crate::pool::touched_capacity;
 use crate::row_kind::RowKind;
 use crate::segment::block_entry::{BlockEntry, KeyBound};
 use crate::segment::row_block::{FooterRow, RowBlockWalk};
-use crate::segment::segment_tail::SegmentNumber;
+use crate::segment::segment_tail::{ColumnTail, SegmentNumber};
 
 /// The most scans a store holds at once
 pub const MOST_SCANS: usize = 32;
@@ -40,6 +40,13 @@ pub struct ScanRange<'key> {
     pub direction: Direction,
 }
 
+/// What lets a counting walk take a block by its line: the lowest bound of anything else the walk knows of, and the rows so far
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockTake {
+    pub gate: KeyBound,
+    pub rows: u64,
+}
+
 /// One sealed segment's place in a scan. The source holds its key and row, and reads its block through the cache
 #[derive(Clone, Debug)]
 pub struct SegmentSource {
@@ -55,6 +62,8 @@ pub struct SegmentSource {
     pub is_at_block_end: bool,
     pub key: Vec<u8>,
     pub row: FooterRow,
+    pub tail: ColumnTail,
+    pub is_countable: bool,
 }
 
 /// One write index shard's next key
@@ -85,6 +94,11 @@ pub struct ScanState {
     pub heads: Vec<ShardHead>,
     pub key: Vec<u8>,
     pub found: Vec<SegmentNumber>,
+    pub origin: Vec<u8>,
+    pub out_key: Vec<u8>,
+    pub is_counting: bool,
+    pub counted: u64,
+    pub taken: u64,
 }
 
 impl SegmentSource {
@@ -108,6 +122,8 @@ impl SegmentSource {
                 length: ByteCount(0),
                 kind: RowKind::Value,
             },
+            tail: ColumnTail::default(),
+            is_countable: false,
         }
     }
 
@@ -198,6 +214,11 @@ impl ScanState {
             heads: (0..SHARD_COUNT).map(|_head| ShardHead::new(widest_key, open_slots)).collect(),
             key: touched_capacity(widest_key, 0),
             found: touched_capacity(MOST_SCAN_SOURCES, SegmentNumber(0)),
+            origin: touched_capacity(widest_key, 0),
+            out_key: touched_capacity(widest_key, 0),
+            is_counting: false,
+            counted: 0,
+            taken: 0,
         }
     }
 
@@ -208,6 +229,11 @@ impl ScanState {
         self.position.clear();
         self.position.extend_from_slice(range.start);
         self.is_inclusive = range.is_start_inclusive;
+        self.origin.clear();
+        self.origin.extend_from_slice(range.start);
+        self.is_counting = false;
+        self.counted = 0;
+        self.taken = 0;
         self.limit.clear();
         self.has_limit = match range.limit {
             ScanLimit::None => false,
@@ -222,6 +248,26 @@ impl ScanState {
         };
         self.point = point;
         self.generation = NO_GENERATION;
+    }
+
+    /// Start a count over from its first key, stepping every row from here on
+    pub fn restart_count(&mut self) {
+        self.position.clear();
+        self.position.extend_from_slice(&self.origin);
+        self.is_inclusive = true;
+        self.is_counting = false;
+        self.counted = 0;
+        self.taken = 0;
+    }
+
+    /// Find the lowest bound of anything but one source: another source, a shard's next key, the next segment or the end
+    pub fn gate_without(&self, index: usize) -> KeyBound {
+        let sources = self.sources[..self.source_count].iter().enumerate().filter(|(other, _source)| *other != index);
+        let keys = sources.map(|(_other, source)| source.key.as_slice());
+        let heads = self.heads.iter().filter(|head| head.has_key).map(|head| head.key.as_slice());
+        let lowest = keys.chain(heads).map(KeyBound::of_key).min().unwrap_or(KeyBound::HIGHEST);
+        let limit = if self.has_limit { KeyBound::of_key(&self.limit) } else { KeyBound::HIGHEST };
+        lowest.min(limit).min(self.frontier.unwrap_or(KeyBound::HIGHEST))
     }
 
     /// Drop every place, for a list that changed, and find them again from the last key
@@ -307,7 +353,7 @@ impl ScanState {
         let source = size_of::<SegmentSource>() as u64;
         let keys: usize = self.sources.iter().map(|source| source.key.capacity()).sum();
         let heads: usize = self.heads.iter().map(|head| head.key.capacity() + head.cursor.trees.capacity() * size_of::<TreeCursor>()).sum();
-        let own = self.position.capacity() + self.limit.capacity() + self.key.capacity() + self.spill.key.capacity();
+        let own = self.position.capacity() + self.limit.capacity() + self.key.capacity() + self.spill.key.capacity() + self.origin.capacity() + self.out_key.capacity();
         let found = self.found.capacity() * size_of::<SegmentNumber>();
         let head = self.heads.capacity() * size_of::<ShardHead>();
         ByteCount(self.sources.capacity() as u64 * source + (keys + heads + own + found + head) as u64)
@@ -365,7 +411,7 @@ pub fn next_prefix(prefix: &mut Vec<u8>) -> bool {
 
 /// Plan the heap one scan holds
 pub fn planned_scan_bytes(widest_key: u64, open_slots: usize) -> u64 {
-    let keys = (MOST_SCAN_SOURCES + SHARD_COUNT + 4) as u64 * widest_key;
+    let keys = (MOST_SCAN_SOURCES + SHARD_COUNT + 6) as u64 * widest_key;
     let sources = (MOST_SCAN_SOURCES + 1) * size_of::<SegmentSource>();
     let heads = SHARD_COUNT * (size_of::<ShardHead>() + open_slots * size_of::<TreeCursor>());
     keys + (sources + heads + MOST_SCAN_SOURCES * size_of::<SegmentNumber>()) as u64

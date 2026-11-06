@@ -289,6 +289,16 @@ impl<Backend: Io> ReelStore<Backend> {
         StoreScan::new(Arc::clone(&self.state), &under_prefix(column, prefix))
     }
 
+    /// Count the keys under a prefix present now, reading no values
+    pub fn count_prefix(&self, column: ColumnId, prefix: &[u8]) -> Result<RowCount, StoreError> {
+        self.cue()?.count_prefix(column, prefix)
+    }
+
+    /// Add up the bytes the values under a prefix take on disk now, compressed where the column compresses, reading no values
+    pub fn bytes_prefix(&self, column: ColumnId, prefix: &[u8]) -> Result<ByteCount, StoreError> {
+        self.cue()?.bytes_prefix(column, prefix)
+    }
+
     /// Check whether the key has a value, without reading the value
     pub fn contains(&self, column: ColumnId, key: &[u8]) -> Result<bool, StoreError> {
         self.check_open()?;

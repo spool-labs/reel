@@ -1760,10 +1760,15 @@ pub fn settle_damaged<Backend: Io>(
         Some(row) => {
             facts = row.facts;
             facts.is_damaged = true;
-            if !row.facts.is_damaged {
-                facts.damage_place = row.facts.places.highest;
-            }
             ranges = row_ranges(&row, found.number, &mut columns);
+            // damage from before the tails went ranks below any row that landed after it, and the lost footer hid those too.
+            // Once ranked at the highest place this stops, so a span a caller cleared stays cleared
+            if row.facts.damage_place < row.facts.places.highest {
+                facts.damage_place = row.facts.places.highest;
+                if row.facts.is_damaged {
+                    ranges.extend(column_ranges(&columns, found.number, row.facts.places.highest));
+                }
+            }
         },
         None => fallback_ranges(state, found, &mut facts, &mut ranges),
     }
@@ -1829,16 +1834,23 @@ pub fn row_ranges(row: &SummaryRow, segment: SegmentNumber, columns: &mut Vec<Ow
         return ranges;
     }
 
-    for column in columns.iter() {
-        ranges.push(DamagedRange {
-            column: column.column,
-            segment,
-            highest_place,
-            start: column.lowest.clone(),
-            end: (!column.bound.is_empty()).then(|| column.bound.clone()),
-        });
-    }
+    ranges.extend(column_ranges(columns, segment, highest_place));
     ranges
+}
+
+/// Cover each of a row's columns from its lowest key to its bound
+pub fn column_ranges<'columns>(
+    columns: &'columns [OwnedColumn],
+    segment: SegmentNumber,
+    highest_place: WritePlace,
+) -> impl Iterator<Item = DamagedRange> + 'columns {
+    columns.iter().map(move |column| DamagedRange {
+        column: column.column,
+        segment,
+        highest_place,
+        start: column.lowest.clone(),
+        end: (!column.bound.is_empty()).then(|| column.bound.clone()),
+    })
 }
 
 /// Cover whole columns when no row can speak for a damaged segment

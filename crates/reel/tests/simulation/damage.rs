@@ -5,13 +5,14 @@ use std::io::IoSlice;
 use std::path::{Path, PathBuf};
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::engine::open_segment::{SegmentPhase, data_path};
 use reel::engine::reel_store::ReelStore;
 use reel::guard::hold;
 use reel_sim::file_image::BitMask;
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_io::SimulatedIo;
-use reel::io::{Io, IoFile};
+use reel::io::{Io, IoFile, IoTask};
 use reel::record::codec::Codec;
 use reel::record::record_check::Checksum;
 use reel::segment::damage_list::{DamagedRange, MOST_DAMAGED_SPANS};
@@ -52,6 +53,7 @@ const TRAILER_MARK_BACK: u64 = 23;
 const SAVE_CRASH_POINTS: u64 = 16;
 const SEGMENTS: usize = 3;
 const SEAL_CRASH_POINTS: u64 = 24;
+const BUSY_WRITES: u32 = 1_000;
 const STALE_TAIL_SEED: u64 = 0;
 const STALE_TAIL_SECOND_POINTS: u64 = 3;
 const SEAL_STEPS: u64 = 1_000;
@@ -1065,6 +1067,66 @@ fn rows_rot() {
     store.clear_damage(ORDERED, b"", None).expect("clear");
     assert_eq!(read(&store, ORDERED, b"later").expect("get"), Some(b"value".to_vec()));
     assert_eq!(read(&store, ORDERED, b"older").expect("get"), None);
+    store.close().expect("close");
+}
+
+// write to one open segment, by making every other look busy
+fn write_in(store: &Store, number: SegmentNumber, write: impl FnOnce()) {
+    let volume = &store.state.volumes[0];
+    let busy = |in_flight: u32| {
+        for segment in hold(&volume.claims).open.iter_mut().filter(|segment| segment.number != number) {
+            segment.in_flight = in_flight;
+        }
+    };
+    busy(BUSY_WRITES);
+    write();
+    busy(0);
+}
+
+fn seal_one(store: &Store, io: &SimulatedIo, number: SegmentNumber) {
+    let volume = &store.state.volumes[0];
+    hold(&volume.claims).open.iter_mut().find(|segment| segment.number == number).expect("open").phase = SegmentPhase::Sealing;
+    if let Some(task) = store.state.seal_tasks[0].get() {
+        task.wake();
+    }
+    settle(io);
+}
+
+// a segment damaged at open goes on taking rows above that rank, and when its tails go the lost footer hid those rows too, so a
+// grave that ranks above the old damage can't answer for the key
+#[test]
+fn lost_tails_raise_the_rank() {
+    let io = rotted_rows(37);
+    let store = open(&io);
+    store.put(ORDERED, b"warm", b"value").expect("put");
+    let volume = &store.state.volumes[0];
+    let damaged = hold(&volume.claims).open[0].number;
+    hold(&volume.claims).wants_prepared = true;
+    store.state.prepare_segments();
+    settle(&io);
+    let other = {
+        let mut claims = hold(&volume.claims);
+        let spare = claims.prepared.take().expect("a spare");
+        let number = spare.number;
+        volume.open_slot(spare.slot);
+        claims.open.push(spare);
+        number
+    };
+    write_in(&store, other, || store.delete(ORDERED, b"later").expect("delete"));
+    write_in(&store, damaged, || store.put(ORDERED, b"later", b"newest").expect("put"));
+    seal_one(&store, &io, other);
+    seal_one(&store, &io, damaged);
+    let highest = hold(&volume.summary).get(damaged).expect("a row").facts.places.highest;
+    let path = data_path(Path::new(ROOT), damaged);
+    store.close().expect("close");
+    drop(store);
+    let length = file_length(&io, &path);
+    io.rot(&path, FileOffset(length.0 - 3), FLIP).expect("rot");
+    io.rot(&path, FileOffset(length.0 - SECOND_TAIL_DISTANCE - 3), FLIP).expect("rot");
+
+    let store = open(&io);
+    assert_eq!(store.state.volumes[0].damage.covering(ORDERED, b"later"), Some(highest));
+    assert!(matches!(read(&store, ORDERED, b"later"), Err(StoreError::Corruption { .. })));
     store.close().expect("close");
 }
 

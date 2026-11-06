@@ -22,6 +22,8 @@ use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, VolumeId};
 use reel_api::write_batch::WriteBatch;
 
+// the default walk runs on the planner, so seeds spread over 0 to 2 workers to keep the worker path under test
+const WALK_WORKER_COUNTS: u64 = 3;
 const ROOTS: [&str; 3] = ["/disk/faults-meta", "/disk/faults-meta-two", "/disk/faults-bulk"];
 const COLUMNS: [ColumnId; 2] = [ColumnId(1), ColumnId(2)];
 const HIGHEST_KEY: &[u8] = b"zzz";
@@ -285,7 +287,8 @@ impl Run {
             if self.streams.open.one_in(4) {
                 self.arm_fault();
             }
-            let opened = ReelStore::open(self.io.clone(), &config(self.policy));
+            let workers = (self.seed % WALK_WORKER_COUNTS) as usize;
+            let opened = ReelStore::open_with_walk_workers(self.io.clone(), &config(self.policy), workers);
             if self.io.is_crashed() {
                 self.crash();
                 drop(opened);

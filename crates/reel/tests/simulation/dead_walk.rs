@@ -22,6 +22,7 @@ use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_io::SimulatedIo;
 
+const WALK_WORKERS: usize = 2;
 const ROOT: &str = "/disk/walk";
 const COLUMN: ColumnId = ColumnId(1);
 const SECOND_COLUMN: ColumnId = ColumnId(2);
@@ -66,6 +67,10 @@ fn open(io: &SimulatedIo) -> Store {
 }
 
 // a key's rows all sit in one shard, so a long run of them needs a large index
+fn open_workers(io: &SimulatedIo) -> Store {
+    held(ReelStore::open_with_walk_workers(io.clone(), &config(BUDGET), WALK_WORKERS).expect("open"))
+}
+
 fn open_large(io: &SimulatedIo) -> Store {
     held(ReelStore::open(io.clone(), &config(LARGE_BUDGET)).expect("open"))
 }
@@ -688,7 +693,7 @@ fn two_blocks(store: &Store, io: &SimulatedIo) -> WalkJob<SimulatedIo> {
 #[test]
 fn blocks_land_in_order() {
     let io = SimulatedIo::new(Seed(40));
-    let store = open(&io);
+    let store = open_workers(&io);
     let mut job = two_blocks(&store, &io);
     let target = job.target.expect("a target");
 
@@ -715,7 +720,7 @@ fn blocks_land_in_order() {
 #[test]
 fn stale_slot_comes_free() {
     let io = SimulatedIo::new(Seed(41));
-    let store = open(&io);
+    let store = open_workers(&io);
     let mut job = two_blocks(&store, &io);
     let target = job.target.expect("a target");
 

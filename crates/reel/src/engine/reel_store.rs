@@ -85,11 +85,22 @@ pub fn open_error(action: &'static str) -> impl Fn(Error) -> StoreError {
 impl<Backend: Io> ReelStore<Backend> {
     /// Open a store: lock every root, read every tail, recover every open segment, start the jobs
     pub fn open(io: Backend, config: &StoreConfig) -> Result<Self, StoreError> {
+        Self::open_sized(io, config, None)
+    }
+
+    /// Open a store with this many walk workers a volume, for the tests and benches that measure them
+    pub fn open_with_walk_workers(io: Backend, config: &StoreConfig, workers: usize) -> Result<Self, StoreError> {
+        Self::open_sized(io, config, Some(workers))
+    }
+
+    /// Open a store, with the walk workers its budget gives unless a count is set
+    pub fn open_sized(io: Backend, config: &StoreConfig, workers: Option<usize>) -> Result<Self, StoreError> {
         check_config(config)?;
         let locks = lock_roots(&io, config)?;
         let superblock = settle_superblock(&io, config)?;
 
-        let sizing = store_sizing(config)?;
+        let mut sizing = store_sizing(config)?;
+        sizing.walk_workers = workers.unwrap_or(sizing.walk_workers);
 
         // every root is listed before any tail is read, and the table is sized from what they hold
         let mut roots = Vec::with_capacity(config.volumes.len());

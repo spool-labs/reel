@@ -136,3 +136,29 @@ fn complete_rows_fit_the_lines() {
     };
     assert!(blocks_for(rows, smallest) <= u64::from(MOST_SEGMENT_BLOCKS.0));
 }
+
+// a seal point leaves room for what arrives while the seal runs, and stays inside the row limit and its floor
+#[test]
+fn seal_point_from_rates() {
+    let limit = RowCount(5_000_000);
+    let index_rows = limit.0 * 8 / SEAL_ROWS_EIGHTHS;
+    assert_eq!(seal_point(limit, 0, 1_000_000), limit);
+    assert_eq!(seal_point(limit, 1_000_000, 0), limit);
+
+    let (seal_rate, ingest_rate) = (2_000_000, 1_600_000);
+    let point = seal_point(limit, seal_rate, ingest_rate).0;
+    assert!(point < limit.0);
+    let seal_seconds = point as f64 / seal_rate as f64;
+    let room_seconds = (index_rows - point) as f64 / ingest_rate as f64;
+    assert!(room_seconds >= seal_seconds, "{room_seconds} s of room, {seal_seconds} s of seal");
+
+    assert_eq!(seal_point(limit, 100_000_000, 1), limit);
+    assert_eq!(seal_point(limit, 1, 100_000_000).0, index_rows / LEAST_SEAL_DIVISOR);
+}
+
+// a rate needs time to have passed
+#[test]
+fn rates() {
+    assert_eq!(rows_per_second(RowCount(500), SECOND / 2), 1_000);
+    assert_eq!(rows_per_second(RowCount(500), 0), 0);
+}

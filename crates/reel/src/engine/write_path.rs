@@ -801,7 +801,8 @@ impl<Backend: Io> EngineState<Backend> {
             self.ask_for_segment(claims);
         }
 
-        if rows >= volume.segment_rows.0 || bytes >= volume.segment_bytes.0 {
+        let point = volume.seal_point.load(Ordering::Relaxed);
+        if rows >= point || bytes >= volume.segment_bytes.0 {
             self.mark_fullest(claims, volume);
         }
     }

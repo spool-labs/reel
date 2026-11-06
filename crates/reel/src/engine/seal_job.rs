@@ -10,6 +10,7 @@ use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RootId, RowCount, Writ
 
 use crate::pool::touched_capacity;
 use crate::config::MAX_KEY_BYTES;
+use crate::engine::engine_sizing::{rows_per_second, seal_point};
 use crate::engine::engine_state::EngineState;
 use crate::engine::open_segment::{SegmentPhase, rows_path};
 use crate::engine::volume::{NO_SEAL, Volume};
@@ -91,6 +92,7 @@ pub struct SealJob<Backend: Io> {
     pub totals: Option<FooterTotals>,
     pub last_key: Vec<u8>,
     pub last_slot: Option<(KeyHash, SegmentNumber, u16)>,
+    pub seal_started: Nanoseconds,
     pub last_column: Option<ColumnId>,
     pub is_in_table: bool,
     pub columns_listed: usize,
@@ -116,6 +118,7 @@ impl<Backend: Io> SealJob<Backend> {
             totals: None,
             last_key: touched_capacity(MAX_KEY_BYTES as usize, 0),
             last_slot: None,
+            seal_started: Nanoseconds(0),
             last_column: None,
             is_in_table: false,
             columns_listed: 0,
@@ -135,6 +138,12 @@ impl<Backend: Io> SealJob<Backend> {
         for segment in &claims.open {
             if segment.phase == SegmentPhase::Sealing {
                 volume.sealing.store(segment.number.0, Ordering::Release);
+                let now = self.state.io.now();
+                if self.seal_started.0 > 0 {
+                    let rate = rows_per_second(segment.row_count, now.0.saturating_sub(self.seal_started.0));
+                    volume.ingest_rate.store(rate, Ordering::Relaxed);
+                }
+                self.seal_started = now;
                 self.target = Some(SealTarget {
                     number: segment.number,
                     slot: segment.slot,
@@ -154,6 +163,14 @@ impl<Backend: Io> SealJob<Backend> {
 
     /// End the seal in progress, and bring the planner back for the walk its segment waited on
     pub fn end_seal(&mut self) {
+        if let Some(target) = &self.target {
+            let elapsed = self.state.io.now().0.saturating_sub(self.seal_started.0);
+            let volume = self.volume();
+            let seal_rate = rows_per_second(target.row_count, elapsed);
+            volume.seal_rate.store(seal_rate, Ordering::Relaxed);
+            let point = seal_point(volume.segment_rows, seal_rate, volume.ingest_rate.load(Ordering::Relaxed));
+            volume.seal_point.store(point.0, Ordering::Relaxed);
+        }
         self.target = None;
         self.phase = SealPhase::Idle;
         self.volume().sealing.store(NO_SEAL, Ordering::Release);

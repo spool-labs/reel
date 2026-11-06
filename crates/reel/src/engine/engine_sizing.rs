@@ -74,6 +74,12 @@ pub const PLANNED_ROW_BYTES: u64 = 227;
 /// A volume holds its open segment and one spare at full size even when its sealed data is small: the reserve is twice the
 /// segment size, 128 MiB at a 128 MiB budget, 192 MiB at 192 MiB, and 2 GiB from the default 512 MiB up. The space gate adds
 /// this to the live bytes
+/// A seal starts at this many eighths of the point the measured rates give, since a seal slows under the load it runs beside
+pub const SEAL_POINT_EIGHTHS: u64 = 7;
+/// A seal never starts below one part in this many of what the index holds, however far the rates say ingest outruns it
+pub const LEAST_SEAL_DIVISOR: u64 = 4;
+/// Nanoseconds in a second, for a rate
+pub const SECOND: u64 = 1_000_000_000;
 pub const SEAL_ROWS_EIGHTHS: u64 = 5;
 /// The eighths of a segment's row block lines a complete column can fill. The rest stay free for other columns' blocks
 pub const SEAL_LINE_EIGHTHS: u64 = 7;
@@ -212,4 +218,26 @@ pub fn complete_row_limit(widest_key: usize) -> RowCount {
 pub fn complete_block_rows(widest_key: usize) -> usize {
     let room = COMPLETE_BLOCK_BYTES - BLOCK_TRAILER_BYTES - RESTART_ROOM - (ROW_ROOM_NUMBERS + widest_key);
     room / (WORST_ROW_NUMBERS + widest_key)
+}
+
+/// Work out how many rows a volume seals at. A seal frees its rows only as it ends, so with the index holding `T` rows, a seal
+/// running at `S` rows a second and ingest at `I`, room lasts through the seal when it starts at `T * S / (S + I)` or below. No
+/// measurement yet leaves the row limit
+pub fn seal_point(limit: RowCount, seal_rate: u64, ingest_rate: u64) -> RowCount {
+    if seal_rate == 0 || ingest_rate == 0 {
+        return limit;
+    }
+    let index_rows = u128::from(limit.0) * 8 / u128::from(SEAL_ROWS_EIGHTHS);
+    let point = index_rows * u128::from(seal_rate) / (u128::from(seal_rate) + u128::from(ingest_rate));
+    let margined = (point * u128::from(SEAL_POINT_EIGHTHS) / 8) as u64;
+    let least = (index_rows / u128::from(LEAST_SEAL_DIVISOR)) as u64;
+    RowCount(margined.max(least).min(limit.0))
+}
+
+/// Work out a rate in rows a second, or nothing when no time has passed
+pub fn rows_per_second(rows: RowCount, elapsed: u64) -> u64 {
+    if elapsed == 0 {
+        return 0;
+    }
+    (u128::from(rows.0) * u128::from(SECOND) / u128::from(elapsed)) as u64
 }

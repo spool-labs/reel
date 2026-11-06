@@ -121,6 +121,12 @@ pub struct Volume<Backend: Io> {
     pub reclaim_retries: AtomicU64,
     /// The walk is part way through a segment
     pub has_walk_target: AtomicBool,
+    /// Rows the open segments reach before a seal starts, from the measured rates and set as each seal ends
+    pub seal_point: AtomicU64,
+    /// Rows a second the last seal ran at, or 0 before one has finished
+    pub seal_rate: AtomicU64,
+    /// Rows a second the volume took between the last two seals, or 0 before there are two
+    pub ingest_rate: AtomicU64,
     /// The lowest segment a rewrite is writing, or `NO_SEAL`. A slot at or above it can point at a segment the table has yet to take. One value
     /// serves one rewrite at a time: when rewrites run on several workers, each needs its own, or one ending uncovers the others
     pub output_floor: AtomicU64,

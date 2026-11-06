@@ -9,6 +9,7 @@ mod counting;
 mod cues;
 mod damage;
 mod dead_walk;
+mod idle_seal;
 mod io_contract;
 mod place_limit;
 mod prefix_counts;

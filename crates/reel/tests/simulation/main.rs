@@ -15,6 +15,7 @@ mod range_apply;
 mod rewrite;
 mod scans;
 mod records;
+mod reports;
 mod seed_sets;
 mod write_index;
 mod faults;

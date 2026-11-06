@@ -113,8 +113,11 @@ impl<Backend: Io> EngineState<Backend> {
             if let Some((many, slot)) = pinned {
                 self.unpin(slot, many.counts);
             }
-            match outcome? {
-                StepOutcome::Answer(step) => return Ok(step),
+            match self.counted(outcome)? {
+                StepOutcome::Answer(step) => {
+                    self.corruption_errors.fetch_add(u64::from(step == ScanStep::Corrupt), Ordering::Relaxed);
+                    return Ok(step);
+                },
                 StepOutcome::Passed => {},
                 StepOutcome::Moved => {
                     tries += 1;

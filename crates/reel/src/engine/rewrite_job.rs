@@ -13,8 +13,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
+use reel_api::maintenance_report::JobKind;
 use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
+use reel_api::units::{ByteCount, FileOffset, RootId, RowCount, WritePlace};
 
 use crate::config::MAX_KEY_BYTES;
 use crate::engine::compact_job::park;
@@ -220,6 +221,7 @@ pub struct RewriteJob<Backend: Io> {
     lowest_dropped: WritePlace,
     pub highest_replacement: WritePlace,
     dropped_rows: u64,
+    dropped_graves: u64,
     kept_dead: Vec<DeadCount>,
     last_tried: SegmentNumber,
     park_waits: u32,
@@ -284,6 +286,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             lowest_dropped: WritePlace(u64::MAX),
             highest_replacement: WritePlace(0),
             dropped_rows: 0,
+            dropped_graves: 0,
             kept_dead: touched_capacity(MOST_KEPT_BLOCKS, DeadCount::default()),
             last_tried: SegmentNumber(0),
             park_waits: 0,
@@ -532,6 +535,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.lowest_dropped = WritePlace(u64::MAX);
         self.highest_replacement = WritePlace(0);
         self.dropped_rows = 0;
+        self.dropped_graves = 0;
         self.park_waits = 0;
         self.data_slot = 0;
         self.is_cutting = false;
@@ -641,12 +645,14 @@ impl<Backend: Io> RewriteJob<Backend> {
         let replacement = self.replacement(volume, column, row)?;
         match replacement {
             Some(place) if self.can_drop(place, row) => {
+                self.dropped_graves += u64::from(row.kind == RowKind::Grave);
                 self.lowest_dropped = self.lowest_dropped.min(row.place);
                 self.highest_replacement = self.highest_replacement.max(place);
                 self.dropped_rows += 1;
                 Ok(())
             },
             None if row.kind == RowKind::Grave && !self.is_unwalked && self.hides_nothing(volume, column, row)? => {
+                self.dropped_graves += 1;
                 self.lowest_dropped = WritePlace(0);
                 self.highest_replacement = self.highest_replacement.max(row.place);
                 self.dropped_rows += 1;
@@ -968,7 +974,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.writer.is_unwalked = self.is_unwalked;
         let totals = self.writer.finish(&output.file, output.number, self.records_end, &[], state.record_key, &numbers[..self.input_count])?;
         self.name_output(output, self.data_slot)?;
-        if !volume.table.install(output.file.clone(), &totals.head, self.writer.columns(), self.writer.entries()) {
+        if !volume.table.install(output.file.clone(), RootId(output.root as u8), &totals.head, self.writer.columns(), self.writer.entries()) {
             return Err(Error::from(ErrorKind::OutOfMemory));
         }
         self.stage_output(output.number, &totals);
@@ -986,6 +992,19 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.is_cutting = false;
         self.phase = RewritePhase::Copying;
         Ok(())
+    }
+
+    /// Count what a merge moved, dropped and carried, for the report
+    pub fn note_install(&self) {
+        let state = &self.state;
+        let staged = self.staged_columns.iter().map(|column| &column.tail);
+        let carried: u64 = staged.chain(self.writer.columns()).chain(self.grave_writer.columns()).map(|tail| tail.grave_count.0).sum();
+        let totals = [self.totals, self.grave_totals].into_iter().flatten().map(|totals| totals.file_length.0).sum::<u64>();
+        let bytes: u64 = totals + self.staged.iter().map(|staged| staged.facts.file_length.0).sum::<u64>();
+        state.graves_dropped.fetch_add(self.dropped_graves, Ordering::Relaxed);
+        state.graves_carried.fetch_add(carried, Ordering::Relaxed);
+        state.empty_rewrites.fetch_add(u64::from(self.dropped_rows == 0), Ordering::Relaxed);
+        state.note_moved(JobKind::Compaction, ByteCount(bytes));
     }
 
     /// Keep what an output's summary row and list entries will need once the writer has moved on
@@ -1123,6 +1142,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             volume.covers.remove_segment(*input);
         }
         let retired: [_; MOST_MERGE_SEGMENTS] = array::from_fn(|index| inputs.get(index).and_then(|number| volume.table.retire(*number)));
+        self.note_install();
         self.summarize(volume, inputs);
         let saved = state.save_summary(volume);
 
@@ -1151,12 +1171,12 @@ impl<Backend: Io> RewriteJob<Backend> {
     /// Put the outputs in the table, both or neither. No list holds them yet, so no read can have found the first
     pub fn enter_table(&self, volume: &Volume<Backend>) -> Result<()> {
         if let (Some(totals), Some(output)) = (self.totals, &self.output)
-            && !volume.table.install(output.file.clone(), &totals.head, self.writer.columns(), self.writer.entries())
+            && !volume.table.install(output.file.clone(), RootId(output.root as u8), &totals.head, self.writer.columns(), self.writer.entries())
         {
             return Err(Error::from(ErrorKind::OutOfMemory));
         }
         if let (Some(totals), Some(output)) = (self.grave_totals, &self.grave_output)
-            && !volume.table.install(output.file.clone(), &totals.head, self.grave_writer.columns(), self.grave_writer.entries())
+            && !volume.table.install(output.file.clone(), RootId(output.root as u8), &totals.head, self.grave_writer.columns(), self.grave_writer.entries())
         {
             if let (Some(_totals), Some(output)) = (self.totals, &self.output)
                 && let Some(retired) = volume.table.retire(output.number)

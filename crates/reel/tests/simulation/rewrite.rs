@@ -25,7 +25,7 @@ use reel::segment::footer_writer::FooterWriter;
 use reel::segment::segment_table::{RetiredSegment, shard_of};
 use reel::segment::segment_tail::{BlockCount, MOST_MERGE_SEGMENTS, SegmentNumber, TailHead};
 use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, FileOffset, Nanoseconds, VolumeId, WritePlace};
+use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RootId, VolumeId, WritePlace};
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_io::SimulatedIo;
@@ -1167,7 +1167,7 @@ fn no_room_for_the_second_output() {
         let filler = SegmentNumber(number);
         if shard_of(filler) == shard
             && filler != data.number
-            && !volume.table.install(graves.file.clone(), &TailHead { segment: filler, ..head }, &[], &[])
+            && !volume.table.install(graves.file.clone(), RootId(0), &TailHead { segment: filler, ..head }, &[], &[])
         {
             break;
         }

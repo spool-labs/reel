@@ -96,6 +96,11 @@ impl ValueList {
         self.answers.iter().any(|answer| matches!(answer, StoredAnswer::Corrupt))
     }
 
+    /// Count the answers that failed their check
+    pub fn corrupt_count(&self) -> u64 {
+        self.answers.iter().filter(|answer| matches!(answer, StoredAnswer::Corrupt)).count() as u64
+    }
+
     /// Read the answer at an index
     pub fn answer(&self, index: usize) -> Option<ValueAnswer<'_>> {
         match self.answers.get(index)? {

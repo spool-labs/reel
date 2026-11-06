@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
+use reel_api::maintenance_report::JobKind;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, Nanoseconds, WritePlace};
 
@@ -586,7 +587,11 @@ impl<Backend: Io> CompactJob<Backend> {
         let Some(retired) = volume.table.retire(segment) else {
             return Ok(());
         };
-        hold(&volume.summary).remove(segment);
+        let mut rows = hold(&volume.summary);
+        let length = rows.get(segment).map_or(ByteCount(0), |row| row.facts.file_length);
+        rows.remove(segment);
+        drop(rows);
+        state.note_moved(JobKind::Compaction, length);
         // the file goes only behind a saved summary, or open would find a row with no file
         let saved = state.save_summary(volume);
         park(volume, Some(retired), segment, saved.is_ok());

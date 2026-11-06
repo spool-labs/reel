@@ -32,6 +32,13 @@ pub enum JobKind {
     SpotCacheUpkeep,
 }
 
+impl JobKind {
+    /// Read this kind's place in `JOB_KINDS`
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
 /// What a job is doing
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum JobState {
@@ -52,7 +59,6 @@ pub struct JobReport {
     pub state: JobState,
     pub bytes_moved: ByteCount,
     pub last_run: Option<Nanoseconds>,
-    pub cpu_time: Nanoseconds,
 }
 
 /// One volume's readings a node roll watches
@@ -78,6 +84,11 @@ pub struct MaintenanceReport {
     pub corruption_errors: RowCount,
     pub damaged_segments: SegmentCount,
     pub summary_rows_dropped: RowCount,
+    pub refused_reads: RowCount,
+    pub reclaim_retries: RowCount,
+    pub segments_parked: SegmentCount,
+    pub empties_left: SegmentCount,
+    pub stray_outputs: SegmentCount,
 }
 
 impl JobReport {
@@ -88,7 +99,6 @@ impl JobReport {
             state: JobState::Idle,
             bytes_moved: ByteCount::default(),
             last_run: None,
-            cpu_time: Nanoseconds::default(),
         }
     }
 }
@@ -114,6 +124,11 @@ impl MaintenanceReport {
             corruption_errors: RowCount::default(),
             damaged_segments: SegmentCount::default(),
             summary_rows_dropped: RowCount::default(),
+            refused_reads: RowCount::default(),
+            reclaim_retries: RowCount::default(),
+            segments_parked: SegmentCount::default(),
+            empties_left: SegmentCount::default(),
+            stray_outputs: SegmentCount::default(),
         }
     }
 }

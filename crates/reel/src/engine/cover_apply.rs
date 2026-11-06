@@ -9,6 +9,7 @@ use std::io::{Error, ErrorKind, Result};
 use std::sync::Arc;
 
 use reel_api::column_id::ColumnId;
+use reel_api::maintenance_report::JobKind;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, WritePlace};
 
@@ -217,6 +218,7 @@ impl<Backend: Io> CoverApply<Backend> {
             return Err(Error::from(ErrorKind::NotFound));
         };
         let length = block.entry.block_length().0 as usize;
+        self.counts.read_bytes = block.entry.block_length();
         if length > self.block.len() {
             return Err(Error::from(ErrorKind::InvalidData));
         }
@@ -292,6 +294,7 @@ impl<Backend: Io> CoverApply<Backend> {
         let Some(block) = volume.table.walk_block(target.segment, target.next_block) else {
             return Err(Error::from(ErrorKind::NotFound));
         };
+        self.counts.read_bytes = block.entry.block_length();
         let (mut graves, mut bytes) = (0, ByteCount(0));
         if volume.table.column_blocks(target.segment, column).is_some_and(|(first, _count)| first == target.next_block) {
             (graves, bytes) = column_left(&hold(&volume.summary), target.segment, column);
@@ -311,6 +314,7 @@ impl<Backend: Io> CoverApply<Backend> {
 
     /// Land a block's counts on its segment
     pub fn land(&mut self, volume: &Volume<Backend>, segment: SegmentNumber) -> Result<()> {
+        self.state.note_moved(JobKind::RangeDeleteApply, self.counts.read_bytes);
         self.counts.counts.sort_unstable_by_key(|count| count.block);
         hold(&volume.summary).apply_counts(segment, &self.counts.counts, None);
         for count in self.counts.counts.iter().filter(|count| count.rows > 0) {

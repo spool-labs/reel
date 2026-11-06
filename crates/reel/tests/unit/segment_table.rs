@@ -2,7 +2,7 @@ use reel::segment::block_entry::BlockEntry;
 use reel::segment::row_block::BLOCK_HEADER_BYTES;
 use reel::segment::segment_table::*;
 use reel::segment::segment_tail::{SegmentNumber, TailHead};
-use reel_api::units::WritePlace;
+use reel_api::units::{RootId, WritePlace};
 
 const NUMBERS: u64 = 500;
 
@@ -34,6 +34,7 @@ fn pool_compact() {
     let entry = |number: u64, start: u32, length: u32| TableEntry {
         number: SegmentNumber(number),
         file: 0_u32,
+        root: RootId(0),
         head: TailHead::default(),
         columns: Extent::default(),
         blocks: Extent { start, length },
@@ -79,12 +80,12 @@ fn table_full() {
     };
     let same_shard = |number: u64| shard_of(SegmentNumber(number)) == shard_of(SegmentNumber(1));
 
-    assert!(table.install(1, &head(1), &[], &[]));
+    assert!(table.install(1, RootId(0), &head(1), &[], &[]));
     let mut other = 2;
     while !same_shard(other) {
         other += 1;
     }
-    assert!(!table.install(2, &head(other), &[], &[]));
+    assert!(!table.install(2, RootId(0), &head(other), &[], &[]));
 }
 
 // numbers go in, read back and come out with every other number still found
@@ -117,10 +118,10 @@ fn retired_keeps_slot() {
     while shard_of(SegmentNumber(other)) != shard_of(SegmentNumber(1)) {
         other += 1;
     }
-    assert!(table.install(1, &head(1), &[], &[]));
+    assert!(table.install(1, RootId(0), &head(1), &[], &[]));
     let retired = table.retire(SegmentNumber(1)).expect("retired");
 
-    assert!(table.install(2, &head(other), &[], &[]));
+    assert!(table.install(2, RootId(0), &head(other), &[], &[]));
     let pin = table.pin(SegmentNumber(other)).expect("a pin");
     assert_eq!(table.retired_pins(&retired), 0);
     drop(pin);

@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
+use reel_api::maintenance_report::JobKind;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, WritePlace};
 
@@ -80,6 +81,7 @@ pub struct BlockCounts {
     pub counts: Vec<DeadCount>,
     pub frees: Vec<FreeRecord>,
     pub overflowed: Vec<SegmentNumber>,
+    pub read_bytes: ByteCount,
 }
 
 impl BlockCounts {
@@ -89,6 +91,7 @@ impl BlockCounts {
             counts: touched_capacity(MOST_BLOCK_ROWS, DeadCount::default()),
             frees: touched_capacity(MOST_BLOCK_FREES, FreeRecord::default()),
             overflowed: touched_capacity(MOST_BLOCK_FREES, SegmentNumber(0)),
+            read_bytes: ByteCount(0),
         }
     }
 
@@ -103,6 +106,7 @@ impl BlockCounts {
         self.counts.clear();
         self.frees.clear();
         self.overflowed.clear();
+        self.read_bytes = ByteCount(0);
     }
 
     /// Count a row dead, and note a large record so its blocks can go
@@ -297,6 +301,7 @@ impl<Backend: Io> BlockCounter<Backend> {
         counts: &mut BlockCounts,
     ) -> Result<()> {
         let length = block.entry.block_length().0 as usize;
+        counts.read_bytes = block.entry.block_length();
         pin.file.read_exact_at(block.entry.block_at(), &mut self.block[..length])?;
         let Some(mut walk) = RowBlockWalk::open(&self.block[..length], pin.head.place_base) else {
             return Ok(());
@@ -453,6 +458,7 @@ impl<Backend: Io> WalkJob<Backend> {
         next_block: u32,
         counts: &mut BlockCounts,
     ) -> Result<()> {
+        self.state.note_moved(JobKind::DeadByteWalk, counts.read_bytes);
         counts.counts.sort_unstable_by_key(|count| count.segment);
         let mut rows = hold(&volume.summary);
         rows.apply_walk(target.segment, next_block, &counts.counts);

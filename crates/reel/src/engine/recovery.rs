@@ -522,7 +522,7 @@ impl<Backend: Io> EngineState<Backend> {
             }
         }
         // the table takes the file last, so a failure before it leaves one owner, the scan
-        if !volume.table.install(found.file.clone(), &found.head, &found.columns, &found.entries) {
+        if !volume.table.install(found.file.clone(), root_of_path(volume, &found.path), &found.head, &found.columns, &found.entries) {
             return Err(Error::other("segment table sized below what the roots hold"));
         }
         Ok(())
@@ -2028,4 +2028,9 @@ pub fn is_tail_stale<Backend: Io>(io: &Backend, record_key: RecordKey, listing: 
     let scanned = scan_rows_of(&rows, record_key);
     io.close_file(rows);
     Ok(scanned?.highest_place > head.places.highest)
+}
+
+/// Find which of a volume's roots a file sits under
+pub fn root_of_path<Backend: Io>(volume: &Volume<Backend>, path: &Path) -> RootId {
+    RootId(volume.roots.iter().position(|root| path.starts_with(root)).unwrap_or(0) as u8)
 }

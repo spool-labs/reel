@@ -9,11 +9,12 @@ use std::sync::{Mutex, OnceLock, RwLock};
 use reel_api::column_id::ColumnId;
 use reel_api::memory_report::MemoryReport;
 use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, FileOffset, WritePlace};
+use reel_api::units::{ByteCount, FileOffset, Nanoseconds, WritePlace};
 
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::cue::{CueTable, JobCounts};
 use crate::engine::engine_sizing::EngineSizing;
+use crate::engine::job_tally::JobTallies;
 use crate::engine::open_segment::{RecordWindow, RowQueue};
 use crate::engine::compact_job::park;
 use crate::engine::open_segment::{data_path, output_path, rows_path};
@@ -100,6 +101,13 @@ pub struct EngineState<Backend: Io> {
     pub row_job_idle: AtomicBool,
     pub damaged_segments: AtomicU64,
     pub dropped_summary_rows: AtomicU64,
+    pub tallies: JobTallies,
+    pub opened_at: Nanoseconds,
+    pub graves_at_open: AtomicU64,
+    pub graves_dropped: AtomicU64,
+    pub graves_carried: AtomicU64,
+    pub empty_rewrites: AtomicU64,
+    pub corruption_errors: AtomicU64,
     pub memory_budget: ByteCount,
     pub seal_heap: AtomicU64,
     pub compaction_heap: AtomicU64,

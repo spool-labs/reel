@@ -7,11 +7,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use reel_api::column_id::ColumnId;
 use reel_api::direction::Direction;
+use reel_api::maintenance_report::MaintenanceReport;
 use reel_api::memory_report::MemoryReport;
 use reel_api::reads::ValueWindow;
 use reel_api::store_error::StoreError;
 use reel_api::value_list::ValueList;
-use reel_api::units::{ByteCount, Nanoseconds, VolumeId, WritePlace};
+use reel_api::units::{ByteCount, Nanoseconds, RowCount, VolumeId, WritePlace};
+use reel_api::usage::{ColumnUsage, UsageReport};
 use reel_api::write_batch::WriteBatch;
 
 use crate::config::{ColumnConfig, StoreConfig};
@@ -140,6 +142,33 @@ impl<Backend: Io> ReelStore<Backend> {
         self.state.dropped_summary_rows.load(Ordering::Acquire)
     }
 
+    /// Estimate the live bytes of the whole store, without a scan
+    pub fn live_data_size_bytes(&self) -> ByteCount {
+        self.state.live_data_size()
+    }
+
+    /// Estimate the keys of the whole store, without a scan
+    pub fn key_count_estimate(&self) -> RowCount {
+        self.state.key_count()
+    }
+
+    /// Fill a report with live and on-disk bytes of one column
+    pub fn column_disk_usage(&self, column: ColumnId, report: &mut ColumnUsage) -> Result<(), StoreError> {
+        self.check_open()?;
+        self.state.column_usage(column, report)
+    }
+
+    /// Fill a report with used and free bytes of every volume and root
+    pub fn volume_usage(&self, report: &mut UsageReport) -> Result<(), StoreError> {
+        self.check_open()?;
+        self.state.volume_usage(report)
+    }
+
+    /// Fill a report with each job's state, the reclaim counts and the volume readings
+    pub fn maintenance_report(&self, report: &mut MaintenanceReport) {
+        self.state.maintenance(report);
+    }
+
     /// Report the heap each structure holds
     pub fn memory_report(&self) -> MemoryReport {
         self.state.memory_report()
@@ -206,13 +235,15 @@ impl<Backend: Io> ReelStore<Backend> {
     /// Fill a buffer with the newest value, and say whether the key has one
     pub fn get(&self, column: ColumnId, key: &[u8], buf: &mut Vec<u8>) -> Result<bool, StoreError> {
         self.check_open()?;
-        self.state.get_latest(column, key, RecordWant::Whole, buf)
+        self.state.counted(self.state.get_latest(column, key, RecordWant::Whole, buf))
     }
 
     /// Answer every key at one point in the write order, with a bad record as that key's answer
     pub fn get_many(&self, column: ColumnId, keys: &[&[u8]], values: &mut ValueList) -> Result<(), StoreError> {
         self.check_open()?;
-        self.state.get_many_now(column, keys, values)
+        let answer = self.state.get_many_now(column, keys, values);
+        self.state.corruption_errors.fetch_add(values.corrupt_count(), Ordering::Relaxed);
+        answer
     }
 
     /// Fill a buffer with a checked window of the value, and say whether the key has one
@@ -225,7 +256,7 @@ impl<Backend: Io> ReelStore<Backend> {
     ) -> Result<bool, StoreError> {
         self.check_open()?;
         let want = RecordWant::Window(window);
-        self.state.get_latest(column, key, want, buf)
+        self.state.counted(self.state.get_latest(column, key, want, buf))
     }
 
     /// Take a read view at this point in the write order, which copies no data and never blocks a writer
@@ -261,7 +292,7 @@ impl<Backend: Io> ReelStore<Backend> {
     /// Check whether the key has a value, without reading the value
     pub fn contains(&self, column: ColumnId, key: &[u8]) -> Result<bool, StoreError> {
         self.check_open()?;
-        self.state.contains_now(column, key)
+        self.state.counted(self.state.contains_now(column, key))
     }
 
     /// Clear a damaged span once the caller has repaired it from peers, up to an end key or the column's end
@@ -546,6 +577,7 @@ pub fn bring_up<Backend: Io>(
     let task = state.io.spawn_job("reel-reserve", reserve_job).map_err(open_error("starting a job"))?;
     let _set = state.reserve_task.set(task);
     state.job_count.store(SHARED_JOBS + state.volumes.len() as u64 + workers, Ordering::Release);
+    state.note_graves_at_open();
     Ok(())
 }
 
@@ -948,6 +980,7 @@ pub fn build_state<Backend: Io>(
     let place_limit = superblock.place_limit;
     let first_place = place_limit.0.saturating_sub(PLACE_RUN);
 
+    let opened_at = io.now();
     EngineState {
         io,
         record_key: superblock.record_key,
@@ -987,6 +1020,13 @@ pub fn build_state<Backend: Io>(
         row_job_idle: AtomicBool::new(false),
         damaged_segments: AtomicU64::new(0),
         dropped_summary_rows: AtomicU64::new(0),
+        tallies: Default::default(),
+        opened_at,
+        graves_at_open: AtomicU64::new(0),
+        graves_dropped: AtomicU64::new(0),
+        graves_carried: AtomicU64::new(0),
+        empty_rewrites: AtomicU64::new(0),
+        corruption_errors: AtomicU64::new(0),
         memory_budget: config.memory_budget,
         seal_heap: AtomicU64::new(0),
         compaction_heap: AtomicU64::new(0),

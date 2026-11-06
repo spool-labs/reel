@@ -184,7 +184,7 @@ impl<Backend: Io> Cue<Backend> {
     /// Check whether the key had a value at this cue
     pub fn contains(&self, column: ColumnId, key: &[u8]) -> Result<bool, StoreError> {
         self.check_open()?;
-        self.state.contains_at(&self.state.key_read(column, key, self.point, true)?)
+        self.state.counted(self.state.contains_at(&self.state.key_read(column, key, self.point, true)?))
     }
 
     /// Answer every key at this cue, with a bad record as that key's answer
@@ -196,6 +196,7 @@ impl<Backend: Io> Cue<Backend> {
         let mut scratch = values.take_scratch();
         let read = self.state.read_keys(column, keys, self.point, handovers, values, &mut scratch);
         values.put_scratch(scratch);
+        self.state.corruption_errors.fetch_add(values.corrupt_count(), Ordering::Relaxed);
         read
     }
 
@@ -237,7 +238,7 @@ impl<Backend: Io> Cue<Backend> {
         let info = self.state.column(column)?;
         let handovers = self.state.volumes[info.volume.0 as usize].handover_count();
         let read = self.state.key_read(column, key, self.point, true)?;
-        self.state.get_at(&read, handovers, want, buf)
+        self.state.counted(self.state.get_at(&read, handovers, want, buf))
     }
 }
 

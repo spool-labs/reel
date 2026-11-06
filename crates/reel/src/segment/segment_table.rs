@@ -5,7 +5,7 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use reel_api::column_id::ColumnId;
 use reel_api::direction::Direction;
-use reel_api::units::{ByteCount, WritePlace};
+use reel_api::units::{ByteCount, RootId, WritePlace};
 
 use crate::pool::touched_capacity;
 use crate::segment::block_entry::{BlockEntry, KeyPrefix};
@@ -35,6 +35,7 @@ pub struct Extent {
 pub struct TableEntry<File> {
     pub number: SegmentNumber,
     pub file: File,
+    pub root: RootId,
     pub head: TailHead,
     pub columns: Extent,
     pub blocks: Extent,
@@ -244,7 +245,7 @@ impl<File: Clone> SegmentTable<File> {
     }
 
     /// Install a sealed segment, or return false when its shard has no room
-    pub fn install(&self, file: File, head: &TailHead, columns: &[ColumnTail], blocks: &[BlockEntry]) -> bool {
+    pub fn install(&self, file: File, root: RootId, head: &TailHead, columns: &[ColumnTail], blocks: &[BlockEntry]) -> bool {
         let mut guard = self.write_shard(shard_of(head.segment));
         if !guard.has_room(columns, blocks) {
             guard.compact();
@@ -269,6 +270,7 @@ impl<File: Clone> SegmentTable<File> {
         guard.segments[slot as usize] = Some(TableEntry {
             number: head.segment,
             file,
+            root,
             head: *head,
             columns: column_extent,
             blocks: block_extent,
@@ -447,6 +449,23 @@ impl<File: Clone> SegmentTable<File> {
         let prefix = KeyPrefix::of_key(key, column_tail.shared_length as usize);
         let start = column_tail.first_block + first_candidate(lines, prefix) as u32;
         Some((start, column_tail.first_block + column_tail.block_count.0))
+    }
+
+    /// Add up each root's segments, as a caller measures them, into one number a root
+    pub fn for_each_segment(&self, mut visit: impl FnMut(SegmentNumber, RootId, &File)) {
+        for shard in 0..self.shards.len() {
+            let guard = self.read_shard(shard);
+            for entry in guard.segments.iter().flatten() {
+                visit(entry.number, entry.root, &entry.file);
+            }
+        }
+    }
+
+    /// Read which root holds a segment
+    pub fn root_of(&self, number: SegmentNumber) -> Option<RootId> {
+        let guard = self.read_shard(shard_of(number));
+        let slot = guard.map.get(number)?;
+        guard.segments[slot as usize].as_ref().map(|entry| entry.root)
     }
 
     /// Copy out a segment's tail for a column

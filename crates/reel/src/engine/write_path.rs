@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
+use reel_api::maintenance_report::JobKind;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RootId, RowCount, WritePlace};
 
@@ -1240,6 +1241,7 @@ impl<Backend: Io> EngineState<Backend> {
             let parts = [IoSlice::new(bytes)];
             outcome = rows.write_at(rows_end, &parts);
             new_end = FileOffset(rows_end.0 + bytes.len() as u64);
+            self.note_moved(JobKind::RowWriteOut, ByteCount(bytes.len() as u64));
         }
         if outcome.is_ok() && data.is_some() {
             outcome = rows.sync();

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
+use reel_api::maintenance_report::JobKind;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RootId, RowCount, WritePlace};
 
 use crate::pool::touched_capacity;
@@ -374,6 +375,7 @@ impl<Backend: Io> SealJob<Backend> {
         if !self.is_in_table {
             let installed = volume.table.install(
                 target.data.clone(),
+                target.root,
                 &totals.head,
                 self.writer.columns(),
                 self.writer.entries(),
@@ -384,6 +386,7 @@ impl<Backend: Io> SealJob<Backend> {
                 return Err(Error::other("segment table is full"));
             }
             volume.note_sealed(totals.head.places.highest);
+            state.note_moved(JobKind::Seal, totals.file_length);
             self.is_in_table = true;
         }
 

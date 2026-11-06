@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::engine::cue::Cue;
 use reel::engine::reel_store::ReelStore;
 use reel::engine::write_path::ClaimRequest;
 use reel::record::codec::Codec;
@@ -141,6 +142,24 @@ fn cut_keeps_write_order() {
         assert!(after.get(META, b"first", &mut buf).expect("get"));
         assert_eq!(buf, value);
     }
+    store.close().expect("close");
+}
+
+// a cue cut at an earlier count holds neither write that landed past it, and above all not the later one without the earlier
+#[test]
+fn cut_caps_every_mark() {
+    let io = SimulatedIo::new(Seed(8));
+    let store = open(&io);
+    let counts = store.state.cues.counts();
+    let cut = store.state.places.last_given();
+    store.put(META, b"first", b"value").expect("put");
+    store.put(BULK, b"second", b"value").expect("put");
+
+    let cue = Cue::pin_at(&store.state, counts, cut).expect("a slot").expect("no job crossed it");
+    let mut buf = Vec::new();
+    assert!(!cue.get(META, b"first", &mut buf).expect("get"));
+    assert!(!cue.get(BULK, b"second", &mut buf).expect("get"));
+    drop(cue);
     store.close().expect("close");
 }
 

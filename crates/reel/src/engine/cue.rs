@@ -182,16 +182,22 @@ impl<Backend: Io> Cue<Backend> {
         loop {
             let counts = state.cues.counts();
             let cut = state.places.last_given();
-            let Some(slot) = state.cues.take_slot() else {
-                return Err(StoreError::CuesFull { limit: MOST_CUES as u64 });
-            };
-            for (index, volume) in state.volumes.iter().enumerate() {
-                state.cues.set_point(slot, index, volume.order.mark().min(cut));
-            }
-            if state.pin_holds(slot, counts) {
-                return Ok(Self { state, slot });
+            if let Some(cue) = Self::pin_at(&state, counts, cut)? {
+                return Ok(cue);
             }
         }
+    }
+
+    /// Pin a cue at a count read earlier, or return nothing when a job crossed it. No volume's point passes the count, so a write
+    /// that took a place after it stays out on every volume
+    pub fn pin_at(state: &Arc<EngineState<Backend>>, counts: JobCounts, cut: WritePlace) -> Result<Option<Self>, StoreError> {
+        let Some(slot) = state.cues.take_slot() else {
+            return Err(StoreError::CuesFull { limit: MOST_CUES as u64 });
+        };
+        for (index, volume) in state.volumes.iter().enumerate() {
+            state.cues.set_point(slot, index, volume.order.mark().min(cut));
+        }
+        Ok(state.pin_holds(slot, counts).then(|| Self { state: Arc::clone(state), slot }))
     }
 
     /// Read the cue's point on a column's volume

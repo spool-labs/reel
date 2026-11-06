@@ -26,6 +26,7 @@ mod reports;
 mod ring_reads;
 mod seed_sets;
 mod volume_marks;
+mod writeback;
 mod write_index;
 mod faults;
 mod filters;

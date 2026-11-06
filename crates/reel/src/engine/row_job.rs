@@ -10,7 +10,7 @@ use crate::engine::engine_state::EngineState;
 use crate::engine::open_segment::SegmentPhase;
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
-use crate::io::Io;
+use crate::io::{Io, IoTask};
 use crate::io::job::{Job, JobStep};
 
 /// How long rows wait in memory, well inside the 100 ms a kill can cost
@@ -109,6 +109,10 @@ impl<Backend: Io> RowJob<Backend> {
 impl<Backend: Io> Job for RowJob<Backend> {
     fn step(&mut self) -> JobStep {
         if self.send_all() {
+            // bytes just sent are what the device can start on, ahead of the seal
+            if let Some(task) = self.state.reserve_task.get() {
+                task.wake();
+            }
             let now = self.state.io.now();
             // a busy store still has quiet segments, and each goes by its own last write
             let _deadline = self.seal_idle_segments();

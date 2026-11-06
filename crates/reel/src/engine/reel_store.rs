@@ -653,9 +653,7 @@ pub fn bring_up<Backend: Io>(
     };
     let task = state.io.spawn_job("reel-planner", planner).map_err(open_error("starting a job"))?;
     let _set = state.planner_task.set(task);
-    let reserve_job = ReserveJob {
-        state: Arc::clone(state),
-    };
+    let reserve_job = ReserveJob::new(Arc::clone(state));
     let task = state.io.spawn_job("reel-reserve", reserve_job).map_err(open_error("starting a job"))?;
     let _set = state.reserve_task.set(task);
     for cell in &state.read_tasks {

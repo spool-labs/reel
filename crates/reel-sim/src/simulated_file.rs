@@ -188,6 +188,11 @@ impl IoFile for SimulatedFile {
         Ok(())
     }
 
+    fn start_writeback(&self, _offset: FileOffset, length: ByteCount) -> Result<()> {
+        hold(&self.disk).writeback_bytes += length.0;
+        Ok(())
+    }
+
     fn sync(&self) -> Result<()> {
         let _pause = CountPause::new();
         let mut disk = hold(&self.disk);

@@ -126,6 +126,10 @@ impl IoFile for PlainFile {
         self.write_remainder(offset, parts, written)
     }
 
+    fn start_writeback(&self, offset: FileOffset, length: ByteCount) -> Result<()> {
+        start_descriptor_writeback(self.descriptor, offset, length)
+    }
+
     fn sync(&self) -> Result<()> {
         sync_descriptor(self.descriptor)
     }
@@ -284,4 +288,21 @@ pub fn reserve_space(file: &File, length: ByteCount) -> Result<()> {
         return Err(Error::last_os_error());
     }
     file.set_len(length.0)
+}
+
+/// Start a range's dirty pages for the device
+#[cfg(target_os = "linux")]
+pub fn start_descriptor_writeback(descriptor: RawFd, offset: FileOffset, length: ByteCount) -> Result<()> {
+    // SAFETY: the descriptor is open, and no pointer crosses the call
+    let status = unsafe { libc::sync_file_range(descriptor, offset.0 as i64, length.0 as i64, libc::SYNC_FILE_RANGE_WRITE) };
+    if status != 0 {
+        return Err(Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Leave a range to the system, which has no call that starts one without waiting
+#[cfg(not(target_os = "linux"))]
+pub fn start_descriptor_writeback(_descriptor: RawFd, _offset: FileOffset, _length: ByteCount) -> Result<()> {
+    Ok(())
 }

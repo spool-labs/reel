@@ -181,6 +181,11 @@ impl SimulatedIo {
         hold(&self.disk).writes
     }
 
+    /// Read how many bytes files have started for the device
+    pub fn writeback_bytes(&self) -> ByteCount {
+        ByteCount(hold(&self.disk).writeback_bytes)
+    }
+
     /// Read how many reads have run
     pub fn read_count(&self) -> OperationCount {
         hold(&self.disk).reads

@@ -36,6 +36,9 @@ pub trait IoFile: Clone + Send + Sync {
     /// Write every part at the offset in one write call
     fn write_at(&self, offset: FileOffset, parts: &[IoSlice]) -> Result<()>;
 
+    /// Start a range on its way to the device, with no wait for it and no promise it lands
+    fn start_writeback(&self, offset: FileOffset, length: ByteCount) -> Result<()>;
+
     /// Make every earlier write survive a power cut
     fn sync(&self) -> Result<()>;
 

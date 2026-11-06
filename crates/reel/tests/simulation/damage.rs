@@ -50,6 +50,8 @@ const TRAILER_MARK_BACK: u64 = 23;
 const SAVE_CRASH_POINTS: u64 = 16;
 const SEGMENTS: usize = 3;
 const SEAL_CRASH_POINTS: u64 = 24;
+const STALE_TAIL_SEED: u64 = 0;
+const STALE_TAIL_SECOND_POINTS: u64 = 3;
 const SEAL_STEPS: u64 = 1_000;
 const CLEAR_CRASH_POINTS: u64 = 24;
 const SEAL_DATA_SYNCS: u64 = 6;
@@ -1133,6 +1135,78 @@ fn tail_then_cut() {
     let store = open(&io);
     assert_eq!(read(&store, ORDERED, b"key").expect("get"), Some(b"value".to_vec()));
     store.close().expect("close");
+}
+
+// run until an armed crash fires or the jobs go quiet, and say whether it fired
+fn run_to_crash(io: &SimulatedIo) -> bool {
+    for _step in 0..SETTLE_STEPS {
+        if io.is_crashed() {
+            return true;
+        }
+        if io.step_any().is_none() {
+            io.advance_clock(SETTLE_TICK);
+            if io.step_any().is_none() {
+                return io.is_crashed();
+            }
+        }
+    }
+    io.is_crashed()
+}
+
+// one seal stopped at one point, rows flushed past what it wrote, and a power cut in a second seal
+fn stale_tail_run(seed: u64, first: u64, second: u64) -> bool {
+    let io = SimulatedIo::new(Seed(seed));
+    let store = open(&io);
+    store.put(ORDERED, b"first", b"value").expect("put");
+    io.advance_clock(ROW_PERIOD);
+    settle(&io);
+    // a failed sync forgets the room set aside, so the file's durable end follows its writes
+    io.fail_file_sync("data", OperationCount(0));
+    let _failed = store.flush();
+    io.kill();
+    drop(store);
+
+    let store = open(&io);
+    store.flush().expect("flush");
+    io.arm_crash(OperationCount(first));
+    store.seal_now();
+    if !run_to_crash(&io) {
+        io.disarm_crash();
+        store.close().expect("close");
+        return false;
+    }
+    io.kill();
+    drop(store);
+
+    let store = open(&io);
+    store.put(ORDERED, b"kept", b"value").expect("put");
+    store.flush().expect("flush");
+    store.put(ORDERED, b"later", b"value").expect("put");
+    io.arm_crash(OperationCount(second));
+    store.seal_now();
+    let _fired = run_to_crash(&io);
+    io.disarm_crash();
+    io.power_cut();
+    drop(store);
+
+    let store = open(&io);
+    let kept = read(&store, ORDERED, b"kept");
+    assert_eq!(kept.expect("get"), Some(b"value".to_vec()), "seed {seed}, crashes at {first} and {second}");
+    store.close().expect("close");
+    true
+}
+
+// the family of `tail_then_cut`: a tail from a seal that never finished, read as final. It stops speaking once rows go on past it, so a power cut that brings it back to the file's
+// end hides none of them
+#[test]
+fn stale_tail_hides_no_rows() {
+    let mut runs = 0;
+    for first in 0..SEAL_CRASH_POINTS {
+        for second in 0..STALE_TAIL_SECOND_POINTS {
+            runs += u64::from(stale_tail_run(STALE_TAIL_SEED, first, second));
+        }
+    }
+    assert!(runs > 0);
 }
 
 fn data_lengths(io: &SimulatedIo) -> Vec<ByteCount> {

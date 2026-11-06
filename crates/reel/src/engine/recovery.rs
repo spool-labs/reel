@@ -374,6 +374,24 @@ pub fn sort_segment<Backend: Io>(
         },
     };
 
+    let tail = match &segment {
+        SegmentRead::Sealed { head, .. } => Some(*head),
+        SegmentRead::Damaged { head, .. } => *head,
+        SegmentRead::Open | SegmentRead::Empty { .. } => None,
+    };
+    let is_stale = match tail.filter(|_head| has_rows(listing, number)) {
+        Some(head) => is_tail_stale(io, record_key, listing, &head),
+        None => Ok(false),
+    };
+    let segment = match is_stale {
+        Ok(true) => SegmentRead::Open,
+        Ok(false) => segment,
+        Err(error) => {
+            io.close_file(file);
+            return Err(error);
+        },
+    };
+
     match segment {
         SegmentRead::Sealed { head, columns, entries } => scan.sealed.push(FoundSealed {
             volume: listing.volume,
@@ -633,55 +651,9 @@ impl<Backend: Io> EngineState<Backend> {
         Ok(true)
     }
 
-    /// Find the next whole group: the one at this offset, or past a bad one the first that shows a sync
-    /// covered it, which makes the bad one rot and never a torn end
-    pub fn next_group(
-        &self,
-        rows: &Backend::File,
-        at: FileOffset,
-        end: ByteCount,
-        bytes: &mut [u8],
-    ) -> Result<Option<(FileOffset, GroupHead)>> {
-        if let Some(head) = read_group(rows, at, end, bytes, self.record_key)? {
-            return Ok(Some((at, head)));
-        }
-        covering_group(rows, at, end, bytes, self.record_key)
-    }
-
     /// Walk a rows file's whole groups for where they end and what a sync last covered
     pub fn scan_rows(&self, rows: &Backend::File) -> Result<RowsScan> {
-        let mut scan = RowsScan::default();
-        let mut bytes = vec![0; GROUP_BYTES.0 as usize];
-        let length = rows.length()?;
-
-        while scan.valid_end.0 < length.0 {
-            let Some((at, head)) = self.next_group(rows, scan.valid_end, length, &mut bytes)? else {
-                break;
-            };
-            if at != scan.valid_end {
-                scan.has_rot = true;
-                scan.rot_sum = rot_sum(scan.rot_sum, scan.valid_end, at);
-            }
-            scan.synced_through = scan.synced_through.max(head.synced_through);
-            scan.row_count = RowCount(scan.row_count.0 + head.row_count.0);
-            let mut highest = scan.highest_place;
-            let walked = walk_rows(rows, at, &head, &mut bytes, |row| {
-                highest = highest.max(row.place);
-                Ok(true)
-            })?;
-            if walked == RowsWalked::Unreadable {
-                scan.has_rot = true;
-                scan.rot_sum = rot_sum(scan.rot_sum, at, FileOffset(at.0 + head.total_length.0));
-            }
-            scan.highest_place = highest;
-            scan.valid_end = FileOffset(at.0 + head.total_length.0);
-        }
-        // a torn end is bytes that read and fail their check, so a device error past the last good group is rot
-        if scan.valid_end.0 < length.0 && has_bad_sector(rows, scan.valid_end, length)? {
-            scan.has_rot = true;
-            scan.rot_sum = rot_sum(scan.rot_sum, scan.valid_end, FileOffset(length.0));
-        }
-        Ok(scan)
+        scan_rows_of(rows, self.record_key)
     }
 
     /// Put each group's rows in the index, checking the records of groups no sync covered, and
@@ -701,7 +673,7 @@ impl<Backend: Io> EngineState<Backend> {
         let end = ByteCount(scan.valid_end.0);
 
         while at.0 < scan.valid_end.0 {
-            let Some((start, head)) = self.next_group(rows, at, end, &mut bytes)? else {
+            let Some((start, head)) = next_group(rows, at, end, &mut bytes, self.record_key)? else {
                 break;
             };
             at = start;
@@ -1055,7 +1027,7 @@ pub fn copy_segment<Backend: Io>(
     let end = ByteCount(segment.scan.valid_end.0);
 
     while at.0 < segment.scan.valid_end.0 {
-        let Some((start, head)) = state.next_group(&segment.rows, at, end, &mut bytes)? else {
+        let Some((start, head)) = next_group(&segment.rows, at, end, &mut bytes, state.record_key)? else {
             break;
         };
         at = start;
@@ -1991,4 +1963,65 @@ impl<Backend: Io> EngineState<Backend> {
         drop(rows);
         self.note_dropped_rows(dropped);
     }
+}
+
+/// Find the next whole group: the one at this offset, or past a bad one the first that shows a sync covered it, which makes
+/// the bad one rot and never a torn end
+pub fn next_group<File: IoFile>(
+    rows: &File,
+    at: FileOffset,
+    end: ByteCount,
+    bytes: &mut [u8],
+    record_key: RecordKey,
+) -> Result<Option<(FileOffset, GroupHead)>> {
+    if let Some(head) = read_group(rows, at, end, bytes, record_key)? {
+        return Ok(Some((at, head)));
+    }
+    covering_group(rows, at, end, bytes, record_key)
+}
+
+/// Walk a rows file for what recovery needs to know before it reads any record
+pub fn scan_rows_of<File: IoFile>(rows: &File, record_key: RecordKey) -> Result<RowsScan> {
+    let mut scan = RowsScan::default();
+    let mut bytes = vec![0; GROUP_BYTES.0 as usize];
+    let length = rows.length()?;
+
+    while scan.valid_end.0 < length.0 {
+        let Some((at, head)) = next_group(rows, scan.valid_end, length, &mut bytes, record_key)? else {
+            break;
+        };
+        if at != scan.valid_end {
+            scan.has_rot = true;
+            scan.rot_sum = rot_sum(scan.rot_sum, scan.valid_end, at);
+        }
+        scan.synced_through = scan.synced_through.max(head.synced_through);
+        scan.row_count = RowCount(scan.row_count.0 + head.row_count.0);
+        let mut highest = scan.highest_place;
+        let walked = walk_rows(rows, at, &head, &mut bytes, |row| {
+            highest = highest.max(row.place);
+            Ok(true)
+        })?;
+        if walked == RowsWalked::Unreadable {
+            scan.has_rot = true;
+            scan.rot_sum = rot_sum(scan.rot_sum, at, FileOffset(at.0 + head.total_length.0));
+        }
+        scan.highest_place = highest;
+        scan.valid_end = FileOffset(at.0 + head.total_length.0);
+    }
+    // a torn end is bytes that read and fail their check, so a device error past the last good group is rot
+    if scan.valid_end.0 < length.0 && has_bad_sector(rows, scan.valid_end, length)? {
+        scan.has_rot = true;
+        scan.rot_sum = rot_sum(scan.rot_sum, scan.valid_end, FileOffset(length.0));
+    }
+    Ok(scan)
+}
+
+/// Check a segment's rows file goes past what its tail lists. A seal that stopped after its tail leaves those bytes in the file
+/// when the segment goes on taking writes, and a power cut that loses what came after can bring them back to the file's end.
+/// The tails sync before the cut for the same reason, and this covers every other way a tail that never finished reads as final
+pub fn is_tail_stale<Backend: Io>(io: &Backend, record_key: RecordKey, listing: &RootListing, head: &TailHead) -> Result<bool> {
+    let rows = io.open_file(&rows_path(&listing.path, head.segment))?;
+    let scanned = scan_rows_of(&rows, record_key);
+    io.close_file(rows);
+    Ok(scanned?.highest_place > head.places.highest)
 }

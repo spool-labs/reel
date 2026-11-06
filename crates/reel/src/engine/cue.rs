@@ -16,7 +16,7 @@ use crate::engine::engine_state::EngineState;
 use crate::engine::read_path::RecordWant;
 use crate::engine::scan_state::{from_key, in_range, under_prefix};
 use crate::engine::store_scan::StoreScan;
-use crate::io::Io;
+use crate::io::{InPlace, Io, in_place};
 
 /// The most cues a store holds at once. A get_many holds a slot while it reads, so callers inside one count toward this
 pub const MOST_CUES: usize = 64;
@@ -206,7 +206,7 @@ impl<Backend: Io> Cue<Backend> {
         let handovers = self.state.volumes[info.volume.0 as usize].handover_count();
         values.clear();
         let mut scratch = values.take_scratch();
-        let read = self.state.read_keys(column, keys, self.point, handovers, values, &mut scratch);
+        let read = in_place(self.state.read_keys(&InPlace, column, keys, self.point, handovers, values, &mut scratch));
         values.put_scratch(scratch);
         self.state.corruption_errors.fetch_add(values.corrupt_count(), Ordering::Relaxed);
         read
@@ -276,7 +276,7 @@ impl<Backend: Io> Cue<Backend> {
         let info = self.state.column(column)?;
         let handovers = self.state.volumes[info.volume.0 as usize].handover_count();
         let read = self.state.key_read(column, key, self.point, true)?;
-        self.state.counted(self.state.get_at(&read, handovers, want, buf))
+        self.state.counted(in_place(self.state.get_at(&InPlace, &read, handovers, want, buf)))
     }
 }
 

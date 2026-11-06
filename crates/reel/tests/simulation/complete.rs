@@ -16,7 +16,7 @@ use reel::engine::rewrite_job::RewritePhase;
 use reel::engine::walk_job::WalkJob;
 use reel::guard::hold;
 use reel::index::complete_table::{COMPLETE_SHARDS, CompleteSlot, MOST_TAG_SLOTS, TagMatches, shard_of, tag_of};
-use reel::io::{Io, IoFile};
+use reel::io::{InPlace, Io, IoFile, in_place};
 use reel::index::key_hash::hash_key;
 use reel::record::codec::Codec;
 use reel::segment::segment_tail::SegmentNumber;
@@ -696,7 +696,7 @@ fn read_behind_a_stale_mark() {
     assert!(slots_of(&store, b"key").iter().any(CompleteSlot::is_stale));
 
     let mut value = Vec::new();
-    let answer = store.state.answer_latest(&latest, RecordWant::Whole, &mut value).expect("no job crossed it");
+    let answer = in_place(store.state.answer_latest(&InPlace, &latest, RecordWant::Whole, &mut value)).expect("no job crossed it");
     assert!(answer.expect("get"));
     assert_eq!(value, b"first");
     store.close().expect("close");

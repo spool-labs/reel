@@ -15,7 +15,7 @@ use reel::engine::reel_store::ReelStore;
 use reel::engine::walk_job::WALK_RETRY;
 use reel::engine::volume::MOST_PARKED;
 use reel::guard::hold;
-use reel::io::Io;
+use reel::io::{InPlace, Io, in_place};
 use reel::record::codec::Codec;
 use reel::segment::damage_list::DamagedRange;
 use reel::segment::segment_tail::SegmentNumber;
@@ -247,7 +247,7 @@ fn get_crossed() {
     assert!(!store.state.volumes[0].table.holds(older));
 
     let mut buf = Vec::new();
-    assert!(store.state.answer_latest(&latest, RecordWant::Whole, &mut buf).is_none());
+    assert!(in_place(store.state.answer_latest(&InPlace, &latest, RecordWant::Whole, &mut buf)).is_none());
     assert_eq!(read(&store), Some(b"newer".to_vec()));
     store.close().expect("close");
 }
@@ -284,7 +284,7 @@ fn many_crossed() {
 
     let mut values = ValueList::new();
     let mut scratch = Vec::new();
-    assert!(state.answer_many(&many, COLUMN, &[b"key"], &mut values, &mut scratch).is_none());
+    assert!(in_place(state.answer_many(&InPlace, &many, COLUMN, &[b"key"], &mut values, &mut scratch)).is_none());
     for slot in slots {
         state.cues.release(slot);
     }
@@ -307,7 +307,7 @@ fn many_pinned() {
 
     let mut values = ValueList::new();
     let mut scratch = Vec::new();
-    let answer = state.answer_many(&many, COLUMN, &[b"key"], &mut values, &mut scratch).expect("an answer");
+    let answer = in_place(state.answer_many(&InPlace, &many, COLUMN, &[b"key"], &mut values, &mut scratch)).expect("an answer");
     answer.expect("read");
     assert_eq!(values.answer(0), Some(ValueAnswer::Found(b"older")));
     settle(&io);

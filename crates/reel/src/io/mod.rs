@@ -7,8 +7,11 @@ pub mod plain;
 pub mod plain_file;
 pub mod plain_task;
 
+use std::future::{Future, ready};
 use std::io::{IoSlice, IoSliceMut, Result};
 use std::path::{Path, PathBuf};
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
 
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds};
 
@@ -43,6 +46,40 @@ pub trait IoFile: Clone + Send + Sync {
 
     /// Cut the file back to a length
     fn truncate(&self, length: ByteCount) -> Result<()>;
+}
+
+/// How a read waits for its device, so one read path serves the blocking calls and the completion ring
+pub trait DeviceReads<File>: Sync {
+    /// Fill the whole buffer from the offset
+    fn read_exact(&self, file: &File, offset: FileOffset, buf: &mut [u8]) -> impl Future<Output = Result<()>> + Send;
+
+    /// Fill every part from the offset
+    fn read_parts(&self, file: &File, offset: FileOffset, parts: &mut [IoSliceMut<'_>]) -> impl Future<Output = Result<()>> + Send;
+}
+
+/// Reads that block the calling thread, so every one is done by its first poll
+#[derive(Clone, Copy, Debug)]
+pub struct InPlace;
+
+impl<File: IoFile> DeviceReads<File> for InPlace {
+    fn read_exact(&self, file: &File, offset: FileOffset, buf: &mut [u8]) -> impl Future<Output = Result<()>> + Send {
+        ready(file.read_exact_at(offset, buf))
+    }
+
+    fn read_parts(&self, file: &File, offset: FileOffset, parts: &mut [IoSliceMut<'_>]) -> impl Future<Output = Result<()>> + Send {
+        ready(file.read_parts_at(offset, parts))
+    }
+}
+
+/// Run a read on this thread, for a read path whose device reads finish where they stand
+pub fn in_place<Output>(read: impl Future<Output = Output>) -> Output {
+    let mut read = pin!(read);
+    let mut context = Context::from_waker(Waker::noop());
+    loop {
+        if let Poll::Ready(output) = read.as_mut().poll(&mut context) {
+            return output;
+        }
+    }
 }
 
 /// A background job's handle

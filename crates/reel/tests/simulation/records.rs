@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use reel_sim::file_image::BitMask;
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_io::SimulatedIo;
-use reel::io::{Io, IoFile};
+use reel::io::{InPlace, Io, IoFile, in_place};
 use reel::record::chunk_table::{ChunkEntry, ENTRIES_PER_PAGE};
 use reel::record::codec::{CHUNK_BYTES, Codec};
 use reel::record::record_check::{Checksum, RecordIdentity, RecordKey, checksum};
@@ -98,9 +98,7 @@ fn read_declared(stored: &Stored, who: &RecordIdentity, declared: Codec) -> (Rec
     let file = open(stored);
     let mut reader = RecordReader::new();
     let mut buf = Vec::new();
-    let read = reader
-        .read_value(&file, stored.location, who, declared, &mut buf)
-        .expect("read");
+    let read = in_place(reader.read_value(&InPlace, &file, stored.location, who, declared, &mut buf)).expect("read");
     (read, buf)
 }
 
@@ -108,9 +106,7 @@ fn read_window(stored: &Stored, window: ValueWindow) -> (RecordRead, Vec<u8>) {
     let file = open(stored);
     let mut reader = RecordReader::new();
     let mut buf = Vec::new();
-    let read = reader
-        .read_window(&file, stored.location, &identity(), window, &mut buf)
-        .expect("read");
+    let read = in_place(reader.read_window(&InPlace, &file, stored.location, &identity(), window, &mut buf)).expect("read");
     (read, buf)
 }
 
@@ -238,9 +234,7 @@ fn window_cost() {
         let mut buf = Vec::new();
         let (reads_before, bytes_before) = stored.io.read_totals();
 
-        let read = reader
-            .read_window(&file, stored.location, &identity(), window(5 * CHUNK_BYTES + 10, 4_096), &mut buf)
-            .expect("read");
+        let read = in_place(reader.read_window(&InPlace, &file, stored.location, &identity(), window(5 * CHUNK_BYTES + 10, 4_096), &mut buf)).expect("read");
 
         let (reads_after, bytes_after) = stored.io.read_totals();
         assert_eq!(read, RecordRead::Valid);

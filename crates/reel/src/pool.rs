@@ -2,7 +2,8 @@
 
 use std::collections::VecDeque;
 use std::hint::black_box;
-use std::mem::MaybeUninit;
+use std::mem::{self, MaybeUninit};
+use std::ops::{Deref, DerefMut};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
@@ -29,6 +30,46 @@ pub struct PoolState<Item> {
     free: Vec<Item>,
     next_ticket: u64,
     serving: u64,
+}
+
+/// An item with no buffers, which a lease leaves in its place as it hands the real one back
+pub trait HollowItem {
+    /// Build an item that holds nothing
+    fn hollow() -> Self;
+}
+
+/// An item out of a pool, which goes back however its holder ends, a dropped read included
+#[derive(Debug)]
+pub struct PoolLease<'pool, Item: HollowItem> {
+    pool: &'pool Pool<Item>,
+    item: Item,
+}
+
+impl<Item: HollowItem> Deref for PoolLease<'_, Item> {
+    type Target = Item;
+
+    fn deref(&self) -> &Item {
+        &self.item
+    }
+}
+
+impl<Item: HollowItem> DerefMut for PoolLease<'_, Item> {
+    fn deref_mut(&mut self) -> &mut Item {
+        &mut self.item
+    }
+}
+
+impl<Item: HollowItem> Drop for PoolLease<'_, Item> {
+    fn drop(&mut self) {
+        self.pool.give_back(mem::replace(&mut self.item, Item::hollow()));
+    }
+}
+
+impl<Item: HollowItem> Pool<Item> {
+    /// Take a free item for as long as the lease lives, waiting in line when all are out
+    pub fn lease(&self) -> PoolLease<'_, Item> {
+        PoolLease { pool: self, item: self.take() }
+    }
 }
 
 impl<Item> PoolState<Item> {

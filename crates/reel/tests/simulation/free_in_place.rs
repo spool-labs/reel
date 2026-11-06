@@ -12,6 +12,7 @@ use reel::engine::reel_store::ReelStore;
 use reel::engine::rewrite_job::freed_in_place;
 use reel::engine::walk_job::{FREE_BLOCK_BYTES, FREE_IN_PLACE_BYTES, FreeRecord, MOST_BLOCK_FREES};
 use reel::guard::hold;
+use reel::io::{InPlace, in_place};
 use reel::record::codec::Codec;
 use reel::segment::segment_tail::SegmentNumber;
 use reel_api::column_id::ColumnId;
@@ -205,7 +206,7 @@ fn read_crossed() {
 
     let mut buf = Vec::new();
     let want = RecordWant::Whole;
-    assert!(store.state.answer_latest(&latest, want, &mut buf).is_none());
+    assert!(in_place(store.state.answer_latest(&InPlace, &latest, want, &mut buf)).is_none());
     assert_eq!(read(&store, b"key"), Some(large(2)));
     store.close().expect("close");
 }
@@ -230,7 +231,7 @@ fn read_outlives_frees() {
     assert!(store.state.cues.counts().frees >= latest.counts.frees + HELD_RECORDS);
 
     let mut buf = Vec::new();
-    let answer = store.state.answer_latest(&latest, RecordWant::Whole, &mut buf).expect("an answer");
+    let answer = in_place(store.state.answer_latest(&InPlace, &latest, RecordWant::Whole, &mut buf)).expect("an answer");
     assert!(answer.expect("get"));
     assert_eq!(buf, large(3));
     store.close().expect("close");
@@ -247,12 +248,12 @@ fn pin_holds_a_free() {
     seal(&store, &io);
 
     let mut buf = Vec::new();
-    let found = state.answer_pinned(COLUMN, b"key", |read, handovers| {
-        store.put(COLUMN, b"key", &large(2)).expect("put");
-        seal(&store, &io);
-        assert_eq!(state.volumes[0].bytes_freed.load(Ordering::Acquire), 0);
-        state.get_at(read, handovers, RecordWant::Whole, &mut buf)
-    });
+    let (read, handovers, held) = state.pinned_read(COLUMN, b"key").expect("pin");
+    store.put(COLUMN, b"key", &large(2)).expect("put");
+    seal(&store, &io);
+    assert_eq!(state.volumes[0].bytes_freed.load(Ordering::Acquire), 0);
+    let found = in_place(state.get_at(&InPlace, &read, handovers, RecordWant::Whole, &mut buf));
+    drop(held);
     assert!(found.expect("get"));
     assert_eq!(buf, large(1));
 
@@ -293,7 +294,7 @@ fn no_pin_to_give() {
     store.put(COLUMN, b"key", &large(1)).expect("put");
     let slots: Vec<usize> = (0..MOST_CUES).map(|_slot| state.cues.take(WritePlace(u64::MAX - 1)).expect("a slot")).collect();
 
-    assert!(state.answer_pinned(COLUMN, b"key", |_read, _handovers| Ok(())).is_err());
+    assert!(state.pinned_read(COLUMN, b"key").is_err());
     assert_eq!(state.cues.refused_reads(), 1);
 
     assert_eq!(read(&store, b"key"), Some(large(1)));
@@ -324,7 +325,7 @@ fn many_crossed_by_a_free() {
 
     let mut values = ValueList::new();
     let mut scratch = Vec::new();
-    assert!(state.answer_many(&many, COLUMN, &[b"key"], &mut values, &mut scratch).is_none());
+    assert!(in_place(state.answer_many(&InPlace, &many, COLUMN, &[b"key"], &mut values, &mut scratch)).is_none());
     for slot in slots {
         state.cues.release(slot);
     }

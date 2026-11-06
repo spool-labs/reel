@@ -4,10 +4,10 @@ use std::io::Result;
 
 use reel_api::units::{ByteCount, FileOffset, WritePlace};
 
-use crate::pool::{touched_capacity, touched_zeroes};
+use crate::pool::{HollowItem, touched_capacity, touched_zeroes};
 use crate::index::key_hash::KeyHash;
-use crate::io::IoFile;
-use crate::io::device_error::read_or_damaged;
+use crate::io::{DeviceReads, InPlace, IoFile, in_place};
+use crate::io::device_error::{read_or_damaged, read_or_damaged_on};
 use crate::record::record_check::{Checksum, RecordKey, checksum};
 use crate::segment::column_directory::Candidate;
 use crate::segment::block_cache::{BlockCache, BlockKey};
@@ -93,6 +93,8 @@ pub struct FooterReader {
     key: Vec<u8>,
     pub candidates: Vec<Candidate>,
     pub found_block: u32,
+    /// Segments the last directory walk asked
+    pub asked: u64,
 }
 
 impl FooterReader {
@@ -105,6 +107,7 @@ impl FooterReader {
             key: touched_capacity(ROW_BLOCK_BYTES, 0),
             candidates: touched_capacity(CANDIDATE_PAGE, Candidate::default()),
             found_block: 0,
+            asked: 0,
         }
     }
 
@@ -233,7 +236,7 @@ impl FooterReader {
                 continue;
             }
 
-            match self.search_block(file, entry, index.place_base, query)? {
+            match in_place(self.search_block(&InPlace, file, entry, index.place_base, query))? {
                 FooterAnswer::Absent => {},
                 answer => return Ok(answer),
             }
@@ -279,12 +282,13 @@ impl FooterReader {
     }
 
     /// Search one window of block lines, through the caches
-    pub fn lookup_window<File: IoFile>(
+    pub async fn lookup_window<File: IoFile>(
         &mut self,
+        device: &impl DeviceReads<File>,
         file: &File,
-        read: &WindowRead,
-        caches: &FooterCaches,
-        query: &FooterQuery,
+        read: &WindowRead<'_>,
+        caches: &FooterCaches<'_>,
+        query: &FooterQuery<'_>,
     ) -> Result<FooterAnswer> {
         for position in 0..read.window.count {
             let entry = read.window.entries[position];
@@ -292,13 +296,13 @@ impl FooterReader {
                 Some(next) if position + 1 < read.window.count => next.header_at().0,
                 _last_line => read.window.filter_end_of_last,
             };
-            match self.probe_filter(file, read.segment, &entry, filter_end, caches, query)? {
+            match self.probe_filter(device, file, read.segment, &entry, filter_end, caches, query).await? {
                 FilterAnswer::Damaged => return Ok(FooterAnswer::Damaged),
                 FilterAnswer::No => continue,
                 FilterAnswer::Maybe => {},
             }
 
-            match self.search_cached(file, (read.segment, read.place_base), &entry, caches, query)? {
+            match self.search_cached(device, file, (read.segment, read.place_base), &entry, caches, query).await? {
                 FooterAnswer::Absent => {},
                 answer => {
                     self.found_block = entry.block_offset;
@@ -310,14 +314,15 @@ impl FooterReader {
     }
 
     /// Ask a block's filter, reading and checking it once when the cache lacks it
-    pub fn probe_filter<File: IoFile>(
+    pub async fn probe_filter<File: IoFile>(
         &mut self,
+        device: &impl DeviceReads<File>,
         file: &File,
         segment: SegmentNumber,
         entry: &BlockEntry,
         filter_end: u64,
-        caches: &FooterCaches,
-        query: &FooterQuery,
+        caches: &FooterCaches<'_>,
+        query: &FooterQuery<'_>,
     ) -> Result<FilterAnswer> {
         let key = BlockKey {
             segment,
@@ -333,7 +338,7 @@ impl FooterReader {
             return Ok(FilterAnswer::Damaged);
         }
         let at = FileOffset(u64::from(entry.filter_offset));
-        file.read_exact_at(at, &mut self.filter[..length])?;
+        device.read_exact(file, at, &mut self.filter[..length]).await?;
         let Some(bits) = open_filter(&self.filter[..length]) else {
             return Ok(FilterAnswer::Damaged);
         };
@@ -342,15 +347,16 @@ impl FooterReader {
     }
 
     /// Read and check a row block and keep it in the cache, or return nothing when it fails its check
-    pub fn load_block<File: IoFile>(
+    pub async fn load_block<File: IoFile>(
         &mut self,
+        device: &impl DeviceReads<File>,
         file: &File,
         key: BlockKey,
         entry: &BlockEntry,
         rows: &BlockCache,
     ) -> Result<Option<&[u8]>> {
         let length = entry.block_length().0 as usize;
-        if length > self.block.len() || !read_or_damaged(file, entry.block_at(), &mut self.block[..length])? {
+        if length > self.block.len() || !read_or_damaged_on(device, file, entry.block_at(), &mut self.block[..length]).await? {
             return Ok(None);
         }
         if RowBlockWalk::open(&self.block[..length], WritePlace(0)).is_none() {
@@ -361,13 +367,14 @@ impl FooterReader {
     }
 
     /// Search a row block, reading and checking it once when the cache lacks it
-    pub fn search_cached<File: IoFile>(
+    pub async fn search_cached<File: IoFile>(
         &mut self,
+        device: &impl DeviceReads<File>,
         file: &File,
         (segment, place_base): (SegmentNumber, WritePlace),
         entry: &BlockEntry,
-        caches: &FooterCaches,
-        query: &FooterQuery,
+        caches: &FooterCaches<'_>,
+        query: &FooterQuery<'_>,
     ) -> Result<FooterAnswer> {
         let key = BlockKey {
             segment,
@@ -379,7 +386,7 @@ impl FooterReader {
             return Ok(answer);
         }
 
-        let answer = self.search_block(file, entry, place_base, query)?;
+        let answer = self.search_block(device, file, entry, place_base, query).await?;
         if answer != FooterAnswer::Damaged {
             caches.rows.insert(key, &self.block[..entry.block_length().0 as usize]);
         }
@@ -387,18 +394,19 @@ impl FooterReader {
     }
 
     /// Read one row block and find the key's newest row at a read point
-    pub fn search_block<File: IoFile>(
+    pub async fn search_block<File: IoFile>(
         &mut self,
+        device: &impl DeviceReads<File>,
         file: &File,
         entry: &BlockEntry,
         place_base: WritePlace,
-        query: &FooterQuery,
+        query: &FooterQuery<'_>,
     ) -> Result<FooterAnswer> {
         let length = entry.block_length().0 as usize;
         if length > self.block.len() {
             return Ok(FooterAnswer::Damaged);
         }
-        file.read_exact_at(entry.block_at(), &mut self.block[..length])?;
+        device.read_exact(file, entry.block_at(), &mut self.block[..length]).await?;
 
         let Some(mut walk) = RowBlockWalk::open(&self.block[..length], place_base) else {
             return Ok(FooterAnswer::Damaged);
@@ -414,7 +422,7 @@ impl Default for FooterReader {
 }
 
 /// Find a key's newest row at a read point in a block already checked
-pub fn search_rows(block: &[u8], place_base: WritePlace, query: &FooterQuery, key: &mut Vec<u8>) -> FooterAnswer {
+pub fn search_rows(block: &[u8], place_base: WritePlace, query: &FooterQuery<'_>, key: &mut Vec<u8>) -> FooterAnswer {
     let Some(mut walk) = RowBlockWalk::open_checked(block, place_base) else {
         return FooterAnswer::Damaged;
     };
@@ -422,7 +430,7 @@ pub fn search_rows(block: &[u8], place_base: WritePlace, query: &FooterQuery, ke
 }
 
 /// Walk from a seek to the key's newest row at a read point
-pub fn newest_at(walk: &mut RowBlockWalk, query: &FooterQuery, key: &mut Vec<u8>) -> FooterAnswer {
+pub fn newest_at(walk: &mut RowBlockWalk, query: &FooterQuery<'_>, key: &mut Vec<u8>) -> FooterAnswer {
     let Some(mut row) = walk.seek(query.key, key) else {
         return FooterAnswer::Absent;
     };
@@ -445,4 +453,18 @@ pub fn newest_at(walk: &mut RowBlockWalk, query: &FooterQuery, key: &mut Vec<u8>
 pub fn first_candidate(entries: &[BlockEntry], prefix: KeyPrefix) -> usize {
     let after = entries.partition_point(|entry| entry.first_key < prefix);
     after.saturating_sub(1)
+}
+
+impl HollowItem for FooterReader {
+    fn hollow() -> Self {
+        Self {
+            tail: Vec::new(),
+            block: Vec::new(),
+            filter: Vec::new(),
+            key: Vec::new(),
+            candidates: Vec::new(),
+            found_block: 0,
+            asked: 0,
+        }
+    }
 }

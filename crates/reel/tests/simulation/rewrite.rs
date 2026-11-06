@@ -1,24 +1,26 @@
 //! Rewrite: a half-dead segment becomes a new one with only what a read can reach, through any crash
 
-use std::io::IoSlice;
+use std::future::{Future, ready};
+use std::io::{IoSlice, IoSliceMut};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::compact_job::{CompactJob, park};
 use reel::engine::cue::{Cue, CueTable};
 use reel::engine::open_segment::{OUTPUT_SUFFIX, data_path};
-use reel::engine::read_path::RecordWant;
+use reel::engine::read_path::{RecordWant, WalkAsk};
 use reel::engine::planner::Planner;
 use reel::engine::reel_store::ReelStore;
 use reel::engine::rewrite_job::{MERGE_BUFFER_BYTES, MOST_OVERLAP, MOST_PARK_WAITS, RewritePhase, is_overlap_input, overlaps};
 use reel::engine::volume::{MOST_PARKED, NO_SEAL};
 use reel::engine::walk_job::WalkJob;
 use reel::guard::hold;
-use reel::io::{Io, IoFile};
+use reel::io::{DeviceReads, InPlace, Io, IoFile, in_place};
 use reel::io::job::Job;
 use reel::record::codec::Codec;
+use reel::segment::column_directory::ColumnDirectory;
 use reel::segment::damage_list::DamagedRange;
 use reel::segment::footer_reader::FooterReader;
 use reel::segment::footer_writer::FooterWriter;
@@ -28,6 +30,7 @@ use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RootId, VolumeId, WritePlace};
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_disk::OperationCount;
+use reel_sim::simulated_file::SimulatedFile;
 use reel_sim::simulated_io::SimulatedIo;
 
 const ROOT: &str = "/disk/rewrite";
@@ -417,21 +420,22 @@ fn search_sees_new_list() {
     let io = SimulatedIo::new(Seed(9));
     let store = open(&io);
     store.put(COLUMN, b"a", b"value").expect("put");
+    store.put(COLUMN, b"c", b"value").expect("put");
     seal(&store, &io);
+    // a fresh open has no filter cached, so the first ask reads the device
+    store.close().expect("close");
+    drop(store);
+    let store = open(&io);
 
     let state = &store.state;
     let directory = state.directories[COLUMN.0 as usize].as_ref().expect("a directory");
     let mut reader = FooterReader::new();
-    let mut asks = 0;
-    let walked = state.walk_candidates(directory, b"a", &mut reader, |_segment, _reader, _best| {
-        asks += 1;
-        if asks == 1 {
-            directory.replace(None, &[SegmentNumber(u64::MAX)]);
-        }
-        Ok(())
-    });
+    let device = ChangesList { directory, has_changed: AtomicBool::new(false) };
+    // a key the segment lacks finds no row to stop the second look
+    let read = state.key_read_now(COLUMN, b"b").expect("read");
+    let walked = in_place(state.walk_candidates(&device, &state.volumes[0], directory, &read, &mut reader, WalkAsk::EVERY));
     walked.expect("walk");
-    assert_eq!(asks, 2);
+    assert_eq!(reader.asked, 2);
     store.close().expect("close");
 }
 
@@ -467,7 +471,7 @@ fn get_crossed() {
     settle(&io);
     assert!(!store.state.volumes[0].table.holds(older));
     let mut buf = Vec::new();
-    assert!(store.state.answer_latest(&latest, RecordWant::Whole, &mut buf).is_none());
+    assert!(in_place(store.state.answer_latest(&InPlace, &latest, RecordWant::Whole, &mut buf)).is_none());
     check_reads(&store);
     store.close().expect("close");
 }
@@ -1626,14 +1630,9 @@ fn newest_first_stops() {
     let volume = &state.volumes[0];
     let directory = state.directories[COLUMN.0 as usize].as_ref().expect("a directory");
     let read = state.key_read_now(COLUMN, b"m-shared").expect("read");
-    let mut asked = 0;
-    let found = state.footer_readers.with(|reader| {
-        state.walk_candidates(directory, b"m-shared", reader, |segment, reader, best| {
-            asked += 1;
-            state.ask_segment(volume, &read, segment, reader, best)
-        })
-    });
-    assert_eq!(asked, 1);
+    let mut reader = state.footer_readers.lease();
+    let found = in_place(state.walk_candidates(&InPlace, volume, directory, &read, &mut reader, WalkAsk::EVERY));
+    assert_eq!(reader.asked, 1);
     assert!(found.expect("a read").is_some());
     store.close().expect("close");
 }
@@ -1794,7 +1793,7 @@ fn newest_past_an_older_segment() {
     // the spot cache would answer a plain get, so this asks the footers
     let state = &store.state;
     let read = state.key_read_now(COLUMN, b"m").expect("read");
-    let found = state.search_footers(&state.volumes[0], &read).expect("search").expect("a row");
+    let found = in_place(state.search_footers(&InPlace, &state.volumes[0], &read)).expect("search").expect("a row");
     assert_eq!(found.segment, newest);
     store.close().expect("close");
 }
@@ -1978,7 +1977,7 @@ fn read_between_a_set_and_its_inputs() {
             for number in 0..SET_KEYS {
                 let key = set_key(number);
                 let read = state.key_read_now(COLUMN, &key).expect("read");
-                assert!(state.search_footers(&state.volumes[0], &read).expect("search").is_some(), "key {number}");
+                assert!(in_place(state.search_footers(&InPlace, &state.volumes[0], &read)).expect("search").is_some(), "key {number}");
             }
         })
         .expect("install");
@@ -2312,7 +2311,7 @@ fn rewrite_keeps_offset_order() {
     let offset_of = |number: u64| {
         let key = format!("key-{number:04}");
         let read = store.state.key_read(COLUMN, key.as_bytes(), WritePlace(u64::MAX), false).expect("read");
-        store.state.search_footers(volume, &read).expect("search").expect("a row").row.offset
+        in_place(store.state.search_footers(&InPlace, volume, &read)).expect("search").expect("a row").row.offset
     };
     let kept: Vec<u64> = (3..IDLE_KEYS).step_by(4).collect();
     for pair in kept.windows(2) {
@@ -2345,4 +2344,30 @@ fn stripe_narrows_when_full() {
         assert_eq!(read(&store, format!("key-{number:06}").as_bytes()).as_deref(), Some(expected), "key {number}");
     }
     store.close().expect("close");
+}
+
+/// A device that publishes a new list at a walk's first read, as a seal landing under it would
+struct ChangesList<'list> {
+    directory: &'list ColumnDirectory,
+    has_changed: AtomicBool,
+}
+
+impl ChangesList<'_> {
+    fn change(&self) {
+        if !self.has_changed.swap(true, Ordering::AcqRel) {
+            self.directory.replace(None, &[SegmentNumber(u64::MAX)]);
+        }
+    }
+}
+
+impl DeviceReads<SimulatedFile> for ChangesList<'_> {
+    fn read_exact(&self, file: &SimulatedFile, offset: FileOffset, buf: &mut [u8]) -> impl Future<Output = std::io::Result<()>> + Send {
+        self.change();
+        ready(file.read_exact_at(offset, buf))
+    }
+
+    fn read_parts(&self, file: &SimulatedFile, offset: FileOffset, parts: &mut [IoSliceMut<'_>]) -> impl Future<Output = std::io::Result<()>> + Send {
+        self.change();
+        ready(file.read_parts_at(offset, parts))
+    }
 }

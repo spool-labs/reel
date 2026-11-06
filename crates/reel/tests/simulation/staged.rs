@@ -23,7 +23,7 @@ use reel_sim::seeded_random::{Seed, SeededRandom};
 use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_io::SimulatedIo;
 use reel_sim::simulated_task::JobIndex;
-use reel::io::{Io, IoFile};
+use reel::io::{InPlace, Io, IoFile, in_place};
 use reel::record::codec::Codec;
 use reel::record::record_check::{RecordIdentity, RecordKey};
 use reel::record::record_encoder::RecordEncoder;
@@ -610,7 +610,7 @@ fn reused_slot() {
 
     let read_key: KeyRead = state.key_read(COLUMN, b"key", point, false).expect("key");
     let mut buf = Vec::new();
-    let is_read = state.read_open(&read_key, &row, RecordWant::Whole, &mut buf).expect("no corruption");
+    let is_read = in_place(state.read_open(&InPlace, &read_key, &row, RecordWant::Whole, &mut buf)).expect("no corruption");
 
     assert!(!is_read);
     assert_eq!(read(&store, b"key"), Some(b"value".to_vec()));
@@ -883,12 +883,12 @@ fn finish_get(state: &State, get: &StagedGet) -> Option<Vec<u8>> {
         if row.kind != RowKind::Value {
             return None;
         }
-        if state.read_open(&read, &row, RecordWant::Whole, &mut buf).expect("read") {
+        if in_place(state.read_open(&InPlace, &read, &row, RecordWant::Whole, &mut buf)).expect("read") {
             return Some(buf);
         }
     }
 
-    match state.get_at(&read, get.handovers, RecordWant::Whole, &mut buf).expect("get") {
+    match in_place(state.get_at(&InPlace, &read, get.handovers, RecordWant::Whole, &mut buf)).expect("get") {
         true => Some(buf),
         false => None,
     }

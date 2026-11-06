@@ -22,7 +22,7 @@ use crate::engine::scan_path::ScanWant;
 use crate::engine::scan_state::ScanState;
 use crate::guard::hold;
 use crate::io::job::{Job, JobStep};
-use crate::io::{Io, IoTask};
+use crate::io::{InPlace, Io, IoTask, in_place};
 use crate::pool::{touched_capacity, touched_queue};
 
 /// Async reads in flight at once
@@ -410,7 +410,7 @@ impl<Backend: Io> EngineState<Backend> {
                 let mut scratch = values.take_scratch();
                 let (mut start, mut answer) = (0, Ok(()));
                 for end in ends {
-                    answer = answer.and_then(|()| self.read_keys(*column, &[&keys[start..*end]], *point, *handovers, values, &mut scratch));
+                    answer = answer.and_then(|()| in_place(self.read_keys(&InPlace, *column, &[&keys[start..*end]], *point, *handovers, values, &mut scratch)));
                     start = *end;
                 }
                 values.put_scratch(scratch);
@@ -435,7 +435,7 @@ impl<Backend: Io> EngineState<Backend> {
         };
         let info = self.column(column)?;
         let handovers = self.volumes[info.volume.0 as usize].handover_count();
-        self.get_at(&self.key_read(column, key, point, true)?, handovers, want, value)
+        in_place(self.get_at(&InPlace, &self.key_read(column, key, point, true)?, handovers, want, value))
     }
 
     /// Fill a list with the next block of a scan's keys, and say whether the walk has more

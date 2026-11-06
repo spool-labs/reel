@@ -8,13 +8,13 @@ use reel_api::store_error::StoreError;
 use reel_api::units::WritePlace;
 
 use crate::engine::engine_state::EngineState;
-use crate::engine::read_path::{KeyRead, SealedRow, corruption};
+use crate::engine::read_path::{KeyRead, SealedRow, WalkAsk, corruption};
 use crate::engine::recovery::{whole_columns, widen_row};
 use crate::engine::volume::Volume;
 use crate::guard::hold;
 use crate::index::complete_table::{CompleteSlot, CompleteTable, TagMatches};
 use crate::index::key_hash::hash_key;
-use crate::io::Io;
+use crate::io::{DeviceReads, InPlace, Io, in_place};
 use crate::io::device_error::is_device_error;
 use crate::row_kind::RowKind;
 use crate::segment::block_cache::BlockKey;
@@ -34,54 +34,57 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Find a key's newest sealed row: through the table on a complete column, and through the footers on any other
-    pub fn search_sealed(&self, volume: &Volume<Backend>, read: &KeyRead) -> Result<Option<SealedRow>, StoreError> {
+    pub async fn search_sealed(
+        &self,
+        device: &impl DeviceReads<Backend::File>,
+        volume: &Volume<Backend>,
+        read: &KeyRead<'_>,
+    ) -> Result<Option<SealedRow>, StoreError> {
         match self.complete_table(read.column) {
-            Some(table) => self.search_complete(volume, read, table),
-            None => self.search_footers(volume, read),
+            Some(table) => self.search_complete(device, volume, read, table).await,
+            None => self.search_footers(device, volume, read).await,
         }
     }
 
-    /// Ask each block a key's tag points at and take the highest place, then the footers from the mark on, where rows found no slot
-    pub fn search_complete(
+    /// Ask each block a key's tag points at and take the highest place, then the footers from the mark on, where rows found
+    /// no slot
+    pub async fn search_complete(
         &self,
+        device: &impl DeviceReads<Backend::File>,
         volume: &Volume<Backend>,
-        read: &KeyRead,
+        read: &KeyRead<'_>,
         table: &CompleteTable,
     ) -> Result<Option<SealedRow>, StoreError> {
         let mut matches = TagMatches::new();
         table.find(read.hash, &mut matches);
-        // a stale mark speaks for reads at or above the row that caused it, and a read behind the newest sealed row may not be.
-        // The check comes after the slots, so a mark this read saw has its sealed row counted
+        // a stale mark speaks for reads at or above the row that caused it, and a read behind the newest sealed row may
+        // need what it hides. The check comes after the slots, so a mark this read saw has its sealed row counted
         let is_behind = volume.may_hide_under_sealed(read.read_point);
         // a sticky slot says the footers answer for this tag
         if matches.slots().iter().any(CompleteSlot::is_sticky) {
-            return self.search_footers(volume, read);
+            return self.search_footers(device, volume, read).await;
         }
-        self.footer_readers.with(|reader| {
-            let mut best = None;
-            for slot in matches.slots() {
-                if !slot.is_stale() || is_behind {
-                    self.ask_slot(volume, read, slot, reader, &mut best)?;
-                }
+        let mut reader = self.footer_readers.lease();
+        let mut best = None;
+        for slot in matches.slots() {
+            if !slot.is_stale() || is_behind {
+                self.ask_slot(device, volume, read, slot, &mut reader, &mut best).await?;
             }
-            let (Some(mark), Some(directory)) = (table.mark(), &self.directories[read.column.0 as usize]) else {
-                return Ok(best);
-            };
-            let marked = self.walk_candidates(directory, read.key, reader, |segment, reader, found| {
-                if segment < mark {
-                    return Ok(());
-                }
-                self.ask_segment(volume, read, segment, reader, found)
-            })?;
-            Ok(newest_sealed(best, marked))
-        })
+        }
+        let (Some(mark), Some(directory)) = (table.mark(), &self.directories[read.column.0 as usize]) else {
+            return Ok(best);
+        };
+        let ask = WalkAsk { first: mark, ..WalkAsk::EVERY };
+        let marked = self.walk_candidates(device, volume, directory, read, &mut reader, ask).await?;
+        Ok(newest_sealed(best, marked))
     }
 
     /// Ask one slot's row block for a key. A segment that left took its rows to wherever the key's other slots point
-    pub fn ask_slot(
+    pub async fn ask_slot(
         &self,
+        device: &impl DeviceReads<Backend::File>,
         volume: &Volume<Backend>,
-        read: &KeyRead,
+        read: &KeyRead<'_>,
         slot: &CompleteSlot,
         reader: &mut FooterReader,
         best: &mut Option<SealedRow>,
@@ -102,7 +105,7 @@ impl<Backend: Io> EngineState<Backend> {
             key: read.key,
             read_point: read.read_point,
         };
-        let answer = match reader.search_cached(&pin.file, (segment, pin.head.place_base), &entry, &caches, &query) {
+        let answer = match reader.search_cached(device, &pin.file, (segment, pin.head.place_base), &entry, &caches, &query).await {
             Ok(answer) => answer,
             Err(source) if is_device_error(&source) => FooterAnswer::Damaged,
             Err(source) => {
@@ -128,7 +131,7 @@ impl<Backend: Io> EngineState<Backend> {
     pub fn newest_walked_complete(
         &self,
         volume: &Volume<Backend>,
-        read: &KeyRead,
+        read: &KeyRead<'_>,
         table: &CompleteTable,
         skipped: &[SegmentNumber],
     ) -> Result<Option<SealedRow>, StoreError> {
@@ -141,18 +144,14 @@ impl<Backend: Io> EngineState<Backend> {
             let mut best = None;
             for slot in matches.slots().iter().filter(|slot| !slot.is_stale() && !skipped.contains(&slot.segment_number())) {
                 if volume.table.pin(slot.segment_number()).is_some_and(|pin| pin.is_walked) {
-                    self.ask_slot(volume, read, slot, reader, &mut best)?;
+                    in_place(self.ask_slot(&InPlace, volume, read, slot, reader, &mut best))?;
                 }
             }
             let (Some(mark), Some(directory)) = (table.mark(), &self.directories[read.column.0 as usize]) else {
                 return Ok(best);
             };
-            let marked = self.walk_candidates(directory, read.key, reader, |segment, reader, found| {
-                if segment < mark || skipped.contains(&segment) {
-                    return Ok(());
-                }
-                self.ask_walked(volume, read, segment, reader, found)
-            })?;
+            let ask = WalkAsk { first: mark, skipped, is_finished_only: true };
+            let marked = in_place(self.walk_candidates(&InPlace, volume, directory, read, reader, ask))?;
             Ok(newest_sealed(best, marked))
         })
     }
@@ -223,7 +222,7 @@ impl<Backend: Io> EngineState<Backend> {
                     return Ok(false);
                 };
                 let block_key = BlockKey { segment: number, offset: entry.block_offset };
-                let block = match reader.load_block(&pin.file, block_key, &entry, self.complete_cache.as_ref().unwrap_or(&self.row_cache)) {
+                let block = match in_place(reader.load_block(&InPlace, &pin.file, block_key, &entry, self.complete_cache.as_ref().unwrap_or(&self.row_cache))) {
                     Ok(Some(block)) => block,
                     Ok(None) => return Ok(false),
                     Err(error) if is_device_error(&error) => return Ok(false),

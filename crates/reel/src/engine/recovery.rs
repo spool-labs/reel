@@ -25,7 +25,7 @@ use crate::index::write_row::WriteRow;
 use crate::lifetime::MarkRange;
 use crate::io::job::{Job, JobStep};
 use crate::io::device_error::{SECTOR_BYTES, is_device_error, read_or_damaged};
-use crate::io::{Io, IoFile};
+use crate::io::{InPlace, Io, IoFile, in_place};
 use crate::record::codec::Codec;
 use crate::record::record_check::{Checksum, RecordIdentity, RecordKey, checksum};
 use crate::record::record_head::SMALL_HEAD_BYTES;
@@ -779,7 +779,7 @@ impl<Backend: Io> EngineState<Backend> {
         // the record of a range delete holds its end, stored as written whatever the column does
         let codec = if row.kind == RowKind::RangeDelete { Codec::None } else { info.codec };
         // a row whose record the device can't give back has no whole write behind it
-        let read = records.read_value(data, location, &identity, codec, value);
+        let read = in_place(records.read_value(&InPlace, data, location, &identity, codec, value));
         match read {
             Ok(RecordRead::Valid) => Ok(true),
             Ok(RecordRead::Failed) => Ok(false),

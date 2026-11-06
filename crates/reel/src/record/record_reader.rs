@@ -6,8 +6,8 @@ use std::ops::Range;
 use reel_api::reads::ValueWindow;
 use reel_api::units::{ByteCount, FileOffset};
 
-use crate::pool::touched_zeroes;
-use crate::io::IoFile;
+use crate::pool::{HollowItem, touched_zeroes};
+use crate::io::{DeviceReads, IoFile};
 use crate::record::chunk_table::{
     ChunkCount, ChunkIndex, ChunkSpan, ENTRIES_PER_PAGE, TABLE_PAGE_BYTES, TablePageIndex, chunk_span, page_bytes,
     page_count, page_of, table_bytes,
@@ -87,7 +87,7 @@ impl RecordReader {
     pub fn read_held(
         &mut self,
         record: &[u8],
-        identity: &RecordIdentity,
+        identity: &RecordIdentity<'_>,
         window: Option<ValueWindow>,
         buf: &mut Vec<u8>,
     ) -> RecordRead {
@@ -103,11 +103,12 @@ impl RecordReader {
     }
 
     /// Fill the buffer with the whole value, in one read when the column stores values as written
-    pub fn read_value<File: IoFile>(
+    pub async fn read_value<File: IoFile>(
         &mut self,
+        device: &impl DeviceReads<File>,
         file: &File,
         location: RecordLocation,
-        identity: &RecordIdentity,
+        identity: &RecordIdentity<'_>,
         declared: Codec,
         buf: &mut Vec<u8>,
     ) -> Result<RecordRead> {
@@ -117,7 +118,7 @@ impl RecordReader {
         {
             buf.resize(shape.value_length.0 as usize, 0);
             let mut parts = [IoSliceMut::new(&mut self.first[..shape.front_length]), IoSliceMut::new(buf)];
-            file.read_parts_at(location.offset, &mut parts)?;
+            device.read_parts(file, location.offset, &mut parts).await?;
 
             if let Some(form) = self.form()
                 && form.is_chunked
@@ -129,11 +130,11 @@ impl RecordReader {
                 if head.value_length != shape.value_length {
                     return Ok(RecordRead::Failed);
                 }
-                return self.check_payload(file, location, &head, buf);
+                return self.check_payload(device, file, location, &head, buf).await;
             }
         }
 
-        let length = self.read_front(file, location)?;
+        let length = self.read_front(device, file, location).await?;
         let Some(form) = self.form() else {
             return Ok(RecordRead::Failed);
         };
@@ -145,25 +146,26 @@ impl RecordReader {
             return Ok(RecordRead::Failed);
         };
         if head.codec == Codec::None {
-            return self.read_payload(file, location, &head, buf);
+            return self.read_payload(device, file, location, &head, buf).await;
         }
         let window = ValueWindow {
             offset: ByteCount(0),
             length: head.value_length,
         };
-        self.read_chunks(file, location, &head, window, buf)
+        self.read_chunks(device, file, location, &head, window, buf).await
     }
 
     /// Fill the buffer with a window of the value, cut at the value's end
-    pub fn read_window<File: IoFile>(
+    pub async fn read_window<File: IoFile>(
         &mut self,
+        device: &impl DeviceReads<File>,
         file: &File,
         location: RecordLocation,
-        identity: &RecordIdentity,
+        identity: &RecordIdentity<'_>,
         window: ValueWindow,
         buf: &mut Vec<u8>,
     ) -> Result<RecordRead> {
-        let length = self.read_front(file, location)?;
+        let length = self.read_front(device, file, location).await?;
         let Some(form) = self.form() else {
             return Ok(RecordRead::Failed);
         };
@@ -176,13 +178,13 @@ impl RecordReader {
         let Some(head) = self.check_chunked(form, length, identity) else {
             return Ok(RecordRead::Failed);
         };
-        self.read_chunks(file, location, &head, window, buf)
+        self.read_chunks(device, file, location, &head, window, buf).await
     }
 
     /// Read the head and the first table page, or all of a small record, in one read
-    pub fn read_front<File: IoFile>(&mut self, file: &File, location: RecordLocation) -> Result<usize> {
+    pub async fn read_front<File: IoFile>(&mut self, device: &impl DeviceReads<File>, file: &File, location: RecordLocation) -> Result<usize> {
         let length = (location.length.0 as usize).min(FIRST_READ_BYTES);
-        file.read_exact_at(location.offset, &mut self.first[..length])?;
+        device.read_exact(file, location.offset, &mut self.first[..length]).await?;
         Ok(length)
     }
 
@@ -196,7 +198,7 @@ impl RecordReader {
         &mut self,
         form: RecordForm,
         length: usize,
-        identity: &RecordIdentity,
+        identity: &RecordIdentity<'_>,
         buf: &mut Vec<u8>,
     ) -> RecordRead {
         if length < SMALL_HEAD_BYTES {
@@ -243,8 +245,9 @@ impl RecordReader {
     }
 
     /// Read a value stored as written in one read, past a table the first read couldn't hold
-    pub fn read_payload<File: IoFile>(
+    pub async fn read_payload<File: IoFile>(
         &mut self,
+        device: &impl DeviceReads<File>,
         file: &File,
         location: RecordLocation,
         head: &ChunkedHead,
@@ -252,13 +255,14 @@ impl RecordReader {
     ) -> Result<RecordRead> {
         buf.resize(head.value_length.0 as usize, 0);
         let payload_start = payload_start(head);
-        file.read_exact_at(FileOffset(location.offset.0 + payload_start), buf)?;
-        self.check_payload(file, location, head, buf)
+        device.read_exact(file, FileOffset(location.offset.0 + payload_start), buf).await?;
+        self.check_payload(device, file, location, head, buf).await
     }
 
     /// Check each chunk of a value stored as written where it sits in the buffer
-    pub fn check_payload<File: IoFile>(
+    pub async fn check_payload<File: IoFile>(
         &mut self,
+        device: &impl DeviceReads<File>,
         file: &File,
         location: RecordLocation,
         head: &ChunkedHead,
@@ -267,7 +271,7 @@ impl RecordReader {
         let start = payload_start(head);
         for page in 0..page_count(head.chunks).0 {
             let page = TablePageIndex(page);
-            if !self.load_page(file, location, head, page)? {
+            if !self.load_page(device, file, location, head, page).await? {
                 return Ok(RecordRead::Failed);
             }
 
@@ -287,8 +291,9 @@ impl RecordReader {
     }
 
     /// Fill the buffer from the chunks a window touches
-    pub fn read_chunks<File: IoFile>(
+    pub async fn read_chunks<File: IoFile>(
         &mut self,
+        device: &impl DeviceReads<File>,
         file: &File,
         location: RecordLocation,
         head: &ChunkedHead,
@@ -309,7 +314,7 @@ impl RecordReader {
             let chunk = ChunkIndex(chunk);
             let page = page_of(chunk);
             if loaded_page != Some(page) {
-                if !self.load_page(file, location, head, page)? {
+                if !self.load_page(device, file, location, head, page).await? {
                     return Ok(RecordRead::Failed);
                 }
                 loaded_page = Some(page);
@@ -321,7 +326,7 @@ impl RecordReader {
             let chunk_start = chunk.0 * CHUNK_BYTES as u64;
             let from = start.saturating_sub(chunk_start) as usize;
             let to = (end - chunk_start).min(span.entry.value_length.0) as usize;
-            if !self.read_chunk(file, location, head, &span, from..to, buf)? {
+            if !self.read_chunk(device, file, location, head, &span, from..to, buf).await? {
                 return Ok(RecordRead::Failed);
             }
         }
@@ -329,8 +334,9 @@ impl RecordReader {
     }
 
     /// Bring a table page into the page buffer and check it against the head
-    pub fn load_page<File: IoFile>(
+    pub async fn load_page<File: IoFile>(
         &mut self,
+        device: &impl DeviceReads<File>,
         file: &File,
         location: RecordLocation,
         head: &ChunkedHead,
@@ -347,7 +353,7 @@ impl RecordReader {
             self.page[..length].copy_from_slice(&self.first[start..start + length]);
         } else {
             let offset = FileOffset(location.offset.0 + start as u64);
-            file.read_exact_at(offset, &mut self.page[..length])?;
+            device.read_exact(file, offset, &mut self.page[..length]).await?;
         }
 
         let sum = checksum(&self.page[..length]);
@@ -368,8 +374,9 @@ impl RecordReader {
     }
 
     /// Read one chunk whole, check it, and add its part of the window to the buffer
-    pub fn read_chunk<File: IoFile>(
+    pub async fn read_chunk<File: IoFile>(
         &mut self,
+        device: &impl DeviceReads<File>,
         file: &File,
         location: RecordLocation,
         head: &ChunkedHead,
@@ -383,7 +390,7 @@ impl RecordReader {
         }
 
         let offset = FileOffset(location.offset.0 + span.entry.stored_offset.0);
-        file.read_exact_at(offset, &mut self.chunk[..stored])?;
+        device.read_exact(file, offset, &mut self.chunk[..stored]).await?;
         if checksum(&self.chunk[..stored]) != span.entry.checksum {
             return Ok(false);
         }
@@ -460,4 +467,15 @@ pub fn cut_to_window(buf: &mut Vec<u8>, window: ValueWindow) {
     let end = start.saturating_add(window.length.0 as usize).min(buf.len());
     buf.copy_within(start..end, 0);
     buf.truncate(end - start);
+}
+
+impl HollowItem for RecordReader {
+    fn hollow() -> Self {
+        Self {
+            first: Vec::new(),
+            page: Vec::new(),
+            chunk: Vec::new(),
+            decoded: Vec::new(),
+        }
+    }
 }

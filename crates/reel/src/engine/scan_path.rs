@@ -17,7 +17,7 @@ use crate::engine::scan_state::{BlockTake, MOST_SCANS, NO_GENERATION, ScanRange,
 use crate::engine::volume::Volume;
 use crate::guard::hold;
 use crate::index::write_shard::WalkBound;
-use crate::io::Io;
+use crate::io::{InPlace, Io, in_place};
 use crate::segment::block_cache::BlockKey;
 use crate::segment::block_entry::{BlockEntry, KeyBound, SHARED_HEAD_BYTES};
 use crate::segment::column_directory::ColumnDirectory;
@@ -225,7 +225,7 @@ impl<Backend: Io> EngineState<Backend> {
         let is_pinned = at.fixed_point.is_some();
         let found = self.index.lookup(scan.column, candidate, read.read_point, volume.view());
         let taken = self.take_rows(volume, scan, candidate, read.read_point)?;
-        let sealed = if scan.is_spilled { self.search_sealed(volume, &read)? } else { taken };
+        let sealed = if scan.is_spilled { in_place(self.search_sealed(&InPlace, volume, &read))? } else { taken };
         // a seal moves rows from the index to a segment this walk hasn't seated, and both of its looks must see one list
         let is_same_list = at.directory.is_none_or(|directory| directory.generation() == at.generation);
         if !is_same_list {
@@ -277,8 +277,8 @@ impl<Backend: Io> EngineState<Backend> {
     ) -> Result<bool, StoreError> {
         match located {
             Located::Absent => Ok(false),
-            Located::Open(row) => self.read_open(read, row, RecordWant::Whole, value),
-            Located::Sealed(row) => self.read_sealed(volume, read, row, RecordWant::Whole, value),
+            Located::Open(row) => in_place(self.read_open(&InPlace, read, row, RecordWant::Whole, value)),
+            Located::Sealed(row) => in_place(self.read_sealed(&InPlace, volume, read, row, RecordWant::Whole, value)),
         }
     }
 
@@ -733,7 +733,7 @@ impl<Backend: Io> EngineState<Backend> {
         let Some(pin) = volume.table.pin(segment) else {
             return Ok(None);
         };
-        self.footer_readers.with(|reader| match reader.load_block(&pin.file, key, line, &self.row_cache) {
+        self.footer_readers.with(|reader| match in_place(reader.load_block(&InPlace, &pin.file, key, line, &self.row_cache)) {
             Ok(Some(block)) => Ok(Some(visit(block))),
             Ok(None) => Err(StoreError::Corruption { column }),
             Err(source) => Err(read_error(source)),

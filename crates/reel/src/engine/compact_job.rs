@@ -26,7 +26,7 @@ use crate::engine::volume::{ParkedSegment, Volume};
 use crate::engine::walk_job::{FREE_IN_PLACE_BYTES, FreeRecord, WALK_RETRY};
 use crate::guard::hold;
 use crate::io::device_error::is_device_error;
-use crate::io::{Io, IoFile, IoTask};
+use crate::io::{InPlace, Io, IoFile, IoTask, in_place};
 use crate::pool::{touched_capacity, touched_zeroes};
 use crate::row_kind::RowKind;
 use crate::segment::block_entry::KeyBound;
@@ -599,7 +599,7 @@ impl<Backend: Io> CompactJob<Backend> {
                 let Ok(read) = self.state.key_read(block.column, &self.key, WritePlace(u64::MAX), false) else {
                     return Ok(());
                 };
-                match self.state.search_footers(volume, &read) {
+                match in_place(self.state.search_footers(&InPlace, volume, &read)) {
                     Ok(newest) => {
                         let is_replaced = newest.is_some_and(|found| found.row.place > row.place);
                         let is_covered = volume.covers.newest_over(block.column, &self.key, WritePlace(u64::MAX)).is_some_and(|cover| cover > row.place);

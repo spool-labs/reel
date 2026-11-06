@@ -18,7 +18,7 @@ use crate::engine::volume::Volume;
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::index::spot_index::SpotLocation;
 use crate::index::write_row::WriteRow;
-use crate::io::Io;
+use crate::io::{DeviceReads, InPlace, Io, in_place};
 use crate::io::device_error::is_device_error;
 use crate::record::record_check::RecordIdentity;
 use crate::record::record_reader::{RecordLocation, RecordRead};
@@ -80,6 +80,36 @@ pub struct LatestRead<'key> {
     pub handovers: u64,
 }
 
+/// Which listed segments a directory walk asks for a key
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WalkAsk<'list> {
+    pub first: SegmentNumber,
+    pub skipped: &'list [SegmentNumber],
+    pub is_finished_only: bool,
+}
+
+impl WalkAsk<'_> {
+    /// Ask every segment listed
+    pub const EVERY: Self = Self {
+        first: SegmentNumber(0),
+        skipped: &[],
+        is_finished_only: false,
+    };
+}
+
+/// A read's pin on its point, which goes back however the read ends, a dropped read included
+pub struct HeldPin<'state, Backend: Io> {
+    pub state: &'state EngineState<Backend>,
+    pub slot: usize,
+    pub counts: JobCounts,
+}
+
+impl<Backend: Io> Drop for HeldPin<'_, Backend> {
+    fn drop(&mut self) {
+        self.state.unpin(self.slot, self.counts);
+    }
+}
+
 /// Many keys being read at one point
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ManyRead {
@@ -127,34 +157,42 @@ impl<Backend: Io> EngineState<Backend> {
         want: RecordWant,
         buf: &mut Vec<u8>,
     ) -> Result<bool, StoreError> {
+        in_place(self.get_latest_on(&InPlace, column, key, want, buf))
+    }
+
+    /// Answer a get through a device's read path, starting over when a job crosses it
+    pub async fn get_latest_on(
+        &self,
+        device: &impl DeviceReads<Backend::File>,
+        column: ColumnId,
+        key: &[u8],
+        want: RecordWant,
+        buf: &mut Vec<u8>,
+    ) -> Result<bool, StoreError> {
         for _try in 0..MOST_READ_TRIES {
             let latest = self.latest_read(column, key)?;
-            if let Some(answer) = self.answer_latest(&latest, want, buf) {
+            if let Some(answer) = self.answer_latest(device, &latest, want, buf).await {
                 return answer;
             }
         }
-        self.answer_pinned(column, key, |read, handovers| self.get_at(read, handovers, want, buf))
+        let (read, handovers, _held) = self.pinned_read(column, key)?;
+        self.get_at(device, &read, handovers, want, buf).await
     }
 
-    /// Answer a key under a pin, once starting over has failed, so no job can cross this try. A free needs its replacement
-    /// at or below the newest point, and a replacement at or below this fresh point would be the row found here, so the
-    /// row found has its replacement above the pin, and the pin stands inside that record's window. A full table has no
-    /// pin to give, so the read gives up and the count shows it
-    pub fn answer_pinned<Answer>(
-        &self,
-        column: ColumnId,
-        key: &[u8],
-        ask: impl FnOnce(&KeyRead, u64) -> Result<Answer, StoreError>,
-    ) -> Result<Answer, StoreError> {
+    /// Pin a key's read, once starting over has failed, so no job can cross this try. A free needs its replacement at or
+    /// below the newest point, and a replacement at or below this fresh point would be the row found here, so the row found
+    /// has its replacement above the pin, and the pin stands inside that record's window. A full table has no pin to give,
+    /// so the read gives up and the count shows it
+    pub fn pinned_read<'key>(&self, column: ColumnId, key: &'key [u8]) -> Result<(KeyRead<'key>, u64, HeldPin<'_, Backend>), StoreError> {
         let info = self.column(column)?;
         let volume = &self.volumes[info.volume.0 as usize];
         let many = (0..MOST_READ_TRIES).find_map(|_try| self.many_read(volume));
         let Some((many, Some(slot))) = many.map(|many| (many, many.pin)) else {
             return self.refuse_read();
         };
-        let answer = self.key_read(column, key, many.point, true).and_then(|read| ask(&read, many.handovers));
-        self.unpin(slot, many.counts);
-        answer
+        let held = HeldPin { state: self, slot, counts: many.counts };
+        let read = self.key_read(column, key, many.point, true)?;
+        Ok((read, many.handovers, held))
     }
 
     /// Give up on a read and count it
@@ -190,19 +228,31 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Answer a read at its point, or return nothing when a job crossed it and took what the point could see
-    pub fn answer_latest(
+    pub async fn answer_latest(
         &self,
-        latest: &LatestRead,
+        device: &impl DeviceReads<Backend::File>,
+        latest: &LatestRead<'_>,
         want: RecordWant,
         buf: &mut Vec<u8>,
     ) -> Option<Result<bool, StoreError>> {
-        let answer = self.get_at(&latest.read, latest.handovers, want, buf);
+        let answer = self.get_at(device, &latest.read, latest.handovers, want, buf).await;
         let is_bad = matches!(answer, Err(StoreError::Corruption { .. }));
         self.has_outlived(latest.counts, is_bad).then_some(answer)
     }
 
     /// Answer every key at one read point, so a batch from one write_batch is seen whole or not at all
     pub fn get_many_now(&self, column: ColumnId, keys: &[&[u8]], values: &mut ValueList) -> Result<(), StoreError> {
+        in_place(self.get_many_on(&InPlace, column, keys, values))
+    }
+
+    /// Answer every key at one read point through a device's read path
+    pub async fn get_many_on(
+        &self,
+        device: &impl DeviceReads<Backend::File>,
+        column: ColumnId,
+        keys: &[&[u8]],
+        values: &mut ValueList,
+    ) -> Result<(), StoreError> {
         let info = self.column(column)?;
         let volume = &self.volumes[info.volume.0 as usize];
         let mut scratch = values.take_scratch();
@@ -211,7 +261,7 @@ impl<Backend: Io> EngineState<Backend> {
             let Some(many) = self.many_read(volume) else {
                 continue;
             };
-            if let Some(answer) = self.answer_many(&many, column, keys, values, &mut scratch) {
+            if let Some(answer) = self.answer_many(device, &many, column, keys, values, &mut scratch).await {
                 outcome = Some(answer);
                 break;
             }
@@ -239,8 +289,9 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Answer keys at their point and give the pin back, or return nothing when a job crossed an unpinned read
-    pub fn answer_many(
+    pub async fn answer_many(
         &self,
+        device: &impl DeviceReads<Backend::File>,
         many: &ManyRead,
         column: ColumnId,
         keys: &[&[u8]],
@@ -248,17 +299,19 @@ impl<Backend: Io> EngineState<Backend> {
         scratch: &mut Vec<u8>,
     ) -> Option<Result<(), StoreError>> {
         values.clear();
-        let answer = self.read_keys(column, keys, many.point, many.handovers, values, scratch);
-        let Some(slot) = many.pin else {
+        let held = many.pin.map(|slot| HeldPin { state: self, slot, counts: many.counts });
+        let answer = self.read_keys(device, column, keys, many.point, many.handovers, values, scratch).await;
+        if held.is_none() {
             return self.has_outlived(many.counts, values.has_corrupt()).then_some(answer);
-        };
-        self.unpin(slot, many.counts);
+        }
+        drop(held);
         Some(answer)
     }
 
     /// Answer keys in order at a read point, with a bad record as that key's answer
-    pub fn read_keys(
+    pub async fn read_keys(
         &self,
+        device: &impl DeviceReads<Backend::File>,
         column: ColumnId,
         keys: &[&[u8]],
         point: WritePlace,
@@ -269,7 +322,7 @@ impl<Backend: Io> EngineState<Backend> {
         for key in keys {
             // a value read below the newest must stay out of the spot cache, as a cue's does
             let read = self.key_read(column, key, point, true)?;
-            match self.get_at(&read, handovers, RecordWant::Whole, scratch) {
+            match self.get_at(device, &read, handovers, RecordWant::Whole, scratch).await {
                 Ok(true) => values.push_found(scratch),
                 Ok(false) => values.push_missing(),
                 Err(StoreError::Corruption { .. }) => values.push_corrupt(),
@@ -280,9 +333,10 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Fill a buffer with a key's newest value at a read point, and say whether it has one
-    pub fn get_at(
+    pub async fn get_at(
         &self,
-        read: &KeyRead,
+        device: &impl DeviceReads<Backend::File>,
+        read: &KeyRead<'_>,
         handovers: u64,
         want: RecordWant,
         buf: &mut Vec<u8>,
@@ -300,7 +354,7 @@ impl<Backend: Io> EngineState<Backend> {
                 if row.kind != RowKind::Value || is_hidden(row.place) {
                     return Ok(false);
                 }
-                if self.read_open(read, &row, want, buf)? {
+                if self.read_open(device, read, &row, want, buf).await? {
                     return Ok(true);
                 }
                 continue;
@@ -308,12 +362,12 @@ impl<Backend: Io> EngineState<Backend> {
 
             let newest_below = found.row.map(|row| row.place).max(cover);
             if self.complete_table(read.column).is_none()
-                && let Some(answer) = self.try_spot(volume, read, newest_below, want, buf)?
+                && let Some(answer) = self.try_spot(device, volume, read, newest_below, want, buf).await?
             {
                 return Ok(answer);
             }
 
-            let sealed = self.search_sealed(volume, read)?;
+            let sealed = self.search_sealed(device, volume, read).await?;
             let located = newest_of(found.row, sealed);
             match located {
                 Located::Absent => return Ok(false),
@@ -321,7 +375,7 @@ impl<Backend: Io> EngineState<Backend> {
                     if row.kind != RowKind::Value || is_hidden(row.place) {
                         return Ok(false);
                     }
-                    if self.read_open(read, &row, want, buf)? {
+                    if self.read_open(device, read, &row, want, buf).await? {
                         return Ok(true);
                     }
                 },
@@ -329,7 +383,7 @@ impl<Backend: Io> EngineState<Backend> {
                     if row.row.kind != RowKind::Value || is_hidden(row.row.place) {
                         return Ok(false);
                     }
-                    if self.read_sealed(volume, read, &row, want, buf)? {
+                    if self.read_sealed(device, volume, read, &row, want, buf).await? {
                         if self.complete_table(read.column).is_none() {
                             self.fill_spot(volume, read, &row, handovers);
                         }
@@ -345,7 +399,7 @@ impl<Backend: Io> EngineState<Backend> {
     pub fn check_damage(
         &self,
         volume: &Volume<Backend>,
-        read: &KeyRead,
+        read: &KeyRead<'_>,
         cover: Option<WritePlace>,
     ) -> Result<(), StoreError> {
         let Some(highest) = volume.damage.covering(read.column, read.key) else {
@@ -353,7 +407,7 @@ impl<Backend: Io> EngineState<Backend> {
         };
 
         let found = self.index.lookup(read.column, read.key, read.read_point, volume.view());
-        let sealed = self.search_sealed(volume, read)?;
+        let sealed = in_place(self.search_sealed(&InPlace, volume, read))?;
         let newest = newest_of(found.row, sealed);
         match newest.place().max(cover) {
             Some(place) if place > highest => Ok(()),
@@ -370,7 +424,8 @@ impl<Backend: Io> EngineState<Backend> {
                 return answer;
             }
         }
-        self.answer_pinned(column, key, |read, _handovers| self.contains_at(read))
+        let (read, _handovers, _held) = self.pinned_read(column, key)?;
+        self.contains_at(&read)
     }
 
     /// Say whether a key has a value at its point, or return nothing when a reclaim crossed the read
@@ -380,7 +435,7 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Say whether a key has a value at a read, without reading the value
-    pub fn contains_at(&self, read: &KeyRead) -> Result<bool, StoreError> {
+    pub fn contains_at(&self, read: &KeyRead<'_>) -> Result<bool, StoreError> {
         let (column, key, read_point) = (read.column, read.key, read.read_point);
         let volume = &self.volumes[read.info.volume.0 as usize];
         let cover = read.cover;
@@ -393,7 +448,7 @@ impl<Backend: Io> EngineState<Backend> {
             return Ok(row.kind == RowKind::Value && !is_hidden(row.place));
         }
 
-        let sealed = self.search_sealed(volume, read)?;
+        let sealed = in_place(self.search_sealed(&InPlace, volume, read))?;
         let newest = newest_of(found.row, sealed);
         Ok(newest.has_value() && !newest.place().is_some_and(is_hidden))
     }
@@ -437,10 +492,11 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Answer from the spot cache, when it has a row newer than the index's and its record checks out
-    pub fn try_spot(
+    pub async fn try_spot(
         &self,
+        device: &impl DeviceReads<Backend::File>,
         volume: &Volume<Backend>,
-        read: &KeyRead,
+        read: &KeyRead<'_>,
         newest_below: Option<WritePlace>,
         want: RecordWant,
         buf: &mut Vec<u8>,
@@ -461,7 +517,7 @@ impl<Backend: Io> EngineState<Backend> {
             length: spot.length,
         };
         // a slot holds no key, so a failed check here means another key or a moved record: a miss
-        match self.read_record(&pin.file, location, spot.place, read, want, buf)? {
+        match self.read_record(device, &pin.file, location, spot.place, read, want, buf).await? {
             RecordRead::Valid => Ok(Some(true)),
             RecordRead::Failed => Ok(None),
         }
@@ -471,7 +527,7 @@ impl<Backend: Io> EngineState<Backend> {
     /// no lock and waits for nothing, since a window keeps its bytes until the write call that sends them returns
     pub fn read_held(
         &self,
-        read: &KeyRead,
+        read: &KeyRead<'_>,
         row: &WriteRow,
         want: RecordWant,
         buf: &mut Vec<u8>,
@@ -503,9 +559,10 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Read a record from an open segment, and return false when the slot has moved on
-    pub fn read_open(
+    pub async fn read_open(
         &self,
-        read: &KeyRead,
+        device: &impl DeviceReads<Backend::File>,
+        read: &KeyRead<'_>,
         row: &WriteRow,
         want: RecordWant,
         buf: &mut Vec<u8>,
@@ -523,17 +580,18 @@ impl<Backend: Io> EngineState<Backend> {
             offset: row.offset,
             length: row.length,
         };
-        match self.read_record(&pin.file, location, row.place, read, want, buf)? {
+        match self.read_record(device, &pin.file, location, row.place, read, want, buf).await? {
             RecordRead::Valid => Ok(true),
             RecordRead::Failed => Err(corruption(read)),
         }
     }
 
     /// Read a record from a sealed segment, and return false when the segment has left the table
-    pub fn read_sealed(
+    pub async fn read_sealed(
         &self,
+        device: &impl DeviceReads<Backend::File>,
         volume: &Volume<Backend>,
-        read: &KeyRead,
+        read: &KeyRead<'_>,
         sealed: &SealedRow,
         want: RecordWant,
         buf: &mut Vec<u8>,
@@ -545,19 +603,20 @@ impl<Backend: Io> EngineState<Backend> {
             offset: sealed.row.offset,
             length: sealed.row.length,
         };
-        match self.read_record(&pin.file, location, sealed.row.place, read, want, buf)? {
+        match self.read_record(device, &pin.file, location, sealed.row.place, read, want, buf).await? {
             RecordRead::Valid => Ok(true),
             RecordRead::Failed => Err(corruption(read)),
         }
     }
 
     /// Read and check one record through a pooled reader
-    pub fn read_record(
+    pub async fn read_record(
         &self,
+        device: &impl DeviceReads<Backend::File>,
         file: &Backend::File,
         location: RecordLocation,
         place: WritePlace,
-        read: &KeyRead,
+        read: &KeyRead<'_>,
         want: RecordWant,
         buf: &mut Vec<u8>,
     ) -> Result<RecordRead, StoreError> {
@@ -568,10 +627,12 @@ impl<Backend: Io> EngineState<Backend> {
             kind: RowKind::Value,
             place,
         };
-        let outcome = self.record_readers.with(|reader| match want {
-            RecordWant::Whole => reader.read_value(file, location, &identity, read.info.codec, buf),
-            RecordWant::Window(window) => reader.read_window(file, location, &identity, window, buf),
-        });
+        let mut reader = self.record_readers.lease();
+        let outcome = match want {
+            RecordWant::Whole => reader.read_value(device, file, location, &identity, read.info.codec, buf).await,
+            RecordWant::Window(window) => reader.read_window(device, file, location, &identity, window, buf).await,
+        };
+        drop(reader);
         // a bad sector comes back as a read error, and it means what a failed check means
         match outcome {
             Ok(read) => Ok(read),
@@ -584,12 +645,13 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Find the key's newest row in the sealed segments, asking every one its range can't rule out
-    pub fn search_footers(&self, volume: &Volume<Backend>, read: &KeyRead) -> Result<Option<SealedRow>, StoreError> {
+    pub async fn search_footers(&self, device: &impl DeviceReads<Backend::File>, volume: &Volume<Backend>, read: &KeyRead<'_>) -> Result<Option<SealedRow>, StoreError> {
         let Some(directory) = &self.directories[read.column.0 as usize] else {
             return Ok(None);
         };
 
-        self.footer_readers.with(|reader| self.search_directory(volume, directory, read, reader))
+        let mut reader = self.footer_readers.lease();
+        self.search_directory(device, volume, directory, read, &mut reader).await
     }
 
     /// Check an older row of a key could still be read: in a sealed segment other than one, or among the open rows
@@ -606,14 +668,8 @@ impl<Backend: Io> EngineState<Backend> {
         };
         let read = self.key_read(column, key, WritePlace(place.0.saturating_sub(1)), false)?;
         let found = self.index.lookup(column, key, read.read_point, volume.view());
-        let sealed = self.footer_readers.with(|reader| {
-            self.walk_candidates(directory, key, reader, |segment, reader, best| {
-                if skipped.contains(&segment) {
-                    return Ok(());
-                }
-                self.ask_segment(volume, &read, segment, reader, best)
-            })
-        })?;
+        let mut reader = self.footer_readers.lease();
+        let sealed = in_place(self.walk_candidates(&InPlace, volume, directory, &read, &mut reader, WalkAsk { skipped, ..WalkAsk::EVERY }))?;
         Ok(newest_of(found.row, sealed).place().is_some())
     }
 
@@ -636,28 +692,23 @@ impl<Backend: Io> EngineState<Backend> {
     pub fn newest_walked_footers(
         &self,
         volume: &Volume<Backend>,
-        read: &KeyRead,
+        read: &KeyRead<'_>,
         skipped: &[SegmentNumber],
     ) -> Result<Option<SealedRow>, StoreError> {
         let Some(directory) = &self.directories[read.column.0 as usize] else {
             return Ok(None);
         };
-        self.footer_readers.with(|reader| {
-            self.walk_candidates(directory, read.key, reader, |segment, reader, best| {
-                if skipped.contains(&segment) {
-                    return Ok(());
-                }
-                self.ask_walked(volume, read, segment, reader, best)
-            })
-        })
+        let mut reader = self.footer_readers.lease();
+        in_place(self.walk_candidates(&InPlace, volume, directory, read, &mut reader, WalkAsk { skipped, is_finished_only: true, ..WalkAsk::EVERY }))
     }
 
     /// Ask a finished segment for a key's newest row that isn't a range delete, and keep it when it's the newest so far.
     /// A stop ends the walk here, so it waits for one read and never for a key's whole set of probes
-    pub fn ask_walked(
+    pub async fn ask_walked(
         &self,
+        device: &impl DeviceReads<Backend::File>,
         volume: &Volume<Backend>,
-        read: &KeyRead,
+        read: &KeyRead<'_>,
         segment: SegmentNumber,
         reader: &mut FooterReader,
         best: &mut Option<SealedRow>,
@@ -674,21 +725,22 @@ impl<Backend: Io> EngineState<Backend> {
         if !pin.is_walked {
             return Ok(());
         }
-        self.ask_rows(volume, read, segment, &pin, reader, best)
+        self.ask_rows(device, volume, read, segment, &pin, reader, best).await
     }
 
     /// Ask one pinned segment for a key's newest row that isn't a range delete, whether or not its walk has finished
-    pub fn ask_rows(
+    pub async fn ask_rows(
         &self,
+        device: &impl DeviceReads<Backend::File>,
         volume: &Volume<Backend>,
-        read: &KeyRead,
+        read: &KeyRead<'_>,
         segment: SegmentNumber,
         pin: &SegmentPin<'_, Backend::File>,
         reader: &mut FooterReader,
         best: &mut Option<SealedRow>,
     ) -> Result<(), StoreError> {
         let mut point = *read;
-        while let Some(found) = self.search_segment(volume, &point, segment, pin, reader)? {
+        while let Some(found) = self.search_segment(device, volume, &point, segment, pin, reader).await? {
             if found.kind != RowKind::RangeDelete {
                 if best.is_none_or(|current| current.row.place < found.place) {
                     *best = Some(SealedRow { segment, row: found, block_offset: reader.found_block });
@@ -704,57 +756,52 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Ask every segment a directory lists for a key
-    pub fn search_directory(
+    pub async fn search_directory(
         &self,
+        device: &impl DeviceReads<Backend::File>,
         volume: &Volume<Backend>,
         directory: &ColumnDirectory,
-        read: &KeyRead,
+        read: &KeyRead<'_>,
         reader: &mut FooterReader,
     ) -> Result<Option<SealedRow>, StoreError> {
-        self.walk_candidates(directory, read.key, reader, |segment, reader, best| {
-            self.ask_segment(volume, read, segment, reader, best)
-        })
+        self.walk_candidates(device, volume, directory, read, reader, WalkAsk::EVERY).await
     }
 
     /// Walk a directory's pages, starting over when the list changes between them
-    pub fn walk_candidates(
+    pub async fn walk_candidates(
         &self,
+        device: &impl DeviceReads<Backend::File>,
+        volume: &Volume<Backend>,
         directory: &ColumnDirectory,
-        key: &[u8],
+        read: &KeyRead<'_>,
         reader: &mut FooterReader,
-        mut ask: impl FnMut(SegmentNumber, &mut FooterReader, &mut Option<SealedRow>) -> Result<(), StoreError>,
+        ask: WalkAsk<'_>,
     ) -> Result<Option<SealedRow>, StoreError> {
+        reader.asked = 0;
         let mut best: Option<SealedRow> = None;
         let mut skip = 0;
         let mut generation = None;
         loop {
-            let mut candidates = std::mem::take(&mut reader.candidates);
-            let page = directory.candidates(key, skip, &mut candidates);
+            let page = directory.candidates(read.key, skip, &mut reader.candidates);
 
             // a list that changed between pages could hide a segment, and asking twice is harmless
             if generation.is_some_and(|seen| seen != page.generation) {
                 skip = 0;
                 generation = None;
-                reader.candidates = candidates;
                 continue;
             }
             generation = Some(page.generation);
             // newest first, so a key with a row stops at its previous version and the older segments cost nothing
-            candidates.sort_unstable_by_key(|candidate| Reverse(candidate.newest_place));
+            reader.candidates.sort_unstable_by_key(|candidate| Reverse(candidate.newest_place));
 
-            let mut outcome = Ok(());
-            for candidate in &candidates {
+            for index in 0..reader.candidates.len() {
+                let candidate = reader.candidates[index];
                 if best.is_some_and(|row| row.row.place >= candidate.newest_place) {
                     break;
                 }
-                outcome = ask(candidate.segment, reader, &mut best);
-                if outcome.is_err() {
-                    break;
-                }
+                self.ask_candidate(device, volume, read, candidate.segment, reader, &mut best, ask).await?;
             }
-            skip += candidates.len();
-            reader.candidates = candidates;
-            outcome?;
+            skip += reader.candidates.len();
 
             // a segment that left under this walk took rows with it, and the list that took it out has their new home
             if !page.is_cut && directory.generation() == page.generation {
@@ -767,11 +814,33 @@ impl<Backend: Io> EngineState<Backend> {
         }
     }
 
-    /// Ask one segment for the key, and keep its row when it's the newest so far
-    pub fn ask_segment(
+    /// Ask one listed segment for a key, if a walk's rule takes it
+    pub async fn ask_candidate(
         &self,
+        device: &impl DeviceReads<Backend::File>,
         volume: &Volume<Backend>,
-        read: &KeyRead,
+        read: &KeyRead<'_>,
+        segment: SegmentNumber,
+        reader: &mut FooterReader,
+        best: &mut Option<SealedRow>,
+        ask: WalkAsk<'_>,
+    ) -> Result<(), StoreError> {
+        if segment < ask.first || ask.skipped.contains(&segment) {
+            return Ok(());
+        }
+        reader.asked += 1;
+        if ask.is_finished_only {
+            return self.ask_walked(device, volume, read, segment, reader, best).await;
+        }
+        self.ask_segment(device, volume, read, segment, reader, best).await
+    }
+
+    /// Ask one segment for the key, and keep its row when it's the newest so far
+    pub async fn ask_segment(
+        &self,
+        device: &impl DeviceReads<Backend::File>,
+        volume: &Volume<Backend>,
+        read: &KeyRead<'_>,
         segment: SegmentNumber,
         reader: &mut FooterReader,
         best: &mut Option<SealedRow>,
@@ -779,7 +848,7 @@ impl<Backend: Io> EngineState<Backend> {
         let Some(pin) = volume.table.pin(segment) else {
             return Ok(());
         };
-        let row = self.search_segment(volume, read, segment, &pin, reader)?;
+        let row = self.search_segment(device, volume, read, segment, &pin, reader).await?;
         if let Some(found) = row
             && best.is_none_or(|current| current.row.place < found.place)
         {
@@ -789,10 +858,11 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Search a pinned segment window by window
-    pub fn search_segment(
+    pub async fn search_segment(
         &self,
+        device: &impl DeviceReads<Backend::File>,
         volume: &Volume<Backend>,
-        read: &KeyRead,
+        read: &KeyRead<'_>,
         segment: SegmentNumber,
         pin: &SegmentPin<'_, Backend::File>,
         reader: &mut FooterReader,
@@ -817,7 +887,7 @@ impl<Backend: Io> EngineState<Backend> {
                 window: &window,
                 place_base: pin.head.place_base,
             };
-            let looked_up = reader.lookup_window(&pin.file, &window_read, &caches, &query);
+            let looked_up = reader.lookup_window(device, &pin.file, &window_read, &caches, &query).await;
             let answer = match looked_up {
                 Ok(answer) => answer,
                 Err(source) if is_device_error(&source) => FooterAnswer::Damaged,
@@ -841,7 +911,7 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Remember a sealed value's location, unless a seal's walk began since the read did
-    pub fn fill_spot(&self, volume: &Volume<Backend>, read: &KeyRead, sealed: &SealedRow, handovers: u64) {
+    pub fn fill_spot(&self, volume: &Volume<Backend>, read: &KeyRead<'_>, sealed: &SealedRow, handovers: u64) {
         if read.is_cue {
             return;
         }
@@ -874,7 +944,7 @@ pub fn newest_of(open: Option<WriteRow>, sealed: Option<SealedRow>) -> Located {
 }
 
 /// Build the error for a key's damaged record
-pub fn corruption(read: &KeyRead) -> StoreError {
+pub fn corruption(read: &KeyRead<'_>) -> StoreError {
     StoreError::Corruption {
         column: read.column,
     }

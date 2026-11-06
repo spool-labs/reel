@@ -21,7 +21,7 @@ use crate::index::open_slots::OpenSlot;
 use crate::index::seal_walk::SealWalk;
 use crate::index::spot_index::SpotLocation;
 use crate::io::job::{Job, JobStep};
-use crate::io::{Io, IoTask};
+use crate::io::{InPlace, Io, IoTask, in_place};
 use crate::io::device_error::is_device_error;
 use crate::record::codec::Codec;
 use crate::record::record_check::RecordIdentity;
@@ -282,7 +282,7 @@ impl<Backend: Io> SealJob<Backend> {
                 };
                 let end = &mut self.range_end;
                 let read = self.state.record_readers.with(|reader| {
-                    reader.read_value(&target.data, location, &identity, Codec::None, end)
+                    in_place(reader.read_value(&InPlace, &target.data, location, &identity, Codec::None, end))
                 });
                 let is_whole = match read {
                     Ok(read) => read == RecordRead::Valid,

@@ -1,12 +1,22 @@
 //! A complete table holds every row it takes, and says when it can't
 
-use reel::index::complete_table::{CompleteShard, CompleteSlot, CompleteTable, Homes, MOST_TAG_SLOTS, STALE_BIT, TagMatches, shard_of, tag_of};
+use std::time::{Duration, Instant};
+
+use reel::index::complete_table::{
+    CompleteShard, CompleteSlot, CompleteTable, Homes, MOST_RUN_SLOTS, MOST_TAG_SLOTS, OVERFLOW_DIVISOR, STALE_BIT, TagMatches, shard_of, tag_of,
+};
 use reel::index::key_hash::KeyHash;
 use reel::segment::segment_tail::SegmentNumber;
 use reel_api::units::RowCount;
 
 const ROWS: u64 = 100_000;
 const OVERFLOW_SHARD_SLOTS: usize = 64;
+const CLIFF_ROOM: u64 = 6_000_000;
+const CLIFF_KEYS: u64 = 1_000_000;
+const CLIFF_WRITES: u64 = 6_000_000;
+const CLIFF_SEGMENT_ROWS: u64 = 250_000;
+const CLIFF_READS: u64 = 100_000;
+const MOST_FIND_TIME: Duration = Duration::from_micros(30);
 
 fn hash_of(number: u64) -> KeyHash {
     let mut mixed = number.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -180,4 +190,36 @@ fn gone_overflow_slots_leave_the_count() {
     let sticky = matches.slots().iter().filter(|slot| slot.is_sticky()).count();
     assert_eq!((gone, sticky), (0, 0));
     assert_eq!(table.used_slots(), RowCount(24));
+}
+
+// keys with many versions fill the overflow area long before the table, and a full area costs a get a bounded walk
+#[test]
+fn full_overflow_stays_cheap() {
+    let table = CompleteTable::new(RowCount(CLIFF_ROOM));
+    let mut random = 0x2545_F491_4F6C_DD1D_u64;
+    for write in 0..CLIFF_WRITES {
+        random ^= random << 13;
+        random ^= random >> 7;
+        random ^= random << 17;
+        table.insert(hash_of(random % CLIFF_KEYS), SegmentNumber(write / CLIFF_SEGMENT_ROWS), (write % CLIFF_SEGMENT_ROWS / 100) as u16, |_segment| false);
+    }
+    assert!(table.past_capacity().0 > 0, "the area should have filled");
+    let started = Instant::now();
+    for number in 0..CLIFF_READS {
+        let _matches = matches_of(&table, hash_of(number));
+    }
+    let each = started.elapsed() / CLIFF_READS as u32;
+    assert!(each < MOST_FIND_TIME, "{each:?} a find");
+}
+
+// a slot past its run's reach never lands, so a run can't grow across the area
+#[test]
+fn run_stops_at_its_reach() {
+    let mut shard = CompleteShard::new(OVERFLOW_SHARD_SLOTS * OVERFLOW_DIVISOR);
+    for _slot in 0..MOST_RUN_SLOTS {
+        assert!(shard.fill_overflow(slot_of(3, false)));
+    }
+    assert!(!shard.fill_overflow(slot_of(3, false)));
+    assert_eq!(shard.overflow_used(), MOST_RUN_SLOTS);
+    assert_eq!(tag_count(&shard, 3), MOST_RUN_SLOTS);
 }

@@ -24,10 +24,12 @@ pub const LOAD_TENTHS: u64 = 9;
 pub const OVERFLOW_DIVISOR: usize = 64;
 /// The smallest overflow area a shard gets
 pub const LEAST_OVERFLOW: usize = 8;
-/// Moves an insert makes between homes before it gives a slot to the overflow area
+/// Moves an insert tries between homes before it looks in the overflow area, and undoes when none finds a free slot
 pub const MOST_MOVES: usize = 64;
+/// The furthest a slot may sit from its run's start in the overflow area, so a full area costs a walk this long and no more
+pub const MOST_RUN_SLOTS: usize = 16;
 /// Slots one tag can hold in its homes and the overflow area before it folds, so a get's candidates fit a fixed list
-pub const MOST_TAG_SLOTS: usize = 32;
+pub const MOST_TAG_SLOTS: usize = 2 * BUCKET_SLOTS + MOST_RUN_SLOTS;
 /// The bit of a slot's tag that marks a superseded row
 pub const STALE_BIT: u16 = 0x8000;
 /// The bits of a slot's tag that come from the key
@@ -210,7 +212,7 @@ impl CompleteShard {
         }
         if self.overflow_used > 0 {
             let mut at = self.overflow_start(homes.tag);
-            for _step in 0..self.overflow.len() {
+            for _step in 0..self.run_reach() {
                 let slot = &self.overflow[at];
                 if !slot.is_used() {
                     break;
@@ -243,7 +245,7 @@ impl CompleteShard {
             return;
         }
         let mut at = self.overflow_start(tag);
-        for _step in 0..self.overflow.len() {
+        for _step in 0..self.run_reach() {
             let slot = &mut self.overflow[at];
             if !slot.is_used() {
                 return;
@@ -263,7 +265,7 @@ impl CompleteShard {
             return cleared;
         }
         let mut at = self.overflow_start(tag);
-        for _step in 0..self.overflow.len() {
+        for _step in 0..self.run_reach() {
             let slot = self.overflow[at];
             if !slot.is_used() {
                 break;
@@ -279,19 +281,19 @@ impl CompleteShard {
         cleared
     }
 
-    /// Take a tag's slots out of its run of the overflow area, and say how many went
+    /// Take a tag's slots out of its run of the overflow area, its sticky slot apart, and say how many went
     pub fn fold_overflow(&mut self, tag: u16) -> u64 {
         let mut folded = 0;
         if self.overflow_used == 0 {
             return folded;
         }
         let mut at = self.overflow_start(tag);
-        for _step in 0..self.overflow.len() {
+        for _step in 0..self.run_reach() {
             let slot = self.overflow[at];
             if !slot.is_used() {
                 break;
             }
-            if slot.key_tag() == tag {
+            if slot.key_tag() == tag && !slot.is_sticky() {
                 // a later slot of the run can shift into this position, so the look stays here
                 self.clear_overflow(at);
                 folded += 1;
@@ -317,9 +319,9 @@ impl CompleteShard {
         self.overflow_used
     }
 
-    /// Check the overflow area can take a slot and still end every run with an unused slot
-    pub fn has_overflow_room(&self) -> bool {
-        self.overflow_used + 1 < self.overflow.len()
+    /// Read how far a walk of a run can go
+    pub fn run_reach(&self) -> usize {
+        MOST_RUN_SLOTS.min(self.overflow.len())
     }
 
     /// Put a slot in a free place in a bucket, clearing slots of gone segments on the way, and say how many it cleared
@@ -339,22 +341,31 @@ impl CompleteShard {
         is_placed.then_some(freed)
     }
 
-    /// Put a slot in the overflow area, which has been checked for room
-    pub fn fill_overflow(&mut self, slot: CompleteSlot) {
+    /// Put a slot in its run of the overflow area, or say there's no room in reach of the run's start
+    pub fn fill_overflow(&mut self, slot: CompleteSlot) -> bool {
         let mut at = self.overflow_start(slot.tag);
-        while self.overflow[at].is_used() {
+        for _step in 0..self.run_reach() {
+            if !self.overflow[at].is_used() {
+                self.overflow[at] = slot;
+                self.overflow_used += 1;
+                return true;
+            }
             at = (at + 1) % self.overflow.len();
         }
-        self.overflow[at] = slot;
-        self.overflow_used += 1;
+        false
     }
 
-    /// Take a slot out of the overflow area and close the gap, so every run stays whole
+    /// Take a slot out of the overflow area and close the gap, so every run stays whole. A slot that could fill the gap sits within
+    /// a run's reach of it, so the look stops that far past the last slot moved
     pub fn clear_overflow(&mut self, at: usize) {
         let length = self.overflow.len();
         let mut gap = at;
         let mut next = (at + 1) % length;
-        while self.overflow[next].is_used() {
+        let mut looked = 0;
+        for _step in 0..length {
+            if next == gap || looked >= self.run_reach() || !self.overflow[next].is_used() {
+                break;
+            }
             let start = self.overflow_start(self.overflow[next].tag);
             // a slot can fill the gap only if its run reaches back that far
             let distance_to_gap = (gap + length - start) % length;
@@ -362,6 +373,9 @@ impl CompleteShard {
             if distance_to_gap <= distance_to_slot {
                 self.overflow[gap] = self.overflow[next];
                 gap = next;
+                looked = 0;
+            } else {
+                looked += 1;
             }
             next = (next + 1) % length;
         }
@@ -516,23 +530,36 @@ impl CompleteTable {
         has_other
     }
 
-    /// Give a tag whose list is full one sticky slot in place of the rest. Its readers go by the footers from here on, so a key
-    /// written into many segments costs that tag and no other
-    pub fn fold_tag(&self, shard: &mut CompleteShard, homes: &Homes) {
+    /// Give a tag whose list is full one sticky slot in place of the rest, or say its run has no room for one. Its readers go by the
+    /// footers from here on, so a key written into many segments costs that tag and no other. The sticky slot goes in the overflow
+    /// run, where every key of the tag looks whatever its homes, and it lands before any other slot goes
+    pub fn fold_tag(&self, shard: &mut CompleteShard, homes: &Homes) -> bool {
+        let sticky = CompleteSlot {
+            segment: STICKY_SEGMENT,
+            block: 0,
+            tag: homes.tag | STALE_BIT,
+        };
+        let mut is_placed = false;
+        shard.change_overflow(homes.tag, |slot| {
+            if !is_placed {
+                *slot = sticky;
+                is_placed = true;
+            }
+        });
+        if !is_placed {
+            if !shard.fill_overflow(sticky) {
+                return false;
+            }
+            self.used.fetch_add(1, Ordering::AcqRel);
+        }
         let mut folded = 0;
         shard.change_homes(homes, |slot| {
             *slot = CompleteSlot::empty();
             folded += 1;
         });
         folded += shard.fold_overflow(homes.tag);
-        let sticky = CompleteSlot {
-            segment: STICKY_SEGMENT,
-            block: 0,
-            tag: homes.tag | STALE_BIT,
-        };
-        // every key of the tag walks this run, whatever its homes, and a full list held most of its slots here, so there's room
-        shard.fill_overflow(sticky);
-        self.used.fetch_sub(folded - 1, Ordering::AcqRel);
+        self.used.fetch_sub(folded, Ordering::AcqRel);
+        true
     }
 
     /// Give a sealed row a slot. A row with no room marks the column at its segment, and a get searches the footers from there
@@ -558,8 +585,7 @@ impl CompleteTable {
         if has_sticky {
             return true;
         }
-        if tag_slots >= MOST_TAG_SLOTS {
-            self.fold_tag(&mut shard, &homes);
+        if tag_slots >= MOST_TAG_SLOTS && self.fold_tag(&mut shard, &homes) {
             return true;
         }
 
@@ -571,16 +597,13 @@ impl CompleteTable {
                 return true;
             }
         }
-        // a slot moved out has to land, so moves start only with room for the last one
-        if !shard.has_overflow_room() {
-            return false;
-        }
-
+        // a key's versions all share one pair of homes, so moves only help other keys in them, and a walk that finds no free slot goes back
         let mut moving = slot;
         let mut bucket = homes.first;
-        for step in 0..MOST_MOVES {
-            let at = bucket * BUCKET_SLOTS + (usize::from(moving.key_tag()) + step) % BUCKET_SLOTS;
-            std::mem::swap(&mut shard.slots[at], &mut moving);
+        let mut moved = [0; MOST_MOVES];
+        for (step, at) in moved.iter_mut().enumerate() {
+            *at = bucket * BUCKET_SLOTS + (usize::from(moving.key_tag()) + step) % BUCKET_SLOTS;
+            std::mem::swap(&mut shard.slots[*at], &mut moving);
             bucket = shard.other_home(bucket, moving.tag);
             if let Some(freed) = shard.fill_bucket(bucket, moving, is_gone) {
                 self.used.fetch_add(1, Ordering::AcqRel);
@@ -588,9 +611,16 @@ impl CompleteTable {
                 return true;
             }
         }
-        shard.fill_overflow(moving);
-        self.used.fetch_add(1, Ordering::AcqRel);
-        true
+        for at in moved.iter().rev() {
+            std::mem::swap(&mut shard.slots[*at], &mut moving);
+        }
+
+        if shard.fill_overflow(slot) {
+            self.used.fetch_add(1, Ordering::AcqRel);
+            return true;
+        }
+        // a key that fills its homes and finds its run full has no room left to wait for
+        tag_slots >= 2 * BUCKET_SLOTS && self.fold_tag(&mut shard, &homes)
     }
 }
 

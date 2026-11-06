@@ -844,6 +844,7 @@ pub fn build_state<Backend: Io>(
             can_free_blocks: volume.roots.iter().all(|root| io.can_free_blocks(root)),
             bytes_freed: AtomicU64::new(0),
             has_held_frees: AtomicBool::new(false),
+            seals_done: AtomicU64::new(0),
             segments_unlinked: AtomicU64::new(0),
             segments_parked: AtomicU64::new(0),
             empties_left: AtomicU64::new(0),

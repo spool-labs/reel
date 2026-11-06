@@ -158,6 +158,7 @@ impl<Backend: Io> SealJob<Backend> {
         self.target = None;
         self.phase = SealPhase::Idle;
         self.volume().sealing.store(NO_SEAL, Ordering::Release);
+        self.volume().seals_done.fetch_add(1, Ordering::AcqRel);
         // each seal can take a column's overlap past the bound
         self.volume().wants_compaction.store(true, Ordering::Release);
         if let Some(task) = self.state.planner_task.get() {

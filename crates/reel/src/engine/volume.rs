@@ -98,6 +98,7 @@ pub struct Volume<Backend: Io> {
     pub bytes_freed: AtomicU64,
     /// A segment has large dead records no list could hold, for one pass to free once no cue is live
     pub has_held_frees: AtomicBool,
+    pub seals_done: AtomicU64,
     pub segments_unlinked: AtomicU64,
     pub segments_parked: AtomicU64,
     /// Empty files a failed remove left with the park full, which the next open removes

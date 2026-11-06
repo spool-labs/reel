@@ -352,7 +352,7 @@ fn inputs() -> Inputs {
 
 fn wait_for_seal(store: &Store, before: u64) {
     for _wait in 0..MOST_SEAL_WAITS {
-        if store.state.volumes[0].table.segment_count() > before {
+        if store.state.volumes[0].seals_done.load(Ordering::Acquire) > before {
             return;
         }
         thread::sleep(SEAL_WAIT);
@@ -402,7 +402,7 @@ fn round(store: &Store, inputs: &mut Inputs, number: usize) {
         store.flush().expect("flush");
     }
     if number.is_multiple_of(SEAL_ROUNDS) {
-        let before = store.state.volumes[0].table.segment_count();
+        let before = store.state.volumes[0].seals_done.load(Ordering::Acquire);
         store.seal_now();
         wait_for_seal(store, before);
     }
@@ -427,7 +427,7 @@ fn free_burst() -> u64 {
         }
     };
     write_records();
-    let before = store.state.volumes[0].table.segment_count();
+    let before = store.state.volumes[0].seals_done.load(Ordering::Acquire);
     store.seal_now();
     wait_for_seal(&store, before);
 
@@ -476,7 +476,7 @@ fn damage(root: &Path, inputs: &Inputs) {
         let key = format!("damaged-{number:06}");
         store.put(META, key.as_bytes(), &inputs.small).expect("put");
     }
-    let before = store.state.volumes[0].table.segment_count();
+    let before = store.state.volumes[0].seals_done.load(Ordering::Acquire);
     store.seal_now();
     wait_for_seal(&store, before);
     // the table has the segment before its rows file goes, and a tail with rows beside it reads as open

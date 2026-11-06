@@ -509,6 +509,21 @@ impl SummaryRows {
         }
     }
 
+    /// Note a segment's covers as settled, so open leaves them out and the segment goes for its own reasons
+    pub fn clear_covers(&mut self, segment: SegmentNumber) {
+        let Some(at) = self.find_row(segment) else {
+            return;
+        };
+        let Some((length, Some(_row))) = read_row(&self.bytes[at..]) else {
+            return;
+        };
+        let body_at = at + ROW_HEAD_BYTES;
+        self.bytes[body_at + ROW_FLAGS_AT] &= !(1 << HAS_COVERS_BIT);
+        let body_end = at + length - ROW_SUM_BYTES;
+        let sum = checksum(&self.bytes[body_at..body_end]);
+        self.bytes[body_end..body_end + ROW_SUM_BYTES].copy_from_slice(&sum.0.to_le_bytes());
+    }
+
     /// Add a segment's counts to its row and move its walk on, resealing the row once
     pub fn apply_counts(&mut self, segment: SegmentNumber, counts: &[DeadCount], position: Option<u32>) {
         let Some(at) = self.find_row(segment) else {

@@ -849,7 +849,13 @@ pub fn load_covers<Backend: Io>(state: &EngineState<Backend>, scan: &RootScan<Ba
     let mut bytes = Vec::new();
     for found in sealed {
         let volume = &state.volumes[found.volume];
-        if found.head.ranges_length.0 == 0 {
+        // a row with the flag gone says its covers settled, so they stay out of the pool. A row an earlier seal of this number
+        // left says nothing about these covers, so it has to be this tail's
+        let head = &found.head;
+        let is_settled = hold(&volume.summary).get(head.segment).is_some_and(|row| {
+            !row.facts.has_covers && row.facts.seal_mark == head.index_sum && row.facts.places == head.places
+        });
+        if found.head.ranges_length.0 == 0 || is_settled {
             continue;
         }
         bytes.resize(found.head.ranges_length.0 as usize, 0);
@@ -1879,6 +1885,8 @@ pub fn is_same_segment(row: &SegmentFacts, tail: &SegmentFacts) -> bool {
     let without_damage = SegmentFacts {
         is_damaged: false,
         damage_place: WritePlace(0),
+        // a settled segment's row drops the flag its tail keeps for good
+        has_covers: tail.has_covers,
         walked_blocks: tail.walked_blocks,
         is_backward: tail.is_backward,
         ..*row

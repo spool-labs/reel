@@ -7,6 +7,7 @@
 
 use std::io::{Error, ErrorKind, Result};
 use std::mem;
+use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -30,10 +31,12 @@ use crate::segment::range_covers::{Cover, MOST_RANGE_COVERS};
 use crate::segment::row_block::{ROW_BLOCK_BYTES, RowBlockWalk};
 use crate::segment::segment_table::RetiredSegment;
 use crate::segment::segment_tail::SegmentNumber;
-use crate::segment::summary::SummaryRow;
+use crate::segment::summary::{DeadCount, SummaryRow};
 
 /// Covers one ask of compaction looks at, which bounds what settling them costs
 pub const MOST_SETTLE_LOOKS: usize = 16;
+/// Settled covers' rows that can wait for their segment's note
+pub const MOST_SETTLED_ROWS: usize = 1_024;
 /// How long compaction waits before it looks at a parked segment's pins again
 pub const PARKED_RETRY: Nanoseconds = Nanoseconds(1_000_000);
 
@@ -66,6 +69,7 @@ pub struct CompactJob<Backend: Io> {
     should_rewrite: bool,
     last_tried: SegmentNumber,
     settle_at: usize,
+    settled_rows: Vec<DeadCount>,
     block: Vec<u8>,
     key: Vec<u8>,
     row_key: Vec<u8>,
@@ -86,6 +90,7 @@ impl<Backend: Io> CompactJob<Backend> {
             retry_at: None,
             last_tried: SegmentNumber(0),
             settle_at: 0,
+            settled_rows: touched_capacity(MOST_SETTLED_ROWS, DeadCount::default()),
             block: touched_zeroes(ROW_BLOCK_BYTES),
             key: touched_capacity(MAX_KEY_BYTES as usize, 0),
             row_key: touched_capacity(MAX_KEY_BYTES as usize, 0),
@@ -96,7 +101,8 @@ impl<Backend: Io> CompactJob<Backend> {
     /// Read the heap the job's buffers hold
     pub fn heap_bytes(&self) -> ByteCount {
         let buffers = self.block.capacity() + self.key.capacity() + self.row_key.capacity() + self.end.capacity();
-        ByteCount(buffers as u64 + self.rewrite.heap_bytes().0)
+        let settled = self.settled_rows.capacity() * size_of::<DeadCount>();
+        ByteCount((buffers + settled) as u64 + self.rewrite.heap_bytes().0)
     }
 
     /// Step once: try the next segment the counts call dead, or nothing when none is
@@ -165,6 +171,7 @@ impl<Backend: Io> CompactJob<Backend> {
         let is_asked = volume.wants_compaction.swap(false, Ordering::AcqRel);
         if is_asked {
             let has_settled = self.settle_covers(volume);
+            self.note_settled(volume);
             self.force_oldest(volume);
             // a settled cover asks again, and only a worked step brings the planner back to hear it
             if has_settled {
@@ -316,10 +323,72 @@ impl<Backend: Io> CompactJob<Backend> {
                 segment,
             };
             volume.covers.remove(&cover);
+            self.note_cover_row(volume, segment, column, place);
             has_settled = true;
             volume.wants_compaction.store(true, Ordering::Release);
         }
         has_settled
+    }
+
+    /// Find a settled cover's own row, for its count to land with the note that its segment's covers are done. A cover can settle
+    /// again after a crash, and only the note says this count hasn't landed. The cover's start key is in `key`
+    pub fn note_cover_row(&mut self, volume: &Volume<Backend>, segment: SegmentNumber, column: ColumnId, place: WritePlace) {
+        let (Some(pin), Some((first, end))) = (volume.table.pin(segment), volume.table.blocks_from(segment, column, &self.key)) else {
+            return;
+        };
+        for index in first..end {
+            let Some(block) = volume.table.walk_block(segment, index) else {
+                return;
+            };
+            let length = block.entry.block_length().0 as usize;
+            if length > self.block.len() || pin.file.read_exact_at(block.entry.block_at(), &mut self.block[..length]).is_err() {
+                return;
+            }
+            let Some(mut walk) = RowBlockWalk::open(&self.block[..length], pin.head.place_base) else {
+                return;
+            };
+            while let Some(row) = walk.next_row(&mut self.row_key) {
+                if row.place == place && row.kind == RowKind::RangeDelete {
+                    // a list that's full leaves the row live, which only keeps its segment a while longer
+                    if self.settled_rows.len() < self.settled_rows.capacity() {
+                        self.settled_rows.push(DeadCount {
+                            segment,
+                            column,
+                            block: index,
+                            rows: 1,
+                            replacement: place,
+                            ..DeadCount::default()
+                        });
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Mark the segments whose covers have all left the pool, so open stops loading them. Each cover has to rest on a sealed row
+    /// first, since one dropped inside a newer cover rests on that one
+    pub fn note_settled(&mut self, volume: &Volume<Backend>) {
+        if !volume.covers.are_all_applied() {
+            return;
+        }
+        let mut rows = hold(&volume.summary);
+        let mut last = SegmentNumber(0);
+        loop {
+            let is_settled = |row: &SummaryRow<'_>| {
+                row.facts.has_covers && row.facts.segment > last && row.facts.is_walked() && !volume.covers.holds_any(row.facts.segment)
+            };
+            let Some(segment) = rows.rows().filter(is_settled).map(|row| row.facts.segment).min() else {
+                return;
+            };
+            rows.clear_covers(segment);
+            for count in self.settled_rows.iter().filter(|count| count.segment == segment) {
+                rows.apply_counts(segment, slice::from_ref(count), None);
+                volume.table.drop_live(segment, count.block, count.rows, count.replacement);
+            }
+            self.settled_rows.retain(|count| count.segment != segment);
+            last = segment;
+        }
     }
 
     /// Find the first segment that keeps a cover in the pool: an open row or a sealed one it still hides. A cue needs no check of
@@ -444,6 +513,10 @@ impl<Backend: Io> CompactJob<Backend> {
                 return Ok(());
             };
             while let Some(row) = walk.next_row(&mut self.key) {
+                // a settled cover's row counts dead with nothing above it
+                if row.kind == RowKind::RangeDelete {
+                    continue;
+                }
                 let Ok(read) = self.state.key_read(block.column, &self.key, WritePlace(u64::MAX), false) else {
                     return Ok(());
                 };
@@ -454,7 +527,6 @@ impl<Backend: Io> CompactJob<Backend> {
                         // damage only answers for a row it could be newer than
                         let is_hidden = volume.damage.covering(block.column, &self.key).is_some_and(|highest| highest > row.place);
                         debug_assert!(is_replaced || is_covered || is_hidden, "the counts call a live row dead");
-                        debug_assert!(row.kind != RowKind::RangeDelete, "the counts call a range delete dead");
                     },
                     Err(StoreError::Corruption { .. }) => return Ok(()),
                     Err(_error) => return Err(Error::from(ErrorKind::Interrupted)),

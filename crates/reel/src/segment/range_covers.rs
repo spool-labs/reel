@@ -483,6 +483,12 @@ impl RangeCovers {
         self.count.store(count, Ordering::Release);
     }
 
+    /// Check a segment has any cover in the pool
+    pub fn holds_any(&self, segment: SegmentNumber) -> bool {
+        let pool = self.read();
+        pool.order.iter().any(|slot| pool.slots[*slot as usize].segment == segment)
+    }
+
     /// Check a segment has a cover that still has rows to wait for outside it
     pub fn holds_segment(&self, segment: SegmentNumber) -> bool {
         let pool = self.read();

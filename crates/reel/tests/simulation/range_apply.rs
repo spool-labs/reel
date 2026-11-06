@@ -489,3 +489,56 @@ fn unlink_waits_for_the_apply() {
     assert_eq!(compaction.pick_dead(volume), Some(newer));
     store.close().expect("close");
 }
+
+// a settled cover costs its segment no rewrite, and open leaves it out of the pool
+#[test]
+fn settled_cover_stays_put() {
+    let io = SimulatedIo::new(Seed(16));
+    let store = open(&io);
+    put_keys(&store, "a", b"value");
+    let older = seal(&store, &io);
+    store.delete_range(COLUMN, b"a-000", b"a-001").expect("delete");
+    put_keys(&store, "z", b"value");
+    let holder = seal(&store, &io);
+    settle(&io);
+    let volume = &store.state.volumes[0];
+    assert_eq!(pending(&store), 1);
+
+    // the row under it goes at its own segment's rewrite, and the holder stays as it was
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    job.rewrite.forced = Some(older);
+    job.rewrite.start();
+    while job.rewrite.is_running() {
+        job.rewrite.step();
+    }
+    store.state.ask_compaction();
+    settle(&io);
+    assert_eq!(pending(&store), 0);
+    assert!(volume.table.holds(holder));
+    assert!(!hold(&volume.summary).get(holder).expect("a row").facts.has_covers);
+    store.close().expect("close");
+
+    let store = open(&io);
+    assert_eq!(pending(&store), 0);
+    // the row stays this tail's, with its counts and its walk, or open would rebuild it and lose them
+    let rows = hold(&store.state.volumes[0].summary);
+    assert!(rows.get(holder).expect("a row").facts.is_walked());
+    drop(rows);
+    assert_eq!(read(&store, b"a-000"), None);
+    assert_eq!(read(&store, b"z-000"), Some(b"value".to_vec()));
+    store.close().expect("close");
+}
+
+// a segment that held nothing but a settled cover goes like any other dead segment
+#[test]
+fn cover_alone_goes() {
+    let io = SimulatedIo::new(Seed(17));
+    let store = open(&io);
+    store.delete_range(COLUMN, b"a", b"b").expect("delete");
+    let holder = seal(&store, &io);
+    settle(&io);
+
+    assert_eq!(pending(&store), 0);
+    assert!(!store.state.volumes[0].table.holds(holder));
+    store.close().expect("close");
+}

@@ -9,6 +9,7 @@ mod column_directory;
 mod complete_table;
 mod damage_list;
 mod device_error;
+mod filter_arena;
 mod engine_sizing;
 mod lifetime;
 mod lz4_block;

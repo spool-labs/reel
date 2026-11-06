@@ -632,6 +632,7 @@ impl<Backend: Io> CompactJob<Backend> {
                 return Err(Error::from(ErrorKind::OutOfMemory));
             }
         }
+        self.state.filter_arena.drop_segment(segment);
         let Some(retired) = volume.table.retire(segment) else {
             return Ok(());
         };

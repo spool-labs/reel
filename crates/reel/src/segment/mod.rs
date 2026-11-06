@@ -5,6 +5,7 @@ pub mod block_entry;
 pub mod block_filter;
 pub mod footer_reader;
 pub mod footer_writer;
+pub mod filter_arena;
 pub mod column_directory;
 pub mod damage_list;
 pub mod range_covers;

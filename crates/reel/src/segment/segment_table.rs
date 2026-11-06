@@ -481,6 +481,9 @@ impl<File: Clone> SegmentTable<File> {
         let guard = self.read_shard(shard_of(number));
         let slot = guard.map.get(number)?;
         let entry = guard.segments[slot as usize].as_ref()?;
+        if index >= entry.blocks.length {
+            return None;
+        }
         let line = guard.blocks.get(entry.blocks.start as usize + index as usize)?;
         Some((*line, entry.highest_replacement))
     }

@@ -1,0 +1,200 @@
+//! Filter blocks stay in memory while they fit, so a get that misses reads nothing
+
+use std::path::{Path, PathBuf};
+
+use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::engine::reel_store::ReelStore;
+use reel::io::Io;
+use reel::record::codec::Codec;
+use reel_api::column_id::ColumnId;
+use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RowCount, VolumeId};
+use reel_sim::file_image::BitMask;
+use reel_sim::seeded_random::Seed;
+use reel_sim::simulated_io::SimulatedIo;
+
+const ROOT: &str = "/disk/filters";
+const COLUMN: ColumnId = ColumnId(1);
+const COMPLETE: ColumnId = ColumnId(2);
+const BUDGET: ByteCount = ByteCount(64 * 1024 * 1024);
+const TICK: Nanoseconds = Nanoseconds(1_000_000);
+const STEPS: u64 = 400_000;
+const KEYS: u64 = 3_000;
+const MISSES: u64 = 500;
+
+type Store = ReelStore<SimulatedIo>;
+
+fn config() -> StoreConfig {
+    StoreConfig {
+        memory_budget: BUDGET,
+        threads: reel::config::NO_WORKERS,
+        volumes: vec![VolumeConfig {
+            name: "filters".to_string(),
+            roots: vec![PathBuf::from(ROOT)],
+            sync: SyncPolicy::Never,
+            device: Default::default(),
+        }],
+        columns: vec![ColumnConfig {
+            id: COLUMN,
+            name: "column".to_string(),
+            key_shape: KeyShape::Variable { most: 64 },
+            codec: Codec::None,
+            volume: VolumeId(0),
+            complete_rows: None,
+        }],
+    }
+}
+
+fn open(io: &SimulatedIo) -> Store {
+    ReelStore::open(io.clone(), &config()).expect("open")
+}
+
+fn settle(io: &SimulatedIo) {
+    for _step in 0..STEPS {
+        if io.step_any().is_none() {
+            io.advance_clock(TICK);
+            if io.step_any().is_none() {
+                return;
+            }
+        }
+    }
+    panic!("jobs never went quiet");
+}
+
+fn key(number: u64) -> Vec<u8> {
+    format!("key-{number:06}").into_bytes()
+}
+
+fn filled(io: &SimulatedIo) -> Store {
+    let store = open(io);
+    for number in 0..KEYS {
+        store.put(COLUMN, &key(2 * number), b"value").expect("put");
+    }
+    store.seal_now();
+    settle(io);
+    store
+}
+
+// a sealed segment's filters come into memory with no read asked for, and misses then read nothing
+#[test]
+fn misses_read_nothing() {
+    let io = SimulatedIo::new(Seed(1));
+    let store = filled(&io);
+    let before = io.read_count().0;
+    let mut buf = Vec::new();
+    for number in 0..MISSES {
+        assert!(!store.get(COLUMN, &key(2 * number + 1), &mut buf).expect("get"));
+    }
+    assert_eq!(io.read_count().0, before);
+    store.close().expect("close");
+}
+
+// an open starts with nothing resident and the loader brings the filters back, with reads answering all the while
+#[test]
+fn reopen_loads_again() {
+    let io = SimulatedIo::new(Seed(2));
+    let store = filled(&io);
+    store.close().expect("close");
+    drop(store);
+
+    let store = open(&io);
+    let mut buf = Vec::new();
+    assert!(store.get(COLUMN, &key(0), &mut buf).expect("get"));
+    assert!(!store.get(COLUMN, &key(1), &mut buf).expect("get"));
+    settle(&io);
+    let before = io.read_count().0;
+    assert!(!store.get(COLUMN, &key(3), &mut buf).expect("get"));
+    assert_eq!(io.read_count().0, before);
+    store.close().expect("close");
+}
+
+// a segment's going takes its filters with it
+#[test]
+fn unlink_frees_the_room() {
+    let io = SimulatedIo::new(Seed(3));
+    let store = filled(&io);
+    let segment = reel::guard::hold(&store.state.volumes[0].summary).rows().next().expect("a row").facts.segment;
+    assert!(store.state.filter_arena.holds(segment));
+    for number in 0..KEYS {
+        store.delete(COLUMN, &key(2 * number)).expect("delete");
+    }
+    store.seal_now();
+    settle(&io);
+    store.state.ask_compaction();
+    settle(&io);
+    assert!(!store.state.filter_arena.holds(segment));
+    store.close().expect("close");
+}
+
+// a segment with no filters to hold takes no room, and the older segments behind it still load
+#[test]
+fn passes_a_segment_without_filters() {
+    let io = SimulatedIo::new(Seed(4));
+    let mut config = config();
+    config.columns.push(ColumnConfig {
+        id: COMPLETE,
+        name: "complete".to_string(),
+        key_shape: KeyShape::Variable { most: 64 },
+        codec: Codec::None,
+        volume: VolumeId(0),
+        complete_rows: Some(RowCount(KEYS)),
+    });
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    for number in 0..KEYS {
+        store.put(COLUMN, &key(2 * number), b"value").expect("put");
+    }
+    store.seal_now();
+    settle(&io);
+    store.put(COMPLETE, b"only", b"value").expect("put");
+    store.seal_now();
+    settle(&io);
+    store.close().expect("close");
+    drop(store);
+
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    settle(&io);
+    let before = io.read_count().0;
+    let mut buf = Vec::new();
+    assert!(!store.get(COLUMN, &key(1), &mut buf).expect("get"));
+    assert_eq!(io.read_count().0, before);
+    store.close().expect("close");
+}
+
+// a filter that fails its check keeps its segment out of memory, and the loader moves on and goes quiet
+#[test]
+fn rotted_filter_stays_out() {
+    let io = SimulatedIo::new(Seed(5));
+    let store = filled(&io);
+    let segment = reel::guard::hold(&store.state.volumes[0].summary).rows().next().expect("a row").facts.segment;
+    let (line, _replacement) = store.state.volumes[0].table.block_line(segment, 0).expect("a block");
+    store.close().expect("close");
+    drop(store);
+    let listing = io.list_directory(Path::new(ROOT)).expect("list");
+    let path = listing.into_iter().find(|path| path.extension().is_some_and(|name| name == "data")).expect("a segment");
+    io.rot(&path, FileOffset(u64::from(line.filter_offset)), BitMask(1)).expect("rot");
+
+    let store = open(&io);
+    settle(&io);
+    assert!(!store.state.filter_arena.holds(segment));
+    store.close().expect("close");
+}
+
+// a rewrite's inputs take their filters with them
+#[test]
+fn rewrite_frees_the_room() {
+    let io = SimulatedIo::new(Seed(6));
+    let store = filled(&io);
+    let segment = reel::guard::hold(&store.state.volumes[0].summary).rows().next().expect("a row").facts.segment;
+    assert!(store.state.filter_arena.holds(segment));
+    for number in 0..KEYS * 3 / 4 {
+        store.put(COLUMN, &key(2 * number), b"newer").expect("put");
+    }
+    store.seal_now();
+    settle(&io);
+    store.state.ask_compaction();
+    settle(&io);
+    let rows = reel::guard::hold(&store.state.volumes[0].summary);
+    assert!(rows.rows().all(|row| row.facts.segment != segment));
+    drop(rows);
+    assert!(!store.state.filter_arena.holds(segment));
+    store.close().expect("close");
+}

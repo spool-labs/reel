@@ -28,6 +28,7 @@ mod seed_sets;
 mod volume_marks;
 mod write_index;
 mod faults;
+mod filters;
 mod done_flag;
 mod footers;
 mod free_in_place;

@@ -12,6 +12,7 @@ use reel_api::units::Nanoseconds;
 
 use crate::engine::compact_job::CompactJob;
 use crate::engine::engine_state::EngineState;
+use crate::engine::filter_job::FilterLoader;
 use crate::engine::open_segment::{OpenSegment, SegmentPhase};
 use crate::engine::volume::Volume;
 use crate::engine::walk_job::WalkJob;
@@ -43,6 +44,7 @@ pub struct Planner<Backend: Io> {
     pub state: Arc<EngineState<Backend>>,
     pub walks: Vec<WalkJob<Backend>>,
     pub compactions: Vec<CompactJob<Backend>>,
+    pub filters: Vec<FilterLoader<Backend>>,
     pub last: usize,
 }
 
@@ -122,6 +124,14 @@ impl<Backend: Io> Job for Planner<Backend> {
             if self.note_step(index, step, &mut soonest) {
                 return JobStep::Worked;
             }
+        }
+        // filters come last, and any left to load bring the planner back
+        let mut has_filters_left = false;
+        for loader in &mut self.filters {
+            has_filters_left |= loader.step();
+        }
+        if has_filters_left {
+            return JobStep::Worked;
         }
         match soonest {
             Some(deadline) => JobStep::IdleUntil { deadline },

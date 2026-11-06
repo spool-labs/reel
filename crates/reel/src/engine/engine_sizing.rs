@@ -100,6 +100,8 @@ pub const LEAST_LZ4_BUDGET: ByteCount = ByteCount(2 * LZ4_STORED_LIMIT.0);
 pub const FILTER_CACHE_QUARTERS: u64 = 3;
 /// Bytes of a filter cache slot, which holds the filter of a full block of typical rows
 pub const FILTER_SLOT_BYTES: usize = 4 * 1024;
+/// Eighths of the filters' share that stay resident, and the rest cache what the arena has no room for
+pub const FILTER_ARENA_EIGHTHS: u64 = 7;
 /// Read buffers a store keeps
 pub const READ_BUFFERS: usize = 8;
 /// Bytes of the buffer a batch gathers its records in, which holds the largest one-chunk record

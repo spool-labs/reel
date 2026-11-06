@@ -1416,6 +1416,9 @@ impl<Backend: Io> RewriteJob<Backend> {
         for input in inputs {
             volume.covers.remove_segment(*input);
         }
+        for input in inputs {
+            self.state.filter_arena.drop_segment(*input);
+        }
         let retired: [_; MOST_MERGE_SEGMENTS] = array::from_fn(|index| inputs.get(index).and_then(|number| volume.table.retire(*number)));
         self.note_install();
         volume.lanes[self.lane].rewrites_done.fetch_add(1, Ordering::AcqRel);

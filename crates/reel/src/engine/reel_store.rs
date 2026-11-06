@@ -20,7 +20,7 @@ use crate::config::{ColumnConfig, DeviceClass, NO_WORKERS, StoreConfig, VolumeCo
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::engine_sizing::{
     complete_block_rows, complete_row_limit,
-    EngineSizing, FILTER_CACHE_QUARTERS, FILTER_SLOT_BYTES, GROUP_BYTES, LEAST_LZ4_BUDGET, PLANNED_COLUMN_BYTES, PLANNED_LINE_BYTES, SHARED_JOBS,
+    EngineSizing, FILTER_ARENA_EIGHTHS, FILTER_CACHE_QUARTERS, FILTER_SLOT_BYTES, GROUP_BYTES, LEAST_LZ4_BUDGET, PLANNED_COLUMN_BYTES, PLANNED_LINE_BYTES, SHARED_JOBS,
     PLANNED_SEGMENT_BYTES, StoreShape, GATHER_BYTES, READ_BUFFERS, WRITE_BUFFERS,
 };
 use crate::engine::engine_state::{EngineState, PLACE_RUN, SEGMENT_NUMBER_BATCH, SlotFile};
@@ -43,6 +43,7 @@ use crate::engine::seal_job::{MOST_SEGMENT_BLOCKS, SealJob};
 use crate::engine::store_scan::StoreScan;
 use crate::engine::compact_job::{CompactJob, park};
 use crate::engine::cue::{Cue, CueTable};
+use crate::engine::filter_job::FilterLoader;
 use crate::engine::planner::Planner;
 use crate::engine::walk_job::{BlockCounter, WalkJob, WalkSlot, WalkWorker};
 use crate::engine::volume::{SealStepTimes, ClaimState, GaveUp, MOST_MERGE_OUTPUTS, MOST_PARKED, NO_SEAL, RewriteLane, SyncState, Volume};
@@ -60,7 +61,8 @@ use crate::record::record_check::RecordKey;
 use crate::record::record_encoder::{RecordEncoder, SHARE_BYTES};
 use crate::record::record_reader::RecordReader;
 use crate::rows::row_group::RowGroupBuffer;
-use crate::segment::block_cache::BlockCache;
+use crate::segment::block_cache::{BlockCache, CACHE_SHARDS, CACHE_WAYS};
+use crate::segment::filter_arena::FilterArena;
 use crate::segment::column_directory::ColumnDirectory;
 use crate::segment::damage_list::{DamageList, MOST_DAMAGED_SPANS, SPAN_KEY_BYTES};
 use crate::segment::range_covers::RangeCovers;
@@ -646,6 +648,7 @@ pub fn bring_up<Backend: Io>(
         state: Arc::clone(state),
         walks,
         compactions,
+        filters: (0..state.volumes.len()).map(|volume| FilterLoader::new(Arc::clone(state), volume)).collect(),
         last: 0,
     };
     let task = state.io.spawn_job("reel-planner", planner).map_err(open_error("starting a job"))?;
@@ -1148,6 +1151,11 @@ pub fn build_state<Backend: Io>(
     }
 
     let filter_share = ByteCount(sizing.cache_share.0 / 4 * FILTER_CACHE_QUARTERS);
+    // the cache takes whole stripes, so the arena works in them too and the pair never holds more than the cache alone would
+    let stripe = (CACHE_SHARDS * CACHE_WAYS * FILTER_SLOT_BYTES) as u64;
+    let whole = filter_share.0 / stripe * stripe;
+    let cache_room = (filter_share.0 / 8 * (8 - FILTER_ARENA_EIGHTHS)).max(stripe).next_multiple_of(stripe);
+    let arena_share = ByteCount(whole.saturating_sub(cache_room));
     let is_complete = config.columns.iter().any(|column| column.complete_rows.is_some());
     let block_share = ByteCount(sizing.cache_share.0 - filter_share.0);
     // complete columns read small blocks, and a slot sized for a full block would hold a sixteenth of what it could
@@ -1167,7 +1175,8 @@ pub fn build_state<Backend: Io>(
         places,
         index: WriteIndex::new(&sizing.shard),
         spot: SpotIndex::new(sizing.spot_share),
-        filter_cache: BlockCache::new(filter_share, FILTER_SLOT_BYTES),
+        filter_cache: BlockCache::new(ByteCount(filter_share.0 - arena_share.0), FILTER_SLOT_BYTES),
+        filter_arena: FilterArena::new(arena_share, segments_per_shard * TABLE_SHARDS * config.volumes.len()),
         row_cache: BlockCache::new(row_share, ROW_BLOCK_BYTES),
         complete_cache: is_complete.then(|| BlockCache::new(complete_share, COMPLETE_BLOCK_BYTES)),
         complete_line_bytes: ByteCount(complete_lines(config) * size_of::<BlockEntry>() as u64),

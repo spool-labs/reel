@@ -887,6 +887,7 @@ impl<Backend: Io> EngineState<Backend> {
         reader: &mut FooterReader,
     ) -> Result<Option<FooterRow>, StoreError> {
         let caches = FooterCaches {
+            resident: &self.filter_arena,
             filters: &self.filter_cache,
             rows: &self.row_cache,
         };

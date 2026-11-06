@@ -101,6 +101,7 @@ impl<Backend: Io> EngineState<Backend> {
             return Ok(());
         };
         let caches = FooterCaches {
+            resident: &self.filter_arena,
             filters: &self.filter_cache,
             rows: self.complete_cache.as_ref().unwrap_or(&self.row_cache),
         };

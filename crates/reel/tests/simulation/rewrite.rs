@@ -1599,6 +1599,7 @@ fn merge_ahead_of_a_walk_target() {
         state: Arc::clone(state),
         walks: vec![WalkJob::new(Arc::clone(state), 0)],
         compactions: vec![CompactJob::new(Arc::clone(state), 0)],
+        filters: Vec::new(),
         last: 0,
     };
     assert!(planner.walks[0].pick_target());

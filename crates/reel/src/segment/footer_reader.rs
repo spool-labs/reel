@@ -12,6 +12,7 @@ use crate::record::record_check::{Checksum, RecordKey, checksum};
 use crate::segment::column_directory::Candidate;
 use crate::segment::block_cache::{BlockCache, BlockKey};
 use crate::segment::block_entry::{BLOCK_ENTRY_BYTES, BlockEntry, KeyPrefix};
+use crate::segment::filter_arena::FilterArena;
 use crate::segment::block_filter::{may_contain, open_filter};
 use crate::segment::footer_writer::fold_sum;
 use crate::segment::row_block::{FooterRow, ROW_BLOCK_BYTES, RowBlockWalk};
@@ -72,6 +73,7 @@ pub struct FooterQuery<'key> {
 /// The caches a footer read goes through
 #[derive(Clone, Copy, Debug)]
 pub struct FooterCaches<'cache> {
+    pub resident: &'cache FilterArena,
     pub filters: &'cache BlockCache,
     pub rows: &'cache BlockCache,
 }
@@ -281,6 +283,11 @@ impl FooterReader {
         Ok(true)
     }
 
+    /// Lend the filter buffer for a read of this many bytes, or nothing when a filter that long can't be one
+    pub fn filter_room(&mut self, length: usize) -> Option<&mut [u8]> {
+        self.filter.get_mut(..length)
+    }
+
     /// Search one window of block lines, through the caches
     pub async fn lookup_window<File: IoFile>(
         &mut self,
@@ -329,6 +336,9 @@ impl FooterReader {
             offset: entry.filter_offset,
         };
         let hash = query.hash;
+        if let Some(may_hold) = caches.resident.with_filter(segment, entry.filter_offset, |bits| may_contain(bits, hash)) {
+            return Ok(FilterAnswer::of(may_hold));
+        }
         if let Some(may_hold) = caches.filters.with(key, |bits| may_contain(bits, hash)) {
             return Ok(FilterAnswer::of(may_hold));
         }

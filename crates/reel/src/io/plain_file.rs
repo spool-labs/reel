@@ -126,6 +126,14 @@ impl IoFile for PlainFile {
         self.write_remainder(offset, parts, written)
     }
 
+    fn try_read_at(&self, offset: FileOffset, buf: &mut [u8]) -> Result<Option<ByteCount>> {
+        read_no_wait(self.descriptor, offset, &mut [IoSliceMut::new(buf)])
+    }
+
+    fn try_read_parts_at(&self, offset: FileOffset, parts: &mut [IoSliceMut]) -> Result<Option<ByteCount>> {
+        read_no_wait(self.descriptor, offset, parts)
+    }
+
     fn start_writeback(&self, offset: FileOffset, length: ByteCount) -> Result<()> {
         start_descriptor_writeback(self.descriptor, offset, length)
     }
@@ -305,4 +313,27 @@ pub fn start_descriptor_writeback(descriptor: RawFd, offset: FileOffset, length:
 #[cfg(not(target_os = "linux"))]
 pub fn start_descriptor_writeback(_descriptor: RawFd, _offset: FileOffset, _length: ByteCount) -> Result<()> {
     Ok(())
+}
+
+/// Read parts from what the kernel holds, and say nothing came when the read would block
+#[cfg(target_os = "linux")]
+pub fn read_no_wait(descriptor: RawFd, offset: FileOffset, parts: &mut [IoSliceMut<'_>]) -> Result<Option<ByteCount>> {
+    let vectors = parts.as_ptr().cast::<libc::iovec>();
+    // SAFETY: `IoSliceMut` matches `iovec`, and each part stays borrowed for the call
+    let count = unsafe { libc::preadv2(descriptor, vectors, parts.len() as libc::c_int, offset.0 as i64, libc::RWF_NOWAIT) };
+    if count >= 0 {
+        return Ok(Some(ByteCount(count as u64)));
+    }
+    let error = Error::last_os_error();
+    match error.raw_os_error() {
+        // a filesystem with no such read answers as one that would block, and the read goes the long way
+        Some(libc::EAGAIN | libc::EOPNOTSUPP) => Ok(None),
+        _other => Err(error),
+    }
+}
+
+/// Say every read would block, on a system with no read that refuses to wait
+#[cfg(not(target_os = "linux"))]
+pub fn read_no_wait(_descriptor: RawFd, _offset: FileOffset, _parts: &mut [IoSliceMut<'_>]) -> Result<Option<ByteCount>> {
+    Ok(None)
 }

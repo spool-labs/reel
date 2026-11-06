@@ -12,6 +12,7 @@ mod damage;
 mod dead_walk;
 mod idle_seal;
 mod io_contract;
+mod latest;
 mod marks;
 mod place_limit;
 mod prefix_counts;

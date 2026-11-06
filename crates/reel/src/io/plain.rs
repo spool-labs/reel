@@ -64,14 +64,14 @@ pub struct PlainLock {
 }
 
 impl PlainIo {
-    /// Start a backend whose clock counts from now, with async reads on the blocking pool
+    /// Start a backend whose clock counts from now, with reads that would block on the kernel's ring
     pub fn new() -> Self {
-        Self { origin: Instant::now(), has_ring: false }
+        Self { origin: Instant::now(), has_ring: true }
     }
 
-    /// Start a backend whose async reads go through the kernel's ring
-    pub fn with_ring() -> Self {
-        Self { origin: Instant::now(), has_ring: true }
+    /// Start a backend whose reads that would block run on the blocking pool
+    pub fn without_ring() -> Self {
+        Self { origin: Instant::now(), has_ring: false }
     }
 }
 

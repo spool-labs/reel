@@ -105,17 +105,21 @@ fn value(number: u64) -> Vec<u8> {
 fn ringed(seed: u64) -> (SimulatedIo, Store2) {
     let io = SimulatedIo::new(Seed(seed));
     io.use_ring();
-    let store = open(&io);
+    let store = filled(&io);
+    (io, store)
+}
+
+fn filled(io: &SimulatedIo) -> Store2 {
+    let store = open(io);
     for number in 0..KEYS {
         store.put(COLUMN, &key(number), &value(number)).expect("put");
     }
     store.seal_now();
-    settle(&io);
+    settle(io);
     // a fresh open has nothing cached, so reads go to the device
     store.close().expect("close");
     drop(store);
-    let store = open(&io);
-    (io, store)
+    open(io)
 }
 
 fn ring(store: &Store2) -> &ReadRing<SimulatedRing> {
@@ -454,6 +458,82 @@ fn read_future_size() {
     eprintln!("get future: {size} B");
     assert!(size < MOST_FUTURE_BYTES, "{size} B");
     drop(read);
+    store.close().expect("close");
+}
+
+// a read the kernel holds answers on the first poll, with the ring left alone
+#[test]
+fn warm_read_skips_the_ring() {
+    let (io, store) = ringed(35);
+    io.set_warm_bytes(usize::MAX);
+    let name = key(21);
+    let mut buf = Vec::new();
+    {
+        let mut read = pin!(Reads::get_async(&store, COLUMN, &name, &mut buf));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(read.as_mut().poll(&mut context), Poll::Ready(Ok(true))));
+    }
+    assert_eq!(buf, value(21));
+    store.close().expect("close");
+}
+
+// a try that brings part of a read leaves the rest to the ring, and the value comes back whole
+#[test]
+fn short_try_finishes_on_the_ring() {
+    let (io, store) = ringed(36);
+    io.set_warm_bytes(3);
+    let name = key(22);
+    let mut buf = Vec::new();
+    assert!(run(&io, Reads::get_async(&store, COLUMN, &name, &mut buf)).expect("get"));
+    assert_eq!(buf, value(22));
+    store.close().expect("close");
+}
+
+// on the pool backend a read the kernel holds answers on the caller's task too, with no worker stepped
+#[test]
+fn warm_read_skips_the_pool() {
+    let io = SimulatedIo::new(Seed(37));
+    let store = filled(&io);
+    io.set_warm_bytes(usize::MAX);
+    let name = key(23);
+    let mut buf = Vec::new();
+    {
+        let mut read = pin!(Reads::get_async(&store, COLUMN, &name, &mut buf));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(read.as_mut().poll(&mut context), Poll::Ready(Ok(true))));
+    }
+    assert_eq!(buf, value(23));
+    store.close().expect("close");
+}
+
+// a read that would block leaves the caller's task, and a worker brings the answer
+#[test]
+fn cold_read_goes_to_the_pool() {
+    let io = SimulatedIo::new(Seed(38));
+    let store = filled(&io);
+    let name = key(24);
+    let mut buf = Vec::new();
+    {
+        let mut read = pin!(Reads::get_async(&store, COLUMN, &name, &mut buf));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(read.as_mut().poll(&mut context).is_pending());
+        settle(&io);
+        assert!(matches!(read.as_mut().poll(&mut context), Poll::Ready(Ok(true))));
+    }
+    assert_eq!(buf, value(24));
+    store.close().expect("close");
+}
+
+// a try that stops partway leaves no trace in the answer of the read that follows
+#[test]
+fn half_warm_read_answers_whole() {
+    let io = SimulatedIo::new(Seed(39));
+    let store = filled(&io);
+    io.set_warm_bytes(3);
+    let name = key(25);
+    let mut buf = b"left over".to_vec();
+    assert!(run(&io, Reads::get_async(&store, COLUMN, &name, &mut buf)).expect("get"));
+    assert_eq!(buf, value(25));
     store.close().expect("close");
 }
 

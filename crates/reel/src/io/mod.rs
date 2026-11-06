@@ -10,7 +10,7 @@ pub mod ring;
 #[cfg(target_os = "linux")]
 pub mod uring;
 
-use std::future::{Future, ready};
+use std::future::{Future, pending, ready};
 use std::io::{IoSlice, IoSliceMut, Result};
 use std::path::{Path, PathBuf};
 use std::pin::pin;
@@ -35,6 +35,12 @@ pub trait IoFile: Clone + Send + Sync {
 
     /// Write every part at the offset in one write call
     fn write_at(&self, offset: FileOffset, parts: &[IoSlice]) -> Result<()>;
+
+    /// Read what the kernel holds with no wait for the device: how many bytes came, or nothing when it would block
+    fn try_read_at(&self, offset: FileOffset, buf: &mut [u8]) -> Result<Option<ByteCount>>;
+
+    /// Read parts from what the kernel holds in one call, as `try_read_at` does
+    fn try_read_parts_at(&self, offset: FileOffset, parts: &mut [IoSliceMut]) -> Result<Option<ByteCount>>;
 
     /// Start a range on its way to the device, with no wait for it and no promise it lands
     fn start_writeback(&self, offset: FileOffset, length: ByteCount) -> Result<()>;
@@ -101,6 +107,47 @@ impl<File: IoFile> DeviceReads<File> for InPlace {
 
     fn read_parts(&self, file: &File, offset: FileOffset, parts: &mut [IoSliceMut<'_>]) -> impl Future<Output = Result<()>> + Send {
         ready(file.read_parts_at(offset, parts))
+    }
+}
+
+/// Reads that answer from what the kernel holds and never finish past that, so a poll that comes back pending found a read
+/// that would block, or one that failed, and the long way hears the real answer
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OnlyWarm;
+
+impl<File: IoFile> DeviceReads<File> for OnlyWarm {
+    fn read_exact(&self, file: &File, offset: FileOffset, buf: &mut [u8]) -> impl Future<Output = Result<()>> + Send {
+        let mut done = 0;
+        while done < buf.len() {
+            match file.try_read_at(FileOffset(offset.0 + done as u64), &mut buf[done..]) {
+                Ok(Some(ByteCount(count))) if count > 0 => done += count as usize,
+                Ok(Some(_) | None) | Err(_) => break,
+            }
+        }
+        finished_or_never(done == buf.len())
+    }
+
+    fn read_parts(&self, file: &File, offset: FileOffset, parts: &mut [IoSliceMut<'_>]) -> impl Future<Output = Result<()>> + Send {
+        let total: u64 = parts.iter().map(|part| part.len() as u64).sum();
+        let read = file.try_read_parts_at(offset, parts);
+        finished_or_never(matches!(read, Ok(Some(ByteCount(count))) if count == total))
+    }
+}
+
+/// Finish now when a read came whole, and never when it didn't
+pub async fn finished_or_never(is_whole: bool) -> Result<()> {
+    if !is_whole {
+        pending::<()>().await;
+    }
+    Ok(())
+}
+
+/// Poll a read once, and return its answer when nothing in it had to wait
+pub fn poll_once<Output>(read: impl Future<Output = Output>) -> Option<Output> {
+    let mut read = pin!(read);
+    match read.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(output) => Some(output),
+        Poll::Pending => None,
     }
 }
 

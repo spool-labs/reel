@@ -23,7 +23,7 @@ use crate::engine::scan_state::ScanState;
 use crate::guard::hold;
 use crate::io::job::{Job, JobStep};
 use crate::io::ring::{OnRing, ReadRing};
-use crate::io::{DeviceReads, InPlace, Io, IoTask, in_place};
+use crate::io::{DeviceReads, InPlace, Io, IoTask, OnlyWarm, in_place, poll_once};
 use crate::pool::{touched_capacity, touched_queue};
 
 /// Async reads in flight at once
@@ -363,6 +363,13 @@ impl<Backend: Io> EngineState<Backend> {
         point: Option<WritePlace>,
         buf: &mut Vec<u8>,
     ) -> Result<bool, StoreError> {
+        if self.is_stopping.load(Ordering::Acquire) {
+            return Err(StoreError::Closed);
+        }
+        // what the kernel holds answers on this task, with no hop to a worker
+        if let Some(answer) = poll_once(self.get_one_on(&OnlyWarm, column, key, want, point, buf)) {
+            return self.counted(answer);
+        }
         if let Some(ring) = &self.ring {
             return self.get_on_ring(ring, column, key, want, point, buf).await;
         }
@@ -386,6 +393,17 @@ impl<Backend: Io> EngineState<Backend> {
         handovers: u64,
         values: &mut ValueList,
     ) -> Result<(), StoreError> {
+        if self.is_stopping.load(Ordering::Acquire) {
+            return Err(StoreError::Closed);
+        }
+        values.clear();
+        let mut scratch = values.take_scratch();
+        let warm = poll_once(self.read_keys(&OnlyWarm, column, keys, ReadAt { point, handovers }, values, &mut scratch));
+        values.put_scratch(scratch);
+        if let Some(answer) = warm {
+            self.corruption_errors.fetch_add(values.corrupt_count(), Ordering::Relaxed);
+            return answer;
+        }
         values.clear();
         if let Some(ring) = &self.ring {
             return self.many_on_ring(ring, column, keys, point, handovers, values).await;

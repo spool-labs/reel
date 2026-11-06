@@ -247,7 +247,7 @@ fn get_crossed() {
     assert!(!store.state.volumes[0].table.holds(older));
 
     let mut buf = Vec::new();
-    assert!(in_place(store.state.answer_latest(&InPlace, &latest, RecordWant::Whole, &mut buf)).is_none());
+    assert!(crate::latest::answer(&store, &latest, RecordWant::Whole, &mut buf).is_none());
     assert_eq!(read(&store), Some(b"newer".to_vec()));
     store.close().expect("close");
 }

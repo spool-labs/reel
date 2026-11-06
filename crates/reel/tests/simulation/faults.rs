@@ -39,6 +39,8 @@ const BUDGET: ByteCount = ByteCount(120 * 1024 * 1024);
 // `wrong_place`. Seeds 1 and 1000 are mapped from notes, with no replay. The rest are plain extra seeds
 const SEEDS: [u64; 10] = [0, 1, 2, 3, 17, 31, 37, 62, 681, 7_157];
 const WORKERS_BUDGET: ByteCount = ByteCount(256 * 1024 * 1024);
+const WARM_READ_ODDS: u64 = 5;
+const WARM_READ_BYTES: usize = 64;
 const WORKER_SEED_STRIDE: u64 = 9;
 const RING_SEED_STRIDE: u64 = 13;
 const MARK_SEED_STRIDE: u64 = 11;
@@ -871,6 +873,12 @@ fn ring_io(seed: u64) -> SimulatedIo {
     let io = SimulatedIo::new(Seed(seed));
     if has_ring(seed) {
         io.use_ring();
+    }
+    // some seeds read from a warm kernel, whole or a few bytes at a time
+    match seed % WARM_READ_ODDS {
+        1 => io.set_warm_bytes(usize::MAX),
+        2 => io.set_warm_bytes(WARM_READ_BYTES),
+        _cold => {},
     }
     io
 }

@@ -1,11 +1,12 @@
 //! Fixed buffers shared by every thread: a caller takes one or waits
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::hint::black_box;
 use std::mem::{self, MaybeUninit};
 use std::ops::{Deref, DerefMut};
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 use std::sync::{Condvar, Mutex, MutexGuard};
 
 use reel_api::units::ByteCount;
@@ -15,19 +16,46 @@ use crate::guard::hold;
 /// The byte a pool is first written with, which is not zero so the writes happen
 pub const TOUCH_BYTE: u8 = 0xA5;
 
-/// A fixed set of items, each owned by its user while in use so no lock spans a read. Callers are served in the
-/// order they came, and a caller who finds items free and nobody ahead never sleeps or wakes anyone
+/// Threads take their first look at slots in the order they first came to any pool
+static NEXT_THREAD: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    static THREAD_NUMBER: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Read this thread's number, which spreads threads over a pool's slots
+pub fn thread_number() -> usize {
+    THREAD_NUMBER.with(|cell| {
+        cell.get().unwrap_or_else(|| {
+            let number = NEXT_THREAD.fetch_add(1, Ordering::Relaxed);
+            cell.set(Some(number));
+            number
+        })
+    })
+}
+
+/// A fixed set of items, each owned by its user while in use so no lock spans a read. A thread looks first at its own slot, so
+/// readers don't share a lock or a cache line. Once every item is out callers wait in line, served in the order they came, and
+/// a caller who finds an item free and nobody ahead never sleeps or wakes anyone
 #[derive(Debug)]
 pub struct Pool<Item> {
-    state: Mutex<PoolState<Item>>,
+    slots: Vec<PoolSlot<Item>>,
+    line: Mutex<PoolLine>,
+    queued: AtomicU64,
     freed: Condvar,
     wakes: AtomicU64,
 }
 
-/// The free items, and the queue of callers waiting for them
+/// One item's place, on cache lines of its own
 #[derive(Debug)]
-pub struct PoolState<Item> {
-    free: Vec<Item>,
+#[repr(align(128))]
+pub struct PoolSlot<Item> {
+    item: Mutex<Option<Item>>,
+}
+
+/// The queue of callers waiting for items
+#[derive(Debug)]
+pub struct PoolLine {
     next_ticket: u64,
     serving: u64,
 }
@@ -72,22 +100,13 @@ impl<Item: HollowItem> Pool<Item> {
     }
 }
 
-impl<Item> PoolState<Item> {
-    /// Check nobody is in the queue
-    pub fn has_no_queue(&self) -> bool {
-        self.next_ticket == self.serving
-    }
-}
-
 impl<Item> Pool<Item> {
     /// Build a pool from its items
     pub fn new(items: Vec<Item>) -> Self {
         Self {
-            state: Mutex::new(PoolState {
-                free: items,
-                next_ticket: 0,
-                serving: 0,
-            }),
+            slots: items.into_iter().map(|item| PoolSlot { item: Mutex::new(Some(item)) }).collect(),
+            line: Mutex::new(PoolLine { next_ticket: 0, serving: 0 }),
+            queued: AtomicU64::new(0),
             freed: Condvar::new(),
             wakes: AtomicU64::new(0),
         }
@@ -96,8 +115,10 @@ impl<Item> Pool<Item> {
     /// Add up what the free items hold
     pub fn heap_bytes(&self, measure: fn(&Item) -> ByteCount) -> ByteCount {
         let mut total = 0;
-        for item in hold(&self.state).free.iter() {
-            total += measure(item).0;
+        for slot in &self.slots {
+            if let Some(item) = hold(&slot.item).as_ref() {
+                total += measure(item).0;
+            }
         }
         ByteCount(total)
     }
@@ -107,16 +128,16 @@ impl<Item> Pool<Item> {
         self.wakes.load(Ordering::Relaxed)
     }
 
-    /// Wake the queue
+    /// Wake the queue. Passing through the line's lock means a caller past its last look is asleep before the wake comes
     pub fn wake(&self) {
+        drop(hold(&self.line));
         self.wakes.fetch_add(1, Ordering::Relaxed);
         self.freed.notify_all();
     }
 
     /// Count the callers in the queue
     pub fn waiting(&self) -> u64 {
-        let state = hold(&self.state);
-        state.next_ticket - state.serving
+        self.queued.load(Ordering::Acquire)
     }
 
     /// Hand every item in a list back
@@ -124,14 +145,12 @@ impl<Item> Pool<Item> {
         if items.is_empty() {
             return;
         }
-        let mut state = hold(&self.state);
-        state.free.append(items);
-        let should_wake = !state.has_no_queue();
-        drop(state);
-        if should_wake {
-            self.wake();
+        for item in items.drain(..) {
+            self.put(item);
         }
+        self.wake_if_waited_for();
     }
+
     /// Run some work with an item, waiting for one when all are out
     pub fn with<Answer>(&self, work: impl FnOnce(&mut Item) -> Answer) -> Answer {
         let mut item = self.take();
@@ -146,14 +165,55 @@ impl<Item> Pool<Item> {
         }
     }
 
+    /// Take an item from the first free slot, starting at this thread's own
+    pub fn grab(&self) -> Option<Item> {
+        let start = thread_number();
+        for offset in 0..self.slots.len() {
+            let slot = &self.slots[(start + offset) % self.slots.len()];
+            if let Ok(mut held) = slot.item.try_lock()
+                && let Some(item) = held.take()
+            {
+                return Some(item);
+            }
+        }
+        None
+    }
+
+    /// Put an item in the first empty slot, which exists since every item has one
+    pub fn put(&self, item: Item) {
+        let start = thread_number();
+        let mut item = Some(item);
+        loop {
+            for offset in 0..self.slots.len() {
+                let slot = &self.slots[(start + offset) % self.slots.len()];
+                if let Ok(mut held) = slot.item.try_lock()
+                    && held.is_none()
+                {
+                    *held = item.take();
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Count the items free right now
+    pub fn free_count(&self) -> usize {
+        self.slots.iter().filter(|slot| hold(&slot.item).is_some()).count()
+    }
+
     /// Take a free item, waiting in line when all are out or others came first
     pub fn take(&self) -> Item {
-        let mut state = self.wait_for(1);
-        let item = state.free.pop();
-        self.leave_line(state);
+        if self.queued.load(Ordering::Acquire) == 0
+            && let Some(item) = self.grab()
+        {
+            return item;
+        }
+        let line = self.wait_for(1);
+        let item = self.grab();
+        self.leave_line(line);
         match item {
             Some(item) => item,
-            // the line only ends with an item free, and a wrong count just waits again
+            // a caller past its look at the line can take the item first, and this one waits again
             None => self.take(),
         }
     }
@@ -163,43 +223,59 @@ impl<Item> Pool<Item> {
         if count == 0 {
             return;
         }
-        let mut state = self.wait_for(count);
-        let first = state.free.len() - count;
-        items.extend(state.free.drain(first..));
-        self.leave_line(state);
+        let mut line = self.wait_for(count);
+        let wanted = items.len() + count;
+        while items.len() < wanted {
+            match self.grab() {
+                Some(item) => items.push(item),
+                None => line = self.sleep(line),
+            }
+        }
+        self.leave_line(line);
     }
 
     /// Wait until these items are free and nobody who came first is still waiting
-    pub fn wait_for(&self, count: usize) -> MutexGuard<'_, PoolState<Item>> {
-        let mut state = hold(&self.state);
-        let ticket = state.next_ticket;
-        state.next_ticket += 1;
-        while state.serving != ticket || state.free.len() < count {
-            state = match self.freed.wait(state) {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+    pub fn wait_for(&self, count: usize) -> MutexGuard<'_, PoolLine> {
+        let mut line = hold(&self.line);
+        let ticket = line.next_ticket;
+        line.next_ticket += 1;
+        self.queued.fetch_add(1, Ordering::AcqRel);
+        // pairs with the fence in `wake_if_waited_for`: this look or that one sees the other's write
+        fence(Ordering::SeqCst);
+        while line.serving != ticket || self.free_count() < count {
+            line = self.sleep(line);
         }
-        state
+        line
+    }
+
+    /// Sleep until the next wake
+    pub fn sleep<'pool>(&'pool self, line: MutexGuard<'pool, PoolLine>) -> MutexGuard<'pool, PoolLine> {
+        match self.freed.wait(line) {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 
     /// Pass the line on, waking it only when someone is in it and an item is left for them
-    pub fn leave_line(&self, mut state: MutexGuard<'_, PoolState<Item>>) {
-        state.serving += 1;
-        let should_wake = !state.has_no_queue() && !state.free.is_empty();
-        drop(state);
-        if should_wake {
+    pub fn leave_line(&self, mut line: MutexGuard<'_, PoolLine>) {
+        line.serving += 1;
+        let left = self.queued.fetch_sub(1, Ordering::AcqRel) - 1;
+        drop(line);
+        if left > 0 && self.free_count() > 0 {
             self.wake();
         }
     }
 
     /// Hand an item back, waking the queue only when there is one
     pub fn give_back(&self, item: Item) {
-        let mut state = hold(&self.state);
-        state.free.push(item);
-        let should_wake = !state.has_no_queue();
-        drop(state);
-        if should_wake {
+        self.put(item);
+        self.wake_if_waited_for();
+    }
+
+    /// Wake the queue when someone is in it
+    pub fn wake_if_waited_for(&self) {
+        fence(Ordering::SeqCst);
+        if self.queued.load(Ordering::Acquire) > 0 {
             self.wake();
         }
     }

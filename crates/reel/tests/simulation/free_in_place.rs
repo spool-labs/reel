@@ -206,7 +206,7 @@ fn read_crossed() {
 
     let mut buf = Vec::new();
     let want = RecordWant::Whole;
-    assert!(in_place(store.state.answer_latest(&InPlace, &latest, want, &mut buf)).is_none());
+    assert!(crate::latest::answer(&store, &latest, want, &mut buf).is_none());
     assert_eq!(read(&store, b"key"), Some(large(2)));
     store.close().expect("close");
 }
@@ -231,7 +231,7 @@ fn read_outlives_frees() {
     assert!(store.state.cues.counts().frees >= latest.counts.frees + HELD_RECORDS);
 
     let mut buf = Vec::new();
-    let answer = in_place(store.state.answer_latest(&InPlace, &latest, RecordWant::Whole, &mut buf)).expect("an answer");
+    let answer = crate::latest::answer(&store, &latest, RecordWant::Whole, &mut buf).expect("an answer");
     assert!(answer.expect("get"));
     assert_eq!(buf, large(3));
     store.close().expect("close");

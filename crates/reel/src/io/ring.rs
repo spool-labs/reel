@@ -353,9 +353,16 @@ impl<Driver> ReadRing<Driver> {
     pub async fn read_into<File>(&self, file: &File, offset: FileOffset, buf: &mut [u8]) -> Result<()>
     where
         Driver: RingDriver<File>,
-        File: Sync,
+        File: IoFile + Sync,
     {
         let mut done = 0;
+        // what the kernel holds answers here, with no submit and no wake
+        while done < buf.len() {
+            match file.try_read_at(FileOffset(offset.0 + done as u64), &mut buf[done..]) {
+                Ok(Some(ByteCount(count))) if count > 0 => done += count as usize,
+                Ok(Some(_) | None) | Err(_) => break,
+            }
+        }
         while done < buf.len() {
             let end = (done + RING_SLOT_BYTES).min(buf.len());
             let read = self.read_once(file, FileOffset(offset.0 + done as u64), &mut buf[done..end]).await?;
@@ -371,9 +378,12 @@ impl<Driver> ReadRing<Driver> {
     pub async fn read_into_parts<File>(&self, file: &File, offset: FileOffset, parts: &mut [IoSliceMut<'_>]) -> Result<()>
     where
         Driver: RingDriver<File>,
-        File: Sync,
+        File: IoFile + Sync,
     {
         let total: usize = parts.iter().map(|part| part.len()).sum();
+        if matches!(file.try_read_parts_at(offset, parts), Ok(Some(ByteCount(count))) if count == total as u64) {
+            return Ok(());
+        }
         if total > RING_SLOT_BYTES {
             let mut at = offset.0;
             for part in parts {

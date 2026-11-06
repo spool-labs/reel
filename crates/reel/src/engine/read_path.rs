@@ -189,7 +189,9 @@ impl<Backend: Io> EngineState<Backend> {
     ) -> Result<bool, StoreError> {
         for _try in 0..MOST_READ_TRIES {
             let latest = self.latest_read(column, key)?;
-            if let Some(answer) = self.answer_latest(device, &latest, want, buf).await {
+            let answer = self.get_at(device, &latest.read, latest.handovers, want, buf).await;
+            let is_bad = matches!(answer, Err(StoreError::Corruption { .. }));
+            if self.has_outlived(latest.counts, is_bad) {
                 return answer;
             }
         }
@@ -243,19 +245,6 @@ impl<Backend: Io> EngineState<Backend> {
         let handovers = self.volumes[info.volume.0 as usize].handover_count();
         let read = self.key_read_now(column, key)?;
         Ok(LatestRead { read, counts, handovers })
-    }
-
-    /// Answer a read at its point, or return nothing when a job crossed it and took what the point could see
-    pub async fn answer_latest(
-        &self,
-        device: &impl DeviceReads<Backend::File>,
-        latest: &LatestRead<'_>,
-        want: RecordWant,
-        buf: &mut Vec<u8>,
-    ) -> Option<Result<bool, StoreError>> {
-        let answer = self.get_at(device, &latest.read, latest.handovers, want, buf).await;
-        let is_bad = matches!(answer, Err(StoreError::Corruption { .. }));
-        self.has_outlived(latest.counts, is_bad).then_some(answer)
     }
 
     /// Answer every key at one read point, so a batch from one write_batch is seen whole or not at all

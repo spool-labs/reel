@@ -188,6 +188,23 @@ impl IoFile for SimulatedFile {
         Ok(())
     }
 
+    fn try_read_at(&self, offset: FileOffset, buf: &mut [u8]) -> Result<Option<ByteCount>> {
+        let warm = hold(&self.disk).warm_bytes.min(buf.len());
+        if warm == 0 {
+            return Ok(None);
+        }
+        self.read_at(offset, &mut buf[..warm]).map(Some)
+    }
+
+    fn try_read_parts_at(&self, offset: FileOffset, parts: &mut [IoSliceMut]) -> Result<Option<ByteCount>> {
+        let total: usize = parts.iter().map(|part| part.len()).sum();
+        if hold(&self.disk).warm_bytes < total {
+            return Ok(None);
+        }
+        self.read_parts_at(offset, parts)?;
+        Ok(Some(ByteCount(total as u64)))
+    }
+
     fn start_writeback(&self, _offset: FileOffset, length: ByteCount) -> Result<()> {
         hold(&self.disk).writeback_bytes += length.0;
         Ok(())

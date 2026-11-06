@@ -84,13 +84,13 @@ fn value(number: u64) -> Vec<u8> {
 
 // a store with its keys sealed and nothing cached, so reads reach the device
 fn filled(root: &Path) -> Store {
-    let store = ReelStore::open(PlainIo::with_ring(), &config(root)).expect("open");
+    let store = ReelStore::open(PlainIo::new(), &config(root)).expect("open");
     for number in 0..KEYS {
         store.put(COLUMN, &key(number), &value(number)).expect("put");
     }
     store.close().expect("close");
     drop(store);
-    ReelStore::open(PlainIo::with_ring(), &config(root)).expect("open")
+    ReelStore::open(PlainIo::new(), &config(root)).expect("open")
 }
 
 // this kernel gives the store a ring, so every test here reads through it
@@ -161,11 +161,34 @@ fn many_at_once() {
 fn pool_still_answers() {
     let root = root("pool");
     filled(&root).close().expect("close");
-    let store: Store = ReelStore::open(PlainIo::new(), &config(&root)).expect("open");
+    let store: Store = ReelStore::open(PlainIo::without_ring(), &config(&root)).expect("open");
     assert!(store.state.ring.is_none());
     let mut buf = Vec::new();
     assert!(run(Reads::get_async(&store, COLUMN, &key(5), &mut buf)).expect("get"));
     assert_eq!(buf, value(5));
     store.close().expect("close");
+    fs::remove_dir_all(&root).expect("remove");
+}
+
+// bytes the page cache holds answer on the first poll on a real file, on the ring and on the pool
+#[test]
+fn warm_get_answers_first_poll() {
+    // tmpfs has no read that refuses to wait, and the temp directory is often one
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("reel-warm-{}", std::process::id()));
+    let _gone = fs::remove_dir_all(&root);
+    filled(&root).close().expect("close");
+    for io in [PlainIo::new(), PlainIo::without_ring()] {
+        let store: Store = ReelStore::open(io, &config(&root)).expect("open");
+        let (name, mut buf) = (key(7), Vec::new());
+        assert!(store.get(COLUMN, &name, &mut buf).expect("get"));
+        buf.clear();
+        {
+            let mut read = pin!(Reads::get_async(&store, COLUMN, &name, &mut buf));
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(matches!(read.as_mut().poll(&mut context), Poll::Ready(Ok(true))));
+        }
+        assert_eq!(buf, value(7));
+        store.close().expect("close");
+    }
     fs::remove_dir_all(&root).expect("remove");
 }

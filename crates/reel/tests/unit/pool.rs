@@ -101,3 +101,34 @@ fn touched_queue_keeps_its_room() {
     assert!(queue.is_empty());
     assert!(queue.capacity() >= QUEUE_ROOM);
 }
+
+// real threads taking one and many items through a pool too small for them lose no wake and no item
+#[test]
+fn threads_lose_nothing() {
+    const ITEMS: usize = 3;
+    const THREADS: usize = 8;
+    const ROUNDS: usize = 2_000;
+    let pool = Pool::new((0..ITEMS).collect::<Vec<_>>());
+    thread::scope(|scope| {
+        for thread_index in 0..THREADS {
+            let pool = &pool;
+            scope.spawn(move || {
+                let mut items = Vec::with_capacity(2);
+                for round in 0..ROUNDS {
+                    if (thread_index + round) % 5 == 0 {
+                        pool.take_many(2, &mut items);
+                        assert_eq!(items.len(), 2);
+                        pool.give_back_all(&mut items);
+                    } else {
+                        let item = pool.take();
+                        pool.give_back(item);
+                    }
+                }
+            });
+        }
+    });
+    let mut left = Vec::new();
+    pool.take_many(ITEMS, &mut left);
+    left.sort_unstable();
+    assert_eq!(left, (0..ITEMS).collect::<Vec<_>>());
+}

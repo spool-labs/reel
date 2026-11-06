@@ -181,6 +181,11 @@ impl SimulatedIo {
         hold(&self.disk).writes
     }
 
+    /// Say how many bytes a read that waits for nothing can get, as the part of a range the page cache holds
+    pub fn set_warm_bytes(&self, bytes: usize) {
+        hold(&self.disk).warm_bytes = bytes;
+    }
+
     /// Read how many bytes files have started for the device
     pub fn writeback_bytes(&self) -> ByteCount {
         ByteCount(hold(&self.disk).writeback_bytes)

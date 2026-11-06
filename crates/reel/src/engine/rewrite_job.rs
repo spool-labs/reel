@@ -38,8 +38,10 @@ use crate::segment::segment_table::SegmentPin;
 use crate::segment::segment_tail::{BlockCount, ColumnTail, MAX_COLUMNS, MOST_MERGE_SEGMENTS, SegmentNumber};
 use crate::segment::summary::{ColumnFacts, DeadCount, SUMMARY_KEY_BYTES, SegmentFacts, SummaryRow, SummaryRows};
 
-/// A segment is rewritten once this part of its rows or bytes is dead: 2 is a half, 4 a quarter
+/// A segment is rewritten once this part of its bytes is dead, the one bar there is: 2 is a half
 pub const REWRITE_DIVISOR: u64 = 2;
+/// Bytes a footer row takes, about, so a rewrite weighs rows it drops beside records. A segment of graves holds rows and no records
+pub const ROW_FOOTER_BYTES: u64 = 41;
 /// Bytes of one job's merge buffer, which carries records and then row blocks. With a row block for each input, a job's
 /// merge buffers come to about 2 MiB
 pub const MERGE_BUFFER_BYTES: usize = 3 * 512 * 1024;
@@ -1420,11 +1422,11 @@ pub fn is_rewrite_ready<Backend: Io>(volume: &Volume<Backend>, row: &SummaryRow<
         bytes += column.live_bytes.0 + column.dead_bytes.0;
         dead_bytes += column.dead_bytes.0;
     }
-    let won_back = dead_bytes.saturating_sub(freed_bytes);
-    REWRITE_DIVISOR * (dead_rows + live_graves) >= rows || (bytes > 0 && REWRITE_DIVISOR * won_back >= bytes)
+    let won_back = dead_bytes.saturating_sub(freed_bytes) + (dead_rows + live_graves) * ROW_FOOTER_BYTES;
+    REWRITE_DIVISOR * won_back >= bytes + rows * ROW_FOOTER_BYTES
 }
 
-/// Read what a rewrite of a segment wins back for the bytes it reads, as a share of its rows or its bytes, whichever is more
+/// Read what a rewrite of a segment wins back, as a share of its record and footer bytes
 pub fn reclaim_share(row: &SummaryRow<'_>) -> u64 {
     let (mut rows, mut dead_rows, mut bytes, mut dead_bytes) = (0, 0, 0, 0);
     let mut cursor = row.cursor();
@@ -1437,7 +1439,7 @@ pub fn reclaim_share(row: &SummaryRow<'_>) -> u64 {
         bytes += column.live_bytes.0 + column.dead_bytes.0;
         dead_bytes += column.dead_bytes.0;
     }
-    (SHARE_SCALE * dead_rows / rows.max(1)).max(SHARE_SCALE * dead_bytes / bytes.max(1))
+    SHARE_SCALE * (dead_bytes + dead_rows * ROW_FOOTER_BYTES) / (bytes + rows * ROW_FOOTER_BYTES).max(1)
 }
 
 /// Check a row's graves make up the share that would trigger a merge, so deciding first can save the copy

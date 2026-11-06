@@ -35,6 +35,7 @@ const COLUMN: ColumnId = ColumnId(1);
 const BUDGET: ByteCount = ByteCount(64 * 1024 * 1024);
 const TICK: Nanoseconds = Nanoseconds(1_000_000);
 const STEPS: u64 = 20_000;
+const SMALL_RECORD_BYTES: usize = 1_024;
 const IDLE_KEYS: u64 = 600;
 const IDLE_VALUE_BYTES: usize = 1_000;
 const IDLE_LOOK: Nanoseconds = Nanoseconds(1_000_000_000);
@@ -389,12 +390,15 @@ fn big_record() {
     let store = open(&io);
     let value = vec![7; MERGE_BUFFER_BYTES + 1000];
     store.put(COLUMN, b"big", &value).expect("put");
-    store.put(COLUMN, b"a", b"first").expect("put");
-    store.put(COLUMN, b"b", b"first").expect("put");
-    store.put(COLUMN, b"c", b"live").expect("put");
+    // small dead records are what a rewrite comes for, since a big dead one frees in place
+    let small = vec![7; SMALL_RECORD_BYTES];
+    for number in 0..MERGE_BUFFER_BYTES * 2 / SMALL_RECORD_BYTES {
+        store.put(COLUMN, format!("key-{number:05}").as_bytes(), &small).expect("put");
+    }
     let older = seal(&store, &io);
-    store.put(COLUMN, b"a", b"second").expect("put");
-    store.put(COLUMN, b"b", b"second").expect("put");
+    for number in 0..MERGE_BUFFER_BYTES * 2 / SMALL_RECORD_BYTES {
+        store.put(COLUMN, format!("key-{number:05}").as_bytes(), b"gone").expect("put");
+    }
     seal(&store, &io);
 
     assert!(!store.state.volumes[0].table.holds(older));
@@ -2178,5 +2182,25 @@ fn most_won_back_goes_first() {
     assert_eq!(job.rewrite.input_numbers()[0], most);
     assert!(!job.rewrite.input_numbers().contains(&half));
     job.rewrite.abandon();
+    store.close().expect("close");
+}
+
+// a big live record beside small dead ones stays put: the rewrite would copy far more than it frees
+#[test]
+fn rows_alone_start_no_copy() {
+    let io = SimulatedIo::new(Seed(78));
+    let store = open(&io);
+    store.put(COLUMN, b"big", &vec![7; MERGE_BUFFER_BYTES]).expect("put");
+    store.put(COLUMN, b"a", b"first").expect("put");
+    store.put(COLUMN, b"b", b"first").expect("put");
+    store.put(COLUMN, b"c", b"first").expect("put");
+    let older = seal(&store, &io);
+    store.put(COLUMN, b"a", b"second").expect("put");
+    store.put(COLUMN, b"b", b"second").expect("put");
+    store.put(COLUMN, b"c", b"second").expect("put");
+    seal(&store, &io);
+
+    assert!(store.state.volumes[0].table.holds(older));
+    assert_eq!(store.state.volumes[0].segments_rewritten.load(Ordering::Acquire), 0);
     store.close().expect("close");
 }

@@ -46,6 +46,7 @@ fn main() {
             key_shape: KeyShape::Variable { most: 32 },
             codec: Codec::None,
             volume: VolumeId(0),
+            complete_rows: None,
         }],
     };
     let store = ReelStore::open(PlainIo::new(), &config).expect("open");

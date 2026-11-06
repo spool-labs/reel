@@ -351,6 +351,7 @@ impl<Backend: Io> BlockCounter<Backend> {
             match newest {
                 Some(found) if found.row.place > row.place => {
                     let replacement = found.row.place;
+                    self.state.mark_slot_stale(volume, block.column, &self.key, target.segment, block.entry.block_offset);
                     counts.count_dead(target.segment, block.column, target.next_block, &row, replacement);
                 },
                 // a row under an applied cover is dead by it, and so is any older one a row here would find
@@ -361,6 +362,7 @@ impl<Backend: Io> BlockCounter<Backend> {
                 Some(found) if !target.is_backward && !is_covered(found.row.place) => {
                     if let Some(index) = volume.table.block_at(found.segment, found.block_offset) {
                         counts.count_dead(found.segment, block.column, index, &found.row, row.place);
+                        self.state.mark_slot_stale(volume, block.column, &self.key, found.segment, found.block_offset);
                     }
                 },
                 Some(_) | None => {},

@@ -4,7 +4,7 @@ use std::io::Error;
 use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::{JOB_KINDS, JobKind, JobState, MaintenanceReport, VolumeReading};
+use reel_api::maintenance_report::{CompleteReading, JOB_KINDS, JobKind, JobState, MaintenanceReport, VolumeReading};
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, RootId, RowCount, SegmentCount, VolumeId};
 use reel_api::usage::{ColumnRootUsage, ColumnUsage, RootUsage, UsageReport, VolumeUsage};
@@ -13,6 +13,7 @@ use crate::engine::engine_state::EngineState;
 use crate::engine::job_tally::STALL_AFTER;
 use crate::engine::planner::is_sealing;
 use crate::engine::volume::{NO_SEAL, Volume};
+use crate::index::complete_table::CompleteTable;
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
 use crate::io::{Io, IoFile};
@@ -151,6 +152,17 @@ impl<Backend: Io> EngineState<Backend> {
                 segment_count: SegmentCount(rows.rows().count() as u64),
                 used_bytes: ByteCount(rows.rows().map(|row| row.facts.file_length.0).sum()),
             });
+        }
+        for (id, info) in self.columns.iter().enumerate() {
+            if info.is_some_and(|info| info.is_complete) {
+                let table = self.complete_table(ColumnId(id as u8));
+                report.complete_columns.push(CompleteReading {
+                    column: ColumnId(id as u8),
+                    has_table: table.is_some(),
+                    used_slots: table.map_or(RowCount(0), CompleteTable::used_slots),
+                    rows_past_capacity: table.map_or(RowCount(0), CompleteTable::past_capacity),
+                });
+            }
         }
         report.segments_rewritten = SegmentCount(rewritten);
         report.segments_unlinked = SegmentCount(unlinked);

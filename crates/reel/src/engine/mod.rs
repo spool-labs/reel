@@ -4,6 +4,8 @@ pub mod batch_path;
 pub mod claim;
 pub mod column_info;
 pub mod compact_job;
+pub mod complete_image;
+pub mod complete_path;
 pub mod cover_apply;
 pub mod cue;
 pub mod engine_sizing;

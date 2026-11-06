@@ -1,5 +1,6 @@
 //! Each maintenance job's state and the store's reclaim counts
 
+use crate::column_id::ColumnId;
 use crate::units::{ByteCount, Nanoseconds, RowCount, SegmentCount, VolumeId};
 
 /// Every kind of job, in the order a report lists them
@@ -69,11 +70,21 @@ pub struct VolumeReading {
     pub used_bytes: ByteCount,
 }
 
+/// How a complete column stands. A read-only view has no table, and reads through the footers
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CompleteReading {
+    pub column: ColumnId,
+    pub has_table: bool,
+    pub used_slots: RowCount,
+    pub rows_past_capacity: RowCount,
+}
+
 /// Every job, the reclaim counts and the readings a node roll stops on, in buffers the caller reuses
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaintenanceReport {
     pub jobs: [JobReport; JOB_KINDS.len()],
     pub volumes: Vec<VolumeReading>,
+    pub complete_columns: Vec<CompleteReading>,
     pub graves_at_open: RowCount,
     pub deletes_since_open: RowCount,
     pub graves_dropped: RowCount,
@@ -107,6 +118,7 @@ impl MaintenanceReport {
     /// Forget the volume readings and keep the buffer
     pub fn clear(&mut self) {
         self.volumes.clear();
+        self.complete_columns.clear();
     }
 
     /// Start a report with one idle entry per kind of job
@@ -114,6 +126,7 @@ impl MaintenanceReport {
         Self {
             jobs: JOB_KINDS.map(JobReport::new),
             volumes: Vec::new(),
+            complete_columns: Vec::new(),
             graves_at_open: RowCount::default(),
             deletes_since_open: RowCount::default(),
             graves_dropped: RowCount::default(),

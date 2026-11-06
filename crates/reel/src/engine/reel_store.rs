@@ -19,6 +19,7 @@ use reel_api::write_batch::WriteBatch;
 use crate::config::{ColumnConfig, StoreConfig};
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::engine_sizing::{
+    complete_block_rows, complete_row_limit,
     EngineSizing, FILTER_CACHE_QUARTERS, FILTER_SLOT_BYTES, GROUP_BYTES, LEAST_LZ4_BUDGET, PLANNED_COLUMN_BYTES, PLANNED_LINE_BYTES, SHARED_JOBS,
     PLANNED_SEGMENT_BYTES, StoreShape, GATHER_BYTES, READ_BUFFERS, WRITE_BUFFERS,
 };
@@ -36,7 +37,7 @@ use crate::engine::recovery::{
 use crate::engine::reserve_job::ReserveJob;
 use crate::engine::row_job::RowJob;
 use crate::engine::scan_state::{MOST_SCANS, ScanState, from_key, in_range, under_prefix};
-use crate::engine::seal_job::SealJob;
+use crate::engine::seal_job::{MOST_SEGMENT_BLOCKS, SealJob};
 use crate::engine::store_scan::StoreScan;
 use crate::engine::compact_job::{CompactJob, park};
 use crate::engine::cue::{Cue, CueTable};
@@ -45,6 +46,8 @@ use crate::engine::walk_job::{BlockCounter, WalkJob, WalkSlot, WalkWorker};
 use crate::engine::volume::{ClaimState, MOST_MERGE_OUTPUTS, MOST_PARKED, NO_SEAL, SyncState, Volume};
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
+use crate::engine::complete_image::ImageFiles;
+use crate::index::complete_table::CompleteTable;
 use crate::index::spot_index::SpotIndex;
 use crate::index::write_index::WriteIndex;
 use crate::io::lock_outcome::LockOutcome;
@@ -61,7 +64,8 @@ use crate::segment::damage_list::{DamageList, MOST_DAMAGED_SPANS, SPAN_KEY_BYTES
 use crate::segment::range_covers::RangeCovers;
 use crate::segment::summary::{MOST_ROW_COLUMN_BYTES, MOST_ROW_FIXED_BYTES, MOST_ROW_SPAN_FIXED_BYTES};
 use crate::segment::footer_reader::FooterReader;
-use crate::segment::row_block::ROW_BLOCK_BYTES;
+use crate::segment::block_entry::BlockEntry;
+use crate::segment::row_block::{COMPLETE_BLOCK_BYTES, ROW_BLOCK_BYTES};
 use crate::segment::segment_table::{SegmentTable, TABLE_SHARDS, TableSizing};
 use crate::segment::segment_tail::{MAX_COLUMNS, MOST_MERGE_SEGMENTS, SegmentNumber};
 use crate::superblock::{RootCopies, StoreId, StoredColumn, StoredVolume, Superblock, SuperblockPaths, stored_column};
@@ -118,7 +122,10 @@ impl<Backend: Io> ReelStore<Backend> {
             },
         };
 
-        let state = Arc::new(build_state(io, config, &sizing, superblock, locks, &scan, summaries));
+        let mut state = build_state(io, config, &sizing, superblock, locks, &scan, summaries);
+        state.complete = complete_tables(config);
+        state.complete_images = complete_images(config);
+        let state = Arc::new(state);
         if let Err(error) = bring_up(&state, &mut scan) {
             // a caller can retry, so a failed open leaves no handle behind
             let _stopped = state.stop_jobs();
@@ -411,6 +418,10 @@ impl<Backend: Io> ReelStore<Backend> {
             if volume.has_failed() {
                 outcome = outcome.and(Err(StoreError::VolumeFailed { volume: volume.id }));
             }
+            // an image only saves the next open time, so one that fails costs that and no more
+            if !volume.has_failed() {
+                let _saved = self.state.save_images(volume.id.0 as usize);
+            }
             outcome = outcome.and(self.state.drop_prepared(volume).map_err(open_error("removing a spare segment")));
             self.state.close_volume(volume);
             hold(&volume.locks).clear();
@@ -563,6 +574,7 @@ pub fn bring_up<Backend: Io>(
         volume.walks_waiting.store(waiting, Ordering::Release);
     }
     recover_segments(state, scan).map_err(open_error("recovering a segment"))?;
+    state.fill_complete_tables().map_err(open_error("filling a complete table"))?;
     let damaged: usize = state.volumes.iter().map(|volume| hold(&volume.damaged).len()).sum();
     state.damaged_segments.store(damaged as u64, Ordering::Release);
 
@@ -940,6 +952,7 @@ pub fn build_state<Backend: Io>(
             key_shape: column.key_shape,
             codec: column.codec,
             volume: column.volume,
+            is_complete: column.complete_rows.is_some(),
         });
         let found = scan.sealed.len();
         let room = (segments_per_shard * TABLE_SHARDS).max(found * 2);
@@ -968,7 +981,8 @@ pub fn build_state<Backend: Io>(
         let span_room = MOST_DAMAGED_SPANS * (MOST_ROW_SPAN_FIXED_BYTES + 2 * SPAN_KEY_BYTES);
         let summary_room = span_room + found_summary.max(planned_summary).max(scan.least_summary_room(index, columns_here) * 2);
         summary.rows.make_room(ByteCount(summary_room as u64));
-        let room = table_room(&table_sizing, &scan.least_sizing(index));
+        let mut room = table_room(&table_sizing, &scan.least_sizing(index));
+        room.blocks_per_shard += complete_shard_lines(config, index);
         // a row for each segment the table can hold, beside open segments and the spans of gone ones
         summary.rows.make_index(room.segments_per_shard * TABLE_SHARDS + open_slots + MOST_DAMAGED_SPANS);
         volumes.push(Volume {
@@ -993,7 +1007,7 @@ pub fn build_state<Backend: Io>(
             sync: Mutex::new(SyncState::default()),
             is_failed: AtomicBool::new(false),
             segment_bytes: sizing.segment_bytes,
-            segment_rows: sizing.segment_rows,
+            segment_rows: volume_rows(config, index, sizing.segment_rows),
             walk_retries: AtomicU64::new(0),
             walks_waiting: AtomicU64::new(0),
             wants_compaction: AtomicBool::new(true),
@@ -1001,6 +1015,7 @@ pub fn build_state<Backend: Io>(
             is_compaction_held: AtomicBool::new(false),
             is_seal_stuck: AtomicBool::new(false),
             sealing: AtomicU64::new(NO_SEAL),
+            output_floor: AtomicU64::new(NO_SEAL),
             walk_slots: (0..sizing.walk_workers).map(|_slot| WalkSlot::new()).collect(),
             can_free_blocks: volume.roots.iter().all(|root| io.can_free_blocks(root)),
             bytes_freed: AtomicU64::new(0),
@@ -1072,7 +1087,11 @@ pub fn build_state<Backend: Io>(
     }
 
     let filter_share = ByteCount(sizing.cache_share.0 / 4 * FILTER_CACHE_QUARTERS);
-    let row_share = ByteCount(sizing.cache_share.0 - filter_share.0);
+    let is_complete = config.columns.iter().any(|column| column.complete_rows.is_some());
+    let block_share = ByteCount(sizing.cache_share.0 - filter_share.0);
+    // complete columns read small blocks, and a slot sized for a full block would hold a sixteenth of what it could
+    let complete_share = ByteCount(if is_complete { block_share.0 / 2 } else { 0 });
+    let row_share = ByteCount(block_share.0 - complete_share.0);
     let reserved = superblock.next_segment.0;
     let first_number = reserved.saturating_sub(SEGMENT_NUMBER_BATCH);
     let place_limit = superblock.place_limit;
@@ -1091,6 +1110,8 @@ pub fn build_state<Backend: Io>(
         spot: SpotIndex::new(sizing.spot_share),
         filter_cache: BlockCache::new(filter_share, FILTER_SLOT_BYTES),
         row_cache: BlockCache::new(row_share, ROW_BLOCK_BYTES),
+        complete_cache: is_complete.then(|| BlockCache::new(complete_share, COMPLETE_BLOCK_BYTES)),
+        complete_line_bytes: ByteCount(complete_lines(config) * size_of::<BlockEntry>() as u64),
         queues,
         spare_groups,
         windows,
@@ -1133,6 +1154,8 @@ pub fn build_state<Backend: Io>(
         read_tasks: (0..READ_WORKERS).map(|_worker| OnceLock::new()).collect(),
         read_pool: ReadPool::new(scans),
         is_read_only: false,
+        complete: Vec::new(),
+        complete_images: Vec::new(),
         seal_tasks,
         planner_task: OnceLock::new(),
         index_waiters: AtomicU64::new(0),
@@ -1141,3 +1164,53 @@ pub fn build_state<Backend: Io>(
     }
 }
 
+
+/// Work out a volume's row limit: the budget's, or less when a complete column on it needs its row blocks addressable
+pub fn volume_rows(config: &StoreConfig, volume: usize, rows: RowCount) -> RowCount {
+    let on_volume = config.columns.iter().filter(|column| column.volume.0 as usize == volume && column.complete_rows.is_some());
+    let widest = on_volume.map(|column| column.key_shape.widest()).max();
+    widest.map_or(rows, |widest| RowCount(rows.0.min(complete_row_limit(widest).0)))
+}
+
+/// Allocate and touch each complete column's table
+pub fn complete_tables(config: &StoreConfig) -> Vec<Option<CompleteTable>> {
+    let mut tables: Vec<Option<CompleteTable>> = (0..MAX_COLUMNS).map(|_column| None).collect();
+    for column in &config.columns {
+        tables[column.id.0 as usize] = column.complete_rows.map(CompleteTable::new);
+    }
+    tables
+}
+
+/// Work out the block lines a volume's complete columns can fill in one table shard: a fair share twice over, for segments
+/// that land unevenly, and room for the one segment that lands last
+pub fn complete_shard_lines(config: &StoreConfig, volume: usize) -> usize {
+    let on_volume = config.columns.iter().filter(|column| column.volume.0 as usize == volume);
+    let lines: u64 = on_volume.map(column_lines).sum();
+    if lines == 0 {
+        return 0;
+    }
+    (lines as usize).div_ceil(TABLE_SHARDS) * 2 + MOST_SEGMENT_BLOCKS.0 as usize
+}
+
+/// Work out the block lines a store sets aside for its complete columns
+pub fn complete_lines(config: &StoreConfig) -> u64 {
+    let shards: usize = (0..config.volumes.len()).map(|volume| complete_shard_lines(config, volume)).sum();
+    (shards * TABLE_SHARDS) as u64
+}
+
+/// Work out the block lines a complete column's rows can fill
+pub fn column_lines(column: &ColumnConfig) -> u64 {
+    let rows_per_block = complete_block_rows(column.key_shape.widest()) as u64;
+    column.complete_rows.map_or(0, |rows| rows.0.div_ceil(rows_per_block))
+}
+
+/// Name each complete column's image files and allocate its buffer
+pub fn complete_images(config: &StoreConfig) -> Vec<Option<Mutex<ImageFiles>>> {
+    let mut images: Vec<Option<Mutex<ImageFiles>>> = (0..MAX_COLUMNS).map(|_column| None).collect();
+    for column in config.columns.iter().filter(|column| column.complete_rows.is_some()) {
+        if let Some(root) = config.volumes[column.volume.0 as usize].roots.first() {
+            images[column.id.0 as usize] = Some(Mutex::new(ImageFiles::new(root, column.id)));
+        }
+    }
+    images
+}

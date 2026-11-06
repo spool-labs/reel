@@ -75,6 +75,7 @@ fn config() -> StoreConfig {
         key_shape: KeyShape::Variable { most: 64 },
         codec,
         volume: VolumeId(volume),
+        complete_rows: None,
     };
     StoreConfig {
         memory_budget: BUDGET,

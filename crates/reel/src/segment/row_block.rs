@@ -10,6 +10,10 @@ use crate::segment::varint::{MAX_VARINT_BYTES, read_varint, write_varint};
 
 /// Most bytes in a row block
 pub const ROW_BLOCK_BYTES: usize = 64 * 1024;
+/// The room a block sets aside for a row's numbers before it takes one
+pub const ROW_ROOM_NUMBERS: usize = 5 * MAX_VARINT_BYTES;
+/// The size a complete column's row blocks stop at, so a get's first read stays small
+pub const COMPLETE_BLOCK_BYTES: usize = 4 * 1024;
 /// Rows between restart points, where a key is stored whole
 pub const RESTART_INTERVAL: u32 = 16;
 /// Most restart points a block can hold
@@ -67,6 +71,7 @@ pub struct RowBlockBuilder {
     last_key: Vec<u8>,
     row_count: u32,
     place_base: WritePlace,
+    block_bytes: usize,
 }
 
 /// A walk over a checked block's rows, keeping the current key in a buffer the caller lends
@@ -89,6 +94,7 @@ impl RowBlockBuilder {
             last_key: touched_capacity(ROW_BLOCK_BYTES, 0),
             row_count: 0,
             place_base: WritePlace(0),
+            block_bytes: ROW_BLOCK_BYTES,
         }
     }
 
@@ -101,6 +107,11 @@ impl RowBlockBuilder {
     /// Set the place every row of the next blocks stores its distance from
     pub fn set_place_base(&mut self, place_base: WritePlace) {
         self.place_base = place_base;
+    }
+
+    /// Set how big the next blocks can get
+    pub fn set_block_bytes(&mut self, block_bytes: usize) {
+        self.block_bytes = block_bytes;
     }
 
     /// Count the rows so far
@@ -121,8 +132,8 @@ impl RowBlockBuilder {
 
         let restarts_after = self.restarts.len() + usize::from(is_restart);
         let trailer = restarts_after * size_of::<u16>() + BLOCK_TRAILER_BYTES;
-        let most_row_bytes = 5 * MAX_VARINT_BYTES + suffix.len();
-        if self.used + most_row_bytes + trailer > ROW_BLOCK_BYTES {
+        let most_row_bytes = ROW_ROOM_NUMBERS + suffix.len();
+        if self.used + most_row_bytes + trailer > self.block_bytes {
             return false;
         }
 

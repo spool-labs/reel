@@ -75,7 +75,7 @@ fn main() {
             shard.table_slots,
         );
         println!("{report:?}");
-        if held > budget.0 || live.abs_diff(report.heap_total().0) > report.heap_total().0 / REPORT_SLACK_DIVISOR {
+        if held > report.budget.0 || live.abs_diff(report.heap_total().0) > report.heap_total().0 / REPORT_SLACK_DIVISOR {
             println!("budget {} MiB fails", budget.0 / MIB);
             failures += 1;
         }

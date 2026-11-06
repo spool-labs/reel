@@ -94,6 +94,14 @@ impl BlockCache {
         }
     }
 
+    /// Empty the cache
+    pub fn clear(&self) {
+        for index in 0..self.shards.len() {
+            let mut guard = self.write_shard(index);
+            guard.keys.fill(NO_BLOCK);
+        }
+    }
+
     /// Read the heap the cache holds
     pub fn heap_bytes(&self) -> ByteCount {
         let mut total = 0;

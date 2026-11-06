@@ -19,11 +19,13 @@ use reel_api::column_id::ColumnId;
 use reel_api::direction::Direction;
 use reel_api::scan::ScanStep;
 use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, FileOffset, Nanoseconds, VolumeId};
+use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RowCount, VolumeId};
 use reel_api::write_batch::WriteBatch;
 
 // the default walk runs on the planner, so seeds spread over 0 to 2 workers to keep the worker path under test
 const WALK_WORKER_COUNTS: u64 = 3;
+const SMALL_TABLE_ROWS: RowCount = RowCount(64);
+const TABLE_ROWS: RowCount = RowCount(100_000);
 const ROOTS: [&str; 3] = ["/disk/faults-meta", "/disk/faults-meta-two", "/disk/faults-bulk"];
 const COLUMNS: [ColumnId; 2] = [ColumnId(1), ColumnId(2)];
 const HIGHEST_KEY: &[u8] = b"zzz";
@@ -185,23 +187,33 @@ impl Default for Versions {
     }
 }
 
-fn config(policy: SyncPolicy) -> StoreConfig {
+fn config(policy: SyncPolicy, complete_rows: Option<RowCount>) -> StoreConfig {
     let volume = |name: &str, roots: &[&str], sync: SyncPolicy| VolumeConfig {
         name: name.to_string(),
         roots: roots.iter().map(PathBuf::from).collect(),
         sync,
     };
-    let column = |id: ColumnId, name: &str, volume: u8| ColumnConfig {
+    let column = |id: ColumnId, name: &str, volume: u8, complete_rows: Option<RowCount>| ColumnConfig {
         id,
         name: name.to_string(),
         key_shape: KeyShape::Variable { most: 64 },
         codec: Codec::None,
         volume: VolumeId(volume),
+        complete_rows,
     };
     StoreConfig {
         memory_budget: BUDGET,
         volumes: vec![volume("meta", &ROOTS[..2], policy), volume("bulk", &ROOTS[2..], SyncPolicy::Never)],
-        columns: vec![column(COLUMNS[0], "meta", 0), column(COLUMNS[1], "bulk", 1)],
+        columns: vec![column(COLUMNS[0], "meta", 0, complete_rows), column(COLUMNS[1], "bulk", 1, None)],
+    }
+}
+
+// half the seeds make the meta column complete, and half of those with a table small enough to run past capacity
+fn complete_rows_of(seed: u64) -> Option<RowCount> {
+    match seed % 4 {
+        1 => Some(SMALL_TABLE_ROWS),
+        3 => Some(TABLE_ROWS),
+        _other => None,
     }
 }
 
@@ -288,7 +300,8 @@ impl Run {
                 self.arm_fault();
             }
             let workers = (self.seed % WALK_WORKER_COUNTS) as usize;
-            let opened = ReelStore::open_with_walk_workers(self.io.clone(), &config(self.policy), workers);
+            let config = config(self.policy, complete_rows_of(self.seed));
+            let opened = ReelStore::open_with_walk_workers(self.io.clone(), &config, workers);
             if self.io.is_crashed() {
                 self.crash();
                 drop(opened);

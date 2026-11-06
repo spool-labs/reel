@@ -56,6 +56,7 @@ fn config_at(budget: ByteCount) -> StoreConfig {
         key_shape: KeyShape::Variable { most: 64 },
         codec: Codec::None,
         volume: VolumeId(0),
+        complete_rows: None,
     };
     StoreConfig {
         memory_budget: budget,

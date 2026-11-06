@@ -4,6 +4,7 @@ use reel_api::units::{ByteCount, RowCount};
 
 use crate::engine::open_segment::RECORD_WINDOW_BYTES;
 use crate::engine::read_pool::{READ_SLOTS, READ_WORKERS, SLOT_KEY_BYTES, SLOT_KEYS};
+use crate::engine::seal_job::MOST_SEGMENT_BLOCKS;
 use crate::engine::scan_state::{MOST_SCANS, planned_scan_bytes};
 use crate::index::entry_slab::{PAGE_BYTES, PageCount};
 use crate::index::node_pool::{NODE_FANOUT, NodeCount};
@@ -14,6 +15,7 @@ use crate::record::codec::CHUNK_BYTES;
 use crate::record::record_head::SMALL_HEAD_BYTES;
 use crate::segment::damage_list::{MOST_DAMAGED_SPANS, SPAN_KEY_BYTES};
 use crate::segment::range_covers::{COVER_RECORD_BYTES, COVER_SLOT_BYTES, MOST_RANGE_COVERS};
+use crate::segment::row_block::{BLOCK_TRAILER_BYTES, COMPLETE_BLOCK_BYTES, ROW_ROOM_NUMBERS};
 use crate::segment::segment_tail::MOST_SEGMENT_BYTES;
 
 /// A segment's target size on a store with a full budget, and a smaller budget targets half of itself
@@ -73,6 +75,12 @@ pub const PLANNED_ROW_BYTES: u64 = 227;
 /// segment size, 128 MiB at a 128 MiB budget, 192 MiB at 192 MiB, and 2 GiB from the default 512 MiB up. The space gate adds
 /// this to the live bytes
 pub const SEAL_ROWS_EIGHTHS: u64 = 5;
+/// The eighths of a segment's row block lines a complete column can fill. The rest stay free for other columns' blocks
+pub const SEAL_LINE_EIGHTHS: u64 = 7;
+/// The most bytes a row's numbers can take in a block: kind and shared length, suffix length, place, offset and length
+pub const WORST_ROW_NUMBERS: usize = 24;
+/// The bytes a block keeps for its restart points
+pub const RESTART_ROOM: usize = COMPLETE_BLOCK_BYTES / 32;
 /// The most stored bytes of a value on an lz4 column, which is also the compress pool, cut into shares
 pub const LZ4_STORED_LIMIT: ByteCount = ByteCount(64 * 1024 * 1024);
 /// Bytes of one row group buffer
@@ -191,4 +199,17 @@ impl EngineSizing {
             walk_workers: shape.walk_workers(),
         }
     }
+}
+
+/// Work out how many rows a segment can take and still fit the row blocks a complete slot can address, for a column's widest
+/// key. A block closes with room left for its next row, and rows can reach their worst size
+pub fn complete_row_limit(widest_key: usize) -> RowCount {
+    let lines = MOST_SEGMENT_BLOCKS.0 as u64 * SEAL_LINE_EIGHTHS / 8;
+    RowCount(lines * complete_block_rows(widest_key) as u64)
+}
+
+/// Work out the fewest rows a complete block closes with, for a column's widest key
+pub fn complete_block_rows(widest_key: usize) -> usize {
+    let room = COMPLETE_BLOCK_BYTES - BLOCK_TRAILER_BYTES - RESTART_ROOM - (ROW_ROOM_NUMBERS + widest_key);
+    room / (WORST_ROW_NUMBERS + widest_key)
 }

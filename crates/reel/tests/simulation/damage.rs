@@ -114,6 +114,7 @@ fn config() -> StoreConfig {
                 key_shape: KeyShape::Variable { most: 128 },
                 codec: Codec::None,
                 volume: VolumeId(0),
+                complete_rows: None,
             },
             ColumnConfig {
                 id: RANDOM,
@@ -121,6 +122,7 @@ fn config() -> StoreConfig {
                 key_shape: KeyShape::Variable { most: 128 },
                 codec: Codec::None,
                 volume: VolumeId(0),
+                complete_rows: None,
             },
         ],
     }
@@ -1321,6 +1323,7 @@ fn wide_config(budget: ByteCount) -> StoreConfig {
             key_shape: KeyShape::Variable { most: 128 },
             codec: Codec::None,
             volume: VolumeId(0),
+            complete_rows: None,
         })
         .collect();
     config

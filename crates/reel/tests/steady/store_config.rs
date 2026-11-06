@@ -7,19 +7,21 @@ use std::process;
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::record::codec::Codec;
 use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, VolumeId};
+use reel_api::units::{ByteCount, RowCount, VolumeId};
 
 pub const META: ColumnId = ColumnId(1);
 pub const BULK: ColumnId = ColumnId(2);
 const MOST_KEY_BYTES: u16 = 64;
+const TABLE_ROWS: RowCount = RowCount(4_000_000);
 
 pub fn config(root: &Path, budget: ByteCount) -> StoreConfig {
-    let column = |id: ColumnId, name: &str, codec: Codec| ColumnConfig {
+    let column = |id: ColumnId, name: &str, codec: Codec, complete_rows: Option<RowCount>| ColumnConfig {
         id,
         name: name.to_string(),
         key_shape: KeyShape::Variable { most: MOST_KEY_BYTES },
         codec,
         volume: VolumeId(0),
+        complete_rows,
     };
     StoreConfig {
         memory_budget: budget,
@@ -28,7 +30,7 @@ pub fn config(root: &Path, budget: ByteCount) -> StoreConfig {
             roots: vec![root.to_path_buf()],
             sync: SyncPolicy::Never,
         }],
-        columns: vec![column(META, "meta", Codec::None), column(BULK, "bulk", Codec::Lz4)],
+        columns: vec![column(META, "meta", Codec::None, Some(TABLE_ROWS)), column(BULK, "bulk", Codec::Lz4, None)],
     }
 }
 

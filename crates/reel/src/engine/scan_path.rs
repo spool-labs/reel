@@ -225,7 +225,7 @@ impl<Backend: Io> EngineState<Backend> {
         let is_pinned = at.fixed_point.is_some();
         let found = self.index.lookup(scan.column, candidate, read.read_point, volume.view());
         let taken = self.take_rows(volume, scan, candidate, read.read_point)?;
-        let sealed = if scan.is_spilled { self.search_footers(volume, &read)? } else { taken };
+        let sealed = if scan.is_spilled { self.search_sealed(volume, &read)? } else { taken };
         // a seal moves rows from the index to a segment this walk hasn't seated, and both of its looks must see one list
         let is_same_list = at.directory.is_none_or(|directory| directory.generation() == at.generation);
         if !is_same_list {

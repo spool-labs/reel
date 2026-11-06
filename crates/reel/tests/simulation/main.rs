@@ -5,6 +5,7 @@ mod allocations;
 mod async_reads;
 mod batches;
 mod compaction;
+mod complete;
 mod counting;
 mod cues;
 mod damage;

@@ -14,7 +14,7 @@ use crate::engine::engine_state::EngineState;
 use crate::engine::open_segment::{SegmentPhase, rows_path};
 use crate::engine::volume::{NO_SEAL, Volume};
 use crate::guard::hold;
-use crate::index::key_hash::hash_key;
+use crate::index::key_hash::{KeyHash, hash_key};
 use crate::index::open_slots::OpenSlot;
 use crate::index::seal_walk::SealWalk;
 use crate::index::spot_index::SpotLocation;
@@ -94,6 +94,7 @@ pub struct SealJob<Backend: Io> {
     pub range_end: Vec<u8>,
     pub totals: Option<FooterTotals>,
     pub last_key: Vec<u8>,
+    pub last_slot: Option<(KeyHash, SegmentNumber, u16)>,
     pub last_column: Option<ColumnId>,
     pub is_in_table: bool,
     pub columns_listed: usize,
@@ -118,6 +119,7 @@ impl<Backend: Io> SealJob<Backend> {
             range_end: touched_capacity(MAX_KEY_BYTES as usize, 0),
             totals: None,
             last_key: touched_capacity(MAX_KEY_BYTES as usize, 0),
+            last_slot: None,
             last_column: None,
             is_in_table: false,
             columns_listed: 0,
@@ -217,6 +219,7 @@ impl<Backend: Io> SealJob<Backend> {
                     column: head.column,
                     lowest: head.key,
                     highest: &self.highest,
+                    block_bytes: self.state.block_bytes_of(head.column),
                 };
                 self.writer.start_column(&target.data, &start)?;
                 self.column = Some(head.column);
@@ -269,9 +272,25 @@ impl<Backend: Io> SealJob<Backend> {
                 kind: row.kind,
             };
             self.writer.push_row(&target.data, head.key, &footer_row)?;
+            self.last_slot = self.give_slot(target.number, head.column, head.key, row.kind);
             self.walk.advance(&self.state.index, shard);
         }
         Ok(())
+    }
+
+    /// Give a row a slot in its column's table, in the block it just went into
+    pub fn give_slot(&self, number: SegmentNumber, column: ColumnId, key: &[u8], kind: RowKind) -> Option<(KeyHash, SegmentNumber, u16)> {
+        let Some(table) = self.state.complete_table(column).filter(|_table| kind != RowKind::RangeDelete) else {
+            return self.last_slot;
+        };
+        let volume = &self.state.volumes[self.volume];
+        let block = self.writer.entries().len() as u16;
+        // a key's versions in one block share a slot, and two keys of a tag never do
+        let hash = hash_key(column, key);
+        if self.last_slot != Some((hash, number, block)) {
+            table.insert(hash, number, block, |segment| self.state.is_slot_gone(volume, segment));
+        }
+        Some((hash, number, block))
     }
 
     /// Finish the footer, which syncs it, then discard the rows file
@@ -434,7 +453,9 @@ impl<Backend: Io> SealJob<Backend> {
             if is_new_key && let Some(row) = head.row {
                 let hash = hash_key(head.column, head.key);
                 let is_newest = self.state.index.is_newest_version(head.column, head.key, row.place);
-                if row.kind == RowKind::Value && is_newest {
+                if self.state.complete_table(head.column).is_some() {
+                    // a complete column gave its slots out as the rows went into the footer
+                } else if row.kind == RowKind::Value && is_newest {
                     let location = SpotLocation {
                         segment: target.number,
                         offset: row.offset,

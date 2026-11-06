@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, VolumeId};
+use reel_api::units::{ByteCount, RowCount, VolumeId};
 
 use crate::record::codec::Codec;
 
@@ -40,6 +40,8 @@ pub struct ColumnConfig {
     pub key_shape: KeyShape,
     pub codec: Codec,
     pub volume: VolumeId,
+    /// The rows a complete table holds, for a column that declares one. A get on it reads no footers
+    pub complete_rows: Option<RowCount>,
 }
 
 /// One volume

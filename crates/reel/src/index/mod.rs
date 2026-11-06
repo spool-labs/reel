@@ -1,5 +1,6 @@
 //! The in-memory index layers
 
+pub mod complete_table;
 pub mod entry_slab;
 pub mod key_hash;
 pub mod key_table;

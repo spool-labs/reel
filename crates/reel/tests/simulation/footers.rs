@@ -14,7 +14,7 @@ use reel::row_kind::RowKind;
 use reel::segment::block_entry::{BLOCK_ENTRY_BYTES, BlockEntry};
 use reel::segment::footer_reader::{ColumnIndex, FooterAnswer, FooterQuery, FooterReader};
 use reel::segment::footer_writer::{ColumnStart, FooterTotals, FooterWriter};
-use reel::segment::row_block::{BLOCK_HEADER_BYTES, FooterRow, read_block_header};
+use reel::segment::row_block::{BLOCK_HEADER_BYTES, FooterRow, ROW_BLOCK_BYTES, read_block_header};
 use reel::segment::segment_tail::{
     BlockCount, COPY_GAP_BYTES, ColumnTail, MAX_TAIL_BYTES, SECOND_TAIL_DISTANCE, SegmentNumber, TailHead,
 };
@@ -89,6 +89,7 @@ fn write_rows(columns: &[ColumnRows]) -> Written {
             column: *column,
             lowest: &rows[0].0,
             highest: &rows[rows.len() - 1].0,
+            block_bytes: ROW_BLOCK_BYTES,
         };
         writer.start_column(&file, &start).expect("column");
         for (key, row) in rows {
@@ -397,6 +398,7 @@ fn cut_during_footer(rows: &[(Vec<u8>, FooterRow)], crash_at: OperationCount, se
         column: FIRST_COLUMN,
         lowest: &rows[0].0,
         highest: &rows[rows.len() - 1].0,
+        block_bytes: ROW_BLOCK_BYTES,
     };
     let mut outcome = writer.start_column(&file, &start);
     for (key, row) in rows {

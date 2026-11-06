@@ -1,6 +1,9 @@
 use reel::engine::engine_sizing::*;
+use reel::engine::seal_job::MOST_SEGMENT_BLOCKS;
 use reel::index::open_slots::MAX_OPEN_SLOTS;
-use reel_api::units::{ByteCount, RowCount};
+use reel::row_kind::RowKind;
+use reel::segment::row_block::{COMPLETE_BLOCK_BYTES, FooterRow, RowBlockBuilder};
+use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
 const ROWS_PER_BLOCK: u64 = 1_400;
 const MOST_ROW_BYTES: u64 = 1_024;
@@ -86,4 +89,50 @@ fn documented_reserve() {
         let segment = EngineSizing::for_store(&store).segment_bytes;
         assert_eq!(2 * segment.0, reserve * 1024 * 1024, "{mib} MiB");
     }
+}
+
+fn blocks_for(rows: u64, row_of: impl Fn(u64) -> (Vec<u8>, FooterRow)) -> u64 {
+    let mut builder = RowBlockBuilder::new();
+    builder.set_block_bytes(COMPLETE_BLOCK_BYTES);
+    let mut blocks = 1;
+    for number in 0..rows {
+        let (key, row) = row_of(number);
+        if !builder.push(&key, &row) {
+            let _bytes = builder.finish();
+            builder.clear();
+            blocks += 1;
+            assert!(builder.push(&key, &row));
+        }
+    }
+    blocks
+}
+
+// a seal's row limit fits the block lines a slot can address, with the widest rows and the smallest the format allows
+#[test]
+fn complete_rows_fit_the_lines() {
+    let widest = 32;
+    let rows = complete_row_limit(widest).0;
+    let worst = |number: u64| {
+        let mut key = vec![0; widest];
+        key[..8].copy_from_slice(&number.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes());
+        let row = FooterRow {
+            place: WritePlace(u64::MAX - number),
+            offset: FileOffset(u64::from(u32::MAX) - number),
+            length: ByteCount(u64::from(u32::MAX)),
+            kind: RowKind::Value,
+        };
+        (key, row)
+    };
+    assert!(blocks_for(rows, worst) <= u64::from(MOST_SEGMENT_BLOCKS.0));
+
+    let smallest = |number: u64| {
+        let row = FooterRow {
+            place: WritePlace(0),
+            offset: FileOffset(0),
+            length: ByteCount(0),
+            kind: RowKind::Grave,
+        };
+        (number.to_be_bytes().to_vec(), row)
+    };
+    assert!(blocks_for(rows, smallest) <= u64::from(MOST_SEGMENT_BLOCKS.0));
 }

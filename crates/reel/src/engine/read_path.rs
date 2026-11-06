@@ -307,11 +307,13 @@ impl<Backend: Io> EngineState<Backend> {
             }
 
             let newest_below = found.row.map(|row| row.place).max(cover);
-            if let Some(answer) = self.try_spot(volume, read, newest_below, want, buf)? {
+            if self.complete_table(read.column).is_none()
+                && let Some(answer) = self.try_spot(volume, read, newest_below, want, buf)?
+            {
                 return Ok(answer);
             }
 
-            let sealed = self.search_footers(volume, read)?;
+            let sealed = self.search_sealed(volume, read)?;
             let located = newest_of(found.row, sealed);
             match located {
                 Located::Absent => return Ok(false),
@@ -328,7 +330,9 @@ impl<Backend: Io> EngineState<Backend> {
                         return Ok(false);
                     }
                     if self.read_sealed(volume, read, &row, want, buf)? {
-                        self.fill_spot(volume, read, &row, handovers);
+                        if self.complete_table(read.column).is_none() {
+                            self.fill_spot(volume, read, &row, handovers);
+                        }
                         return Ok(true);
                     }
                 },
@@ -349,7 +353,7 @@ impl<Backend: Io> EngineState<Backend> {
         };
 
         let found = self.index.lookup(read.column, read.key, read.read_point, volume.view());
-        let sealed = self.search_footers(volume, read)?;
+        let sealed = self.search_sealed(volume, read)?;
         let newest = newest_of(found.row, sealed);
         match newest.place().max(cover) {
             Some(place) if place > highest => Ok(()),
@@ -389,7 +393,7 @@ impl<Backend: Io> EngineState<Backend> {
             return Ok(row.kind == RowKind::Value && !is_hidden(row.place));
         }
 
-        let sealed = self.search_footers(volume, read)?;
+        let sealed = self.search_sealed(volume, read)?;
         let newest = newest_of(found.row, sealed);
         Ok(newest.has_value() && !newest.place().is_some_and(is_hidden))
     }
@@ -625,6 +629,9 @@ impl<Backend: Io> EngineState<Backend> {
             return Ok(None);
         };
         let read = self.key_read(column, key, WritePlace(u64::MAX), false)?;
+        if let Some(table) = self.complete_table(column) {
+            return self.newest_walked_complete(volume, &read, table, skipped);
+        }
         self.footer_readers.with(|reader| {
             self.walk_candidates(directory, key, reader, |segment, reader, best| {
                 if skipped.contains(&segment) {

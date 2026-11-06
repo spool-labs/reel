@@ -167,6 +167,7 @@ fn config(sync: SyncPolicy) -> StoreConfig {
             key_shape: KeyShape::Variable { most: 64 },
             codec: Codec::None,
             volume: VolumeId(0),
+            complete_rows: None,
         }],
     }
 }

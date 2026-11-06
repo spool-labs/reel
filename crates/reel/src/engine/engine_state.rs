@@ -32,7 +32,10 @@ use crate::record::record_check::RecordKey;
 use crate::record::record_encoder::RecordEncoder;
 use crate::record::record_reader::RecordReader;
 use crate::rows::row_group::RowGroupBuffer;
+use crate::engine::complete_image::ImageFiles;
+use crate::index::complete_table::CompleteTable;
 use crate::segment::block_cache::BlockCache;
+use crate::segment::row_block::ROW_BLOCK_BYTES;
 use crate::segment::column_directory::ColumnDirectory;
 use crate::segment::footer_reader::FooterReader;
 use crate::segment::segment_tail::SegmentNumber;
@@ -116,6 +119,10 @@ pub struct EngineState<Backend: Io> {
     pub read_tasks: Vec<OnceLock<Backend::Task>>,
     pub read_pool: ReadPool,
     pub is_read_only: bool,
+    pub complete: Vec<Option<CompleteTable>>,
+    pub complete_images: Vec<Option<Mutex<ImageFiles>>>,
+    pub complete_cache: Option<BlockCache>,
+    pub complete_line_bytes: ByteCount,
     pub seal_tasks: Vec<OnceLock<Backend::Task>>,
     pub planner_task: OnceLock<Backend::Task>,
     pub index_waiters: AtomicU64,
@@ -201,6 +208,11 @@ impl<Backend: Io> EngineState<Backend> {
             Some(info) => Ok(info),
             None => Err(StoreError::UnknownColumn { column }),
         }
+    }
+
+    /// Read how big a column's row blocks can get, with a column no store declares taking the usual size
+    pub fn block_bytes_of(&self, column: ColumnId) -> usize {
+        self.columns[column.0 as usize].map_or(ROW_BLOCK_BYTES, |info| info.block_bytes())
     }
 
     /// Read the write mark a new read starts from
@@ -491,7 +503,8 @@ impl<Backend: Io> EngineState<Backend> {
             budget: self.memory_budget,
             write_index: self.index.heap_bytes(),
             spot_cache: self.spot.heap_bytes(),
-            block_cache: ByteCount(self.filter_cache.heap_bytes().0 + self.row_cache.heap_bytes().0),
+            complete_tables: ByteCount(self.complete.iter().flatten().map(|table| table.heap_bytes().0).sum()),
+            block_cache: ByteCount(self.filter_cache.heap_bytes().0 + self.row_cache.heap_bytes().0 + self.complete_cache_bytes()),
             footer_space: ByteCount(self.seal_heap.load(Ordering::Acquire)),
             compaction: ByteCount(self.compaction_heap.load(Ordering::Acquire)),
             thread_stacks: ByteCount(self.job_count.load(Ordering::Acquire) * self.io.job_stack_bytes().0),
@@ -511,6 +524,8 @@ impl<Backend: Io> EngineState<Backend> {
         let footers = self.footer_readers.heap_bytes(FooterReader::heap_bytes);
         report.read_buffers = ByteCount(readers.0 + footers.0);
         report.scans = self.scan_heap;
+        // the tables and their block lines come on top of the budget
+        report.budget = ByteCount(report.budget.0 + report.complete_tables.0 + self.complete_line_bytes.0);
         report.read_buffers = ByteCount(report.read_buffers.0 + self.read_pool.heap_bytes().0);
         let encoders = self.encoders.heap_bytes(RecordEncoder::heap_bytes);
         let shares = self.stored_shares.heap_bytes(|share| ByteCount(share.capacity() as u64));

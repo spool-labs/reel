@@ -50,6 +50,7 @@ fn open(io: &SimulatedIo) -> Store2 {
             key_shape: KeyShape::Variable { most: 64 },
             codec: Codec::None,
             volume: VolumeId(0),
+            complete_rows: None,
         }],
     };
     ReelStore::open(io.clone(), &config).expect("open")

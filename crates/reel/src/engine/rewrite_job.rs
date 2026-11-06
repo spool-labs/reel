@@ -23,7 +23,7 @@ use crate::engine::engine_state::EngineState;
 use crate::engine::read_path::SealedRow;
 use crate::engine::open_segment::{data_path, output_path};
 use crate::engine::seal_job::MOST_SEGMENT_BLOCKS;
-use crate::engine::volume::{GRAVE_SLOT, MOST_MERGE_OUTPUTS, OutputSlots, RewriteOutput, Volume};
+use crate::engine::volume::{NO_SEAL, GRAVE_SLOT, MOST_MERGE_OUTPUTS, OutputSlots, RewriteOutput, Volume};
 use crate::engine::walk_job::add_count;
 use crate::guard::hold;
 use crate::io::{Io, IoFile};
@@ -31,6 +31,8 @@ use crate::pool::{touched_capacity, touched_zeroes};
 use crate::row_kind::RowKind;
 use crate::segment::column_directory::Listing;
 use crate::segment::footer_writer::{ColumnStart, FooterTotals, FooterWriter};
+use crate::index::complete_table::CompleteTable;
+use crate::index::key_hash::{KeyHash, hash_key};
 use crate::segment::row_block::{FooterRow, ROW_BLOCK_BYTES, RowBlockWalk};
 use crate::segment::segment_table::SegmentPin;
 use crate::segment::segment_tail::{BlockCount, ColumnTail, MAX_COLUMNS, MOST_MERGE_SEGMENTS, SegmentNumber};
@@ -237,6 +239,7 @@ pub struct RewriteJob<Backend: Io> {
     staged_columns: Vec<StagedColumn>,
     staged_keys: Vec<u8>,
     pub forced: Option<SegmentNumber>,
+    pub last_slot: Option<(KeyHash, SegmentNumber, u32)>,
     is_unwalked: bool,
     crowded_key: Vec<u8>,
     pub has_looks_left: bool,
@@ -298,10 +301,11 @@ impl<Backend: Io> RewriteJob<Backend> {
             output_rows: 0,
             output_last_key: touched_capacity(keys, 0),
             grave_last_key: touched_capacity(keys, 0),
-            staged: Vec::with_capacity(MOST_MERGE_OUTPUTS),
+            staged: touched_capacity(MOST_MERGE_OUTPUTS, StagedOutput { facts: SegmentFacts::default(), newest_place: WritePlace(0), first_column: 0, column_count: 0 }),
             staged_columns: touched_capacity(MOST_MERGE_OUTPUTS * MAX_COLUMNS, StagedColumn::default()),
             staged_keys: touched_capacity(MOST_MERGE_OUTPUTS * MAX_COLUMNS * (2 * SUMMARY_KEY_BYTES + 2), 0),
             forced: None,
+            last_slot: None,
             is_unwalked: false,
             crowded_key: touched_capacity(SUMMARY_KEY_BYTES, 0),
             has_looks_left: false,
@@ -412,7 +416,8 @@ impl<Backend: Io> RewriteJob<Backend> {
             let segment = row.facts.segment.0;
             is_overlap_input(row) && segment != sealing && segment != walking
         };
-        let found = overlap_start(rows, &mut self.looked_up_to, can_merge, &mut self.crowded_key);
+        let has_bound = |column: ColumnId| self.state.complete_table(column).is_none();
+        let found = overlap_start(rows, &mut self.looked_up_to, can_merge, has_bound, &mut self.crowded_key);
         let looked_up_to = self.looked_up_to;
         self.has_looks_left = rows.rows().any(|row| row.facts.segment > looked_up_to);
         let (crowded, column) = found?;
@@ -502,6 +507,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         };
         let root = number.0 as usize % volume.roots.len();
         let file = self.state.io.create_file(&output_path(&volume.roots[root], number), length)?;
+        volume.output_floor.fetch_min(number.0, Ordering::AcqRel);
         let output = RewriteOutput { file, root, number, is_named: false };
         hold(&volume.partial_outputs)[slot] = Some(output.clone());
         Ok(output)
@@ -733,11 +739,25 @@ impl<Backend: Io> RewriteJob<Backend> {
         {
             return Ok(false);
         }
+        if let Some(table) = state.complete_table(column) {
+            return Ok(!self.has_older_slot(volume, table, column, row));
+        }
         match state.has_older_row(volume, column, &self.key, row.place, &self.numbers[..self.input_count]) {
             Ok(has_older) => Ok(!has_older),
             Err(StoreError::Corruption { .. }) => Ok(false),
             Err(_error) => Err(Error::from(ErrorKind::Interrupted)),
         }
+    }
+
+    /// Check a complete column still holds an older row of a grave's key: an open row, or any slot of its tag outside this merge,
+    /// live or stale. A slot of another key can only keep the grave longer, and past the mark a row can stand with no slot at all
+    pub fn has_older_slot(&self, volume: &Volume<Backend>, table: &CompleteTable, column: ColumnId, row: &FooterRow) -> bool {
+        let state = &self.state;
+        let point = WritePlace(row.place.0.saturating_sub(1));
+        let is_own = |segment: u32| self.numbers[..self.input_count].contains(&SegmentNumber(u64::from(segment)));
+        table.mark().is_some()
+            || state.index.lookup(column, &self.key, point, volume.view()).row.is_some()
+            || table.has_other_slot(hash_key(column, &self.key), is_own, |segment| state.is_slot_gone(volume, segment))
     }
 
     /// Carry a row into the data output, and note it dead when a cue is all that keeps it, since no walk will count it again
@@ -762,6 +782,7 @@ impl<Backend: Io> RewriteJob<Backend> {
                 column,
                 lowest: &self.key,
                 highest: &self.highest,
+                block_bytes: self.state.block_bytes_of(column),
             };
             self.writer.start_column(&output.file, &start)?;
             self.output_column = Some(column);
@@ -773,6 +794,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.output_last_key.clear();
         self.output_last_key.extend_from_slice(&self.key);
         let block = self.writer.entries().len() as u32;
+        self.give_slot(volume, output.number, column, block);
         self.note_kept_dead(output.number, column, block, &kept, replacement)
     }
 
@@ -803,6 +825,7 @@ impl<Backend: Io> RewriteJob<Backend> {
                 column,
                 lowest: &self.key,
                 highest: &self.highest,
+                block_bytes: self.state.block_bytes_of(column),
             };
             self.grave_writer.start_column(&output.file, &start)?;
             self.grave_column = Some(column);
@@ -816,7 +839,19 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.grave_last_key.clear();
         self.grave_last_key.extend_from_slice(&self.key);
         let block = self.grave_writer.entries().len() as u32;
+        self.give_slot(volume, output.number, column, block);
         self.note_kept_dead(output.number, column, block, &kept, replacement)
+    }
+
+    /// Give a kept row a slot in its column's table, before the inputs go, so a read that meets the change finds it twice
+    pub fn give_slot(&mut self, volume: &Volume<Backend>, number: SegmentNumber, column: ColumnId, block: u32) {
+        if let Some(table) = self.state.complete_table(column) {
+            let hash = hash_key(column, &self.key);
+            if self.last_slot != Some((hash, number, block)) {
+                table.insert(hash, number, block as u16, |segment| self.state.is_slot_gone(volume, segment));
+                self.last_slot = Some((hash, number, block));
+            }
+        }
     }
 
     /// Note a row a cue alone keeps
@@ -1156,6 +1191,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.output = None;
         self.grave_output = None;
         self.target = None;
+        volume.output_floor.store(NO_SEAL, Ordering::Release);
         volume.is_rewriting.store(false, Ordering::Release);
         *hold(&volume.merging) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
         volume.segments_rewritten.fetch_add(1, Ordering::AcqRel);
@@ -1294,6 +1330,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.grave_output = None;
         self.leave_outputs(volume, slots);
         self.target = None;
+        volume.output_floor.store(NO_SEAL, Ordering::Release);
         volume.is_rewriting.store(false, Ordering::Release);
         *hold(&volume.merging) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
     }
@@ -1503,6 +1540,7 @@ pub fn overlap_start<'rows>(
     rows: &'rows SummaryRows,
     looked_up_to: &mut SegmentNumber,
     can_merge: impl Fn(&SummaryRow<'_>) -> bool,
+    has_bound: impl Fn(ColumnId) -> bool,
     point: &mut Vec<u8>,
 ) -> Option<(SummaryRow<'rows>, ColumnId)> {
     let is_crowded = |column: ColumnId, key: &[u8]| {
@@ -1513,6 +1551,9 @@ pub fn overlap_start<'rows>(
         let mut columns = row.cursor();
         for _column in 0..row.column_count {
             let facts = columns.column()?;
+            if !has_bound(facts.column) {
+                continue;
+            }
             let inside = rows.rows().filter_map(|other| lowest_inside(&other, facts.column, facts.lowest, facts.bound));
             let found = iter::once(facts.lowest).chain(inside.take(OVERLAP_PROBES)).find(|key| is_crowded(facts.column, key));
             if let Some(key) = found.filter(|_key| can_merge(&row)) {

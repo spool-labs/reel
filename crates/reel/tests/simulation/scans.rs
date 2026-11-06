@@ -53,6 +53,7 @@ fn open(io: &SimulatedIo) -> Store {
         key_shape: KeyShape::Variable { most: 96 },
         codec: Codec::None,
         volume: VolumeId(0),
+        complete_rows: None,
     };
     let config = StoreConfig {
         memory_budget: BUDGET,

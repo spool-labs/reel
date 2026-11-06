@@ -298,7 +298,7 @@ impl FooterReader {
                 FilterAnswer::Maybe => {},
             }
 
-            match self.search_cached(file, read, &entry, caches, query)? {
+            match self.search_cached(file, (read.segment, read.place_base), &entry, caches, query)? {
                 FooterAnswer::Absent => {},
                 answer => {
                     self.found_block = entry.block_offset;
@@ -364,22 +364,22 @@ impl FooterReader {
     pub fn search_cached<File: IoFile>(
         &mut self,
         file: &File,
-        read: &WindowRead,
+        (segment, place_base): (SegmentNumber, WritePlace),
         entry: &BlockEntry,
         caches: &FooterCaches,
         query: &FooterQuery,
     ) -> Result<FooterAnswer> {
         let key = BlockKey {
-            segment: read.segment,
+            segment,
             offset: entry.block_offset,
         };
         let buffer = &mut self.key;
-        let cached = caches.rows.with(key, |block| search_rows(block, read.place_base, query, buffer));
+        let cached = caches.rows.with(key, |block| search_rows(block, place_base, query, buffer));
         if let Some(answer) = cached {
             return Ok(answer);
         }
 
-        let answer = self.search_block(file, entry, read.place_base, query)?;
+        let answer = self.search_block(file, entry, place_base, query)?;
         if answer != FooterAnswer::Damaged {
             caches.rows.insert(key, &self.block[..entry.block_length().0 as usize]);
         }

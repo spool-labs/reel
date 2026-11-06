@@ -30,6 +30,7 @@ pub struct ColumnStart<'key> {
     pub column: ColumnId,
     pub lowest: &'key [u8],
     pub highest: &'key [u8],
+    pub block_bytes: usize,
 }
 
 /// Where a column's whole lowest and highest keys sit in the writer's key buffer
@@ -173,6 +174,7 @@ impl FooterWriter {
     /// Start a column, closing the row block of the one before it
     pub fn start_column<File: IoFile>(&mut self, file: &File, start: &ColumnStart) -> Result<()> {
         self.close_block(file)?;
+        self.builder.set_block_bytes(start.block_bytes);
         let shared = shared_prefix(start.lowest, start.highest);
         let lowest_at = self.key_bytes.len();
         put_lowest(start.lowest, &mut self.key_bytes);

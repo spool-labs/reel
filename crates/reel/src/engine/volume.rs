@@ -121,6 +121,8 @@ pub struct Volume<Backend: Io> {
     pub reclaim_retries: AtomicU64,
     /// The walk is part way through a segment
     pub has_walk_target: AtomicBool,
+    /// The lowest segment a rewrite is writing, or `NO_SEAL`. A slot at or above it can point at a segment the table has yet to take
+    pub output_floor: AtomicU64,
     /// The segment the walk has as its target, or `NO_SEAL`
     pub walk_segment: AtomicU64,
     /// A test holds the walk here to leave segments unwalked

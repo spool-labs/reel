@@ -15,7 +15,7 @@ use reel::segment::segment_tail::SECOND_TAIL_DISTANCE;
 use reel_api::column_id::ColumnId;
 use reel_api::direction::Direction;
 use reel_api::scan::ScanStep;
-use reel_api::units::{ByteCount, FileOffset, Nanoseconds, VolumeId};
+use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RowCount, VolumeId};
 use reel_api::write_batch::WriteBatch;
 use reel_sim::count_pause::CountPause;
 use reel_sim::file_image::BitMask;
@@ -28,6 +28,7 @@ const ROOT: &str = "/disk/allocations";
 const META: ColumnId = ColumnId(1);
 const BULK: ColumnId = ColumnId(2);
 const BUDGET: ByteCount = ByteCount(171 * 1024 * 1024);
+const TABLE_ROWS: RowCount = RowCount(1_000_000);
 const LONG_ROWS: usize = 4_000;
 const LONG_VALUE: &[u8] = b"a value on each column of a long batch, a value on each column of a long batch";
 const KEYS: usize = 64;
@@ -60,12 +61,13 @@ struct Inputs {
 }
 
 fn config() -> StoreConfig {
-    let column = |id: ColumnId, name: &str, codec: Codec| ColumnConfig {
+    let column = |id: ColumnId, name: &str, codec: Codec, complete_rows: Option<RowCount>| ColumnConfig {
         id,
         name: name.to_string(),
         key_shape: KeyShape::Variable { most: 64 },
         codec,
         volume: VolumeId(0),
+        complete_rows,
     };
     StoreConfig {
         memory_budget: BUDGET,
@@ -74,7 +76,7 @@ fn config() -> StoreConfig {
             roots: vec![PathBuf::from(ROOT)],
             sync: SyncPolicy::Never,
         }],
-        columns: vec![column(META, "meta", Codec::None), column(BULK, "bulk", Codec::Lz4)],
+        columns: vec![column(META, "meta", Codec::None, Some(TABLE_ROWS)), column(BULK, "bulk", Codec::Lz4, None)],
     }
 }
 

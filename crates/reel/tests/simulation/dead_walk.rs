@@ -58,6 +58,7 @@ fn config(budget: ByteCount) -> StoreConfig {
             key_shape: KeyShape::Variable { most: LONG_KEY_BYTES as u16 + 8 },
             codec: Codec::None,
             volume: VolumeId(0),
+            complete_rows: None,
         }],
     }
 }
@@ -494,6 +495,7 @@ fn turn_with(seed: Seed) {
         key_shape: KeyShape::Variable { most: 64 },
         codec: Codec::None,
         volume: VolumeId(1),
+        complete_rows: None,
     });
     let store = held(ReelStore::open(io.clone(), &config).expect("open"));
     io.hold_jobs(WALK_JOB, true);

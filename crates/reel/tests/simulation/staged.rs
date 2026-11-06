@@ -95,6 +95,7 @@ fn config(budget: ByteCount) -> StoreConfig {
                 key_shape: KeyShape::Variable { most: 64 },
                 codec: Codec::None,
                 volume: VolumeId(0),
+                complete_rows: None,
             },
             ColumnConfig {
                 id: LONG_COLUMN,
@@ -102,6 +103,7 @@ fn config(budget: ByteCount) -> StoreConfig {
                 key_shape: KeyShape::Variable { most: 1_056 },
                 codec: Codec::None,
                 volume: VolumeId(0),
+                complete_rows: None,
             },
         ],
     }

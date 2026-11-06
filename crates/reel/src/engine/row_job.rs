@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use reel_api::units::{ByteCount, Nanoseconds};
 
 use crate::engine::engine_state::EngineState;
-use crate::engine::open_segment::{OpenSegment, SegmentPhase};
+use crate::engine::open_segment::SegmentPhase;
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
 use crate::io::Io;
@@ -17,13 +17,14 @@ use crate::io::job::{Job, JobStep};
 pub const WRITE_OUT_PERIOD: Nanoseconds = Nanoseconds(50_000_000);
 /// An open segment this large seals once it sits with no write
 pub const IDLE_SEAL_BYTES: ByteCount = ByteCount(64 * 1024 * 1024);
-/// How long a large open segment sits before it seals
+/// How long an open segment that is large or holds a delete sits before it seals
 pub const IDLE_SEAL_AFTER: Nanoseconds = Nanoseconds(3_000_000_000);
+/// How old a segment's oldest delete gets before the segment seals, idle or not, so a trickle of writes can't hold space back
+pub const DELETE_SEAL_AFTER: Nanoseconds = Nanoseconds(60_000_000_000);
 
 /// The job that sends waiting rows to the kernel
 pub struct RowJob<Backend: Io> {
     pub state: Arc<EngineState<Backend>>,
-    pub last_sent: Nanoseconds,
 }
 
 impl<Backend: Io> RowJob<Backend> {
@@ -57,23 +58,38 @@ impl<Backend: Io> RowJob<Backend> {
         }
     }
 
-    /// Seal what has sat with no write long enough, and say when to look at what hasn't yet. A segment under the size stays,
-    /// since sealing it would only leave a small one to merge
+    /// Seal what has sat with no write long enough, and say when to look at what hasn't yet. A segment goes by its own last
+    /// write, so a quiet group seals beside a busy one. A segment under the size stays, since sealing it would only leave a
+    /// small one to merge, unless it holds a delete: nothing a delete hides comes back until its segment seals, so one of those
+    /// also seals on its oldest delete's age
     pub fn seal_idle_segments(&self) -> Option<Nanoseconds> {
         let now = self.state.io.now();
-        let due = Nanoseconds(self.last_sent.0 + IDLE_SEAL_AFTER.0);
-        let mut deadline = None;
+        let mut deadline: Option<Nanoseconds> = None;
         for volume in &self.state.volumes {
-            let is_large = |segment: &OpenSegment<Backend::File>| {
-                segment.phase == SegmentPhase::Taking && segment.write_end.0 >= IDLE_SEAL_BYTES.0
-            };
-            if !hold(&volume.claims).open.iter().any(is_large) {
-                continue;
-            }
-            if now.0 >= due.0 {
-                self.state.seal_fullest(volume);
-            } else {
-                deadline = Some(due);
+            let mut claims = hold(&volume.claims);
+            for index in 0..claims.open.len() {
+                let segment = &mut claims.open[index];
+                if segment.phase != SegmentPhase::Taking || segment.row_count.0 == 0 {
+                    continue;
+                }
+                if segment.seen_rows != segment.row_count {
+                    segment.seen_rows = segment.row_count;
+                    segment.quiet_since = now;
+                }
+                if segment.has_deletes && segment.delete_seen.is_none() {
+                    segment.delete_seen = Some(now);
+                }
+                if !segment.has_deletes && segment.write_end.0 < IDLE_SEAL_BYTES.0 {
+                    continue;
+                }
+                let quiet_due = Nanoseconds(segment.quiet_since.0 + IDLE_SEAL_AFTER.0);
+                let aged_due = segment.delete_seen.map(|seen| Nanoseconds(seen.0 + DELETE_SEAL_AFTER.0));
+                let due = aged_due.map_or(quiet_due, |aged| aged.min(quiet_due));
+                if now.0 >= due.0 {
+                    self.state.seal_at(&mut claims, volume, index);
+                } else {
+                    deadline = Some(deadline.map_or(due, |soonest| soonest.min(due)));
+                }
             }
         }
         deadline
@@ -94,7 +110,8 @@ impl<Backend: Io> Job for RowJob<Backend> {
     fn step(&mut self) -> JobStep {
         if self.send_all() {
             let now = self.state.io.now();
-            self.last_sent = now;
+            // a busy store still has quiet segments, and each goes by its own last write
+            let _deadline = self.seal_idle_segments();
             return JobStep::IdleUntil {
                 deadline: Nanoseconds(now.0 + WRITE_OUT_PERIOD.0),
             };

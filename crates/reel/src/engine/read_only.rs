@@ -7,7 +7,7 @@ use std::io::{Error, ErrorKind, Result as IoResult};
 use std::sync::Arc;
 
 use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
+use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RowCount, WritePlace};
 
 use crate::config::StoreConfig;
 use crate::engine::engine_sizing::GROUP_BYTES;
@@ -145,6 +145,7 @@ impl<Backend: Io> EngineState<Backend> {
             lost_region: None,
             cover_rows: 0,
             marks: MarkRange::NONE,
+            has_deletes: false,
         };
         let target = ReplayTarget {
             volume,
@@ -173,6 +174,10 @@ impl<Backend: Io> EngineState<Backend> {
             highest_place: recovered.highest_place,
             ceiling: recovered.marks.highest(),
             marks: recovered.marks,
+            has_deletes: recovered.has_deletes,
+            seen_rows: RowCount(0),
+            quiet_since: Nanoseconds(0),
+            delete_seen: None,
         });
         Ok(())
     }

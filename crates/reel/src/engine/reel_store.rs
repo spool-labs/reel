@@ -599,7 +599,6 @@ pub fn bring_up<Backend: Io>(
 
     let row_job = RowJob {
         state: Arc::clone(state),
-        last_sent: state.io.now(),
     };
     let task = state.io.spawn_job("reel-rows", row_job).map_err(open_error("starting a job"))?;
     // the cell is empty until here, so this set can't fail

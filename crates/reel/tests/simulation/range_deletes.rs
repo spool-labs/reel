@@ -403,6 +403,7 @@ fn older_outlives_newer() {
         has_records: true,
         covers: 0,
         mark: None,
+        has_deletes: false,
     };
     let claim = store.state.claim(volume, &alone).expect("claim");
     let (older_slot, older_segment) = (claim.slot, claim.segment);

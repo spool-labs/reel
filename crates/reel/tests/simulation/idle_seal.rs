@@ -1,14 +1,15 @@
-//! A large open segment seals once it sits with no write, and a small one stays open for the writes to come
+//! A large open segment seals once it sits with no write, one that holds a delete seals at any size, and a small one stays open
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
-use reel::engine::row_job::{IDLE_SEAL_AFTER, IDLE_SEAL_BYTES};
+use reel::engine::row_job::{DELETE_SEAL_AFTER, IDLE_SEAL_AFTER, IDLE_SEAL_BYTES};
+use reel::guard::hold;
 use reel::record::codec::Codec;
 use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, Nanoseconds, VolumeId};
+use reel_api::units::{ByteCount, DeathMark, Nanoseconds, VolumeId};
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_io::SimulatedIo;
 
@@ -106,5 +107,72 @@ fn writes_hold_it_off() {
     }
     settle(&io);
     assert_eq!(seals(&store), 0);
+    store.close().expect("close");
+}
+
+// a segment that holds a delete seals a few seconds after its last write, whatever its size
+#[test]
+fn delete_seals_small() {
+    let io = SimulatedIo::new(Seed(4));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"value").expect("put");
+    store.delete(COLUMN, b"key").expect("delete");
+    settle(&io);
+    assert_eq!(seals(&store), 0);
+    io.advance_clock(IDLE_SEAL_AFTER);
+    settle(&io);
+    assert_eq!(seals(&store), 1);
+    store.close().expect("close");
+}
+
+fn trickle(store: &Store, io: &SimulatedIo) {
+    let second = Nanoseconds(1_000_000_000);
+    for number in 0..DELETE_SEAL_AFTER.0 / second.0 + 2 {
+        store.put(COLUMN, format!("trickle-{number:03}").as_bytes(), b"value").expect("put");
+        settle(io);
+        io.advance_clock(second);
+    }
+    settle(io);
+}
+
+// a trickle of writes can't hold a delete's segment open past the bound
+#[test]
+fn delete_ages_out() {
+    let io = SimulatedIo::new(Seed(5));
+    let store = open(&io);
+    store.delete(COLUMN, b"key").expect("delete");
+    settle(&io);
+    trickle(&store, &io);
+    assert_eq!(seals(&store), 1);
+    store.close().expect("close");
+}
+
+// the same trickle with no delete leaves the segment open
+#[test]
+fn trickle_stays_open() {
+    let io = SimulatedIo::new(Seed(6));
+    let store = open(&io);
+    trickle(&store, &io);
+    assert_eq!(seals(&store), 0);
+    store.close().expect("close");
+}
+
+// a quiet segment seals beside a busy one, which store-wide idle would never reach
+#[test]
+fn quiet_beside_busy() {
+    let io = SimulatedIo::new(Seed(7));
+    let store = open(&io);
+    store.delete(COLUMN, b"key").expect("delete");
+    settle(&io);
+    let holding_deletes = |store: &Store| hold(&store.state.volumes[0].claims).open.iter().filter(|segment| segment.has_deletes).count();
+    assert_eq!(holding_deletes(&store), 1);
+    let second = Nanoseconds(1_000_000_000);
+    for number in 0..IDLE_SEAL_AFTER.0 / second.0 + 2 {
+        store.put_marked(COLUMN, format!("marked-{number:03}").as_bytes(), b"value", DeathMark(1_000)).expect("put");
+        settle(&io);
+        io.advance_clock(second);
+    }
+    settle(&io);
+    assert_eq!(holding_deletes(&store), 0);
     store.close().expect("close");
 }

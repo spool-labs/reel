@@ -6,7 +6,7 @@ use std::ops::Deref;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-use reel_api::units::{ByteCount, DeathMark, FileOffset, RootId, RowCount, WritePlace};
+use reel_api::units::{ByteCount, DeathMark, FileOffset, Nanoseconds, RootId, RowCount, WritePlace};
 
 use crate::index::open_slots::OpenSlot;
 use crate::lifetime::MarkRange;
@@ -55,6 +55,10 @@ pub struct OpenSegment<File> {
     pub highest_place: WritePlace,
     pub ceiling: Option<DeathMark>,
     pub marks: MarkRange,
+    pub has_deletes: bool,
+    pub seen_rows: RowCount,
+    pub quiet_since: Nanoseconds,
+    pub delete_seen: Option<Nanoseconds>,
 }
 
 /// Bytes of the file range a slot's small records fill before they reach the kernel in one write call

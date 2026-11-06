@@ -171,6 +171,7 @@ fn stage<'state>(state: &'state State, key: &[u8], value: Option<&[u8]>) -> Stag
         has_records: true,
         covers: 0,
         mark: None,
+        has_deletes: false,
     };
     let claim = state.claim(volume, &request).expect("claim");
     let record = value.map_or(Vec::new(), |value| encode(state, key, value, claim.first_place()));
@@ -1086,6 +1087,7 @@ fn empty_seal() {
         has_records: false,
         covers: 0,
         mark: None,
+        has_deletes: false,
     };
     // a claim that lands nothing leaves a segment with no rows in the index
     drop(state.claim(&state.volumes[0], &request).expect("claim"));
@@ -1141,6 +1143,7 @@ fn covers_out_of_order() {
         has_records: true,
         covers: 1,
         mark: None,
+        has_deletes: false,
     };
 
     assert!(volume.covers.hold(1));

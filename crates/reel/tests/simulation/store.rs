@@ -61,6 +61,7 @@ const ONE_ROW: ClaimRequest = ClaimRequest {
     has_records: true,
     covers: 0,
     mark: None,
+    has_deletes: false,
 };
 
 type Store = ReelStore<SimulatedIo>;

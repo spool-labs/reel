@@ -229,6 +229,7 @@ fn seen_whole() {
         has_records: false,
         covers: 0,
         mark: None,
+        has_deletes: false,
     };
     let earlier = store.state.claim(volume, &request).expect("claim");
 
@@ -610,6 +611,7 @@ fn alone_claim() {
         has_records: true,
         covers: 0,
         mark: None,
+        has_deletes: false,
     };
     let short = ClaimRequest { is_alone: false, ..long };
 
@@ -640,6 +642,7 @@ fn rows_go_first() {
         has_records: false,
         covers: 0,
         mark: None,
+        has_deletes: false,
     };
     let earlier = store.state.claim(volume, &request).expect("claim");
     let place = earlier.first_place();
@@ -687,6 +690,7 @@ fn turn_spares_puts() {
         has_records: true,
         covers: 0,
         mark: None,
+        has_deletes: false,
     };
     let claim = store.state.claim(volume, &long).expect("claim");
     let slot = claim.slot;
@@ -933,6 +937,7 @@ fn long_seal_beside() {
         has_records: false,
         covers: 0,
         mark: None,
+        has_deletes: false,
     };
     let earlier = store.state.claim(volume, &request).expect("claim");
 

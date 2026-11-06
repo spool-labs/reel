@@ -314,6 +314,7 @@ impl<Backend: Io> EngineState<Backend> {
             has_records: bytes.0 > 0,
             covers: plan.covers,
             mark: batch_mark(batch, plan),
+            has_deletes: plan.deletes > 0 || plan.covers > 0,
         };
         // a long group goes out under its own turn, and a short one needs room in the group filling
         let (claim, room) = if is_long {

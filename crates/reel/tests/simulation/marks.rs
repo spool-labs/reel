@@ -434,3 +434,21 @@ fn crowd_of_lifetimes_goes_quiet() {
     assert!(!store.state.volumes[0].has_walk_target.load(Ordering::Acquire));
     store.close().expect("close");
 }
+
+// a range delete over a whole lifetime gives its space back on a quiet volume, with the delete itself the only unmarked row
+#[test]
+fn range_delete_ends_a_lifetime() {
+    let io = SimulatedIo::new(Seed(43));
+    let store = open(&io);
+    put_keys(&store, 0, LIFETIME_KEYS, DeathMark(1_000));
+    store.set_current_mark(DeathMark(2_000));
+    settle(&io);
+    assert_eq!(sealed_marks(&store).len(), 1);
+    store.delete_range(COLUMN, &key(0), &key(LIFETIME_KEYS)).expect("delete");
+    idle(&store, &io);
+    let mut report = MaintenanceReport::default();
+    store.maintenance_report(&mut report);
+    assert!(report.segments_unlinked.0 >= 1, "{report:?}");
+    assert_eq!(report.volumes[0].used_bytes, ByteCount(0), "{report:?}");
+    store.close().expect("close");
+}

@@ -44,6 +44,7 @@ pub const SPARE_REQUEST: ClaimRequest = ClaimRequest {
     has_records: true,
     covers: 0,
     mark: None,
+    has_deletes: false,
 };
 /// How many times a writer waits on the spot for a window to go out before it tries again
 pub const WINDOW_SPINS: u32 = 2_000;
@@ -61,6 +62,7 @@ pub struct ClaimRequest {
     pub has_records: bool,
     pub covers: usize,
     pub mark: Option<DeathMark>,
+    pub has_deletes: bool,
 }
 
 /// A value on its way to a record
@@ -143,6 +145,7 @@ impl<Backend: Io> EngineState<Backend> {
             has_records: true,
             covers: 0,
             mark: write.mark,
+            has_deletes: false,
         };
         let size = row_size(write.key.len());
         loop {
@@ -398,6 +401,7 @@ impl<Backend: Io> EngineState<Backend> {
             has_records: true,
             covers: 0,
             mark: write.mark,
+            has_deletes: false,
         };
         loop {
             let (claim, room) = self.claim_with_room(volume, &request, row_size(write.key.len()))?;
@@ -449,6 +453,7 @@ impl<Backend: Io> EngineState<Backend> {
             has_records: false,
             covers: 0,
             mark: None,
+            has_deletes: true,
         };
         loop {
             let (claim, room) = self.claim_with_room(volume, &request, row_size(key.len()))?;
@@ -526,6 +531,7 @@ impl<Backend: Io> EngineState<Backend> {
             has_records: true,
             covers: 1,
             mark: None,
+            has_deletes: true,
         };
         loop {
             let (claim, room) = self.claim_with_room(volume, &request, row_size(start.len()))?;
@@ -813,6 +819,7 @@ impl<Backend: Io> EngineState<Backend> {
                 volume.rows_in_index.fetch_add(request.rows.0, Ordering::Relaxed);
                 segment.in_flight += 1;
                 segment.cover_rows += request.covers;
+                segment.has_deletes |= request.has_deletes;
                 segment.lowest_place = segment.lowest_place.min(ticket.first);
                 segment.highest_place = segment.highest_place.max(ticket.last);
                 if let Some(mark) = request.mark {
@@ -1144,6 +1151,10 @@ impl<Backend: Io> EngineState<Backend> {
             highest_place: WritePlace(0),
             ceiling: None,
             marks: MarkRange::NONE,
+            has_deletes: false,
+            seen_rows: RowCount(0),
+            quiet_since: Nanoseconds(0),
+            delete_seen: None,
         })
     }
 

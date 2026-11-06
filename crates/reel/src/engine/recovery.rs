@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, FileOffset, RootId, RowCount, WritePlace};
+use reel_api::units::{ByteCount, FileOffset, RootId, Nanoseconds, RowCount, WritePlace};
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::engine::engine_sizing::GROUP_BYTES;
@@ -214,6 +214,7 @@ pub struct RecoveredRows {
     pub lost_region: Option<(FileOffset, FileOffset)>,
     pub cover_rows: usize,
     pub marks: MarkRange,
+    pub has_deletes: bool,
 }
 
 impl<File> RootScan<File> {
@@ -627,6 +628,7 @@ impl<Backend: Io> EngineState<Backend> {
             lost_region: None,
             cover_rows: 0,
             marks: MarkRange::NONE,
+            has_deletes: false,
         };
         let mut records = RecordReader::new();
         let target = ReplayTarget {
@@ -679,6 +681,10 @@ impl<Backend: Io> EngineState<Backend> {
             highest_place: recovered.highest_place,
             ceiling: recovered.marks.highest(),
             marks: recovered.marks,
+            has_deletes: recovered.has_deletes,
+            seen_rows: RowCount(0),
+            quiet_since: Nanoseconds(0),
+            delete_seen: None,
         });
         Ok(true)
     }
@@ -838,6 +844,7 @@ impl<Backend: Io> EngineState<Backend> {
         }
 
         recovered.row_count = RowCount(recovered.row_count.0 + 1);
+        recovered.has_deletes |= row.kind != RowKind::Value;
         recovered.lowest_place = recovered.lowest_place.min(row.place);
         recovered.highest_place = recovered.highest_place.max(row.place);
         recovered.write_end = recovered.write_end.max(FileOffset(row.offset.0 + row.length.0));
@@ -1141,6 +1148,7 @@ pub fn copy_row<Backend: Io>(
         has_records: row.length.0 > 0,
         covers: usize::from(row.kind == RowKind::RangeDelete),
         mark: None,
+        has_deletes: row.kind != RowKind::Value,
     };
     loop {
         let claim = state.claim(target, &request).map_err(open_failure)?;

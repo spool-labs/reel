@@ -490,6 +490,73 @@ fn unlink_waits_for_the_apply() {
     store.close().expect("close");
 }
 
+// a cover part way through its apply has counted rows, so a newer one that isn't applied leaves it in the pool
+#[test]
+fn counting_cover_stays() {
+    let io = SimulatedIo::new(Seed(21));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let volume = &store.state.volumes[0];
+    put_keys(&store, "a", b"value");
+    put_keys(&store, "m", b"value");
+    let older = seal(&store, &io);
+    store.delete_range(COLUMN, b"m", b"n").expect("delete");
+    store.put(COLUMN, b"zz", b"value").expect("put");
+    let cover_segment = hold(&volume.claims).open[0].number;
+    volume.is_walk_held.store(true, Ordering::Release);
+    store.seal_now();
+    settle(&io);
+
+    let rows = hold(&volume.summary);
+    let block_count = rows.get(cover_segment).expect("a row").facts.block_count;
+    drop(rows);
+    let mut walk = WalkJob::new(Arc::clone(&store.state), 0);
+    walk.target = Some(WalkTarget {
+        segment: cover_segment,
+        next_block: 0,
+        block_count,
+        is_backward: false,
+        is_damaged: false,
+    });
+    while dead_rows(&store, older) < KEYS {
+        walk.step_unit(io.now());
+        let _stepped = io.step_any();
+        io.advance_clock(TICK);
+    }
+    assert!(walk.apply.segment.is_some());
+    store.delete_range(COLUMN, b"l", b"o").expect("delete");
+    assert_eq!(pending(&store), 2);
+    store.close().expect("close");
+}
+
+// a rebuilt row's backward walk leaves what its cover's apply already counted
+#[test]
+fn rebuilt_cover_counts_once() {
+    let io = SimulatedIo::new(Seed(22));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    put_keys(&store, "a", b"value");
+    put_keys(&store, "m", b"value");
+    let older = seal(&store, &io);
+    store.delete_range(COLUMN, b"m", b"n").expect("delete");
+    store.put(COLUMN, b"zz", b"value").expect("put");
+    let cover_segment = seal(&store, &io);
+    assert_eq!(dead_rows(&store, older), KEYS);
+
+    let volume = &store.state.volumes[0];
+    hold(&volume.summary).remove(cover_segment);
+    store.state.save_summary(volume).expect("save");
+    io.kill();
+    drop(store);
+
+    let store = open(&io);
+    hold_compaction(&store, true);
+    settle(&io);
+    assert_eq!(dead_rows(&store, older), KEYS);
+    assert_eq!(read(&store, b"m-000"), None);
+    store.close().expect("close");
+}
+
 // a settled cover costs its segment no rewrite, and open leaves it out of the pool
 #[test]
 fn settled_cover_stays_put() {

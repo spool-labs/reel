@@ -482,6 +482,11 @@ impl<Backend: Io> WalkJob<Backend> {
         }
         // the covers land before the mark, while no other walk is running to see the rows they hide
         if self.has_covers(volume, target.segment) {
+            // a forward walk came first, and its apply counted what these hide
+            if target.is_backward {
+                self.end_apply(volume, target.segment);
+                return self.finish_target(volume, target.segment);
+            }
             self.apply.start(target.segment);
             volume.is_applying.store(true, Ordering::Release);
             self.target = Some(WalkTarget { next_block, ..target });
@@ -503,10 +508,7 @@ impl<Backend: Io> WalkJob<Backend> {
         match self.apply.step() {
             Ok(ApplyStep::Working) => UnitStep::Worked,
             Ok(ApplyStep::Done) => {
-                volume.is_applying.store(false, Ordering::Release);
-                volume.covers.mark_segment_applied(target.segment);
-                // an older cover inside this one could not go until now
-                volume.has_kept_covers.store(true, Ordering::Release);
+                self.end_apply(volume, target.segment);
                 match self.finish_target(volume, target.segment) {
                     Ok(()) => UnitStep::Worked,
                     Err(_) => self.wait_for_retry(now),
@@ -514,6 +516,14 @@ impl<Backend: Io> WalkJob<Backend> {
             },
             Err(_) => self.wait_for_retry(now),
         }
+    }
+
+    /// Note a segment's covers are applied
+    pub fn end_apply(&self, volume: &Volume<Backend>, segment: SegmentNumber) {
+        volume.is_applying.store(false, Ordering::Release);
+        volume.covers.mark_segment_applied(segment);
+        // an older cover inside this one could not go until now
+        volume.has_kept_covers.store(true, Ordering::Release);
     }
 
     /// End a walk target

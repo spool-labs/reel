@@ -126,7 +126,7 @@ impl<Backend: Io> CoverApply<Backend> {
     pub fn next_cover(&mut self, volume: &Volume<Backend>, segment: SegmentNumber) -> ApplyStep {
         while let Some((column, place, owner)) = volume.covers.cover_at(self.position, &mut self.start, &mut self.end) {
             self.position += 1;
-            if owner == segment {
+            if owner == segment && volume.covers.mark_counting(place) {
                 self.cover = Some((column, place));
                 self.last_other = SegmentNumber(0);
                 return ApplyStep::Working;

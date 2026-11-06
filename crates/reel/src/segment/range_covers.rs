@@ -45,6 +45,8 @@ pub struct CoverSlot {
     pub segment: SegmentNumber,
     /// The walk of the cover's segment has counted what it hides, so a row's count can stand on it
     pub is_applied: bool,
+    /// Its apply has begun, and the rows it counted need it in the pool from here on
+    pub is_counting: bool,
     /// Rows it hides are left only in its own segment, and they leave with the cover at that segment's rewrite
     pub is_clear: bool,
 }
@@ -217,7 +219,7 @@ impl CoverPool {
             }
             // an applied cover has counted its rows, so it stays until one that knows those rows are counted can take over
             let fields = &self.slots[slot as usize];
-            if self.end(slot) <= cover.end && fields.place < cover.place && (is_applied || !fields.is_applied) {
+            if self.end(slot) <= cover.end && fields.place < cover.place && (is_applied || !fields.is_counting) {
                 return true;
             }
             position += 1;
@@ -237,7 +239,7 @@ impl CoverPool {
             }
             // an applied cover has counted its rows, so it stays until one that knows those rows are counted can take over
             let fields = &self.slots[slot as usize];
-            if self.end(slot) <= cover.end && fields.place < cover.place && (is_applied || !fields.is_applied) {
+            if self.end(slot) <= cover.end && fields.place < cover.place && (is_applied || !fields.is_counting) {
                 self.order.remove(position);
                 self.reach.remove(position);
                 self.free.push(slot);
@@ -326,6 +328,7 @@ impl CoverPool {
             place: cover.place,
             segment: cover.segment,
             is_applied,
+            is_counting: is_applied,
             is_clear: false,
         };
         let start_at = slot as usize * 2 * self.widest_key;
@@ -422,6 +425,20 @@ impl RangeCovers {
         newest
     }
 
+    /// Note a cover's apply has begun, and say whether the cover is still here to count for
+    pub fn mark_counting(&self, place: WritePlace) -> bool {
+        let mut pool = self.write();
+        let order = mem::take(&mut pool.order);
+        let mut is_here = false;
+        for slot in &order {
+            let fields = &mut pool.slots[*slot as usize];
+            is_here |= fields.place == place;
+            fields.is_counting |= fields.place == place;
+        }
+        pool.order = order;
+        is_here
+    }
+
     /// Note one cover as applied, found by its place
     pub fn mark_applied(&self, place: WritePlace) {
         let mut pool = self.write();
@@ -429,6 +446,7 @@ impl RangeCovers {
         for slot in &order {
             let fields = &mut pool.slots[*slot as usize];
             fields.is_applied |= fields.place == place;
+            fields.is_counting |= fields.place == place;
         }
         pool.order = order;
     }
@@ -440,6 +458,7 @@ impl RangeCovers {
         for slot in &order {
             let fields = &mut pool.slots[*slot as usize];
             fields.is_applied |= fields.segment == segment;
+            fields.is_counting |= fields.segment == segment;
         }
         pool.order = order;
     }

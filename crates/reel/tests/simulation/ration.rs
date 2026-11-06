@@ -5,6 +5,7 @@ use std::sync::atomic::Ordering;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
+use reel::io::Io;
 use reel::record::codec::Codec;
 use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
@@ -80,7 +81,7 @@ fn put_keys(store: &Store, first: u64, count: u64) {
 }
 
 fn line(store: &Store) -> Option<RowCount> {
-    store.state.volumes[0].ration.line()
+    store.state.volumes[0].ration.line(|| store.state.io.now())
 }
 
 // a seal's first step starts the ration, so the line stands where the walk has it

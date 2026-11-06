@@ -2,7 +2,7 @@
 
 use std::io::{Error, ErrorKind, Result};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use reel_api::column_id::ColumnId;
 use reel_api::maintenance_report::JobKind;
@@ -13,7 +13,7 @@ use crate::config::MAX_KEY_BYTES;
 use crate::engine::engine_sizing::{rows_per_second, seal_point};
 use crate::engine::engine_state::EngineState;
 use crate::engine::open_segment::{SegmentPhase, rows_path};
-use crate::engine::volume::{NO_SEAL, Volume};
+use crate::engine::volume::{NO_SEAL, SealStepTimes, Volume};
 use crate::guard::hold;
 use crate::lifetime::MarkRange;
 use crate::index::key_hash::{KeyHash, hash_key};
@@ -95,6 +95,7 @@ pub struct SealJob<Backend: Io> {
     pub last_key: Vec<u8>,
     pub last_slot: Option<(KeyHash, SegmentNumber, u16)>,
     pub seal_started: Nanoseconds,
+    pub step_started: Nanoseconds,
     pub rows_walked: u64,
     pub rows_cleaned: u64,
     pub last_column: Option<ColumnId>,
@@ -123,6 +124,7 @@ impl<Backend: Io> SealJob<Backend> {
             last_key: touched_capacity(MAX_KEY_BYTES as usize, 0),
             last_slot: None,
             seal_started: Nanoseconds(0),
+            step_started: Nanoseconds(0),
             rows_walked: 0,
             rows_cleaned: 0,
             last_column: None,
@@ -150,11 +152,12 @@ impl<Backend: Io> SealJob<Backend> {
                     volume.ingest_rate.store(rate, Ordering::Relaxed);
                 }
                 self.seal_started = now;
+                self.step_started = now;
                 self.rows_walked = 0;
                 self.rows_cleaned = 0;
                 let held = self.state.rows_held();
                 let free = RowCount(self.state.index_capacity().0.saturating_sub(held.0));
-                volume.ration.start(segment.row_count, held, free);
+                volume.ration.start(segment.row_count, held, free, now);
                 self.target = Some(SealTarget {
                     number: segment.number,
                     slot: segment.slot,
@@ -171,6 +174,14 @@ impl<Backend: Io> SealJob<Backend> {
             }
         }
         false
+    }
+
+    /// Note how long a step ran, and start the clock on the next
+    pub fn end_step(&mut self, step: impl Fn(&SealStepTimes) -> &AtomicU64) {
+        let now = self.state.io.now();
+        let elapsed = now.0.saturating_sub(self.step_started.0);
+        step(&self.volume().seal_steps).fetch_max(elapsed, Ordering::Relaxed);
+        self.step_started = now;
     }
 
     /// End the seal in progress, and bring the planner back for the walk its segment waited on
@@ -226,6 +237,7 @@ impl<Backend: Io> SealJob<Backend> {
 
     /// Send the target's last rows out and start its footer
     pub fn start_writing(&mut self, target: &SealTarget<Backend::File>) -> Result<()> {
+        self.end_step(|steps| &steps.drain);
         self.state.write_out(target.slot)?;
         self.writer.start(target.data_end, target.lowest_place);
         self.writer.set_marks(target.marks);
@@ -244,6 +256,7 @@ impl<Backend: Io> SealJob<Backend> {
 
     /// Put a step's rows into the footer, and finish it when they run out
     pub fn write_rows(&mut self, target: &SealTarget<Backend::File>) -> Result<()> {
+        self.end_step(|steps| &steps.walk_step);
         self.volume().ration.note_walked(RowCount(self.rows_walked));
         self.rows_walked += SEAL_STEP_ROWS;
         for _row in 0..SEAL_STEP_ROWS {
@@ -358,6 +371,8 @@ impl<Backend: Io> SealJob<Backend> {
 
     /// Finish the footer, which syncs it, then discard the rows file
     pub fn finish_footer(&mut self, target: &SealTarget<Backend::File>) -> Result<()> {
+        self.end_step(|steps| &steps.walk_step);
+        self.volume().ration.note_walk_end(self.step_started);
         let state = Arc::clone(&self.state);
         // the tail ends the segment's rows, so what they can no longer say has to be on disk first, and a failed save
         // holds the seal here
@@ -367,6 +382,7 @@ impl<Backend: Io> SealJob<Backend> {
         }
         let totals = self.writer.finish(&target.data, target.number, target.data_end, &self.ranges, state.record_key, &[])?;
         self.totals = Some(totals);
+        self.end_step(|steps| &steps.footer);
         self.phase = SealPhase::Installing;
         Ok(())
     }
@@ -509,11 +525,13 @@ impl<Backend: Io> SealJob<Backend> {
         if let Some(task) = self.state.planner_task.get() {
             task.wake();
         }
+        self.end_step(|steps| &steps.install);
         self.phase = SealPhase::Cleaning;
     }
 
     /// Clean a step's rows out of the write index, and free the slot when they and the pins are gone
     pub fn clean(&mut self, target: &SealTarget<Backend::File>) -> bool {
+        self.end_step(|steps| &steps.clean_step);
         self.volume().ration.note_cleaned(RowCount(self.rows_cleaned));
         self.rows_cleaned += SEAL_STEP_ROWS;
         if !self.state.index.clean_slot(target.slot, RowCount(SEAL_STEP_ROWS)) {

@@ -601,7 +601,7 @@ impl<Backend: Io> EngineState<Backend> {
     /// Each volume answers only to its own seal, so a meta writer goes past a bulk seal's walk. It waits behind that seal only
     /// once the index itself is full, and the bulk writers stop short of that by the share held back for the seal's last steps
     pub fn draw_ration(&self, volume: &Volume<Backend>, rows: RowCount) -> Result<(), StoreError> {
-        if volume.ration.lets_through(self.rows_held(), rows) {
+        if volume.ration.lets_through(self.rows_held(), rows, || self.io.now()) {
             return Ok(());
         }
 
@@ -613,7 +613,7 @@ impl<Backend: Io> EngineState<Backend> {
         let mut spins = 0;
         loop {
             if volume.ration.is_served(ticket) {
-                let is_clear = volume.ration.line().is_none_or(|line| self.rows_held().0 + rows.0 <= line.0);
+                let is_clear = volume.ration.line(|| self.io.now()).is_none_or(|line| self.rows_held().0 + rows.0 <= line.0);
                 let has_failed = volume.has_failed();
                 let is_late = self.io.now().0 > deadline;
                 if is_clear || has_failed || is_late {

@@ -85,6 +85,7 @@ pub struct VolumeReading {
     pub early_bar_rewrites: u64,
     /// Marked segments rewritten at the plain bar, once the current mark had passed their highest
     pub plain_bar_rewrites: u64,
+    pub longest_seal_steps: SealSteps,
 }
 
 /// Lanes a volume reading has room for. Workers past this show in the last one
@@ -173,4 +174,19 @@ impl Default for MaintenanceReport {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The longest each step of a seal has run since open, each a stretch with no room coming back on its own
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SealSteps {
+    /// Waiting for the segment's writers to land
+    pub drain: Nanoseconds,
+    /// One step of the walk
+    pub walk_step: Nanoseconds,
+    /// Writing and syncing the footer
+    pub footer: Nanoseconds,
+    /// Listing the segment and saving its summary
+    pub install: Nanoseconds,
+    /// One step of cleaning the write index
+    pub clean_step: Nanoseconds,
 }

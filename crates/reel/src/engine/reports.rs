@@ -161,6 +161,7 @@ impl<Backend: Io> EngineState<Backend> {
                 marks_dropped: volume.marks_dropped.load(Ordering::Acquire),
                 early_bar_rewrites: volume.early_bar_rewrites.load(Ordering::Acquire),
                 plain_bar_rewrites: volume.plain_bar_rewrites.load(Ordering::Acquire),
+                longest_seal_steps: volume.seal_steps.reading(),
             });
         }
         for (id, info) in self.columns.iter().enumerate() {

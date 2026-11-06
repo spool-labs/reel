@@ -45,7 +45,7 @@ use crate::engine::compact_job::{CompactJob, park};
 use crate::engine::cue::{Cue, CueTable};
 use crate::engine::planner::Planner;
 use crate::engine::walk_job::{BlockCounter, WalkJob, WalkSlot, WalkWorker};
-use crate::engine::volume::{ClaimState, GaveUp, MOST_MERGE_OUTPUTS, MOST_PARKED, NO_SEAL, RewriteLane, SyncState, Volume};
+use crate::engine::volume::{SealStepTimes, ClaimState, GaveUp, MOST_MERGE_OUTPUTS, MOST_PARKED, NO_SEAL, RewriteLane, SyncState, Volume};
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
 use crate::engine::complete_image::ImageFiles;
@@ -1069,6 +1069,7 @@ pub fn build_state<Backend: Io>(
             plain_bar_rewrites: AtomicU64::new(0),
             order: WriteOrder::new(Arc::clone(&places)),
             rows_in_index: AtomicU64::new(0),
+            seal_steps: SealStepTimes::default(),
             ration: Ration::default(),
             marked_seals: AtomicU64::new(0),
             marked_seal_bytes: AtomicU64::new(0),

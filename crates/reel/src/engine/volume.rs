@@ -4,7 +4,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use reel_api::units::{ByteCount, RowCount, VolumeId, WritePlace};
+use reel_api::maintenance_report::SealSteps;
+use reel_api::units::{ByteCount, Nanoseconds, RowCount, VolumeId, WritePlace};
 
 use crate::config::SyncPolicy;
 use crate::engine::open_segment::{OpenSegment, SegmentPhase};
@@ -212,6 +213,7 @@ pub struct Volume<Backend: Io> {
     pub plain_bar_rewrites: AtomicU64,
     pub order: WriteOrder,
     pub rows_in_index: AtomicU64,
+    pub seal_steps: SealStepTimes,
     pub ration: Ration,
     pub marked_seals: AtomicU64,
     pub marked_seal_bytes: AtomicU64,
@@ -350,5 +352,29 @@ impl<Backend: Io> Volume<Backend> {
             }
         }
         count
+    }
+}
+
+/// The longest each step of a seal has run, for the report
+#[derive(Debug, Default)]
+pub struct SealStepTimes {
+    pub drain: AtomicU64,
+    pub walk_step: AtomicU64,
+    pub footer: AtomicU64,
+    pub install: AtomicU64,
+    pub clean_step: AtomicU64,
+}
+
+impl SealStepTimes {
+    /// Read the times for a report
+    pub fn reading(&self) -> SealSteps {
+        let read = |step: &AtomicU64| Nanoseconds(step.load(Ordering::Relaxed));
+        SealSteps {
+            drain: read(&self.drain),
+            walk_step: read(&self.walk_step),
+            footer: read(&self.footer),
+            install: read(&self.install),
+            clean_step: read(&self.clean_step),
+        }
     }
 }

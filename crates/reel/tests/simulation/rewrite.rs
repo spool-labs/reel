@@ -247,7 +247,7 @@ fn install_looks_again() {
     }
     assert!(has_file(&io, number));
 
-    let slot = state.cues.take(WritePlace(state.read_point().0 - 3)).expect("a slot");
+    let slot = state.cues.take(0, WritePlace(state.read_point(&state.volumes[0]).0 - 3)).expect("a slot");
     job.rewrite.step();
     assert!(!job.rewrite.is_running());
     assert!(!has_file(&io, number));
@@ -442,11 +442,11 @@ fn search_sees_new_list() {
 // a cue counts inside a row's window from the row's place up to, and not including, its replacement's
 #[test]
 fn cue_window() {
-    let table = CueTable::new();
-    let slot = table.take(WritePlace(10)).expect("a slot");
-    assert!(table.has_cue_between(WritePlace(10), WritePlace(11)));
-    assert!(!table.has_cue_between(WritePlace(11), WritePlace(20)));
-    assert!(!table.has_cue_between(WritePlace(5), WritePlace(10)));
+    let table = CueTable::new(1);
+    let slot = table.take(0, WritePlace(10)).expect("a slot");
+    assert!(table.has_cue_between(0, WritePlace(10), WritePlace(11)));
+    assert!(!table.has_cue_between(0, WritePlace(11), WritePlace(20)));
+    assert!(!table.has_cue_between(0, WritePlace(5), WritePlace(10)));
     table.release(slot);
 }
 
@@ -574,7 +574,7 @@ fn open_row_is_older_data() {
     let io = SimulatedIo::new(Seed(14));
     let store = open(&io);
     store.put(COLUMN, b"key", b"value").expect("put");
-    let place = WritePlace(store.state.read_point().0 + 1);
+    let place = WritePlace(store.state.read_point(&store.state.volumes[0]).0 + 1);
     let volume = &store.state.volumes[0];
     let found = store.state.has_older_row(volume, COLUMN, b"key", place, &[]);
     assert!(found.expect("search"));
@@ -648,7 +648,7 @@ fn parked_file_keeps_grave() {
 
         let pin = volume.table.pin(older).expect("a pin");
         let job = CompactJob::new(Arc::clone(&state), 0);
-        job.unlink(volume, older, state.read_point()).expect("unlink");
+        job.unlink(volume, older, state.read_point(&state.volumes[0])).expect("unlink");
         assert_eq!(volume.segments_parked.load(Ordering::Acquire), 1);
 
         let mut job = CompactJob::new(Arc::clone(&state), 0);
@@ -765,7 +765,7 @@ fn stray_output_holds_graves() {
     while job.rewrite.phase != RewritePhase::Installing {
         job.rewrite.step();
     }
-    let slot = state.cues.take(WritePlace(state.read_point().0 - 3)).expect("a slot");
+    let slot = state.cues.take(0, WritePlace(state.read_point(&state.volumes[0]).0 - 3)).expect("a slot");
     io.fail_directory_syncs(OperationCount(1));
     job.rewrite.step();
     state.cues.release(slot);
@@ -821,7 +821,7 @@ fn failed_remove_stays_a_stray() {
     let volume = &state.volumes[0];
     let mut job = CompactJob::new(Arc::clone(state), 0);
     run_to_install(&mut job);
-    let slot = state.cues.take(WritePlace(state.read_point().0 - 3)).expect("a slot");
+    let slot = state.cues.take(0, WritePlace(state.read_point(&state.volumes[0]).0 - 3)).expect("a slot");
     io.fail_removes(OperationCount(1));
     job.rewrite.step();
     state.cues.release(slot);
@@ -918,7 +918,7 @@ fn mark_holds_the_install() {
     let state = &store.state;
     let mut job = CompactJob::new(Arc::clone(state), 0);
     run_to_install(&mut job);
-    job.rewrite.highest_replacement = WritePlace(state.read_point().0 + 1);
+    job.rewrite.highest_replacement = WritePlace(state.read_point(&state.volumes[0]).0 + 1);
     job.rewrite.step();
 
     assert!(!job.rewrite.is_running());
@@ -1122,7 +1122,7 @@ fn stuck_data_output_keeps_graves() {
     let state = &store.state;
     let mut job = CompactJob::new(Arc::clone(state), 0);
     run_to_both_outputs(&mut job);
-    let slot = state.cues.take(WritePlace(state.read_point().0 - 3)).expect("a slot");
+    let slot = state.cues.take(0, WritePlace(state.read_point(&state.volumes[0]).0 - 3)).expect("a slot");
     io.fail_removes(OperationCount(1));
     job.rewrite.step();
     state.cues.release(slot);
@@ -1149,7 +1149,7 @@ fn strays_clear_in_order() {
     let volume = &state.volumes[0];
     let mut job = CompactJob::new(Arc::clone(state), 0);
     run_to_both_outputs(&mut job);
-    let slot = state.cues.take(WritePlace(state.read_point().0 - 3)).expect("a slot");
+    let slot = state.cues.take(0, WritePlace(state.read_point(&state.volumes[0]).0 - 3)).expect("a slot");
     io.fail_removes(OperationCount(1));
     job.rewrite.step();
     state.cues.release(slot);
@@ -1996,7 +1996,7 @@ fn stuck_last_output_keeps_the_set() {
     let state = &store.state;
     let mut job = CompactJob::new(Arc::clone(state), 0);
     let count = run_to_set(&mut job);
-    let slot = state.cues.take(WritePlace(state.read_point().0 - 3)).expect("a slot");
+    let slot = state.cues.take(0, WritePlace(state.read_point(&state.volumes[0]).0 - 3)).expect("a slot");
     io.fail_removes(OperationCount(1));
     job.rewrite.step();
     state.cues.release(slot);

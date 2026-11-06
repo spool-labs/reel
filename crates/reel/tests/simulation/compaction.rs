@@ -275,7 +275,7 @@ fn many_crossed() {
     let state = &store.state;
     let volume = &state.volumes[0];
     let older = sealed_put(&store, &io, b"older");
-    let slots: Vec<usize> = (0..MOST_CUES).map(|_slot| state.cues.take(WritePlace(u64::MAX - 1)).expect("a slot")).collect();
+    let slots: Vec<usize> = (0..MOST_CUES).map(|_slot| state.cues.take(0, WritePlace(u64::MAX - 1)).expect("a slot")).collect();
 
     let many = state.many_read(volume).expect("a read");
     assert_eq!(many.pin, None);
@@ -323,11 +323,11 @@ fn cue_crossed() {
     let state = &store.state;
     let older = sealed_put(&store, &io, b"older");
     let counts = state.cues.counts();
-    let point = state.read_point();
+    let point = state.read_point(&state.volumes[0]);
     sealed_put(&store, &io, b"newer");
     assert!(!state.volumes[0].table.holds(older));
 
-    let slot = state.cues.take(point).expect("a slot");
+    let slot = state.cues.take(0, point).expect("a slot");
     assert!(!state.pin_holds(slot, counts));
     assert!(state.cues.is_empty());
     store.close().expect("close");
@@ -342,12 +342,12 @@ fn unlink_looks_again() {
     let state = &store.state;
     let volume = &state.volumes[0];
     let older = sealed_put(&store, &io, b"older");
-    let below = state.read_point();
+    let below = state.read_point(&state.volumes[0]);
     sealed_put(&store, &io, b"newer");
-    let replacement = state.read_point();
+    let replacement = state.read_point(&state.volumes[0]);
     let job = job(&store);
 
-    let slot = state.cues.take(below).expect("a slot");
+    let slot = state.cues.take(0, below).expect("a slot");
     job.unlink(volume, older, replacement).expect("unlink");
     assert!(volume.table.holds(older));
     state.cues.release(slot);
@@ -598,7 +598,7 @@ fn parked_waits() {
     sealed_put(&store, &io, b"newer");
 
     let pin = volume.table.pin(older).expect("a pin");
-    job(&store).unlink(volume, older, state.read_point()).expect("unlink");
+    job(&store).unlink(volume, older, state.read_point(&state.volumes[0])).expect("unlink");
     assert!(!volume.table.holds(older));
     assert!(has_file(&io, older));
     assert_eq!(volume.segments_parked.load(Ordering::Acquire), 1);
@@ -636,9 +636,9 @@ fn park_full() {
     let last = numbers[MOST_PARKED];
     let pins: Vec<_> = numbers[..MOST_PARKED].iter().map(|number| volume.table.pin(*number).expect("a pin")).collect();
     for number in &numbers[..MOST_PARKED] {
-        job.unlink(volume, *number, state.read_point()).expect("unlink");
+        job.unlink(volume, *number, state.read_point(&state.volumes[0])).expect("unlink");
     }
-    job.unlink(volume, last, state.read_point()).expect("unlink");
+    job.unlink(volume, last, state.read_point(&state.volumes[0])).expect("unlink");
     assert!(volume.table.holds(last));
 
     drop(pins);
@@ -661,7 +661,7 @@ fn close_clears_parked() {
     sealed_put(&store, &io, b"newer");
 
     let pin = volume.table.pin(older).expect("a pin");
-    job(&store).unlink(volume, older, store.state.read_point()).expect("unlink");
+    job(&store).unlink(volume, older, store.state.read_point(&store.state.volumes[0])).expect("unlink");
     drop(pin);
     store.close().expect("close");
     assert!(!has_file(&io, older));
@@ -683,8 +683,8 @@ fn parked_crash() {
 
         let pins = [volume.table.pin(first).expect("a pin"), volume.table.pin(second).expect("a pin")];
         let job = job(&store);
-        job.unlink(volume, first, state.read_point()).expect("unlink");
-        job.unlink(volume, second, state.read_point()).expect("unlink");
+        job.unlink(volume, first, state.read_point(&state.volumes[0])).expect("unlink");
+        job.unlink(volume, second, state.read_point(&state.volumes[0])).expect("unlink");
         assert_eq!(volume.segments_parked.load(Ordering::Acquire), 2);
         assert!(has_file(&io, first) && has_file(&io, second));
 
@@ -733,7 +733,7 @@ fn failed_save_keeps_file() {
     sealed_put(&store, &io, b"newer");
 
     io.fail_writes(OperationCount(1));
-    assert!(job(&store).unlink(volume, older, state.read_point()).is_err());
+    assert!(job(&store).unlink(volume, older, state.read_point(&state.volumes[0])).is_err());
     assert!(!volume.table.holds(older));
     assert_eq!(volume.segments_unlinked.load(Ordering::Acquire), 0);
 
@@ -768,7 +768,7 @@ fn rebuilt_keeps_place() {
     hold_compaction(&store);
     let older = sealed_put(&store, &io, b"older");
     sealed_put(&store, &io, b"newer");
-    let replacement = store.state.read_point();
+    let replacement = store.state.read_point(&store.state.volumes[0]);
     let volume = &store.state.volumes[0];
     hold(&volume.summary).remove(older);
     store.state.save_summary(volume).expect("save");
@@ -791,7 +791,7 @@ fn walk_keeps_place() {
     store.put(COLUMN, b"key", b"oldest").expect("put");
     let older = sealed_put(&store, &io, b"older");
     sealed_put(&store, &io, b"newer");
-    let replacement = store.state.read_point();
+    let replacement = store.state.read_point(&store.state.volumes[0]);
 
     let table = &store.state.volumes[0].table;
     assert_eq!(table.dead_replacement(older), Some(replacement));
@@ -1052,7 +1052,7 @@ fn parked_until_durable() {
     sealed_put(&store, &io, b"newer");
 
     let mut job = job(&store);
-    job.unlink(volume, older, state.read_point()).expect("unlink");
+    job.unlink(volume, older, state.read_point(&state.volumes[0])).expect("unlink");
     release_compaction(&store);
     io.fail_directory_syncs(OperationCount(1));
     assert!(matches!(job.step_unit(Nanoseconds(0)), UnitStep::RetryAt(_)));

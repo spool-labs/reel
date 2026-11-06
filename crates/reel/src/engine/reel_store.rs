@@ -71,7 +71,7 @@ use crate::segment::row_block::{COMPLETE_BLOCK_BYTES, ROW_BLOCK_BYTES};
 use crate::segment::segment_table::{SegmentTable, TABLE_SHARDS, TableSizing};
 use crate::segment::segment_tail::{MAX_COLUMNS, SegmentNumber};
 use crate::superblock::{RootCopies, StoreId, StoredColumn, StoredVolume, Superblock, SuperblockPaths, stored_column};
-use crate::write_order::WriteOrder;
+use crate::write_order::{PlaceCount, WriteOrder};
 
 /// The lock file in each root
 pub const LOCK_NAME: &str = "lock";
@@ -558,7 +558,7 @@ pub fn bring_up<Backend: Io>(
     }
     // damage ranks at the counter, so the counter passes every place open can find first
     for found in &scan.sealed {
-        state.order.resume_past(found.head.places.highest);
+        state.resume_past(found.head.places.highest);
     }
     pass_open_rows(state, scan);
     load_covers(state, scan).map_err(open_error("reading pending range deletes"))?;
@@ -960,6 +960,8 @@ pub fn build_state<Backend: Io>(
     scan: &RootScan<Backend::File>,
     summaries: Vec<SummaryFound>,
 ) -> EngineState<Backend> {
+    let first_place = superblock.place_limit.0.saturating_sub(PLACE_RUN);
+    let places = Arc::new(PlaceCount::new(WritePlace(first_place), superblock.place_limit));
     // a volume's table and directories come out of its part of the share, by the columns it can hold
     let volume_share = sizing.table_share.0 / config.volumes.len().max(1) as u64;
     let most_columns = (0..config.volumes.len())
@@ -1054,6 +1056,7 @@ pub fn build_state<Backend: Io>(
             gave_up: Mutex::new(GaveUp::new()),
             early_bar_rewrites: AtomicU64::new(0),
             plain_bar_rewrites: AtomicU64::new(0),
+            order: WriteOrder::new(Arc::clone(&places)),
             rows_in_index: AtomicU64::new(0),
             ration: Ration::default(),
             marked_seals: AtomicU64::new(0),
@@ -1140,8 +1143,6 @@ pub fn build_state<Backend: Io>(
     let row_share = ByteCount(block_share.0 - complete_share.0);
     let reserved = superblock.next_segment.0;
     let first_number = reserved.saturating_sub(SEGMENT_NUMBER_BATCH);
-    let place_limit = superblock.place_limit;
-    let first_place = place_limit.0.saturating_sub(PLACE_RUN);
 
     let opened_at = io.now();
     EngineState {
@@ -1151,7 +1152,7 @@ pub fn build_state<Backend: Io>(
         columns,
         directories,
         volumes,
-        order: WriteOrder::new(WritePlace(first_place), place_limit),
+        places,
         index: WriteIndex::new(&sizing.shard),
         spot: SpotIndex::new(sizing.spot_share),
         filter_cache: BlockCache::new(filter_share, FILTER_SLOT_BYTES),
@@ -1211,7 +1212,7 @@ pub fn build_state<Backend: Io>(
         seal_tasks,
         planner_task: OnceLock::new(),
         index_waiters: AtomicU64::new(0),
-        cues: CueTable::new(),
+        cues: CueTable::new(config.volumes.len()),
         is_stopping: AtomicBool::new(false),
     }
 }

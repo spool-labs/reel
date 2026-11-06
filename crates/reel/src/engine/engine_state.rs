@@ -4,7 +4,7 @@ use std::io::{Error, ErrorKind};
 use std::path::Path;
 use std::mem;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use reel_api::column_id::ColumnId;
 use reel_api::memory_report::MemoryReport;
@@ -42,7 +42,7 @@ use crate::segment::footer_reader::FooterReader;
 use crate::segment::segment_tail::SegmentNumber;
 use crate::segment::summary::write_summary;
 use crate::superblock::Superblock;
-use crate::write_order::WriteOrder;
+use crate::write_order::PlaceCount;
 
 /// Segment numbers one superblock write reserves
 pub const SEGMENT_NUMBER_BATCH: u64 = 1_024;
@@ -73,7 +73,7 @@ pub struct EngineState<Backend: Io> {
     pub columns: Vec<Option<ColumnInfo>>,
     pub directories: Vec<Option<ColumnDirectory>>,
     pub volumes: Vec<Volume<Backend>>,
-    pub order: WriteOrder,
+    pub places: Arc<PlaceCount>,
     pub index: WriteIndex,
     pub spot: SpotIndex,
     pub filter_cache: BlockCache,
@@ -222,8 +222,8 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Read the write mark a new read starts from
-    pub fn read_point(&self) -> WritePlace {
-        self.order.mark()
+    pub fn read_point(&self, volume: &Volume<Backend>) -> WritePlace {
+        volume.order.mark()
     }
 
     /// Count a summary row that did not fit
@@ -244,7 +244,7 @@ impl<Backend: Io> EngineState<Backend> {
             buffer.extend_from_slice(rows.bytes());
             let forward = rows.highest_forward;
             drop(rows);
-            write_summary(&self.io, &volume.summary_paths, self.read_point(), forward, buffer)
+            write_summary(&self.io, &volume.summary_paths, self.read_point(volume), forward, buffer)
         })
     }
 
@@ -252,7 +252,7 @@ impl<Backend: Io> EngineState<Backend> {
     pub fn needs_reservation(&self) -> bool {
         let next_segment = self.next_segment.load(Ordering::Acquire);
         let reserved = self.reserved_segment.load(Ordering::Acquire);
-        self.order.places_left() < PLACE_RUN / 2 || reserved.saturating_sub(next_segment) < SEGMENT_NUMBER_BATCH / 2
+        self.places.left() < PLACE_RUN / 2 || reserved.saturating_sub(next_segment) < SEGMENT_NUMBER_BATCH / 2
     }
 
     /// Save the next limit and segment counter to every live root, and publish them once a root holds them,
@@ -289,7 +289,7 @@ impl<Backend: Io> EngineState<Backend> {
 
         *hold(&self.superblock_bytes) = bytes;
         if is_held {
-            self.order.set_limit(limit);
+            self.places.set_limit(limit);
             self.reserved_segment.store(reserved.0, Ordering::Release);
         }
         self.is_reserving.store(false, Ordering::Release);
@@ -450,11 +450,11 @@ impl<Backend: Io> EngineState<Backend> {
         if !volume.can_free_blocks {
             return true;
         }
-        if self.read_point() < free.replacement {
+        if self.read_point(volume) < free.replacement {
             return false;
         }
         self.cues.note_free();
-        if self.cues.has_cue_between(free.place, free.replacement) {
+        if self.cues.has_cue_between(volume.id.0 as usize, free.place, free.replacement) {
             return false;
         }
         let start = free.offset.0.next_multiple_of(FREE_BLOCK_BYTES);
@@ -495,7 +495,7 @@ impl<Backend: Io> EngineState<Backend> {
             return;
         }
         self.cues.note_reclaim();
-        if !self.cues.has_cue_below(cover.place) {
+        if !self.cues.has_cue_below(volume.id.0 as usize, cover.place) {
             volume.covers.drop_inside(cover);
         } else {
             // the cue's going looks again, or this cover would stay past its need
@@ -586,5 +586,15 @@ impl<'state> IndexWait<'state> {
 impl Drop for IndexWait<'_> {
     fn drop(&mut self) {
         self.waiters.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl<Backend: Io> EngineState<Backend> {
+    /// Move the count and every volume's mark past a place an open found, so no volume starts below a row it holds
+    pub fn resume_past(&self, place: WritePlace) {
+        self.places.resume_past(place);
+        for volume in &self.volumes {
+            volume.order.resume_past(place);
+        }
     }
 }

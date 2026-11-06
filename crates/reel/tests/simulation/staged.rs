@@ -599,7 +599,7 @@ fn reused_slot() {
     store.put(COLUMN, b"key", b"value").expect("put");
 
     let volume = &state.volumes[0];
-    let point = state.read_point();
+    let point = state.read_point(&state.volumes[0]);
     let found = state.index.lookup(COLUMN, b"key", point, volume.view());
     let row = found.row.expect("row");
 
@@ -627,7 +627,7 @@ fn seal_retry() {
     let io = SimulatedIo::new(Seed(10));
     let store = open(&io);
     store.put(COLUMN, b"key", b"value").expect("put");
-    let slot = store.state.index.lookup(COLUMN, b"key", store.state.read_point(), store.state.volumes[0].view());
+    let slot = store.state.index.lookup(COLUMN, b"key", store.state.read_point(&store.state.volumes[0]), store.state.volumes[0].view());
     let slot = slot.row.expect("row").slot;
 
     // the rows go out first, so the failed write is the footer's
@@ -862,7 +862,7 @@ fn begin_get(state: &State, key: &[u8]) -> StagedGet {
     let volume = &state.volumes[0];
     let reclaims = state.cues.counts().reclaims;
     let handovers = volume.handover_count();
-    let point = state.read_point();
+    let point = state.read_point(&state.volumes[0]);
     let found = state.index.lookup(COLUMN, key, point, volume.view());
     StagedGet {
         key: key.to_vec(),
@@ -924,7 +924,7 @@ fn run_interleaving(seed: Seed) {
             },
             None => {
                 settle(&io);
-                let mark = state.read_point().0;
+                let mark = state.read_point(&state.volumes[0]).0;
                 for key in history.keys() {
                     assert_eq!(read(&store, key), newest_at(&history, key, mark));
                 }
@@ -990,7 +990,7 @@ fn run_until_crash(
             return Some(random.one_in(2));
         }
         if random.one_in(FLUSH_ODDS) {
-            let mark = state.read_point().0;
+            let mark = state.read_point(&state.volumes[0]).0;
             store.flush().expect("flush");
             for (key, versions) in history.iter() {
                 if let Some((place, _value)) = versions.range(..=mark).next_back() {
@@ -1059,9 +1059,9 @@ fn run_until_crash(
             },
             _read => {
                 let key = format!("key-{:04}", random.below(KEY_SPACE)).into_bytes();
-                let mark = state.read_point().0;
+                let mark = state.read_point(&state.volumes[0]).0;
                 let found = read(store, &key);
-                if state.read_point().0 == mark {
+                if state.read_point(&state.volumes[0]).0 == mark {
                     assert_eq!(found, newest_at(history, &key, mark), "get of {key:?}");
                 }
             },
@@ -1219,5 +1219,24 @@ fn rotted_rows() {
 
     let data = data_path(Path::new(ROOT), number).to_path_buf();
     assert!(io.list_directory(Path::new(ROOT)).expect("list").contains(&data));
+    store.close().expect("close");
+}
+
+// a write claimed before a seal damages a segment lands above the damage
+#[test]
+fn damage_under_a_write_in_flight() {
+    let io = SimulatedIo::new(Seed(77));
+    let store = open(&io);
+    let state = Arc::clone(&store.state);
+    let first = stage(&state, b"sealed", Some(b"value"));
+    let number = first.claim.segment;
+    first.finish(&state);
+    store.seal_now();
+    settle(&io);
+
+    let in_flight = stage(&state, b"key", Some(b"value"));
+    state.damage_whole(0, number);
+    in_flight.finish(&state);
+    assert_eq!(read(&store, b"key"), Some(b"value".to_vec()));
     store.close().expect("close");
 }

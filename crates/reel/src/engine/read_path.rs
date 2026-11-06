@@ -286,13 +286,13 @@ impl<Backend: Io> EngineState<Backend> {
     pub fn many_read(&self, volume: &Volume<Backend>) -> Option<ManyRead> {
         let counts = self.cues.counts();
         let handovers = volume.handover_count();
-        let point = self.read_point();
-        self.pin_many(point, counts, handovers)
+        let point = self.read_point(volume);
+        self.pin_many(volume, point, counts, handovers)
     }
 
     /// Pin a point read after these counts, unless a job moved one first
-    pub fn pin_many(&self, point: WritePlace, counts: JobCounts, handovers: u64) -> Option<ManyRead> {
-        let pin = self.cues.take(point);
+    pub fn pin_many(&self, volume: &Volume<Backend>, point: WritePlace, counts: JobCounts, handovers: u64) -> Option<ManyRead> {
+        let pin = self.cues.take(volume.id.0 as usize, point);
         if pin.is_some_and(|slot| !self.pin_holds(slot, counts)) {
             return None;
         }
@@ -468,8 +468,9 @@ impl<Backend: Io> EngineState<Backend> {
     pub fn key_read_now<'key>(&self, column: ColumnId, key: &'key [u8]) -> Result<KeyRead<'key>, StoreError> {
         let info = self.column(column)?;
         self.check_key(column, key)?;
-        let covers = &self.volumes[info.volume.0 as usize].covers;
-        let (cover, read_point) = covers.newest_now(column, key, || self.read_point());
+        let volume = &self.volumes[info.volume.0 as usize];
+        let covers = &volume.covers;
+        let (cover, read_point) = covers.newest_now(column, key, || self.read_point(volume));
         Ok(KeyRead {
             column,
             info,

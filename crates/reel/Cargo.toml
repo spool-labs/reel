@@ -36,3 +36,7 @@ harness = false
 [[test]]
 name = "ring"
 path = "tests/ring/main.rs"
+
+[[test]]
+name = "cut"
+path = "tests/cut/main.rs"

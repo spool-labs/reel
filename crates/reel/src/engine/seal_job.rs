@@ -210,7 +210,7 @@ impl<Backend: Io> SealJob<Backend> {
     /// Check the footer walk can start: the writers have landed, and the mark has passed the segment, so every lower place is in
     /// the index and a read that starts from here has a point at or above the segment's rows
     pub fn is_ready(&self, target: &SealTarget<Backend::File>) -> bool {
-        self.is_drained(target.slot) && self.state.order.mark() >= target.highest_place
+        self.is_drained(target.slot) && self.volume().order.mark() >= target.highest_place
     }
 
     /// Check the target's writers have all landed

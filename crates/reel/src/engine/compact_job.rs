@@ -558,7 +558,7 @@ impl<Backend: Io> CompactJob<Backend> {
         let Some(highest_replacement) = volume.table.dead_replacement(segment) else {
             return Ok(());
         };
-        if self.state.cues.holds_back(highest_replacement) {
+        if self.state.cues.holds_back(self.volume, highest_replacement) {
             return Ok(());
         }
         if cfg!(debug_assertions) {
@@ -620,11 +620,11 @@ impl<Backend: Io> CompactJob<Backend> {
     /// crash before it goes leaves a segment with no row, which open walks backward and finds dead again
     pub fn unlink(&self, volume: &Volume<Backend>, segment: SegmentNumber, highest_replacement: WritePlace) -> Result<()> {
         let state = &self.state;
-        if !volume.can_park(1) || state.read_point() < highest_replacement {
+        if !volume.can_park(1) || state.read_point(volume) < highest_replacement {
             return Ok(());
         }
         state.cues.note_reclaim();
-        if state.cues.has_cue_below(highest_replacement) {
+        if state.cues.has_cue_below(self.volume, highest_replacement) {
             return Ok(());
         }
         for directory in state.directories.iter().flatten() {

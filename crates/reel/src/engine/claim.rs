@@ -34,15 +34,15 @@ impl<Backend: Io> Claim<'_, Backend> {
 
     /// End the claim with its rows in the index, and wait until a later read sees them
     pub fn land(self) {
-        let state = self.state;
+        let volume = self.volume;
         let ticket = self.ticket;
         self.finish();
-        state.order.wait_visible(&ticket);
+        volume.order.wait_visible(&ticket);
     }
 
     /// End the claim with its rows in the index, leaving the wait for the mark to the caller
     pub fn finish(mut self) {
-        self.state.order.finish(&self.ticket, TicketState::Landed);
+        self.volume.order.finish(&self.ticket, TicketState::Landed);
         self.is_landed = true;
         self.release();
     }
@@ -70,7 +70,7 @@ impl<Backend: Io> Drop for Claim<'_, Backend> {
     fn drop(&mut self) {
         if !self.is_landed {
             // a failed writer must not hold the mark, or every later write would wait for it
-            self.state.order.finish(&self.ticket, TicketState::Aborted);
+            self.volume.order.finish(&self.ticket, TicketState::Aborted);
             self.release();
         }
     }

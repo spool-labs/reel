@@ -169,7 +169,7 @@ impl<Backend: Io> EngineState<Backend> {
     ) -> Result<StepOutcome, StoreError> {
         let generation = directory.map_or(0, ColumnDirectory::generation);
         let fixed_point = scan.point.or(pin_point);
-        let point = fixed_point.unwrap_or_else(|| self.read_point());
+        let point = fixed_point.unwrap_or_else(|| self.read_point(volume));
         if generation != scan.generation {
             // a block taken by its line has no key to seek from, so a count that took one starts over and steps every row
             if scan.taken > 0 {

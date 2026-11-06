@@ -208,13 +208,13 @@ fn pin_lost() {
     let store = open(&io);
     let state = &store.state;
     let counts = state.cues.counts();
-    let slot = state.cues.take(state.read_point()).expect("a slot");
+    let slot = state.cues.take(0, state.read_point(&state.volumes[0])).expect("a slot");
 
     state.cues.note_reclaim();
 
     assert!(!state.pin_holds(slot, counts));
     assert!(state.cues.is_empty());
-    let slot = state.cues.take(state.read_point()).expect("a slot");
+    let slot = state.cues.take(0, state.read_point(&state.volumes[0])).expect("a slot");
     assert!(state.pin_holds(slot, state.cues.counts()));
     assert_eq!(state.cues.len(), 1);
     state.cues.release(slot);
@@ -228,7 +228,7 @@ fn pin_lost_to_a_free() {
     let store = open(&io);
     let state = &store.state;
     let counts = state.cues.counts();
-    let slot = state.cues.take(state.read_point()).expect("a slot");
+    let slot = state.cues.take(0, state.read_point(&state.volumes[0])).expect("a slot");
 
     state.cues.note_free();
 
@@ -244,11 +244,11 @@ fn many_pin_lost() {
     let store = open(&io);
     let state = &store.state;
     let counts = state.cues.counts();
-    let point = state.read_point();
+    let point = state.read_point(&state.volumes[0]);
 
     state.cues.note_reclaim();
 
-    assert_eq!(state.pin_many(point, counts, 0), None);
+    assert_eq!(state.pin_many(&state.volumes[0], point, counts, 0), None);
     assert!(state.cues.is_empty());
     store.close().expect("close");
 }

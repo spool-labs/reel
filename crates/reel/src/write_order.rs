@@ -1,8 +1,8 @@
-//! The single store-wide order, and the mark that publishes it
+//! The store-wide count of places, and each volume's order and the mark that publishes it
 
 use std::hint;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use reel_api::units::{RowCount, WritePlace};
 
@@ -11,7 +11,7 @@ use crate::guard::hold;
 /// How many times a writer checks the mark before it sleeps: the writers ahead are usually a write call from done,
 /// and a sleep costs both sides a system call
 pub const MARK_SPINS: u32 = 256;
-/// Writers that can be in flight at once
+/// Writers that can be in flight at once on a volume
 pub const MOST_IN_FLIGHT: usize = 1_024;
 
 /// How one claim ended
@@ -40,14 +40,20 @@ pub struct TicketRing {
     ends: Vec<WritePlace>,
     head: usize,
     tail: usize,
-    next_place: WritePlace,
-    limit: WritePlace,
     waiters: u32,
 }
 
-/// The write order of a store
+/// The places a store hands out, one count across every volume, so a place means one thing everywhere
+#[derive(Debug)]
+pub struct PlaceCount {
+    next: AtomicU64,
+    limit: AtomicU64,
+}
+
+/// One volume's write order. A write waits only for this volume's earlier claims, so a slow disk holds back its own writes
 #[derive(Debug)]
 pub struct WriteOrder {
+    places: Arc<PlaceCount>,
     ring: Mutex<TicketRing>,
     mark: AtomicU64,
     moved: Condvar,
@@ -66,20 +72,66 @@ impl TicketRing {
     }
 }
 
-impl WriteOrder {
-    /// Start the order after the last place a store has used, with places reserved up to a limit
+impl PlaceCount {
+    /// Start after the last place a store has used, with places reserved up to a limit
     pub fn new(last_used: WritePlace, limit: WritePlace) -> Self {
         Self {
+            next: AtomicU64::new(last_used.0 + 1),
+            limit: AtomicU64::new(limit.0),
+        }
+    }
+
+    /// Read the last place handed out. A cue reads this before any mark, and that order makes its marks one moment
+    pub fn last_given(&self) -> WritePlace {
+        WritePlace(self.next.load(Ordering::Acquire) - 1)
+    }
+
+    /// Take the next places, or return nothing when the limit is in the way
+    pub fn take(&self, rows: RowCount) -> Option<(WritePlace, WritePlace)> {
+        let limit = self.limit.load(Ordering::Acquire);
+        let taken = self.next.fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+            let after = next + rows.0;
+            (after - 1 <= limit).then_some(after)
+        });
+        let first = taken.ok()?;
+        Some((WritePlace(first), WritePlace(first + rows.0 - 1)))
+    }
+
+    /// Check whether a claim of these rows would pass the limit
+    pub fn is_past_limit(&self, rows: RowCount) -> bool {
+        self.next.load(Ordering::Acquire) + rows.0 - 1 > self.limit.load(Ordering::Acquire)
+    }
+
+    /// Move the count past a place recovery found
+    pub fn resume_past(&self, place: WritePlace) {
+        self.next.fetch_max(place.0 + 1, Ordering::AcqRel);
+    }
+
+    /// Count the places left under the limit
+    pub fn left(&self) -> u64 {
+        self.limit.load(Ordering::Acquire).saturating_sub(self.next.load(Ordering::Acquire))
+    }
+
+    /// Set the limit, once every root holds it
+    pub fn set_limit(&self, limit: WritePlace) {
+        self.limit.store(limit.0, Ordering::Release);
+    }
+}
+
+impl WriteOrder {
+    /// Start an order with nothing in flight, on the store's count
+    pub fn new(places: Arc<PlaceCount>) -> Self {
+        let mark = places.last_given();
+        Self {
+            places,
             ring: Mutex::new(TicketRing {
                 states: vec![TicketState::Landed; MOST_IN_FLIGHT],
                 ends: vec![WritePlace(0); MOST_IN_FLIGHT],
                 head: 0,
                 tail: 0,
-                next_place: WritePlace(last_used.0 + 1),
-                limit,
                 waiters: 0,
             }),
-            mark: AtomicU64::new(last_used.0),
+            mark: AtomicU64::new(mark.0),
             moved: Condvar::new(),
             wakes: AtomicU64::new(0),
         }
@@ -90,7 +142,7 @@ impl WriteOrder {
         self.wakes.load(Ordering::Relaxed)
     }
 
-    /// Read the mark: every place at or below it is published
+    /// Read the mark: every place of this volume at or below it is published
     pub fn mark(&self) -> WritePlace {
         WritePlace(self.mark.load(Ordering::Acquire))
     }
@@ -102,13 +154,8 @@ impl WriteOrder {
             return None;
         }
 
-        let first = ring.next_place;
-        let last = WritePlace(first.0 + rows.0 - 1);
-        if last > ring.limit {
-            return None;
-        }
-        ring.next_place = WritePlace(last.0 + 1);
-
+        // the count moves under this lock, so this volume's claims stand in the ring in place order
+        let (first, last) = self.places.take(rows)?;
         let slot = ring.tail % MOST_IN_FLIGHT;
         ring.states[slot] = TicketState::InFlight;
         ring.ends[slot] = last;
@@ -161,29 +208,8 @@ impl WriteOrder {
         ring.waiters -= 1;
     }
 
-    /// Check whether a claim of these rows would pass the limit
-    pub fn is_past_limit(&self, rows: RowCount) -> bool {
-        let ring = hold(&self.ring);
-        ring.next_place.0 + rows.0 - 1 > ring.limit.0
-    }
-
-    /// Move the order past a place recovery found
+    /// Move the mark past a place recovery found, with no claim in flight
     pub fn resume_past(&self, place: WritePlace) {
-        let mut ring = hold(&self.ring);
-        if place >= ring.next_place {
-            ring.next_place = WritePlace(place.0 + 1);
-            self.mark.store(place.0, Ordering::Release);
-        }
-    }
-
-    /// Count the places left under the limit
-    pub fn places_left(&self) -> u64 {
-        let ring = hold(&self.ring);
-        ring.limit.0.saturating_sub(ring.next_place.0)
-    }
-
-    /// Set the limit, once every root holds it
-    pub fn set_limit(&self, limit: WritePlace) {
-        hold(&self.ring).limit = limit;
+        self.mark.fetch_max(place.0, Ordering::AcqRel);
     }
 }

@@ -73,7 +73,7 @@ fn first_run() {
 
     let store = open(&io);
 
-    assert_eq!(store.state.read_point(), WritePlace(0));
+    assert_eq!(store.state.read_point(&store.state.volumes[0]), WritePlace(0));
     for root in ROOTS {
         assert_eq!(limit_of(&io, root), WritePlace(PLACE_RUN));
     }
@@ -92,7 +92,7 @@ fn open_start() {
 
     let store = open(&io);
 
-    assert_eq!(store.state.read_point(), saved);
+    assert_eq!(store.state.read_point(&store.state.volumes[0]), saved);
     assert!(holds(&store, KEY));
     for root in ROOTS {
         assert_eq!(limit_of(&io, root), WritePlace(saved.0 + PLACE_RUN));
@@ -116,7 +116,7 @@ fn stale_root() {
 
     let store = open(&io);
 
-    assert_eq!(store.state.read_point(), saved);
+    assert_eq!(store.state.read_point(&store.state.volumes[0]), saved);
     store.close().expect("close");
 }
 
@@ -134,7 +134,7 @@ fn lost_root() {
 
     let store = open(&io);
 
-    assert_eq!(store.state.read_point(), saved);
+    assert_eq!(store.state.read_point(&store.state.volumes[0]), saved);
     store.close().expect("close");
 }
 
@@ -145,7 +145,7 @@ fn run_raise() {
     let store = open(&io);
     store.put(COLUMN, b"before", VALUE).expect("put");
     let saved = limit_of(&io, FIRST_ROOT);
-    store.state.order.set_limit(store.state.read_point());
+    store.state.places.set_limit(store.state.read_point(&store.state.volumes[0]));
 
     store.put(COLUMN, KEY, VALUE).expect("put");
 
@@ -162,19 +162,19 @@ fn raise_fails() {
     let io = SimulatedIo::new(Seed(6));
     let store = open(&io);
     store.put(COLUMN, b"before", VALUE).expect("put");
-    let mark = store.state.read_point();
-    store.state.order.set_limit(mark);
+    let mark = store.state.read_point(&store.state.volumes[0]);
+    store.state.places.set_limit(mark);
 
     io.fail_syncs(OperationCount(1));
     assert!(store.put(COLUMN, KEY, VALUE).is_err());
 
-    assert_eq!(store.state.read_point(), mark);
+    assert_eq!(store.state.read_point(&store.state.volumes[0]), mark);
     assert!(!holds(&store, KEY));
     assert!(store.close().is_err());
     drop(store);
 
     let store = open(&io);
-    assert!(store.state.read_point() >= mark);
+    assert!(store.state.read_point(&store.state.volumes[0]) >= mark);
     store.put(COLUMN, KEY, VALUE).expect("put");
     assert!(holds(&store, KEY));
     store.close().expect("close");
@@ -186,7 +186,7 @@ fn job_raises() {
     let io = SimulatedIo::new(Seed(7));
     let store = open(&io);
     let saved = limit_of(&io, FIRST_ROOT);
-    store.state.order.set_limit(WritePlace(store.state.read_point().0 + PLACE_RUN / 2 - 1));
+    store.state.places.set_limit(WritePlace(store.state.read_point(&store.state.volumes[0]).0 + PLACE_RUN / 2 - 1));
 
     io.advance_clock(RESERVE_PERIOD);
     while io.step_any().is_some() {}
@@ -202,8 +202,8 @@ fn raise_crash() {
         let io = SimulatedIo::new(Seed(100 + crash_at));
         let store = open(&io);
         store.put(COLUMN, b"before", VALUE).expect("put");
-        let mark = store.state.read_point();
-        store.state.order.set_limit(mark);
+        let mark = store.state.read_point(&store.state.volumes[0]);
+        store.state.places.set_limit(mark);
 
         io.arm_crash(OperationCount(crash_at));
         let written = store.put(COLUMN, KEY, VALUE);
@@ -212,7 +212,7 @@ fn raise_crash() {
         drop(store);
 
         let store = open(&io);
-        assert!(store.state.read_point() >= handed_out, "crash at {crash_at}");
+        assert!(store.state.read_point(&store.state.volumes[0]) >= handed_out, "crash at {crash_at}");
         store.put(COLUMN, b"after", VALUE).expect("put");
         assert!(holds(&store, b"after"));
         store.close().expect("close");
@@ -225,13 +225,13 @@ fn no_root() {
     let io = SimulatedIo::new(Seed(8));
     let store = open(&io);
     store.put(COLUMN, b"before", VALUE).expect("put");
-    let mark = store.state.read_point();
-    store.state.order.set_limit(mark);
+    let mark = store.state.read_point(&store.state.volumes[0]);
+    store.state.places.set_limit(mark);
 
     io.fail_syncs(OperationCount(1));
     assert!(!store.state.reserve_ahead());
 
-    assert_eq!(store.state.order.try_claim(RowCount(1)), None);
+    assert_eq!(store.state.volumes[0].order.try_claim(RowCount(1)), None);
     assert!(store.close().is_err());
 }
 
@@ -260,7 +260,7 @@ fn replay_past() {
     let store = open(&io);
     store.put(COLUMN, KEY, VALUE).expect("put");
     store.put(COLUMN, b"second", VALUE).expect("put");
-    let highest = store.state.read_point();
+    let highest = store.state.read_point(&store.state.volumes[0]);
     store.close().expect("close");
     drop(store);
 
@@ -271,7 +271,7 @@ fn replay_past() {
     }
     let store = open(&io);
 
-    assert!(store.state.read_point() >= highest);
+    assert!(store.state.read_point(&store.state.volumes[0]) >= highest);
     store.put(COLUMN, KEY, b"newer").expect("put");
     let mut buf = Vec::new();
     store.get(COLUMN, KEY, &mut buf).expect("get");
@@ -343,14 +343,14 @@ fn copy_crash() {
         let io = SimulatedIo::new(Seed(200 + crash_at));
         let store = open(&io);
         store.put(COLUMN, KEY, VALUE).expect("put");
-        let mark = store.state.read_point();
+        let mark = store.state.read_point(&store.state.volumes[0]);
         io.arm_crash(OperationCount(crash_at));
         let _is_held = store.state.reserve_ahead();
         io.power_cut();
         drop(store);
 
         let store = open(&io);
-        assert!(store.state.read_point() >= mark, "crash at {crash_at}");
+        assert!(store.state.read_point(&store.state.volumes[0]) >= mark, "crash at {crash_at}");
         store.close().expect("close");
     }
 }

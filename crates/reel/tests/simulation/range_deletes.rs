@@ -294,12 +294,12 @@ fn full_pool() {
         let start = 1_000_000 + 2 * number;
         store.delete_range(COLUMN, &key_of(start), &key_of(start + 1)).expect("delete");
     }
-    let before = store.state.read_point();
+    let before = store.state.read_point(&store.state.volumes[0]);
 
     let refused = store.delete_range(COLUMN, &key_of(10), &key_of(20));
 
     assert!(matches!(refused, Err(StoreError::RangeDeletesFull { .. })));
-    assert_eq!(store.state.read_point(), before);
+    assert_eq!(store.state.read_point(&store.state.volumes[0]), before);
     assert_eq!(read(&store, COLUMN, &key_of(15)), Some(b"older".to_vec()));
     store.close().expect("close");
 }
@@ -883,7 +883,7 @@ fn copied_cover_full() {
     let row = RowEntry {
         column: COLUMN,
         key: b"key",
-        place: store.state.order.mark(),
+        place: store.state.volumes[0].order.mark(),
         offset,
         length,
         kind: RowKind::RangeDelete,

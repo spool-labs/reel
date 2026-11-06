@@ -196,7 +196,7 @@ impl<Backend: Io> EngineState<Backend> {
     /// The segment stays in the table and its row keeps its facts
     pub fn damage_unread(&self, index: usize, number: SegmentNumber) {
         let volume = &self.volumes[index];
-        let counter = self.order.mark();
+        let counter = self.places.last_given();
         for range in whole_columns(self, index, number, counter) {
             volume.damage.add(&range);
         }

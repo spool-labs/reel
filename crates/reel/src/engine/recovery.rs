@@ -916,7 +916,7 @@ pub fn load_covers<Backend: Io>(state: &EngineState<Backend>, scan: &RootScan<Ba
 /// and open never hands out a place it found
 pub fn pass_open_rows<Backend: Io>(state: &EngineState<Backend>, scan: &RootScan<Backend::File>) {
     for segment in &scan.scanned {
-        state.order.resume_past(segment.scan.highest_place);
+        state.resume_past(segment.scan.highest_place);
     }
 }
 
@@ -1179,7 +1179,7 @@ pub fn copy_row<Backend: Io>(
                     let has_room = target.covers.add(&cover, false);
                     if !has_room {
                         // the cover's row stays in the copy, so this holds for this open and the next open decides again
-                        for range in whole_columns(state, volume, copied.segment, state.order.mark()) {
+                        for range in whole_columns(state, volume, copied.segment, state.places.last_given()) {
                             target.damage.add(&range);
                         }
                     }
@@ -1425,7 +1425,7 @@ pub fn damage_open<Backend: Io>(
         return Ok(());
     }
 
-    let counter = state.order.mark();
+    let counter = state.places.last_given();
     let facts = SegmentFacts {
         segment: found.number,
         seal_mark: rot_sum,
@@ -1596,7 +1596,7 @@ pub fn mark_lost_rows<Backend: Io>(
     rows: &mut SummaryRows,
 ) {
     let lost = mem::take(&mut *hold(&state.volumes[index].lost_rows));
-    let counter = state.order.mark();
+    let counter = state.places.last_given();
     for number in &lost.unread_covers {
         widen_row(state, index, rows, *number, counter);
     }
@@ -1894,7 +1894,7 @@ pub fn fallback_ranges<Backend: Io>(
         },
         None => {
             // every row a read can find sits at or below the counter at open, and every new write above it
-            let counter = state.order.mark();
+            let counter = state.places.last_given();
             facts.places.highest = counter;
             facts.damage_place = counter;
             counter
@@ -1994,7 +1994,8 @@ impl<Backend: Io> EngineState<Backend> {
     /// Damage a segment's columns whole at the counter, when a seal finds a cover it can't read. The row it leaves is an
     /// open segment's, which open carries over to the sealed segment, and the seal saves it before its tail is durable
     pub fn damage_whole(&self, volume: usize, segment: SegmentNumber) {
-        let counter = self.order.mark();
+        // a claim in flight stands above the volume's mark, and its row has to land above this damage
+        let counter = self.volumes[volume].order.mark();
         let ranges = whole_columns(self, volume, segment, counter);
         let target = &self.volumes[volume];
         for range in &ranges {

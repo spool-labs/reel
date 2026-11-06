@@ -79,7 +79,7 @@ pub fn bring_up_read_only<Backend: Io>(
     scan: &mut RootScan<Backend::File>,
 ) -> Result<(), StoreError> {
     for found in &scan.sealed {
-        state.order.resume_past(found.head.places.highest);
+        state.resume_past(found.head.places.highest);
     }
     pass_open_rows(state, scan);
     load_covers(state, scan).map_err(open_error("reading pending range deletes"))?;

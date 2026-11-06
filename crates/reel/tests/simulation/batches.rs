@@ -201,7 +201,7 @@ fn one_claim() {
     let store = open(&io);
     store.put(PLAIN, b"before", b"value").expect("put");
     store.flush().expect("flush");
-    let mark = store.state.read_point();
+    let mark = store.state.read_point(&store.state.volumes[0]);
 
     store.write_batch(&batch_of(b"value")).expect("batch");
     store.flush().expect("flush");
@@ -351,11 +351,11 @@ fn segment_limit() {
 fn empty_batch() {
     let io = SimulatedIo::new(Seed(9));
     let store = open(&io);
-    let mark = store.state.read_point();
+    let mark = store.state.read_point(&store.state.volumes[0]);
 
     store.write_batch(&WriteBatch::new()).expect("batch");
 
-    assert_eq!(store.state.read_point(), mark);
+    assert_eq!(store.state.read_point(&store.state.volumes[0]), mark);
     store.close().expect("close");
 }
 
@@ -411,7 +411,7 @@ fn long_group() {
     let store = open(&io);
     store.put(PLAIN, b"before", b"value").expect("put");
     store.flush().expect("flush");
-    let mark = store.state.read_point();
+    let mark = store.state.read_point(&store.state.volumes[0]);
 
     store.write_batch(&long_batch(Some(b"value"))).expect("batch");
 

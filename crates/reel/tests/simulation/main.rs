@@ -25,6 +25,7 @@ mod records;
 mod reports;
 mod ring_reads;
 mod seed_sets;
+mod volume_marks;
 mod write_index;
 mod faults;
 mod done_flag;

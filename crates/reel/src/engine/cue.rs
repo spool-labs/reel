@@ -3,7 +3,7 @@
 //! A cue takes a slot in a fixed table, and everything that would drop a version or a cover counts itself and looks there first.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use reel_api::column_id::ColumnId;
 use reel_api::direction::Direction;
@@ -32,10 +32,12 @@ pub struct JobCounts {
     pub frees: u64,
 }
 
-/// The read point of every live cue
+/// The read points of every live cue, one a volume, since each volume publishes on its own mark
 #[derive(Debug)]
 pub struct CueTable {
-    slots: [AtomicU64; MOST_CUES],
+    taken: [AtomicBool; MOST_CUES],
+    points: Vec<AtomicU64>,
+    volumes: usize,
     reclaims: AtomicU64,
     cues_gone: AtomicU64,
     frees: AtomicU64,
@@ -43,10 +45,12 @@ pub struct CueTable {
 }
 
 impl CueTable {
-    /// Start with no cues
-    pub fn new() -> Self {
+    /// Start with no cues, on a store of this many volumes
+    pub fn new(volumes: usize) -> Self {
         Self {
-            slots: [const { AtomicU64::new(NO_CUE) }; MOST_CUES],
+            taken: [const { AtomicBool::new(false) }; MOST_CUES],
+            points: (0..MOST_CUES * volumes).map(|_point| AtomicU64::new(NO_CUE)).collect(),
+            volumes,
             reclaims: AtomicU64::new(0),
             cues_gone: AtomicU64::new(0),
             frees: AtomicU64::new(0),
@@ -54,42 +58,62 @@ impl CueTable {
         }
     }
 
-    /// Take a slot for a read point, or return nothing when the table is full
-    pub fn take(&self, point: WritePlace) -> Option<usize> {
-        self.slots.iter().position(|slot| {
-            slot.compare_exchange(NO_CUE, point.0 + 1, Ordering::SeqCst, Ordering::SeqCst).is_ok()
-        })
+    /// Take a free slot
+    pub fn take_slot(&self) -> Option<usize> {
+        self.taken.iter().position(|slot| slot.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok())
+    }
+
+    /// Set a slot's read point on a volume
+    pub fn set_point(&self, slot: usize, volume: usize, point: WritePlace) {
+        self.points[slot * self.volumes + volume].store(point.0 + 1, Ordering::SeqCst);
+    }
+
+    /// Read a slot's point on a volume
+    pub fn point(&self, slot: usize, volume: usize) -> WritePlace {
+        WritePlace(self.points[slot * self.volumes + volume].load(Ordering::SeqCst).saturating_sub(1))
+    }
+
+    /// Take a slot for a read point on one volume, or return nothing when the table is full
+    pub fn take(&self, volume: usize, point: WritePlace) -> Option<usize> {
+        let slot = self.take_slot()?;
+        self.set_point(slot, volume, point);
+        Some(slot)
     }
 
     /// Give a slot back
     pub fn release(&self, slot: usize) {
-        self.slots[slot].store(NO_CUE, Ordering::SeqCst);
+        for volume in 0..self.volumes {
+            self.points[slot * self.volumes + volume].store(NO_CUE, Ordering::SeqCst);
+        }
+        self.taken[slot].store(false, Ordering::SeqCst);
     }
 
-    /// Check a live cue reads below a place, so it can't see what stands at that place
-    pub fn has_cue_below(&self, place: WritePlace) -> bool {
-        self.slots.iter().any(|slot| {
+    /// Run a test over the live points on a volume
+    pub fn any_point(&self, volume: usize, test: impl Fn(u64) -> bool) -> bool {
+        self.points.iter().skip(volume).step_by(self.volumes).any(|slot| {
             let point = slot.load(Ordering::SeqCst);
-            point != NO_CUE && point - 1 < place.0
+            point != NO_CUE && test(point - 1)
         })
     }
 
-    /// Check a live cue reads at or above one place and below another, so it sees a row the second one replaced
-    pub fn has_cue_between(&self, lowest: WritePlace, highest: WritePlace) -> bool {
-        self.slots.iter().any(|slot| {
-            let point = slot.load(Ordering::SeqCst);
-            point != NO_CUE && (lowest.0..highest.0).contains(&(point - 1))
-        })
+    /// Check a live cue reads below a place on a volume, so it can't see what stands at that place
+    pub fn has_cue_below(&self, volume: usize, place: WritePlace) -> bool {
+        self.any_point(volume, |point| point < place.0)
+    }
+
+    /// Check a live cue reads at or above one place and below another on a volume, so it sees a row the second one replaces
+    pub fn has_cue_between(&self, volume: usize, lowest: WritePlace, highest: WritePlace) -> bool {
+        self.any_point(volume, |point| (lowest.0..highest.0).contains(&point))
     }
 
     /// Check a live cue reads below a place, for a reclaim about to stand aside. The count moves before the last look, so
     /// a pin this finds sees the count move as it leaves, and asks for the reclaim again
-    pub fn holds_back(&self, place: WritePlace) -> bool {
-        if !self.has_cue_below(place) {
+    pub fn holds_back(&self, volume: usize, place: WritePlace) -> bool {
+        if !self.has_cue_below(volume, place) {
             return false;
         }
         self.note_reclaim();
-        self.has_cue_below(place)
+        self.has_cue_below(volume, place)
     }
 
     /// Count a reclaim, before its last look at this table and before anything leaves a directory. A reader that took its
@@ -134,7 +158,7 @@ impl CueTable {
 
     /// Count the live cues
     pub fn len(&self) -> usize {
-        self.slots.iter().filter(|slot| slot.load(Ordering::SeqCst) != NO_CUE).count()
+        self.taken.iter().filter(|slot| slot.load(Ordering::SeqCst)).count()
     }
 
     /// Check no cue is live
@@ -143,38 +167,37 @@ impl CueTable {
     }
 }
 
-impl Default for CueTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// A read view at one point in the write order
 pub struct Cue<Backend: Io> {
     state: Arc<EngineState<Backend>>,
     slot: usize,
-    point: WritePlace,
 }
 
 impl<Backend: Io> Cue<Backend> {
-    /// Pin the newest read point. A job counts itself before it looks at the table, and this reads the counts after
-    /// taking a slot, so either the job sees the pin or this sees the job and takes a newer point
+    /// Pin every volume's newest read point at one moment. The count comes first: a write that came after another that had
+    /// returned took a higher place, so a cue holding the later one holds the earlier one, whatever order the marks are read
+    /// in. A job counts itself before it looks at the table, and this reads the counts before taking a slot, so either the
+    /// job sees the pin or this sees the job and takes a newer point
     pub fn new(state: Arc<EngineState<Backend>>) -> Result<Self, StoreError> {
         loop {
             let counts = state.cues.counts();
-            let point = state.read_point();
-            let Some(slot) = state.cues.take(point) else {
+            let cut = state.places.last_given();
+            let Some(slot) = state.cues.take_slot() else {
                 return Err(StoreError::CuesFull { limit: MOST_CUES as u64 });
             };
+            for (index, volume) in state.volumes.iter().enumerate() {
+                state.cues.set_point(slot, index, volume.order.mark().min(cut));
+            }
             if state.pin_holds(slot, counts) {
-                return Ok(Self { state, slot, point });
+                return Ok(Self { state, slot });
             }
         }
     }
 
-    /// Read the cue's point in the write order
-    pub fn point(&self) -> WritePlace {
-        self.point
+    /// Read the cue's point on a column's volume
+    pub fn point_of(&self, column: ColumnId) -> Result<WritePlace, StoreError> {
+        let info = self.state.column(column)?;
+        Ok(self.state.cues.point(self.slot, info.volume.0 as usize))
     }
 
     /// Fill the buffer with the value the key had at this cue, and say whether it had one
@@ -196,7 +219,7 @@ impl<Backend: Io> Cue<Backend> {
     /// Check whether the key had a value at this cue
     pub fn contains(&self, column: ColumnId, key: &[u8]) -> Result<bool, StoreError> {
         self.check_open()?;
-        self.state.counted(self.state.contains_at(&self.state.key_read(column, key, self.point, true)?))
+        self.state.counted(self.state.contains_at(&self.state.key_read(column, key, self.point_of(column)?, true)?))
     }
 
     /// Answer every key at this cue, with a bad record as that key's answer
@@ -206,7 +229,7 @@ impl<Backend: Io> Cue<Backend> {
         let handovers = self.state.volumes[info.volume.0 as usize].handover_count();
         values.clear();
         let mut scratch = values.take_scratch();
-        let read = in_place(self.state.read_keys(&InPlace, column, keys, self.point, handovers, values, &mut scratch));
+        let read = in_place(self.state.read_keys(&InPlace, column, keys, self.point_of(column)?, handovers, values, &mut scratch));
         values.put_scratch(scratch);
         self.state.corruption_errors.fetch_add(values.corrupt_count(), Ordering::Relaxed);
         read
@@ -215,7 +238,7 @@ impl<Backend: Io> Cue<Backend> {
     /// Walk rows and keys from a key at this cue
     pub fn iter_from(&self, column: ColumnId, start: &[u8], direction: Direction) -> Result<StoreScan<Backend>, StoreError> {
         self.check_open()?;
-        StoreScan::at_cue(Arc::clone(&self.state), &from_key(column, start, direction), self.point)
+        StoreScan::at_cue(Arc::clone(&self.state), &from_key(column, start, direction), self.point_of(column)?)
     }
 
     /// Walk rows and keys in [start, end) at this cue
@@ -227,31 +250,31 @@ impl<Backend: Io> Cue<Backend> {
         direction: Direction,
     ) -> Result<StoreScan<Backend>, StoreError> {
         self.check_open()?;
-        StoreScan::at_cue(Arc::clone(&self.state), &in_range(column, start, end, direction), self.point)
+        StoreScan::at_cue(Arc::clone(&self.state), &in_range(column, start, end, direction), self.point_of(column)?)
     }
 
     /// Walk rows and keys under a prefix at this cue
     pub fn iter_prefix(&self, column: ColumnId, prefix: &[u8]) -> Result<StoreScan<Backend>, StoreError> {
         self.check_open()?;
-        StoreScan::at_cue(Arc::clone(&self.state), &under_prefix(column, prefix), self.point)
+        StoreScan::at_cue(Arc::clone(&self.state), &under_prefix(column, prefix), self.point_of(column)?)
     }
 
     /// Count the keys under a prefix at this cue, reading no values
     pub fn count_prefix(&self, column: ColumnId, prefix: &[u8]) -> Result<RowCount, StoreError> {
         self.check_open()?;
-        self.state.counted(self.state.count_at(column, prefix, self.point))
+        self.state.counted(self.state.count_at(column, prefix, self.point_of(column)?))
     }
 
     /// Add up the bytes the values under a prefix take on disk at this cue, reading no values
     pub fn bytes_prefix(&self, column: ColumnId, prefix: &[u8]) -> Result<ByteCount, StoreError> {
         self.check_open()?;
-        self.state.counted(self.state.bytes_at(column, prefix, self.point))
+        self.state.counted(self.state.bytes_at(column, prefix, self.point_of(column)?))
     }
 
     /// Run a get at this cue without blocking the caller's runtime thread
     pub async fn read_async(&self, column: ColumnId, key: &[u8], want: RecordWant, buf: &mut Vec<u8>) -> Result<bool, StoreError> {
         self.check_open()?;
-        self.state.read_async(column, key, want, Some(self.point), buf).await
+        self.state.read_async(column, key, want, Some(self.point_of(column)?), buf).await
     }
 
     /// Run a batched get at this cue without blocking the caller's runtime thread
@@ -259,7 +282,7 @@ impl<Backend: Io> Cue<Backend> {
         self.check_open()?;
         let info = self.state.column(column)?;
         let handovers = self.state.volumes[info.volume.0 as usize].handover_count();
-        self.state.many_async(column, keys, self.point, handovers, values).await
+        self.state.many_async(column, keys, self.point_of(column)?, handovers, values).await
     }
 
     /// Refuse a read once the store is going, whose files are closing under it
@@ -275,7 +298,7 @@ impl<Backend: Io> Cue<Backend> {
         self.check_open()?;
         let info = self.state.column(column)?;
         let handovers = self.state.volumes[info.volume.0 as usize].handover_count();
-        let read = self.state.key_read(column, key, self.point, true)?;
+        let read = self.state.key_read(column, key, self.point_of(column)?, true)?;
         self.state.counted(in_place(self.state.get_at(&InPlace, &read, handovers, want, buf)))
     }
 }

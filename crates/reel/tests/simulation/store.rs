@@ -534,7 +534,7 @@ fn spot_fence() {
 
     let volume = &store.state.volumes[0];
     let before = volume.handover_count();
-    let point = store.state.read_point();
+    let point = store.state.read_point(&store.state.volumes[0]);
     let hit = store.state.key_read(COLUMN, b"key", point, false).expect("key");
     let older = in_place(store.state.search_footers(&InPlace, volume, &hit)).expect("footers").expect("row");
 
@@ -602,7 +602,7 @@ fn quiet_put() {
     }
 
     let state = &store.state;
-    assert_eq!(state.order.wakes(), 0);
+    assert_eq!(state.volumes[0].order.wakes(), 0);
     assert_eq!(state.encoders.wakes() + state.stored_shares.wakes() + state.record_readers.wakes(), 0);
     store.close().expect("close");
 }
@@ -1147,7 +1147,7 @@ fn many_old_point() {
     store.put(COLUMN, b"key", b"older").expect("put");
     store.seal_now();
     settle(&io);
-    let point = store.state.read_point();
+    let point = store.state.read_point(&store.state.volumes[0]);
     store.put(COLUMN, b"key", b"newer").expect("put");
     store.seal_now();
     settle(&io);

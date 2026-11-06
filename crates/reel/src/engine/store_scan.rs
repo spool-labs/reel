@@ -32,7 +32,8 @@ impl<Backend: Io> StoreScan<Backend> {
 
     /// Start a walk at a live cue's point. It takes a slot of its own, so it can outlive the cue
     pub fn at_cue(state: Arc<EngineState<Backend>>, range: &ScanRange, point: WritePlace) -> Result<Self, StoreError> {
-        let Some(slot) = state.cues.take(point) else {
+        let info = state.column(range.column)?;
+        let Some(slot) = state.cues.take(info.volume.0 as usize, point) else {
             return Err(StoreError::CuesFull { limit: MOST_CUES as u64 });
         };
         match state.take_scan(range, Some(point)) {

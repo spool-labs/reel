@@ -638,7 +638,7 @@ fn lost_write() {
     rot_second_tail(&built, NEWEST);
 
     let store = open(&built.io);
-    assert!(store.state.read_point() >= built.heads[NEWEST].places.highest);
+    assert!(store.state.read_point(&store.state.volumes[0]) >= built.heads[NEWEST].places.highest);
     let mut model = built.model.clone();
     write(&store, &mut model, ORDERED, 155, AFTER_OPEN, false);
     write(&store, &mut model, RANDOM, 156, AFTER_OPEN, true);
@@ -660,7 +660,7 @@ fn close_mark() {
     let built = build(17);
     let store = open(&built.io);
     store.put(ORDERED, b"last", b"value").expect("put");
-    let mark = store.state.read_point();
+    let mark = store.state.read_point(&store.state.volumes[0]);
     store.close().expect("close");
     drop(store);
 
@@ -1955,7 +1955,7 @@ fn newer_rot() {
             let summary = hold(&store.state.volumes[0].summary);
             let facts = summary.get(segment).expect("row").facts;
             assert_eq!((facts.places, facts.seal_mark), (older.places, older.seal_mark));
-            assert_eq!(facts.damage_place, store.state.order.mark());
+            assert_eq!(facts.damage_place, store.state.volumes[0].order.mark());
             drop(summary);
             store.close().expect("close");
         }

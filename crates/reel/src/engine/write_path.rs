@@ -441,7 +441,7 @@ impl<Backend: Io> EngineState<Backend> {
         self.check_key(column, key)?;
         let volume = &self.volumes[info.volume.0 as usize];
         check_writable(volume)?;
-        if self.index.is_newest_grave(column, key, self.read_point(), volume.view()) {
+        if self.index.is_newest_grave(column, key, self.read_point(volume), volume.view()) {
             return Ok(());
         }
 
@@ -799,10 +799,10 @@ impl<Backend: Io> EngineState<Backend> {
             }
 
             if let Some(index) = pick.best {
-                let Some(ticket) = self.order.try_claim(request.rows) else {
+                let Some(ticket) = volume.order.try_claim(request.rows) else {
                     // the ring frees when claims end, and ending one needs this lock, and so does a raise
                     drop(claims);
-                    if self.order.is_past_limit(request.rows) {
+                    if self.places.is_past_limit(request.rows) {
                         let _is_held = self.reserve_ahead();
                     }
                     self.io.pause();

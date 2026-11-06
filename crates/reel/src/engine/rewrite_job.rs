@@ -844,7 +844,7 @@ impl<Backend: Io> RewriteJob<Backend> {
 
     /// Check a replaced row can go: no live cue sits at or above it and below its newest replacement
     pub fn can_drop(&self, replacement: WritePlace, row: &FooterRow) -> bool {
-        !self.state.cues.has_cue_between(row.place, replacement)
+        !self.state.cues.has_cue_between(self.volume, row.place, replacement)
     }
 
     /// Check a grave with no newer row of its key has nothing left to hide, by this key's own rows and nothing wider. An older
@@ -855,7 +855,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         let state = &self.state;
         if volume.segments_parked.load(Ordering::Acquire) > 0
             || volume.stray_outputs.load(Ordering::Acquire) > 0
-            || state.cues.has_cue_below(row.place)
+            || state.cues.has_cue_below(self.volume, row.place)
             || volume.damage.covering(column, &self.key).is_some()
         {
             return Ok(false);
@@ -1367,11 +1367,11 @@ impl<Backend: Io> RewriteJob<Backend> {
             }
             return Ok(());
         }
-        if state.read_point() < self.highest_replacement {
+        if state.read_point(volume) < self.highest_replacement {
             return Err(Error::from(ErrorKind::Interrupted));
         }
         state.cues.note_reclaim();
-        if state.cues.has_cue_between(self.lowest_dropped, self.highest_replacement) {
+        if state.cues.has_cue_between(self.volume, self.lowest_dropped, self.highest_replacement) {
             return Err(Error::from(ErrorKind::Interrupted));
         }
         let numbers = self.numbers;

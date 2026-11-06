@@ -292,7 +292,7 @@ fn no_pin_to_give() {
     let store = open(&io);
     let state = &store.state;
     store.put(COLUMN, b"key", &large(1)).expect("put");
-    let slots: Vec<usize> = (0..MOST_CUES).map(|_slot| state.cues.take(WritePlace(u64::MAX - 1)).expect("a slot")).collect();
+    let slots: Vec<usize> = (0..MOST_CUES).map(|_slot| state.cues.take(0, WritePlace(u64::MAX - 1)).expect("a slot")).collect();
 
     assert!(state.pinned_read(COLUMN, b"key").is_err());
     assert_eq!(state.cues.refused_reads(), 1);
@@ -315,7 +315,7 @@ fn many_crossed_by_a_free() {
     keep_live(&store);
     store.put(COLUMN, b"key", &large(1)).expect("put");
     seal(&store, &io);
-    let slots: Vec<usize> = (0..MOST_CUES).map(|_slot| state.cues.take(WritePlace(u64::MAX - 1)).expect("a slot")).collect();
+    let slots: Vec<usize> = (0..MOST_CUES).map(|_slot| state.cues.take(0, WritePlace(u64::MAX - 1)).expect("a slot")).collect();
 
     let many = state.many_read(volume).expect("a read");
     assert_eq!(many.pin, None);
@@ -464,7 +464,7 @@ fn unpublished_replacement() {
         offset: FileOffset(0),
         length: ByteCount(2 * FREE_BLOCK_BYTES),
         place: WritePlace(1),
-        replacement: WritePlace(store.state.read_point().0 + 1),
+        replacement: WritePlace(store.state.read_point(&store.state.volumes[0]).0 + 1),
     };
     assert!(!state.free_record(&store.state.volumes[0], &free));
     assert_eq!(io.freed_bytes().0, 0);

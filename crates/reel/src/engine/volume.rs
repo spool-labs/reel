@@ -20,6 +20,7 @@ use crate::segment::segment_tail::{MOST_MERGE_SEGMENTS, SegmentNumber};
 use crate::segment::range_covers::RangeCovers;
 use crate::segment::summary::{LostRows, SummaryPaths, SummaryRows};
 use crate::superblock::SuperblockPaths;
+use crate::write_order::WriteOrder;
 
 /// A volume's `sealing` number between seals
 pub const NO_SEAL: u64 = u64::MAX;
@@ -209,6 +210,7 @@ pub struct Volume<Backend: Io> {
     pub gave_up: Mutex<GaveUp>,
     pub early_bar_rewrites: AtomicU64,
     pub plain_bar_rewrites: AtomicU64,
+    pub order: WriteOrder,
     pub rows_in_index: AtomicU64,
     pub ration: Ration,
     pub marked_seals: AtomicU64,

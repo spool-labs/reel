@@ -32,3 +32,7 @@ harness = false
 name = "budgets"
 path = "tests/budgets/main.rs"
 harness = false
+
+[[test]]
+name = "ring"
+path = "tests/ring/main.rs"

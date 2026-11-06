@@ -27,6 +27,7 @@ const SEAL_WAIT: Duration = Duration::from_millis(1);
 const MOST_SEAL_WAITS: u32 = 20_000;
 const HIGH_KEY: &[u8] = b"zzz";
 const FIRST_ROUND: u64 = 0;
+const MOST_VIEWS: u32 = 20;
 
 type Store = ReelStore<PlainIo>;
 
@@ -126,6 +127,7 @@ fn churn(has_cue: bool) -> JobsRun {
     let cue = has_cue.then(|| store.cue().expect("cue"));
     let is_done = AtomicBool::new(false);
     let walks = AtomicU64::new(0);
+    let mut views = 0;
     thread::scope(|scope| {
         let walker = |direction: Direction, start: &'static [u8]| {
             let (store, is_done, walks) = (&store, &is_done, &walks);
@@ -136,6 +138,18 @@ fn churn(has_cue: bool) -> JobsRun {
                 }
             }
         };
+        let viewer = scope.spawn(|| {
+            let mut views = 0;
+            let config = config(&root, BUDGET);
+            let mut view = ReelStore::open_read_only(PlainIo::new(), &config).expect("open read-only");
+            while !is_done.load(Ordering::Acquire) && views < MOST_VIEWS {
+                check_walk(view.iter_from(META, b"", Direction::Ascending).expect("scan"), Direction::Ascending, None);
+                view.refresh().expect("refresh");
+                views += 1;
+            }
+            view.close().expect("close");
+            views
+        });
         let up = scope.spawn(walker(Direction::Ascending, b""));
         let down = scope.spawn(walker(Direction::Descending, HIGH_KEY));
         let at_cue = scope.spawn(|| {
@@ -152,6 +166,7 @@ fn churn(has_cue: bool) -> JobsRun {
             store.seal_now();
         }
         is_done.store(true, Ordering::Release);
+        views = viewer.join().expect("join");
         for walker in [up, down, at_cue] {
             walker.join().expect("join");
         }
@@ -163,7 +178,7 @@ fn churn(has_cue: bool) -> JobsRun {
         unlinks: volume.segments_unlinked.load(Ordering::Acquire),
         rewrites: volume.segments_rewritten.load(Ordering::Acquire),
     };
-    println!("{} walks beside {} unlinks and {} rewrites", walks.load(Ordering::Relaxed), run.unlinks, run.rewrites);
+    println!("{} walks and {views} views beside {} unlinks and {} rewrites", walks.load(Ordering::Relaxed), run.unlinks, run.rewrites);
     assert!(walks.load(Ordering::Relaxed) > 0);
     assert_eq!(store.state.cues.refused_reads(), 0);
     store.close().expect("close");

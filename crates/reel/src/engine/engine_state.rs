@@ -115,6 +115,7 @@ pub struct EngineState<Backend: Io> {
     pub reserve_task: OnceLock<Backend::Task>,
     pub read_tasks: Vec<OnceLock<Backend::Task>>,
     pub read_pool: ReadPool,
+    pub is_read_only: bool,
     pub seal_tasks: Vec<OnceLock<Backend::Task>>,
     pub planner_task: OnceLock<Backend::Task>,
     pub index_waiters: AtomicU64,

@@ -12,6 +12,7 @@ pub mod job_tally;
 pub mod reports;
 pub mod open_segment;
 pub mod planner;
+pub mod read_only;
 pub mod read_path;
 pub mod read_pool;
 pub mod recovery;

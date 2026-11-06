@@ -24,9 +24,11 @@ use crate::engine::engine_sizing::{
 };
 use crate::engine::engine_state::{EngineState, PLACE_RUN, SEGMENT_NUMBER_BATCH, SlotFile};
 use crate::engine::open_segment::{RECORD_WINDOW_BYTES, RecordWindow, RowQueue, fits_a_segment_path};
+use crate::engine::read_only::{close_read_only, load_read_only};
 use crate::engine::read_path::RecordWant;
 use crate::engine::read_pool::{READ_WORKERS, ReadPool, ReadWorker};
 use crate::engine::recovery::{
+    OpenMode,
     RootScan, SummaryFound, list_roots, load_covers, read_summaries, recover_segments, save_cleared_spans, scan_roots,
     walk_open_rows,
     settle_summaries,
@@ -72,6 +74,7 @@ pub const LOCK_NAME: &str = "lock";
 pub struct ReelStore<Backend: Io> {
     pub state: Arc<EngineState<Backend>>,
     is_closed: AtomicBool,
+    config: StoreConfig,
 }
 
 /// Turn a backend failure at open into a store error
@@ -86,24 +89,7 @@ impl<Backend: Io> ReelStore<Backend> {
         let locks = lock_roots(&io, config)?;
         let superblock = settle_superblock(&io, config)?;
 
-        let mut root_count = 0;
-        for volume in &config.volumes {
-            root_count += volume.roots.len();
-        }
-        let shape = StoreShape {
-            budget: config.memory_budget,
-            roots: root_count,
-            volumes: config.volumes.len(),
-            has_lz4: config.columns.iter().any(|column| column.codec == Codec::Lz4),
-            widest_keys: (0..config.volumes.len()).map(|volume| config.widest_key(volume) as u64).sum(),
-        };
-        if config.memory_budget < shape.least_budget() {
-            return Err(StoreError::BudgetTooSmall {
-                budget: config.memory_budget,
-                least: shape.least_budget(),
-            });
-        }
-        let sizing = EngineSizing::for_store(&shape);
+        let sizing = store_sizing(config)?;
 
         // every root is listed before any tail is read, and the table is sized from what they hold
         let mut roots = Vec::with_capacity(config.volumes.len());
@@ -112,7 +98,7 @@ impl<Backend: Io> ReelStore<Backend> {
         }
         let listings = list_roots(&io, &roots).map_err(open_error("listing a root"))?;
         let record_key = superblock.record_key;
-        let mut scan = scan_roots(&io, record_key, &listings).map_err(open_error("reading a tail"))?;
+        let mut scan = scan_roots(&io, record_key, &listings, OpenMode::Writable).map_err(open_error("reading a tail"))?;
         let summaries = match read_summaries(&io, &roots) {
             Ok(summaries) => summaries,
             Err(error) => {
@@ -135,6 +121,7 @@ impl<Backend: Io> ReelStore<Backend> {
         Ok(Self {
             state,
             is_closed: AtomicBool::new(false),
+            config: config.clone(),
         })
     }
 
@@ -180,6 +167,38 @@ impl<Backend: Io> ReelStore<Backend> {
         self.state.damaged_segments.load(Ordering::Acquire)
     }
 
+    /// Open a store beside its writer, with no lock and no write. It sees the store as it stood, every batch whole or absent,
+    /// until `refresh` looks again
+    pub fn open_read_only(io: Backend, config: &StoreConfig) -> Result<Self, StoreError> {
+        check_config(config)?;
+        Ok(Self {
+            state: load_read_only(&io, config)?,
+            is_closed: AtomicBool::new(false),
+            config: config.clone(),
+        })
+    }
+
+    /// Take in what the writer has done since this view was taken. The old view goes first, so the heap never holds two, and
+    /// a refresh that fails can be asked for again
+    pub fn refresh(&mut self) -> Result<(), StoreError> {
+        self.check_open()?;
+        if !self.state.is_read_only {
+            return Ok(());
+        }
+        close_read_only(&self.state);
+        self.state = load_read_only(&self.state.io, &self.config)?;
+        Ok(())
+    }
+
+    /// Refuse a write on a store that only looks
+    pub fn check_writes(&self) -> Result<(), StoreError> {
+        self.check_open()?;
+        if self.state.is_read_only {
+            return Err(StoreError::ReadOnly);
+        }
+        Ok(())
+    }
+
     /// Refuse a call after close
     pub fn check_open(&self) -> Result<(), StoreError> {
         if self.is_closed.load(Ordering::Acquire) {
@@ -190,7 +209,7 @@ impl<Backend: Io> ReelStore<Backend> {
 
     /// Write a value, visible to every later read when this returns
     pub fn put(&self, column: ColumnId, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
-        self.check_open()?;
+        self.check_writes()?;
         self.state.write_value(column, key, value)
     }
 
@@ -212,7 +231,7 @@ impl<Backend: Io> ReelStore<Backend> {
 
     /// Apply a batch whole, in batch order, visible to every later read when this returns
     pub fn write_batch(&self, batch: &WriteBatch) -> Result<(), StoreError> {
-        self.check_open()?;
+        self.check_writes()?;
         self.state.write_batch(batch)
     }
 
@@ -223,13 +242,13 @@ impl<Backend: Io> ReelStore<Backend> {
 
     /// Remove every key in [start, end) written before this call, as one record whatever the keys it covers
     pub fn delete_range(&self, column: ColumnId, start: &[u8], end: &[u8]) -> Result<(), StoreError> {
-        self.check_open()?;
+        self.check_writes()?;
         self.state.write_range_delete(column, start, end)
     }
 
     /// Write a grave
     pub fn delete(&self, column: ColumnId, key: &[u8]) -> Result<(), StoreError> {
-        self.check_open()?;
+        self.check_writes()?;
         self.state.write_grave(column, key)
     }
 
@@ -308,7 +327,7 @@ impl<Backend: Io> ReelStore<Backend> {
 
     /// Clear a damaged span once the caller has repaired it from peers, up to an end key or the column's end
     pub fn clear_damage(&self, column: ColumnId, start: &[u8], end: Option<&[u8]>) -> Result<(), StoreError> {
-        self.check_open()?;
+        self.check_writes()?;
         let info = self.state.column(column)?;
         let volume = &self.state.volumes[info.volume.0 as usize];
         while volume.is_clearing.swap(true, Ordering::AcqRel) {
@@ -343,7 +362,7 @@ impl<Backend: Io> ReelStore<Backend> {
 
     /// Make every write that returned before this call durable on every volume
     pub fn flush(&self) -> Result<(), StoreError> {
-        self.check_open()?;
+        self.check_writes()?;
         for volume in &self.state.volumes {
             self.state.sync_volume(volume)?;
         }
@@ -363,6 +382,10 @@ impl<Backend: Io> ReelStore<Backend> {
             return Ok(());
         }
 
+        if self.state.is_read_only {
+            close_read_only(&self.state);
+            return Ok(());
+        }
         self.state.stop_jobs().map_err(open_error("stopping a job"))?;
 
         let mut outcome = Ok(());
@@ -500,7 +523,7 @@ pub fn bring_up<Backend: Io>(
     for found in &scan.sealed {
         state.order.resume_past(found.head.places.highest);
     }
-    walk_open_rows(state, scan).map_err(open_error("walking a rows file"))?;
+    walk_open_rows(state, scan, OpenMode::Writable).map_err(open_error("walking a rows file"))?;
     load_covers(state, scan).map_err(open_error("reading pending range deletes"))?;
     settle_summaries(state, scan).map_err(open_error("settling a summary"))?;
 
@@ -607,6 +630,25 @@ pub fn bring_up<Backend: Io>(
 }
 
 /// Refuse a config that can't work
+/// Work out what a store's budget buys, or refuse one too small
+pub fn store_sizing(config: &StoreConfig) -> Result<EngineSizing, StoreError> {
+    let root_count = config.volumes.iter().map(|volume| volume.roots.len()).sum();
+    let shape = StoreShape {
+        budget: config.memory_budget,
+        roots: root_count,
+        volumes: config.volumes.len(),
+        has_lz4: config.columns.iter().any(|column| column.codec == Codec::Lz4),
+        widest_keys: (0..config.volumes.len()).map(|volume| config.widest_key(volume) as u64).sum(),
+    };
+    if config.memory_budget < shape.least_budget() {
+        return Err(StoreError::BudgetTooSmall {
+            budget: config.memory_budget,
+            least: shape.least_budget(),
+        });
+    }
+    Ok(EngineSizing::for_store(&shape))
+}
+
 pub fn check_config(config: &StoreConfig) -> Result<(), StoreError> {
     for volume in &config.volumes {
         if !volume.roots.iter().all(|root| fits_a_segment_path(root)) {
@@ -671,7 +713,9 @@ pub fn lock_roots<Backend: Io>(io: &Backend, config: &StoreConfig) -> Result<Vec
 }
 
 /// Read the newest superblock of any root, check the config against it, and write it to every root
-pub fn settle_superblock<Backend: Io>(io: &Backend, config: &StoreConfig) -> Result<Superblock, StoreError> {
+/// Read the newest superblock every root agrees on, and the highest limit any copy holds. No copy anywhere that passes, with
+/// some that exist, is a lost store and never a new one
+pub fn newest_superblock<Backend: Io>(io: &Backend, config: &StoreConfig) -> Result<(Option<Superblock>, WritePlace), StoreError> {
     let mut newest: Option<Superblock> = None;
     let mut highest_limit = WritePlace(0);
     let mut has_failed = false;
@@ -704,7 +748,6 @@ pub fn settle_superblock<Backend: Io>(io: &Backend, config: &StoreConfig) -> Res
         }
     }
 
-    // no copy anywhere that passes, with some that exist, is a lost store and never a new one
     if newest.is_none() && has_failed {
         return Err(StoreError::Io {
             action: "reading a superblock",
@@ -712,6 +755,25 @@ pub fn settle_superblock<Backend: Io>(io: &Backend, config: &StoreConfig) -> Res
         });
     }
 
+    Ok((newest, highest_limit))
+}
+
+/// Read what a read-only open goes by, and write nothing
+pub fn read_superblock<Backend: Io>(io: &Backend, config: &StoreConfig) -> Result<Superblock, StoreError> {
+    let (newest, _limit) = newest_superblock(io, config)?;
+    let Some(superblock) = newest else {
+        return Err(StoreError::Io {
+            action: "reading a superblock",
+            source: Error::from(ErrorKind::NotFound),
+        });
+    };
+    check_layout(&superblock, config)?;
+    Ok(superblock)
+}
+
+/// Read the superblock, or start one for a new store, and save it with the next run of places
+pub fn settle_superblock<Backend: Io>(io: &Backend, config: &StoreConfig) -> Result<Superblock, StoreError> {
+    let (newest, highest_limit) = newest_superblock(io, config)?;
     let mut superblock = match newest {
         Some(superblock) => {
             check_layout(&superblock, config)?;
@@ -1059,6 +1121,7 @@ pub fn build_state<Backend: Io>(
         reserve_task: OnceLock::new(),
         read_tasks: (0..READ_WORKERS).map(|_worker| OnceLock::new()).collect(),
         read_pool: ReadPool::new(scans),
+        is_read_only: false,
         seal_tasks,
         planner_task: OnceLock::new(),
         index_waiters: AtomicU64::new(0),

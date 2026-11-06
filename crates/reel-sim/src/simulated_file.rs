@@ -148,6 +148,7 @@ impl IoFile for SimulatedFile {
         }
 
         let mut disk = hold(&self.disk);
+        disk.writes = OperationCount(disk.writes.0 + 1);
         let was_crashed = disk.is_crashed;
         if let Err(error) = self.check(&mut disk, true) {
             if !was_crashed && disk.is_crashed {

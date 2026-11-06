@@ -74,6 +74,24 @@ pub struct FoundSealed<File> {
     pub has_rows: bool,
 }
 
+/// Which segment file an open is sorting, and how
+#[derive(Clone, Copy, Debug)]
+pub struct SegmentAt<'listing> {
+    pub record_key: RecordKey,
+    pub listing: &'listing RootListing,
+    pub number: SegmentNumber,
+    pub mode: OpenMode,
+}
+
+/// Whether an open owns the store or only looks at it
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OpenMode {
+    /// It holds the lock and writes
+    Writable,
+    /// It reads beside a writer, and changes nothing
+    ReadOnly,
+}
+
 /// A sealed segment whose copies of the tail or the index all fail
 #[derive(Clone, Debug)]
 pub struct FoundDamaged {
@@ -273,6 +291,7 @@ pub fn scan_roots<Backend: Io>(
     io: &Backend,
     record_key: RecordKey,
     listings: &[RootListing],
+    mode: OpenMode,
 ) -> Result<RootScan<Backend::File>> {
     let mut scan = RootScan {
         sealed: Vec::new(),
@@ -289,23 +308,26 @@ pub fn scan_roots<Backend: Io>(
         for path in &listing.files {
             // a stopped rewrite's output has no tail, and everything in it is still in its input
             if parse_segment(path, OUTPUT_SUFFIX).is_some() {
-                let _removed = io.remove_file(path);
+                if mode == OpenMode::Writable {
+                    let _removed = io.remove_file(path);
+                }
                 continue;
             }
             let Some(number) = parse_segment(path, DATA_SUFFIX) else {
                 continue;
             };
             scan.highest_segment = scan.highest_segment.max(number);
-            let sorted = io
-                .open_file(path)
-                .and_then(|file| sort_segment(io, record_key, listing, number, file, &mut reader, &mut scan));
+            let sorted = open_for(io, path, mode)
+                .and_then(|file| sort_segment(io, &SegmentAt { record_key, listing, number, mode }, file, &mut reader, &mut scan));
             if let Err(error) = sorted {
                 scan.close_files(io);
                 return Err(error);
             }
         }
     }
-    drop_inputs(io, &mut scan);
+    if mode == OpenMode::Writable {
+        drop_inputs(io, &mut scan);
+    }
     Ok(scan)
 }
 
@@ -359,13 +381,12 @@ pub fn drop_inputs<Backend: Io>(io: &Backend, scan: &mut RootScan<Backend::File>
 /// Read one segment and hand its file to the scan, or close it
 pub fn sort_segment<Backend: Io>(
     io: &Backend,
-    record_key: RecordKey,
-    listing: &RootListing,
-    number: SegmentNumber,
+    at: &SegmentAt,
     file: Backend::File,
     reader: &mut FooterReader,
     scan: &mut RootScan<Backend::File>,
 ) -> Result<()> {
+    let SegmentAt { record_key, listing, number, mode } = *at;
     let segment = match read_segment(record_key, listing, number, &file, reader) {
         Ok(segment) => segment,
         Err(error) => {
@@ -380,7 +401,7 @@ pub fn sort_segment<Backend: Io>(
         SegmentRead::Open | SegmentRead::Empty { .. } => None,
     };
     let is_stale = match tail.filter(|_head| has_rows(listing, number)) {
-        Some(head) => is_tail_stale(io, record_key, listing, &head),
+        Some(head) => is_tail_stale(io, record_key, listing, &head, mode),
         None => Ok(false),
     };
     let segment = match is_stale {
@@ -498,7 +519,7 @@ impl<Backend: Io> EngineState<Backend> {
     pub fn install_sealed(&self, volume: &Volume<Backend>, found: &FoundSealed<Backend::File>) -> Result<()> {
         // a seal stopped after its tails reached the kernel leaves its rows, and a failed sync can have left
         // the tails nowhere else, so they go out again and sync before the rows go
-        if found.has_rows {
+        if found.has_rows && !self.is_read_only {
             let end = found.file.length()?;
             let tails = ByteCount(end.0 - found.head.second_index_at.0);
             rewrite_range(&found.file, found.head.second_index_at, tails, &mut vec![0; GROUP_BYTES.0 as usize])?;
@@ -865,12 +886,12 @@ pub fn load_covers<Backend: Io>(state: &EngineState<Backend>, scan: &RootScan<Ba
 }
 
 /// Walk every open segment's rows file and move the order past what they hold, before anything ranks damage
-pub fn walk_open_rows<Backend: Io>(state: &EngineState<Backend>, scan: &mut RootScan<Backend::File>) -> Result<()> {
+pub fn walk_open_rows<Backend: Io>(state: &EngineState<Backend>, scan: &mut RootScan<Backend::File>, mode: OpenMode) -> Result<()> {
     scan.open.reverse();
     while let Some(open) = scan.open.last() {
         let volume = &state.volumes[open.volume];
         let path = &volume.roots[open.root.0 as usize];
-        let rows = state.io.open_file(&rows_path(path, open.number))?;
+        let rows = open_for(&state.io, &rows_path(path, open.number), mode)?;
         let walked = match state.scan_rows(&rows) {
             Ok(walked) => walked,
             Err(error) => {
@@ -2023,11 +2044,25 @@ pub fn scan_rows_of<File: IoFile>(rows: &File, record_key: RecordKey) -> Result<
 /// Check a segment's rows file goes past what its tail lists. A seal that stopped after its tail leaves those bytes in the file
 /// when the segment goes on taking writes, and a power cut that loses what came after can bring them back to the file's end.
 /// The tails sync before the cut for the same reason, and this covers every other way a tail that never finished reads as final
-pub fn is_tail_stale<Backend: Io>(io: &Backend, record_key: RecordKey, listing: &RootListing, head: &TailHead) -> Result<bool> {
-    let rows = io.open_file(&rows_path(&listing.path, head.segment))?;
+pub fn is_tail_stale<Backend: Io>(
+    io: &Backend,
+    record_key: RecordKey,
+    listing: &RootListing,
+    head: &TailHead,
+    mode: OpenMode,
+) -> Result<bool> {
+    let rows = open_for(io, &rows_path(&listing.path, head.segment), mode)?;
     let scanned = scan_rows_of(&rows, record_key);
     io.close_file(rows);
     Ok(scanned?.highest_place > head.places.highest)
+}
+
+/// Open a file the way this open needs it
+pub fn open_for<Backend: Io>(io: &Backend, path: &Path, mode: OpenMode) -> Result<Backend::File> {
+    match mode {
+        OpenMode::Writable => io.open_file(path),
+        OpenMode::ReadOnly => io.open_read_only(path),
+    }
 }
 
 /// Find which of a volume's roots a file sits under

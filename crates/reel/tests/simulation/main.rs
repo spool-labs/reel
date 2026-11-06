@@ -17,6 +17,7 @@ mod range_deletes;
 mod range_apply;
 mod rewrite;
 mod scans;
+mod read_only;
 mod records;
 mod reports;
 mod seed_sets;

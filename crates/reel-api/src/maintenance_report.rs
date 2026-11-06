@@ -120,6 +120,8 @@ pub struct MaintenanceReport {
     pub segments_parked: SegmentCount,
     pub empties_left: SegmentCount,
     pub stray_outputs: SegmentCount,
+    /// Async reads complete through the ring, and through the blocking pool when this is false
+    pub has_ring: bool,
 }
 
 impl JobReport {
@@ -162,6 +164,7 @@ impl MaintenanceReport {
             segments_parked: SegmentCount::default(),
             empties_left: SegmentCount::default(),
             stray_outputs: SegmentCount::default(),
+            has_ring: false,
         }
     }
 }

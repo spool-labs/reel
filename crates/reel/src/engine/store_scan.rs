@@ -14,6 +14,7 @@ use crate::engine::read_pool::ReadWork;
 use crate::engine::scan_path::ScanWant;
 use crate::engine::scan_state::{ScanRange, ScanState};
 use crate::io::Io;
+use crate::io::ring::OnRing;
 
 /// A walk over keys in order. It holds no segment open between steps
 pub struct StoreScan<Backend: Io> {
@@ -55,6 +56,9 @@ impl<Backend: Io> StoreScan<Backend> {
     /// gives its buffers back when the worker ends, and a future dropped part way ends the walk
     pub async fn next_block(&mut self, keys: &mut ValueList) -> Result<bool, StoreError> {
         keys.clear();
+        if self.state.ring.is_some() {
+            return self.next_block_on_ring(keys).await;
+        }
         let lease = self.state.read_pool.claim().await;
         let Some(scan) = self.scan.take() else {
             return Ok(false);
@@ -66,6 +70,28 @@ impl<Backend: Io> StoreScan<Backend> {
             self.scan = Some(scan);
             *keys = list;
         }
+        answer
+    }
+
+    /// Stream the next block of keys on the ring, on the caller's task. A future dropped part way ends the walk, since a step
+    /// that stopped half done leaves nothing to go on from
+    pub async fn next_block_on_ring(&mut self, keys: &mut ValueList) -> Result<bool, StoreError> {
+        let state = Arc::clone(&self.state);
+        let Some(ring) = &state.ring else {
+            return Ok(false);
+        };
+        let Ok(_seat) = ring.seat().await else {
+            return Err(StoreError::Closed);
+        };
+        let Some(scan) = self.scan.take() else {
+            return Ok(false);
+        };
+        let mut held = HeldScan { state: &state, scan: Some(scan) };
+        let answer = match &mut held.scan {
+            Some(scan) => state.scan_block_on(&OnRing(ring), scan, keys).await,
+            None => Ok(false),
+        };
+        self.scan = held.scan.take();
         answer
     }
 
@@ -87,6 +113,20 @@ impl<Backend: Io> Drop for StoreScan<Backend> {
             self.state.cues.release(slot);
             // what this walk kept can go now, and nothing else would look again
             self.state.ask_compaction();
+        }
+    }
+}
+
+/// A scan on its way through a ring read, which goes back to the pool when the read is dropped part way
+pub struct HeldScan<'state, Backend: Io> {
+    state: &'state EngineState<Backend>,
+    scan: Option<ScanState>,
+}
+
+impl<Backend: Io> Drop for HeldScan<'_, Backend> {
+    fn drop(&mut self) {
+        if let Some(scan) = self.scan.take() {
+            self.state.give_back_scan(scan);
         }
     }
 }

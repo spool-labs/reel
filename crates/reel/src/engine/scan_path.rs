@@ -12,12 +12,12 @@ use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, RowCount, WritePlace};
 
 use crate::engine::engine_state::EngineState;
-use crate::engine::read_path::{KeyRead, Located, MOST_READ_TRIES, RecordWant, SealedRow, newest_of};
+use crate::engine::read_path::{HeldPin, KeyRead, Located, MOST_READ_TRIES, RecordWant, SealedRow, newest_of};
 use crate::engine::scan_state::{BlockTake, MOST_SCANS, NO_GENERATION, ScanRange, ScanState, SegmentSource, under_prefix};
 use crate::engine::volume::Volume;
 use crate::guard::hold;
 use crate::index::write_shard::WalkBound;
-use crate::io::{InPlace, Io, in_place};
+use crate::io::{DeviceReads, InPlace, Io, in_place};
 use crate::segment::block_cache::BlockKey;
 use crate::segment::block_entry::{BlockEntry, KeyBound, SHARED_HEAD_BYTES};
 use crate::segment::column_directory::ColumnDirectory;
@@ -114,11 +114,17 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// Take one step of a scan, with a value buffer when it wants values. A job that crosses a try costs a seek from the last
     /// key, and past the usual tries a pin holds the jobs off that key
-    pub fn step_scan(
+    pub fn step_scan(&self, scan: &mut ScanState, key: &mut Vec<u8>, want: ScanWant) -> Result<ScanStep, StoreError> {
+        in_place(self.step_scan_on(&InPlace, scan, key, want))
+    }
+
+    /// Take one step of a scan through a device's read path
+    pub async fn step_scan_on(
         &self,
+        device: &impl DeviceReads<Backend::File>,
         scan: &mut ScanState,
         key: &mut Vec<u8>,
-        mut want: ScanWant,
+        mut want: ScanWant<'_>,
     ) -> Result<ScanStep, StoreError> {
         let info = self.column(scan.column)?;
         let volume = &self.volumes[info.volume.0 as usize];
@@ -130,10 +136,9 @@ impl<Backend: Io> EngineState<Backend> {
             }
             let many = if tries >= MOST_READ_TRIES && scan.point.is_none() { self.many_read(volume) } else { None };
             let pinned = many.and_then(|many| many.pin.map(|slot| (many, slot)));
-            let outcome = self.try_step(volume, directory, scan, pinned.map(|(many, _slot)| many.point), key, want.reborrow());
-            if let Some((many, slot)) = pinned {
-                self.unpin(slot, many.counts);
-            }
+            let held = pinned.map(|(many, slot)| HeldPin { state: self, slot, counts: many.counts });
+            let outcome = self.try_step(device, volume, directory, scan, pinned.map(|(many, _slot)| many.point), key, want.reborrow()).await;
+            drop(held);
             match self.counted(outcome)? {
                 StepOutcome::Answer(step) => {
                     self.corruption_errors.fetch_add(u64::from(step == ScanStep::Corrupt), Ordering::Relaxed);
@@ -152,14 +157,15 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Try one key: seat what moved, find the walk's next key, and answer it
-    pub fn try_step(
+    pub async fn try_step(
         &self,
+        device: &impl DeviceReads<Backend::File>,
         volume: &Volume<Backend>,
         directory: Option<&ColumnDirectory>,
         scan: &mut ScanState,
         pin_point: Option<WritePlace>,
         key: &mut Vec<u8>,
-        want: ScanWant,
+        want: ScanWant<'_>,
     ) -> Result<StepOutcome, StoreError> {
         let generation = directory.map_or(0, ColumnDirectory::generation);
         let fixed_point = scan.point.or(pin_point);
@@ -173,7 +179,7 @@ impl<Backend: Io> EngineState<Backend> {
         }
         self.place_heads(volume, scan);
         if let Some(directory) = directory {
-            self.join_segments(volume, directory, scan, point)?;
+            self.join_segments(device, volume, directory, scan, point).await?;
         }
 
         let mut candidate = mem::take(&mut scan.key);
@@ -183,7 +189,7 @@ impl<Backend: Io> EngineState<Backend> {
             true
         });
         let spilled = match directory.filter(|_directory| scan.is_spilled) {
-            Some(directory) => self.spilled_key(volume, directory, scan, point, has_key, &mut candidate),
+            Some(directory) => self.spilled_key(device, volume, directory, scan, point, has_key, &mut candidate).await,
             None => Ok(has_key),
         };
         has_key = match spilled {
@@ -197,7 +203,7 @@ impl<Backend: Io> EngineState<Backend> {
         let outcome = match self.check_reach(volume, scan, has_key.then_some(&candidate)) {
             Ok(()) if has_key => {
                 let at = StepAt { directory, generation, fixed_point };
-                self.answer_key(volume, scan, &candidate, at, key, want)
+                self.answer_key(device, volume, scan, &candidate, at, key, want).await
             },
             Ok(()) => Ok(StepOutcome::Answer(ScanStep::End)),
             Err(error) => Err(error),
@@ -207,14 +213,15 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Answer the walk's next key at a point
-    pub fn answer_key(
+    pub async fn answer_key(
         &self,
+        device: &impl DeviceReads<Backend::File>,
         volume: &Volume<Backend>,
         scan: &mut ScanState,
         candidate: &[u8],
-        at: StepAt,
+        at: StepAt<'_>,
         key: &mut Vec<u8>,
-        want: ScanWant,
+        want: ScanWant<'_>,
     ) -> Result<StepOutcome, StoreError> {
         // the counts come before the point, as a get takes them
         let counts = self.cues.counts();
@@ -224,8 +231,8 @@ impl<Backend: Io> EngineState<Backend> {
         };
         let is_pinned = at.fixed_point.is_some();
         let found = self.index.lookup(scan.column, candidate, read.read_point, volume.view());
-        let taken = self.take_rows(volume, scan, candidate, read.read_point)?;
-        let sealed = if scan.is_spilled { in_place(self.search_sealed(&InPlace, volume, &read))? } else { taken };
+        let taken = self.take_rows(device, volume, scan, candidate, read.read_point).await?;
+        let sealed = if scan.is_spilled { self.search_sealed(device, volume, &read).await? } else { taken };
         // a seal moves rows from the index to a segment this walk hasn't seated, and both of its looks must see one list
         let is_same_list = at.directory.is_none_or(|directory| directory.generation() == at.generation);
         if !is_same_list {
@@ -240,7 +247,7 @@ impl<Backend: Io> EngineState<Backend> {
         }
 
         let answer = match want {
-            ScanWant::Value(value) => self.read_located(volume, &read, &located, value),
+            ScanWant::Value(value) => self.read_located(device, volume, &read, &located, value).await,
             ScanWant::Key => {
                 scan.counted += 1;
                 Ok(true)
@@ -268,17 +275,18 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Read the value of the row a key landed on, and return false when its segment or slot moved on
-    pub fn read_located(
+    pub async fn read_located(
         &self,
+        device: &impl DeviceReads<Backend::File>,
         volume: &Volume<Backend>,
-        read: &KeyRead,
+        read: &KeyRead<'_>,
         located: &Located,
         value: &mut Vec<u8>,
     ) -> Result<bool, StoreError> {
         match located {
             Located::Absent => Ok(false),
-            Located::Open(row) => in_place(self.read_open(&InPlace, read, row, RecordWant::Whole, value)),
-            Located::Sealed(row) => in_place(self.read_sealed(&InPlace, volume, read, row, RecordWant::Whole, value)),
+            Located::Open(row) => self.read_open(device, read, row, RecordWant::Whole, value).await,
+            Located::Sealed(row) => self.read_sealed(device, volume, read, row, RecordWant::Whole, value).await,
         }
     }
 
@@ -324,8 +332,9 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Seat every segment that starts before the walk's next key, one bound of the list at a time
-    pub fn join_segments(
+    pub async fn join_segments(
         &self,
+        device: &impl DeviceReads<Backend::File>,
         volume: &Volume<Backend>,
         directory: &ColumnDirectory,
         scan: &mut ScanState,
@@ -349,7 +358,7 @@ impl<Backend: Io> EngineState<Backend> {
                 Direction::Ascending => (frontier, reach),
                 Direction::Descending => (reach, frontier),
             };
-            self.join_range(volume, directory, scan, &low, &high, point)?;
+            self.join_range(device, volume, directory, scan, &low, &high, point).await?;
             scan.frontier = match scan.direction {
                 Direction::Ascending => directory.next_above(&reach),
                 Direction::Descending => directory.next_below(&reach),
@@ -359,8 +368,9 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Seat every segment a range of bounds meets. What the sources can't hold spills, and goes by seeks from then on
-    pub fn join_range(
+    pub async fn join_range(
         &self,
+        device: &impl DeviceReads<Backend::File>,
         volume: &Volume<Backend>,
         directory: &ColumnDirectory,
         scan: &mut ScanState,
@@ -392,7 +402,7 @@ impl<Backend: Io> EngineState<Backend> {
                 let source = &mut scan.sources[scan.source_count];
                 source.segment = segment;
                 // a segment gone from under the list is in the next one, which the step's last look will see
-                if self.seat_source(volume, source, &at)? == SourceMove::Row {
+                if self.seat_source(device, volume, source, &at).await? == SourceMove::Row {
                     scan.source_count += 1;
                 }
             }
@@ -403,8 +413,9 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Find the walk's next key among the segments the sources couldn't hold, and say whether it has one
-    pub fn spilled_key(
+    pub async fn spilled_key(
         &self,
+        device: &impl DeviceReads<Backend::File>,
         volume: &Volume<Backend>,
         directory: &ColumnDirectory,
         scan: &mut ScanState,
@@ -437,7 +448,7 @@ impl<Backend: Io> EngineState<Backend> {
                     is_counting: scan.is_counting,
                 };
                 scan.spill.segment = segment;
-                if self.seat_source(volume, &mut scan.spill, &at)? == SourceMove::Row
+                if self.seat_source(device, volume, &mut scan.spill, &at).await? == SourceMove::Row
                     && (!has_key || scan.is_before(&scan.spill.key, candidate))
                 {
                     candidate.clear();
@@ -452,8 +463,9 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Walk every source past a key, and return its newest row at a point
-    pub fn take_rows(
+    pub async fn take_rows(
         &self,
+        device: &impl DeviceReads<Backend::File>,
         volume: &Volume<Backend>,
         scan: &mut ScanState,
         key: &[u8],
@@ -478,7 +490,7 @@ impl<Backend: Io> EngineState<Backend> {
                         block_offset: source.line.block_offset,
                     });
                 }
-                step = self.step_source(volume, column, source, direction, point, take.as_mut())?;
+                step = self.step_source(device, volume, column, source, direction, point, take.as_mut()).await?;
             }
             let taken = take.map_or(0, |take| take.rows);
             scan.counted += taken;
@@ -493,8 +505,9 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Move a source to its next row in the walk's direction
-    pub fn step_source(
+    pub async fn step_source(
         &self,
+        device: &impl DeviceReads<Backend::File>,
         volume: &Volume<Backend>,
         column: ColumnId,
         source: &mut SegmentSource,
@@ -504,10 +517,10 @@ impl<Backend: Io> EngineState<Backend> {
     ) -> Result<SourceMove, StoreError> {
         loop {
             let (segment, line) = (source.segment, source.line);
-            let row = self.visit_block(volume, column, segment, &line, |block| match direction {
+            let row = self.visit_block(device, volume, column, segment, &line, |block| match direction {
                 Direction::Ascending => source.next_in_block(block),
                 Direction::Descending => source.previous_in_block(block),
-            })?;
+            }).await?;
             match row {
                 None => return Ok(SourceMove::Left),
                 Some(Some(row)) => {
@@ -566,11 +579,12 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Stand a source on its segment's first row past a key
-    pub fn seat_source(
+    pub async fn seat_source(
         &self,
+        device: &impl DeviceReads<Backend::File>,
         volume: &Volume<Backend>,
         source: &mut SegmentSource,
-        at: &SeatAt,
+        at: &SeatAt<'_>,
     ) -> Result<SourceMove, StoreError> {
         let Some(pin) = volume.table.pin(source.segment) else {
             return Ok(SourceMove::Left);
@@ -585,7 +599,7 @@ impl<Backend: Io> EngineState<Backend> {
         source.tail = tail;
         source.first_block = tail.first_block;
         source.end_block = tail.first_block + tail.block_count.0;
-        let spot = self.column_spot(volume, source, &tail, at)?;
+        let spot = self.column_spot(device, volume, source, &tail, at).await?;
         let start = match (spot, at.direction) {
             (ColumnSpot::Inside, direction) => volume.table.entry_block(source.segment, &tail, at.key, direction),
             (ColumnSpot::Below, Direction::Ascending) => Some(source.first_block),
@@ -609,10 +623,10 @@ impl<Backend: Io> EngineState<Backend> {
         }
         loop {
             let (segment, line) = (source.segment, source.line);
-            let row = self.visit_block(volume, at.column, segment, &line, |block| match at.direction {
+            let row = self.visit_block(device, volume, at.column, segment, &line, |block| match at.direction {
                 Direction::Ascending => source.seek_up(block, at.key, at.is_inclusive),
                 Direction::Descending => source.seek_down(block, at.key, at.is_inclusive),
-            })?;
+            }).await?;
             match row {
                 None => return Ok(SourceMove::Left),
                 Some(Some(row)) => {
@@ -687,12 +701,13 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// Place a walk's key against the bytes a column's keys share, which the block index leaves out. A prefix longer than the
     /// tail holds takes the column's first key to settle
-    pub fn column_spot(
+    pub async fn column_spot(
         &self,
+        device: &impl DeviceReads<Backend::File>,
         volume: &Volume<Backend>,
         source: &mut SegmentSource,
         tail: &ColumnTail,
-        at: &SeatAt,
+        at: &SeatAt<'_>,
     ) -> Result<ColumnSpot, StoreError> {
         let shared = tail.shared_length as usize;
         let mut order = tail.order_against_shared(at.key);
@@ -702,7 +717,7 @@ impl<Backend: Io> EngineState<Backend> {
             };
             source.enter_block(line);
             let segment = source.segment;
-            let first = self.visit_block(volume, at.column, segment, &line, |block| source.next_in_block(block))?;
+            let first = self.visit_block(device, volume, at.column, segment, &line, |block| source.next_in_block(block)).await?;
             if first.flatten().is_some() {
                 order = at.key[..at.key.len().min(shared)].cmp(&source.key[..shared]);
             }
@@ -715,13 +730,14 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Run a function over a row block through the cache, and return nothing when its segment has left
-    pub fn visit_block<Answer>(
+    pub async fn visit_block<Answer>(
         &self,
+        device: &impl DeviceReads<Backend::File>,
         volume: &Volume<Backend>,
         column: ColumnId,
         segment: SegmentNumber,
         line: &BlockEntry,
-        mut visit: impl FnMut(&[u8]) -> Answer,
+        mut visit: impl FnMut(&[u8]) -> Answer + Send,
     ) -> Result<Option<Answer>, StoreError> {
         let key = BlockKey {
             segment,
@@ -733,11 +749,12 @@ impl<Backend: Io> EngineState<Backend> {
         let Some(pin) = volume.table.pin(segment) else {
             return Ok(None);
         };
-        self.footer_readers.with(|reader| match in_place(reader.load_block(&InPlace, &pin.file, key, line, &self.row_cache)) {
+        let mut reader = self.footer_reader_for(device);
+        match reader.load_block(device, &pin.file, key, line, &self.row_cache).await {
             Ok(Some(block)) => Ok(Some(visit(block))),
             Ok(None) => Err(StoreError::Corruption { column }),
             Err(source) => Err(read_error(source)),
-        })
+        }
     }
 }
 

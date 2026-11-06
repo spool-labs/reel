@@ -179,6 +179,7 @@ impl<Backend: Io> EngineState<Backend> {
         report.segments_parked = SegmentCount(parked);
         report.empties_left = SegmentCount(empties);
         report.stray_outputs = SegmentCount(strays);
+        report.has_ring = self.ring.is_some();
         report.reclaim_retries = RowCount(retries);
         report.graves_at_open = RowCount(self.graves_at_open.load(Ordering::Acquire));
         report.deletes_since_open = RowCount(self.deletes.load(Ordering::Relaxed));

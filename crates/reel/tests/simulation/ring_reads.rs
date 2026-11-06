@@ -7,12 +7,16 @@ use std::task::{Context, Poll, Waker};
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
+use reel::engine::scan_state::MOST_SCANS;
 use reel::io::ring::{RING_READS, RING_SLOT_BYTES, RING_SLOTS, ReadRing};
 use reel::record::codec::Codec;
 use reel_api::column_id::ColumnId;
+use reel_api::direction::Direction;
 use reel_api::reads::{Reads, ValueWindow};
+use reel_api::scan::Scan;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, Nanoseconds, VolumeId};
+use reel_api::value_list::{ValueAnswer, ValueList};
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_io::SimulatedIo;
 use reel_sim::simulated_ring::SimulatedRing;
@@ -250,5 +254,79 @@ fn no_allocations() {
     let (found, allocations, frees) = counted(|| run(&io, Reads::get_async(&store, COLUMN, &name, &mut buf)));
     assert!(found.expect("get"));
     assert_eq!((allocations, frees), (0, 0));
+    store.close().expect("close");
+}
+
+// a batch answers in key order at one point, past a missing key
+#[test]
+fn batch_answers() {
+    let (io, store) = ringed(8);
+    let names: Vec<Vec<u8>> = (0..KEYS).step_by(13).map(key).collect();
+    let mut keys: Vec<&[u8]> = names.iter().map(Vec::as_slice).collect();
+    keys.push(b"missing");
+    let mut values = ValueList::new();
+    run(&io, Reads::get_many_async(&store, COLUMN, &keys, &mut values)).expect("many");
+    assert_eq!(values.len(), keys.len());
+    for (index, number) in (0..KEYS).step_by(13).enumerate() {
+        let expected = value(number);
+        assert_eq!(values.answer(index), Some(ValueAnswer::Found(&expected)));
+    }
+    assert_eq!(values.answer(keys.len() - 1), Some(ValueAnswer::Missing));
+    store.close().expect("close");
+}
+
+// a scan streams every key through the ring, a block at a time
+#[test]
+fn scan_streams() {
+    let (io, store) = ringed(9);
+    let mut scan = store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan");
+    let (mut keys, mut seen) = (ValueList::new(), 0);
+    loop {
+        let has_more = run(&io, Scan::next_block(&mut scan, &mut keys)).expect("block");
+        for index in 0..keys.len() {
+            let expected = key(seen);
+            assert_eq!(keys.answer(index), Some(ValueAnswer::Found(&expected)));
+            seen += 1;
+        }
+        if !has_more {
+            break;
+        }
+    }
+    assert_eq!(seen, KEYS);
+    drop(scan);
+    store.close().expect("close");
+}
+
+// a scan dropped with a block in flight gives its buffers back, so every scan can still start
+#[test]
+fn dropped_block_ends_the_walk() {
+    let (io, store) = ringed(10);
+    let mut context = Context::from_waker(Waker::noop());
+    let mut scan = store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan");
+    let mut keys = ValueList::new();
+    {
+        let mut block = pin!(Scan::next_block(&mut scan, &mut keys));
+        assert!(block.as_mut().poll(&mut context).is_pending());
+    }
+    settle(&io);
+    assert!(!run(&io, Scan::next_block(&mut scan, &mut keys)).expect("block"));
+    drop(scan);
+    let scans: Vec<_> = (0..MOST_SCANS).map(|_scan| store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan")).collect();
+    drop(scans);
+    store.close().expect("close");
+}
+
+// a cue reads at its point through the ring
+#[test]
+fn cue_reads_its_point() {
+    let (io, store) = ringed(11);
+    let cue = store.cue().expect("cue");
+    store.put(COLUMN, &key(3), b"newer").expect("put");
+    let mut buf = Vec::new();
+    assert!(run(&io, Reads::get_async(&cue, COLUMN, &key(3), &mut buf)).expect("get"));
+    assert_eq!(buf, value(3));
+    assert!(run(&io, Reads::get_async(&store, COLUMN, &key(3), &mut buf)).expect("get"));
+    assert_eq!(buf, b"newer");
+    drop(cue);
     store.close().expect("close");
 }

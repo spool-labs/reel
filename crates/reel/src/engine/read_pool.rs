@@ -387,6 +387,9 @@ impl<Backend: Io> EngineState<Backend> {
         values: &mut ValueList,
     ) -> Result<(), StoreError> {
         values.clear();
+        if let Some(ring) = &self.ring {
+            return self.many_on_ring(ring, column, keys, point, handovers, values).await;
+        }
         let mut at = 0;
         while at < keys.len() {
             let lease = self.read_pool.claim().await;
@@ -400,6 +403,26 @@ impl<Backend: Io> EngineState<Backend> {
             answer?;
         }
         Ok(())
+    }
+
+    /// Answer keys at one point on the ring, on the caller's task
+    pub async fn many_on_ring(
+        &self,
+        ring: &ReadRing<Backend::Ring>,
+        column: ColumnId,
+        keys: &[&[u8]],
+        point: WritePlace,
+        handovers: u64,
+        values: &mut ValueList,
+    ) -> Result<(), StoreError> {
+        let Ok(_seat) = ring.seat().await else {
+            return Err(StoreError::Closed);
+        };
+        let mut scratch = values.take_scratch();
+        let answer = self.read_keys(&OnRing(ring), column, keys, point, handovers, values, &mut scratch).await;
+        values.put_scratch(scratch);
+        self.corruption_errors.fetch_add(values.corrupt_count(), Ordering::Relaxed);
+        answer
     }
 
     /// Run one read, with its keys beside it
@@ -475,10 +498,20 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// Fill a list with the next block of a scan's keys, and say whether the walk has more
     pub fn scan_block(&self, scan: &mut ScanState, keys: &mut ValueList) -> Result<bool, StoreError> {
+        in_place(self.scan_block_on(&InPlace, scan, keys))
+    }
+
+    /// Fill a list with the next block of a scan's keys through a device's read path
+    pub async fn scan_block_on(
+        &self,
+        device: &impl DeviceReads<Backend::File>,
+        scan: &mut ScanState,
+        keys: &mut ValueList,
+    ) -> Result<bool, StoreError> {
         let mut key = mem::take(&mut scan.out_key);
         let mut outcome = Ok(true);
         for _key in 0..SCAN_BLOCK_KEYS {
-            match self.step_scan(scan, &mut key, ScanWant::Key) {
+            match self.step_scan_on(device, scan, &mut key, ScanWant::Key).await {
                 Ok(ScanStep::Found | ScanStep::Corrupt) => keys.push_found(&key),
                 Ok(ScanStep::End) => {
                     outcome = Ok(false);

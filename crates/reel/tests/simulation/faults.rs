@@ -1,5 +1,7 @@
 //! Random work on two volumes with failed syncs, full disks, rot and crashes, also inside recovery
 
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -19,6 +21,7 @@ use reel::superblock::Superblock;
 use reel_api::column_id::ColumnId;
 use reel_api::direction::Direction;
 use reel_api::scan::ScanStep;
+use reel_api::reads::Reads;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, DeathMark, FileOffset, Nanoseconds, RowCount, VolumeId};
 use reel_api::write_batch::WriteBatch;
@@ -37,6 +40,7 @@ const BUDGET: ByteCount = ByteCount(118 * 1024 * 1024);
 const SEEDS: [u64; 10] = [0, 1, 2, 3, 17, 31, 37, 62, 681, 7_157];
 const WORKERS_BUDGET: ByteCount = ByteCount(256 * 1024 * 1024);
 const WORKER_SEED_STRIDE: u64 = 9;
+const RING_SEED_STRIDE: u64 = 13;
 const MARK_SEED_STRIDE: u64 = 11;
 const MARK_SPREAD: u64 = 16;
 const MARK_STEP: u64 = 64;
@@ -218,6 +222,29 @@ fn config(policy: SyncPolicy, complete_rows: Option<RowCount>) -> StoreConfig {
 }
 
 // half the seeds make the meta column complete, and half of those with a table small enough to run past capacity
+/// Some seeds read through the ring, on residues that keep the seeds pinned above as they were
+fn has_ring(seed: u64) -> bool {
+    matches!(seed % RING_SEED_STRIDE, 3 | 5)
+}
+
+/// Run a get through the ring, with the jobs stepping between polls. A crash ends the reaper, so the read ends with it
+fn read_on_ring(store: &Store, column: ColumnId, key: &[u8], buf: &mut Vec<u8>) -> Result<bool, StoreError> {
+    let io = &store.state.io;
+    let mut read = pin!(Reads::get_async(store, column, key, buf));
+    let mut context = Context::from_waker(Waker::noop());
+    loop {
+        if let Poll::Ready(found) = read.as_mut().poll(&mut context) {
+            return found;
+        }
+        if io.is_crashed() {
+            return Err(StoreError::Closed);
+        }
+        if io.step_any().is_none() {
+            io.advance_clock(SETTLE_TICK);
+        }
+    }
+}
+
 /// Some seeds run the default workers, on residues that keep the seeds pinned above as they were
 fn has_every_worker(seed: u64) -> bool {
     matches!(seed % WORKER_SEED_STRIDE, 0 | 6)
@@ -244,6 +271,9 @@ fn complete_rows_of(seed: u64) -> Option<RowCount> {
 
 fn read(store: &Store, column: ColumnId, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
     let mut buf = Vec::new();
+    if store.state.ring.is_some() {
+        return Ok(read_on_ring(store, column, key, &mut buf)?.then_some(buf));
+    }
     Ok(store.get(column, key, &mut buf)?.then_some(buf))
 }
 
@@ -302,7 +332,7 @@ impl Run {
     fn new(seed: u64, has_rot: bool) -> Self {
         Self {
             seed,
-            io: SimulatedIo::new(Seed(seed)),
+            io: ring_io(seed),
             streams: Streams::new(seed),
             model: Model::new(),
             has_rot,
@@ -328,6 +358,9 @@ impl Run {
             let mut config = config(self.policy, complete_rows_of(self.seed));
             config.threads.maintenance_workers = Some((self.seed % WALK_WORKER_COUNTS) as usize);
             // the default runs what fits, so these seeds open on any machine, and this budget holds four on the ones here
+            if has_ring(self.seed) {
+                config.memory_budget = WORKERS_BUDGET;
+            }
             if has_every_worker(self.seed) {
                 config.threads.maintenance_workers = None;
                 config.memory_budget = WORKERS_BUDGET;
@@ -831,4 +864,13 @@ fn flushed_unknown() {
     assert!(versions.accept(&Some(b"c".to_vec())));
 
     assert!(!versions.accept(&Some(b"a".to_vec())));
+}
+
+// a backend for a seed, with the ring on when the seed reads through it
+fn ring_io(seed: u64) -> SimulatedIo {
+    let io = SimulatedIo::new(Seed(seed));
+    if has_ring(seed) {
+        io.use_ring();
+    }
+    io
 }

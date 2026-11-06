@@ -48,6 +48,7 @@ const BURST_FREES: usize = BURST_RECORDS / 2;
 const LONG_GET_BYTES: usize = 4 * 1024 * 1024;
 const ROUNDS: usize = 1_500;
 const FLUSH_ROUNDS: usize = 64;
+const STACK_STRETCH: usize = 1024 * 1024;
 const SEAL_ROUNDS: usize = 300;
 const MOST_WARM_ROUNDS: usize = 20 * SEAL_ROUNDS;
 const MOST_WINDOW_ROUNDS: usize = 20 * ROUNDS;
@@ -628,6 +629,7 @@ fn main() {
         thread::sleep(SEAL_WAIT);
     }
     let rewritten_before = store.state.volumes[0].segments_rewritten.load(Ordering::Acquire);
+    touch_stack();
     let mut faults = FaultCounter::new();
     let _first_read = faults.read();
     let threads_before = thread_faults();
@@ -682,4 +684,14 @@ fn main() {
     if failures + allocations + frees + minor_faults + major_faults + close_allocations > 0 {
         process::exit(1);
     }
+}
+
+// write a stretch of this thread's stack, since the caller owns it and a read that goes a frame deeper in the window would fault
+#[inline(never)]
+fn touch_stack() {
+    let mut stretch = [0_u8; STACK_STRETCH];
+    for byte in stretch.iter_mut().step_by(1024) {
+        *byte = 1;
+    }
+    std::hint::black_box(&mut stretch);
 }

@@ -45,7 +45,8 @@ impl<Backend: Io> EngineState<Backend> {
         self.ring_footer_readers = Pool::new((0..RING_READS).map(|_reader| FooterReader::without_tail()).collect());
     }
 
-    /// Refuse new ring reads, let the ones in flight land, and bring the reaper out of its wait
+    /// Refuse new ring reads, let the ones in flight land, and bring the reaper out of its wait. The kernel answers every read
+    /// it took, a dying device included, and the errors a wait can return pass, so this ends
     pub fn drain_ring(&self) {
         let Some(ring) = &self.ring else {
             return;

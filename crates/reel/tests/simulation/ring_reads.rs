@@ -8,8 +8,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::engine::read_path::RecordWant;
 use reel::engine::reel_store::ReelStore;
 use reel::engine::scan_state::MOST_SCANS;
+use reel::io::InPlace;
 use reel::io::ring::{RING_READS, RING_SLOT_BYTES, RING_SLOTS, ReadRing};
 use reel::record::codec::Codec;
 use reel_api::column_id::ColumnId;
@@ -32,6 +34,7 @@ const TICK: Nanoseconds = Nanoseconds(1_000_000);
 const STEPS: u64 = 400_000;
 const KEYS: u64 = 3_000;
 const MANY_READS: u64 = 3 * RING_SLOTS as u64;
+const MOST_FUTURE_BYTES: usize = 64 * 1024;
 
 type Store2 = ReelStore<SimulatedIo>;
 type PendingRead<'call> = Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + 'call>>;
@@ -411,4 +414,17 @@ fn slot_wake_reaches_a_slot_waiter() {
     }
     assert_eq!(slot_wakes.0.load(Ordering::Acquire), 1, "a slot is free and the caller waiting for it sleeps");
     drop(seats);
+}
+
+// a read's future stays small enough to sit on a job's stack and a caller's
+#[test]
+fn read_future_size() {
+    let (_io, store) = ringed(34);
+    let mut buf = Vec::new();
+    let read = store.state.get_latest_on(&InPlace, COLUMN, b"key", RecordWant::Whole, &mut buf);
+    let size = size_of_val(&read);
+    eprintln!("get future: {size} B");
+    assert!(size < MOST_FUTURE_BYTES, "{size} B");
+    drop(read);
+    store.close().expect("close");
 }

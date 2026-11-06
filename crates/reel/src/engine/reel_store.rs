@@ -95,7 +95,7 @@ impl<Backend: Io> ReelStore<Backend> {
         let locks = lock_roots(&io, config)?;
         let superblock = settle_superblock(&io, config)?;
 
-        let ring = io.open_ring().map_err(open_error("opening a ring"))?;
+        let ring = if ring_fits(config) { io.open_ring().map_err(open_error("opening a ring"))? } else { None };
         let sizing = store_sizing(config, ring.is_some())?;
 
         // every root is listed before any tail is read, and the table is sized from what they hold
@@ -672,11 +672,10 @@ pub fn bring_up<Backend: Io>(
     Ok(())
 }
 
-/// Refuse a config that can't work
-/// Work out what a store's budget buys, or refuse one too small
-pub fn store_sizing(config: &StoreConfig, has_ring: bool) -> Result<EngineSizing, StoreError> {
+/// Describe a store to the sizing
+pub fn store_shape(config: &StoreConfig, has_ring: bool) -> StoreShape {
     let root_count = config.volumes.iter().map(|volume| volume.roots.len()).sum();
-    let shape = StoreShape {
+    StoreShape {
         budget: config.memory_budget,
         roots: root_count,
         volumes: config.volumes.len(),
@@ -684,7 +683,18 @@ pub fn store_sizing(config: &StoreConfig, has_ring: bool) -> Result<EngineSizing
         widest_keys: (0..config.volumes.len()).map(|volume| config.widest_key(volume) as u64).sum(),
         threads: config.threads,
         has_ring,
-    };
+    }
+}
+
+/// Check a budget holds the ring beside the least a store runs on. A smaller one keeps async reads on the blocking pool
+pub fn ring_fits(config: &StoreConfig) -> bool {
+    let shape = StoreShape { threads: NO_WORKERS, ..store_shape(config, true) };
+    shape.least_budget() <= config.memory_budget
+}
+
+/// Share a budget out for a store, or say why it can't run on it
+pub fn store_sizing(config: &StoreConfig, has_ring: bool) -> Result<EngineSizing, StoreError> {
+    let shape = store_shape(config, has_ring);
     let shape = shape.with_workers_settled();
     let least_shape = StoreShape { threads: NO_WORKERS, ..shape };
     if config.threads.read_threads == 0 {
@@ -707,6 +717,7 @@ pub fn store_sizing(config: &StoreConfig, has_ring: bool) -> Result<EngineSizing
     Ok(EngineSizing::for_store(&shape))
 }
 
+/// Refuse a config that can't work
 pub fn check_config(config: &StoreConfig) -> Result<(), StoreError> {
     for volume in &config.volumes {
         if !volume.roots.iter().all(|root| fits_a_segment_path(root)) {

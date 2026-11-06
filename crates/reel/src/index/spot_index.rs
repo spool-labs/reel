@@ -193,7 +193,7 @@ impl SpotIndex {
     pub fn insert_from_read(&self, hash: KeyHash, location: &SpotLocation, is_current: impl Fn() -> bool) {
         let shard = shard_of(hash);
         let mut guard = self.write_shard(shard);
-        if is_current() {
+        if is_current() && !holds_newer(&guard, hash, location.place) {
             self.store(shard, &mut guard, hash, location);
         }
     }
@@ -203,6 +203,25 @@ impl SpotIndex {
         let shard = shard_of(hash);
         let mut guard = self.write_shard(shard);
         self.store(shard, &mut guard, hash, location);
+    }
+
+    /// Point a key at a location, unless its slot holds a newer place
+    pub fn insert_newer(&self, hash: KeyHash, location: &SpotLocation) {
+        let shard = shard_of(hash);
+        let mut guard = self.write_shard(shard);
+        if !holds_newer(&guard, hash, location.place) {
+            self.store(shard, &mut guard, hash, location);
+        }
+    }
+
+    /// Forget a key, unless its slot holds a newer place than this one
+    pub fn remove_older(&self, hash: KeyHash, place: WritePlace) {
+        let shard = shard_of(hash);
+        let mut guard = self.write_shard(shard);
+        if let Some(index) = guard.find(hash).filter(|index| guard.slots[*index].place < place.0) {
+            guard.slots[index] = SpotSlot::empty();
+            self.clear_touch(shard, index);
+        }
     }
 
     /// Write a location into a key's slot under the shard's lock
@@ -264,4 +283,9 @@ impl SpotIndex {
 /// Pick the bits that tell keys in one bucket apart
 pub fn tag_of(hash: KeyHash) -> u32 {
     (hash.0 >> TAG_SHIFT) as u32
+}
+
+/// Check a key's slot holds a place newer than this one
+pub fn holds_newer(guard: &SpotShard, hash: KeyHash, place: WritePlace) -> bool {
+    guard.find(hash).is_some_and(|index| guard.slots[index].place > place.0)
 }

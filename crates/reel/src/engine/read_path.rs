@@ -179,7 +179,7 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Take the newest point for a key. The counts come first. A job counted before them has its replacements under
-    /// the point, and a hand-over only starts past its rows' places, so the point can't be below a row a hand-over under
+    /// the point, and a seal's walk only starts past its rows' places, so the point can't be below a row a walk under
     /// this count gave out
     pub fn latest_read<'key>(&self, column: ColumnId, key: &'key [u8]) -> Result<LatestRead<'key>, StoreError> {
         let info = self.column(column)?;
@@ -840,7 +840,7 @@ impl<Backend: Io> EngineState<Backend> {
         }
     }
 
-    /// Remember a sealed value's location, unless a hand-over began since the read did
+    /// Remember a sealed value's location, unless a seal's walk began since the read did
     pub fn fill_spot(&self, volume: &Volume<Backend>, read: &KeyRead, sealed: &SealedRow, handovers: u64) {
         if read.is_cue {
             return;

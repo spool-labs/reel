@@ -11,6 +11,7 @@ use reel::engine::planner::{Planner, WALK_LAG_SEGMENTS, UnitStep};
 use reel::engine::reel_store::ReelStore;
 use reel::engine::walk_job::{SLOT_COUNTED, WalkJob, WalkTarget};
 use reel::guard::hold;
+use reel::index::key_hash::hash_key;
 use reel::io::IoTask;
 use reel::io::job::{Job, JobStep};
 use reel::record::codec::Codec;
@@ -738,5 +739,73 @@ fn stale_slot_comes_free() {
     assert_ne!(slot.phase.load(Ordering::Acquire), SLOT_COUNTED);
     drop(job);
     io.hold_jobs("reel-walk", false);
+    store.close().expect("close");
+}
+
+// delete a key in one open segment, by making every other look busy
+fn delete_in(store: &Store, number: SegmentNumber) {
+    let volume = &store.state.volumes[0];
+    let busy = |is_busy: bool| {
+        for segment in hold(&volume.claims).open.iter_mut().filter(|segment| segment.number != number) {
+            segment.in_flight = if is_busy { BUSY } else { 0 };
+        }
+    };
+    busy(true);
+    store.delete(COLUMN, b"key").expect("delete");
+    busy(false);
+}
+
+fn has_key(store: &Store) -> bool {
+    let mut value = Vec::new();
+    store.get(COLUMN, b"key", &mut value).expect("get")
+}
+
+// a grave over an older value in one segment leaves the key absent, and the older row never reaches the spot cache
+#[test]
+fn grave_over_a_value_in_one_segment() {
+    let io = SimulatedIo::new(Seed(60));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"older").expect("put");
+    store.delete(COLUMN, b"key").expect("delete");
+    let number = hold(&store.state.volumes[0].claims).open[0].number;
+    seal_segment(&store, &io, number);
+    assert!(!has_key(&store));
+    assert!(store.state.spot.lookup(hash_key(COLUMN, b"key")).is_none());
+    store.close().expect("close");
+}
+
+// a newer grave sealed first from another open segment keeps the older value out when that value's segment seals
+#[test]
+fn newer_grave_sealed_first() {
+    let io = SimulatedIo::new(Seed(61));
+    let store = open(&io);
+    store.put(COLUMN, b"warm", b"value").expect("put");
+    let older = hold(&store.state.volumes[0].claims).open[0].number;
+    let newer = add_open(&store, &io);
+    put_in(&store, older, b"older");
+    delete_in(&store, newer);
+    seal_segment(&store, &io, newer);
+    assert!(!has_key(&store));
+    seal_segment(&store, &io, older);
+    assert!(!has_key(&store));
+    assert!(store.state.spot.lookup(hash_key(COLUMN, b"key")).is_none());
+    store.close().expect("close");
+}
+
+// a newer value sealed first stays in the spot cache when the older value's segment seals behind it
+#[test]
+fn newer_value_sealed_first() {
+    let io = SimulatedIo::new(Seed(62));
+    let store = open(&io);
+    store.put(COLUMN, b"warm", b"value").expect("put");
+    let older = hold(&store.state.volumes[0].claims).open[0].number;
+    let newer = add_open(&store, &io);
+    put_in(&store, older, b"older");
+    put_in(&store, newer, b"newer");
+    seal_segment(&store, &io, newer);
+    seal_segment(&store, &io, older);
+    let mut value = Vec::new();
+    assert!(store.get(COLUMN, b"key", &mut value).expect("get"));
+    assert_eq!(value, b"newer");
     store.close().expect("close");
 }

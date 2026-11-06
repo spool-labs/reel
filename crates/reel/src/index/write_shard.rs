@@ -308,12 +308,6 @@ impl WriteShard {
         None
     }
 
-    /// Check no newer version of a key is in any open segment or has sealed away
-    pub fn is_newest_version(&self, hash: KeyHash, column: ColumnId, key: &[u8], place: WritePlace) -> bool {
-        let head = self.table.head(self.table.probe(hash, column, key, &self.slab));
-        head != NO_ENTRY && self.slab.place(head) == place && !self.slab.has_newer_sealed(head)
-    }
-
     /// Check whether a key's newest row is a visible grave in an open slot
     pub fn is_newest_grave(
         &self,

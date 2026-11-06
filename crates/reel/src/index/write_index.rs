@@ -135,12 +135,6 @@ impl WriteIndex {
         }
     }
 
-    /// Check a row is its key's newest, so a seal may hand it to the spot cache
-    pub fn is_newest_version(&self, column: ColumnId, key: &[u8], place: WritePlace) -> bool {
-        let hash = hash_key(column, key);
-        self.read_shard(shard_of(hash)).is_newest_version(hash, column, key, place)
-    }
-
     /// Find the key a walk reaches next in one shard
     pub fn next_key(
         &self,

@@ -1,4 +1,4 @@
-//! Seal: an open segment's footer, its hand-over, and the one atomic switch to sealed
+//! Seal: an open segment's footer, the rows it gives the spot cache on the way, and the one atomic switch to sealed
 
 use std::io::{Error, ErrorKind, Result};
 use std::sync::Arc;
@@ -71,10 +71,6 @@ pub enum SealPhase {
     Summarizing,
     /// The table has the segment, and the rows file goes
     DiscardingRows,
-    /// The table has the segment, and every lower place has yet to reach the index
-    AwaitingMark,
-    /// Rows go to the spot cache
-    HandingOver,
     /// The switch has happened, and the write index lets go
     Cleaning,
 }
@@ -177,6 +173,12 @@ impl<Backend: Io> SealJob<Backend> {
         }
     }
 
+    /// Check the footer walk can start: the writers have landed, and the mark has passed the segment, so every lower place is in
+    /// the index and a read that starts from here has a point at or above the segment's rows
+    pub fn is_ready(&self, target: &SealTarget<Backend::File>) -> bool {
+        self.is_drained(target.slot) && self.state.order.mark() >= target.highest_place
+    }
+
     /// Check the target's writers have all landed
     pub fn is_drained(&self, slot: OpenSlot) -> bool {
         let claims = hold(&self.volume().claims);
@@ -192,6 +194,9 @@ impl<Backend: Io> SealJob<Backend> {
     pub fn start_writing(&mut self, target: &SealTarget<Backend::File>) -> Result<()> {
         self.state.write_out(target.slot)?;
         self.writer.start(target.data_end, target.lowest_place);
+        // a read that began before this count can't fill the spot cache behind the walk
+        self.volume().handovers.fetch_add(1, Ordering::AcqRel);
+        self.last_column = None;
         self.walk.start(&self.state.index, target.slot);
         self.column = None;
         self.ranges.clear();
@@ -273,6 +278,27 @@ impl<Backend: Io> SealJob<Backend> {
             };
             self.writer.push_row(&target.data, head.key, &footer_row)?;
             self.last_slot = self.give_slot(target.number, head.column, head.key, row.kind);
+            let is_new_key = self.last_column != Some(head.column) || self.last_key != head.key;
+            if is_new_key {
+                self.last_column = Some(head.column);
+                self.last_key.clear();
+                self.last_key.extend_from_slice(head.key);
+                // a complete column has its slots already, and reads no spot cache
+                if self.state.complete_table(head.column).is_none() {
+                    let hash = hash_key(head.column, head.key);
+                    if row.kind == RowKind::Value && head.is_newest {
+                        let location = SpotLocation {
+                            segment: target.number,
+                            offset: row.offset,
+                            length: row.length,
+                            place: row.place,
+                        };
+                        self.state.spot.insert_newer(hash, &location);
+                    } else {
+                        self.state.spot.remove_older(hash, row.place);
+                    }
+                }
+            }
             self.walk.advance(&self.state.index, shard);
         }
         Ok(())
@@ -380,7 +406,7 @@ impl<Backend: Io> SealJob<Backend> {
             Err(error) => return Err(error),
         }
         state.io.sync_directory(root)?;
-        self.phase = SealPhase::AwaitingMark;
+        self.switch(target);
         Ok(())
     }
 
@@ -423,55 +449,6 @@ impl<Backend: Io> SealJob<Backend> {
         volume.is_seal_stuck.store(false, Ordering::Release);
         self.phase = SealPhase::Summarizing;
         Ok(())
-    }
-
-    /// Start the hand-over once the mark passes the segment, so every lower place is in the index
-    /// and no read that starts from here can have a read point below this segment's rows
-    pub fn start_hand_over(&mut self, target: &SealTarget<Backend::File>) {
-        let state = Arc::clone(&self.state);
-        let volume = &state.volumes[self.volume];
-        if state.order.mark() < target.highest_place {
-            return;
-        }
-
-        // a get that started before this count can't fill the spot cache with an older row
-        volume.handovers.fetch_add(1, Ordering::AcqRel);
-        self.walk.start(&state.index, target.slot);
-        self.last_column = None;
-        self.phase = SealPhase::HandingOver;
-    }
-
-    /// Give a step's rows to the spot cache: every row replaces or removes its key's slot
-    pub fn hand_over(&mut self, target: &SealTarget<Backend::File>) {
-        for _row in 0..SEAL_STEP_ROWS {
-            let Some(shard) = self.walk.next_shard() else {
-                self.switch(target);
-                return;
-            };
-            let head = self.walk.head(shard);
-            let is_new_key = self.last_column != Some(head.column) || self.last_key != head.key;
-            if is_new_key && let Some(row) = head.row {
-                let hash = hash_key(head.column, head.key);
-                let is_newest = self.state.index.is_newest_version(head.column, head.key, row.place);
-                if self.state.complete_table(head.column).is_some() {
-                    // a complete column gave its slots out as the rows went into the footer
-                } else if row.kind == RowKind::Value && is_newest {
-                    let location = SpotLocation {
-                        segment: target.number,
-                        offset: row.offset,
-                        length: row.length,
-                        place: row.place,
-                    };
-                    self.state.spot.insert(hash, &location);
-                } else {
-                    self.state.spot.remove(hash);
-                }
-            }
-            self.last_column = Some(head.column);
-            self.last_key.clear();
-            self.last_key.extend_from_slice(self.walk.head(shard).key);
-            self.walk.advance(&self.state.index, shard);
-        }
     }
 
     /// Make the one atomic store: from here the footer answers and the write index doesn't
@@ -542,15 +519,13 @@ impl<Backend: Io> SealJob<Backend> {
     /// Check the seal can do nothing until writers land or the mark moves
     pub fn is_waiting(&self, target: &SealTarget<Backend::File>) -> bool {
         match self.phase {
-            SealPhase::Draining => !self.is_drained(target.slot),
-            SealPhase::AwaitingMark => true,
+            SealPhase::Draining => !self.is_ready(target),
             SealPhase::Cleaning => self.state.slot_files[target.slot.0 as usize].pin_count() > 0,
             SealPhase::Idle
             | SealPhase::Writing
             | SealPhase::Installing
             | SealPhase::Summarizing
-            | SealPhase::DiscardingRows
-            | SealPhase::HandingOver => false,
+            | SealPhase::DiscardingRows => false,
         }
     }
 
@@ -580,7 +555,7 @@ impl<Backend: Io> SealJob<Backend> {
         match self.phase {
             SealPhase::Idle => Ok(()),
             SealPhase::Draining => {
-                if !self.is_drained(target.slot) {
+                if !self.is_ready(target) {
                     return Ok(());
                 }
                 if target.row_count.0 == 0 {
@@ -594,14 +569,6 @@ impl<Backend: Io> SealJob<Backend> {
             SealPhase::Installing => self.install(target),
             SealPhase::Summarizing => self.summarize(target),
             SealPhase::DiscardingRows => self.discard_rows(target),
-            SealPhase::AwaitingMark => {
-                self.start_hand_over(target);
-                Ok(())
-            },
-            SealPhase::HandingOver => {
-                self.hand_over(target);
-                Ok(())
-            },
             SealPhase::Cleaning => {
                 if self.clean(target) {
                     self.end_seal();

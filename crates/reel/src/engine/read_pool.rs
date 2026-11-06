@@ -17,7 +17,7 @@ use reel_api::units::{ByteCount, WritePlace};
 use reel_api::value_list::ValueList;
 
 use crate::engine::engine_state::EngineState;
-use crate::engine::read_path::RecordWant;
+use crate::engine::read_path::{ReadAt, RecordWant};
 use crate::engine::scan_path::ScanWant;
 use crate::engine::scan_state::ScanState;
 use crate::guard::hold;
@@ -419,7 +419,7 @@ impl<Backend: Io> EngineState<Backend> {
             return Err(StoreError::Closed);
         };
         let mut scratch = values.take_scratch();
-        let answer = self.read_keys(&OnRing(ring), column, keys, point, handovers, values, &mut scratch).await;
+        let answer = self.read_keys(&OnRing(ring), column, keys, ReadAt { point, handovers }, values, &mut scratch).await;
         values.put_scratch(scratch);
         self.corruption_errors.fetch_add(values.corrupt_count(), Ordering::Relaxed);
         answer
@@ -437,7 +437,7 @@ impl<Backend: Io> EngineState<Backend> {
                 let mut scratch = values.take_scratch();
                 let (mut start, mut answer) = (0, Ok(()));
                 for end in ends {
-                    answer = answer.and_then(|()| in_place(self.read_keys(&InPlace, *column, &[&keys[start..*end]], *point, *handovers, values, &mut scratch)));
+                    answer = answer.and_then(|()| in_place(self.read_keys(&InPlace, *column, &[&keys[start..*end]], ReadAt { point: *point, handovers: *handovers }, values, &mut scratch)));
                     start = *end;
                 }
                 values.put_scratch(scratch);

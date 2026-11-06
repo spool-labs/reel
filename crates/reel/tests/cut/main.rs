@@ -1,7 +1,8 @@
 //! Real threads: a cue across two volumes never holds a later write without the earlier one it followed
+#![allow(clippy::expect_used)]
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -19,7 +20,7 @@ const BUDGET: ByteCount = ByteCount(256 * 1024 * 1024);
 const RUN: Duration = Duration::from_secs(3);
 const KEY: &[u8] = b"count";
 
-fn config(root: &PathBuf) -> StoreConfig {
+fn config(root: &Path) -> StoreConfig {
     let volume = |name: &str| VolumeConfig {
         name: name.to_string(),
         roots: vec![root.join(name)],

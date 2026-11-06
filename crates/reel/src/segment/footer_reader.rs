@@ -6,7 +6,7 @@ use reel_api::units::{ByteCount, FileOffset, WritePlace};
 
 use crate::pool::{HollowItem, touched_capacity, touched_zeroes};
 use crate::index::key_hash::KeyHash;
-use crate::io::{DeviceReads, InPlace, IoFile, in_place};
+use crate::io::{DeviceReads, InPlace, IoFile, ReadOn, in_place};
 use crate::io::device_error::{read_or_damaged, read_or_damaged_on};
 use crate::record::record_check::{Checksum, RecordKey, checksum};
 use crate::segment::column_directory::Candidate;
@@ -296,7 +296,7 @@ impl FooterReader {
                 Some(next) if position + 1 < read.window.count => next.header_at().0,
                 _last_line => read.window.filter_end_of_last,
             };
-            match self.probe_filter(device, file, read.segment, &entry, filter_end, caches, query).await? {
+            match self.probe_filter(ReadOn::new(device, file), read.segment, &entry, filter_end, caches, query).await? {
                 FilterAnswer::Damaged => return Ok(FooterAnswer::Damaged),
                 FilterAnswer::No => continue,
                 FilterAnswer::Maybe => {},
@@ -316,14 +316,14 @@ impl FooterReader {
     /// Ask a block's filter, reading and checking it once when the cache lacks it
     pub async fn probe_filter<File: IoFile>(
         &mut self,
-        device: &impl DeviceReads<File>,
-        file: &File,
+        on: ReadOn<'_, impl DeviceReads<File>, File>,
         segment: SegmentNumber,
         entry: &BlockEntry,
         filter_end: u64,
         caches: &FooterCaches<'_>,
         query: &FooterQuery<'_>,
     ) -> Result<FilterAnswer> {
+        let ReadOn { device, target: file } = on;
         let key = BlockKey {
             segment,
             offset: entry.filter_offset,

@@ -61,6 +61,11 @@ impl JobSlot {
 }
 
 impl IoTask for SimulatedTask {
+    fn has_ended(&self) -> bool {
+        let slots = hold(&self.slots);
+        !slots.get(self.index.0).is_some_and(|slot| slot.process == self.process && !slot.is_stopped)
+    }
+
     fn wake(&self) {
         let mut slots = hold(&self.slots);
         if let Some(slot) = slots.get_mut(self.index.0)

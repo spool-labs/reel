@@ -7,7 +7,7 @@ use reel_api::units::Nanoseconds;
 use crate::engine::engine_state::EngineState;
 use crate::io::job::{Job, JobStep};
 use crate::io::ring::{RING_READS, ReadRing, RingDriver};
-use crate::io::Io;
+use crate::io::{Io, IoTask};
 use crate::pool::Pool;
 use crate::record::record_reader::RecordReader;
 use crate::segment::footer_reader::FooterReader;
@@ -52,7 +52,9 @@ impl<Backend: Io> EngineState<Backend> {
             return;
         };
         ring.close();
-        while !ring.is_drained() {
+        // a reaper that has gone answers nothing more, so a close stops waiting on it
+        let is_reaping = || self.ring_task.get().is_some_and(|task| !task.has_ended());
+        while !ring.is_drained() && is_reaping() {
             self.io.pause();
         }
         ring.driver.poke();

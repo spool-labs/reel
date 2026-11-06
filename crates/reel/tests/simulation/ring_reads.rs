@@ -249,6 +249,21 @@ fn close_drains_the_ring() {
     assert!(matches!(late, Err(StoreError::Closed)));
 }
 
+// a kill takes the reaper with it, so a store going down after one stops waiting for the reads in flight
+#[test]
+fn kill_under_a_read() {
+    let (io, store) = ringed(7);
+    let name = key(14);
+    let mut buf = Vec::new();
+    {
+        let mut read = pin!(Reads::get_async(&store, COLUMN, &name, &mut buf));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(read.as_mut().poll(&mut context).is_pending());
+    }
+    io.kill();
+    drop(store);
+}
+
 // a warm read through the ring takes nothing from the allocator
 #[test]
 fn no_allocations() {

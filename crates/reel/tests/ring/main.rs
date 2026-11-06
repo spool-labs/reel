@@ -1,9 +1,10 @@
 //! The kernel's ring on real files: async reads answer as the blocking calls do, and hold no thread while they wait
 #![cfg(target_os = "linux")]
+#![allow(clippy::expect_used)]
 
 use std::fs;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
@@ -52,13 +53,13 @@ fn root(name: &str) -> PathBuf {
     root
 }
 
-fn config(root: &PathBuf) -> StoreConfig {
+fn config(root: &Path) -> StoreConfig {
     StoreConfig {
         memory_budget: BUDGET,
         threads: Default::default(),
         volumes: vec![VolumeConfig {
             name: "ring".to_string(),
-            roots: vec![root.clone()],
+            roots: vec![root.to_path_buf()],
             sync: SyncPolicy::Never,
             device: Default::default(),
         }],
@@ -82,14 +83,14 @@ fn value(number: u64) -> Vec<u8> {
 }
 
 // a store with its keys sealed and nothing cached, so reads reach the device
-fn filled(root: &PathBuf) -> Store {
-    let store = ReelStore::open(PlainIo::new(), &config(root)).expect("open");
+fn filled(root: &Path) -> Store {
+    let store = ReelStore::open(PlainIo::with_ring(), &config(root)).expect("open");
     for number in 0..KEYS {
         store.put(COLUMN, &key(number), &value(number)).expect("put");
     }
     store.close().expect("close");
     drop(store);
-    ReelStore::open(PlainIo::new(), &config(root)).expect("open")
+    ReelStore::open(PlainIo::with_ring(), &config(root)).expect("open")
 }
 
 // this kernel gives the store a ring, so every test here reads through it
@@ -160,7 +161,7 @@ fn many_at_once() {
 fn pool_still_answers() {
     let root = root("pool");
     filled(&root).close().expect("close");
-    let store: Store = ReelStore::open(PlainIo::without_ring(), &config(&root)).expect("open");
+    let store: Store = ReelStore::open(PlainIo::new(), &config(&root)).expect("open");
     assert!(store.state.ring.is_none());
     let mut buf = Vec::new();
     assert!(run(Reads::get_async(&store, COLUMN, &key(5), &mut buf)).expect("get"));

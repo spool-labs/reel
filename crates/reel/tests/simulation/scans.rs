@@ -814,3 +814,71 @@ fn window_read_fails_only_the_bad_row() {
     assert!(corrupt > 0 && corrupt < WINDOW_KEYS / 10, "{corrupt} rows lost to one sector");
     store.close().expect("close");
 }
+
+const SPREAD_STRIDE: u64 = 787;
+const SPREAD_ROWS: u64 = 2_000;
+
+fn lz4_config() -> StoreConfig {
+    StoreConfig {
+        memory_budget: ByteCount(128 * 1024 * 1024),
+        threads: reel::config::NO_WORKERS,
+        volumes: vec![VolumeConfig {
+            name: "scans".to_string(),
+            roots: vec![PathBuf::from(ROOT)],
+            sync: SyncPolicy::Never,
+            device: Default::default(),
+        }],
+        columns: vec![ColumnConfig {
+            id: COLUMN,
+            name: "column".to_string(),
+            key_shape: KeyShape::Variable { most: 96 },
+            codec: Codec::Lz4,
+            volume: VolumeId(0),
+            complete_rows: None,
+        }],
+    }
+}
+
+// a scan of a reopened lz4 column, with its rows written in the order a stride gives: its rows and read calls
+fn lz4_scan(stride: u64) -> (u64, u64) {
+    let io = SimulatedIo::new(Seed(73));
+    let config = lz4_config();
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    for step in 0..SPREAD_ROWS {
+        let number = step * stride % SPREAD_ROWS;
+        let value = vec![b'a' + (number % 20) as u8; 300];
+        store.put(COLUMN, &key(number), &value).expect("put");
+    }
+    seal(&store, &io);
+    store.close().expect("close");
+    drop(store);
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+
+    let before = io.read_count().0;
+    let mut scan = store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan");
+    let (mut name, mut value, mut rows) = (Vec::new(), Vec::new(), 0);
+    while scan.next_row(&mut name, &mut value).expect("step") == ScanStep::Found {
+        assert_eq!(value.len(), 300);
+        rows += 1;
+    }
+    drop(scan);
+    let reads = io.read_count().0 - before;
+    store.close().expect("close");
+    (rows, reads)
+}
+
+// a compressed column's scan costs no more reads than rows, with the rows scattered through the segment
+#[test]
+fn compressed_scan_reads_once_a_row() {
+    let (rows, reads) = lz4_scan(SPREAD_STRIDE);
+    assert_eq!(rows, SPREAD_ROWS);
+    assert!(reads < SPREAD_ROWS + SPREAD_ROWS / 4, "{reads} reads for {rows} rows");
+}
+
+// a compressed column's rows side by side come out of the window with a read call for many
+#[test]
+fn compressed_rows_share_reads() {
+    let (rows, reads) = lz4_scan(1);
+    assert_eq!(rows, SPREAD_ROWS);
+    assert!(reads < SPREAD_ROWS / 4, "{reads} reads for {rows} rows");
+}

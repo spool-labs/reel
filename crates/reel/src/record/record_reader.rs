@@ -7,7 +7,7 @@ use reel_api::reads::ValueWindow;
 use reel_api::units::{ByteCount, FileOffset};
 
 use crate::pool::{HollowItem, touched_zeroes};
-use crate::io::{DeviceReads, IoFile};
+use crate::io::{DeviceReads, IoFile, ReadOn};
 use crate::record::chunk_table::{
     ChunkCount, ChunkIndex, ChunkSpan, ENTRIES_PER_PAGE, TABLE_PAGE_BYTES, TablePageIndex, chunk_span, page_bytes,
     page_count, page_of, table_bytes,
@@ -193,20 +193,9 @@ impl RecordReader {
         RecordForm::from_byte(*self.first.get(FORM_AT)?)
     }
 
-    /// Check a small plain record where it lies and hand its value over, with no reader, or return nothing for any other form
-    pub fn check_plain(record: &[u8], identity: &RecordIdentity<'_>, buf: &mut Vec<u8>) -> Option<RecordRead> {
-        let form = RecordForm::from_byte(*record.get(FORM_AT)?)?;
-        if form.is_chunked || form.codec != Codec::None {
-            return None;
-        }
-        let payload = record.get(SMALL_HEAD_BYTES..)?;
-        let check = place_check(record_check(identity, form, checksum(payload)), identity.record_key, identity.place);
-        if read_check(record) != Some(check) {
-            return Some(RecordRead::Failed);
-        }
-        buf.clear();
-        buf.extend_from_slice(payload);
-        Some(RecordRead::Valid)
+    /// Check a small record where it lies and hand its value over, using this reader's room to restore a compressed one
+    pub fn check_held(&mut self, record: &[u8], form: RecordForm, identity: &RecordIdentity<'_>, buf: &mut Vec<u8>) -> RecordRead {
+        open_small(record, form, identity, &mut self.decoded, buf)
     }
 
     /// Check a one-chunk record and hand its value over
@@ -217,26 +206,7 @@ impl RecordReader {
         identity: &RecordIdentity<'_>,
         buf: &mut Vec<u8>,
     ) -> RecordRead {
-        if length < SMALL_HEAD_BYTES {
-            return RecordRead::Failed;
-        }
-        let payload = &self.first[SMALL_HEAD_BYTES..length];
-        let check = place_check(record_check(identity, form, checksum(payload)), identity.record_key, identity.place);
-        if read_check(&self.first) != Some(check) {
-            return RecordRead::Failed;
-        }
-
-        buf.clear();
-        match form.codec {
-            Codec::None => buf.extend_from_slice(payload),
-            Codec::Lz4 => {
-                let Some(restored) = decompress(payload, &mut self.decoded) else {
-                    return RecordRead::Failed;
-                };
-                buf.extend_from_slice(&self.decoded[..restored]);
-            },
-        }
-        RecordRead::Valid
+        open_small(&self.first[..length], form, identity, &mut self.decoded, buf)
     }
 
     /// Check a chunked record's head against the record check
@@ -342,7 +312,7 @@ impl RecordReader {
             let chunk_start = chunk.0 * CHUNK_BYTES as u64;
             let from = start.saturating_sub(chunk_start) as usize;
             let to = (end - chunk_start).min(span.entry.value_length.0) as usize;
-            if !self.read_chunk(device, file, location, head, &span, from..to, buf).await? {
+            if !self.read_chunk(ReadOn::new(device, file), location, head, &span, from..to, buf).await? {
                 return Ok(RecordRead::Failed);
             }
         }
@@ -392,14 +362,14 @@ impl RecordReader {
     /// Read one chunk whole, check it, and add its part of the window to the buffer
     pub async fn read_chunk<File: IoFile>(
         &mut self,
-        device: &impl DeviceReads<File>,
-        file: &File,
+        on: ReadOn<'_, impl DeviceReads<File>, File>,
         location: RecordLocation,
         head: &ChunkedHead,
         span: &ChunkSpan,
         part: Range<usize>,
         buf: &mut Vec<u8>,
     ) -> Result<bool> {
+        let ReadOn { device, target: file } = on;
         let stored = span.stored_length.0 as usize;
         if stored > CHUNK_BYTES || span.stored_length > span.entry.value_length {
             return Ok(false);
@@ -494,4 +464,38 @@ impl HollowItem for RecordReader {
             decoded: Vec::new(),
         }
     }
+}
+
+/// Read a record's form where it lies
+pub fn form_of(record: &[u8]) -> Option<RecordForm> {
+    RecordForm::from_byte(*record.get(FORM_AT)?)
+}
+
+/// Check a one-chunk record and hand its value over, restoring a compressed one through `decoded`
+pub fn open_small(
+    record: &[u8],
+    form: RecordForm,
+    identity: &RecordIdentity<'_>,
+    decoded: &mut [u8],
+    buf: &mut Vec<u8>,
+) -> RecordRead {
+    let Some(payload) = record.get(SMALL_HEAD_BYTES..) else {
+        return RecordRead::Failed;
+    };
+    let check = place_check(record_check(identity, form, checksum(payload)), identity.record_key, identity.place);
+    if read_check(record) != Some(check) {
+        return RecordRead::Failed;
+    }
+
+    buf.clear();
+    match form.codec {
+        Codec::None => buf.extend_from_slice(payload),
+        Codec::Lz4 => {
+            let Some(restored) = decompress(payload, decoded) else {
+                return RecordRead::Failed;
+            };
+            buf.extend_from_slice(&decoded[..restored]);
+        },
+    }
+    RecordRead::Valid
 }

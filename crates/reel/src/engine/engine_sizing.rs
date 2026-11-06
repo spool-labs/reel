@@ -49,6 +49,8 @@ pub const PLANNED_COLUMN_BYTES: u64 = 576;
 pub const PLANNED_LINE_BYTES: u64 = 32;
 /// The least a budget has to leave after the fixed parts
 pub const LEAST_SHARED_BYTES: ByteCount = ByteCount(8 * 1024 * 1024);
+/// Room for the index's power-of-two table and the caches' least sizes, which run past their shares at a small budget
+pub const ROUNDING_ROOM: u64 = 1024 * 1024;
 /// Bytes a read buffer pair is planned at: a record reader and a footer reader
 pub const READ_BUFFER_BYTES: u64 = 512 * 1024;
 /// Bytes a record encoder is planned at, with no share of the compress pool
@@ -176,7 +178,7 @@ impl StoreShape {
         let covers = 2 * cover_keys + volumes * cover_fixed;
         let jobs = SEAL_JOB_BYTES + WALK_JOB_BYTES + COMPACT_JOB_BYTES;
         let worker_jobs = workers * COMPACT_JOB_BYTES;
-        ByteCount(queues + gathers + windows + reads + scans + read_slots + encoders + covers + volumes * (jobs + spans) + worker_jobs + workers * WALK_JOB_BYTES + stacks)
+        ByteCount(ROUNDING_ROOM + queues + gathers + windows + reads + scans + read_slots + encoders + covers + volumes * (jobs + spans) + worker_jobs + workers * WALK_JOB_BYTES + stacks)
     }
 
     /// Read the smallest budget this store can run in

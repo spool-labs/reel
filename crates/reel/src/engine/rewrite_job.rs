@@ -69,6 +69,8 @@ pub const MOST_GRAVE_BLOCKS: BlockCount = BlockCount(2_048);
 pub const MOST_PARK_WAITS: u32 = 4_096;
 /// Most segments of a column that overlap one key before a merge is due
 pub const MOST_OVERLAP: usize = 32;
+/// The planner's own lane. Worker lanes count up from one
+pub const PLANNER_LANE: usize = 0;
 /// Keys inside a new segment one look tries for the crowded point, which bounds what a look costs
 pub const OVERLAP_PROBES: usize = 16;
 /// Most segments one look for an overlap starts from, which bounds what a look costs
@@ -472,7 +474,10 @@ impl<Backend: Io> RewriteJob<Backend> {
             self.inputs[0].block_count = self.rebuild_blocks;
             return Some((target, false));
         }
-        if let Some(target) = self.pick_overlap(volume, &rows, room) {
+        // an overlap merge copies records, so one at a time on the planner keeps ingest at its line
+        if self.lane == PLANNER_LANE
+            && let Some(target) = self.pick_overlap(volume, &rows, room)
+        {
             return Some((target, false));
         }
         if volume.has_walk_target.load(Ordering::Acquire) {

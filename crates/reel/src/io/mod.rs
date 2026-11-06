@@ -52,6 +52,27 @@ pub trait IoFile: Clone + Send + Sync {
     fn truncate(&self, length: ByteCount) -> Result<()>;
 }
 
+/// A device and what its reads go to, which travel down a read path together
+pub struct ReadOn<'a, Device, Target> {
+    pub device: &'a Device,
+    pub target: &'a Target,
+}
+
+impl<'a, Device, Target> ReadOn<'a, Device, Target> {
+    /// Pair a device with what it reads
+    pub fn new(device: &'a Device, target: &'a Target) -> Self {
+        Self { device, target }
+    }
+}
+
+impl<Device, Target> Clone for ReadOn<'_, Device, Target> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<Device, Target> Copy for ReadOn<'_, Device, Target> {}
+
 /// How a read waits for its device, so one read path serves the blocking calls and the completion ring
 pub trait DeviceReads<File>: Sync {
     /// Fill the whole buffer from the offset
@@ -95,6 +116,9 @@ pub fn in_place<Output>(read: impl Future<Output = Output>) -> Output {
 pub trait IoTask: Send + Sync {
     /// Tell an idle job to look for work
     fn wake(&self);
+
+    /// Check the job has ended, so nothing it owed will come
+    fn has_ended(&self) -> bool;
 
     /// Stop the job after its current step and wait for it
     fn stop(&self) -> Result<()>;

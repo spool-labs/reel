@@ -13,6 +13,7 @@ use reel::engine::open_segment::{RECORD_WINDOW_BYTES, SegmentPhase, rows_path};
 use reel::engine::engine_sizing::OPEN_PER_ROOT;
 use reel::engine::reserve_job::RESERVE_PERIOD;
 use reel::engine::write_path::{ClaimRequest, SPARE_REQUEST, WRITES_PER_OPEN, WindowSwitch};
+use reel::engine::read_path::ReadAt;
 use reel::engine::reel_store::ReelStore;
 use reel::guard::hold;
 use reel::io::{InPlace, Io, IoFile, in_place};
@@ -29,7 +30,7 @@ use reel_api::write_batch::WriteBatch;
 
 const ROOT: &str = "/disk/meta";
 const COLUMN: ColumnId = ColumnId(1);
-const BUDGET: ByteCount = ByteCount(54 * 1024 * 1024);
+const BUDGET: ByteCount = ByteCount(56 * 1024 * 1024);
 const KEY_SPACE: u64 = 400;
 const OPERATIONS: u64 = 3_000;
 const SEED_COUNT: u64 = 8;
@@ -1155,7 +1156,7 @@ fn many_old_point() {
     let mut values = ValueList::new();
     let mut scratch = Vec::new();
     let handovers = store.state.volumes[0].handover_count();
-    in_place(store.state.read_keys(&InPlace, COLUMN, &[b"key"], point, handovers, &mut values, &mut scratch)).expect("read");
+    in_place(store.state.read_keys(&InPlace, COLUMN, &[b"key"], ReadAt { point, handovers }, &mut values, &mut scratch)).expect("read");
 
     assert_eq!(values.answer(0), Some(ValueAnswer::Found(b"older")));
     let mut buf = Vec::new();

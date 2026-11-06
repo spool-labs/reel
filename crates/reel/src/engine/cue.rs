@@ -13,7 +13,7 @@ use reel_api::units::{ByteCount, RowCount, WritePlace};
 use reel_api::value_list::ValueList;
 
 use crate::engine::engine_state::EngineState;
-use crate::engine::read_path::RecordWant;
+use crate::engine::read_path::{ReadAt, RecordWant};
 use crate::engine::scan_state::{from_key, in_range, under_prefix};
 use crate::engine::store_scan::StoreScan;
 use crate::io::{InPlace, Io, in_place};
@@ -229,7 +229,7 @@ impl<Backend: Io> Cue<Backend> {
         let handovers = self.state.volumes[info.volume.0 as usize].handover_count();
         values.clear();
         let mut scratch = values.take_scratch();
-        let read = in_place(self.state.read_keys(&InPlace, column, keys, self.point_of(column)?, handovers, values, &mut scratch));
+        let read = in_place(self.state.read_keys(&InPlace, column, keys, ReadAt { point: self.point_of(column)?, handovers }, values, &mut scratch));
         values.put_scratch(scratch);
         self.state.corruption_errors.fetch_add(values.corrupt_count(), Ordering::Relaxed);
         read

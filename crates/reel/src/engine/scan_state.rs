@@ -530,7 +530,7 @@ impl ScanWindow {
         };
         self.segment = Some(segment);
         self.start = start;
-        self.length = (end - start) as usize;
+        self.length = end.saturating_sub(start) as usize;
         (FileOffset(start), &mut self.bytes[..self.length])
     }
 }

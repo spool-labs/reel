@@ -87,6 +87,10 @@ impl Drop for PlainTask {
 }
 
 impl IoTask for PlainTask {
+    fn has_ended(&self) -> bool {
+        hold(&self.thread).as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
     fn wake(&self) {
         hold(&self.signal.flags).is_woken = true;
         self.signal.changed.notify_all();

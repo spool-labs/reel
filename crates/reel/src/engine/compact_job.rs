@@ -20,7 +20,7 @@ use crate::config::MAX_KEY_BYTES;
 use crate::engine::cover_apply::is_in_range;
 use crate::engine::engine_state::EngineState;
 use crate::engine::planner::UnitStep;
-use crate::engine::rewrite_job::{RewriteJob, RewriteSeat};
+use crate::engine::rewrite_job::{PLANNER_LANE, RewriteJob, RewriteSeat};
 use crate::engine::rebuild::MOST_REBUILD_TRIES;
 use crate::engine::volume::{ParkedSegment, Volume};
 use crate::engine::walk_job::{FREE_IN_PLACE_BYTES, FreeRecord, WALK_RETRY};
@@ -95,7 +95,7 @@ impl<Backend: Io> CompactJob<Backend> {
         let seats: Vec<RewriteSeat<Backend>> =
             (1..=workers).map(|lane| RewriteSeat { job: Mutex::new(RewriteJob::new(Arc::clone(&state), volume, lane)) }).collect();
         Self {
-            rewrite: RewriteJob::new(Arc::clone(&state), volume, 0),
+            rewrite: RewriteJob::new(Arc::clone(&state), volume, PLANNER_LANE),
             seats: Arc::new(seats),
             handed_at: 0,
             should_rewrite: false,

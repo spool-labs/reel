@@ -19,7 +19,7 @@ use crate::engine::read_path::SealedRow;
 use crate::engine::volume::Volume;
 use crate::engine::walk_job::BlockCounts;
 use crate::guard::hold;
-use crate::io::{InPlace, Io, IoFile, in_place};
+use crate::io::{InPlace, Io, IoFile, ReadOn, in_place};
 use crate::pool::{touched_capacity, touched_zeroes};
 use crate::row_kind::RowKind;
 use crate::segment::row_block::{ROW_BLOCK_BYTES, RowBlockWalk};
@@ -271,7 +271,7 @@ impl<Backend: Io> CoverApply<Backend> {
         let own = state.footer_readers.with(|reader| {
             let mut best = None;
             if let Some(pin) = volume.table.pin(segment) {
-                in_place(state.ask_rows(&InPlace, volume, &read, segment, &pin, reader, &mut best))?;
+                in_place(state.ask_rows(ReadOn::new(&InPlace, volume), &read, segment, &pin, reader, &mut best))?;
             }
             Ok::<_, StoreError>(best)
         })?;

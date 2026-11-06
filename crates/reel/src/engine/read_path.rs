@@ -18,7 +18,7 @@ use crate::engine::volume::Volume;
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::index::spot_index::SpotLocation;
 use crate::index::write_row::WriteRow;
-use crate::io::{DeviceReads, InPlace, Io, in_place};
+use crate::io::{DeviceReads, InPlace, Io, ReadOn, in_place};
 use crate::pool::PoolLease;
 use crate::io::device_error::is_device_error;
 use crate::record::record_check::RecordIdentity;
@@ -118,6 +118,13 @@ pub struct ManyRead {
     pub counts: JobCounts,
     pub handovers: u64,
     pub pin: Option<usize>,
+}
+
+/// Where a read of keys stands: its read point, and the handovers it counted when it took that point
+#[derive(Clone, Copy, Debug)]
+pub struct ReadAt {
+    pub point: WritePlace,
+    pub handovers: u64,
 }
 
 impl Located {
@@ -311,7 +318,7 @@ impl<Backend: Io> EngineState<Backend> {
     ) -> Option<Result<(), StoreError>> {
         values.clear();
         let held = many.pin.map(|slot| HeldPin { state: self, slot, counts: many.counts });
-        let answer = self.read_keys(device, column, keys, many.point, many.handovers, values, scratch).await;
+        let answer = self.read_keys(device, column, keys, ReadAt { point: many.point, handovers: many.handovers }, values, scratch).await;
         if held.is_none() {
             return self.has_outlived(many.counts, values.has_corrupt()).then_some(answer);
         }
@@ -325,11 +332,11 @@ impl<Backend: Io> EngineState<Backend> {
         device: &impl DeviceReads<Backend::File>,
         column: ColumnId,
         keys: &[&[u8]],
-        point: WritePlace,
-        handovers: u64,
+        at: ReadAt,
         values: &mut ValueList,
         scratch: &mut Vec<u8>,
     ) -> Result<(), StoreError> {
+        let ReadAt { point, handovers } = at;
         for key in keys {
             // a value read below the newest must stay out of the spot cache, as a cue's does
             let read = self.key_read(column, key, point, true)?;
@@ -529,7 +536,7 @@ impl<Backend: Io> EngineState<Backend> {
             length: spot.length,
         };
         // a slot holds no key, so a failed check here means another key or a moved record: a miss
-        match self.read_record(device, &pin.file, location, spot.place, read, want, buf).await? {
+        match self.read_record(ReadOn::new(device, &pin.file), location, spot.place, read, want, buf).await? {
             RecordRead::Valid => Ok(Some(true)),
             RecordRead::Failed => Ok(None),
         }
@@ -592,7 +599,7 @@ impl<Backend: Io> EngineState<Backend> {
             offset: row.offset,
             length: row.length,
         };
-        match self.read_record(device, &pin.file, location, row.place, read, want, buf).await? {
+        match self.read_record(ReadOn::new(device, &pin.file), location, row.place, read, want, buf).await? {
             RecordRead::Valid => Ok(true),
             RecordRead::Failed => Err(corruption(read)),
         }
@@ -615,7 +622,7 @@ impl<Backend: Io> EngineState<Backend> {
             offset: sealed.row.offset,
             length: sealed.row.length,
         };
-        match self.read_record(device, &pin.file, location, sealed.row.place, read, want, buf).await? {
+        match self.read_record(ReadOn::new(device, &pin.file), location, sealed.row.place, read, want, buf).await? {
             RecordRead::Valid => Ok(true),
             RecordRead::Failed => Err(corruption(read)),
         }
@@ -624,14 +631,14 @@ impl<Backend: Io> EngineState<Backend> {
     /// Read and check one record through a pooled reader
     pub async fn read_record(
         &self,
-        device: &impl DeviceReads<Backend::File>,
-        file: &Backend::File,
+        on: ReadOn<'_, impl DeviceReads<Backend::File>, Backend::File>,
         location: RecordLocation,
         place: WritePlace,
         read: &KeyRead<'_>,
         want: RecordWant,
         buf: &mut Vec<u8>,
     ) -> Result<RecordRead, StoreError> {
+        let ReadOn { device, target: file } = on;
         let identity = RecordIdentity {
             record_key: self.record_key,
             column: read.column,
@@ -737,20 +744,20 @@ impl<Backend: Io> EngineState<Backend> {
         if !pin.is_walked {
             return Ok(());
         }
-        self.ask_rows(device, volume, read, segment, &pin, reader, best).await
+        self.ask_rows(ReadOn::new(device, volume), read, segment, &pin, reader, best).await
     }
 
     /// Ask one pinned segment for a key's newest row that isn't a range delete, whether or not its walk has finished
     pub async fn ask_rows(
         &self,
-        device: &impl DeviceReads<Backend::File>,
-        volume: &Volume<Backend>,
+        on: ReadOn<'_, impl DeviceReads<Backend::File>, Volume<Backend>>,
         read: &KeyRead<'_>,
         segment: SegmentNumber,
         pin: &SegmentPin<'_, Backend::File>,
         reader: &mut FooterReader,
         best: &mut Option<SealedRow>,
     ) -> Result<(), StoreError> {
+        let ReadOn { device, target: volume } = on;
         let mut point = *read;
         while let Some(found) = self.search_segment(device, volume, &point, segment, pin, reader).await? {
             if found.kind != RowKind::RangeDelete {
@@ -811,7 +818,7 @@ impl<Backend: Io> EngineState<Backend> {
                 if best.is_some_and(|row| row.row.place >= candidate.newest_place) {
                     break;
                 }
-                self.ask_candidate(device, volume, read, candidate.segment, reader, &mut best, ask).await?;
+                self.ask_candidate(ReadOn::new(device, volume), read, candidate.segment, reader, &mut best, ask).await?;
             }
             skip += reader.candidates.len();
 
@@ -829,14 +836,14 @@ impl<Backend: Io> EngineState<Backend> {
     /// Ask one listed segment for a key, if a walk's rule takes it
     pub async fn ask_candidate(
         &self,
-        device: &impl DeviceReads<Backend::File>,
-        volume: &Volume<Backend>,
+        on: ReadOn<'_, impl DeviceReads<Backend::File>, Volume<Backend>>,
         read: &KeyRead<'_>,
         segment: SegmentNumber,
         reader: &mut FooterReader,
         best: &mut Option<SealedRow>,
         ask: WalkAsk<'_>,
     ) -> Result<(), StoreError> {
+        let ReadOn { device, target: volume } = on;
         if segment < ask.first || ask.skipped.contains(&segment) {
             return Ok(());
         }

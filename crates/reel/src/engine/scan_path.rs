@@ -17,9 +17,10 @@ use crate::engine::scan_state::{BlockTake, MOST_SCANS, MOST_WINDOW_RECORD, NO_GE
 use crate::engine::volume::Volume;
 use crate::guard::hold;
 use crate::index::write_shard::WalkBound;
-use crate::io::{DeviceReads, InPlace, Io, in_place};
+use crate::io::{DeviceReads, InPlace, Io, ReadOn, in_place};
 use crate::record::record_check::RecordIdentity;
-use crate::record::record_reader::{RecordRead, RecordReader};
+use crate::record::codec::Codec;
+use crate::record::record_reader::{RecordRead, form_of, open_small};
 use crate::row_kind::RowKind;
 use crate::segment::block_cache::BlockKey;
 use crate::segment::block_entry::{BlockEntry, KeyBound, SHARED_HEAD_BYTES};
@@ -140,7 +141,7 @@ impl<Backend: Io> EngineState<Backend> {
             let many = if tries >= MOST_READ_TRIES && scan.point.is_none() { self.many_read(volume) } else { None };
             let pinned = many.and_then(|many| many.pin.map(|slot| (many, slot)));
             let held = pinned.map(|(many, slot)| HeldPin { state: self, slot, counts: many.counts });
-            let outcome = self.try_step(device, volume, directory, scan, pinned.map(|(many, _slot)| many.point), key, want.reborrow()).await;
+            let outcome = self.try_step(ReadOn::new(device, volume), directory, scan, pinned.map(|(many, _slot)| many.point), key, want.reborrow()).await;
             drop(held);
             match self.counted(outcome)? {
                 StepOutcome::Answer(step) => {
@@ -162,14 +163,14 @@ impl<Backend: Io> EngineState<Backend> {
     /// Try one key: seat what moved, find the walk's next key, and answer it
     pub async fn try_step(
         &self,
-        device: &impl DeviceReads<Backend::File>,
-        volume: &Volume<Backend>,
+        on: ReadOn<'_, impl DeviceReads<Backend::File>, Volume<Backend>>,
         directory: Option<&ColumnDirectory>,
         scan: &mut ScanState,
         pin_point: Option<WritePlace>,
         key: &mut Vec<u8>,
         want: ScanWant<'_>,
     ) -> Result<StepOutcome, StoreError> {
+        let ReadOn { device, target: volume } = on;
         let generation = directory.map_or(0, ColumnDirectory::generation);
         let fixed_point = scan.point.or(pin_point);
         let point = fixed_point.unwrap_or_else(|| self.read_point(volume));
@@ -192,7 +193,7 @@ impl<Backend: Io> EngineState<Backend> {
             true
         });
         let spilled = match directory.filter(|_directory| scan.is_spilled) {
-            Some(directory) => self.spilled_key(device, volume, directory, scan, point, has_key, &mut candidate).await,
+            Some(directory) => self.spilled_key(on, directory, scan, point, has_key, &mut candidate).await,
             None => Ok(has_key),
         };
         has_key = match spilled {
@@ -206,7 +207,7 @@ impl<Backend: Io> EngineState<Backend> {
         let outcome = match self.check_reach(volume, scan, has_key.then_some(&candidate)) {
             Ok(()) if has_key => {
                 let at = StepAt { directory, generation, fixed_point };
-                self.answer_key(device, volume, scan, &candidate, at, key, want).await
+                self.answer_key(on, scan, &candidate, at, key, want).await
             },
             Ok(()) => Ok(StepOutcome::Answer(ScanStep::End)),
             Err(error) => Err(error),
@@ -218,14 +219,14 @@ impl<Backend: Io> EngineState<Backend> {
     /// Answer the walk's next key at a point
     pub async fn answer_key(
         &self,
-        device: &impl DeviceReads<Backend::File>,
-        volume: &Volume<Backend>,
+        on: ReadOn<'_, impl DeviceReads<Backend::File>, Volume<Backend>>,
         scan: &mut ScanState,
         candidate: &[u8],
         at: StepAt<'_>,
         key: &mut Vec<u8>,
         want: ScanWant<'_>,
     ) -> Result<StepOutcome, StoreError> {
+        let ReadOn { device, target: volume } = on;
         // the counts come before the point, as a get takes them
         let counts = self.cues.counts();
         let read = match at.fixed_point {
@@ -250,7 +251,7 @@ impl<Backend: Io> EngineState<Backend> {
         }
 
         let answer = match want {
-            ScanWant::Value(value) => self.read_located(device, volume, &read, &located, &mut scan.window, scan.direction, value).await,
+            ScanWant::Value(value) => self.read_located(on, &read, &located, &mut scan.window, scan.direction, value).await,
             ScanWant::Key => {
                 scan.counted += 1;
                 Ok(true)
@@ -280,19 +281,19 @@ impl<Backend: Io> EngineState<Backend> {
     /// Read the value of the row a key landed on, and return false when its segment or slot moved on
     pub async fn read_located(
         &self,
-        device: &impl DeviceReads<Backend::File>,
-        volume: &Volume<Backend>,
+        on: ReadOn<'_, impl DeviceReads<Backend::File>, Volume<Backend>>,
         read: &KeyRead<'_>,
         located: &Located,
         window: &mut ScanWindow,
         direction: Direction,
         value: &mut Vec<u8>,
     ) -> Result<bool, StoreError> {
+        let ReadOn { device, target: volume } = on;
         match located {
             Located::Absent => Ok(false),
             Located::Open(row) => self.read_open(device, read, row, RecordWant::Whole, value).await,
             Located::Sealed(row) => {
-                if let Some(answer) = self.read_from_window(device, volume, read, row, window, direction, value).await {
+                if let Some(answer) = self.read_from_window(on, read, row, window, direction, value).await {
                     return Ok(answer);
                 }
                 self.read_sealed(device, volume, read, row, RecordWant::Whole, value).await
@@ -306,14 +307,14 @@ impl<Backend: Io> EngineState<Backend> {
     #[allow(clippy::too_many_arguments, reason = "a read, its row, and the window and direction a scan keeps")]
     pub async fn read_from_window(
         &self,
-        device: &impl DeviceReads<Backend::File>,
-        volume: &Volume<Backend>,
+        on: ReadOn<'_, impl DeviceReads<Backend::File>, Volume<Backend>>,
         read: &KeyRead<'_>,
         sealed: &SealedRow,
         window: &mut ScanWindow,
         direction: Direction,
         value: &mut Vec<u8>,
     ) -> Option<bool> {
+        let ReadOn { device, target: volume } = on;
         let (offset, length) = (sealed.row.offset.0, sealed.row.length.0 as usize);
         if length > MOST_WINDOW_RECORD {
             return None;
@@ -334,7 +335,12 @@ impl<Backend: Io> EngineState<Backend> {
             place: sealed.row.place,
         };
         let record = window.holding(sealed.segment, offset, length)?;
-        match RecordReader::check_plain(record, &identity, value)? {
+        let form = form_of(record).filter(|form| !form.is_chunked)?;
+        let read = match form.codec {
+            Codec::None => open_small(record, form, &identity, &mut [], value),
+            Codec::Lz4 => self.record_reader_for(device).check_held(record, form, &identity, value),
+        };
+        match read {
             RecordRead::Valid => Some(true),
             RecordRead::Failed => None,
         }
@@ -413,7 +419,7 @@ impl<Backend: Io> EngineState<Backend> {
                 Direction::Ascending => (frontier, reach),
                 Direction::Descending => (reach, frontier),
             };
-            self.join_range(device, volume, directory, scan, &low, &high, point).await?;
+            self.join_range(ReadOn::new(device, volume), directory, scan, &low, &high, point).await?;
             scan.frontier = match scan.direction {
                 Direction::Ascending => directory.next_above(&reach),
                 Direction::Descending => directory.next_below(&reach),
@@ -425,14 +431,14 @@ impl<Backend: Io> EngineState<Backend> {
     /// Seat every segment a range of bounds meets. What the sources can't hold spills, and goes by seeks from then on
     pub async fn join_range(
         &self,
-        device: &impl DeviceReads<Backend::File>,
-        volume: &Volume<Backend>,
+        on: ReadOn<'_, impl DeviceReads<Backend::File>, Volume<Backend>>,
         directory: &ColumnDirectory,
         scan: &mut ScanState,
         low: &KeyBound,
         high: &KeyBound,
         point: WritePlace,
     ) -> Result<(), StoreError> {
+        let ReadOn { device, target: volume } = on;
         let mut skip = 0;
         loop {
             let page = directory.overlapping(low, high, skip, &mut scan.found);
@@ -470,14 +476,14 @@ impl<Backend: Io> EngineState<Backend> {
     /// Find the walk's next key among the segments the sources couldn't hold, and say whether it has one
     pub async fn spilled_key(
         &self,
-        device: &impl DeviceReads<Backend::File>,
-        volume: &Volume<Backend>,
+        on: ReadOn<'_, impl DeviceReads<Backend::File>, Volume<Backend>>,
         directory: &ColumnDirectory,
         scan: &mut ScanState,
         point: WritePlace,
         has_key: bool,
         candidate: &mut Vec<u8>,
     ) -> Result<bool, StoreError> {
+        let ReadOn { device, target: volume } = on;
         let mut has_key = has_key;
         let position = KeyBound::of_key(&scan.position);
         let reach = if has_key { KeyBound::of_key(candidate) } else { scan.far_bound() };
@@ -545,7 +551,7 @@ impl<Backend: Io> EngineState<Backend> {
                         block_offset: source.line.block_offset,
                     });
                 }
-                step = self.step_source(device, volume, column, source, direction, point, take.as_mut()).await?;
+                step = self.step_source(ReadOn::new(device, volume), column, source, direction, point, take.as_mut()).await?;
             }
             let taken = take.map_or(0, |take| take.rows);
             scan.counted += taken;
@@ -562,14 +568,14 @@ impl<Backend: Io> EngineState<Backend> {
     /// Move a source to its next row in the walk's direction
     pub async fn step_source(
         &self,
-        device: &impl DeviceReads<Backend::File>,
-        volume: &Volume<Backend>,
+        on: ReadOn<'_, impl DeviceReads<Backend::File>, Volume<Backend>>,
         column: ColumnId,
         source: &mut SegmentSource,
         direction: Direction,
         point: WritePlace,
         mut take: Option<&mut BlockTake>,
     ) -> Result<SourceMove, StoreError> {
+        let ReadOn { device, target: volume } = on;
         loop {
             let (segment, line) = (source.segment, source.line);
             let row = self.visit_block(device, volume, column, segment, &line, |block| match direction {

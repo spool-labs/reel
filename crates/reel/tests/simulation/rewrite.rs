@@ -13,7 +13,7 @@ use reel::engine::open_segment::{OUTPUT_SUFFIX, data_path};
 use reel::engine::read_path::{RecordWant, WalkAsk};
 use reel::engine::planner::Planner;
 use reel::engine::reel_store::ReelStore;
-use reel::engine::rewrite_job::{MERGE_BUFFER_BYTES, MOST_OVERLAP, MOST_PARK_WAITS, RewritePhase, is_overlap_input, overlaps};
+use reel::engine::rewrite_job::{MERGE_BUFFER_BYTES, MOST_OVERLAP, MOST_PARK_WAITS, PLANNER_LANE, RewriteJob, RewritePhase, is_overlap_input, overlaps};
 use reel::engine::volume::{MOST_PARKED, NO_SEAL};
 use reel::engine::walk_job::WalkJob;
 use reel::guard::hold;
@@ -57,8 +57,8 @@ const UNWALKED_CRASH_STRIDE: u64 = 3;
 
 type Store = ReelStore<SimulatedIo>;
 
-fn open(io: &SimulatedIo) -> Store {
-    let config = StoreConfig {
+fn config() -> StoreConfig {
+    StoreConfig {
         memory_budget: BUDGET,
         threads: reel::config::NO_WORKERS,
         volumes: vec![VolumeConfig {
@@ -75,7 +75,11 @@ fn open(io: &SimulatedIo) -> Store {
             volume: VolumeId(0),
             complete_rows: None,
         }],
-    };
+    }
+}
+
+fn open(io: &SimulatedIo) -> Store {
+    let config = config();
     ReelStore::open(io.clone(), &config).expect("open")
 }
 
@@ -2370,4 +2374,28 @@ impl DeviceReads<SimulatedFile> for ChangesList<'_> {
         self.change();
         ready(file.read_parts_at(offset, parts))
     }
+}
+
+// an overlap merge copies records, so it starts on the planner's lane and a worker leaves it there
+#[test]
+fn workers_leave_overlap() {
+    let io = SimulatedIo::new(Seed(74));
+    let mut config = config();
+    config.memory_budget = ByteCount(256 * 1024 * 1024);
+    config.threads.maintenance_workers = Some(1);
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    hold_compaction(&store, true);
+    hold_walk(&store, true);
+    pile_up(&store, &io, OVER_THE_BOUND);
+    hold_compaction(&store, false);
+
+    let state = &store.state;
+    let mut worker = RewriteJob::new(Arc::clone(state), 0, PLANNER_LANE + 1);
+    assert!((0..OVER_THE_BOUND).all(|_look| worker.pick(&state.volumes[0]).is_none()));
+    let mut planner = RewriteJob::new(Arc::clone(state), 0, PLANNER_LANE);
+    assert!((0..OVER_THE_BOUND).any(|_look| planner.pick(&state.volumes[0]).is_some()));
+    planner.abandon();
+    drop(planner);
+    drop(worker);
+    store.close().expect("close");
 }

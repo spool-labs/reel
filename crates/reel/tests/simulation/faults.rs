@@ -33,7 +33,7 @@ const TABLE_ROWS: RowCount = RowCount(100_000);
 const ROOTS: [&str; 3] = ["/disk/faults-meta", "/disk/faults-meta-two", "/disk/faults-bulk"];
 const COLUMNS: [ColumnId; 2] = [ColumnId(1), ColumnId(2)];
 const HIGHEST_KEY: &[u8] = b"zzz";
-const BUDGET: ByteCount = ByteCount(118 * 1024 * 1024);
+const BUDGET: ByteCount = ByteCount(120 * 1024 * 1024);
 // a test holds each seed with a traced bug: 0 `failed_open` and `failed_close`, 1 `rows_sync` and `tail_sync`, 37 and
 // 349 `covered_last` and `later_sync`, 125 `one_copy`, 681 `tail_then_cut`, 959 `flushed_unknown`, 1000 `open_covers`, 1002
 // `wrong_place`. Seeds 1 and 1000 are mapped from notes, with no replay. The rest are plain extra seeds

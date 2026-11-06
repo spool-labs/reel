@@ -10,8 +10,10 @@ use std::task::{Context, Poll, Wake, Waker};
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::read_path::RecordWant;
 use reel::engine::reel_store::ReelStore;
+use reel::engine::ring_job::RingReaper;
 use reel::engine::scan_state::MOST_SCANS;
 use reel::io::InPlace;
+use reel::io::job::{Job, JobStep};
 use reel::io::ring::{RING_READS, RING_SLOT_BYTES, RING_SLOTS, ReadRing};
 use reel::record::codec::Codec;
 use reel_api::column_id::ColumnId;
@@ -262,6 +264,16 @@ fn kill_under_a_read() {
     }
     io.kill();
     drop(store);
+}
+
+// a reaper ends by itself on a closed and drained ring, so a stop that lands after the last poke finds it gone
+#[test]
+fn reaper_ends_when_drained() {
+    let (_io, store) = ringed(8);
+    store.state.drain_ring();
+    let mut reaper = RingReaper { state: Arc::clone(&store.state) };
+    assert_eq!(reaper.step(), JobStep::Finished);
+    store.close().expect("close");
 }
 
 // a warm read through the ring takes nothing from the allocator

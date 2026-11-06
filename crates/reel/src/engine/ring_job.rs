@@ -25,6 +25,10 @@ impl<Backend: Io> Job for RingReaper<Backend> {
         let Some(ring) = &self.state.ring else {
             return JobStep::Finished;
         };
+        // a stop can land between the close's poke and the next wait, so a drained ring ends the job by itself
+        if ring.is_drained() {
+            return JobStep::Finished;
+        }
         match ring.driver.reap(&mut |slot, answer| ring.finish(slot, answer)) {
             Ok(false) => JobStep::Idle,
             Ok(true) => JobStep::Worked,

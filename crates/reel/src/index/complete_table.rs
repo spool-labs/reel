@@ -255,6 +255,30 @@ impl CompleteShard {
         }
     }
 
+    /// Take the slots of gone segments out of a tag's run of the overflow area, whatever their tag, and say how many went. Runs are
+    /// shared, so inserts keep each other's runs clean
+    pub fn clear_gone(&mut self, tag: u16, is_gone: &impl Fn(u32) -> bool) -> u64 {
+        let mut cleared = 0;
+        if self.overflow_used == 0 {
+            return cleared;
+        }
+        let mut at = self.overflow_start(tag);
+        for _step in 0..self.overflow.len() {
+            let slot = self.overflow[at];
+            if !slot.is_used() {
+                break;
+            }
+            if !slot.is_sticky() && is_gone(slot.segment) {
+                // a later slot of the run can shift into this position, so the look stays here
+                self.clear_overflow(at);
+                cleared += 1;
+                continue;
+            }
+            at = (at + 1) % self.overflow.len();
+        }
+        cleared
+    }
+
     /// Take a tag's slots out of its run of the overflow area, and say how many went
     pub fn fold_overflow(&mut self, tag: u16) -> u64 {
         let mut folded = 0;
@@ -524,6 +548,8 @@ impl CompleteTable {
     pub fn place(&self, hash: KeyHash, segment: u32, block: u16, is_gone: &impl Fn(u32) -> bool) -> bool {
         let mut shard = self.write_shard(shard_of(hash));
         let homes = shard.homes(hash);
+        let cleared = shard.clear_gone(homes.tag, is_gone);
+        self.used.fetch_sub(cleared, Ordering::AcqRel);
         let (mut tag_slots, mut has_sticky) = (0, false);
         shard.visit_tag(&homes, |slot| {
             tag_slots += 1;

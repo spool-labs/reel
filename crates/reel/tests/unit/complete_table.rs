@@ -163,3 +163,21 @@ fn fold_covers_a_key_with_other_homes() {
     let matches = matches_of(&table, other);
     assert!(matches.slots().iter().any(|slot| slot.is_sticky() || (slot.segment == 7 && slot.block == 3)));
 }
+
+// slots of gone segments leave the overflow area, so they count toward no fold and hold no room
+#[test]
+fn gone_overflow_slots_leave_the_count() {
+    let table = CompleteTable::new(RowCount(ROWS));
+    let hash = hash_of(3);
+    for segment in 0..20 {
+        table.insert(hash, SegmentNumber(segment), 1, |_segment| false);
+    }
+    for segment in 100..124 {
+        table.insert(hash, SegmentNumber(segment), 1, |segment| segment < 100);
+    }
+    let matches = matches_of(&table, hash);
+    let gone = matches.slots().iter().filter(|slot| slot.segment < 100).count();
+    let sticky = matches.slots().iter().filter(|slot| slot.is_sticky()).count();
+    assert_eq!((gone, sticky), (0, 0));
+    assert_eq!(table.used_slots(), RowCount(24));
+}

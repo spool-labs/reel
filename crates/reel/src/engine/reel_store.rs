@@ -30,7 +30,7 @@ use crate::engine::read_pool::{READ_WORKERS, ReadPool, ReadWorker};
 use crate::engine::recovery::{
     OpenMode,
     RootScan, SummaryFound, list_roots, load_covers, read_summaries, recover_segments, save_cleared_spans, scan_roots,
-    walk_open_rows,
+    pass_open_rows,
     settle_summaries,
 };
 use crate::engine::reserve_job::ReserveJob;
@@ -523,7 +523,7 @@ pub fn bring_up<Backend: Io>(
     for found in &scan.sealed {
         state.order.resume_past(found.head.places.highest);
     }
-    walk_open_rows(state, scan, OpenMode::Writable).map_err(open_error("walking a rows file"))?;
+    pass_open_rows(state, scan);
     load_covers(state, scan).map_err(open_error("reading pending range deletes"))?;
     settle_summaries(state, scan).map_err(open_error("settling a summary"))?;
 

@@ -1193,7 +1193,7 @@ fn run_to_crash(io: &SimulatedIo) -> bool {
 }
 
 // one seal stopped at one point, rows flushed past what it wrote, and a power cut in a second seal
-fn stale_tail_run(seed: u64, first: u64, second: u64) -> bool {
+fn stale_tail_run(seed: u64, first: u64, second: u64, before_open: impl Fn(&SimulatedIo)) -> bool {
     let io = SimulatedIo::new(Seed(seed));
     let store = open(&io);
     store.put(ORDERED, b"first", b"value").expect("put");
@@ -1227,6 +1227,7 @@ fn stale_tail_run(seed: u64, first: u64, second: u64) -> bool {
     io.disarm_crash();
     io.power_cut();
     drop(store);
+    before_open(&io);
 
     let store = open(&io);
     let kept = read(&store, ORDERED, b"kept");
@@ -1242,7 +1243,34 @@ fn stale_tail_hides_no_rows() {
     let mut runs = 0;
     for first in 0..SEAL_CRASH_POINTS {
         for second in 0..STALE_TAIL_SECOND_POINTS {
-            runs += u64::from(stale_tail_run(STALE_TAIL_SEED, first, second));
+            runs += u64::from(stale_tail_run(STALE_TAIL_SEED, first, second, |_io| {}));
+        }
+    }
+    assert!(runs > 0);
+}
+
+// rot both index copies of every segment that still reads a tail
+fn rot_tailed_indexes(io: &SimulatedIo) {
+    let superblock = Superblock::read(io, &PathBuf::from(ROOT)).expect("read").expect("superblock");
+    for path in data_files(io) {
+        let file = io.open_read_only(&path).expect("open");
+        let mut columns = Vec::new();
+        let head = FooterReader::new().read_tail(&file, superblock.record_key, &mut columns).expect("tail");
+        io.close_file(file);
+        if let Some(head) = head {
+            io.rot(&path, FileOffset(head.index_at.0 + 2), FLIP).expect("rot");
+            io.rot(&path, FileOffset(head.second_index_at.0 + 2), FLIP).expect("rot");
+        }
+    }
+}
+
+// a stale tail over a footer that reads as damaged still stops speaking, so the rows file comes back whole
+#[test]
+fn stale_tail_over_rot() {
+    let mut runs = 0;
+    for first in 0..SEAL_CRASH_POINTS {
+        for second in 0..STALE_TAIL_SECOND_POINTS {
+            runs += u64::from(stale_tail_run(STALE_TAIL_SEED, first, second, rot_tailed_indexes));
         }
     }
     assert!(runs > 0);

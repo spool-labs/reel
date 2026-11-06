@@ -17,7 +17,7 @@ use crate::engine::read_pool::ReadWorker;
 use crate::engine::recovery::{
     OpenMode, RecoveredRows, ReplayTarget, RootScan, RowsWalked, ScannedOpen, list_roots, load_covers, next_group, read_summaries, row_ranges,
     scan_roots,
-    walk_open_rows, walk_rows,
+    pass_open_rows, walk_rows,
 };
 use crate::engine::reel_store::{build_state, open_error, read_superblock, store_sizing};
 use crate::engine::volume::Volume;
@@ -80,7 +80,7 @@ pub fn bring_up_read_only<Backend: Io>(
     for found in &scan.sealed {
         state.order.resume_past(found.head.places.highest);
     }
-    walk_open_rows(state, scan, OpenMode::ReadOnly).map_err(open_error("walking a rows file"))?;
+    pass_open_rows(state, scan);
     load_covers(state, scan).map_err(open_error("reading pending range deletes"))?;
     load_damage(state);
 

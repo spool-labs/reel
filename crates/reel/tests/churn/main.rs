@@ -123,6 +123,8 @@ fn churn(has_cue: bool) -> JobsRun {
         store.delete(META, &gone(number)).expect("delete");
     }
     store.delete_range(META, &spanned(0), &spanned(GONE_KEYS)).expect("delete");
+    // a view reads the rows files, and a write reaches them within 100 ms of returning
+    store.flush().expect("flush");
 
     let cue = has_cue.then(|| store.cue().expect("cue"));
     let is_done = AtomicBool::new(false);

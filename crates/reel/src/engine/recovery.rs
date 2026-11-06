@@ -177,7 +177,6 @@ pub struct HeldFile {
 #[derive(Debug)]
 pub struct RootScan<File> {
     pub sealed: Vec<FoundSealed<File>>,
-    pub open: Vec<FoundOpen<File>>,
     pub scanned: Vec<ScannedOpen<File>>,
     pub damaged: Vec<FoundDamaged>,
     pub empty: Vec<FoundEmpty>,
@@ -221,9 +220,6 @@ impl<File> RootScan<File> {
         for found in self.sealed.drain(..) {
             io.close_file(found.file);
         }
-        for found in self.open.drain(..) {
-            io.close_file(found.data);
-        }
         for segment in self.scanned.drain(..) {
             io.close_file(segment.found.data);
             io.close_file(segment.rows);
@@ -235,7 +231,7 @@ impl<File> RootScan<File> {
         let sealed_columns: usize = self.sealed.iter().filter(|found| found.volume == volume).map(|found| found.columns.len()).sum();
         let sealed = self.sealed.iter().filter(|found| found.volume == volume).count();
         let others = self.damaged.iter().filter(|found| found.volume == volume).count()
-            + self.open.iter().filter(|found| found.volume == volume).count()
+            + self.scanned.iter().filter(|segment| segment.found.volume == volume).count()
             + self.empty.iter().filter(|found| found.volume == volume).count();
         let sealed_blocks: usize = self.sealed.iter().filter(|found| found.volume == volume).map(|found| found.entries.len()).sum();
         let fixed = (sealed + others) * MOST_ROW_FIXED_BYTES + sealed_blocks * size_of::<u32>();
@@ -295,7 +291,6 @@ pub fn scan_roots<Backend: Io>(
 ) -> Result<RootScan<Backend::File>> {
     let mut scan = RootScan {
         sealed: Vec::new(),
-        open: Vec::new(),
         scanned: Vec::new(),
         damaged: Vec::new(),
         empty: Vec::new(),
@@ -378,7 +373,7 @@ pub fn drop_inputs<Backend: Io>(io: &Backend, scan: &mut RootScan<Backend::File>
     }
 }
 
-/// Read one segment and hand its file to the scan, or close it
+/// Read one segment and hand its files to the scan, or close them
 pub fn sort_segment<Backend: Io>(
     io: &Backend,
     at: &SegmentAt,
@@ -386,11 +381,22 @@ pub fn sort_segment<Backend: Io>(
     reader: &mut FooterReader,
     scan: &mut RootScan<Backend::File>,
 ) -> Result<()> {
-    let SegmentAt { record_key, listing, number, mode } = *at;
+    let SegmentAt { record_key, listing, number, .. } = *at;
+    // a seal writes its tail before it takes the rows file, so a view that opens the rows first misses neither
+    let mut opened = match walk_listed_rows(io, at) {
+        Ok(opened) => opened,
+        Err(error) => {
+            io.close_file(file);
+            return Err(error);
+        },
+    };
     let segment = match read_segment(record_key, listing, number, &file, reader) {
         Ok(segment) => segment,
         Err(error) => {
             io.close_file(file);
+            if let Some((rows, _walked)) = opened {
+                io.close_file(rows);
+            }
             return Err(error);
         },
     };
@@ -400,18 +406,11 @@ pub fn sort_segment<Backend: Io>(
         SegmentRead::Damaged { head, .. } => *head,
         SegmentRead::Open | SegmentRead::Empty { .. } => None,
     };
-    let is_stale = match tail.filter(|_head| has_rows(listing, number)) {
-        Some(head) => is_tail_stale(io, record_key, listing, &head, mode),
-        None => Ok(false),
+    let is_stale = match (&tail, &opened) {
+        (Some(head), Some((_rows, walked))) => is_tail_stale(head, walked),
+        (_, _) => false,
     };
-    let segment = match is_stale {
-        Ok(true) => SegmentRead::Open,
-        Ok(false) => segment,
-        Err(error) => {
-            io.close_file(file);
-            return Err(error);
-        },
-    };
+    let segment = if is_stale { SegmentRead::Open } else { segment };
 
     match segment {
         SegmentRead::Sealed { head, columns, entries } => scan.sealed.push(FoundSealed {
@@ -421,14 +420,22 @@ pub fn sort_segment<Backend: Io>(
             head,
             columns,
             entries,
-            has_rows: has_rows(listing, number),
+            has_rows: opened.is_some(),
         }),
-        SegmentRead::Open => scan.open.push(FoundOpen {
-            volume: listing.volume,
-            root: listing.root,
-            number,
-            data: file,
-        }),
+        SegmentRead::Open => {
+            let found = FoundOpen {
+                volume: listing.volume,
+                root: listing.root,
+                number,
+                data: file,
+            };
+            let Some((rows, walked)) = opened.take() else {
+                // a view listed a rows file that went with no tail left behind, so the segment went too
+                io.close_file(found.data);
+                return Err(Error::from(ErrorKind::NotFound));
+            };
+            scan.scanned.push(ScannedOpen { found, rows, scan: walked });
+        },
         SegmentRead::Damaged { head, columns, file_length } => {
             io.close_file(file);
             scan.damaged.push(FoundDamaged {
@@ -450,6 +457,9 @@ pub fn sort_segment<Backend: Io>(
                 file_length,
             });
         },
+    }
+    if let Some((rows, _walked)) = opened {
+        io.close_file(rows);
     }
     Ok(())
 }
@@ -885,27 +895,12 @@ pub fn load_covers<Backend: Io>(state: &EngineState<Backend>, scan: &RootScan<Ba
     Ok(())
 }
 
-/// Walk every open segment's rows file and move the order past what they hold, before anything ranks damage
-pub fn walk_open_rows<Backend: Io>(state: &EngineState<Backend>, scan: &mut RootScan<Backend::File>, mode: OpenMode) -> Result<()> {
-    scan.open.reverse();
-    while let Some(open) = scan.open.last() {
-        let volume = &state.volumes[open.volume];
-        let path = &volume.roots[open.root.0 as usize];
-        let rows = open_for(&state.io, &rows_path(path, open.number), mode)?;
-        let walked = match state.scan_rows(&rows) {
-            Ok(walked) => walked,
-            Err(error) => {
-                state.io.close_file(rows);
-                return Err(error);
-            },
-        };
-        // the limit should already stand above these, and open never hands out a place it found
-        state.order.resume_past(walked.highest_place);
-        if let Some(found) = scan.open.pop() {
-            scan.scanned.push(ScannedOpen { found, rows, scan: walked });
-        }
+/// Move the order past what the open segments hold, before anything ranks damage. The limit should already stand above these,
+/// and open never hands out a place it found
+pub fn pass_open_rows<Backend: Io>(state: &EngineState<Backend>, scan: &RootScan<Backend::File>) {
+    for segment in &scan.scanned {
+        state.order.resume_past(segment.scan.highest_place);
     }
-    Ok(())
 }
 
 /// Bring every open segment back, sealing as a running store at this budget would have, taking each out of
@@ -2044,17 +2039,27 @@ pub fn scan_rows_of<File: IoFile>(rows: &File, record_key: RecordKey) -> Result<
 /// Check a segment's rows file goes past what its tail lists. A seal that stopped after its tail leaves those bytes in the file
 /// when the segment goes on taking writes, and a power cut that loses what came after can bring them back to the file's end.
 /// The tails sync before the cut for the same reason, and this covers every other way a tail that never finished reads as final
-pub fn is_tail_stale<Backend: Io>(
-    io: &Backend,
-    record_key: RecordKey,
-    listing: &RootListing,
-    head: &TailHead,
-    mode: OpenMode,
-) -> Result<bool> {
-    let rows = open_for(io, &rows_path(&listing.path, head.segment), mode)?;
-    let scanned = scan_rows_of(&rows, record_key);
-    io.close_file(rows);
-    Ok(scanned?.highest_place > head.places.highest)
+pub fn is_tail_stale(head: &TailHead, walked: &RowsScan) -> bool {
+    walked.highest_place > head.places.highest
+}
+
+/// Open and walk the rows file a listing shows. A view finds it gone once a seal finishes
+pub fn walk_listed_rows<Backend: Io>(io: &Backend, at: &SegmentAt) -> Result<Option<(Backend::File, RowsScan)>> {
+    if !has_rows(at.listing, at.number) {
+        return Ok(None);
+    }
+    let rows = match open_for(io, &rows_path(&at.listing.path, at.number), at.mode) {
+        Ok(rows) => rows,
+        Err(error) if at.mode == OpenMode::ReadOnly && error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    match scan_rows_of(&rows, at.record_key) {
+        Ok(walked) => Ok(Some((rows, walked))),
+        Err(error) => {
+            io.close_file(rows);
+            Err(error)
+        },
+    }
 }
 
 /// Open a file the way this open needs it

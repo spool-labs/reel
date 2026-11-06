@@ -1,5 +1,6 @@
 //! Fixed buffers shared by every thread: a caller takes one or waits
 
+use std::collections::VecDeque;
 use std::hint::black_box;
 use std::mem::MaybeUninit;
 use std::panic::{self, AssertUnwindSafe};
@@ -177,6 +178,15 @@ pub fn touched_zeroes(length: usize) -> Vec<u8> {
     black_box(bytes.as_mut_slice());
     bytes.fill(0);
     bytes
+}
+
+/// Allocate an empty queue with room for its items and every page of that room written
+pub fn touched_queue<Item: Clone>(capacity: usize, filler: Item) -> VecDeque<Item> {
+    let mut items = VecDeque::with_capacity(capacity);
+    items.resize(capacity, filler);
+    black_box(&mut items);
+    items.clear();
+    items
 }
 
 /// Allocate an empty list with room for its items and every page of that room written

@@ -4,6 +4,8 @@ use std::thread;
 
 use reel::pool::*;
 
+const QUEUE_ROOM: usize = 1_024;
+
 const FIRST: u32 = 1;
 const SECOND: u32 = 2;
 
@@ -90,4 +92,12 @@ fn many_at_once() {
         assert_eq!(waiter.join().expect("join"), 3);
     });
     assert_eq!(pool.waiting(), 0);
+}
+
+// a touched queue comes back empty, with its room still there to take what it was sized for
+#[test]
+fn touched_queue_keeps_its_room() {
+    let queue = touched_queue(QUEUE_ROOM, 0_u64);
+    assert!(queue.is_empty());
+    assert!(queue.capacity() >= QUEUE_ROOM);
 }

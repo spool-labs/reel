@@ -23,7 +23,7 @@ use crate::engine::scan_state::ScanState;
 use crate::guard::hold;
 use crate::io::job::{Job, JobStep};
 use crate::io::{Io, IoTask};
-use crate::pool::touched_capacity;
+use crate::pool::{touched_capacity, touched_queue};
 
 /// Engine threads that run async reads on a backend with no completions of its own
 pub const READ_WORKERS: usize = 4;
@@ -153,7 +153,7 @@ impl ReadPool {
             slots: (0..READ_SLOTS).map(|_slot| Mutex::new(ReadSlot::new())).collect(),
             free: Mutex::new((0..READ_SLOTS).collect()),
             queue: Mutex::new(queue),
-            waiters: Mutex::new(VecDeque::with_capacity(MOST_WAITERS)),
+            waiters: Mutex::new(touched_queue(MOST_WAITERS, Waker::noop().clone())),
             next_worker: AtomicUsize::new(0),
             scans: Mutex::new(scans),
         }

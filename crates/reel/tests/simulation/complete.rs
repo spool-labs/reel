@@ -42,6 +42,9 @@ const TINY_CAPACITY: RowCount = RowCount(64);
 const OVERWRITES: u64 = 300;
 const SHORT_LIVED: u64 = 40;
 const KEPT_PER_ROUND: u64 = 10;
+const OUTPUT_ROOM: u64 = 100_000;
+const OUTPUT_KEYS: u64 = 15_000;
+const OUTPUT_STEPS: usize = 2;
 const IMAGE_ROT_STEP: usize = 8;
 const IMAGE_LIST_ROOM: u64 = 1_024;
 const CHARGE_CRASH_POINTS: u64 = 40;
@@ -767,5 +770,56 @@ fn hot_key_charges_through_the_footers() {
     assert!(slots_of(&store, b"hot").iter().any(CompleteSlot::is_sticky));
     let dead: u64 = sealed_numbers(&store).into_iter().map(|segment| dead_rows(&store, segment)).sum();
     assert_eq!(dead, MOST_TAG_SLOTS as u64 * 2 - 1);
+    store.close().expect("close");
+}
+
+// rows sealed while a rewrite writes land in the buckets of its output's slots, which point at a segment the table has yet to take, so
+// they stay. Tiny buckets make every insert visit them
+#[test]
+fn output_slots_outlast_a_rewrite_in_flight() {
+    let io = SimulatedIo::new(Seed(23));
+    let store = open(&io, RowCount(OUTPUT_ROOM));
+    let volume = &store.state.volumes[0];
+    volume.is_compaction_held.store(true, Ordering::Release);
+    for number in 0..OUTPUT_KEYS {
+        store.put(COLUMN, &key(number), b"first").expect("put");
+    }
+    seal(&store, &io);
+    for number in (0..OUTPUT_KEYS).step_by(3) {
+        store.put(COLUMN, &key(number), b"second").expect("put");
+    }
+    for number in (1..OUTPUT_KEYS).step_by(3) {
+        store.put(COLUMN, &key(number), b"second").expect("put");
+    }
+    seal(&store, &io);
+
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    while !job.rewrite.start() {
+        assert!(job.rewrite.has_looks_left, "no merge to run");
+    }
+    while job.rewrite.phase != RewritePhase::Copying {
+        job.rewrite.step();
+    }
+    // part of the rows are in the footer, and their slots stand for a segment that isn't in the table
+    for _step in 0..OUTPUT_STEPS {
+        job.rewrite.step();
+    }
+    assert!(job.rewrite.is_running());
+    for number in 0..OUTPUT_KEYS {
+        store.put(COLUMN, format!("later-{number}").as_bytes(), b"value").expect("put");
+    }
+    store.seal_now();
+    settle(&io);
+    while job.rewrite.is_running() {
+        job.rewrite.step();
+    }
+    assert!(volume.segments_rewritten.load(Ordering::Acquire) > 0);
+    let table = store.state.complete_table(COLUMN).expect("a table");
+    assert_eq!(table.mark(), None);
+    for number in 0..OUTPUT_KEYS {
+        let expected: &[u8] = if number % 3 == 2 { b"first" } else { b"second" };
+        assert_eq!(read(&store, &key(number)).as_deref(), Some(expected), "key {number}");
+    }
+    volume.is_compaction_held.store(false, Ordering::Release);
     store.close().expect("close");
 }

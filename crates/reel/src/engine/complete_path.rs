@@ -52,7 +52,7 @@ impl<Backend: Io> EngineState<Backend> {
         table.find(read.hash, &mut matches);
         // a stale mark speaks for reads at or above the row that caused it, and a read behind the newest sealed row may not be.
         // The check comes after the slots, so a mark this read saw has its sealed row counted
-        let is_behind = read.is_cue || volume.may_hide_under_sealed(read.read_point);
+        let is_behind = volume.may_hide_under_sealed(read.read_point);
         // a sticky slot says the footers answer for this tag
         if matches.slots().iter().any(CompleteSlot::is_sticky) {
             return self.search_footers(volume, read);
@@ -122,7 +122,8 @@ impl<Backend: Io> EngineState<Backend> {
         }
     }
 
-    /// Find a key's newest row among finished segments through its slots. A stale slot has been charged already, and rows past
+    /// Find a key's newest row among finished segments through its slots. A stale slot only saves a block read here, since the row
+    /// that made it stale stands higher and the highest place wins. Rows past
     /// the mark have no slot, so the footers answer for those
     pub fn newest_walked_complete(
         &self,

@@ -18,7 +18,7 @@ use crate::engine::job_tally::JobTallies;
 use crate::engine::open_segment::{RecordWindow, RowQueue};
 use crate::engine::compact_job::park;
 use crate::engine::open_segment::{data_path, output_path, rows_path};
-use crate::engine::scan_state::ScanState;
+use crate::engine::read_pool::ReadPool;
 use crate::engine::walk_job::{FREE_BLOCK_BYTES, FreeRecord};
 use crate::engine::volume::{ParkedSegment, RewriteOutput, Volume};
 use crate::segment::range_covers::Cover;
@@ -90,7 +90,6 @@ pub struct EngineState<Backend: Io> {
     pub longest_index_wait: AtomicU64,
     pub record_readers: Pool<RecordReader>,
     pub footer_readers: Pool<FooterReader>,
-    pub scans: Mutex<Vec<ScanState>>,
     pub scan_heap: ByteCount,
     pub superblock: Mutex<Superblock>,
     pub superblock_bytes: Mutex<Vec<u8>>,
@@ -114,6 +113,8 @@ pub struct EngineState<Backend: Io> {
     pub job_count: AtomicU64,
     pub row_task: OnceLock<Backend::Task>,
     pub reserve_task: OnceLock<Backend::Task>,
+    pub read_tasks: Vec<OnceLock<Backend::Task>>,
+    pub read_pool: ReadPool,
     pub seal_tasks: Vec<OnceLock<Backend::Task>>,
     pub planner_task: OnceLock<Backend::Task>,
     pub index_waiters: AtomicU64,
@@ -509,6 +510,7 @@ impl<Backend: Io> EngineState<Backend> {
         let footers = self.footer_readers.heap_bytes(FooterReader::heap_bytes);
         report.read_buffers = ByteCount(readers.0 + footers.0);
         report.scans = self.scan_heap;
+        report.read_buffers = ByteCount(report.read_buffers.0 + self.read_pool.heap_bytes().0);
         let encoders = self.encoders.heap_bytes(RecordEncoder::heap_bytes);
         let shares = self.stored_shares.heap_bytes(|share| ByteCount(share.capacity() as u64));
         report.compress_buffers = ByteCount(encoders.0 + shares.0);

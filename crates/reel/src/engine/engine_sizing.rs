@@ -3,6 +3,7 @@
 use reel_api::units::{ByteCount, RowCount};
 
 use crate::engine::open_segment::RECORD_WINDOW_BYTES;
+use crate::engine::read_pool::{READ_SLOTS, READ_WORKERS, SLOT_KEY_BYTES, SLOT_KEYS};
 use crate::engine::scan_state::{MOST_SCANS, planned_scan_bytes};
 use crate::index::entry_slab::{PAGE_BYTES, PageCount};
 use crate::index::node_pool::{NODE_FANOUT, NodeCount};
@@ -64,8 +65,8 @@ pub const SHARED_JOBS: u64 = 3;
 /// Bytes a row of the write index really takes, node, page and table share included, with a long batch's length of it
 pub const PLANNED_ROW_BYTES: u64 = 227;
 /// A volume seals at this share of what the index holds, in eighths, to keep room for writers in flight. With one
-/// lz4 column and 64 B keys that gives these rows a segment: 37,011 at 128 MiB, 129,397 at 192 MiB, 591,325 at 512 MiB and
-/// 5,764,916 at 4 GiB. A segment seals at its byte target or at this limit, whichever comes first, so small
+/// lz4 column and 64 B keys that gives these rows a segment: 29,072 at 128 MiB, 121,458 at 192 MiB, 583,386 at 512 MiB and
+/// 5,756,976 at 4 GiB. A segment seals at its byte target or at this limit, whichever comes first, so small
 /// records seal smaller and reach their size through merges, whose outputs the write index doesn't bound
 /// A volume holds its open segment and one spare at full size even when its sealed data is small: the reserve is twice the
 /// segment size, 128 MiB at a 128 MiB budget, 192 MiB at 192 MiB, and 2 GiB from the default 512 MiB up. The space gate adds
@@ -131,17 +132,18 @@ impl StoreShape {
         let windows = self.open_slots() as u64 * 3 * RECORD_WINDOW_BYTES as u64;
         let reads = READ_BUFFERS as u64 * READ_BUFFER_BYTES;
         let scans = MOST_SCANS as u64 * planned_scan_bytes(self.widest_keys, self.open_slots());
+        let read_slots = READ_SLOTS as u64 * (SLOT_KEY_BYTES + SLOT_KEYS * size_of::<usize>()) as u64;
         let large = if self.has_lz4 { LZ4_STORED_LIMIT.0 } else { 0 };
         let encoders = WRITE_BUFFERS as u64 * ENCODER_BYTES + large;
         let spans = 4 * MOST_DAMAGED_SPANS as u64 * (SPAN_KEY_BYTES as u64 * 2);
         let workers = volumes * self.walk_workers() as u64;
-        let stacks = (SHARED_JOBS + volumes + workers) * JOB_STACK_PLAN_BYTES;
+        let stacks = (SHARED_JOBS + READ_WORKERS as u64 + volumes + workers) * JOB_STACK_PLAN_BYTES;
         // the pool holds both keys of every cover, and a seal job has room to write them all to a footer
         let cover_keys = 2 * MOST_RANGE_COVERS as u64 * self.widest_keys;
         let cover_fixed = (COVER_SLOT_BYTES + COVER_RECORD_BYTES) as u64 * MOST_RANGE_COVERS as u64;
         let covers = 2 * cover_keys + volumes * cover_fixed;
         let jobs = SEAL_JOB_BYTES + WALK_JOB_BYTES + COMPACT_JOB_BYTES;
-        ByteCount(queues + gathers + windows + reads + scans + encoders + covers + volumes * (jobs + spans) + workers * WALK_JOB_BYTES + stacks)
+        ByteCount(queues + gathers + windows + reads + scans + read_slots + encoders + covers + volumes * (jobs + spans) + workers * WALK_JOB_BYTES + stacks)
     }
 
     /// Read the smallest budget this store can run in

@@ -1,13 +1,16 @@
 //! A scan a caller holds: its buffers from the store's pool, and a cue's slot when it reads at one
 
+use std::mem;
 use std::sync::Arc;
 
 use reel_api::scan::ScanStep;
 use reel_api::store_error::StoreError;
 use reel_api::units::WritePlace;
+use reel_api::value_list::ValueList;
 
 use crate::engine::cue::MOST_CUES;
 use crate::engine::engine_state::EngineState;
+use crate::engine::read_pool::ReadWork;
 use crate::engine::scan_path::ScanWant;
 use crate::engine::scan_state::{ScanRange, ScanState};
 use crate::io::Io;
@@ -46,6 +49,24 @@ impl<Backend: Io> StoreScan<Backend> {
             return Ok(ScanStep::End);
         };
         self.state.step_scan(scan, key, ScanWant::Value(value))
+    }
+
+    /// Stream the next block of keys through the read workers, and say whether the walk has more. A walk dropped part way
+    /// gives its buffers back when the worker ends, and a future dropped part way ends the walk
+    pub async fn next_block(&mut self, keys: &mut ValueList) -> Result<bool, StoreError> {
+        keys.clear();
+        let lease = self.state.read_pool.claim().await;
+        let Some(scan) = self.scan.take() else {
+            return Ok(false);
+        };
+        lease.set_work(ReadWork::Block { scan, keys: mem::take(keys) });
+        self.state.wake_reader(lease.submit());
+        let (work, answer) = lease.finished().await;
+        if let ReadWork::Block { scan, keys: list } = work {
+            self.scan = Some(scan);
+            *keys = list;
+        }
+        answer
     }
 
     /// Fill the buffer with the next key

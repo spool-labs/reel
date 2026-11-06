@@ -100,7 +100,7 @@ impl<Backend: Io> EngineState<Backend> {
     /// Take a scan's buffers from the pool and start it
     pub fn take_scan(&self, range: &ScanRange, point: Option<WritePlace>) -> Result<ScanState, StoreError> {
         self.column(range.column)?;
-        let Some(mut scan) = hold(&self.scans).pop() else {
+        let Some(mut scan) = hold(&self.read_pool.scans).pop() else {
             return Err(StoreError::ScansFull { limit: MOST_SCANS as u64 });
         };
         scan.start(range, point);
@@ -109,7 +109,7 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// Hand a scan's buffers back
     pub fn give_back_scan(&self, scan: ScanState) {
-        hold(&self.scans).push(scan);
+        hold(&self.read_pool.scans).push(scan);
     }
 
     /// Take one step of a scan, with a value buffer when it wants values. A job that crosses a try costs a seek from the last

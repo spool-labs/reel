@@ -25,6 +25,7 @@ use crate::engine::engine_sizing::{
 use crate::engine::engine_state::{EngineState, PLACE_RUN, SEGMENT_NUMBER_BATCH, SlotFile};
 use crate::engine::open_segment::{RECORD_WINDOW_BYTES, RecordWindow, RowQueue, fits_a_segment_path};
 use crate::engine::read_path::RecordWant;
+use crate::engine::read_pool::{READ_WORKERS, ReadPool, ReadWorker};
 use crate::engine::recovery::{
     RootScan, SummaryFound, list_roots, load_covers, read_summaries, recover_segments, save_cleared_spans, scan_roots,
     walk_open_rows,
@@ -398,6 +399,12 @@ impl<Backend: Io> EngineState<Backend> {
         if let Some(task) = self.row_task.get() {
             task.stop()?;
         }
+        for cell in &self.read_tasks {
+            if let Some(task) = cell.get() {
+                task.stop()?;
+            }
+        }
+        self.read_pool.refuse_queued();
         if let Some(task) = self.reserve_task.get() {
             task.stop()?;
         }
@@ -586,7 +593,14 @@ pub fn bring_up<Backend: Io>(
     };
     let task = state.io.spawn_job("reel-reserve", reserve_job).map_err(open_error("starting a job"))?;
     let _set = state.reserve_task.set(task);
-    state.job_count.store(SHARED_JOBS + state.volumes.len() as u64 + workers, Ordering::Release);
+    for cell in &state.read_tasks {
+        let worker = ReadWorker {
+            state: Arc::clone(state),
+        };
+        let task = state.io.spawn_job("reel-read", worker).map_err(open_error("starting a job"))?;
+        let _set = cell.set(task);
+    }
+    state.job_count.store(SHARED_JOBS + READ_WORKERS as u64 + state.volumes.len() as u64 + workers, Ordering::Release);
     state.note_graves_at_open();
     Ok(())
 }
@@ -1019,7 +1033,6 @@ pub fn build_state<Backend: Io>(
         longest_index_wait: AtomicU64::new(0),
         record_readers: Pool::new(record_readers),
         footer_readers: Pool::new(footer_readers),
-        scans: Mutex::new(scans),
         scan_heap,
         superblock: Mutex::new(superblock),
         superblock_bytes: Mutex::new(Vec::new()),
@@ -1043,6 +1056,8 @@ pub fn build_state<Backend: Io>(
         job_count: AtomicU64::new(0),
         row_task: OnceLock::new(),
         reserve_task: OnceLock::new(),
+        read_tasks: (0..READ_WORKERS).map(|_worker| OnceLock::new()).collect(),
+        read_pool: ReadPool::new(scans),
         seal_tasks,
         planner_task: OnceLock::new(),
         index_waiters: AtomicU64::new(0),

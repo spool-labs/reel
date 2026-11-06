@@ -236,6 +236,20 @@ impl<Backend: Io> Cue<Backend> {
         self.state.counted(self.state.bytes_at(column, prefix, self.point))
     }
 
+    /// Run a get at this cue without blocking the caller's runtime thread
+    pub async fn read_async(&self, column: ColumnId, key: &[u8], want: RecordWant, buf: &mut Vec<u8>) -> Result<bool, StoreError> {
+        self.check_open()?;
+        self.state.read_async(column, key, want, Some(self.point), buf).await
+    }
+
+    /// Run a batched get at this cue without blocking the caller's runtime thread
+    pub async fn many_async(&self, column: ColumnId, keys: &[&[u8]], values: &mut ValueList) -> Result<(), StoreError> {
+        self.check_open()?;
+        let info = self.state.column(column)?;
+        let handovers = self.state.volumes[info.volume.0 as usize].handover_count();
+        self.state.many_async(column, keys, self.point, handovers, values).await
+    }
+
     /// Refuse a read once the store is going, whose files are closing under it
     pub fn check_open(&self) -> Result<(), StoreError> {
         if self.state.is_stopping.load(Ordering::Acquire) {

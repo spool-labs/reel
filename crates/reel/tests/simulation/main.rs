@@ -2,6 +2,7 @@
 #![cfg(test)]
 
 mod allocations;
+mod async_reads;
 mod batches;
 mod compaction;
 mod counting;

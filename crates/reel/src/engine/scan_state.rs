@@ -6,7 +6,7 @@ use reel_api::units::{ByteCount, FileOffset, WritePlace};
 
 use crate::index::shard_cursor::{ShardCursor, TreeCursor};
 use crate::index::write_index::SHARD_COUNT;
-use crate::pool::touched_capacity;
+use crate::pool::{touched_capacity, touched_filled};
 use crate::row_kind::RowKind;
 use crate::segment::block_entry::{BlockEntry, KeyBound};
 use crate::segment::row_block::{FooterRow, RowBlockWalk};
@@ -92,6 +92,7 @@ pub struct ScanState {
     pub spill: SegmentSource,
     pub is_spilled: bool,
     pub heads: Vec<ShardHead>,
+    pub closest_head: Option<usize>,
     pub key: Vec<u8>,
     pub found: Vec<SegmentNumber>,
     pub origin: Vec<u8>,
@@ -99,6 +100,7 @@ pub struct ScanState {
     pub is_counting: bool,
     pub counted: u64,
     pub taken: u64,
+    pub window: ScanWindow,
 }
 
 impl SegmentSource {
@@ -212,6 +214,7 @@ impl ScanState {
             spill: SegmentSource::new(widest_key),
             is_spilled: false,
             heads: (0..SHARD_COUNT).map(|_head| ShardHead::new(widest_key, open_slots)).collect(),
+            closest_head: None,
             key: touched_capacity(widest_key, 0),
             found: touched_capacity(MOST_SCAN_SOURCES, SegmentNumber(0)),
             origin: touched_capacity(widest_key, 0),
@@ -219,6 +222,7 @@ impl ScanState {
             is_counting: false,
             counted: 0,
             taken: 0,
+            window: ScanWindow::new(),
         }
     }
 
@@ -234,6 +238,7 @@ impl ScanState {
         self.is_counting = false;
         self.counted = 0;
         self.taken = 0;
+        self.window.clear();
         self.limit.clear();
         self.has_limit = match range.limit {
             ScanLimit::None => false,
@@ -299,8 +304,19 @@ impl ScanState {
     /// Find the key the walk reaches next among the places it holds
     pub fn closest_key(&self) -> Option<&[u8]> {
         let sources = self.sources[..self.source_count].iter().map(|source| source.key.as_slice());
-        let heads = self.heads.iter().filter(|head| head.has_key).map(|head| head.key.as_slice());
-        sources.chain(heads).reduce(|best, key| if self.is_before(key, best) { key } else { best })
+        let head = self.closest_head.map(|head| self.heads[head].key.as_slice());
+        sources.chain(head).reduce(|best, key| if self.is_before(key, best) { key } else { best })
+    }
+
+    /// Find the closest of the heads, once any has moved
+    pub fn find_closest_head(&mut self) {
+        let mut closest: Option<usize> = None;
+        for (index, head) in self.heads.iter().enumerate() {
+            if head.has_key && closest.is_none_or(|best| self.is_before(&head.key, &self.heads[best].key)) {
+                closest = Some(index);
+            }
+        }
+        self.closest_head = closest;
     }
 
     /// Check a key lies past the walk's far end
@@ -335,6 +351,10 @@ impl ScanState {
         self.position.clear();
         self.position.extend_from_slice(key);
         self.is_inclusive = false;
+        // the closest head stands at or before every other, so a key that isn't it is on none of them
+        if self.closest_head.is_none_or(|head| self.heads[head].key != key) {
+            return;
+        }
         for head in &mut self.heads {
             if head.has_key && head.key == key {
                 head.is_placed = false;
@@ -356,7 +376,7 @@ impl ScanState {
         let own = self.position.capacity() + self.limit.capacity() + self.key.capacity() + self.spill.key.capacity() + self.origin.capacity() + self.out_key.capacity();
         let found = self.found.capacity() * size_of::<SegmentNumber>();
         let head = self.heads.capacity() * size_of::<ShardHead>();
-        ByteCount(self.sources.capacity() as u64 * source + (keys + heads + own + found + head) as u64)
+        ByteCount(self.sources.capacity() as u64 * source + (keys + heads + own + found + head + self.window.heap_bytes()) as u64)
     }
 }
 
@@ -414,6 +434,109 @@ pub fn planned_scan_bytes(widest_key: u64, open_slots: usize) -> u64 {
     let keys = (MOST_SCAN_SOURCES + SHARD_COUNT + 6) as u64 * widest_key;
     let sources = (MOST_SCAN_SOURCES + 1) * size_of::<SegmentSource>();
     let heads = SHARD_COUNT * (size_of::<ShardHead>() + open_slots * size_of::<TreeCursor>());
-    keys + (sources + heads + MOST_SCAN_SOURCES * size_of::<SegmentNumber>()) as u64
+    keys + (sources + heads + MOST_SCAN_SOURCES * size_of::<SegmentNumber>() + SCAN_WINDOW_BYTES) as u64
 }
 
+
+/// Bytes a scan's window reads at its widest
+pub const SCAN_WINDOW_BYTES: usize = 64 * 1024;
+/// Bytes a window reads until rows show they lie side by side
+pub const LEAST_WINDOW_BYTES: usize = 4 * 1024;
+/// The largest record a window takes, so a big value goes through its own read
+pub const MOST_WINDOW_RECORD: usize = LEAST_WINDOW_BYTES;
+
+/// A stretch of one segment's records a scan has read. Rows that lie side by side come from it with no read call each, and
+/// its reach grows only while they do, so a walk over scattered rows reads what it would have read anyway
+#[derive(Clone, Debug)]
+pub struct ScanWindow {
+    bytes: Vec<u8>,
+    segment: Option<SegmentNumber>,
+    start: u64,
+    length: usize,
+    reach: usize,
+}
+
+impl ScanWindow {
+    /// Allocate the window's bytes
+    pub fn new() -> Self {
+        Self {
+            bytes: touched_filled(SCAN_WINDOW_BYTES, 0),
+            segment: None,
+            start: 0,
+            length: 0,
+            reach: LEAST_WINDOW_BYTES,
+        }
+    }
+
+    /// Read the heap the window holds
+    pub fn heap_bytes(&self) -> usize {
+        self.bytes.capacity()
+    }
+
+    /// Forget what the window holds
+    pub fn clear(&mut self) {
+        self.segment = None;
+        self.length = 0;
+        self.reach = LEAST_WINDOW_BYTES;
+    }
+
+    /// Find a record's bytes, when the window holds them whole
+    pub fn holding(&self, segment: SegmentNumber, offset: u64, length: usize) -> Option<&[u8]> {
+        if self.segment != Some(segment) {
+            return None;
+        }
+        let at = offset.checked_sub(self.start)? as usize;
+        self.bytes.get(at..at + length).filter(|_record| at + length <= self.length)
+    }
+
+    /// Check a record lies just past the window in the walk's direction, which is what earns a longer read
+    pub fn is_next_to(&self, segment: SegmentNumber, offset: u64, length: usize, direction: Direction) -> bool {
+        if self.segment != Some(segment) {
+            return false;
+        }
+        let span = self.length as u64;
+        match direction {
+            Direction::Ascending => {
+                let end = self.start + span;
+                offset >= end && offset < end + span
+            },
+            Direction::Descending => {
+                let record_end = offset + length as u64;
+                record_end <= self.start && record_end + span > self.start
+            },
+        }
+    }
+
+    /// Work out what to read for a record, and give the bytes to read into
+    pub fn plan(
+        &mut self,
+        segment: SegmentNumber,
+        (offset, length): (u64, usize),
+        direction: Direction,
+        data_end: u64,
+    ) -> (FileOffset, &mut [u8]) {
+        self.reach = if self.is_next_to(segment, offset, length, direction) {
+            (self.reach * 2).min(SCAN_WINDOW_BYTES)
+        } else {
+            LEAST_WINDOW_BYTES
+        };
+        let reach = self.reach as u64;
+        let (start, end) = match direction {
+            Direction::Ascending => (offset, (offset + reach).min(data_end)),
+            Direction::Descending => {
+                let end = offset + length as u64;
+                (end.saturating_sub(reach), end)
+            },
+        };
+        self.segment = Some(segment);
+        self.start = start;
+        self.length = (end - start) as usize;
+        (FileOffset(start), &mut self.bytes[..self.length])
+    }
+}
+
+impl Default for ScanWindow {
+    fn default() -> Self {
+        Self::new()
+    }
+}

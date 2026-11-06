@@ -13,11 +13,14 @@ use reel_api::units::{ByteCount, RowCount, WritePlace};
 
 use crate::engine::engine_state::EngineState;
 use crate::engine::read_path::{HeldPin, KeyRead, Located, MOST_READ_TRIES, RecordWant, SealedRow, newest_of};
-use crate::engine::scan_state::{BlockTake, MOST_SCANS, NO_GENERATION, ScanRange, ScanState, SegmentSource, under_prefix};
+use crate::engine::scan_state::{BlockTake, MOST_SCANS, MOST_WINDOW_RECORD, NO_GENERATION, ScanRange, ScanState, ScanWindow, SegmentSource, under_prefix};
 use crate::engine::volume::Volume;
 use crate::guard::hold;
 use crate::index::write_shard::WalkBound;
 use crate::io::{DeviceReads, InPlace, Io, in_place};
+use crate::record::record_check::RecordIdentity;
+use crate::record::record_reader::{RecordRead, RecordReader};
+use crate::row_kind::RowKind;
 use crate::segment::block_cache::BlockKey;
 use crate::segment::block_entry::{BlockEntry, KeyBound, SHARED_HEAD_BYTES};
 use crate::segment::column_directory::ColumnDirectory;
@@ -247,7 +250,7 @@ impl<Backend: Io> EngineState<Backend> {
         }
 
         let answer = match want {
-            ScanWant::Value(value) => self.read_located(device, volume, &read, &located, value).await,
+            ScanWant::Value(value) => self.read_located(device, volume, &read, &located, &mut scan.window, scan.direction, value).await,
             ScanWant::Key => {
                 scan.counted += 1;
                 Ok(true)
@@ -281,12 +284,59 @@ impl<Backend: Io> EngineState<Backend> {
         volume: &Volume<Backend>,
         read: &KeyRead<'_>,
         located: &Located,
+        window: &mut ScanWindow,
+        direction: Direction,
         value: &mut Vec<u8>,
     ) -> Result<bool, StoreError> {
         match located {
             Located::Absent => Ok(false),
             Located::Open(row) => self.read_open(device, read, row, RecordWant::Whole, value).await,
-            Located::Sealed(row) => self.read_sealed(device, volume, read, row, RecordWant::Whole, value).await,
+            Located::Sealed(row) => {
+                if let Some(answer) = self.read_from_window(device, volume, read, row, window, direction, value).await {
+                    return Ok(answer);
+                }
+                self.read_sealed(device, volume, read, row, RecordWant::Whole, value).await
+            },
+        }
+    }
+
+    /// Answer a small plain record from the scan's window, reading the next stretch when it lacks it. Anything else comes back
+    /// as nothing for the record's own read to settle: a bad stretch can be a neighbour's, and a failed check says nothing
+    /// about this row until its own read does
+    #[allow(clippy::too_many_arguments, reason = "a read, its row, and the window and direction a scan keeps")]
+    pub async fn read_from_window(
+        &self,
+        device: &impl DeviceReads<Backend::File>,
+        volume: &Volume<Backend>,
+        read: &KeyRead<'_>,
+        sealed: &SealedRow,
+        window: &mut ScanWindow,
+        direction: Direction,
+        value: &mut Vec<u8>,
+    ) -> Option<bool> {
+        let (offset, length) = (sealed.row.offset.0, sealed.row.length.0 as usize);
+        if length > MOST_WINDOW_RECORD {
+            return None;
+        }
+        if window.holding(sealed.segment, offset, length).is_none() {
+            let pin = volume.table.pin(sealed.segment)?;
+            let (at, bytes) = window.plan(sealed.segment, (offset, length), direction, pin.head.data_end.0);
+            if device.read_exact(&pin.file, at, bytes).await.is_err() {
+                window.clear();
+                return None;
+            }
+        }
+        let identity = RecordIdentity {
+            record_key: self.record_key,
+            column: read.column,
+            key: read.key,
+            kind: RowKind::Value,
+            place: sealed.row.place,
+        };
+        let record = window.holding(sealed.segment, offset, length)?;
+        match RecordReader::check_plain(record, &identity, value)? {
+            RecordRead::Valid => Some(true),
+            RecordRead::Failed => None,
         }
     }
 
@@ -323,11 +373,16 @@ impl<Backend: Io> EngineState<Backend> {
             direction: scan.direction,
         };
         let view = volume.view();
+        let mut has_moved = false;
         for (shard, head) in scan.heads.iter_mut().enumerate() {
             if !head.is_placed {
                 head.has_key = self.index.next_key(shard, &mut head.cursor, &bound, view, &mut head.key);
                 head.is_placed = true;
+                has_moved = true;
             }
+        }
+        if has_moved {
+            scan.find_closest_head();
         }
     }
 

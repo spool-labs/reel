@@ -193,6 +193,22 @@ impl RecordReader {
         RecordForm::from_byte(*self.first.get(FORM_AT)?)
     }
 
+    /// Check a small plain record where it lies and hand its value over, with no reader, or return nothing for any other form
+    pub fn check_plain(record: &[u8], identity: &RecordIdentity<'_>, buf: &mut Vec<u8>) -> Option<RecordRead> {
+        let form = RecordForm::from_byte(*record.get(FORM_AT)?)?;
+        if form.is_chunked || form.codec != Codec::None {
+            return None;
+        }
+        let payload = record.get(SMALL_HEAD_BYTES..)?;
+        let check = place_check(record_check(identity, form, checksum(payload)), identity.record_key, identity.place);
+        if read_check(record) != Some(check) {
+            return Some(RecordRead::Failed);
+        }
+        buf.clear();
+        buf.extend_from_slice(payload);
+        Some(RecordRead::Valid)
+    }
+
     /// Check a one-chunk record and hand its value over
     pub fn finish_small(
         &mut self,

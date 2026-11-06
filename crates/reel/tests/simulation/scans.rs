@@ -2,14 +2,14 @@
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
 use reel::engine::read_path::MOST_READ_TRIES;
-use reel::engine::scan_state::{MOST_SCAN_SOURCES, MOST_SCANS};
+use reel::engine::scan_state::{MOST_SCAN_SOURCES, MOST_SCANS, MOST_WINDOW_RECORD};
 use reel::engine::store_scan::StoreScan;
 use reel::engine::walk_job::FREE_IN_PLACE_BYTES;
 use reel::guard::hold;
@@ -42,6 +42,8 @@ const RANDOM_KEYS: u64 = 300;
 const RANDOM_ROUNDS: u64 = 400;
 const FIXED_SEEDS: [u64; 6] = [0, 1, 2, 3, 4, 5];
 const HOOK_STEPS: u64 = 20_000;
+const WINDOW_KEYS: u64 = 2_000;
+const BAD_RECORD_AT: u64 = 4_000;
 
 type Store = ReelStore<SimulatedIo>;
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -716,4 +718,99 @@ fn rot_value(io: &SimulatedIo, needle: &[u8]) {
     io.close_file(file);
     let at = bytes.windows(needle.len()).position(|window| window == needle).expect("the value");
     io.rot(&path, FileOffset(at as u64), BitMask(1)).expect("rot");
+}
+
+fn walk_values(store: &Store, direction: Direction) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let start: &[u8] = match direction {
+        Direction::Ascending => b"",
+        Direction::Descending => b"\xff",
+    };
+    let mut scan = store.iter_from(COLUMN, start, direction).expect("scan");
+    let (mut name, mut value, mut rows) = (Vec::new(), Vec::new(), Vec::new());
+    loop {
+        match scan.next_row(&mut name, &mut value).expect("step") {
+            ScanStep::Found => rows.push((name.clone(), value.clone())),
+            ScanStep::Corrupt => panic!("a row failed its check"),
+            ScanStep::End => return rows,
+        }
+    }
+}
+
+fn sealed_in_order(io: &SimulatedIo) -> Store {
+    let store = open(io);
+    for number in 0..WINDOW_KEYS {
+        store.put(COLUMN, &key(number), format!("value-{number:06}").as_bytes()).expect("put");
+    }
+    seal(&store, io);
+    store.close().expect("close");
+    drop(store);
+    open(io)
+}
+
+// rows side by side come out of a window, far fewer reads than rows, in both directions
+#[test]
+fn window_saves_reads() {
+    for direction in [Direction::Ascending, Direction::Descending] {
+        let io = SimulatedIo::new(Seed(70));
+        let store = sealed_in_order(&io);
+        let before = io.read_count().0;
+        let rows = walk_values(&store, direction);
+        let reads = io.read_count().0 - before;
+
+        assert_eq!(rows.len() as u64, WINDOW_KEYS);
+        for (index, (name, value)) in rows.iter().enumerate() {
+            let number = match direction {
+                Direction::Ascending => index as u64,
+                Direction::Descending => WINDOW_KEYS - 1 - index as u64,
+            };
+            assert_eq!(*name, key(number));
+            assert_eq!(*value, format!("value-{number:06}").into_bytes());
+        }
+        assert!(reads < WINDOW_KEYS / 4, "{reads} reads for {WINDOW_KEYS} rows going {direction:?}");
+        store.close().expect("close");
+    }
+}
+
+// a value too large for the window still reads back through its own read
+#[test]
+fn window_passes_a_large_value() {
+    let io = SimulatedIo::new(Seed(71));
+    let store = open(&io);
+    let large = vec![9; MOST_WINDOW_RECORD * 3];
+    store.put(COLUMN, b"a", b"small").expect("put");
+    store.put(COLUMN, b"b", &large).expect("put");
+    store.put(COLUMN, b"c", b"small").expect("put");
+    seal(&store, &io);
+    let rows = walk_values(&store, Direction::Ascending);
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[1].1, large);
+    store.close().expect("close");
+}
+
+// a bad sector under a neighbour leaves this row to its own read, so the window never fails a row that reads
+#[test]
+fn window_read_fails_only_the_bad_row() {
+    let io = SimulatedIo::new(Seed(72));
+    let store = sealed_in_order(&io);
+    let path = io
+        .list_directory(Path::new(ROOT))
+        .expect("list")
+        .into_iter()
+        .find(|path| path.extension().is_some_and(|name| name == "data"))
+        .expect("a segment");
+    io.bad_sector(&path, FileOffset(BAD_RECORD_AT)).expect("bad");
+
+    let mut scan = store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan");
+    let (mut name, mut value, mut found, mut corrupt) = (Vec::new(), Vec::new(), 0, 0);
+    loop {
+        match scan.next_row(&mut name, &mut value).expect("step") {
+            ScanStep::Found => found += 1,
+            ScanStep::Corrupt => corrupt += 1,
+            ScanStep::End => break,
+        }
+    }
+    drop(scan);
+    assert_eq!(found + corrupt, WINDOW_KEYS);
+    assert!(corrupt > 0 && corrupt < WINDOW_KEYS / 10, "{corrupt} rows lost to one sector");
+    store.close().expect("close");
 }

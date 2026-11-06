@@ -102,6 +102,7 @@ impl<File: IoFile> DeviceReads<File> for InPlace {
 }
 
 /// Run a read on this thread, for a read path whose device reads finish where they stand
+#[inline(always)]
 pub fn in_place<Output>(read: impl Future<Output = Output>) -> Output {
     let mut read = pin!(read);
     let mut context = Context::from_waker(Waker::noop());

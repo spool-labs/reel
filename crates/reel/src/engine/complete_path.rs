@@ -64,6 +64,10 @@ impl<Backend: Io> EngineState<Backend> {
         if matches.slots().iter().any(CompleteSlot::is_sticky) {
             return self.search_footers(device, volume, read).await;
         }
+        // a miss asks no footer, so it takes no reader
+        if matches.slots().is_empty() && table.mark().is_none() {
+            return Ok(None);
+        }
         let mut reader = self.footer_reader_for(device);
         let mut best = None;
         for slot in matches.slots() {

@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, FileOffset, RowCount, VolumeId, WritePlace};
+use reel_api::units::{ByteCount, DeathMark, FileOffset, RowCount, VolumeId, WritePlace};
 use reel_api::write_batch::{BatchOperation, WriteBatch};
 use xxhash_rust::xxh3::Xxh3;
 
@@ -64,6 +64,9 @@ impl<Backend: Io> EngineState<Backend> {
         };
         let volume = &self.volumes[plan.volume.0 as usize];
         check_writable(volume)?;
+        if batch.mark().is_some() && batch_mark(batch, &plan).is_none() {
+            volume.marks_dropped.fetch_add(1, Ordering::Relaxed);
+        }
         if !volume.covers.hold(plan.covers) {
             return Err(StoreError::RangeDeletesFull { volume: volume.id });
         }
@@ -309,6 +312,7 @@ impl<Backend: Io> EngineState<Backend> {
             is_alone: is_long,
             has_records: bytes.0 > 0,
             covers: plan.covers,
+            mark: batch_mark(batch, plan),
         };
         // a long group goes out under its own turn, and a short one needs room in the group filling
         let (claim, room) = if is_long {
@@ -516,9 +520,9 @@ impl<Backend: Io> EngineState<Backend> {
         stage: &mut RowGroupBuffer,
     ) -> std::io::Result<()> {
         let queue = &self.queues[slot.0 as usize];
-        let (rows_end, synced_through) = {
+        let (rows_end, synced_through, marks) = {
             let guard = hold(queue);
-            (guard.rows_end, guard.synced_through)
+            (guard.rows_end, guard.synced_through, guard.marks)
         };
         let total = ByteCount((plan.row_bytes + GROUP_OVERHEAD_BYTES) as u64);
         let group = LongGroup::new(rows, rows_end, self.record_key);
@@ -528,6 +532,7 @@ impl<Backend: Io> EngineState<Backend> {
             row_count: plan.rows,
             total_length: total,
             synced_through,
+            marks,
         });
         let sent = send_pieces(group, batch_rows, stage);
         // a failed write may still have landed, and a whole group left behind would bring the batch back at open
@@ -721,4 +726,9 @@ impl BatchCursor {
         self.place = WritePlace(self.place.0 + 1);
         row
     }
+}
+
+/// Read the mark a batch lands under. A grave carries no mark and a batch never splits, so one that holds a delete has none
+pub fn batch_mark(batch: &WriteBatch, plan: &BatchPlan) -> Option<DeathMark> {
+    batch.mark().filter(|_mark| plan.deletes == 0 && plan.covers == 0)
 }

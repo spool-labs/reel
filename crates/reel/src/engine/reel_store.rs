@@ -12,7 +12,7 @@ use reel_api::memory_report::MemoryReport;
 use reel_api::reads::ValueWindow;
 use reel_api::store_error::StoreError;
 use reel_api::value_list::ValueList;
-use reel_api::units::{ByteCount, Nanoseconds, RowCount, VolumeId, WritePlace};
+use reel_api::units::{ByteCount, DeathMark, Nanoseconds, RowCount, VolumeId, WritePlace};
 use reel_api::usage::{ColumnUsage, UsageReport};
 use reel_api::write_batch::WriteBatch;
 
@@ -217,7 +217,23 @@ impl<Backend: Io> ReelStore<Backend> {
     /// Write a value, visible to every later read when this returns
     pub fn put(&self, column: ColumnId, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
         self.check_writes()?;
-        self.state.write_value(column, key, value)
+        self.state.write_value(column, key, value, None)
+    }
+
+    /// Write a value that dies at a mark, so it sits with records that die near it
+    pub fn put_marked(&self, column: ColumnId, key: &[u8], value: &[u8], mark: DeathMark) -> Result<(), StoreError> {
+        self.check_writes()?;
+        self.state.write_value(column, key, value, Some(mark))
+    }
+
+    /// Write a value that dies at a mark and take its buffer
+    pub fn put_owned_marked(&self, column: ColumnId, key: &[u8], value: Vec<u8>, mark: DeathMark) -> Result<(), StoreError> {
+        self.put_marked(column, key, &value, mark)
+    }
+
+    /// Tell the store the current mark, which seals every open group whose ceiling it has reached
+    pub fn set_current_mark(&self, mark: DeathMark) {
+        self.state.set_current_mark(mark);
     }
 
     /// Count a volume's pending range deletes
@@ -1022,6 +1038,11 @@ pub fn build_state<Backend: Io>(
             sealing: AtomicU64::new(NO_SEAL),
             lanes: (0..=sizing.walk_workers).map(|_lane| RewriteLane::new()).collect(),
             gave_up: Mutex::new(GaveUp::new()),
+            early_bar_rewrites: AtomicU64::new(0),
+            plain_bar_rewrites: AtomicU64::new(0),
+            marked_seals: AtomicU64::new(0),
+            marked_seal_bytes: AtomicU64::new(0),
+            marks_dropped: AtomicU64::new(0),
             is_spinning: is_spinning(&io, volume),
             is_device_set: volume.device != DeviceClass::Detect,
             seal_point: AtomicU64::new(volume_rows(config, index, sizing.segment_rows).0),
@@ -1132,6 +1153,7 @@ pub fn build_state<Backend: Io>(
         batch_rows: Pool::new((0..WRITE_BUFFERS).map(|_buffer| RowGroupBuffer::new(GROUP_BYTES)).collect()),
         batch_records: Pool::new((0..WRITE_BUFFERS).map(|_buffer| touched_zeroes(GATHER_BYTES)).collect()),
         batch_lengths: Pool::new(vec![touched_filled(sizing.segment_rows.0 as usize, 0)]),
+        current_mark: AtomicU64::new(0),
         longest_turn: AtomicU64::new(0),
         index_waits: AtomicU64::new(0),
         longest_index_wait: AtomicU64::new(0),

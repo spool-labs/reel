@@ -10,6 +10,7 @@ mod complete_table;
 mod damage_list;
 mod device_error;
 mod engine_sizing;
+mod lifetime;
 mod lz4_block;
 mod open_segment;
 mod pool;

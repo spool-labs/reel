@@ -22,6 +22,7 @@ use crate::engine::write_path::{ClaimRequest, LandOutcome};
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
 use crate::index::write_row::WriteRow;
+use crate::lifetime::MarkRange;
 use crate::io::job::{Job, JobStep};
 use crate::io::device_error::{SECTOR_BYTES, is_device_error, read_or_damaged};
 use crate::io::{Io, IoFile};
@@ -212,6 +213,7 @@ pub struct RecoveredRows {
     pub highest_place: WritePlace,
     pub lost_region: Option<(FileOffset, FileOffset)>,
     pub cover_rows: usize,
+    pub marks: MarkRange,
 }
 
 impl<File> RootScan<File> {
@@ -624,6 +626,7 @@ impl<Backend: Io> EngineState<Backend> {
             highest_place: WritePlace(0),
             lost_region: None,
             cover_rows: 0,
+            marks: MarkRange::NONE,
         };
         let mut records = RecordReader::new();
         let target = ReplayTarget {
@@ -647,7 +650,11 @@ impl<Backend: Io> EngineState<Backend> {
         let rewrite_from = synced_through;
         let unsynced = ByteCount(kept_end.0 - rewrite_from.0);
         rewrite_range(&scanned.rows, rewrite_from, unsynced, &mut vec![0; GROUP_BYTES.0 as usize])?;
-        hold(&self.queues[slot.0 as usize]).reset(kept_end, synced_through);
+        {
+            let mut queue = hold(&self.queues[slot.0 as usize]);
+            queue.reset(kept_end, synced_through);
+            queue.marks = recovered.marks;
+        }
         self.reset_windows(slot);
         // what open keeps, a read can see: this sync covers it on disk, so no crash or rot can take it back
         self.write_out_turn(slot, &scanned.rows, Some(&found.data))?;
@@ -669,6 +676,8 @@ impl<Backend: Io> EngineState<Backend> {
             in_flight: 0,
             lowest_place: recovered.lowest_place,
             highest_place: recovered.highest_place,
+            ceiling: recovered.marks.highest(),
+            marks: recovered.marks,
         });
         Ok(true)
     }
@@ -728,6 +737,7 @@ impl<Backend: Io> EngineState<Backend> {
                 // rows of this group are in the index, and damage over the columns keeps them from a read
                 RowsWalked::Unreadable => recovered.lost_region = Some((at, FileOffset(at.0 + head.total_length.0))),
             }
+            recovered.marks = recovered.marks.join(head.marks);
             at = FileOffset(at.0 + head.total_length.0);
         }
         Ok(Some(at))
@@ -1129,6 +1139,7 @@ pub fn copy_row<Backend: Io>(
         is_alone: false,
         has_records: row.length.0 > 0,
         covers: usize::from(row.kind == RowKind::RangeDelete),
+        mark: None,
     };
     loop {
         let claim = state.claim(target, &request).map_err(open_failure)?;
@@ -1657,6 +1668,7 @@ pub fn settle_sealed<Backend: Io>(
         row_block_end: found.head.index_at,
         seal_mark: found.head.index_sum,
         places: found.head.places,
+        marks: found.head.marks,
         is_damaged: false,
         has_covers: found.head.ranges_length.0 > 0,
         damage_place: WritePlace(0),

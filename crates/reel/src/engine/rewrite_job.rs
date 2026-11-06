@@ -15,7 +15,7 @@ use std::sync::atomic::Ordering;
 use reel_api::column_id::ColumnId;
 use reel_api::maintenance_report::JobKind;
 use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, FileOffset, RootId, RowCount, WritePlace};
+use reel_api::units::{ByteCount, DeathMark, FileOffset, RootId, RowCount, WritePlace};
 
 use crate::config::MAX_KEY_BYTES;
 use crate::engine::compact_job::park;
@@ -27,6 +27,7 @@ use crate::engine::seal_job::MOST_SEGMENT_BLOCKS;
 use crate::engine::volume::{GRAVE_SLOT, GaveUp, MOST_MERGE_OUTPUTS, NO_SEAL, OutputSlots, RewriteOutput, Volume};
 use crate::engine::walk_job::add_count;
 use crate::guard::hold;
+use crate::lifetime::MarkRange;
 use crate::io::{Io, IoFile};
 use crate::pool::{touched_capacity, touched_filled, touched_zeroes};
 use crate::row_kind::RowKind;
@@ -40,8 +41,13 @@ use crate::segment::segment_table::SegmentPin;
 use crate::segment::segment_tail::{BlockCount, ColumnTail, MAX_COLUMNS, MOST_MERGE_SEGMENTS, SegmentNumber};
 use crate::segment::summary::{ColumnFacts, DeadCount, SUMMARY_KEY_BYTES, SegmentFacts, SummaryRow, SummaryRows};
 
-/// A segment is rewritten once this part of its bytes is dead, the one bar there is: 2 is a half
-pub const REWRITE_DIVISOR: u64 = 2;
+/// A bar counts in quarters of a segment's bytes
+pub const BAR_QUARTERS: u64 = 4;
+/// A segment is rewritten once this many quarters of its bytes are dead, the plain bar: a half
+pub const PLAIN_BAR_QUARTERS: u64 = 2;
+/// A marked segment waits for this many while its highest mark stands, since it dies whole soon. A rewrite there copies at
+/// most a third of a byte for each byte freed, so a record freed early still comes back
+pub const EARLY_BAR_QUARTERS: u64 = 3;
 /// Bytes a footer row takes, about, so a rewrite weighs rows it drops beside records. A segment of graves holds rows and no records
 pub const ROW_FOOTER_BYTES: u64 = 41;
 /// Bytes of one job's merge buffer, which carries records and then row blocks. With a row block for each input, a job's
@@ -95,12 +101,20 @@ pub struct StripeRow {
     pub ordinal: u32,
 }
 
+/// Marked segments a rewrite took, by the bar each one passed
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BarsFired {
+    pub early: u64,
+    pub plain: u64,
+}
+
 /// What a merge is copying
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MergeTarget {
     pub blocks_at: FileOffset,
     pub data: ByteCount,
     pub length: ByteCount,
+    pub marks: MarkRange,
 }
 
 /// How far a merge has gone
@@ -280,6 +294,7 @@ pub struct RewriteJob<Backend: Io> {
     /// A damaged segment the next pick copies whole, and the spans its lost blocks leave
     pub rebuild: Option<SegmentNumber>,
     pub rebuild_blocks: u32,
+    pub bars_fired: BarsFired,
     pub lost_spans: Vec<DamagedRange>,
     is_unwalked: bool,
     crowded_key: Vec<u8>,
@@ -359,6 +374,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             is_key_order_held: false,
             rebuild: None,
             rebuild_blocks: 0,
+            bars_fired: BarsFired::default(),
             lost_spans: Vec::new(),
             is_unwalked: false,
             crowded_key: touched_capacity(SUMMARY_KEY_BYTES, 0),
@@ -447,6 +463,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
         let rows = hold(&volume.summary);
         self.is_unwalked = false;
+        self.bars_fired = BarsFired::default();
         // its rows counted for nothing a walk can trust, so the output goes through the forward walk they owe
         if let Some(row) = self.rebuild.and_then(|segment| rows.get(segment)) {
             self.is_unwalked = true;
@@ -465,17 +482,21 @@ impl<Backend: Io> RewriteJob<Backend> {
         if let Some(row) = self.forced.take().and_then(|forced| rows.get(forced)).filter(|row| is_mergeable(volume, row)) {
             return Some((self.gather(volume, &rows, &row, 1, |_row| false), false));
         }
+        let current = DeathMark(self.state.current_mark.load(Ordering::Relaxed));
         let gave_up = self.gave_up_list(volume);
         let is_ready = |row: &SummaryRow<'_>| {
-            row.facts.is_walked() && !gave_up.holds(row.facts.segment) && is_rewrite_ready(volume, row, 0) && is_rewrite_ready(volume, row, freed_in_place(volume, row))
+            row.facts.is_walked() && !gave_up.holds(row.facts.segment) && is_rewrite_ready(volume, row, 0, current) && is_rewrite_ready(volume, row, freed_in_place(volume, row), current)
         };
         let ready = rows.rows().filter(is_ready);
         // the most won back for the bytes read goes first, past the one last tried, so a merge that gave way lets the next one up
         let after = ready.clone().filter(|row| row.facts.segment > self.last_tried).max_by_key(reclaim_share);
         if let Some(first) = after.or_else(|| ready.max_by_key(reclaim_share)) {
             let is_grave_heavy = is_grave_heavy(&first);
-            let is_more = |row: &SummaryRow<'_>| is_ready(row) && row.facts.segment > first.facts.segment;
-            return Some((self.gather(volume, &rows, &first, room, is_more), is_grave_heavy));
+            let lifetime = first.facts.marks;
+            let is_more = |row: &SummaryRow<'_>| is_ready(row) && row.facts.segment > first.facts.segment && row.facts.marks.shares_lifetime(lifetime);
+            let target = self.gather(volume, &rows, &first, room, is_more);
+            self.note_bars(&rows, current);
+            return Some((target, is_grave_heavy));
         }
         None
     }
@@ -495,10 +516,13 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.has_looks_left = rows.rows().any(|row| row.facts.segment > looked_up_to);
         let (crowded, column) = found?;
         let point = &self.crowded_key;
-        let is_near = |row: &SummaryRow<'_>| can_merge(row) && covers_point(row, column, point);
+        let lifetime = crowded.facts.marks;
+        let is_near = |row: &SummaryRow<'_>| can_merge(row) && covers_point(row, column, point) && row.facts.marks.shares_lifetime(lifetime);
         // unwalked segments go first, since they need nothing from the walk
         let is_unwalked = rows.rows().filter(|row| is_near(row) && !row.facts.is_walked()).take(2).count() == 2;
         if !is_unwalked && volume.has_walk_target.load(Ordering::Acquire) {
+            // the walk goes first and asks again when it ends, and a look left here would keep the planner from it
+            self.has_looks_left = false;
             return None;
         }
         let is_more = |row: &SummaryRow<'_>| is_near(row) && row.facts.is_walked() != is_unwalked;
@@ -516,6 +540,20 @@ impl<Backend: Io> RewriteJob<Backend> {
         Some(target)
     }
 
+    /// Count the marked segments picked, by the bar each one passed
+    pub fn note_bars(&mut self, rows: &SummaryRows, current: DeathMark) {
+        for number in &self.numbers[..self.input_count] {
+            let Some(marks) = rows.get(*number).map(|row| row.facts.marks).filter(|marks| !marks.is_empty()) else {
+                continue;
+            };
+            if bar_quarters(marks, current) == EARLY_BAR_QUARTERS {
+                self.bars_fired.early += 1;
+            } else {
+                self.bars_fired.plain += 1;
+            }
+        }
+    }
+
     /// Take a first segment and the next ones a test passes, while they fit one output, and note the last as tried
     pub fn gather(
         &mut self,
@@ -529,6 +567,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         let mut data = 0;
         let mut length = 0;
         let mut blocks = 0;
+        let mut marks = MarkRange::NONE;
         let mut next = Some(*first);
         while let Some(row) = next {
             let facts = row.facts;
@@ -541,6 +580,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             data += facts.data_end.0;
             length += facts.file_length.0;
             blocks += facts.block_count;
+            marks = marks.join(facts.marks);
             self.last_tried = facts.segment;
             if self.input_count == most {
                 break;
@@ -558,6 +598,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             blocks_at: FileOffset(data.min(2 * volume.segment_bytes.0)),
             data: ByteCount(data),
             length: ByteCount(length),
+            marks,
         }
     }
 
@@ -569,6 +610,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.output = Some(output);
         let base = self.lowest_place_base(volume)?;
         self.writer.start(target.blocks_at, base);
+        self.writer.set_marks(target.marks);
         self.clear(target);
         self.phase = RewritePhase::Copying;
         Ok(())
@@ -1195,6 +1237,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.output = Some(next);
         let base = self.lowest_place_base(volume)?;
         self.writer.start(target.blocks_at, base);
+        self.writer.set_marks(target.marks);
         self.records_end = FileOffset(0);
         self.used = 0;
         self.moved = 0;
@@ -1390,6 +1433,8 @@ impl<Backend: Io> RewriteJob<Backend> {
         *hold(&volume.lanes[self.lane].merging) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
         *hold(&volume.lanes[self.lane].inputs) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
         volume.segments_rewritten.fetch_add(1, Ordering::AcqRel);
+        volume.early_bar_rewrites.fetch_add(self.bars_fired.early, Ordering::Relaxed);
+        volume.plain_bar_rewrites.fetch_add(self.bars_fired.plain, Ordering::Relaxed);
         volume.wants_compaction.store(true, Ordering::Release);
         for (segment, retired) in inputs.iter().zip(retired) {
             if let Some(retired) = retired {
@@ -1584,6 +1629,7 @@ pub fn output_facts(number: SegmentNumber, totals: &FooterTotals, data_end: File
         row_block_end: totals.head.index_at,
         seal_mark: totals.head.index_sum,
         places: totals.head.places,
+        marks: totals.head.marks,
         is_damaged: false,
         has_covers: false,
         damage_place: WritePlace(0),
@@ -1632,7 +1678,7 @@ pub fn is_overlap_input(row: &SummaryRow<'_>) -> bool {
 }
 
 /// Check a row's counts say a merge would win back its share of the rows or the bytes, past the bytes already freed in place
-pub fn is_rewrite_ready<Backend: Io>(volume: &Volume<Backend>, row: &SummaryRow<'_>, freed_bytes: u64) -> bool {
+pub fn is_rewrite_ready<Backend: Io>(volume: &Volume<Backend>, row: &SummaryRow<'_>, freed_bytes: u64, current: DeathMark) -> bool {
     if !is_mergeable(volume, row) {
         return false;
     }
@@ -1653,7 +1699,7 @@ pub fn is_rewrite_ready<Backend: Io>(volume: &Volume<Backend>, row: &SummaryRow<
         dead_bytes += column.dead_bytes.0;
     }
     let won_back = dead_bytes.saturating_sub(freed_bytes) + (dead_rows + live_graves) * ROW_FOOTER_BYTES;
-    REWRITE_DIVISOR * won_back >= bytes + rows * ROW_FOOTER_BYTES
+    BAR_QUARTERS * won_back >= bar_quarters(row.facts.marks, current) * (bytes + rows * ROW_FOOTER_BYTES)
 }
 
 /// Read what a rewrite of a segment wins back, as a share of its record and footer bytes
@@ -1683,7 +1729,7 @@ pub fn is_grave_heavy(row: &SummaryRow<'_>) -> bool {
         rows += column.row_count.0;
         graves += column.grave_count.0;
     }
-    REWRITE_DIVISOR * graves >= rows
+    BAR_QUARTERS * graves >= PLAIN_BAR_QUARTERS * rows
 }
 
 /// Take the smallest segments a test passes, whole segments included, since the output is cut to size. Small ones first, so a
@@ -1699,6 +1745,7 @@ pub fn gather_smallest<Backend: Io>(
 ) -> MergeTarget {
     *input_count = 0;
     let (mut data, mut length, mut blocks) = (0, 0, 0);
+    let mut marks = MarkRange::NONE;
     while *input_count < most {
         let taken = &numbers[..*input_count];
         let fits = |row: &SummaryRow<'_>| {
@@ -1716,11 +1763,13 @@ pub fn gather_smallest<Backend: Io>(
         data += facts.data_end.0;
         length += facts.file_length.0;
         blocks += facts.block_count;
+        marks = marks.join(facts.marks);
     }
     MergeTarget {
         blocks_at: FileOffset(data.min(2 * volume.segment_bytes.0)),
         data: ByteCount(data),
         length: ByteCount(length),
+        marks,
     }
 }
 
@@ -1827,4 +1876,13 @@ pub fn rows_of(row: &SummaryRow<'_>) -> u64 {
         }
     }
     rows
+}
+
+/// Read a segment's bar in quarters: the early bar while its highest mark stands, and the plain one after that or with no marks
+pub fn bar_quarters(marks: MarkRange, current: DeathMark) -> u64 {
+    if marks.highest().is_some_and(|highest| current <= highest) {
+        EARLY_BAR_QUARTERS
+    } else {
+        PLAIN_BAR_QUARTERS
+    }
 }

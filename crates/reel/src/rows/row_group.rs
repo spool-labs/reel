@@ -1,9 +1,10 @@
 //! One group in a rows file: a header, a row count, the rows and a checksum
 
 use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
+use reel_api::units::{ByteCount, DeathMark, FileOffset, RowCount, WritePlace};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
+use crate::lifetime::MarkRange;
 use crate::pool::touched_zeroes;
 use crate::little_endian::{read_half, read_word};
 use crate::record::record_check::RecordKey;
@@ -17,8 +18,10 @@ pub const TOTAL_LENGTH_AT: usize = 4;
 pub const ROW_COUNT_AT: usize = 8;
 /// Where the end of the last completed sync sits
 pub const SYNCED_THROUGH_AT: usize = 12;
+/// Where the lowest and highest death mark so far in the segment sit
+pub const MARKS_AT: usize = 20;
 /// Bytes of a group's header
-pub const GROUP_HEADER_BYTES: usize = 20;
+pub const GROUP_HEADER_BYTES: usize = 36;
 /// Bytes of a group's checksum
 pub const GROUP_SUM_BYTES: usize = size_of::<u64>();
 /// Bytes a group adds around its rows
@@ -61,6 +64,7 @@ pub struct GroupHead {
     pub row_count: RowCount,
     pub total_length: ByteCount,
     pub synced_through: FileOffset,
+    pub marks: MarkRange,
 }
 
 /// A whole group read back
@@ -70,6 +74,7 @@ pub struct ParsedGroup<'bytes> {
     pub row_count: RowCount,
     pub total_length: ByteCount,
     pub synced_through: FileOffset,
+    pub marks: MarkRange,
 }
 
 /// A walk over a group's rows
@@ -154,7 +159,9 @@ impl RowGroupBuffer {
         self.bytes[..TOTAL_LENGTH_AT].copy_from_slice(&GROUP_MAGIC.to_le_bytes());
         self.bytes[TOTAL_LENGTH_AT..ROW_COUNT_AT].copy_from_slice(&(head.total_length.0 as u32).to_le_bytes());
         self.bytes[ROW_COUNT_AT..SYNCED_THROUGH_AT].copy_from_slice(&(head.row_count.0 as u32).to_le_bytes());
-        self.bytes[SYNCED_THROUGH_AT..GROUP_HEADER_BYTES].copy_from_slice(&head.synced_through.0.to_le_bytes());
+        self.bytes[SYNCED_THROUGH_AT..MARKS_AT].copy_from_slice(&head.synced_through.0.to_le_bytes());
+        self.bytes[MARKS_AT..MARKS_AT + size_of::<u64>()].copy_from_slice(&head.marks.lowest.0.to_le_bytes());
+        self.bytes[MARKS_AT + size_of::<u64>()..GROUP_HEADER_BYTES].copy_from_slice(&head.marks.highest.0.to_le_bytes());
     }
 
     /// Read the header and the rows so far
@@ -168,12 +175,13 @@ impl RowGroupBuffer {
     }
 
     /// Close the group and return its bytes, ready to write
-    pub fn finish(&mut self, synced_through: FileOffset, record_key: RecordKey) -> &[u8] {
+    pub fn finish(&mut self, synced_through: FileOffset, marks: MarkRange, record_key: RecordKey) -> &[u8] {
         let total = self.used + GROUP_SUM_BYTES;
         self.set_head(&GroupHead {
             row_count: RowCount(u64::from(self.row_count)),
             total_length: ByteCount(total as u64),
             synced_through,
+            marks,
         });
 
         let sum = xxh3_64_with_seed(&self.bytes[..self.used], record_key.0);
@@ -247,6 +255,10 @@ pub fn parse_head(bytes: &[u8]) -> Option<GroupHead> {
         row_count: RowCount(u64::from(read_half(header, ROW_COUNT_AT)?)),
         total_length: ByteCount(total as u64),
         synced_through: FileOffset(read_word(header, SYNCED_THROUGH_AT)?),
+        marks: MarkRange {
+            lowest: DeathMark(read_word(header, MARKS_AT)?),
+            highest: DeathMark(read_word(header, MARKS_AT + size_of::<u64>())?),
+        },
     })
 }
 
@@ -265,5 +277,6 @@ pub fn parse_group(bytes: &[u8], record_key: RecordKey) -> Option<ParsedGroup<'_
         row_count: head.row_count,
         total_length: head.total_length,
         synced_through: head.synced_through,
+        marks: head.marks,
     })
 }

@@ -6,10 +6,11 @@ use std::io::{ErrorKind, IoSlice, Result};
 use std::path::{Path, PathBuf};
 
 use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
+use reel_api::units::{ByteCount, DeathMark, FileOffset, RowCount, WritePlace};
 
 use crate::io::device_error::{SECTOR_BYTES, read_or_damaged};
 use crate::io::{Io, IoFile};
+use crate::lifetime::MarkRange;
 use crate::little_endian::read_half;
 use crate::record::record_check::{Checksum, checksum};
 use crate::segment::segment_table::NumberMap;
@@ -44,7 +45,7 @@ pub const ROW_HEAD_BYTES: usize = 3 * size_of::<u32>();
 /// Bytes of a row's checksum
 pub const ROW_SUM_BYTES: usize = size_of::<u64>();
 /// Bytes of the fields every row has, before its columns
-pub const ROW_FACT_BYTES: usize = 77;
+pub const ROW_FACT_BYTES: usize = 93;
 /// Where a row's body keeps its span count
 /// Where a row's body keeps its flags
 pub const ROW_FLAGS_AT: usize = 56;
@@ -88,6 +89,7 @@ pub struct SegmentFacts {
     pub walked_blocks: u32,
     pub is_backward: bool,
     pub has_lost_rows: bool,
+    pub marks: MarkRange,
 }
 
 impl SegmentFacts {
@@ -626,6 +628,8 @@ impl SummaryRows {
         self.bytes.extend_from_slice(&facts.damage_place.0.to_le_bytes());
         self.bytes.extend_from_slice(&facts.block_count.to_le_bytes());
         self.bytes.extend_from_slice(&facts.walked_blocks.to_le_bytes());
+        self.bytes.extend_from_slice(&facts.marks.lowest.0.to_le_bytes());
+        self.bytes.extend_from_slice(&facts.marks.highest.0.to_le_bytes());
     }
 
     /// Walk the rows that pass their checks
@@ -843,6 +847,10 @@ pub fn parse_row(body: &[u8]) -> Option<SummaryRow<'_>> {
     let damage_place = WritePlace(cursor.word()?);
     let block_count = cursor.half()?;
     let walked_blocks = cursor.half()?;
+    let marks = MarkRange {
+        lowest: DeathMark(cursor.word()?),
+        highest: DeathMark(cursor.word()?),
+    };
     let block_dead = cursor.take(block_count as usize * size_of::<u32>())?;
     let facts = SegmentFacts {
         segment,
@@ -858,6 +866,7 @@ pub fn parse_row(body: &[u8]) -> Option<SummaryRow<'_>> {
         walked_blocks,
         is_backward,
         has_lost_rows,
+        marks,
     };
     Some(SummaryRow {
         facts,

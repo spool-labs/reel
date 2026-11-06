@@ -667,7 +667,7 @@ fn freed_under_a_read() {
     let (state, disk, is_done, value) = (Arc::clone(&store.state), io.clone(), AtomicBool::new(false), newer.clone());
     io.on_every_read(Some(Arc::new(move || {
         if !is_done.swap(true, Ordering::AcqRel) {
-            state.write_value(COLUMN, b"key", &value).expect("put");
+            state.write_value(COLUMN, b"key", &value, None).expect("put");
             state.seal_fullest(&state.volumes[0]);
             step_jobs(&disk);
         }

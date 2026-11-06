@@ -6,9 +6,10 @@ use std::ops::Deref;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-use reel_api::units::{ByteCount, FileOffset, RootId, RowCount, WritePlace};
+use reel_api::units::{ByteCount, DeathMark, FileOffset, RootId, RowCount, WritePlace};
 
 use crate::index::open_slots::OpenSlot;
+use crate::lifetime::MarkRange;
 use crate::pool::TOUCH_BYTE;
 use crate::rows::row_group::RowGroupBuffer;
 use crate::segment::segment_tail::SegmentNumber;
@@ -52,6 +53,8 @@ pub struct OpenSegment<File> {
     pub cover_rows: usize,
     pub lowest_place: WritePlace,
     pub highest_place: WritePlace,
+    pub ceiling: Option<DeathMark>,
+    pub marks: MarkRange,
 }
 
 /// Bytes of the file range a slot's small records fill before they reach the kernel in one write call
@@ -180,6 +183,7 @@ pub struct RowQueue {
     pub live_window: usize,
     pub window_room: usize,
     pub has_kept_window: bool,
+    pub marks: MarkRange,
 }
 
 impl RowQueue {
@@ -195,6 +199,7 @@ impl RowQueue {
             live_window: 0,
             window_room: 0,
             has_kept_window: false,
+            marks: MarkRange::NONE,
         }
     }
 
@@ -208,6 +213,7 @@ impl RowQueue {
         self.reserved = 0;
         self.window_room = 0;
         self.has_kept_window = false;
+        self.marks = MarkRange::NONE;
     }
 }
 

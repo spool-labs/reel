@@ -3,9 +3,10 @@
 use std::cmp::Ordering;
 
 use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
+use reel_api::units::{ByteCount, DeathMark, FileOffset, RowCount, WritePlace};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
+use crate::lifetime::MarkRange;
 use crate::record::record_check::{Checksum, RecordKey};
 use crate::segment::block_entry::{KEY_BOUND_BYTES, KEY_PREFIX_BYTES, KeyBound, KeyPrefix, SHARED_HEAD_BYTES, SharedHead};
 
@@ -14,7 +15,7 @@ pub const TAIL_MAGIC: u32 = 0x5245_4C54;
 /// Bytes at the very end: the tail's length, the magic and the checksum
 pub const TRAILER_BYTES: usize = 16;
 /// Bytes of the fixed part of a tail
-pub const TAIL_FIXED_BYTES: usize = 100 + MOST_MERGE_SEGMENTS * size_of::<u64>();
+pub const TAIL_FIXED_BYTES: usize = 116 + MOST_MERGE_SEGMENTS * size_of::<u64>();
 /// Most segments one compaction merges into one, which a tail lists as its inputs
 pub const MOST_MERGE_SEGMENTS: usize = 8;
 /// Bytes of one column's part of a tail
@@ -90,6 +91,7 @@ pub struct TailHead {
     pub is_partial: bool,
     pub is_unwalked: bool,
     pub inputs: [SegmentNumber; MOST_MERGE_SEGMENTS],
+    pub marks: MarkRange,
 }
 
 /// Writes the fixed fields of a tail in order
@@ -184,6 +186,8 @@ impl TailHead {
         for input in &self.inputs {
             out.put(&input.0.to_le_bytes());
         }
+        out.put(&self.marks.lowest.0.to_le_bytes());
+        out.put(&self.marks.highest.0.to_le_bytes());
     }
 
     /// Read the segments this one replaced
@@ -214,6 +218,7 @@ impl TailHead {
             is_partial: false,
             is_unwalked: false,
             inputs: [SegmentNumber(0); MOST_MERGE_SEGMENTS],
+            marks: MarkRange::NONE,
         };
         let listed = input.half()?;
         head.input_count = listed & !(OUTPUT_BIT | PARTIAL_BIT | UNWALKED_BIT);
@@ -223,6 +228,10 @@ impl TailHead {
         for segment in &mut head.inputs {
             *segment = SegmentNumber(input.word()?);
         }
+        head.marks = MarkRange {
+            lowest: DeathMark(input.word()?),
+            highest: DeathMark(input.word()?),
+        };
         Some(head)
     }
 }

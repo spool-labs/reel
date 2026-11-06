@@ -29,7 +29,7 @@ use reel_sim::simulated_io::SimulatedIo;
 const ROOT: &str = "/disk/ranges";
 const COLUMN: ColumnId = ColumnId(1);
 const OTHER: ColumnId = ColumnId(2);
-const BUDGET: ByteCount = ByteCount(54 * 1024 * 1024);
+const BUDGET: ByteCount = ByteCount(60 * 1024 * 1024);
 const KEYS: u64 = 100;
 const SEARCH_STEPS: usize = 4;
 const CRASH_POINTS: u64 = 10;
@@ -402,6 +402,7 @@ fn older_outlives_newer() {
         is_alone: true,
         has_records: true,
         covers: 0,
+        mark: None,
     };
     let claim = store.state.claim(volume, &alone).expect("claim");
     let (older_slot, older_segment) = (claim.slot, claim.segment);

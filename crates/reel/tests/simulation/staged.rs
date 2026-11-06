@@ -39,8 +39,8 @@ use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RowCount, VolumeId, Wr
 const ROOT: &str = "/disk/staged";
 const COLUMN: ColumnId = ColumnId(1);
 const LONG_COLUMN: ColumnId = ColumnId(2);
-const BUDGET: ByteCount = ByteCount(79 * 1024 * 1024);
-const SMALL_BUDGET: ByteCount = ByteCount(68 * 1024 * 1024);
+const BUDGET: ByteCount = ByteCount(85 * 1024 * 1024);
+const SMALL_BUDGET: ByteCount = ByteCount(74 * 1024 * 1024);
 const LARGEST: ByteCount = ByteCount(1024 * 1024);
 const LONG_KEY_BYTES: usize = 1_000;
 const LONG_KEYS: u64 = 6_000;
@@ -170,6 +170,7 @@ fn stage<'state>(state: &'state State, key: &[u8], value: Option<&[u8]>) -> Stag
         is_alone: false,
         has_records: true,
         covers: 0,
+        mark: None,
     };
     let claim = state.claim(volume, &request).expect("claim");
     let record = value.map_or(Vec::new(), |value| encode(state, key, value, claim.first_place()));
@@ -260,7 +261,7 @@ fn sync_order() {
 
         let state = Arc::clone(&store.state);
         io.after_next_sync(Box::new(move || {
-            state.write_value(COLUMN, b"key", b"landed-during-the-sync").expect("put");
+            state.write_value(COLUMN, b"key", b"landed-during-the-sync", None).expect("put");
         }));
         store.flush().expect("flush");
         store.put(COLUMN, b"after", b"carries the sync mark").expect("put");
@@ -1084,6 +1085,7 @@ fn empty_seal() {
         is_alone: false,
         has_records: false,
         covers: 0,
+        mark: None,
     };
     // a claim that lands nothing leaves a segment with no rows in the index
     drop(state.claim(&state.volumes[0], &request).expect("claim"));
@@ -1138,6 +1140,7 @@ fn covers_out_of_order() {
         is_alone: false,
         has_records: true,
         covers: 1,
+        mark: None,
     };
 
     assert!(volume.covers.hold(1));

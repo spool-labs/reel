@@ -5,7 +5,7 @@ use crate::maintenance_report::MaintenanceReport;
 use crate::memory_report::MemoryReport;
 use crate::reads::Reads;
 use crate::store_error::StoreError;
-use crate::units::{ByteCount, RowCount};
+use crate::units::{ByteCount, DeathMark, RowCount};
 use crate::usage::{ColumnUsage, UsageReport};
 use crate::write_batch::WriteBatch;
 
@@ -19,6 +19,15 @@ pub trait Store: Reads {
 
     /// Write a value and take its buffer, so a none column never copies it
     fn put_owned(&self, column: ColumnId, key: &[u8], value: Vec<u8>) -> Result<(), StoreError>;
+
+    /// Write a value that dies at a mark, so it sits with records that die near it
+    fn put_marked(&self, column: ColumnId, key: &[u8], value: &[u8], mark: DeathMark) -> Result<(), StoreError>;
+
+    /// Write a value that dies at a mark and take its buffer
+    fn put_owned_marked(&self, column: ColumnId, key: &[u8], value: Vec<u8>, mark: DeathMark) -> Result<(), StoreError>;
+
+    /// Tell the store the current mark, from which it reads how long each marked record has left
+    fn set_current_mark(&self, mark: DeathMark);
 
     /// Write a grave without reading any device
     fn delete(&self, column: ColumnId, key: &[u8]) -> Result<(), StoreError>;

@@ -8,6 +8,7 @@ use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
 use crate::pool::{touched_capacity, touched_zeroes};
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::io::IoFile;
+use crate::lifetime::MarkRange;
 use crate::record::record_check::{Checksum, RecordKey, checksum};
 use crate::row_kind::RowKind;
 use crate::segment::block_entry::{BLOCK_ENTRY_BYTES, BlockEntry, KeyPrefix, SharedHead};
@@ -68,6 +69,7 @@ pub struct FooterWriter {
     last_key: Vec<u8>,
     places: PlaceRange,
     place_base: WritePlace,
+    marks: MarkRange,
     row_count: RowCount,
     pub is_output: bool,
     pub is_partial: bool,
@@ -92,6 +94,7 @@ impl FooterWriter {
             last_key: touched_capacity(ROW_BLOCK_BYTES, 0),
             places: PlaceRange::default(),
             place_base: WritePlace(0),
+            marks: MarkRange::NONE,
             row_count: RowCount(0),
             is_output: false,
             is_partial: false,
@@ -150,9 +153,15 @@ impl FooterWriter {
         self.position = FileOffset(self.position.0 - bytes.0);
     }
 
+    /// Keep the death marks the segment holds for its tail, after a start
+    pub fn set_marks(&mut self, marks: MarkRange) {
+        self.marks = marks;
+    }
+
     /// Start a footer right after a segment's records
     pub fn start(&mut self, data_end: FileOffset, place_base: WritePlace) {
         self.place_base = place_base;
+        self.marks = MarkRange::NONE;
         self.builder.set_place_base(place_base);
         self.builder.clear();
         self.hashes.clear();
@@ -362,6 +371,7 @@ impl FooterWriter {
             is_partial: self.is_partial,
             is_unwalked: self.is_unwalked,
             inputs: listed,
+            marks: self.marks,
         };
         let total = self.write_tail(&head, record_key);
         let second_tail_at = self.position;

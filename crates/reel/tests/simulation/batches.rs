@@ -16,6 +16,7 @@ use reel::index::open_slots::OpenSlot;
 use reel::index::write_index::shard_of;
 use reel::index::write_row::WriteRow;
 use reel::io::{Io, IoFile};
+use reel::lifetime::MarkRange;
 use reel::record::codec::Codec;
 use reel::record::record_check::RecordKey;
 use reel::row_kind::RowKind;
@@ -38,7 +39,7 @@ const SECOND_ROOT: &str = "/disk/batch-bulk";
 const PLAIN: ColumnId = ColumnId(1);
 const PACKED: ColumnId = ColumnId(2);
 const OTHER_VOLUME: ColumnId = ColumnId(3);
-const BUDGET: ByteCount = ByteCount(152 * 1024 * 1024);
+const BUDGET: ByteCount = ByteCount(164 * 1024 * 1024);
 const BATCH_KEYS: u64 = 5;
 const CRASH_POINTS: u64 = 12;
 const LARGE_VALUE_BYTES: usize = 200_000;
@@ -227,6 +228,7 @@ fn seen_whole() {
         is_alone: false,
         has_records: false,
         covers: 0,
+        mark: None,
     };
     let earlier = store.state.claim(volume, &request).expect("claim");
 
@@ -607,6 +609,7 @@ fn alone_claim() {
         is_alone: true,
         has_records: true,
         covers: 0,
+        mark: None,
     };
     let short = ClaimRequest { is_alone: false, ..long };
 
@@ -636,6 +639,7 @@ fn rows_go_first() {
         is_alone: false,
         has_records: false,
         covers: 0,
+        mark: None,
     };
     let earlier = store.state.claim(volume, &request).expect("claim");
     let place = earlier.first_place();
@@ -682,6 +686,7 @@ fn turn_spares_puts() {
         is_alone: true,
         has_records: true,
         covers: 0,
+        mark: None,
     };
     let claim = store.state.claim(volume, &long).expect("claim");
     let slot = claim.slot;
@@ -927,6 +932,7 @@ fn long_seal_beside() {
         is_alone: false,
         has_records: false,
         covers: 0,
+        mark: None,
     };
     let earlier = store.state.claim(volume, &request).expect("claim");
 
@@ -976,6 +982,7 @@ fn unread_row() {
         row_count: RowCount(1),
         total_length: ByteCount(total as u64),
         synced_through: FileOffset(0),
+        marks: MarkRange::NONE,
     };
     stage.set_head(&head);
     let mut bytes = stage.with_head().to_vec();

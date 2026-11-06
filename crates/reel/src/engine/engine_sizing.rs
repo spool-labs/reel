@@ -10,6 +10,7 @@ use crate::engine::scan_state::{MOST_SCANS, planned_scan_bytes};
 use crate::index::entry_slab::{PAGE_BYTES, PageCount};
 use crate::index::node_pool::{NODE_FANOUT, NodeCount};
 use crate::index::open_slots::MAX_OPEN_SLOTS;
+use crate::lifetime::MOST_LIFETIME_GROUPS;
 use crate::index::write_index::SHARD_COUNT;
 use crate::index::write_shard::ShardSizing;
 use crate::record::codec::CHUNK_BYTES;
@@ -131,9 +132,9 @@ impl StoreShape {
         self.threads.maintenance_workers
     }
 
-    /// Count the open slots the roots can use
+    /// Count the open slots the roots and the lifetime groups can use
     pub fn open_slots(&self) -> usize {
-        (self.roots * OPEN_PER_ROOT * SLOTS_PER_OPEN).min(MAX_OPEN_SLOTS)
+        (self.roots * OPEN_PER_ROOT * SLOTS_PER_OPEN + self.volumes * MOST_LIFETIME_GROUPS).min(MAX_OPEN_SLOTS)
     }
 
     /// Add up what a store holds whatever its budget: buffers, pools, stacks and the spans a summary must keep
@@ -177,7 +178,7 @@ impl EngineSizing {
 
         let least_pages = (open_slots + 1) as u64;
         let page_rows = (PAGE_BYTES / 64) as u64;
-        let pages = (rows_per_shard / page_rows + 1).max(least_pages) * 2;
+        let pages = ((rows_per_shard / page_rows + 1) * 2).max(least_pages);
         let nodes = (rows_per_shard / (NODE_FANOUT as u64 / 2) + 1) * 2 + 64;
 
         let segment_bytes = if budget >= FULL_BUDGET {

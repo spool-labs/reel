@@ -19,7 +19,7 @@ use reel_api::column_id::ColumnId;
 use reel_api::direction::Direction;
 use reel_api::scan::ScanStep;
 use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RowCount, VolumeId};
+use reel_api::units::{ByteCount, DeathMark, FileOffset, Nanoseconds, RowCount, VolumeId};
 use reel_api::write_batch::WriteBatch;
 
 // the default walk runs on the planner, so seeds spread over 0 to 2 workers to keep the worker path under test
@@ -29,12 +29,16 @@ const TABLE_ROWS: RowCount = RowCount(100_000);
 const ROOTS: [&str; 3] = ["/disk/faults-meta", "/disk/faults-meta-two", "/disk/faults-bulk"];
 const COLUMNS: [ColumnId; 2] = [ColumnId(1), ColumnId(2)];
 const HIGHEST_KEY: &[u8] = b"zzz";
-const BUDGET: ByteCount = ByteCount(108 * 1024 * 1024);
+const BUDGET: ByteCount = ByteCount(118 * 1024 * 1024);
 // a test holds each seed with a traced bug: 0 `failed_open` and `failed_close`, 1 `rows_sync` and `tail_sync`, 37 and
 // 349 `covered_last` and `later_sync`, 125 `one_copy`, 681 `tail_then_cut`, 959 `flushed_unknown`, 1000 `open_covers`, 1002
 // `wrong_place`. Seeds 1 and 1000 are mapped from notes, with no replay. The rest are plain extra seeds
 const SEEDS: [u64; 10] = [0, 1, 2, 3, 17, 31, 37, 62, 681, 7_157];
-const ROT_SEEDS: [u64; 12] = [19, 125, 349, 959, 1_000, 1_001, 1_002, 1_003, 1_011, 1_031, 6_185, 10_745];
+const MARK_SEED_STRIDE: u64 = 11;
+const MARK_SPREAD: u64 = 16;
+const MARK_STEP: u64 = 64;
+const MARK_EVERY_STEPS: u64 = 32;
+const ROT_SEEDS: [u64; 13] = [19, 125, 349, 959, 1_000, 1_001, 1_002, 1_003, 1_011, 1_031, 2_635, 6_185, 10_745];
 const STEPS: u64 = 3_000;
 const KEY_SPACE: u64 = 30;
 const SETTLE_STEPS: u64 = 2_000_000;
@@ -211,6 +215,17 @@ fn config(policy: SyncPolicy, complete_rows: Option<RowCount>) -> StoreConfig {
 }
 
 // half the seeds make the meta column complete, and half of those with a table small enough to run past capacity
+/// Some seeds write marked records, on residues that keep the seeds pinned above as they were
+fn has_marks(seed: u64) -> bool {
+    matches!(seed % MARK_SEED_STRIDE, 5..=7)
+}
+
+/// Pick a key's mark from its bytes, so a mark costs no draw on any stream
+fn mark_of(key: &[u8]) -> DeathMark {
+    let sum: u64 = key.iter().map(|byte| u64::from(*byte)).sum();
+    DeathMark((sum % MARK_SPREAD + 1) * MARK_STEP)
+}
+
 fn complete_rows_of(seed: u64) -> Option<RowCount> {
     match seed % 4 {
         1 => Some(SMALL_TABLE_ROWS),
@@ -460,6 +475,7 @@ impl Run {
         }
         let value = (!is_grave).then_some(bytes);
         let written = match &value {
+            Some(value) if has_marks(self.seed) => store.put_marked(column, &key, value, mark_of(&key)),
             Some(value) => store.put(column, &key, value),
             None => store.delete(column, &key),
         };
@@ -508,6 +524,9 @@ impl Run {
             batch.delete_range(column, &set_key(set, 0), &set_key(set, SET_KEYS));
         }
 
+        if has_marks(self.seed) {
+            batch.set_mark(mark_of(&set_key(set, 0)));
+        }
         let written = store.write_batch(&batch);
         let has_landed = matches!(written, Err(StoreError::Io { action: "syncing a volume", .. }));
         if written.is_ok() || has_landed || self.io.is_crashed() {
@@ -578,6 +597,9 @@ impl Run {
     fn work(&mut self, store: &Store) -> bool {
         while self.steps_left > 0 {
             self.steps_left -= 1;
+            if has_marks(self.seed) && self.steps_left.is_multiple_of(MARK_EVERY_STEPS) {
+                store.set_current_mark(DeathMark((STEPS - self.steps_left) / MARK_EVERY_STEPS));
+            }
             if self.io.is_crashed() {
                 return true;
             }

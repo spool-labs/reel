@@ -1,8 +1,9 @@
+use reel::lifetime::MarkRange;
 use reel::record::record_check::RecordKey;
 use reel::row_kind::RowKind;
 use reel::rows::row_group::*;
 use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
+use reel_api::units::{ByteCount, DeathMark, FileOffset, RowCount, WritePlace};
 
 const RECORD_KEY: RecordKey = RecordKey(11);
 const CAPACITY: ByteCount = ByteCount(4_096);
@@ -27,7 +28,7 @@ fn group_round() {
     assert!(group.push(&row(b"", 2, RowKind::Grave)));
     assert!(group.push(&row(b"third", 3, RowKind::RangeDelete)));
 
-    let bytes = group.finish(SYNCED, RECORD_KEY);
+    let bytes = group.finish(SYNCED, MarkRange::NONE, RECORD_KEY);
     let parsed = parse_group(bytes, RECORD_KEY).expect("whole group");
     let rows: Vec<RowEntry> = parsed.walk().collect();
 
@@ -44,7 +45,7 @@ fn group_round() {
 fn torn_group() {
     let mut group = RowGroupBuffer::new(CAPACITY);
     assert!(group.push(&row(b"key", 1, RowKind::Value)));
-    let mut bytes = group.finish(SYNCED, RECORD_KEY).to_vec();
+    let mut bytes = group.finish(SYNCED, MarkRange::NONE, RECORD_KEY).to_vec();
 
     assert!(parse_group(&bytes[..bytes.len() - 1], RECORD_KEY).is_none());
     assert!(parse_group(&bytes, RecordKey(12)).is_none());
@@ -56,7 +57,7 @@ fn torn_group() {
 // a group refuses a row past its capacity and takes rows again after a clear
 #[test]
 fn group_capacity() {
-    let mut group = RowGroupBuffer::new(ByteCount(64));
+    let mut group = RowGroupBuffer::new(ByteCount(GROUP_OVERHEAD_BYTES as u64 + 32));
 
     assert!(group.push(&row(b"", 1, RowKind::Value)));
     assert!(!group.push(&row(b"", 2, RowKind::Value)));
@@ -64,4 +65,14 @@ fn group_capacity() {
     group.clear();
     assert!(group.is_empty());
     assert!(group.push(&row(b"", 3, RowKind::Value)));
+}
+
+// a group keeps the marks so far, which is how an open segment finds its group after a crash
+#[test]
+fn group_keeps_marks() {
+    let marks = MarkRange { lowest: DeathMark(40), highest: DeathMark(70) };
+    let mut group = RowGroupBuffer::new(CAPACITY);
+    assert!(group.push(&row(b"first", 1, RowKind::Value)));
+    let bytes = group.finish(SYNCED, marks, RECORD_KEY);
+    assert_eq!(parse_group(bytes, RECORD_KEY).expect("whole group").marks, marks);
 }

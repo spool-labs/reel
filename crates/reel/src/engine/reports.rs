@@ -12,6 +12,7 @@ use reel_api::usage::{ColumnRootUsage, ColumnUsage, RootUsage, UsageReport, Volu
 use crate::engine::engine_state::EngineState;
 use crate::engine::job_tally::STALL_AFTER;
 use crate::engine::planner::is_sealing;
+use crate::engine::write_path::lifetime_groups;
 use crate::engine::volume::{NO_SEAL, Volume};
 use crate::index::complete_table::CompleteTable;
 use crate::guard::hold;
@@ -154,6 +155,12 @@ impl<Backend: Io> EngineState<Backend> {
                 is_spinning: volume.is_spinning,
                 is_device_set: volume.is_device_set,
                 rewrites_by_lane: lane_counts(volume),
+                lifetime_groups: lifetime_groups(&hold(&volume.claims)),
+                marked_seals: volume.marked_seals.load(Ordering::Acquire),
+                marked_seal_bytes: ByteCount(volume.marked_seal_bytes.load(Ordering::Acquire)),
+                marks_dropped: volume.marks_dropped.load(Ordering::Acquire),
+                early_bar_rewrites: volume.early_bar_rewrites.load(Ordering::Acquire),
+                plain_bar_rewrites: volume.plain_bar_rewrites.load(Ordering::Acquire),
             });
         }
         for (id, info) in self.columns.iter().enumerate() {

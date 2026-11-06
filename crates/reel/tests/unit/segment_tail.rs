@@ -1,8 +1,9 @@
+use reel::lifetime::MarkRange;
 use reel::record::record_check::{Checksum, RecordKey};
 use reel::segment::block_entry::{KeyBound, KeyPrefix, SHARED_HEAD_BYTES, SharedHead};
 use reel::segment::segment_tail::*;
 use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
+use reel_api::units::{ByteCount, DeathMark, FileOffset, RowCount, WritePlace};
 
 const RECORD_KEY: RecordKey = RecordKey(31);
 
@@ -28,6 +29,7 @@ fn head() -> TailHead {
         is_partial: false,
         is_unwalked: false,
         inputs: [SegmentNumber(5); MOST_MERGE_SEGMENTS],
+        marks: MarkRange { lowest: DeathMark(40), highest: DeathMark(70) },
     }
 }
 

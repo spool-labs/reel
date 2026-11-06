@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use reel_api::column_id::ColumnId;
 use reel_api::maintenance_report::JobKind;
 use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RootId, RowCount, WritePlace};
+use reel_api::units::{ByteCount, DeathMark, FileOffset, Nanoseconds, RootId, RowCount, WritePlace};
 
 use crate::config::SyncPolicy;
 use crate::engine::claim::Claim;
@@ -23,6 +23,7 @@ use crate::engine::volume::{ClaimState, Volume};
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
 use crate::index::write_row::WriteRow;
+use crate::lifetime::{MOST_LIFETIME_GROUPS, MarkRange, ceiling_of, reach_of};
 use crate::io::{Io, IoFile, IoTask};
 use crate::record::codec::{CHUNK_BYTES, Codec};
 use crate::record::record_check::RecordIdentity;
@@ -41,6 +42,7 @@ pub const SPARE_REQUEST: ClaimRequest = ClaimRequest {
     is_alone: false,
     has_records: true,
     covers: 0,
+    mark: None,
 };
 /// How many times a writer waits on the spot for a window to go out before it tries again
 pub const WINDOW_SPINS: u32 = 2_000;
@@ -57,6 +59,7 @@ pub struct ClaimRequest {
     pub is_alone: bool,
     pub has_records: bool,
     pub covers: usize,
+    pub mark: Option<DeathMark>,
 }
 
 /// A value on its way to a record
@@ -66,6 +69,7 @@ pub struct ValueWrite<'bytes> {
     pub key: &'bytes [u8],
     pub value: &'bytes [u8],
     pub codec: Codec,
+    pub mark: Option<DeathMark>,
 }
 
 /// How an attempt to land a row ended
@@ -100,7 +104,7 @@ pub fn store_error<Backend: Io>(volume: &Volume<Backend>, action: &'static str, 
 
 impl<Backend: Io> EngineState<Backend> {
     /// Write a value
-    pub fn write_value(&self, column: ColumnId, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
+    pub fn write_value(&self, column: ColumnId, key: &[u8], value: &[u8], mark: Option<DeathMark>) -> Result<(), StoreError> {
         let info = self.column(column)?;
         self.check_key(column, key)?;
         let volume = &self.volumes[info.volume.0 as usize];
@@ -112,6 +116,7 @@ impl<Backend: Io> EngineState<Backend> {
             key,
             value,
             codec: info.codec,
+            mark,
         };
         if info.codec == Codec::None && value.len() <= CHUNK_BYTES {
             return self.write_plain(volume, &write);
@@ -135,6 +140,7 @@ impl<Backend: Io> EngineState<Backend> {
             is_alone: false,
             has_records: true,
             covers: 0,
+            mark: write.mark,
         };
         let size = row_size(write.key.len());
         loop {
@@ -389,6 +395,7 @@ impl<Backend: Io> EngineState<Backend> {
             is_alone: false,
             has_records: true,
             covers: 0,
+            mark: write.mark,
         };
         loop {
             let (claim, room) = self.claim_with_room(volume, &request, row_size(write.key.len()))?;
@@ -438,6 +445,7 @@ impl<Backend: Io> EngineState<Backend> {
             is_alone: false,
             has_records: false,
             covers: 0,
+            mark: None,
         };
         loop {
             let (claim, room) = self.claim_with_room(volume, &request, row_size(key.len()))?;
@@ -513,6 +521,7 @@ impl<Backend: Io> EngineState<Backend> {
             is_alone: false,
             has_records: true,
             covers: 1,
+            mark: None,
         };
         loop {
             let (claim, room) = self.claim_with_room(volume, &request, row_size(start.len()))?;
@@ -699,10 +708,20 @@ impl<Backend: Io> EngineState<Backend> {
             }
 
             let mut claims = hold(&volume.claims);
-            let pick = pick_segment(&claims, volume, request);
+            let current = DeathMark(self.current_mark.load(Ordering::Relaxed));
+            let pick = pick_segment(&claims, volume, request, current);
+            if let Some(index) = pick.to_seal {
+                self.seal_at(&mut claims, volume, index);
+            }
+            if pick.must_wait {
+                drop(claims);
+                self.io.pause();
+                continue;
+            }
             if pick.wants_more || pick.best.is_none() {
                 // a segment made ahead costs a claim nothing, and the job starts on the next
-                if let Some(segment) = claims.prepared.take() {
+                if let Some(mut segment) = claims.prepared.take() {
+                    segment.ceiling = pick.ceiling;
                     volume.open_slot(segment.slot);
                     claims.open.push(segment);
                     self.ask_for_segment(&mut claims);
@@ -739,11 +758,19 @@ impl<Backend: Io> EngineState<Backend> {
                 segment.cover_rows += request.covers;
                 segment.lowest_place = segment.lowest_place.min(ticket.first);
                 segment.highest_place = segment.highest_place.max(ticket.last);
+                if let Some(mark) = request.mark {
+                    segment.marks.add(mark);
+                }
                 let number = segment.number;
                 let data = segment.data.clone();
                 let slot = segment.slot;
                 self.slot_files[slot.0 as usize].pins.fetch_add(1, Ordering::AcqRel);
                 self.mark_full_segments(&mut claims, volume);
+                drop(claims);
+                // a group goes out with the marks so far, and this comes before the row lands
+                if let Some(mark) = request.mark {
+                    hold(&self.queues[slot.0 as usize]).marks.add(mark);
+                }
                 return Ok(Claim {
                     state: self,
                     volume,
@@ -771,7 +798,8 @@ impl<Backend: Io> EngineState<Backend> {
             let mut claims = hold(&volume.claims);
             claims.is_creating = false;
             match created {
-                Ok(Some(segment)) => {
+                Ok(Some(mut segment)) => {
+                    segment.ceiling = pick.ceiling;
                     volume.open_slot(segment.slot);
                     claims.open.push(segment);
                 },
@@ -882,6 +910,31 @@ impl<Backend: Io> EngineState<Backend> {
             self.io.remove_file(&rows_path(root, segment.number))?;
         }
         self.io.sync_directory(root)
+    }
+
+    /// Mark one open segment to seal, with the claim lock held
+    pub fn seal_at(&self, claims: &mut ClaimState<Backend::File>, volume: &Volume<Backend>, index: usize) {
+        claims.open[index].phase = SegmentPhase::Sealing;
+        if let Some(task) = self.seal_tasks[volume.id.0 as usize].get() {
+            task.wake();
+        }
+    }
+
+    /// Take the current mark, and seal every open group it has reached, since a group left open would keep its records
+    /// past the slack they were promised
+    pub fn set_current_mark(&self, mark: DeathMark) {
+        self.current_mark.store(mark.0, Ordering::Relaxed);
+        for volume in &self.volumes {
+            let mut claims = hold(&volume.claims);
+            for index in 0..claims.open.len() {
+                let segment = &claims.open[index];
+                if segment.phase == SegmentPhase::Taking && segment.ceiling.is_some_and(|ceiling| ceiling <= mark) {
+                    self.seal_at(&mut claims, volume, index);
+                }
+            }
+        }
+        // a segment past its highest mark drops to the plain bar, and nothing else would look
+        self.ask_compaction();
     }
 
     /// Mark the fullest taking segment to seal
@@ -1032,6 +1085,8 @@ impl<Backend: Io> EngineState<Backend> {
             cover_rows: 0,
             lowest_place: WritePlace(u64::MAX),
             highest_place: WritePlace(0),
+            ceiling: None,
+            marks: MarkRange::NONE,
         })
     }
 
@@ -1218,13 +1273,13 @@ impl<Backend: Io> EngineState<Backend> {
             group
         };
 
-        let (rows_end, synced_through, mut marked_end) = {
+        let (rows_end, synced_through, mut marked_end, marks) = {
             let mut queue = hold(&self.queues[index]);
             // a group a failed write left behind goes first, and whole
             if group.is_empty() {
                 mem::swap(&mut queue.filling, &mut group);
             }
-            (queue.rows_end, queue.synced_through, queue.marked_end)
+            (queue.rows_end, queue.synced_through, queue.marked_end, queue.marks)
         };
 
         // records go first, so the rows that list them never reach the kernel alone
@@ -1238,7 +1293,7 @@ impl<Backend: Io> EngineState<Backend> {
 
         let mut new_end = rows_end;
         if outcome.is_ok() && !group.is_empty() {
-            let bytes = group.finish(synced_through, self.record_key);
+            let bytes = group.finish(synced_through, marks, self.record_key);
             let parts = [IoSlice::new(bytes)];
             outcome = rows.write_at(rows_end, &parts);
             new_end = FileOffset(rows_end.0 + bytes.len() as u64);
@@ -1255,7 +1310,7 @@ impl<Backend: Io> EngineState<Backend> {
                 covered = new_end;
                 // only a group written after the sync can say it finished, and with nothing new there's nothing to say
                 if new_end > marked_end {
-                    let bytes = group.finish(covered, self.record_key);
+                    let bytes = group.finish(covered, marks, self.record_key);
                     let parts = [IoSlice::new(bytes)];
                     let mark_end = FileOffset(new_end.0 + bytes.len() as u64);
                     // the sync is done whatever this does: a lost mark costs the next open a check of these records
@@ -1364,10 +1419,38 @@ pub enum WindowSwitch {
 pub struct SegmentPick {
     pub best: Option<usize>,
     pub wants_more: bool,
+    /// The ceiling a segment opened for this claim takes
+    pub ceiling: Option<DeathMark>,
+    /// The segment to seal first, to make room for a group
+    pub to_seal: Option<usize>,
+    /// Every group is busy, so a new one waits for a seal
+    pub must_wait: bool,
 }
 
-/// Pick the taking segment with the fewest writers, and say when the volume should open another
+/// Check a segment can take a claim
+pub fn has_room<Backend: Io>(segment: &OpenSegment<Backend::File>, volume: &Volume<Backend>, request: &ClaimRequest) -> bool {
+    let has_bytes = segment.write_end.0 + request.bytes.0 <= volume.segment_bytes.0.max(request.bytes.0);
+    let has_rows = segment.row_count.0 + request.rows.0 <= volume.segment_rows.0.max(request.rows.0);
+    // a seal lists a segment's covers in a buffer sized for this many
+    let has_cover_room = segment.cover_rows + request.covers <= MOST_RANGE_COVERS;
+    has_bytes && has_rows && has_cover_room
+}
+
+/// Pick the segment for a claim: its lifetime group when it has a mark, and otherwise the unmarked one with the fewest writers
 pub fn pick_segment<Backend: Io>(
+    claims: &ClaimState<Backend::File>,
+    volume: &Volume<Backend>,
+    request: &ClaimRequest,
+    current: DeathMark,
+) -> SegmentPick {
+    match request.mark {
+        Some(mark) => pick_group(claims, volume, request, mark, current),
+        None => pick_unmarked(claims, volume, request),
+    }
+}
+
+/// Pick the taking unmarked segment with the fewest writers, and say when the volume should open another
+pub fn pick_unmarked<Backend: Io>(
     claims: &ClaimState<Backend::File>,
     volume: &Volume<Backend>,
     request: &ClaimRequest,
@@ -1375,15 +1458,7 @@ pub fn pick_segment<Backend: Io>(
     let mut best: Option<usize> = None;
     let mut taking = 0;
     for (index, segment) in claims.open.iter().enumerate() {
-        if segment.phase != SegmentPhase::Taking {
-            continue;
-        }
-        let has_bytes = segment.write_end.0 + request.bytes.0 <= volume.segment_bytes.0.max(request.bytes.0);
-        let has_rows = segment.row_count.0 + request.rows.0 <= volume.segment_rows.0.max(request.rows.0);
-        // a seal lists a segment's covers in a buffer sized for this many
-        let has_cover_room = segment.cover_rows + request.covers <= MOST_RANGE_COVERS;
-        let fits = has_bytes && has_rows && has_cover_room;
-        if !fits {
+        if segment.phase != SegmentPhase::Taking || segment.ceiling.is_some() || !has_room(segment, volume, request) {
             continue;
         }
         taking += 1;
@@ -1398,7 +1473,67 @@ pub fn pick_segment<Backend: Io>(
 
     let most_open = volume.roots.len() * OPEN_PER_ROOT;
     let wants_more = best.is_some_and(|index| claims.open[index].in_flight >= WRITES_PER_OPEN) && taking < most_open;
-    SegmentPick { best, wants_more }
+    SegmentPick {
+        best,
+        wants_more,
+        ceiling: None,
+        to_seal: None,
+        must_wait: false,
+    }
+}
+
+/// Pick the open group with the lowest ceiling a mark may join, or say what a new group needs first
+pub fn pick_group<Backend: Io>(
+    claims: &ClaimState<Backend::File>,
+    volume: &Volume<Backend>,
+    request: &ClaimRequest,
+    mark: DeathMark,
+    current: DeathMark,
+) -> SegmentPick {
+    let reach = reach_of(mark, current);
+    let (mut home, mut dies_first, mut groups) = (None, None, 0);
+    for (index, segment) in claims.open.iter().enumerate() {
+        let Some(ceiling) = segment.ceiling else {
+            continue;
+        };
+        if segment.phase == SegmentPhase::Sealing {
+            continue;
+        }
+        groups += 1;
+        if segment.phase != SegmentPhase::Taking {
+            continue;
+        }
+        if dies_first.is_none_or(|(first, _index)| ceiling < first) {
+            dies_first = Some((ceiling, index));
+        }
+        if ceiling >= mark && ceiling <= reach && home.is_none_or(|(lowest, _index)| ceiling < lowest) {
+            home = Some((ceiling, index));
+        }
+    }
+
+    let mut pick = SegmentPick {
+        best: None,
+        wants_more: false,
+        ceiling: Some(ceiling_of(mark, current)),
+        to_seal: None,
+        must_wait: false,
+    };
+    match home {
+        Some((_ceiling, index)) if has_room(&claims.open[index], volume, request) => pick.best = Some(index),
+        // a full group gives up its place to the one that follows it
+        Some((_ceiling, index)) => pick.to_seal = Some(index),
+        None if groups < MOST_LIFETIME_GROUPS => {},
+        None => {
+            pick.to_seal = dies_first.map(|(_ceiling, index)| index);
+            pick.must_wait = dies_first.is_none();
+        },
+    }
+    pick
+}
+
+/// Count the lifetime groups open now
+pub fn lifetime_groups<File>(claims: &ClaimState<File>) -> usize {
+    claims.open.iter().filter(|segment| segment.ceiling.is_some() && segment.phase != SegmentPhase::Sealing).count()
 }
 
 /// Refuse a value larger than a segment of its volume

@@ -10,7 +10,7 @@ use reel_api::reads::{Reads, ValueWindow};
 use reel_api::scan::{KeyScan, Scan, ScanStep};
 use reel_api::store::Store;
 use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, RowCount};
+use reel_api::units::{ByteCount, DeathMark, RowCount};
 use reel_api::usage::{ColumnUsage, UsageReport};
 use reel_api::value_list::ValueList;
 use reel_api::write_batch::WriteBatch;
@@ -198,6 +198,18 @@ impl<Backend: Io> Store for ReelStore<Backend> {
 
     fn put_owned(&self, column: ColumnId, key: &[u8], value: Vec<u8>) -> Result<(), StoreError> {
         ReelStore::put_owned(self, column, key, value)
+    }
+
+    fn put_marked(&self, column: ColumnId, key: &[u8], value: &[u8], mark: DeathMark) -> Result<(), StoreError> {
+        ReelStore::put_marked(self, column, key, value, mark)
+    }
+
+    fn put_owned_marked(&self, column: ColumnId, key: &[u8], value: Vec<u8>, mark: DeathMark) -> Result<(), StoreError> {
+        ReelStore::put_owned_marked(self, column, key, value, mark)
+    }
+
+    fn set_current_mark(&self, mark: DeathMark) {
+        ReelStore::set_current_mark(self, mark);
     }
 
     fn delete(&self, column: ColumnId, key: &[u8]) -> Result<(), StoreError> {

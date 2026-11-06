@@ -5,6 +5,7 @@ pub mod engine;
 pub mod guard;
 pub mod index;
 pub mod io;
+pub mod lifetime;
 pub mod little_endian;
 pub mod record;
 pub mod pool;

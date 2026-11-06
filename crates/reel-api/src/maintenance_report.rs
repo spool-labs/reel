@@ -73,6 +73,18 @@ pub struct VolumeReading {
     pub is_device_set: bool,
     /// Rewrites each lane has finished: the planner's, then a worker's each
     pub rewrites_by_lane: [u64; MOST_REPORTED_LANES],
+    /// Lifetime groups open now
+    pub lifetime_groups: usize,
+    /// Segments of marked records sealed since open
+    pub marked_seals: u64,
+    /// Record bytes those segments held at seal
+    pub marked_seal_bytes: ByteCount,
+    /// Marked batches that held a delete, which went to the unmarked segments with their marks dropped
+    pub marks_dropped: u64,
+    /// Marked segments rewritten at the early bar, while their highest mark stood
+    pub early_bar_rewrites: u64,
+    /// Marked segments rewritten at the plain bar, once the current mark had passed their highest
+    pub plain_bar_rewrites: u64,
 }
 
 /// Lanes a volume reading has room for. Workers past this show in the last one

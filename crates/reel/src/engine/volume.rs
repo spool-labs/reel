@@ -206,6 +206,11 @@ pub struct Volume<Backend: Io> {
     /// The walk is part way through a segment
     pub has_walk_target: AtomicBool,
     pub gave_up: Mutex<GaveUp>,
+    pub early_bar_rewrites: AtomicU64,
+    pub plain_bar_rewrites: AtomicU64,
+    pub marked_seals: AtomicU64,
+    pub marked_seal_bytes: AtomicU64,
+    pub marks_dropped: AtomicU64,
     pub is_spinning: bool,
     pub is_device_set: bool,
     /// One lane for each rewrite that can run at once: the planner's, then a worker's each

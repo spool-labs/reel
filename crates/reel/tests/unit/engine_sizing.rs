@@ -12,7 +12,7 @@ const MOST_ROW_BYTES: u64 = 1_024;
 #[test]
 fn budget_split() {
     let full = EngineSizing::for_store(&shape(FULL_BUDGET, 3));
-    let small = EngineSizing::for_store(&shape(ByteCount(40 * 1024 * 1024), 1));
+    let small = EngineSizing::for_store(&shape(ByteCount(48 * 1024 * 1024), 1));
 
     assert_eq!(full.segment_bytes, SEGMENT_TARGET);
     assert_eq!(full.lz4_stored_limit, LZ4_STORED_LIMIT);
@@ -45,7 +45,7 @@ fn least_budget() {
 // the rows a segment takes at each budget, as `SEAL_ROWS_EIGHTHS` documents them
 #[test]
 fn documented_rows() {
-    for (mib, rows) in [(128, 35_568), (192, 127_954), (512, 589_881), (4_096, 5_763_472)] {
+    for (mib, rows) in [(128, 27_516), (192, 119_901), (512, 581_830), (4_096, 5_755_420)] {
         let store = StoreShape {
             budget: ByteCount(mib * 1024 * 1024),
             roots: 1,

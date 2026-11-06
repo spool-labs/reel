@@ -88,6 +88,7 @@ pub struct EngineState<Backend: Io> {
     pub batch_rows: Pool<RowGroupBuffer>,
     pub batch_records: Pool<Vec<u8>>,
     pub batch_lengths: Pool<Vec<u32>>,
+    pub current_mark: AtomicU64,
     pub longest_turn: AtomicU64,
     pub index_waits: AtomicU64,
     pub longest_index_wait: AtomicU64,
@@ -508,6 +509,7 @@ impl<Backend: Io> EngineState<Backend> {
             footer_space: ByteCount(self.seal_heap.load(Ordering::Acquire)),
             compaction: ByteCount(self.compaction_heap.load(Ordering::Acquire)),
             thread_stacks: ByteCount(self.job_count.load(Ordering::Acquire) * self.io.job_stack_bytes().0),
+            open_slots: self.queues.len(),
             ..MemoryReport::default()
         };
         for directory in self.directories.iter().flatten() {

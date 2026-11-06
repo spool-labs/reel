@@ -23,6 +23,7 @@ use crate::engine::reel_store::{build_state, open_error, read_superblock, store_
 use crate::engine::volume::Volume;
 use crate::guard::hold;
 use crate::io::Io;
+use crate::lifetime::MarkRange;
 use crate::record::record_reader::RecordReader;
 
 /// Times an open lists its roots again after a file it listed went away
@@ -143,6 +144,7 @@ impl<Backend: Io> EngineState<Backend> {
             highest_place: WritePlace(0),
             lost_region: None,
             cover_rows: 0,
+            marks: MarkRange::NONE,
         };
         let target = ReplayTarget {
             volume,
@@ -169,6 +171,8 @@ impl<Backend: Io> EngineState<Backend> {
             in_flight: 0,
             lowest_place: recovered.lowest_place,
             highest_place: recovered.highest_place,
+            ceiling: recovered.marks.highest(),
+            marks: recovered.marks,
         });
         Ok(())
     }
@@ -201,6 +205,7 @@ impl<Backend: Io> EngineState<Backend> {
             if walked != RowsWalked::Whole {
                 return Err(Error::other("a writer's open rows don't fit this budget"));
             }
+            recovered.marks = recovered.marks.join(head.marks);
             at = FileOffset(at.0 + head.total_length.0);
         }
         Ok(())

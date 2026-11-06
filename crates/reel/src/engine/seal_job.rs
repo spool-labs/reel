@@ -15,6 +15,7 @@ use crate::engine::engine_state::EngineState;
 use crate::engine::open_segment::{SegmentPhase, rows_path};
 use crate::engine::volume::{NO_SEAL, Volume};
 use crate::guard::hold;
+use crate::lifetime::MarkRange;
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::index::open_slots::OpenSlot;
 use crate::index::seal_walk::SealWalk;
@@ -55,6 +56,7 @@ pub struct SealTarget<File> {
     pub row_count: RowCount,
     pub lowest_place: WritePlace,
     pub highest_place: WritePlace,
+    pub marks: MarkRange,
 }
 
 /// How far a seal has gone
@@ -154,6 +156,7 @@ impl<Backend: Io> SealJob<Backend> {
                     row_count: segment.row_count,
                     lowest_place: segment.lowest_place,
                     highest_place: segment.highest_place,
+                    marks: segment.marks,
                 });
                 return true;
             }
@@ -211,6 +214,7 @@ impl<Backend: Io> SealJob<Backend> {
     pub fn start_writing(&mut self, target: &SealTarget<Backend::File>) -> Result<()> {
         self.state.write_out(target.slot)?;
         self.writer.start(target.data_end, target.lowest_place);
+        self.writer.set_marks(target.marks);
         // a read that began before this count can't fill the spot cache behind the walk
         self.volume().handovers.fetch_add(1, Ordering::AcqRel);
         self.last_column = None;
@@ -366,6 +370,7 @@ impl<Backend: Io> SealJob<Backend> {
                 row_block_end: totals.head.index_at,
                 seal_mark: totals.head.index_sum,
                 places: totals.head.places,
+                marks: totals.head.marks,
                 is_damaged: false,
                 has_covers: totals.head.ranges_length.0 > 0,
                 damage_place: WritePlace(0),
@@ -452,6 +457,10 @@ impl<Backend: Io> SealJob<Backend> {
             }
             volume.note_sealed(totals.head.places.highest);
             state.note_moved(JobKind::Seal, totals.file_length);
+            if !target.marks.is_empty() {
+                volume.marked_seals.fetch_add(1, Ordering::Relaxed);
+                volume.marked_seal_bytes.fetch_add(target.data_end.0, Ordering::Relaxed);
+            }
             self.is_in_table = true;
         }
 

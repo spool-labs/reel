@@ -2,7 +2,8 @@ use reel::segment::segment_tail::{PlaceRange, SegmentNumber};
 use reel::record::record_check::Checksum;
 use reel::segment::summary::*;
 use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
+use reel::lifetime::MarkRange;
+use reel_api::units::{DeathMark, ByteCount, FileOffset, RowCount, WritePlace};
 
 const ROOM: ByteCount = ByteCount(4_096);
 
@@ -23,6 +24,8 @@ fn facts(number: u64) -> SegmentFacts {
         block_count: 7,
         walked_blocks: 3,
         is_backward: false,
+        has_lost_rows: false,
+        marks: MarkRange { lowest: DeathMark(40), highest: DeathMark(70) },
     }
 }
 

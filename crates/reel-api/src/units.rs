@@ -28,6 +28,10 @@ pub struct SegmentCount(pub u64);
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct WritePlace(pub u64);
 
+/// When a record will die, a number the caller picks. Marks only group records, and nothing about correctness depends on them
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DeathMark(pub u64);
+
 /// One of a store's volumes, in the order the config declares them
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct VolumeId(pub u8);

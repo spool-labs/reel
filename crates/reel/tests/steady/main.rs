@@ -17,7 +17,6 @@ use std::time::Duration;
 use reel::engine::reel_store::ReelStore;
 use reel::engine::walk_job::FREE_IN_PLACE_BYTES;
 use reel::io::plain::PlainIo;
-use reel::segment::segment_tail::SECOND_TAIL_DISTANCE;
 use reel_api::direction::Direction;
 use reel_api::scan::ScanStep;
 use reel_api::store_error::StoreError;
@@ -523,12 +522,8 @@ fn damage(root: &Path, inputs: &Inputs) {
         if path.extension().is_some_and(|extension| extension == "data") {
             let file = OpenOptions::new().read(true).write(true).open(&path).expect("open");
             let length = file.metadata().expect("metadata").len();
-            for end in [length, length - SECOND_TAIL_DISTANCE] {
-                let mut byte = [0];
-                file.read_exact_at(&mut byte, end - 3).expect("read");
-                byte[0] ^= 1;
-                file.write_all_at(&byte, end - 3).expect("write");
-            }
+            // the blocks go with the tails, or a rebuild would bring the segment back before the run starts
+            file.write_all_at(&vec![0; length as usize], 0).expect("write");
         }
     }
 }

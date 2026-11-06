@@ -1,7 +1,7 @@
 //! A set of writes applied whole, kept in buffers the caller reuses
 
 use crate::column_id::ColumnId;
-use crate::units::ByteCount;
+use crate::units::{ByteCount, DeathMark};
 
 /// What one entry in a batch does
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,6 +48,7 @@ pub enum BatchOperation<'batch> {
 pub struct WriteBatch {
     bytes: Vec<u8>,
     entries: Vec<BatchEntry>,
+    mark: Option<DeathMark>,
 }
 
 impl WriteBatch {
@@ -60,6 +61,17 @@ impl WriteBatch {
     pub fn clear(&mut self) {
         self.bytes.clear();
         self.entries.clear();
+        self.mark = None;
+    }
+
+    /// Set the mark every put in the batch dies at. A batch that holds a delete goes to the unmarked segments whole
+    pub fn set_mark(&mut self, mark: DeathMark) {
+        self.mark = Some(mark);
+    }
+
+    /// Read the batch's mark
+    pub fn mark(&self) -> Option<DeathMark> {
+        self.mark
     }
 
     /// Add a put

@@ -37,7 +37,7 @@ const ROOT: &str = "/disk/damage";
 const ORDERED: ColumnId = ColumnId(1);
 const RANDOM: ColumnId = ColumnId(2);
 const COLUMNS: [ColumnId; 2] = [ORDERED, RANDOM];
-const BUDGET: ByteCount = ByteCount(50 * 1024 * 1024);
+const BUDGET: ByteCount = ByteCount(56 * 1024 * 1024);
 const SETTLE_STEPS: u64 = 2_000_000;
 const SETTLE_TICK: Nanoseconds = Nanoseconds(1_000_000);
 const ROW_PERIOD: Nanoseconds = Nanoseconds(60_000_000);
@@ -68,10 +68,10 @@ const SECTOR_ROWS: u64 = 40;
 const GROUPS_BACK: u64 = 150;
 const WIDE_COLUMNS: u8 = 200;
 const WIDE_SEGMENTS: u64 = 90;
-const WIDE_BUDGET: ByteCount = ByteCount(139 * 1024 * 1024);
+const WIDE_BUDGET: ByteCount = ByteCount(145 * 1024 * 1024);
 // what the summary plans at the least budget, spans included
 const PLANNED_ROOM_AT_LEAST: u64 = 1_400_000;
-const LEAST_BUDGET: ByteCount = ByteCount(49 * 1024 * 1024);
+const LEAST_BUDGET: ByteCount = ByteCount(55 * 1024 * 1024);
 // a segment lost with its row counts every stage a store held at open
 const STAGE_LOST: usize = NEWEST;
 // a stage for writes after the open

@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::engine::open_segment::data_path;
 use reel::engine::reel_store::ReelStore;
 use reel::io::Io;
 use reel::record::codec::Codec;
@@ -174,7 +175,7 @@ fn rotted_filter_stays_out() {
 
     let store = open(&io);
     settle(&io);
-    assert!(!store.state.filter_arena.holds(segment));
+    assert!(store.state.filter_arena.with_filter(segment, line.filter_offset, |_bits| ()).is_none());
     store.close().expect("close");
 }
 
@@ -196,5 +197,35 @@ fn rewrite_frees_the_room() {
     assert!(rows.rows().all(|row| row.facts.segment != segment));
     drop(rows);
     assert!(!store.state.filter_arena.holds(segment));
+    store.close().expect("close");
+}
+
+// more segments with a rotted filter than any list could hold still leave the loader quiet, and each answers through the cache
+#[test]
+fn many_rotted_filters_go_quiet() {
+    const SEGMENTS: u64 = 80;
+    let io = SimulatedIo::new(Seed(7));
+    let store = open(&io);
+    let mut lines = Vec::new();
+    for number in 0..SEGMENTS {
+        store.put(COLUMN, &key(number), b"value").expect("put");
+        store.seal_now();
+        settle(&io);
+    }
+    let rows: Vec<_> = reel::guard::hold(&store.state.volumes[0].summary).rows().map(|row| row.facts.segment).collect();
+    for segment in rows {
+        let (line, _replacement) = store.state.volumes[0].table.block_line(segment, 0).expect("a block");
+        lines.push((segment, line.filter_offset));
+    }
+    store.close().expect("close");
+    drop(store);
+    for (segment, offset) in lines {
+        io.rot(data_path(Path::new(ROOT), segment).as_ref(), FileOffset(u64::from(offset)), BitMask(1)).expect("rot");
+    }
+
+    let store = open(&io);
+    settle(&io);
+    let mut buf = Vec::new();
+    assert!(matches!(store.get(COLUMN, &key(0), &mut buf), Ok(true) | Err(_)));
     store.close().expect("close");
 }

@@ -8,7 +8,7 @@ use reel_api::column_id::ColumnId;
 use reel_api::units::FileOffset;
 
 use crate::engine::engine_state::EngineState;
-use crate::engine::volume::{GaveUp, Volume};
+use crate::engine::volume::Volume;
 use crate::guard::hold;
 use crate::io::{Io, IoFile};
 use crate::pool::touched_capacity;
@@ -32,7 +32,6 @@ pub struct FilterLoader<Backend: Io> {
     segment: Option<SegmentNumber>,
     runs: Vec<BlockRun>,
     looked_at: u64,
-    skipped: GaveUp,
 }
 
 impl<Backend: Io> FilterLoader<Backend> {
@@ -44,7 +43,6 @@ impl<Backend: Io> FilterLoader<Backend> {
             segment: None,
             runs: touched_capacity(MAX_COLUMNS, BlockRun::default()),
             looked_at: u64::MAX,
-            skipped: GaveUp::new(),
         }
     }
 
@@ -66,7 +64,10 @@ impl<Backend: Io> FilterLoader<Backend> {
         };
         if !self.load_some(volume, segment) {
             state.filter_arena.drop_segment(segment);
-            self.skipped.add(segment);
+            // an empty extent says the arena tried, so the look moves on and the block cache answers for this segment
+            if !state.filter_arena.begin(segment, 0, 0) {
+                self.looked_at = self.changes(volume);
+            }
             self.segment = None;
             return true;
         }
@@ -85,7 +86,7 @@ impl<Backend: Io> FilterLoader<Backend> {
         let arena = &self.state.filter_arena;
         let next = {
             let rows = hold(&volume.summary);
-            let wanted = rows.rows().filter(|row| !row.facts.is_damaged && !self.skipped.holds(row.facts.segment));
+            let wanted = rows.rows().filter(|row| !row.facts.is_damaged);
             wanted.map(|row| row.facts.segment).filter(|segment| !arena.holds(*segment)).max()
         };
         let Some(segment) = next else {

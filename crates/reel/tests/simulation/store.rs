@@ -156,6 +156,7 @@ impl Model {
 fn config(sync: SyncPolicy) -> StoreConfig {
     StoreConfig {
         memory_budget: BUDGET,
+        threads: Default::default(),
         volumes: vec![VolumeConfig {
             name: "meta".to_string(),
             roots: vec![PathBuf::from(ROOT)],

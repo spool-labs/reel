@@ -30,6 +30,7 @@ mod store_config;
 use store_config::{BULK, META, PLAIN, config, scratch_root};
 
 const BUDGET: ByteCount = ByteCount(192 * 1024 * 1024);
+const WORKERS_VARIABLE: &str = "REEL_STEADY_WORKERS";
 // set in the child that makes the damaged store, so the measured process runs one open
 const PREPARE_ROOT: &str = "REEL_STEADY_PREPARE";
 const PAGE_BYTES: usize = 4_096;
@@ -296,7 +297,12 @@ impl Drop for ScratchRoot {
 }
 
 fn open(root: &Path) -> Store {
-    ReelStore::open(PlainIo::new(), &config(root, BUDGET)).expect("open")
+    let mut config = config(root, BUDGET);
+    // a gate run sets this to hold the same line with workers beside the planner
+    if let Some(workers) = env::var(WORKERS_VARIABLE).ok().and_then(|workers| workers.parse().ok()) {
+        config.threads.maintenance_workers = workers;
+    }
+    ReelStore::open(PlainIo::new(), &config).expect("open")
 }
 
 // rows past one group's buffer, so they go out in pieces

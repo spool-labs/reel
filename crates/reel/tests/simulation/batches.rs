@@ -79,6 +79,7 @@ fn config() -> StoreConfig {
     };
     StoreConfig {
         memory_budget: BUDGET,
+        threads: Default::default(),
         volumes: vec![volume("meta", ROOT), volume("bulk", SECOND_ROOT)],
         columns: vec![
             column(PLAIN, "plain", Codec::None, 0),

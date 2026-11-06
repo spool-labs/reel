@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use reel::engine::reel_store::ReelStore;
 use reel::io::plain::PlainIo;
+use reel_api::store_error::StoreError;
 use reel_api::units::ByteCount;
 
 #[path = "../steady/store_config.rs"]
@@ -19,6 +20,7 @@ use store_config::{config, scratch_root};
 
 const MIB: u64 = 1024 * 1024;
 const BUDGETS: [u64; 4] = [128, 192, 512, 4_096];
+const WORKER_COUNTS: [usize; 3] = [0, 1, 4];
 // the spec lets memory_report miss the process heap by this share, as a divisor
 const REPORT_SLACK_DIVISOR: u64 = 10;
 
@@ -55,17 +57,31 @@ unsafe impl GlobalAlloc for LiveBytes {
 
 fn main() {
     let mut failures = 0;
-    for budget in BUDGETS {
+    for (budget, workers) in BUDGETS.into_iter().flat_map(|budget| WORKER_COUNTS.map(|workers| (budget, workers))) {
         let root = scratch_root();
         let live_before = LIVE_BYTES.load(Ordering::Acquire);
         let budget = ByteCount(budget * MIB);
-        let store = ReelStore::open(PlainIo::new(), &config(&root, budget)).expect("open");
+        let mut config = config(&root, budget);
+        config.threads.maintenance_workers = workers;
+        let store = match ReelStore::open(PlainIo::new(), &config) {
+            Ok(store) => store,
+            // a count this budget can't hold is the refusal the store promises
+            Err(StoreError::ThreadsPastBudget { .. }) => {
+                println!("budget {} MiB refuses {workers} workers", budget.0 / MIB);
+                fs::remove_dir_all(&root).expect("remove");
+                continue;
+            },
+            Err(error) => {
+                println!("open failed: {error}");
+                process::exit(1);
+            },
+        };
         let live = LIVE_BYTES.load(Ordering::Acquire) - live_before;
         let report = store.memory_report();
         let held = report.heap_total().0 + report.thread_stacks.0;
         let shard = &store.state.sizing.shard;
         println!(
-            "budget {} MiB: {} B held, {live} B live, {:?} rows a segment, {:?} a segment, {} pages {} nodes {} slots a shard",
+            "budget {} MiB, {workers} workers: {} B held, {live} B live, {:?} rows a segment, {:?} a segment, {} pages {} nodes {} slots a shard",
             budget.0 / MIB,
             held,
             store.state.sizing.segment_rows,

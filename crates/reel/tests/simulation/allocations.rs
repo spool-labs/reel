@@ -72,6 +72,7 @@ fn config() -> StoreConfig {
     };
     StoreConfig {
         memory_budget: BUDGET,
+        threads: Default::default(),
         volumes: vec![VolumeConfig {
             name: "allocations".to_string(),
             roots: vec![PathBuf::from(ROOT)],

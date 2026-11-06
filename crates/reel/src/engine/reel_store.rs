@@ -16,7 +16,7 @@ use reel_api::units::{ByteCount, Nanoseconds, RowCount, VolumeId, WritePlace};
 use reel_api::usage::{ColumnUsage, UsageReport};
 use reel_api::write_batch::WriteBatch;
 
-use crate::config::{ColumnConfig, StoreConfig};
+use crate::config::{ColumnConfig, StoreConfig, ThreadCounts};
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::engine_sizing::{
     complete_block_rows, complete_row_limit,
@@ -27,7 +27,7 @@ use crate::engine::engine_state::{EngineState, PLACE_RUN, SEGMENT_NUMBER_BATCH, 
 use crate::engine::open_segment::{RECORD_WINDOW_BYTES, RecordWindow, RowQueue, fits_a_segment_path};
 use crate::engine::read_only::{close_read_only, load_read_only};
 use crate::engine::read_path::RecordWant;
-use crate::engine::read_pool::{READ_WORKERS, ReadPool, ReadWorker};
+use crate::engine::read_pool::{ReadPool, ReadWorker};
 use crate::engine::recovery::{
     OpenMode,
     RootScan, SummaryFound, list_roots, load_covers, read_summaries, recover_segments, save_cleared_spans, scan_roots,
@@ -89,22 +89,11 @@ pub fn open_error(action: &'static str) -> impl Fn(Error) -> StoreError {
 impl<Backend: Io> ReelStore<Backend> {
     /// Open a store: lock every root, read every tail, recover every open segment, start the jobs
     pub fn open(io: Backend, config: &StoreConfig) -> Result<Self, StoreError> {
-        Self::open_sized(io, config, None)
-    }
-
-    /// Open a store with this many walk workers a volume, for the tests and benches that measure them
-    pub fn open_with_walk_workers(io: Backend, config: &StoreConfig, workers: usize) -> Result<Self, StoreError> {
-        Self::open_sized(io, config, Some(workers))
-    }
-
-    /// Open a store, with the walk workers its budget gives unless a count is set
-    pub fn open_sized(io: Backend, config: &StoreConfig, workers: Option<usize>) -> Result<Self, StoreError> {
         check_config(config)?;
         let locks = lock_roots(&io, config)?;
         let superblock = settle_superblock(&io, config)?;
 
-        let mut sizing = store_sizing(config)?;
-        sizing.walk_workers = workers.unwrap_or(sizing.walk_workers);
+        let sizing = store_sizing(config)?;
 
         // every root is listed before any tail is read, and the table is sized from what they hold
         let mut roots = Vec::with_capacity(config.volumes.len());
@@ -647,7 +636,7 @@ pub fn bring_up<Backend: Io>(
         let task = state.io.spawn_job("reel-read", worker).map_err(open_error("starting a job"))?;
         let _set = cell.set(task);
     }
-    state.job_count.store(SHARED_JOBS + READ_WORKERS as u64 + state.volumes.len() as u64 + workers, Ordering::Release);
+    state.job_count.store(SHARED_JOBS + state.read_tasks.len() as u64 + state.volumes.len() as u64 + workers, Ordering::Release);
     state.note_graves_at_open();
     Ok(())
 }
@@ -662,7 +651,20 @@ pub fn store_sizing(config: &StoreConfig) -> Result<EngineSizing, StoreError> {
         volumes: config.volumes.len(),
         has_lz4: config.columns.iter().any(|column| column.codec == Codec::Lz4),
         widest_keys: (0..config.volumes.len()).map(|volume| config.widest_key(volume) as u64).sum(),
+        threads: config.threads,
     };
+    let default_shape = StoreShape { threads: ThreadCounts::default(), ..shape };
+    if config.threads.read_threads == 0 {
+        return Err(StoreError::NoReadThreads);
+    }
+    if config.memory_budget >= default_shape.least_budget() && config.memory_budget < shape.least_budget() {
+        return Err(StoreError::ThreadsPastBudget {
+            maintenance_workers: config.threads.maintenance_workers,
+            read_threads: config.threads.read_threads,
+            budget: config.memory_budget,
+            least: shape.least_budget(),
+        });
+    }
     if config.memory_budget < shape.least_budget() {
         return Err(StoreError::BudgetTooSmall {
             budget: config.memory_budget,
@@ -1154,8 +1156,8 @@ pub fn build_state<Backend: Io>(
         job_count: AtomicU64::new(0),
         row_task: OnceLock::new(),
         reserve_task: OnceLock::new(),
-        read_tasks: (0..READ_WORKERS).map(|_worker| OnceLock::new()).collect(),
-        read_pool: ReadPool::new(scans),
+        read_tasks: (0..config.threads.read_threads).map(|_worker| OnceLock::new()).collect(),
+        read_pool: ReadPool::new(scans, config.threads.read_threads),
         is_read_only: false,
         complete: Vec::new(),
         complete_images: Vec::new(),

@@ -33,6 +33,10 @@ pub enum StoreError {
     ScansFull { limit: u64 },
     #[error("a budget of {budget:?} is under the {least:?} this store needs")]
     BudgetTooSmall { budget: ByteCount, least: ByteCount },
+    #[error("{maintenance_workers} maintenance workers a volume and {read_threads} read threads need {least:?}, past a budget of {budget:?}")]
+    ThreadsPastBudget { maintenance_workers: usize, read_threads: usize, budget: ByteCount, least: ByteCount },
+    #[error("a store needs at least one read thread")]
+    NoReadThreads,
     #[error("batch touches more than one volume")]
     BatchAcrossVolumes,
     #[error("a record in column {column:?} failed its check")]

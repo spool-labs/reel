@@ -39,6 +39,7 @@ type PendingRead<'call> = Pin<Box<dyn Future<Output = Result<bool, StoreError>> 
 fn open(io: &SimulatedIo) -> Store2 {
     let config = StoreConfig {
         memory_budget: BUDGET,
+        threads: Default::default(),
         volumes: vec![VolumeConfig {
             name: "async".to_string(),
             roots: vec![PathBuf::from(ROOT)],

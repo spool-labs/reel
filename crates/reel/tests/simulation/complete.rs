@@ -52,6 +52,7 @@ type Filled = (BTreeMap<Vec<u8>, Vec<u8>>, Vec<Vec<u8>>);
 fn config(capacity: RowCount) -> StoreConfig {
     StoreConfig {
         memory_budget: BUDGET,
+        threads: Default::default(),
         volumes: vec![VolumeConfig {
             name: "complete".to_string(),
             roots: vec![PathBuf::from(ROOT)],

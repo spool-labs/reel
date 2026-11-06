@@ -25,8 +25,6 @@ use crate::io::job::{Job, JobStep};
 use crate::io::{Io, IoTask};
 use crate::pool::{touched_capacity, touched_queue};
 
-/// Engine threads that run async reads on a backend with no completions of its own
-pub const READ_WORKERS: usize = 4;
 /// Async reads in flight at once
 pub const READ_SLOTS: usize = 64;
 /// Bytes of keys a slot holds, and a longer get_many goes through in turns
@@ -99,6 +97,7 @@ pub struct ReadPool {
     queue: Mutex<VecDeque<usize>>,
     waiters: Mutex<VecDeque<Waker>>,
     next_worker: AtomicUsize,
+    workers: usize,
     pub scans: Mutex<Vec<ScanState>>,
 }
 
@@ -145,7 +144,7 @@ impl Default for ReadSlot {
 
 impl ReadPool {
     /// Allocate every slot
-    pub fn new(scans: Vec<ScanState>) -> Self {
+    pub fn new(scans: Vec<ScanState>, workers: usize) -> Self {
         let mut queue = VecDeque::with_capacity(READ_SLOTS);
         queue.extend(0..READ_SLOTS);
         queue.clear();
@@ -155,6 +154,7 @@ impl ReadPool {
             queue: Mutex::new(queue),
             waiters: Mutex::new(touched_queue(MOST_WAITERS, Waker::noop().clone())),
             next_worker: AtomicUsize::new(0),
+            workers,
             scans: Mutex::new(scans),
         }
     }
@@ -310,7 +310,7 @@ impl SlotLease<'_> {
     pub fn submit(&self) -> usize {
         hold(&self.pool.slots[self.index]).phase = SlotPhase::Queued;
         hold(&self.pool.queue).push_back(self.index);
-        self.pool.next_worker.fetch_add(1, Ordering::Relaxed) % READ_WORKERS
+        self.pool.next_worker.fetch_add(1, Ordering::Relaxed) % self.pool.workers
     }
 
     /// Wait for the read and take back its work and answer

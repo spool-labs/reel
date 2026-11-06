@@ -2,8 +2,9 @@
 
 use reel_api::units::{ByteCount, RowCount};
 
+use crate::config::ThreadCounts;
 use crate::engine::open_segment::RECORD_WINDOW_BYTES;
-use crate::engine::read_pool::{READ_SLOTS, READ_WORKERS, SLOT_KEY_BYTES, SLOT_KEYS};
+use crate::engine::read_pool::{READ_SLOTS, SLOT_KEY_BYTES, SLOT_KEYS};
 use crate::engine::seal_job::MOST_SEGMENT_BLOCKS;
 use crate::engine::scan_state::{MOST_SCANS, planned_scan_bytes};
 use crate::index::entry_slab::{PAGE_BYTES, PageCount};
@@ -54,11 +55,6 @@ pub const ENCODER_BYTES: u64 = 256 * 1024;
 pub const SEAL_JOB_BYTES: u64 = 3 * 1024 * 1024;
 /// Bytes a dead-byte walk's own buffers are planned at
 pub const WALK_JOB_BYTES: u64 = 5 * 256 * 1024;
-/// Most workers a volume's walk has beside the planner. Measured on the 8-core box: two workers cost 5 to 7% of ingest at the best
-/// thread count, past the walk's 5%, and the planner alone costs none. The complete table's walk sets this again
-pub const MOST_WALK_WORKERS: usize = 0;
-/// A store gets one walk worker a volume for each this much budget, up to the most
-pub const WALK_WORKER_BUDGET: ByteCount = ByteCount(64 * 1024 * 1024);
 /// Bytes a compaction job's own buffers are planned at
 pub const COMPACT_JOB_BYTES: u64 = 11 * 512 * 1024;
 /// Bytes a job's stack is planned at
@@ -112,6 +108,7 @@ pub struct StoreShape {
     pub volumes: usize,
     pub has_lz4: bool,
     pub widest_keys: u64,
+    pub threads: ThreadCounts,
 }
 
 /// What a budget buys
@@ -130,9 +127,8 @@ pub struct EngineSizing {
 
 impl StoreShape {
     /// Count the walk workers each volume gets
-    #[allow(clippy::unnecessary_min_or_max, reason = "the most is measured, and a measurement can set it back above none")]
     pub fn walk_workers(&self) -> usize {
-        ((self.budget.0 / WALK_WORKER_BUDGET.0) as usize).min(MOST_WALK_WORKERS)
+        self.threads.maintenance_workers
     }
 
     /// Count the open slots the roots can use
@@ -153,7 +149,7 @@ impl StoreShape {
         let encoders = WRITE_BUFFERS as u64 * ENCODER_BYTES + large;
         let spans = 4 * MOST_DAMAGED_SPANS as u64 * (SPAN_KEY_BYTES as u64 * 2);
         let workers = volumes * self.walk_workers() as u64;
-        let stacks = (SHARED_JOBS + READ_WORKERS as u64 + volumes + workers) * JOB_STACK_PLAN_BYTES;
+        let stacks = (SHARED_JOBS + self.threads.read_threads as u64 + volumes + workers) * JOB_STACK_PLAN_BYTES;
         // the pool holds both keys of every cover, and a seal job has room to write them all to a footer
         let cover_keys = 2 * MOST_RANGE_COVERS as u64 * self.widest_keys;
         let cover_fixed = (COVER_SLOT_BYTES + COVER_RECORD_BYTES) as u64 * MOST_RANGE_COVERS as u64;

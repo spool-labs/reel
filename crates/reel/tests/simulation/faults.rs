@@ -29,7 +29,7 @@ const TABLE_ROWS: RowCount = RowCount(100_000);
 const ROOTS: [&str; 3] = ["/disk/faults-meta", "/disk/faults-meta-two", "/disk/faults-bulk"];
 const COLUMNS: [ColumnId; 2] = [ColumnId(1), ColumnId(2)];
 const HIGHEST_KEY: &[u8] = b"zzz";
-const BUDGET: ByteCount = ByteCount(82 * 1024 * 1024);
+const BUDGET: ByteCount = ByteCount(84 * 1024 * 1024);
 // a test holds each seed with a traced bug: 0 `failed_open` and `failed_close`, 1 `rows_sync` and `tail_sync`, 37 and
 // 349 `covered_last` and `later_sync`, 125 `one_copy`, 681 `tail_then_cut`, 959 `flushed_unknown`, 1000 `open_covers`, 1002
 // `wrong_place`. Seeds 1 and 1000 are mapped from notes, with no replay. The rest are plain extra seeds
@@ -203,6 +203,7 @@ fn config(policy: SyncPolicy, complete_rows: Option<RowCount>) -> StoreConfig {
     };
     StoreConfig {
         memory_budget: BUDGET,
+        threads: Default::default(),
         volumes: vec![volume("meta", &ROOTS[..2], policy), volume("bulk", &ROOTS[2..], SyncPolicy::Never)],
         columns: vec![column(COLUMNS[0], "meta", 0, complete_rows), column(COLUMNS[1], "bulk", 1, None)],
     }
@@ -300,8 +301,9 @@ impl Run {
                 self.arm_fault();
             }
             let workers = (self.seed % WALK_WORKER_COUNTS) as usize;
-            let config = config(self.policy, complete_rows_of(self.seed));
-            let opened = ReelStore::open_with_walk_workers(self.io.clone(), &config, workers);
+            let mut config = config(self.policy, complete_rows_of(self.seed));
+            config.threads.maintenance_workers = workers;
+            let opened = ReelStore::open(self.io.clone(), &config);
             if self.io.is_crashed() {
                 self.crash();
                 drop(opened);

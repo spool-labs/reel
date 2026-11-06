@@ -26,6 +26,7 @@ pub fn config(root: &Path, budget: ByteCount) -> StoreConfig {
     };
     StoreConfig {
         memory_budget: budget,
+        threads: Default::default(),
         volumes: vec![VolumeConfig {
             name: "steady".to_string(),
             roots: vec![root.to_path_buf()],

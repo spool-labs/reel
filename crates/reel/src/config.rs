@@ -9,6 +9,11 @@ use crate::record::codec::Codec;
 
 /// The memory budget when the caller doesn't set one
 pub const DEFAULT_MEMORY_BUDGET: ByteCount = ByteCount(512 * 1024 * 1024);
+/// Maintenance workers a volume runs by default. Measured on the 8-core box: two workers cost 5 to 7% of ingest at the best thread
+/// count, past the walk's 5%, and the planner alone costs none
+pub const DEFAULT_MAINTENANCE_WORKERS: usize = 0;
+/// Async read threads a store runs by default
+pub const DEFAULT_READ_THREADS: usize = 4;
 /// The longest key a column can declare
 pub const MAX_KEY_BYTES: u16 = 1_056;
 
@@ -52,10 +57,30 @@ pub struct VolumeConfig {
     pub sync: SyncPolicy,
 }
 
+/// How many threads a store runs for maintenance and async reads. Each one's memory comes out of the budget, sized and touched at
+/// open, and a count the budget can't hold is refused there. One seal thread a volume runs whatever these say
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ThreadCounts {
+    /// Workers a volume's planner hands jobs to, beside the planner itself
+    pub maintenance_workers: usize,
+    /// Threads that serve the async read forms
+    pub read_threads: usize,
+}
+
+impl Default for ThreadCounts {
+    fn default() -> Self {
+        Self {
+            maintenance_workers: DEFAULT_MAINTENANCE_WORKERS,
+            read_threads: DEFAULT_READ_THREADS,
+        }
+    }
+}
+
 /// A whole store
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoreConfig {
     pub memory_budget: ByteCount,
+    pub threads: ThreadCounts,
     pub volumes: Vec<VolumeConfig>,
     pub columns: Vec<ColumnConfig>,
 }

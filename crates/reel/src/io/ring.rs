@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 use std::future::{Future, poll_fn};
 use std::io::{Error, ErrorKind, IoSliceMut, Result};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::task::{Context, Poll, Waker};
 
@@ -102,6 +102,110 @@ pub struct RingSlot {
     waker: Option<Waker>,
 }
 
+/// Callers waiting for one kind of room, oldest first. A wake goes to one caller, so one that leaves takes itself out of line
+/// or hands on a wake it got and didn't use
+#[derive(Debug)]
+pub struct WaitLine {
+    spots: Mutex<VecDeque<(u64, Waker)>>,
+    next_id: AtomicU64,
+}
+
+/// A caller's place in a line, which it gives up however it ends
+#[derive(Debug)]
+pub struct LineSpot<'line> {
+    line: &'line WaitLine,
+    id: Option<u64>,
+    is_served: bool,
+}
+
+impl WaitLine {
+    /// Allocate a line with room for every caller it keeps
+    pub fn new() -> Self {
+        Self {
+            spots: Mutex::new(touched_queue(MOST_RING_WAITERS, (0, Waker::noop().clone()))),
+            next_id: AtomicU64::new(0),
+        }
+    }
+
+    /// Wake the first in line
+    pub fn wake_next(&self) {
+        if let Some((_id, waker)) = hold(&self.spots).pop_front() {
+            waker.wake();
+        }
+    }
+
+    /// Wake everyone in line
+    pub fn wake_all(&self) {
+        while let Some((_id, waker)) = hold(&self.spots).pop_front() {
+            waker.wake();
+        }
+    }
+
+    /// Stand in line, or keep a caller's place with its newest waker. A full line has the runtime poll again
+    pub fn stand(&self, spot: &mut Option<u64>, context: &mut Context<'_>) {
+        let mut spots = hold(&self.spots);
+        if let Some(entry) = spots.iter_mut().find(|entry| Some(entry.0) == *spot) {
+            if !entry.1.will_wake(context.waker()) {
+                entry.1 = context.waker().clone();
+            }
+            return;
+        }
+        if spots.len() == MOST_RING_WAITERS {
+            drop(spots);
+            *spot = None;
+            context.waker().wake_by_ref();
+            return;
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        spots.push_back((id, context.waker().clone()));
+        *spot = Some(id);
+    }
+
+    /// Wait for a take to succeed, in line between tries. A take after standing catches room freed before the waker went in
+    pub async fn wait_for<Item>(&self, take: impl Fn() -> Result<Option<Item>>) -> Result<Item> {
+        let mut spot = LineSpot { line: self, id: None, is_served: false };
+        poll_fn(|context| {
+            if let Some(item) = take()? {
+                spot.is_served = true;
+                return Poll::Ready(Ok(item));
+            }
+            self.stand(&mut spot.id, context);
+            match take()? {
+                Some(item) => {
+                    spot.is_served = true;
+                    Poll::Ready(Ok(item))
+                },
+                None => Poll::Pending,
+            }
+        })
+        .await
+    }
+}
+
+impl Default for WaitLine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for LineSpot<'_> {
+    fn drop(&mut self) {
+        let Some(id) = self.id else {
+            return;
+        };
+        let mut spots = hold(&self.line.spots);
+        if let Some(position) = spots.iter().position(|entry| entry.0 == id) {
+            spots.remove(position);
+            return;
+        }
+        drop(spots);
+        // the wake came here, and a caller that took nothing hands it on
+        if !self.is_served {
+            self.line.wake_next();
+        }
+    }
+}
+
 /// The slots of a ring and the callers waiting for them
 #[derive(Debug)]
 pub struct ReadRing<Driver> {
@@ -109,7 +213,8 @@ pub struct ReadRing<Driver> {
     slots: Vec<Mutex<RingSlot>>,
     free: Mutex<Vec<usize>>,
     seats: AtomicUsize,
-    waiters: Mutex<VecDeque<Waker>>,
+    seat_line: WaitLine,
+    slot_line: WaitLine,
     in_flight: AtomicUsize,
     is_closed: AtomicBool,
 }
@@ -140,7 +245,8 @@ impl<Driver> ReadRing<Driver> {
             slots: (0..RING_SLOTS).map(|_slot| Mutex::new(slot())).collect(),
             free: Mutex::new((0..RING_SLOTS).collect()),
             seats: AtomicUsize::new(RING_READS),
-            waiters: Mutex::new(touched_queue(MOST_RING_WAITERS, Waker::noop().clone())),
+            seat_line: WaitLine::new(),
+            slot_line: WaitLine::new(),
             in_flight: AtomicUsize::new(0),
             is_closed: AtomicBool::new(false),
         }
@@ -148,14 +254,15 @@ impl<Driver> ReadRing<Driver> {
 
     /// Read the heap the slots hold, past the driver's own
     pub fn heap_bytes(&self) -> ByteCount {
-        let lists = RING_SLOTS * (size_of::<RingSlot>() + size_of::<usize>()) + MOST_RING_WAITERS * size_of::<Waker>();
+        let lists = RING_SLOTS * (size_of::<RingSlot>() + size_of::<usize>()) + 2 * MOST_RING_WAITERS * size_of::<(u64, Waker)>();
         ByteCount(lists as u64)
     }
 
     /// Refuse new reads, so the reads in flight can drain
     pub fn close(&self) {
         self.is_closed.store(true, Ordering::Release);
-        self.wake_waiters();
+        self.seat_line.wake_all();
+        self.slot_line.wake_all();
     }
 
     /// Check nothing is left for the device to finish
@@ -163,45 +270,9 @@ impl<Driver> ReadRing<Driver> {
         self.is_closed.load(Ordering::Acquire) && self.in_flight.load(Ordering::Acquire) == 0
     }
 
-    /// Wake every caller in line
-    pub fn wake_waiters(&self) {
-        while let Some(waiter) = hold(&self.waiters).pop_front() {
-            waiter.wake();
-        }
-    }
-
-    /// Leave a waker in line, or ask the runtime to poll again when the line is full
-    pub fn wait_in_line(&self, context: &mut Context<'_>) {
-        let mut waiters = hold(&self.waiters);
-        if waiters.len() == MOST_RING_WAITERS {
-            drop(waiters);
-            context.waker().wake_by_ref();
-            return;
-        }
-        waiters.push_back(context.waker().clone());
-    }
-
-    /// Wake the next in line
-    pub fn wake_next(&self) {
-        if let Some(waiter) = hold(&self.waiters).pop_front() {
-            waiter.wake();
-        }
-    }
-
     /// Take a place among the reads running, or wait in line for one
     pub async fn seat(&self) -> Result<RingSeat<'_, Driver>> {
-        poll_fn(|context| {
-            if let Some(seat) = self.try_seat()? {
-                return Poll::Ready(Ok(seat));
-            }
-            self.wait_in_line(context);
-            // a seat given back before the waker went in would wake nobody
-            match self.try_seat()? {
-                Some(seat) => Poll::Ready(Ok(seat)),
-                None => Poll::Pending,
-            }
-        })
-        .await
+        self.seat_line.wait_for(|| self.try_seat()).await
     }
 
     /// Take a place if one is free
@@ -221,17 +292,7 @@ impl<Driver> ReadRing<Driver> {
 
     /// Take a free slot, or wait in line for one
     pub async fn claim(&self) -> Result<RingLease<'_, Driver>> {
-        poll_fn(|context| {
-            if let Some(lease) = self.try_claim()? {
-                return Poll::Ready(Ok(lease));
-            }
-            self.wait_in_line(context);
-            match self.try_claim()? {
-                Some(lease) => Poll::Ready(Ok(lease)),
-                None => Poll::Pending,
-            }
-        })
-        .await
+        self.slot_line.wait_for(|| self.try_claim()).await
     }
 
     /// Take a free slot if one stands free
@@ -252,7 +313,7 @@ impl<Driver> ReadRing<Driver> {
             held.waker = None;
         }
         hold(&self.free).push(slot);
-        self.wake_next();
+        self.slot_line.wake_next();
     }
 
     /// Take a completion from the driver and wake its caller, or free the slot when the caller went away
@@ -324,8 +385,15 @@ impl<Driver> ReadRing<Driver> {
 
         let lease = self.claim().await?;
         lease.start(file, offset, total)?;
+        // a short read goes round part by part, as a filled buffer does
         if lease.finished().await? != total {
-            return Err(Error::from(ErrorKind::UnexpectedEof));
+            drop(lease);
+            let mut at = offset.0;
+            for part in parts {
+                self.read_into(file, FileOffset(at), part).await?;
+                at += part.len() as u64;
+            }
+            return Ok(());
         }
         self.driver.copy_parts(lease.slot, parts);
         Ok(())
@@ -381,7 +449,7 @@ impl<Driver> Drop for RingLease<'_, Driver> {
 impl<Driver> Drop for RingSeat<'_, Driver> {
     fn drop(&mut self) {
         self.ring.seats.fetch_add(1, Ordering::AcqRel);
-        self.ring.wake_next();
+        self.ring.seat_line.wake_next();
     }
 }
 

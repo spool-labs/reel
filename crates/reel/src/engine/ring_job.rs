@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use reel_api::units::Nanoseconds;
+
 use crate::engine::engine_state::EngineState;
 use crate::io::job::{Job, JobStep};
 use crate::io::ring::{RING_READS, ReadRing, RingDriver};
@@ -9,6 +11,9 @@ use crate::io::Io;
 use crate::pool::Pool;
 use crate::record::record_reader::RecordReader;
 use crate::segment::footer_reader::FooterReader;
+
+/// How long a reaper waits after its driver fails a look
+pub const RING_RETRY: Nanoseconds = Nanoseconds(10_000_000);
 
 /// A job that reaps one ring
 pub struct RingReaper<Backend: Io> {
@@ -22,8 +27,9 @@ impl<Backend: Io> Job for RingReaper<Backend> {
         };
         match ring.driver.reap(&mut |slot, answer| ring.finish(slot, answer)) {
             Ok(false) => JobStep::Idle,
-            // a ring that can't wait has nothing a retry would change, and a close finds the reads it left
-            Ok(true) | Err(_) => JobStep::Worked,
+            Ok(true) => JobStep::Worked,
+            // a kernel that refuses the wait now may take it later, and a spin would cost a core until then
+            Err(_) => JobStep::IdleUntil { deadline: Nanoseconds(self.state.io.now().0 + RING_RETRY.0) },
         }
     }
 }

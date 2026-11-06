@@ -3,7 +3,9 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::{Pin, pin};
-use std::task::{Context, Poll, Waker};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll, Wake, Waker};
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
@@ -329,4 +331,84 @@ fn cue_reads_its_point() {
     assert_eq!(buf, b"newer");
     drop(cue);
     store.close().expect("close");
+}
+
+struct WakeCount(AtomicUsize);
+
+impl Wake for WakeCount {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+// a caller that left the line doesn't take the wake the next one needs
+#[test]
+fn wake_passes_a_caller_that_left() {
+    let (_io, store) = ringed(31);
+    let ring = ring(&store);
+    let mut seats: Vec<_> = (0..RING_READS).map(|_seat| ring.try_seat().expect("open").expect("a free seat")).collect();
+    {
+        let mut left = pin!(ring.seat());
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(left.as_mut().poll(&mut context).is_pending());
+    }
+    let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+    let waker = Waker::from(Arc::clone(&wakes));
+    let mut context = Context::from_waker(&waker);
+    let mut live = pin!(ring.seat());
+    assert!(live.as_mut().poll(&mut context).is_pending());
+
+    drop(seats.pop());
+    assert_eq!(wakes.0.load(Ordering::Acquire), 1, "a seat is free and the caller in line sleeps");
+}
+
+// a wake that came to a caller who left passes to the next, so a dropped read never strands the line
+#[test]
+fn woken_caller_hands_on() {
+    let (_io, store) = ringed(33);
+    let ring = ring(&store);
+    let mut seats: Vec<_> = (0..RING_READS).map(|_seat| ring.try_seat().expect("open").expect("a free seat")).collect();
+    let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+    let waker = Waker::from(Arc::clone(&wakes));
+    let mut context = Context::from_waker(&waker);
+    {
+        let mut first = pin!(ring.seat());
+        assert!(first.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+        let mut second = Box::pin(ring.seat());
+        assert!(second.as_mut().poll(&mut context).is_pending());
+        drop(seats.pop());
+        assert_eq!(wakes.0.load(Ordering::Acquire), 0);
+        let taken = ring.try_seat().expect("open");
+        drop(taken);
+    }
+    drop(seats);
+}
+
+// a slot coming back wakes a caller waiting for a slot, with a caller waiting for a seat ahead of it in line
+#[test]
+fn slot_wake_reaches_a_slot_waiter() {
+    let (_io, store) = ringed(32);
+    let ring = ring(&store);
+    let seats: Vec<_> = (0..RING_READS).map(|_seat| ring.try_seat().expect("open").expect("a free seat")).collect();
+    let mut leases: Vec<_> = (0..RING_SLOTS).map(|_slot| ring.try_claim().expect("open").expect("a free slot")).collect();
+
+    let seat_wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+    let seat_waker = Waker::from(Arc::clone(&seat_wakes));
+    let mut seat_context = Context::from_waker(&seat_waker);
+    let mut wants_seat = pin!(ring.seat());
+    assert!(wants_seat.as_mut().poll(&mut seat_context).is_pending());
+
+    let slot_wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+    let slot_waker = Waker::from(Arc::clone(&slot_wakes));
+    let mut slot_context = Context::from_waker(&slot_waker);
+    let mut wants_slot = pin!(ring.claim());
+    assert!(wants_slot.as_mut().poll(&mut slot_context).is_pending());
+
+    drop(leases.pop());
+    // a runtime polls whoever the ring woke
+    if seat_wakes.0.load(Ordering::Acquire) > 0 {
+        assert!(wants_seat.as_mut().poll(&mut seat_context).is_pending());
+    }
+    assert_eq!(slot_wakes.0.load(Ordering::Acquire), 1, "a slot is free and the caller waiting for it sleeps");
+    drop(seats);
 }

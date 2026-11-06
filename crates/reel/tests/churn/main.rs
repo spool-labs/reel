@@ -51,7 +51,7 @@ fn value_of(key: &[u8], round: u64) -> Vec<u8> {
 
 fn wait_for_seal(store: &Store, before: u64) {
     let mut waits = 0;
-    while store.state.volumes[0].table.segment_count() == before && waits < MOST_SEAL_WAITS {
+    while store.state.volumes[0].seals_done.load(Ordering::Acquire) == before && waits < MOST_SEAL_WAITS {
         waits += 1;
         thread::sleep(SEAL_WAIT);
     }
@@ -115,7 +115,7 @@ fn churn(has_cue: bool) -> JobsRun {
         store.put(META, &gone(number), b"gone").expect("put");
         store.put(META, &spanned(number), b"gone").expect("put");
     }
-    let before = store.state.volumes[0].table.segment_count();
+    let before = store.state.volumes[0].seals_done.load(Ordering::Acquire);
     store.seal_now();
     wait_for_seal(&store, before);
     for number in 0..GONE_KEYS {

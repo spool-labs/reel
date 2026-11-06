@@ -77,7 +77,10 @@ pub const SEAL_POINT_EIGHTHS: u64 = 7;
 pub const LEAST_SEAL_DIVISOR: u64 = 4;
 /// Nanoseconds in a second, for a rate
 pub const SECOND: u64 = 1_000_000_000;
+/// Eighths of the rows the index plans for that a segment may reach
 pub const SEAL_ROWS_EIGHTHS: u64 = 5;
+/// A seal starts with room for this part of a second of its own rate, or the line a ration draws on barely moves
+pub const LEAST_ROOM_DIVISOR: u128 = 10;
 /// The eighths of a segment's row block lines a complete column can fill. The rest stay free for other columns' blocks
 pub const SEAL_LINE_EIGHTHS: u64 = 7;
 /// The most bytes a row's numbers can take in a block: kind and shared length, suffix length, place, offset and length
@@ -229,7 +232,10 @@ pub fn seal_point(limit: RowCount, seal_rate: u64, ingest_rate: u64) -> RowCount
     let point = index_rows * u128::from(seal_rate) / (u128::from(seal_rate) + u128::from(ingest_rate));
     let margined = (point * u128::from(SEAL_POINT_EIGHTHS) / 8) as u64;
     let least = (index_rows / u128::from(LEAST_SEAL_DIVISOR)) as u64;
-    RowCount(margined.max(least).min(limit.0))
+    // a seal that ends inside the same time needs no room held for it
+    let least_room = u128::from(seal_rate) / LEAST_ROOM_DIVISOR;
+    let room_line = if least_room < u128::from(limit.0) { (index_rows - least_room) as u64 } else { index_rows as u64 };
+    RowCount(margined.min(room_line).max(least).min(limit.0))
 }
 
 /// Work out a rate in rows a second, or nothing when no time has passed

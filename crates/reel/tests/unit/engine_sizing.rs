@@ -158,6 +158,10 @@ fn seal_point_from_rates() {
 
     assert_eq!(seal_point(limit, 100_000_000, 1), limit);
     assert_eq!(seal_point(limit, 1, 100_000_000).0, index_rows / LEAST_SEAL_DIVISOR);
+
+    // a seal starts with room for a tenth of a second of its own rate, whatever the ingest
+    let (fast_seal, slow_ingest) = (6_000_000, 1);
+    assert!(index_rows - seal_point(limit, fast_seal, slow_ingest).0 >= fast_seal / 10);
 }
 
 // a rate needs time to have passed

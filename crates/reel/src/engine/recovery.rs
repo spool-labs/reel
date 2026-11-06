@@ -663,6 +663,7 @@ impl<Backend: Io> EngineState<Backend> {
             file: found.data.clone(),
         }));
         volume.open_slot(slot);
+        volume.rows_in_index.fetch_add(recovered.row_count.0, Ordering::Relaxed);
         hold(&volume.claims).open.push(OpenSegment {
             number: found.number,
             slot,

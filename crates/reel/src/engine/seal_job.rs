@@ -95,6 +95,8 @@ pub struct SealJob<Backend: Io> {
     pub last_key: Vec<u8>,
     pub last_slot: Option<(KeyHash, SegmentNumber, u16)>,
     pub seal_started: Nanoseconds,
+    pub rows_walked: u64,
+    pub rows_cleaned: u64,
     pub last_column: Option<ColumnId>,
     pub is_in_table: bool,
     pub columns_listed: usize,
@@ -121,6 +123,8 @@ impl<Backend: Io> SealJob<Backend> {
             last_key: touched_capacity(MAX_KEY_BYTES as usize, 0),
             last_slot: None,
             seal_started: Nanoseconds(0),
+            rows_walked: 0,
+            rows_cleaned: 0,
             last_column: None,
             is_in_table: false,
             columns_listed: 0,
@@ -146,6 +150,11 @@ impl<Backend: Io> SealJob<Backend> {
                     volume.ingest_rate.store(rate, Ordering::Relaxed);
                 }
                 self.seal_started = now;
+                self.rows_walked = 0;
+                self.rows_cleaned = 0;
+                let held = self.state.rows_held();
+                let free = RowCount(self.state.index_capacity().0.saturating_sub(held.0));
+                volume.ration.start(segment.row_count, held, free);
                 self.target = Some(SealTarget {
                     number: segment.number,
                     slot: segment.slot,
@@ -173,6 +182,11 @@ impl<Backend: Io> SealJob<Backend> {
             volume.seal_rate.store(seal_rate, Ordering::Relaxed);
             let point = seal_point(volume.segment_rows, seal_rate, volume.ingest_rate.load(Ordering::Relaxed));
             volume.seal_point.store(point.0, Ordering::Relaxed);
+        }
+        if let Some(target) = &self.target {
+            let volume = self.volume();
+            volume.rows_in_index.fetch_sub(target.row_count.0, Ordering::Relaxed);
+            volume.ration.clear();
         }
         self.target = None;
         self.phase = SealPhase::Idle;
@@ -230,6 +244,8 @@ impl<Backend: Io> SealJob<Backend> {
 
     /// Put a step's rows into the footer, and finish it when they run out
     pub fn write_rows(&mut self, target: &SealTarget<Backend::File>) -> Result<()> {
+        self.volume().ration.note_walked(RowCount(self.rows_walked));
+        self.rows_walked += SEAL_STEP_ROWS;
         for _row in 0..SEAL_STEP_ROWS {
             let Some(shard) = self.walk.next_shard() else {
                 return self.finish_footer(target);
@@ -498,6 +514,8 @@ impl<Backend: Io> SealJob<Backend> {
 
     /// Clean a step's rows out of the write index, and free the slot when they and the pins are gone
     pub fn clean(&mut self, target: &SealTarget<Backend::File>) -> bool {
+        self.volume().ration.note_cleaned(RowCount(self.rows_cleaned));
+        self.rows_cleaned += SEAL_STEP_ROWS;
         if !self.state.index.clean_slot(target.slot, RowCount(SEAL_STEP_ROWS)) {
             return false;
         }

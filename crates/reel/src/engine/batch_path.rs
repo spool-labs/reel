@@ -67,6 +67,7 @@ impl<Backend: Io> EngineState<Backend> {
         if batch.mark().is_some() && batch_mark(batch, &plan).is_none() {
             volume.marks_dropped.fetch_add(1, Ordering::Relaxed);
         }
+        self.draw_ration(volume, plan.rows)?;
         if !volume.covers.hold(plan.covers) {
             return Err(StoreError::RangeDeletesFull { volume: volume.id });
         }

@@ -14,6 +14,7 @@ mod lifetime;
 mod lz4_block;
 mod open_segment;
 mod pool;
+mod ration;
 mod range_covers;
 mod record_check;
 mod record_head;

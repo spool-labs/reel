@@ -13,7 +13,8 @@ use reel_api::units::{ByteCount, DeathMark, FileOffset, Nanoseconds, RootId, Row
 
 use crate::config::SyncPolicy;
 use crate::engine::claim::Claim;
-use crate::engine::engine_sizing::OPEN_PER_ROOT;
+use crate::engine::ration::RATION_SPINS;
+use crate::engine::engine_sizing::{OPEN_PER_ROOT, SEAL_ROWS_EIGHTHS};
 use crate::engine::engine_state::{EngineState, IndexWait, SlotData, SlotPin};
 use crate::engine::open_segment::{
     MOST_WINDOW_RECORD_BYTES, OpenSegment, RECORD_WINDOW_BYTES, RecordWindow, RowQueue, SegmentPhase, data_path,
@@ -110,6 +111,7 @@ impl<Backend: Io> EngineState<Backend> {
         let volume = &self.volumes[info.volume.0 as usize];
         check_value_size(volume, value)?;
         check_writable(volume)?;
+        self.draw_ration(volume, RowCount(1))?;
 
         let write = ValueWrite {
             column,
@@ -439,6 +441,7 @@ impl<Backend: Io> EngineState<Backend> {
             return Ok(());
         }
 
+        self.draw_ration(volume, RowCount(1))?;
         let request = ClaimRequest {
             bytes: ByteCount(0),
             rows: RowCount(1),
@@ -485,6 +488,7 @@ impl<Backend: Io> EngineState<Backend> {
         if start >= end {
             return Ok(());
         }
+        self.draw_ration(volume, RowCount(1))?;
         if !volume.covers.hold(1) {
             return Err(StoreError::RangeDeletesFull { volume: volume.id });
         }
@@ -575,6 +579,58 @@ impl<Backend: Io> EngineState<Backend> {
             column,
             length: ByteCount(key.len() as u64),
         })
+    }
+
+    /// Read the rows the write index holds, or will once every claim lands
+    pub fn rows_held(&self) -> RowCount {
+        RowCount(self.volumes.iter().map(|volume| volume.rows_in_index.load(Ordering::Relaxed)).sum())
+    }
+
+    /// Read the rows the write index plans for, of which a segment takes its limit
+    pub fn index_capacity(&self) -> RowCount {
+        RowCount(self.sizing.segment_rows.0 * 8 / SEAL_ROWS_EIGHTHS)
+    }
+
+    /// Wait for a volume's seal to reach the point where these rows fit its ration, in line behind any writer already waiting.
+    /// Each volume answers only to its own seal, so a meta writer goes past a bulk seal's walk. It waits behind that seal only
+    /// once the index itself is full, and the bulk writers stop short of that by the share held back for the seal's last steps
+    pub fn draw_ration(&self, volume: &Volume<Backend>, rows: RowCount) -> Result<(), StoreError> {
+        if volume.ration.lets_through(self.rows_held(), rows) {
+            return Ok(());
+        }
+
+        let started = self.io.now();
+        self.index_waits.fetch_add(1, Ordering::Relaxed);
+        let _waiting = IndexWait::new(&self.index_waiters);
+        let deadline = started.0.saturating_add(INDEX_WAIT.0);
+        let ticket = volume.ration.take_ticket();
+        let mut spins = 0;
+        loop {
+            if volume.ration.is_served(ticket) {
+                let is_clear = volume.ration.line().is_none_or(|line| self.rows_held().0 + rows.0 <= line.0);
+                let has_failed = volume.has_failed();
+                let is_late = self.io.now().0 > deadline;
+                if is_clear || has_failed || is_late {
+                    volume.ration.next_in_line();
+                    self.longest_index_wait.fetch_max(self.io.now().0.saturating_sub(started.0), Ordering::Relaxed);
+                    check_writable(volume)?;
+                    if !is_clear {
+                        return Err(StoreError::Io {
+                            action: "waiting for the write index",
+                            source: Error::from(ErrorKind::TimedOut),
+                        });
+                    }
+                    return Ok(());
+                }
+            }
+            spins += 1;
+            if spins < RATION_SPINS {
+                hint::spin_loop();
+            } else {
+                spins = 0;
+                self.io.pause();
+            }
+        }
     }
 
     /// Claim with room held for rows in the group filling. A full group goes out with no claim held, since a writer
@@ -754,6 +810,7 @@ impl<Backend: Io> EngineState<Backend> {
                 let offset = segment.write_end;
                 segment.write_end = FileOffset(offset.0 + request.bytes.0);
                 segment.row_count = RowCount(segment.row_count.0 + request.rows.0);
+                volume.rows_in_index.fetch_add(request.rows.0, Ordering::Relaxed);
                 segment.in_flight += 1;
                 segment.cover_rows += request.covers;
                 segment.lowest_place = segment.lowest_place.min(ticket.first);

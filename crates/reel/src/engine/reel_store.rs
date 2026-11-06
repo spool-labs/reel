@@ -25,6 +25,7 @@ use crate::engine::engine_sizing::{
 };
 use crate::engine::engine_state::{EngineState, PLACE_RUN, SEGMENT_NUMBER_BATCH, SlotFile};
 use crate::engine::open_segment::{RECORD_WINDOW_BYTES, RecordWindow, RowQueue, fits_a_segment_path};
+use crate::engine::ration::Ration;
 use crate::engine::read_only::{close_read_only, load_read_only};
 use crate::engine::read_path::RecordWant;
 use crate::engine::read_pool::{ReadPool, ReadWorker};
@@ -1040,6 +1041,8 @@ pub fn build_state<Backend: Io>(
             gave_up: Mutex::new(GaveUp::new()),
             early_bar_rewrites: AtomicU64::new(0),
             plain_bar_rewrites: AtomicU64::new(0),
+            rows_in_index: AtomicU64::new(0),
+            ration: Ration::default(),
             marked_seals: AtomicU64::new(0),
             marked_seal_bytes: AtomicU64::new(0),
             marks_dropped: AtomicU64::new(0),

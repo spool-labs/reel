@@ -8,6 +8,7 @@ use reel_api::units::{ByteCount, RowCount, VolumeId, WritePlace};
 
 use crate::config::SyncPolicy;
 use crate::engine::open_segment::{OpenSegment, SegmentPhase};
+use crate::engine::ration::Ration;
 use crate::engine::walk_job::WalkSlot;
 use crate::guard::hold;
 use crate::index::open_slots::{OpenSlot, OpenSlots};
@@ -208,6 +209,8 @@ pub struct Volume<Backend: Io> {
     pub gave_up: Mutex<GaveUp>,
     pub early_bar_rewrites: AtomicU64,
     pub plain_bar_rewrites: AtomicU64,
+    pub rows_in_index: AtomicU64,
+    pub ration: Ration,
     pub marked_seals: AtomicU64,
     pub marked_seal_bytes: AtomicU64,
     pub marks_dropped: AtomicU64,

@@ -2,6 +2,7 @@
 
 use std::hint::black_box;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::open_segment::SegmentPhase;
@@ -184,6 +185,10 @@ fn no_allocations() {
     let io = SimulatedIo::new(Seed(1));
     damage(&io);
     let store = ReelStore::open(io.clone(), &config()).expect("open");
+    // the loop reads a span as damaged on every round, so no rebuild may clear it
+    for volume in &store.state.volumes {
+        volume.is_rebuild_held.store(true, Ordering::Release);
+    }
     let keys: Vec<Vec<u8>> = (0..KEYS).map(|number| format!("key-{number:06}").into_bytes()).collect();
     let small = vec![7; 100];
     let compressible = vec![b'x'; CHUNKED_BYTES];

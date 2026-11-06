@@ -52,7 +52,8 @@ impl<Backend: Io> CompactJob<Backend> {
         if volume.damage.is_empty() || volume.is_rebuild_held.load(Ordering::Acquire) {
             return false;
         }
-        let next = hold(&volume.damaged).iter().copied().find(|number| !self.rebuilds_tried.contains(number));
+        // a segment with a good tail lost its rows some other way, so its blocks can't say what the span hides
+        let next = hold(&volume.damaged).iter().copied().find(|number| !self.rebuilds_tried.contains(number) && volume.table.pin(*number).is_none());
         let Some(number) = next else {
             return false;
         };

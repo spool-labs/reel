@@ -19,6 +19,8 @@ use crate::segment::segment_tail::{PlaceRange, SegmentNumber};
 pub const HAS_COVERS_BIT: u8 = 1;
 /// The bit of a row's flags that says its counts come from a backward walk
 pub const IS_BACKWARD_BIT: u8 = 2;
+/// The bit of a row's flags that says its segment lost rows its blocks never held
+pub const HAS_LOST_ROWS_BIT: u8 = 3;
 /// Opens a summary file
 pub const SUMMARY_MAGIC: u64 = 0x5245_4C53_554D_4D31;
 /// Closes a summary file
@@ -85,6 +87,7 @@ pub struct SegmentFacts {
     pub block_count: u32,
     pub walked_blocks: u32,
     pub is_backward: bool,
+    pub has_lost_rows: bool,
 }
 
 impl SegmentFacts {
@@ -617,7 +620,7 @@ impl SummaryRows {
         self.bytes.extend_from_slice(&facts.seal_mark.0.to_le_bytes());
         self.bytes.extend_from_slice(&facts.places.lowest.0.to_le_bytes());
         self.bytes.extend_from_slice(&facts.places.highest.0.to_le_bytes());
-        self.bytes.push(u8::from(facts.is_damaged) | (u8::from(facts.has_covers) << HAS_COVERS_BIT) | (u8::from(facts.is_backward) << IS_BACKWARD_BIT));
+        self.bytes.push(u8::from(facts.is_damaged) | (u8::from(facts.has_covers) << HAS_COVERS_BIT) | (u8::from(facts.is_backward) << IS_BACKWARD_BIT) | (u8::from(facts.has_lost_rows) << HAS_LOST_ROWS_BIT));
         self.bytes.extend_from_slice(&columns.to_le_bytes());
         self.bytes.extend_from_slice(&spans.to_le_bytes());
         self.bytes.extend_from_slice(&facts.damage_place.0.to_le_bytes());
@@ -834,6 +837,7 @@ pub fn parse_row(body: &[u8]) -> Option<SummaryRow<'_>> {
     let is_damaged = flags & 1 != 0;
     let has_covers = flags >> HAS_COVERS_BIT & 1 != 0;
     let is_backward = flags >> IS_BACKWARD_BIT & 1 != 0;
+    let has_lost_rows = flags >> HAS_LOST_ROWS_BIT & 1 != 0;
     let column_count = cursor.short()?;
     let span_count = cursor.short()?;
     let damage_place = WritePlace(cursor.word()?);
@@ -853,6 +857,7 @@ pub fn parse_row(body: &[u8]) -> Option<SummaryRow<'_>> {
         block_count,
         walked_blocks,
         is_backward,
+        has_lost_rows,
     };
     Some(SummaryRow {
         facts,

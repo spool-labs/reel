@@ -1410,6 +1410,7 @@ pub fn damage_open<Backend: Io>(
         segment: found.number,
         seal_mark: rot_sum,
         is_damaged: true,
+        has_lost_rows: true,
         damage_place: counter,
         ..SegmentFacts::default()
     };
@@ -1664,6 +1665,7 @@ pub fn settle_sealed<Backend: Io>(
         // no saved count can hold a walk of a segment above the number, one at or below it may be held already, and an output
         // holds rows its input's walk already counted
         is_backward: found.head.segment <= rows.highest_forward || (found.head.is_output && !found.head.is_unwalked),
+        has_lost_rows: false,
     };
 
     if let Some(at) = listed.get(&facts.segment)
@@ -1722,6 +1724,7 @@ pub fn settle_sealed<Backend: Io>(
         ranges = row_ranges(&row, facts.segment, &mut Vec::new());
         facts.is_damaged = true;
         facts.damage_place = row.facts.damage_place;
+        facts.has_lost_rows = row.facts.has_lost_rows;
         for range in &ranges {
             volume.damage.add(range);
         }
@@ -1908,6 +1911,7 @@ pub fn is_same_segment(row: &SegmentFacts, tail: &SegmentFacts) -> bool {
         has_covers: tail.has_covers,
         walked_blocks: tail.walked_blocks,
         is_backward: tail.is_backward,
+        has_lost_rows: false,
         ..*row
     };
     without_damage == *tail

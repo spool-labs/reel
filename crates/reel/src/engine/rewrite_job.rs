@@ -1590,6 +1590,7 @@ pub fn output_facts(number: SegmentNumber, totals: &FooterTotals, data_end: File
         block_count,
         walked_blocks: if is_unwalked { 0 } else { block_count },
         is_backward: false,
+        has_lost_rows: false,
     }
 }
 

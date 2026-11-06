@@ -372,6 +372,7 @@ impl<Backend: Io> SealJob<Backend> {
                 block_count: self.writer.entries().len() as u32,
                 walked_blocks: 0,
                 is_backward: false,
+                has_lost_rows: false,
             };
             let writer = &self.writer;
             let columns = (0..writer.columns().len()).map(|index| writer.column_facts(index));
@@ -386,6 +387,8 @@ impl<Backend: Io> SealJob<Backend> {
             match highest_of(&slots, target.number).filter(|_place| is_listed) {
                 Some(place) => {
                     facts.is_damaged = true;
+                    // a segment damaged before its seal lost what its rows held, and its blocks can't give that back
+                    facts.has_lost_rows = true;
                     facts.damage_place = place;
                     state.note_dropped_rows(rows.push_kept(&facts, columns, spans_of(&slots, target.number)));
                 },

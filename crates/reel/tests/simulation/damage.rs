@@ -1142,6 +1142,29 @@ fn lost_tails_raise_the_rank() {
     store.close().expect("close");
 }
 
+// a segment that lost rows and then loses both tails stays damaged, since its blocks can't say what the rows file held
+#[test]
+fn lost_rows_outlive_a_rebuild() {
+    let io = rotted_rows(36);
+    let store = open(&io);
+    store.seal_now();
+    settle(&io);
+    store.close().expect("close");
+    drop(store);
+    for path in data_files(&io) {
+        let length = file_length(&io, &path);
+        if length.0 > SECOND_TAIL_DISTANCE + 3 {
+            io.rot(&path, FileOffset(length.0 - 3), FLIP).expect("rot");
+            io.rot(&path, FileOffset(length.0 - SECOND_TAIL_DISTANCE - 3), FLIP).expect("rot");
+        }
+    }
+
+    let store = open(&io);
+    settle(&io);
+    assert!(matches!(read(&store, ORDERED, b"older"), Err(StoreError::Corruption { .. })));
+    store.close().expect("close");
+}
+
 // the rank from the first open holds through opens and a seal, and so do a put and a clear
 #[test]
 fn rows_stay() {

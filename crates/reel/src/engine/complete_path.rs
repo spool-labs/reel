@@ -50,14 +50,17 @@ impl<Backend: Io> EngineState<Backend> {
     ) -> Result<Option<SealedRow>, StoreError> {
         let mut matches = TagMatches::new();
         table.find(read.hash, &mut matches);
-        // a fold took the slots of rows a cue can still read, and their footers still hold them
-        if read.is_cue && matches.slots().iter().any(CompleteSlot::is_sticky) {
+        // a stale mark speaks for reads at or above the row that caused it, and a read behind the newest sealed row may not be.
+        // The check comes after the slots, so a mark this read saw has its sealed row counted
+        let is_behind = read.is_cue || volume.may_hide_under_sealed(read.read_point);
+        // a fold took the slots of rows such a read can still see, and their footers still hold them
+        if is_behind && matches.slots().iter().any(CompleteSlot::is_sticky) {
             return self.search_footers(volume, read);
         }
         self.footer_readers.with(|reader| {
             let mut best = None;
             for slot in matches.slots() {
-                if !slot.is_stale() || read.is_cue {
+                if !slot.is_stale() || is_behind {
                     self.ask_slot(volume, read, slot, reader, &mut best)?;
                 }
             }

@@ -532,7 +532,7 @@ impl CompleteTable {
 
     /// Give a sealed row a slot. A row with no room marks the column at its segment, and a get searches the footers from there
     pub fn insert(&self, hash: KeyHash, segment: SegmentNumber, block: u16, is_gone: impl Fn(u32) -> bool) {
-        let is_placed = u32::try_from(segment.0).is_ok_and(|number| number != NO_SEGMENT && self.place(hash, number, block, &is_gone));
+        let is_placed = u32::try_from(segment.0).is_ok_and(|number| number < STICKY_SEGMENT && self.place(hash, number, block, &is_gone));
         if !is_placed {
             self.past_capacity.fetch_add(1, Ordering::AcqRel);
             self.mark.fetch_min(segment.0, Ordering::AcqRel);

@@ -10,6 +10,7 @@ use reel::engine::compact_job::CompactJob;
 use reel::engine::open_segment::data_path;
 use reel::engine::planner::UnitStep;
 use reel::engine::complete_image::IMAGE_HEAD_BYTES;
+use reel::engine::read_path::RecordWant;
 use reel::engine::reel_store::ReelStore;
 use reel::engine::rewrite_job::RewritePhase;
 use reel::engine::walk_job::WalkJob;
@@ -671,5 +672,27 @@ fn cue_reads_past_a_fold() {
     assert!(cue.get(COLUMN, b"hot", &mut value).expect("get"));
     assert_eq!(value, b"first");
     drop(cue);
+    store.close().expect("close");
+}
+
+// a get that took its point before an overwrite still reads what stood then, though the walk marked that row stale since
+#[test]
+fn read_behind_a_stale_mark() {
+    let io = SimulatedIo::new(Seed(19));
+    let store = open(&io, CAPACITY);
+    for number in 0..KEPT_PER_ROUND {
+        store.put(COLUMN, format!("keep-{number}").as_bytes(), b"value").expect("put");
+    }
+    store.put(COLUMN, b"key", b"first").expect("put");
+    seal(&store, &io);
+    let latest = store.state.latest_read(COLUMN, b"key").expect("read");
+    store.put(COLUMN, b"key", b"second").expect("put");
+    seal(&store, &io);
+    assert!(slots_of(&store, b"key").iter().any(CompleteSlot::is_stale));
+
+    let mut value = Vec::new();
+    let answer = store.state.answer_latest(&latest, RecordWant::Whole, &mut value).expect("no job crossed it");
+    assert!(answer.expect("get"));
+    assert_eq!(value, b"first");
     store.close().expect("close");
 }

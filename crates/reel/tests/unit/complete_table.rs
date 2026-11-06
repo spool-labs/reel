@@ -1,11 +1,12 @@
 //! A complete table holds every row it takes, and says when it can't
 
-use reel::index::complete_table::{CompleteTable, MOST_TAG_SLOTS, TagMatches, shard_of, tag_of};
+use reel::index::complete_table::{CompleteShard, CompleteSlot, CompleteTable, Homes, MOST_TAG_SLOTS, STALE_BIT, TagMatches, shard_of, tag_of};
 use reel::index::key_hash::KeyHash;
 use reel::segment::segment_tail::SegmentNumber;
 use reel_api::units::RowCount;
 
 const ROWS: u64 = 100_000;
+const OVERFLOW_SHARD_SLOTS: usize = 64;
 
 fn hash_of(number: u64) -> KeyHash {
     let mut mixed = number.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -92,4 +93,46 @@ fn tag_and_shard() {
     let hash = KeyHash(0xABCD_1234_0000_0000);
     assert_eq!(tag_of(hash), 0x1234);
     assert_eq!(shard_of(hash), 0xABCD % 64);
+}
+
+fn slot_of(tag: u16, is_stale: bool) -> CompleteSlot {
+    CompleteSlot {
+        segment: u32::from(tag),
+        block: 0,
+        tag: if is_stale { tag | STALE_BIT } else { tag },
+    }
+}
+
+fn tag_count(shard: &CompleteShard, tag: u16) -> usize {
+    let homes = Homes { first: 0, second: 0, tag };
+    let mut count = 0;
+    shard.visit_tag(&homes, |_slot| count += 1);
+    count
+}
+
+// a slot whose run wrapped past the end of the overflow area stays in reach when a stale slot before it goes
+#[test]
+fn fold_keeps_a_wrapped_run() {
+    let mut shard = CompleteShard::new(OVERFLOW_SHARD_SLOTS);
+    for slot in [slot_of(5, true), slot_of(13, false), slot_of(7, false), slot_of(6, false)] {
+        shard.fill_overflow(slot);
+    }
+    assert_eq!(tag_count(&shard, 6), 1);
+    assert_eq!(shard.fold_overflow(5), (1, false));
+    for tag in [13, 7, 6] {
+        assert_eq!(tag_count(&shard, tag), 1, "tag {tag}");
+    }
+    assert_eq!(shard.overflow_used(), 3);
+}
+
+// a run of one tag with stale and live slots keeps the live ones, and a slot that shifts into a cleared position is looked at
+#[test]
+fn fold_clears_a_whole_run() {
+    let mut shard = CompleteShard::new(OVERFLOW_SHARD_SLOTS);
+    for is_stale in [true, true, false, true] {
+        shard.fill_overflow(slot_of(3, is_stale));
+    }
+    assert_eq!(shard.fold_overflow(3), (3, false));
+    assert_eq!(tag_count(&shard, 3), 1);
+    assert_eq!(shard.overflow_used(), 1);
 }

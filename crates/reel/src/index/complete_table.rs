@@ -221,8 +221,8 @@ impl CompleteShard {
         }
     }
 
-    /// Change every used slot with a tag, in the homes and then the overflow area
-    pub fn change_tag(&mut self, homes: &Homes, mut change: impl FnMut(&mut CompleteSlot)) {
+    /// Change every used slot with a tag in a key's homes
+    pub fn change_homes(&mut self, homes: &Homes, mut change: impl FnMut(&mut CompleteSlot)) {
         let tag = homes.tag;
         let mut buckets = [Some(homes.first), Some(homes.second)];
         if homes.first == homes.second {
@@ -235,31 +235,50 @@ impl CompleteShard {
                 }
             }
         }
-        for slot in &mut self.overflow {
-            if slot.is_used() && slot.key_tag() == tag {
+    }
+
+    /// Change every slot with a tag in its run of the overflow area, leaving each one used so the run stays whole
+    pub fn change_overflow(&mut self, tag: u16, mut change: impl FnMut(&mut CompleteSlot)) {
+        if self.overflow_used == 0 {
+            return;
+        }
+        let mut at = self.overflow_start(tag);
+        for _step in 0..self.overflow.len() {
+            let slot = &mut self.overflow[at];
+            if !slot.is_used() {
+                return;
+            }
+            if slot.key_tag() == tag {
                 change(slot);
             }
+            at = (at + 1) % self.overflow.len();
         }
     }
 
-    /// Put the overflow area's slots back in their runs after some were emptied in place
-    pub fn close_overflow_gaps(&mut self) {
-        let mut held = 0;
-        for at in 0..self.overflow.len() {
-            let slot = self.overflow[at];
-            self.overflow[at] = CompleteSlot::empty();
-            if slot.is_used() {
-                held += 1;
-                self.overflow_used = 0;
-                let (start, length) = (self.overflow_start(slot.tag), self.overflow.len());
-                let mut landing = start;
-                while self.overflow[landing].is_used() {
-                    landing = (landing + 1) % length;
-                }
-                self.overflow[landing] = slot;
-            }
+    /// Take a tag's stale slots out of its run of the overflow area, say how many went, and say whether a sticky slot stands
+    pub fn fold_overflow(&mut self, tag: u16) -> (u64, bool) {
+        let (mut folded, mut has_sticky) = (0, false);
+        if self.overflow_used == 0 {
+            return (folded, has_sticky);
         }
-        self.overflow_used = held;
+        let mut at = self.overflow_start(tag);
+        for _step in 0..self.overflow.len() {
+            let slot = self.overflow[at];
+            if !slot.is_used() {
+                break;
+            }
+            if slot.key_tag() == tag {
+                has_sticky |= slot.is_sticky();
+                if slot.is_stale() && !slot.is_sticky() {
+                    // a later slot of the run can shift into this position, so the look stays here
+                    self.clear_overflow(at);
+                    folded += 1;
+                    continue;
+                }
+            }
+            at = (at + 1) % self.overflow.len();
+        }
+        (folded, has_sticky)
     }
 
     /// Read a bucket's slots
@@ -270,6 +289,11 @@ impl CompleteShard {
     /// Work out where a tag's run starts in the overflow area
     pub fn overflow_start(&self, tag: u16) -> usize {
         (tag & TAG_MASK) as usize % self.overflow.len()
+    }
+
+    /// Count the overflow area's slots
+    pub fn overflow_used(&self) -> usize {
+        self.overflow_used
     }
 
     /// Check the overflow area can take a slot and still end every run with an unused slot
@@ -452,12 +476,14 @@ impl CompleteTable {
         let mut shard = self.write_shard(shard_of(hash));
         let homes = shard.homes(hash);
         let mut is_marked = false;
-        shard.change_tag(&homes, |slot| {
+        let mut mark = |slot: &mut CompleteSlot| {
             if !is_marked && !slot.is_stale() && u64::from(slot.segment) == segment.0 && slot.block == block {
                 slot.tag |= STALE_BIT;
                 is_marked = true;
             }
-        });
+        };
+        shard.change_homes(&homes, &mut mark);
+        shard.change_overflow(homes.tag, mark);
     }
 
     /// Check a key's tag has a slot past the ones it is asked to leave out. A tag another key shares can only keep a grave longer
@@ -474,14 +500,16 @@ impl CompleteTable {
     pub fn fold_stale(&self, shard: &mut CompleteShard, homes: &Homes) -> bool {
         let mut folded = 0;
         let mut has_sticky = false;
-        shard.change_tag(homes, |slot| {
+        shard.change_homes(homes, |slot| {
             has_sticky |= slot.is_sticky();
             if slot.is_stale() && !slot.is_sticky() {
                 *slot = CompleteSlot::empty();
                 folded += 1;
             }
         });
-        shard.close_overflow_gaps();
+        let (in_overflow, held_sticky) = shard.fold_overflow(homes.tag);
+        folded += in_overflow;
+        has_sticky |= held_sticky;
         if folded == 0 {
             return false;
         }

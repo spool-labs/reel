@@ -16,7 +16,7 @@ use reel_api::units::{ByteCount, DeathMark, Nanoseconds, RowCount, VolumeId, Wri
 use reel_api::usage::{ColumnUsage, UsageReport};
 use reel_api::write_batch::WriteBatch;
 
-use crate::config::{ColumnConfig, DeviceClass, StoreConfig, ThreadCounts, VolumeConfig};
+use crate::config::{ColumnConfig, DeviceClass, NO_WORKERS, StoreConfig, VolumeConfig};
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::engine_sizing::{
     complete_block_rows, complete_row_limit,
@@ -672,13 +672,14 @@ pub fn store_sizing(config: &StoreConfig) -> Result<EngineSizing, StoreError> {
         widest_keys: (0..config.volumes.len()).map(|volume| config.widest_key(volume) as u64).sum(),
         threads: config.threads,
     };
-    let default_shape = StoreShape { threads: ThreadCounts::default(), ..shape };
+    let shape = shape.with_workers_settled();
+    let least_shape = StoreShape { threads: NO_WORKERS, ..shape };
     if config.threads.read_threads == 0 {
         return Err(StoreError::NoReadThreads);
     }
-    if config.memory_budget >= default_shape.least_budget() && config.memory_budget < shape.least_budget() {
+    if config.memory_budget >= least_shape.least_budget() && config.memory_budget < shape.least_budget() {
         return Err(StoreError::ThreadsPastBudget {
-            maintenance_workers: config.threads.maintenance_workers,
+            maintenance_workers: shape.walk_workers(),
             read_threads: config.threads.read_threads,
             budget: config.memory_budget,
             least: shape.least_budget(),
@@ -1162,8 +1163,9 @@ pub fn build_state<Backend: Io>(
         record_readers: Pool::new(record_readers),
         footer_readers: Pool::new(footer_readers),
         scan_heap,
+        // a reservation rewrites these bytes, and the first must not grow the buffer on a job thread
+        superblock_bytes: Mutex::new(superblock.to_bytes()),
         superblock: Mutex::new(superblock),
-        superblock_bytes: Mutex::new(Vec::new()),
         next_segment: AtomicU64::new(first_number),
         reserved_segment: AtomicU64::new(reserved),
         is_reserving: AtomicBool::new(false),

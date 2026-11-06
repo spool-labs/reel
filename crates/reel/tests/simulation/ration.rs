@@ -50,7 +50,7 @@ fn column(id: ColumnId, name: &str, volume: u8) -> ColumnConfig {
 fn open(io: &SimulatedIo) -> Store {
     let config = StoreConfig {
         memory_budget: BUDGET,
-        threads: Default::default(),
+        threads: reel::config::NO_WORKERS,
         volumes: vec![volume("bulk", BULK_ROOT), volume("meta", META_ROOT)],
         columns: vec![column(BULK, "bulk", 0), column(META, "meta", 1)],
     };

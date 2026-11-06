@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::seed_sets::seeds;
-use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::config::{DEFAULT_MAINTENANCE_WORKERS, ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
 use reel_sim::file_image::BitMask;
 use reel_sim::seeded_random::{Seed, SeededRandom};
@@ -34,6 +34,8 @@ const BUDGET: ByteCount = ByteCount(118 * 1024 * 1024);
 // 349 `covered_last` and `later_sync`, 125 `one_copy`, 681 `tail_then_cut`, 959 `flushed_unknown`, 1000 `open_covers`, 1002
 // `wrong_place`. Seeds 1 and 1000 are mapped from notes, with no replay. The rest are plain extra seeds
 const SEEDS: [u64; 10] = [0, 1, 2, 3, 17, 31, 37, 62, 681, 7_157];
+const WORKERS_BUDGET: ByteCount = ByteCount(136 * 1024 * 1024);
+const WORKER_SEED_STRIDE: u64 = 9;
 const MARK_SEED_STRIDE: u64 = 11;
 const MARK_SPREAD: u64 = 16;
 const MARK_STEP: u64 = 64;
@@ -208,13 +210,18 @@ fn config(policy: SyncPolicy, complete_rows: Option<RowCount>) -> StoreConfig {
     };
     StoreConfig {
         memory_budget: BUDGET,
-        threads: Default::default(),
+        threads: reel::config::NO_WORKERS,
         volumes: vec![volume("meta", &ROOTS[..2], policy), volume("bulk", &ROOTS[2..], SyncPolicy::Never)],
         columns: vec![column(COLUMNS[0], "meta", 0, complete_rows), column(COLUMNS[1], "bulk", 1, None)],
     }
 }
 
 // half the seeds make the meta column complete, and half of those with a table small enough to run past capacity
+/// Some seeds run the default workers, on residues that keep the seeds pinned above as they were
+fn has_every_worker(seed: u64) -> bool {
+    matches!(seed % WORKER_SEED_STRIDE, 0 | 6)
+}
+
 /// Some seeds write marked records, on residues that keep the seeds pinned above as they were
 fn has_marks(seed: u64) -> bool {
     matches!(seed % MARK_SEED_STRIDE, 5..=7)
@@ -316,9 +323,12 @@ impl Run {
             if self.streams.open.one_in(4) {
                 self.arm_fault();
             }
-            let workers = (self.seed % WALK_WORKER_COUNTS) as usize;
+            let workers = if has_every_worker(self.seed) { DEFAULT_MAINTENANCE_WORKERS } else { (self.seed % WALK_WORKER_COUNTS) as usize };
             let mut config = config(self.policy, complete_rows_of(self.seed));
-            config.threads.maintenance_workers = workers;
+            if has_every_worker(self.seed) {
+                config.memory_budget = WORKERS_BUDGET;
+            }
+            config.threads.maintenance_workers = Some(workers);
             let opened = ReelStore::open(self.io.clone(), &config);
             if self.io.is_crashed() {
                 self.crash();

@@ -9,9 +9,9 @@ use crate::record::codec::Codec;
 
 /// The memory budget when the caller doesn't set one
 pub const DEFAULT_MEMORY_BUDGET: ByteCount = ByteCount(512 * 1024 * 1024);
-/// Maintenance workers a volume runs by default. Measured on the 8-core box: two workers cost 5 to 7% of ingest at the best thread
-/// count, past the walk's 5%, and the planner alone costs none
-pub const DEFAULT_MAINTENANCE_WORKERS: usize = 0;
+/// Maintenance workers a volume runs by default, fewer where the budget can't hold them. On the 4-core box four cost 13% of one
+/// writer's rate while writing, and drained the walk backlog inside the idle time where none and one did not
+pub const DEFAULT_MAINTENANCE_WORKERS: usize = 4;
 /// Async read threads a store runs by default
 pub const DEFAULT_READ_THREADS: usize = 4;
 /// The longest key a column can declare
@@ -74,16 +74,23 @@ pub struct VolumeConfig {
 /// open, and a count the budget can't hold is refused there. One seal thread a volume runs whatever these say
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ThreadCounts {
-    /// Workers a volume's planner hands jobs to, beside the planner itself
-    pub maintenance_workers: usize,
+    /// Workers a volume's planner hands jobs to, beside the planner itself. Nothing takes the default, or as many of it as
+    /// the budget holds, and a count set here that the budget can't hold is refused
+    pub maintenance_workers: Option<usize>,
     /// Threads that serve the async read forms
     pub read_threads: usize,
 }
 
+/// A planner alone on each volume, with no workers beside it
+pub const NO_WORKERS: ThreadCounts = ThreadCounts {
+    maintenance_workers: Some(0),
+    read_threads: DEFAULT_READ_THREADS,
+};
+
 impl Default for ThreadCounts {
     fn default() -> Self {
         Self {
-            maintenance_workers: DEFAULT_MAINTENANCE_WORKERS,
+            maintenance_workers: None,
             read_threads: DEFAULT_READ_THREADS,
         }
     }

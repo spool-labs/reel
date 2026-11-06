@@ -2,7 +2,7 @@
 
 use reel_api::units::{ByteCount, RowCount};
 
-use crate::config::ThreadCounts;
+use crate::config::{DEFAULT_MAINTENANCE_WORKERS, ThreadCounts};
 use crate::engine::open_segment::RECORD_WINDOW_BYTES;
 use crate::engine::read_pool::{READ_SLOTS, SLOT_KEY_BYTES, SLOT_KEYS};
 use crate::engine::seal_job::MOST_SEGMENT_BLOCKS;
@@ -132,7 +132,20 @@ pub struct EngineSizing {
 impl StoreShape {
     /// Count the walk workers each volume gets
     pub fn walk_workers(&self) -> usize {
-        self.threads.maintenance_workers
+        self.threads.maintenance_workers.unwrap_or(DEFAULT_MAINTENANCE_WORKERS)
+    }
+
+    /// Build the shape with the workers settled: the count set, or the most of the default the budget holds
+    pub fn with_workers_settled(self) -> Self {
+        if self.threads.maintenance_workers.is_some() {
+            return self;
+        }
+        let with_workers = |workers: usize| {
+            let threads = ThreadCounts { maintenance_workers: Some(workers), ..self.threads };
+            Self { threads, ..self }
+        };
+        let fits = |workers: &usize| with_workers(*workers).least_budget() <= self.budget;
+        with_workers((0..=DEFAULT_MAINTENANCE_WORKERS).rev().find(fits).unwrap_or(0))
     }
 
     /// Count the open slots the roots and the lifetime groups can use

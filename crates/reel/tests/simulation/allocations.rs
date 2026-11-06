@@ -73,7 +73,7 @@ fn config() -> StoreConfig {
     };
     StoreConfig {
         memory_budget: BUDGET,
-        threads: Default::default(),
+        threads: reel::config::NO_WORKERS,
         volumes: vec![VolumeConfig {
             name: "allocations".to_string(),
             roots: vec![PathBuf::from(ROOT)],
@@ -283,5 +283,16 @@ fn full_cover_block() {
     let sealed = counted(|| settle(&io));
 
     assert_eq!((sealed.1, sealed.2), (0, 0));
+    store.close().expect("close");
+}
+
+// the first reservation after an open writes the superblock from a buffer open sized, and later ones reuse it
+#[test]
+fn first_reservation() {
+    let io = SimulatedIo::new(Seed(6));
+    let store = ReelStore::open(io.clone(), &config()).expect("open");
+    let (is_held, allocations, frees) = counted(|| store.state.reserve_ahead());
+    assert!(is_held);
+    assert_eq!((allocations, frees), (0, 0));
     store.close().expect("close");
 }

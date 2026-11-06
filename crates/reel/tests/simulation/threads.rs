@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
-use reel::config::{ColumnConfig, DeviceClass, KeyShape, StoreConfig, SyncPolicy, ThreadCounts, VolumeConfig};
+use reel::config::{DEFAULT_MAINTENANCE_WORKERS, ColumnConfig, DeviceClass, KeyShape, StoreConfig, SyncPolicy, ThreadCounts, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
 use reel::guard::hold;
 use reel::record::codec::Codec;
@@ -69,7 +69,7 @@ fn settle(io: &SimulatedIo) {
 // the keys and values of a seeded run, after the jobs have gone quiet
 fn contents(workers: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
     let io = SimulatedIo::new(Seed(1));
-    let threads = ThreadCounts { maintenance_workers: workers, ..ThreadCounts::default() };
+    let threads = ThreadCounts { maintenance_workers: Some(workers), ..ThreadCounts::default() };
     let store: Store = ReelStore::open(io.clone(), &config(threads)).expect("open");
     let mut random = SeededRandom::new(Seed(2));
     for round in 0..ROUNDS {
@@ -108,9 +108,9 @@ fn any_count_same_store() {
 #[test]
 fn refused_at_open() {
     let io = SimulatedIo::new(Seed(3));
-    let many = ThreadCounts { maintenance_workers: MANY_WORKERS, ..ThreadCounts::default() };
+    let many = ThreadCounts { maintenance_workers: Some(MANY_WORKERS), ..ThreadCounts::default() };
     assert!(matches!(ReelStore::open(io.clone(), &config(many)), Err(StoreError::ThreadsPastBudget { .. })));
-    let none = ThreadCounts { read_threads: 0, ..ThreadCounts::default() };
+    let none = ThreadCounts { read_threads: 0, ..reel::config::NO_WORKERS };
     assert!(matches!(ReelStore::open(io, &config(none)), Err(StoreError::NoReadThreads)));
 }
 
@@ -118,7 +118,7 @@ fn refused_at_open() {
 #[test]
 fn read_threads_follow_the_count() {
     let io = SimulatedIo::new(Seed(4));
-    let threads = ThreadCounts { read_threads: 2, ..ThreadCounts::default() };
+    let threads = ThreadCounts { read_threads: 2, ..reel::config::NO_WORKERS };
     let store: Store = ReelStore::open(io, &config(threads)).expect("open");
     assert_eq!(store.state.read_tasks.len(), 2);
     store.close().expect("close");
@@ -128,7 +128,7 @@ fn read_threads_follow_the_count() {
 #[test]
 fn workers_run_rewrites() {
     let io = SimulatedIo::new(Seed(5));
-    let threads = ThreadCounts { maintenance_workers: 2, ..ThreadCounts::default() };
+    let threads = ThreadCounts { maintenance_workers: Some(2), ..ThreadCounts::default() };
     let store: Store = ReelStore::open(io.clone(), &config(threads)).expect("open");
     for round in 0..ROUNDS {
         for number in 0..KEYS {
@@ -157,7 +157,7 @@ fn workers_run_rewrites() {
 // the most rewrites seen running at once while the jobs drain a volume of half-dead segments
 fn most_rewrites_at_once(device: DeviceClass) -> usize {
     let io = SimulatedIo::new(Seed(6));
-    let threads = ThreadCounts { maintenance_workers: 3, ..ThreadCounts::default() };
+    let threads = ThreadCounts { maintenance_workers: Some(3), ..ThreadCounts::default() };
     let store: Store = ReelStore::open(io.clone(), &config_on(threads, device)).expect("open");
     let volume = &store.state.volumes[0];
     volume.is_compaction_held.store(true, Ordering::Release);
@@ -216,4 +216,34 @@ fn class_shows_in_the_report() {
         assert_eq!((report.volumes[0].is_spinning, report.volumes[0].is_device_set), (is_spinning, is_set));
         store.close().expect("close");
     }
+}
+
+fn config_at(threads: ThreadCounts, budget: ByteCount) -> StoreConfig {
+    StoreConfig { memory_budget: budget, ..config(threads) }
+}
+
+// a store that leaves the count alone runs the default where the budget holds it
+#[test]
+fn default_runs_at_full_budget() {
+    let store: Store = ReelStore::open(SimulatedIo::new(Seed(8)), &config_at(ThreadCounts::default(), ByteCount(512 * 1024 * 1024))).expect("open");
+    assert_eq!(store.memory_report().maintenance_workers, DEFAULT_MAINTENANCE_WORKERS);
+    store.close().expect("close");
+}
+
+// a default never refuses an open: it comes down to what the budget holds, and the report shows the count that runs
+#[test]
+fn default_fits_a_small_budget() {
+    let small = ByteCount(64 * 1024 * 1024);
+    let store: Store = ReelStore::open(SimulatedIo::new(Seed(9)), &config_at(ThreadCounts::default(), small)).expect("open");
+    assert!(store.memory_report().maintenance_workers < DEFAULT_MAINTENANCE_WORKERS);
+    store.close().expect("close");
+}
+
+// the same count set by the caller is refused
+#[test]
+fn set_count_is_refused() {
+    let small = ByteCount(64 * 1024 * 1024);
+    let threads = ThreadCounts { maintenance_workers: Some(DEFAULT_MAINTENANCE_WORKERS), ..ThreadCounts::default() };
+    let opened: Result<Store, StoreError> = ReelStore::open(SimulatedIo::new(Seed(10)), &config_at(threads, small));
+    assert!(matches!(opened, Err(StoreError::ThreadsPastBudget { .. })));
 }

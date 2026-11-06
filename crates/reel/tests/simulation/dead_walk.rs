@@ -48,7 +48,7 @@ type Store = ReelStore<SimulatedIo>;
 fn config(budget: ByteCount) -> StoreConfig {
     StoreConfig {
         memory_budget: budget,
-        threads: Default::default(),
+        threads: reel::config::NO_WORKERS,
         volumes: vec![VolumeConfig {
             name: "walk".to_string(),
             roots: vec![PathBuf::from(ROOT)],
@@ -73,7 +73,7 @@ fn open(io: &SimulatedIo) -> Store {
 // a key's rows all sit in one shard, so a long run of them needs a large index
 fn open_workers(io: &SimulatedIo) -> Store {
     let mut config = config(BUDGET);
-    config.threads.maintenance_workers = WALK_WORKERS;
+    config.threads.maintenance_workers = Some(WALK_WORKERS);
     held(ReelStore::open(io.clone(), &config).expect("open"))
 }
 

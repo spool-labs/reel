@@ -83,7 +83,7 @@ struct Staged<'state> {
 fn config(budget: ByteCount) -> StoreConfig {
     StoreConfig {
         memory_budget: budget,
-        threads: Default::default(),
+        threads: reel::config::NO_WORKERS,
         volumes: vec![VolumeConfig {
             name: "meta".to_string(),
             roots: vec![PathBuf::from(ROOT)],

@@ -28,7 +28,7 @@ fn shape(budget: ByteCount, roots: usize) -> StoreShape {
         volumes: 1,
         has_lz4: false,
         widest_keys: 64,
-        threads: Default::default(),
+        threads: reel::config::NO_WORKERS,
     }
 }
 
@@ -52,7 +52,7 @@ fn documented_rows() {
             volumes: 1,
             has_lz4: true,
             widest_keys: 64,
-            threads: Default::default(),
+            threads: reel::config::NO_WORKERS,
         };
 
         assert_eq!(EngineSizing::for_store(&store).segment_rows, RowCount(rows), "{mib} MiB");
@@ -68,7 +68,7 @@ fn summary_holds_blocks() {
         volumes: 1,
         has_lz4: true,
         widest_keys: 64,
-        threads: Default::default(),
+        threads: reel::config::NO_WORKERS,
     };
     let rows_room = EngineSizing::for_store(&store).summary_share.0 / 2;
     let blocks = 1_000_000_000 / ROWS_PER_BLOCK;
@@ -87,7 +87,7 @@ fn documented_reserve() {
             volumes: 1,
             has_lz4: true,
             widest_keys: 64,
-            threads: Default::default(),
+            threads: reel::config::NO_WORKERS,
         };
 
         let segment = EngineSizing::for_store(&store).segment_bytes;

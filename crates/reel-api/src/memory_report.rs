@@ -26,6 +26,8 @@ pub struct MemoryReport {
     pub thread_stacks: ByteCount,
     /// Open segment slots the store sized at open, each with its queues and windows in the parts above
     pub open_slots: usize,
+    /// Workers each volume runs beside its planner, which the budget may have set below the default
+    pub maintenance_workers: usize,
 }
 
 impl MemoryReport {

@@ -31,7 +31,7 @@ type Store = ReelStore<SimulatedIo>;
 fn config() -> StoreConfig {
     StoreConfig {
         memory_budget: BUDGET,
-        threads: Default::default(),
+        threads: reel::config::NO_WORKERS,
         volumes: vec![VolumeConfig {
             name: "meta".to_string(),
             roots: ROOTS.iter().map(PathBuf::from).collect(),

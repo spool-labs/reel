@@ -60,7 +60,7 @@ fn config_at(budget: ByteCount) -> StoreConfig {
     };
     StoreConfig {
         memory_budget: budget,
-        threads: Default::default(),
+        threads: reel::config::NO_WORKERS,
         volumes: vec![VolumeConfig {
             name: "ranges".to_string(),
             roots: vec![PathBuf::from(ROOT)],

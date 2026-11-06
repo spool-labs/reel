@@ -510,6 +510,7 @@ impl<Backend: Io> EngineState<Backend> {
             compaction: ByteCount(self.compaction_heap.load(Ordering::Acquire)),
             thread_stacks: ByteCount(self.job_count.load(Ordering::Acquire) * self.io.job_stack_bytes().0),
             open_slots: self.queues.len(),
+            maintenance_workers: self.sizing.walk_workers,
             ..MemoryReport::default()
         };
         for directory in self.directories.iter().flatten() {

@@ -142,7 +142,14 @@ impl<'bytes> FieldReader<'bytes> {
 }
 
 impl Superblock {
-    /// Lay the superblock out in a buffer the caller keeps, so a save allocates nothing
+    /// Lay the superblock out in a new buffer, which open keeps so a save allocates nothing
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        self.write_bytes(&mut bytes);
+        bytes
+    }
+
+    /// Lay the superblock out in a buffer the caller keeps
     pub fn write_bytes(&self, out: &mut Vec<u8>) {
         out.clear();
         let mut fields = FieldWriter { bytes: out };

@@ -299,7 +299,7 @@ fn open(root: &Path) -> Store {
     let mut config = config(root, BUDGET);
     // a gate run sets this to hold the same line with workers beside the planner
     if let Some(workers) = env::var(WORKERS_VARIABLE).ok().and_then(|workers| workers.parse().ok()) {
-        config.threads.maintenance_workers = workers;
+        config.threads.maintenance_workers = Some(workers);
     }
     ReelStore::open(PlainIo::new(), &config).expect("open")
 }

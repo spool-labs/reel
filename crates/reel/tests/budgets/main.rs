@@ -62,7 +62,7 @@ fn main() {
         let live_before = LIVE_BYTES.load(Ordering::Acquire);
         let budget = ByteCount(budget * MIB);
         let mut config = config(&root, budget);
-        config.threads.maintenance_workers = workers;
+        config.threads.maintenance_workers = Some(workers);
         let store = match ReelStore::open(PlainIo::new(), &config) {
             Ok(store) => store,
             // a count this budget can't hold is the refusal the store promises

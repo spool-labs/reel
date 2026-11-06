@@ -21,6 +21,7 @@ use crate::config::MAX_KEY_BYTES;
 use crate::engine::compact_job::park;
 use crate::engine::engine_state::EngineState;
 use crate::engine::read_path::SealedRow;
+use crate::engine::recovery::save_cleared_spans;
 use crate::engine::open_segment::{data_path, output_path};
 use crate::engine::seal_job::MOST_SEGMENT_BLOCKS;
 use crate::engine::volume::{GRAVE_SLOT, GaveUp, MOST_MERGE_OUTPUTS, NO_SEAL, OutputSlots, RewriteOutput, Volume};
@@ -29,6 +30,7 @@ use crate::guard::hold;
 use crate::io::{Io, IoFile};
 use crate::pool::{touched_capacity, touched_filled, touched_zeroes};
 use crate::row_kind::RowKind;
+use crate::segment::damage_list::DamagedRange;
 use crate::segment::column_directory::Listing;
 use crate::segment::footer_writer::{ColumnStart, FooterTotals, FooterWriter};
 use crate::index::complete_table::CompleteTable;
@@ -275,6 +277,10 @@ pub struct RewriteJob<Backend: Io> {
     is_ordered: bool,
     /// Tests of a merge's cut set this, since an offset-order copy runs to one output
     pub is_key_order_held: bool,
+    /// A damaged segment the next pick copies whole, and the spans its lost blocks leave
+    pub rebuild: Option<SegmentNumber>,
+    pub rebuild_blocks: u32,
+    pub lost_spans: Vec<DamagedRange>,
     is_unwalked: bool,
     crowded_key: Vec<u8>,
     pub has_looks_left: bool,
@@ -351,6 +357,9 @@ impl<Backend: Io> RewriteJob<Backend> {
             row_ordinal: 0,
             is_ordered: false,
             is_key_order_held: false,
+            rebuild: None,
+            rebuild_blocks: 0,
+            lost_spans: Vec::new(),
             is_unwalked: false,
             crowded_key: touched_capacity(SUMMARY_KEY_BYTES, 0),
             has_looks_left: false,
@@ -408,7 +417,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         inputs[..self.input_count].copy_from_slice(&self.numbers[..self.input_count]);
         *hold(&volume.lanes[self.lane].inputs) = inputs;
         // one input copies in offset order, and a deciding pass says which rows go across
-        self.is_ordered = self.input_count == 1 && !self.is_key_order_held && self.inputs[0].row_room(self.placed.len());
+        self.is_ordered = self.input_count == 1 && self.rebuild.is_none() && !self.is_key_order_held && self.inputs[0].row_room(self.placed.len());
         self.marks.fill(0);
         self.row_ordinal = 0;
         if is_grave_heavy || self.is_ordered {
@@ -438,6 +447,14 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
         let rows = hold(&volume.summary);
         self.is_unwalked = false;
+        // its rows counted for nothing a walk can trust, so the output goes through the forward walk they owe
+        if let Some(row) = self.rebuild.and_then(|segment| rows.get(segment)) {
+            self.is_unwalked = true;
+            let target = self.gather(volume, &rows, &row, 1, |_row| false);
+            // the row counts every block the segment had, and only the ones that read are in the table
+            self.inputs[0].block_count = self.rebuild_blocks;
+            return Some((target, false));
+        }
         if let Some(target) = self.pick_overlap(volume, &rows, room) {
             return Some((target, false));
         }
@@ -1124,7 +1141,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         let Some(output) = self.output.clone() else {
             return Err(Error::from(ErrorKind::NotFound));
         };
-        if self.dropped_rows == 0 && self.input_count == 1 && !self.is_cutting && self.staged.is_empty() {
+        if self.dropped_rows == 0 && self.input_count == 1 && !self.is_cutting && self.staged.is_empty() && self.rebuild.is_none() {
             self.note_gave_up();
             return Err(Error::from(ErrorKind::Interrupted));
         }
@@ -1186,6 +1203,22 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.is_cutting = false;
         self.phase = RewritePhase::Copying;
         Ok(())
+    }
+
+    /// Swap a rebuilt segment's spans for what its lost blocks leave. Its row is gone, and what stays damaged keeps a row of its own
+    pub fn end_rebuild(&mut self, volume: &Volume<Backend>) {
+        let Some(segment) = self.rebuild.take() else {
+            return;
+        };
+        volume.damage.drop_segment(segment);
+        for range in self.lost_spans.drain(..) {
+            volume.damage.add(&range);
+        }
+        if !volume.damage.holds_segment(segment) {
+            hold(&volume.damaged).retain(|number| *number != segment);
+            self.state.damaged_segments.fetch_sub(1, Ordering::AcqRel);
+        }
+        save_cleared_spans(&self.state, volume);
     }
 
     /// Count what a merge moved, dropped and carried, for the report
@@ -1339,6 +1372,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.note_install();
         volume.lanes[self.lane].rewrites_done.fetch_add(1, Ordering::AcqRel);
         self.summarize(volume, inputs);
+        self.end_rebuild(volume);
         let saved = state.save_summary(volume);
 
         *hold(&volume.lanes[self.lane].partial_outputs) = Default::default();

@@ -1042,6 +1042,7 @@ pub fn build_state<Backend: Io>(
             has_walk_target: AtomicBool::new(false),
             walk_segment: AtomicU64::new(NO_SEAL),
             is_walk_held: AtomicBool::new(false),
+            is_rebuild_held: AtomicBool::new(false),
             is_applying: AtomicBool::new(false),
             walks_held: AtomicU64::new(0),
             reserve: ByteCount(sizing.segment_bytes.0 * 2),

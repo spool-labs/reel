@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::io::IoSlice;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::open_segment::{SegmentPhase, data_path};
@@ -17,7 +18,7 @@ use reel::record::codec::Codec;
 use reel::record::record_check::Checksum;
 use reel::segment::damage_list::{DamagedRange, MOST_DAMAGED_SPANS};
 use reel::segment::footer_reader::FooterReader;
-use reel::segment::row_block::BLOCK_HEADER_BYTES;
+use reel::segment::row_block::{BLOCK_HEADER_BYTES, BlockHeader, read_block_header};
 use reel::segment::segment_tail::{SECOND_TAIL_DISTANCE, SegmentNumber, TailHead};
 use reel::segment::summary::{
     FORWARD_UNKNOWN, LostRows, ROW_HEAD_BYTES, SUMMARY_HEADER_BYTES, SegmentFacts, SummaryPaths, SummaryRows, read_row, read_summary,
@@ -41,6 +42,9 @@ const SETTLE_STEPS: u64 = 2_000_000;
 const SETTLE_TICK: Nanoseconds = Nanoseconds(1_000_000);
 const ROW_PERIOD: Nanoseconds = Nanoseconds(60_000_000);
 const KEY_COUNT: u64 = 300;
+const REBUILD_KEYS: u64 = 20_000;
+const REBUILD_LOST_BLOCKS: u64 = 6;
+const REBUILD_BUDGET: ByteCount = ByteCount(192 * 1024 * 1024);
 const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
 const FLIP: BitMask = BitMask(1);
 const OLDEST: usize = 0;
@@ -102,8 +106,12 @@ enum Cover {
 }
 
 fn config() -> StoreConfig {
+    sized_config(BUDGET)
+}
+
+fn sized_config(budget: ByteCount) -> StoreConfig {
     StoreConfig {
-        memory_budget: BUDGET,
+        memory_budget: budget,
         threads: Default::default(),
         volumes: vec![VolumeConfig {
             name: "meta".to_string(),
@@ -513,6 +521,7 @@ fn write_above() {
     rot_second_tail(&built, NEWEST);
 
     let store = open(&built.io);
+    hold_rebuilds(&store);
     let mut model = built.model.clone();
     write(&store, &mut model, ORDERED, 155, NEWEST + 1, false);
     write(&store, &mut model, ORDERED, 156, NEWEST + 1, true);
@@ -524,6 +533,7 @@ fn write_above() {
     drop(store);
 
     let store = open(&built.io);
+    hold_rebuilds(&store);
     assert_eq!(assert_guarded(&store, &built, Cover::Edges(NEWEST)), guarded);
     store.close().expect("close");
 }
@@ -1302,6 +1312,119 @@ fn stale_tail_run(seed: u64, first: u64, second: u64, before_open: impl Fn(&Simu
     true
 }
 
+// a segment that lost both tails comes back whole from its row blocks, through an open too
+#[test]
+fn rebuild_restores() {
+    let built = build(42);
+    rot_first_tail(&built, MIDDLE);
+    rot_second_tail(&built, MIDDLE);
+
+    let store = open(&built.io);
+    assert_eq!(store.damaged_segments(), 1);
+    settle(&built.io);
+    assert_eq!(store.damaged_segments(), 0);
+    assert_match(&store, &built.model);
+    store.close().expect("close");
+    drop(store);
+
+    let store = open(&built.io);
+    assert_eq!(store.damaged_segments(), 0);
+    assert_match(&store, &built.model);
+    store.close().expect("close");
+}
+
+// a row block that fails its check leaves its span damaged, and every other key serves
+#[test]
+fn rebuild_keeps_a_lost_block_damaged() {
+    let built = build(43);
+    rot_first_tail(&built, MIDDLE);
+    rot_second_tail(&built, MIDDLE);
+    let at = built.heads[MIDDLE].data_end.0 + BLOCK_HEADER_BYTES as u64 + 3;
+    built.io.rot(&built.files[MIDDLE], FileOffset(at), FLIP).expect("rot");
+
+    let store = open(&built.io);
+    settle(&built.io);
+    assert_eq!(store.damaged_segments(), 1);
+    let mut refused = 0;
+    for ((column, key), entry) in &built.model {
+        match read(&store, *column, key) {
+            Ok(found) => assert_eq!(found, entry.value, "key {key:?}"),
+            Err(StoreError::Corruption { .. }) => refused += 1,
+            Err(error) => panic!("key {key:?} failed: {error}"),
+        }
+    }
+    assert!(refused > 0);
+    for ((column, key), entry) in &built.model {
+        if read(&store, *column, key).is_err() {
+            match &entry.value {
+                Some(value) => store.put(*column, key, value).expect("put"),
+                None => store.delete(*column, key).expect("delete"),
+            }
+        }
+    }
+    store.clear_damage(ORDERED, b"", None).expect("clear");
+    store.clear_damage(RANDOM, b"", None).expect("clear");
+    assert_match(&store, &built.model);
+    store.close().expect("close");
+}
+
+// a lost block costs its own span and nothing past it, and no key in it reads older, whichever block it was
+#[test]
+fn rebuild_never_reads_older() {
+    for lost in 0..REBUILD_LOST_BLOCKS {
+        let io = SimulatedIo::new(Seed(44));
+        let store = ReelStore::open(io.clone(), &sized_config(REBUILD_BUDGET)).expect("open");
+        hold_rebuilds(&store);
+        store.state.volumes[0].is_compaction_held.store(true, Ordering::Release);
+        let mut model = Model::new();
+        for stage in [OLDEST, MIDDLE] {
+            for column in COLUMNS {
+                for number in 0..REBUILD_KEYS {
+                    write(&store, &mut model, column, number, stage, false);
+                }
+            }
+            seal(&store, &io);
+        }
+        store.close().expect("close");
+        drop(store);
+
+        let files = data_files(&io);
+        assert_eq!(files.len(), 2);
+        let heads: Vec<TailHead> = files.iter().map(|path| read_head(&io, path)).collect();
+        let built = Built { io, model, files, heads };
+        rot_first_tail(&built, MIDDLE);
+        rot_second_tail(&built, MIDDLE);
+        let mut at = built.heads[MIDDLE].data_end.0;
+        for _block in 0..lost {
+            let header = block_header(&built, at);
+            at += BLOCK_HEADER_BYTES as u64 + u64::from(header.block_length) + u64::from(header.filter_length);
+        }
+        built.io.rot(&built.files[MIDDLE], FileOffset(at + BLOCK_HEADER_BYTES as u64 + 3), FLIP).expect("rot");
+
+        let store = ReelStore::open(built.io.clone(), &sized_config(REBUILD_BUDGET)).expect("open");
+        settle(&built.io);
+        assert!(store.state.volumes[0].segments_rewritten.load(Ordering::Acquire) > 0, "block {lost}");
+        let mut refused = 0;
+        for ((column, key), entry) in &built.model {
+            match read(&store, *column, key) {
+                Ok(found) => assert_eq!(found, entry.value, "block {lost}, key {key:?}"),
+                Err(StoreError::Corruption { .. }) => refused += 1,
+                Err(error) => panic!("key {key:?} failed: {error}"),
+            }
+        }
+        assert!(refused > 0 && refused < REBUILD_KEYS / 2, "block {lost}: {refused} refused");
+        store.close().expect("close");
+    }
+}
+
+fn block_header(built: &Built, at: u64) -> BlockHeader {
+    let file = built.io.open_read_only(&built.files[OLDEST]).expect("open");
+    let mut bytes = [0; BLOCK_HEADER_BYTES];
+    file.read_exact_at(FileOffset(at), &mut bytes).expect("read");
+    built.io.close_file(file);
+    read_block_header(&bytes).expect("a header")
+}
+
 // the family of `tail_then_cut`: a tail from a seal that never finished, read as final. It stops speaking once rows go on past it, so a power cut that brings it back to the file's
 // end hides none of them
 #[test]
@@ -1340,6 +1463,12 @@ fn stale_tail_over_rot() {
         }
     }
     assert!(runs > 0);
+}
+
+fn hold_rebuilds(store: &Store) {
+    for volume in &store.state.volumes {
+        volume.is_rebuild_held.store(true, Ordering::Release);
+    }
 }
 
 fn data_lengths(io: &SimulatedIo) -> Vec<ByteCount> {

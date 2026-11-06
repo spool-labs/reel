@@ -1,5 +1,6 @@
 //! One block of a footer's rows, with shared key prefixes and restart points
 
+use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -35,15 +36,17 @@ pub const KIND_MASK: u64 = (1 << KIND_BITS) - 1;
 /// Opens every row block, so a walk with no index can find one
 pub const BLOCK_MARKER: u32 = 0x524C_4248;
 /// Bytes of a row block's header
-pub const BLOCK_HEADER_BYTES: usize = 24;
+pub const BLOCK_HEADER_BYTES: usize = 28;
 /// Where the header keeps the row block's length
 pub const HEADER_BLOCK_LENGTH_AT: usize = 4;
 /// Where the header keeps the filter's length
 pub const HEADER_FILTER_LENGTH_AT: usize = 8;
 /// Where the header keeps the base its rows' places count from
 pub const HEADER_PLACE_BASE_AT: usize = 12;
+/// Where the header keeps the column its rows belong to, so a walk with no tail can tell
+pub const HEADER_COLUMN_AT: usize = 20;
 /// Where the header keeps its own checksum
-pub const HEADER_SUM_AT: usize = 20;
+pub const HEADER_SUM_AT: usize = 24;
 
 /// What a row block's header says
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,6 +54,7 @@ pub struct BlockHeader {
     pub block_length: u32,
     pub filter_length: u32,
     pub place_base: WritePlace,
+    pub column: ColumnId,
 }
 
 /// A row as a footer stores it
@@ -377,7 +381,8 @@ pub fn write_block_header(header: &BlockHeader) -> [u8; BLOCK_HEADER_BYTES] {
     bytes[..HEADER_BLOCK_LENGTH_AT].copy_from_slice(&BLOCK_MARKER.to_le_bytes());
     bytes[HEADER_BLOCK_LENGTH_AT..HEADER_FILTER_LENGTH_AT].copy_from_slice(&header.block_length.to_le_bytes());
     bytes[HEADER_FILTER_LENGTH_AT..HEADER_PLACE_BASE_AT].copy_from_slice(&header.filter_length.to_le_bytes());
-    bytes[HEADER_PLACE_BASE_AT..HEADER_SUM_AT].copy_from_slice(&header.place_base.0.to_le_bytes());
+    bytes[HEADER_PLACE_BASE_AT..HEADER_COLUMN_AT].copy_from_slice(&header.place_base.0.to_le_bytes());
+    bytes[HEADER_COLUMN_AT] = header.column.0;
     let sum = xxh3_64(&bytes[..HEADER_SUM_AT]) as u32;
     bytes[HEADER_SUM_AT..].copy_from_slice(&sum.to_le_bytes());
     bytes
@@ -396,6 +401,7 @@ pub fn read_block_header(bytes: &[u8]) -> Option<BlockHeader> {
         block_length: read_half(header, HEADER_BLOCK_LENGTH_AT)?,
         filter_length: read_half(header, HEADER_FILTER_LENGTH_AT)?,
         place_base: WritePlace(read_word(header, HEADER_PLACE_BASE_AT)?),
+        column: ColumnId(header[HEADER_COLUMN_AT]),
     })
 }
 

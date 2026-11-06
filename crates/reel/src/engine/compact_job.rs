@@ -21,6 +21,7 @@ use crate::engine::cover_apply::is_in_range;
 use crate::engine::engine_state::EngineState;
 use crate::engine::planner::UnitStep;
 use crate::engine::rewrite_job::{RewriteJob, RewriteSeat};
+use crate::engine::rebuild::MOST_REBUILD_TRIES;
 use crate::engine::volume::{ParkedSegment, Volume};
 use crate::engine::walk_job::{FREE_IN_PLACE_BYTES, FreeRecord, WALK_RETRY};
 use crate::guard::hold;
@@ -78,6 +79,7 @@ pub struct CompactJob<Backend: Io> {
     settle_at: usize,
     settled_rows: Vec<DeadCount>,
     listed: Vec<SegmentNumber>,
+    pub rebuilds_tried: Vec<SegmentNumber>,
     block: Vec<u8>,
     key: Vec<u8>,
     row_key: Vec<u8>,
@@ -105,6 +107,7 @@ impl<Backend: Io> CompactJob<Backend> {
             settle_at: 0,
             settled_rows: touched_capacity(MOST_SETTLED_ROWS, DeadCount::default()),
             listed: touched_capacity(MOST_LISTED_LOOKS, SegmentNumber(0)),
+            rebuilds_tried: touched_capacity(MOST_REBUILD_TRIES, SegmentNumber(0)),
             block: touched_zeroes(ROW_BLOCK_BYTES),
             key: touched_capacity(MAX_KEY_BYTES as usize, 0),
             row_key: touched_capacity(MAX_KEY_BYTES as usize, 0),
@@ -182,6 +185,9 @@ impl<Backend: Io> CompactJob<Backend> {
         self.hand_out_on_change(volume);
         if self.rewrite.is_running() {
             self.rewrite.step();
+            return UnitStep::Worked;
+        }
+        if self.start_rebuild(volume) {
             return UnitStep::Worked;
         }
         let is_asked = volume.wants_compaction.swap(false, Ordering::AcqRel);

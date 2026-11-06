@@ -263,6 +263,11 @@ impl DamageList {
         self.count.store(slots.len(), Ordering::Release);
     }
 
+    /// Check any span belongs to a segment
+    pub fn holds_segment(&self, segment: SegmentNumber) -> bool {
+        read_slots(&self.slots).iter().any(|slot| slot.segment == segment)
+    }
+
     /// Keep a copy of the spans in the spare, which a failed save goes back to
     pub fn keep_spare(&self) {
         hold(&self.spare).clone_from(&read_slots(&self.slots));

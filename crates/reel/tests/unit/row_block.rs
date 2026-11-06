@@ -1,5 +1,6 @@
 use reel::row_kind::RowKind;
 use reel::segment::row_block::*;
+use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, FileOffset, WritePlace};
 
 const ROWS: u64 = 500;
@@ -93,6 +94,7 @@ fn header_round() {
         place_base: WritePlace(77),
         block_length: 60_000,
         filter_length: 2_500,
+        column: ColumnId(3),
     };
     let bytes = write_block_header(&header);
 

@@ -220,6 +220,8 @@ pub struct Volume<Backend: Io> {
     pub walk_segment: AtomicU64,
     /// A test holds the walk here to leave segments unwalked
     pub is_walk_held: AtomicBool,
+    /// A test holds rebuilds off, to see what damage does before one runs
+    pub is_rebuild_held: AtomicBool,
     /// A walk is counting what its covers hide, and a row that left now would make an older one look live
     pub is_applying: AtomicBool,
     /// Counts the turns a walk stood aside for a rewrite

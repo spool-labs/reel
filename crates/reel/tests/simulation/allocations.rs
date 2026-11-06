@@ -77,6 +77,7 @@ fn config() -> StoreConfig {
             name: "allocations".to_string(),
             roots: vec![PathBuf::from(ROOT)],
             sync: SyncPolicy::Never,
+            device: Default::default(),
         }],
         columns: vec![column(META, "meta", Codec::None, Some(TABLE_ROWS)), column(BULK, "bulk", Codec::Lz4, None), column(PLAIN, "plain", Codec::None, None)],
     }

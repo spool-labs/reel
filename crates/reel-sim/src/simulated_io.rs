@@ -428,6 +428,10 @@ impl Io for SimulatedIo {
         Ok(paths)
     }
 
+    fn is_rotational(&self, _path: &Path) -> Option<bool> {
+        None
+    }
+
     fn free_space(&self, path: &Path) -> Result<ByteCount> {
         let _pause = CountPause::new();
         let mut disk = hold(&self.disk);

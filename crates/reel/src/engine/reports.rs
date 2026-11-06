@@ -4,7 +4,7 @@ use std::io::Error;
 use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::{CompleteReading, JOB_KINDS, JobKind, JobState, MaintenanceReport, VolumeReading};
+use reel_api::maintenance_report::{CompleteReading, JOB_KINDS, JobKind, JobState, MOST_REPORTED_LANES, MaintenanceReport, VolumeReading};
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, RootId, RowCount, SegmentCount, VolumeId};
 use reel_api::usage::{ColumnRootUsage, ColumnUsage, RootUsage, UsageReport, VolumeUsage};
@@ -151,6 +151,9 @@ impl<Backend: Io> EngineState<Backend> {
                 volume: VolumeId(index as u8),
                 segment_count: SegmentCount(rows.rows().count() as u64),
                 used_bytes: ByteCount(rows.rows().map(|row| row.facts.file_length.0).sum()),
+                is_spinning: volume.is_spinning,
+                is_device_set: volume.is_device_set,
+                rewrites_by_lane: lane_counts(volume),
             });
         }
         for (id, info) in self.columns.iter().enumerate() {
@@ -248,4 +251,13 @@ pub fn usage_error(source: Error) -> StoreError {
         action: "reading space used",
         source,
     }
+}
+
+/// Read each lane's finished rewrites, with lanes past the report's room added to its last
+pub fn lane_counts<Backend: Io>(volume: &Volume<Backend>) -> [u64; MOST_REPORTED_LANES] {
+    let mut counts = [0; MOST_REPORTED_LANES];
+    for (index, lane) in volume.lanes.iter().enumerate() {
+        counts[index.min(MOST_REPORTED_LANES - 1)] += lane.rewrites_done.load(Ordering::Acquire);
+    }
+    counts
 }

@@ -37,6 +37,18 @@ pub enum SyncPolicy {
     Never,
 }
 
+/// What a volume sits on, which every rule for spinning disks keys on
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum DeviceClass {
+    /// Ask the kernel about the device under the first root. A device it can't say about counts as solid
+    #[default]
+    Detect,
+    /// A spinning disk, or anything with one under it
+    Spinning,
+    /// Anything with no seek to speak of
+    Solid,
+}
+
 /// One column
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ColumnConfig {
@@ -55,6 +67,7 @@ pub struct VolumeConfig {
     pub name: String,
     pub roots: Vec<PathBuf>,
     pub sync: SyncPolicy,
+    pub device: DeviceClass,
 }
 
 /// How many threads a store runs for maintenance and async reads. Each one's memory comes out of the budget, sized and touched at

@@ -44,6 +44,7 @@ fn main() {
             name: "turn".to_string(),
             roots: vec![root.clone()],
             sync: SyncPolicy::Never,
+            device: Default::default(),
         }],
         columns: vec![ColumnConfig {
             id: COLUMN,

@@ -16,7 +16,7 @@ use reel_api::units::{ByteCount, Nanoseconds, RowCount, VolumeId, WritePlace};
 use reel_api::usage::{ColumnUsage, UsageReport};
 use reel_api::write_batch::WriteBatch;
 
-use crate::config::{ColumnConfig, StoreConfig, ThreadCounts};
+use crate::config::{ColumnConfig, DeviceClass, StoreConfig, ThreadCounts, VolumeConfig};
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::engine_sizing::{
     complete_block_rows, complete_row_limit,
@@ -1022,6 +1022,8 @@ pub fn build_state<Backend: Io>(
             sealing: AtomicU64::new(NO_SEAL),
             lanes: (0..=sizing.walk_workers).map(|_lane| RewriteLane::new()).collect(),
             gave_up: Mutex::new(GaveUp::new()),
+            is_spinning: is_spinning(&io, volume),
+            is_device_set: volume.device != DeviceClass::Detect,
             seal_point: AtomicU64::new(volume_rows(config, index, sizing.segment_rows).0),
             seal_rate: AtomicU64::new(0),
             ingest_rate: AtomicU64::new(0),
@@ -1219,4 +1221,13 @@ pub fn complete_images(config: &StoreConfig) -> Vec<Option<Mutex<ImageFiles>>> {
         }
     }
     images
+}
+
+/// Work out what a volume sits on: what the config says, or what the kernel says of its first root. Unknown counts as solid
+pub fn is_spinning<Backend: Io>(io: &Backend, volume: &VolumeConfig) -> bool {
+    match volume.device {
+        DeviceClass::Spinning => true,
+        DeviceClass::Solid => false,
+        DeviceClass::Detect => volume.roots.first().and_then(|root| io.is_rotational(root)).unwrap_or(false),
+    }
 }

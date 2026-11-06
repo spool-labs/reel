@@ -27,7 +27,7 @@ use crate::engine::volume::{GRAVE_SLOT, GaveUp, MOST_MERGE_OUTPUTS, NO_SEAL, Out
 use crate::engine::walk_job::add_count;
 use crate::guard::hold;
 use crate::io::{Io, IoFile};
-use crate::pool::{touched_capacity, touched_zeroes};
+use crate::pool::{touched_capacity, touched_filled, touched_zeroes};
 use crate::row_kind::RowKind;
 use crate::segment::column_directory::Listing;
 use crate::segment::footer_writer::{ColumnStart, FooterTotals, FooterWriter};
@@ -51,6 +51,10 @@ pub const SHARE_SCALE: u64 = 1_000_000;
 pub const MOST_KEPT_BLOCKS: usize = 1_024;
 /// Rows one step of a merge decides
 pub const MERGE_STEP_ROWS: usize = 4_096;
+/// The widest span of a segment one stripe of a record rewrite covers
+pub const MOST_STRIPE_BYTES: u64 = 256 * 1024 * 1024;
+/// Rows a stripe lists at once. A span with more narrows to the half with the lowest offsets
+pub const MOST_STRIPE_ROWS: usize = 65_536;
 /// Most row blocks the output for kept graves can have, past which the merge gives way
 pub const MOST_GRAVE_BLOCKS: BlockCount = BlockCount(2_048);
 /// Rounds an install waits for room to park its inputs, past which the merge gives way
@@ -81,6 +85,14 @@ pub struct StagedOutput {
     pub column_count: usize,
 }
 
+/// A marked row a stripe will copy
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StripeRow {
+    pub offset: FileOffset,
+    pub length: ByteCount,
+    pub ordinal: u32,
+}
+
 /// What a merge is copying
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MergeTarget {
@@ -94,6 +106,8 @@ pub struct MergeTarget {
 pub enum RewritePhase {
     /// Rows of a grave-heavy segment are being decided, and nothing is copied unless one would drop
     Deciding,
+    /// Records go across in offset order, a stripe at a time, for one input whose rows are marked
+    Placing,
     /// Rows are being decided and records copied
     Copying,
     /// Row blocks are moving down to the records' end
@@ -106,6 +120,7 @@ pub enum RewritePhase {
 pub struct MergeInput {
     pub segment: SegmentNumber,
     pub block_count: u32,
+    pub block_rows: u64,
     next_block: u32,
     block: Vec<u8>,
     length: usize,
@@ -121,6 +136,7 @@ impl MergeInput {
         Self {
             segment: SegmentNumber(0),
             block_count: 0,
+            block_rows: 0,
             next_block: 0,
             block: touched_zeroes(ROW_BLOCK_BYTES),
             length: 0,
@@ -134,6 +150,11 @@ impl MergeInput {
     /// Read the heap the buffers hold
     pub fn heap_bytes(&self) -> usize {
         self.block.capacity() + self.key.capacity()
+    }
+
+    /// Check a row list this long has room for every row of the input
+    pub fn row_room(&self, rows: usize) -> bool {
+        self.block_rows <= rows as u64
     }
 
     /// Go back to the first row
@@ -243,6 +264,17 @@ pub struct RewriteJob<Backend: Io> {
     staged_keys: Vec<u8>,
     pub forced: Option<SegmentNumber>,
     pub last_slot: Option<(KeyHash, SegmentNumber, u32)>,
+    /// One bit a row of a single input, set when the deciding pass keeps its record
+    marks: Vec<u64>,
+    /// Where each marked row's record landed in the output, by the row's place in the input
+    placed: Vec<u32>,
+    stripe: Vec<StripeRow>,
+    stripe_start: u64,
+    stripe_end: u64,
+    row_ordinal: usize,
+    is_ordered: bool,
+    /// Tests of a merge's cut set this, since an offset-order copy runs to one output
+    pub is_key_order_held: bool,
     is_unwalked: bool,
     crowded_key: Vec<u8>,
     pub has_looks_left: bool,
@@ -252,6 +284,7 @@ pub struct RewriteJob<Backend: Io> {
 impl<Backend: Io> RewriteJob<Backend> {
     /// Allocate the job's fixed buffers
     pub fn new(state: Arc<EngineState<Backend>>, volume: usize, lane: usize) -> Self {
+        let most_rows = state.volumes[volume].segment_rows.0 as usize;
         // a mutex's first lock can allocate, and this one's first real use could be in a close
         drop(hold(&state.volumes[volume].lanes[lane].partial_outputs));
         drop(hold(&state.volumes[volume].lanes[lane].merging));
@@ -310,6 +343,14 @@ impl<Backend: Io> RewriteJob<Backend> {
             staged_keys: touched_capacity(MOST_MERGE_OUTPUTS * MAX_COLUMNS * (2 * SUMMARY_KEY_BYTES + 2), 0),
             forced: None,
             last_slot: None,
+            marks: touched_filled(most_rows.div_ceil(u64::BITS as usize), 0),
+            placed: touched_filled(most_rows, 0),
+            stripe: touched_capacity(MOST_STRIPE_ROWS, StripeRow::default()),
+            stripe_start: 0,
+            stripe_end: 0,
+            row_ordinal: 0,
+            is_ordered: false,
+            is_key_order_held: false,
             is_unwalked: false,
             crowded_key: touched_capacity(SUMMARY_KEY_BYTES, 0),
             has_looks_left: false,
@@ -366,7 +407,11 @@ impl<Backend: Io> RewriteJob<Backend> {
         let mut inputs = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
         inputs[..self.input_count].copy_from_slice(&self.numbers[..self.input_count]);
         *hold(&volume.lanes[self.lane].inputs) = inputs;
-        if is_grave_heavy {
+        // one input copies in offset order, and a deciding pass says which rows go across
+        self.is_ordered = self.input_count == 1 && !self.is_key_order_held && self.inputs[0].row_room(self.placed.len());
+        self.marks.fill(0);
+        self.row_ordinal = 0;
+        if is_grave_heavy || self.is_ordered {
             self.phase = RewritePhase::Deciding;
             return true;
         }
@@ -381,6 +426,9 @@ impl<Backend: Io> RewriteJob<Backend> {
 
     /// Pick the inputs: a run of segments over the overlap bound first, since that comes ahead of the walk, then ready segments
     pub fn pick(&mut self, volume: &Volume<Backend>) -> Option<(MergeTarget, bool)> {
+        if !volume.can_start_rewrite() {
+            return None;
+        }
         if volume.stray_outputs.load(Ordering::Acquire) > 0 {
             return None;
         }
@@ -470,6 +518,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             let input = &mut self.inputs[self.input_count];
             input.segment = facts.segment;
             input.block_count = facts.block_count;
+            input.block_rows = rows_of(&row);
             self.numbers[self.input_count] = facts.segment;
             self.input_count += 1;
             data += facts.data_end.0;
@@ -573,6 +622,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         let outcome = match self.phase {
             RewritePhase::Deciding | RewritePhase::Copying if !self.is_drained && !self.is_cutting => self.merge_rows(),
             RewritePhase::Deciding => self.end_deciding(target),
+            RewritePhase::Placing => self.place_rows(),
             RewritePhase::Copying => self.finish_rows(),
             RewritePhase::Moving => self.move_blocks(target),
             RewritePhase::Installing => self.install(),
@@ -651,6 +701,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         column: ColumnId,
         row: &FooterRow,
     ) -> Result<()> {
+        self.row_ordinal += 1;
         // its cover left the pool before this segment could merge, so nothing older sits under it
         if row.kind == RowKind::RangeDelete {
             self.dropped_rows += 1;
@@ -672,7 +723,10 @@ impl<Backend: Io> RewriteJob<Backend> {
                 self.dropped_rows += 1;
                 Ok(())
             },
-            _kept if self.phase == RewritePhase::Deciding => Ok(()),
+            _kept if self.phase == RewritePhase::Deciding => {
+                self.mark_kept(row);
+                Ok(())
+            },
             // a grave output that's full leaves the rest of the graves as footer rows in the data output
             _kept if row.kind == RowKind::Grave && self.grave_writer.has_block_room() => {
                 self.keep_grave(volume, pins, column, row, replacement)
@@ -690,7 +744,7 @@ impl<Backend: Io> RewriteJob<Backend> {
     pub fn is_cut_due(&self) -> bool {
         let bytes = self.records_end.0 + self.used as u64;
         let is_full = bytes >= self.cut_bytes || self.writer.entries().len() + 2 >= MOST_SEGMENT_BLOCKS.0 as usize;
-        self.output_rows > 0 && self.data_slot + 1 < MOST_MERGE_OUTPUTS && is_full
+        !self.is_ordered && self.output_rows > 0 && self.data_slot + 1 < MOST_MERGE_OUTPUTS && is_full
     }
 
     /// Find the newest place above a row that replaces it: the key's first row across the inputs, or a row in a finished
@@ -795,7 +849,10 @@ impl<Backend: Io> RewriteJob<Backend> {
             self.writer.start_column(&output.file, &start)?;
             self.output_column = Some(column);
         }
-        let offset = self.copy_record(&pin.file, &output.file, row)?;
+        let offset = match self.placed_offset() {
+            Some(offset) => offset,
+            None => self.copy_record(&pin.file, &output.file, row)?,
+        };
         let kept = FooterRow { offset, ..*row };
         self.writer.push_row(&output.file, &self.key, &kept)?;
         self.output_rows += 1;
@@ -966,7 +1023,99 @@ impl<Backend: Io> RewriteJob<Backend> {
             return Err(Error::from(ErrorKind::Interrupted));
         }
         let state = Arc::clone(&self.state);
-        self.open_output(&state.volumes[self.volume], target)
+        self.open_output(&state.volumes[self.volume], target)?;
+        self.row_ordinal = 0;
+        if self.is_ordered {
+            self.stripe.clear();
+            self.stripe_start = 0;
+            self.stripe_end = MOST_STRIPE_BYTES;
+            self.phase = RewritePhase::Placing;
+        }
+        Ok(())
+    }
+
+    /// Note a kept row of a deciding pass, for the copy to take in offset order
+    pub fn mark_kept(&mut self, row: &FooterRow) {
+        if self.is_ordered && row.kind == RowKind::Value {
+            let ordinal = self.row_ordinal - 1;
+            self.marks[ordinal / u64::BITS as usize] |= 1 << (ordinal % u64::BITS as usize);
+        }
+    }
+
+    /// Check a row was marked
+    pub fn is_marked(&self, ordinal: usize) -> bool {
+        self.marks[ordinal / u64::BITS as usize] >> (ordinal % u64::BITS as usize) & 1 != 0
+    }
+
+    /// Read where the row in hand's record landed, if a stripe copied it
+    pub fn placed_offset(&self) -> Option<FileOffset> {
+        let ordinal = self.row_ordinal - 1;
+        (self.is_ordered && self.is_marked(ordinal)).then(|| FileOffset(u64::from(self.placed[ordinal])))
+    }
+
+    /// Walk a step of the input's rows, listing the marked ones in this stripe, and copy the stripe once the rows run out
+    pub fn place_rows(&mut self) -> Result<()> {
+        let state = Arc::clone(&self.state);
+        let volume = &state.volumes[self.volume];
+        let Some(pin) = volume.table.pin(self.numbers[0]) else {
+            return Err(Error::from(ErrorKind::NotFound));
+        };
+        if self.inputs[0].row.is_none() && self.inputs[0].length == 0 {
+            self.inputs[0].advance(volume, &pin)?;
+        }
+        for _row in 0..MERGE_STEP_ROWS {
+            let Some(row) = self.inputs[0].row else {
+                return self.copy_stripe(&pin.file);
+            };
+            let ordinal = self.row_ordinal;
+            self.row_ordinal += 1;
+            if self.is_marked(ordinal) && row.offset.0 >= self.stripe_start && row.offset.0 < self.stripe_end {
+                self.list_stripe_row(&row, ordinal);
+            }
+            self.inputs[0].advance(volume, &pin)?;
+        }
+        Ok(())
+    }
+
+    /// List a row, narrowing the stripe to its lowest half when the list is full. The rows that leave wait for the next stripe
+    pub fn list_stripe_row(&mut self, row: &FooterRow, ordinal: usize) {
+        if self.stripe.len() == MOST_STRIPE_ROWS {
+            self.stripe.sort_unstable_by_key(|listed| listed.offset);
+            self.stripe.truncate(MOST_STRIPE_ROWS / 2);
+            self.stripe_end = self.stripe.last().map_or(self.stripe_end, |listed| listed.offset.0 + 1);
+            if row.offset.0 >= self.stripe_end {
+                return;
+            }
+        }
+        self.stripe.push(StripeRow { offset: row.offset, length: row.length, ordinal: ordinal as u32 });
+    }
+
+    /// Copy a stripe's records in offset order, and go round for the next stripe or on to the footer once the records run out
+    pub fn copy_stripe(&mut self, from: &Backend::File) -> Result<()> {
+        let Some(output) = self.output.clone() else {
+            return Err(Error::from(ErrorKind::NotFound));
+        };
+        self.stripe.sort_unstable_by_key(|listed| listed.offset);
+        for index in 0..self.stripe.len() {
+            let listed = self.stripe[index];
+            let row = FooterRow { place: WritePlace(0), offset: listed.offset, length: listed.length, kind: RowKind::Value };
+            let at = self.copy_record(from, &output.file, &row)?;
+            self.placed[listed.ordinal as usize] = at.0 as u32;
+        }
+        self.stripe.clear();
+        self.row_ordinal = 0;
+        self.inputs[0].rewind();
+        self.stripe_start = self.stripe_end;
+        self.stripe_end = self.stripe_start + MOST_STRIPE_BYTES;
+        if self.stripe_start >= self.inputs_data_end() {
+            self.phase = RewritePhase::Copying;
+        }
+        Ok(())
+    }
+
+    /// Read where the input's records end
+    pub fn inputs_data_end(&self) -> u64 {
+        self.target.map_or(0, |target| target.data.0)
     }
 
     /// End the copying. Several inputs becoming one wins back overlap whatever it dropped, and one input that dropped nothing
@@ -1188,6 +1337,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
         let retired: [_; MOST_MERGE_SEGMENTS] = array::from_fn(|index| inputs.get(index).and_then(|number| volume.table.retire(*number)));
         self.note_install();
+        volume.lanes[self.lane].rewrites_done.fetch_add(1, Ordering::AcqRel);
         self.summarize(volume, inputs);
         let saved = state.save_summary(volume);
 
@@ -1630,4 +1780,16 @@ pub fn lowest_inside<'row>(row: &SummaryRow<'row>, column: ColumnId, lowest: &[u
 /// A rewrite a worker runs. The planner starts one here and the worker steps it, and the lock only ever waits on one step
 pub struct RewriteSeat<Backend: Io> {
     pub job: Mutex<RewriteJob<Backend>>,
+}
+
+/// Count the rows a summary row's columns hold
+pub fn rows_of(row: &SummaryRow<'_>) -> u64 {
+    let mut rows = 0;
+    let mut cursor = row.cursor();
+    for _column in 0..row.column_count {
+        if let Some(column) = cursor.column() {
+            rows += column.row_count.0;
+        }
+    }
+    rows
 }

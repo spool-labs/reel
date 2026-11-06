@@ -130,6 +130,8 @@ pub struct RewriteLane<File> {
     /// Every input of the rewrite running here
     pub inputs: Mutex<[SegmentNumber; MOST_MERGE_SEGMENTS]>,
     pub partial_outputs: Mutex<OutputSlots<File>>,
+    /// Rewrites this lane has finished
+    pub rewrites_done: AtomicU64,
     /// Outputs a failed remove left here. A lane with any starts nothing until they go
     pub strays: AtomicU64,
 }
@@ -144,6 +146,7 @@ impl<File> RewriteLane<File> {
             inputs: Mutex::new([SegmentNumber(0); MOST_MERGE_SEGMENTS]),
             partial_outputs: Mutex::new(Default::default()),
             strays: AtomicU64::new(0),
+            rewrites_done: AtomicU64::new(0),
         }
     }
 }
@@ -203,6 +206,8 @@ pub struct Volume<Backend: Io> {
     /// The walk is part way through a segment
     pub has_walk_target: AtomicBool,
     pub gave_up: Mutex<GaveUp>,
+    pub is_spinning: bool,
+    pub is_device_set: bool,
     /// One lane for each rewrite that can run at once: the planner's, then a worker's each
     pub lanes: Vec<RewriteLane<Backend::File>>,
     /// Rows the open segments reach before a seal starts, from the measured rates and set as each seal ends
@@ -290,6 +295,11 @@ impl<Backend: Io> Volume<Backend> {
     /// Check a running rewrite has taken a segment as an input, so no other lane picks it
     pub fn is_taken(&self, segment: SegmentNumber) -> bool {
         self.lanes.iter().any(|lane| hold(&lane.inputs).contains(&segment))
+    }
+
+    /// Check a rewrite may start: a spinning disk runs one stream at a time, so a second would only seek between them
+    pub fn can_start_rewrite(&self) -> bool {
+        !self.is_spinning || self.lanes.iter().all(|lane| hold(&lane.inputs)[0] == SegmentNumber(0))
     }
 
     /// Check a rewrite sits between its first row decision and its install

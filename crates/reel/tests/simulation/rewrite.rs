@@ -37,6 +37,7 @@ const TICK: Nanoseconds = Nanoseconds(1_000_000);
 const STEPS: u64 = 20_000;
 const SMALL_RECORD_BYTES: usize = 1_024;
 const IDLE_KEYS: u64 = 600;
+const STRIPE_KEYS: u64 = 300_000;
 const IDLE_VALUE_BYTES: usize = 1_000;
 const IDLE_LOOK: Nanoseconds = Nanoseconds(1_000_000_000);
 const CRASH_POINTS: u64 = 300;
@@ -61,6 +62,7 @@ fn open(io: &SimulatedIo) -> Store {
             name: "rewrite".to_string(),
             roots: vec![PathBuf::from(ROOT)],
             sync: SyncPolicy::Never,
+            device: Default::default(),
         }],
         columns: vec![ColumnConfig {
             id: COLUMN,
@@ -234,6 +236,7 @@ fn install_looks_again() {
     let state = &store.state;
     let volume = &state.volumes[0];
     let mut job = CompactJob::new(Arc::clone(state), 0);
+    job.rewrite.is_key_order_held = true;
     assert!(start_merge(&mut job));
     let number = job.rewrite.output.as_ref().expect("an output").number;
     while job.rewrite.phase != RewritePhase::Installing {
@@ -288,6 +291,7 @@ fn stopped() {
 
     let volume = &store.state.volumes[0];
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    job.rewrite.is_key_order_held = true;
     assert!(start_merge(&mut job));
     job.rewrite.step();
     assert!(has_partial(&io));
@@ -310,6 +314,7 @@ fn partial_goes_at_open() {
     hold_compaction(&store, true);
     half_dead(&store, &io);
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    job.rewrite.is_key_order_held = true;
     assert!(start_merge(&mut job));
     job.rewrite.step();
     io.kill();
@@ -476,6 +481,7 @@ fn open_removes_input() {
     let (older, _newer) = half_dead(&store, &io);
 
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    job.rewrite.is_key_order_held = true;
     assert!(start_merge(&mut job));
     let number = job.rewrite.output.as_ref().expect("an output").number;
     while job.rewrite.phase != RewritePhase::Installing {
@@ -778,6 +784,7 @@ fn name_landed_before_the_failure() {
     half_dead(&store, &io);
 
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    job.rewrite.is_key_order_held = true;
     assert!(start_merge(&mut job));
     let number = job.rewrite.output.as_ref().expect("an output").number;
     while job.rewrite.phase == RewritePhase::Copying {
@@ -1915,6 +1922,7 @@ fn check_set(store: &Store) {
 
 // run a merge up to its install, cutting at small sizes, with the outputs written so far
 fn run_to_set(job: &mut CompactJob<SimulatedIo>) -> usize {
+    job.rewrite.is_key_order_held = true;
     job.rewrite.cut_floor = 0;
     assert!(start_merge(job));
     while job.rewrite.phase != RewritePhase::Installing {
@@ -1935,6 +1943,7 @@ fn outputs_never_overlap() {
     let old: Vec<SegmentNumber> = hold(&store.state.volumes[0].summary).rows().map(|row| row.facts.segment).collect();
 
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    job.rewrite.is_key_order_held = true;
     let count = run_to_set(&mut job);
     job.rewrite.step();
     assert!(!job.rewrite.is_running());
@@ -1960,6 +1969,7 @@ fn read_between_a_set_and_its_inputs() {
     set_of_inputs(&store, &io);
 
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    job.rewrite.is_key_order_held = true;
     run_to_set(&mut job);
     // the spot cache would answer a plain get, so this asks the footers, which go by the lists
     let state = &store.state;
@@ -2018,6 +2028,7 @@ fn cut_keeps_a_key_whole() {
     let only = seal(&store, &io);
 
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    job.rewrite.is_key_order_held = true;
     job.rewrite.forced = Some(only);
     job.rewrite.cut_floor = 0;
     assert!(start_merge(&mut job));
@@ -2268,5 +2279,70 @@ fn cue_held_rows_copy_once() {
     drop(cue);
     assert!(start_merge(&mut job));
     job.rewrite.abandon();
+    store.close().expect("close");
+}
+
+// a rewrite lays records down in the order they lay in its input, whatever order their keys sort in
+#[test]
+fn rewrite_keeps_offset_order() {
+    let io = SimulatedIo::new(Seed(81));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let value = vec![7; IDLE_VALUE_BYTES];
+    // written from the highest key down, so key order runs against offset order
+    for number in (0..IDLE_KEYS).rev() {
+        store.put(COLUMN, format!("key-{number:04}").as_bytes(), &value).expect("put");
+    }
+    let older = seal(&store, &io);
+    for number in (0..IDLE_KEYS).step_by(2) {
+        store.put(COLUMN, format!("key-{number:04}").as_bytes(), b"newer").expect("put");
+    }
+    for number in (1..IDLE_KEYS).step_by(4) {
+        store.put(COLUMN, format!("key-{number:04}").as_bytes(), b"newer").expect("put");
+    }
+    seal(&store, &io);
+
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(start_merge(&mut job));
+    assert_eq!(job.rewrite.input_numbers(), &[older]);
+    run_to_end(&mut job);
+    assert!(!store.state.volumes[0].table.holds(older));
+
+    let volume = &store.state.volumes[0];
+    let offset_of = |number: u64| {
+        let key = format!("key-{number:04}");
+        let read = store.state.key_read(COLUMN, key.as_bytes(), WritePlace(u64::MAX), false).expect("read");
+        store.state.search_footers(volume, &read).expect("search").expect("a row").row.offset
+    };
+    let kept: Vec<u64> = (3..IDLE_KEYS).step_by(4).collect();
+    for pair in kept.windows(2) {
+        assert!(offset_of(pair[0]) > offset_of(pair[1]), "keys {pair:?}");
+    }
+    store.close().expect("close");
+}
+
+// a stripe that lists more rows than it holds narrows, and every record still lands where its row says
+#[test]
+fn stripe_narrows_when_full() {
+    let io = SimulatedIo::new(Seed(82));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    for number in 0..STRIPE_KEYS {
+        store.put(COLUMN, format!("key-{number:06}").as_bytes(), b"first").expect("put");
+    }
+    seal(&store, &io);
+    for number in (0..STRIPE_KEYS).step_by(2) {
+        store.put(COLUMN, format!("key-{number:06}").as_bytes(), b"second").expect("put");
+    }
+    seal(&store, &io);
+
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(start_merge(&mut job));
+    run_to_end(&mut job);
+    assert!(store.state.volumes[0].segments_rewritten.load(Ordering::Acquire) > 0);
+    for number in 0..STRIPE_KEYS {
+        let expected: &[u8] = if number % 2 == 0 { b"second" } else { b"first" };
+        assert_eq!(read(&store, format!("key-{number:06}").as_bytes()).as_deref(), Some(expected), "key {number}");
+    }
     store.close().expect("close");
 }

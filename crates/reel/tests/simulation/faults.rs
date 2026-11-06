@@ -192,6 +192,7 @@ fn config(policy: SyncPolicy, complete_rows: Option<RowCount>) -> StoreConfig {
         name: name.to_string(),
         roots: roots.iter().map(PathBuf::from).collect(),
         sync,
+        device: Default::default(),
     };
     let column = |id: ColumnId, name: &str, volume: u8, complete_rows: Option<RowCount>| ColumnConfig {
         id,

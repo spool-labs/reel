@@ -53,6 +53,7 @@ fn open(io: &SimulatedIo) -> Store {
             name: "prefix".to_string(),
             roots: vec![PathBuf::from(ROOT)],
             sync: SyncPolicy::Never,
+            device: Default::default(),
         }],
         columns: vec![column(COLUMN, "column", Codec::None), column(PACKED, "packed", Codec::Lz4)],
     };

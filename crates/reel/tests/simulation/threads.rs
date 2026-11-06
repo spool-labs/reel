@@ -3,11 +3,14 @@
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
-use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, ThreadCounts, VolumeConfig};
+use reel::config::{ColumnConfig, DeviceClass, KeyShape, StoreConfig, SyncPolicy, ThreadCounts, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
+use reel::guard::hold;
 use reel::record::codec::Codec;
+use reel::segment::segment_tail::SegmentNumber;
 use reel_api::column_id::ColumnId;
 use reel_api::direction::Direction;
+use reel_api::maintenance_report::MaintenanceReport;
 use reel_api::scan::ScanStep;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, Nanoseconds, VolumeId};
@@ -22,10 +25,15 @@ const STEPS: u64 = 400_000;
 const ROUNDS: u64 = 6;
 const KEYS: u64 = 400;
 const MANY_WORKERS: usize = 100_000;
+const DEAD_SEGMENTS: u64 = 6;
 
 type Store = ReelStore<SimulatedIo>;
 
 fn config(threads: ThreadCounts) -> StoreConfig {
+    config_on(threads, DeviceClass::Detect)
+}
+
+fn config_on(threads: ThreadCounts, device: DeviceClass) -> StoreConfig {
     StoreConfig {
         memory_budget: BUDGET,
         threads,
@@ -33,6 +41,7 @@ fn config(threads: ThreadCounts) -> StoreConfig {
             name: "threads".to_string(),
             roots: vec![PathBuf::from(ROOT)],
             sync: SyncPolicy::Never,
+            device,
         }],
         columns: vec![ColumnConfig {
             id: COLUMN,
@@ -130,6 +139,10 @@ fn workers_run_rewrites() {
         settle(&io);
     }
     let volume = &store.state.volumes[0];
+    let mut report = MaintenanceReport::default();
+    store.maintenance_report(&mut report);
+    let by_lane = report.volumes[0].rewrites_by_lane;
+    assert!(by_lane[1..].iter().sum::<u64>() > 0, "no worker finished a rewrite: {by_lane:?}");
     let worked = volume.lanes.len();
     assert_eq!(worked, 3);
     assert!(volume.segments_rewritten.load(Ordering::Acquire) > 0);
@@ -139,4 +152,68 @@ fn workers_run_rewrites() {
         assert_eq!(value, format!("value-{}", ROUNDS - 1).into_bytes());
     }
     store.close().expect("close");
+}
+
+// the most rewrites seen running at once while the jobs drain a volume of half-dead segments
+fn most_rewrites_at_once(device: DeviceClass) -> usize {
+    let io = SimulatedIo::new(Seed(6));
+    let threads = ThreadCounts { maintenance_workers: 3, ..ThreadCounts::default() };
+    let store: Store = ReelStore::open(io.clone(), &config_on(threads, device)).expect("open");
+    let volume = &store.state.volumes[0];
+    volume.is_compaction_held.store(true, Ordering::Release);
+    for round in 0..DEAD_SEGMENTS {
+        for number in 0..KEYS {
+            store.put(COLUMN, format!("key-{round}-{number:04}").as_bytes(), b"first").expect("put");
+        }
+        store.seal_now();
+        settle(&io);
+    }
+    for round in 0..DEAD_SEGMENTS {
+        for number in 0..KEYS {
+            store.put(COLUMN, format!("key-{round}-{number:04}").as_bytes(), b"second").expect("put");
+        }
+    }
+    store.seal_now();
+    settle(&io);
+
+    volume.is_compaction_held.store(false, Ordering::Release);
+    store.state.ask_compaction();
+    let mut most = 0;
+    for _step in 0..STEPS {
+        let running = volume.lanes.iter().filter(|lane| hold(&lane.inputs)[0] != SegmentNumber(0)).count();
+        most = most.max(running);
+        if io.step_any().is_none() {
+            io.advance_clock(TICK);
+            if io.step_any().is_none() {
+                break;
+            }
+        }
+    }
+    store.close().expect("close");
+    most
+}
+
+// a spinning volume runs one rewrite at a time however many workers stand by
+#[test]
+fn spinning_runs_one_stream() {
+    assert_eq!(most_rewrites_at_once(DeviceClass::Spinning), 1);
+}
+
+// a solid volume runs them side by side
+#[test]
+fn solid_runs_several() {
+    assert!(most_rewrites_at_once(DeviceClass::Solid) > 1);
+}
+
+// the report says what class a volume has and where it came from, and a backend that can't tell leaves it solid
+#[test]
+fn class_shows_in_the_report() {
+    for (device, is_spinning, is_set) in [(DeviceClass::Detect, false, false), (DeviceClass::Solid, false, true), (DeviceClass::Spinning, true, true)] {
+        let io = SimulatedIo::new(Seed(7));
+        let store: Store = ReelStore::open(io, &config_on(ThreadCounts::default(), device)).expect("open");
+        let mut report = MaintenanceReport::default();
+        store.maintenance_report(&mut report);
+        assert_eq!((report.volumes[0].is_spinning, report.volumes[0].is_device_set), (is_spinning, is_set));
+        store.close().expect("close");
+    }
 }

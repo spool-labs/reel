@@ -96,6 +96,9 @@ pub trait Io: Clone + Send + Sync + 'static {
     /// Read how many bytes the disk under a directory can still take
     fn free_space(&self, path: &Path) -> Result<ByteCount>;
 
+    /// Say whether any disk under a path spins, or nothing when this backend can't tell
+    fn is_rotational(&self, path: &Path) -> Option<bool>;
+
     /// Take a process-wide lock on a file, or learn which process holds it
     fn lock(&self, path: &Path) -> Result<LockOutcome<Self::Lock>>;
 

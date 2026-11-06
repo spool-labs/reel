@@ -68,7 +68,15 @@ pub struct VolumeReading {
     pub volume: VolumeId,
     pub segment_count: SegmentCount,
     pub used_bytes: ByteCount,
+    pub is_spinning: bool,
+    /// The class came from the config, where a false here means it was detected
+    pub is_device_set: bool,
+    /// Rewrites each lane has finished: the planner's, then a worker's each
+    pub rewrites_by_lane: [u64; MOST_REPORTED_LANES],
 }
+
+/// Lanes a volume reading has room for. Workers past this show in the last one
+pub const MOST_REPORTED_LANES: usize = 16;
 
 /// How a complete column stands. A read-only view has no table, and reads through the footers
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

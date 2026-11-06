@@ -179,7 +179,7 @@ impl<Backend: Io> CompactJob<Backend> {
                 Err(_) => UnitStep::RetryAt(Nanoseconds(now.0 + WALK_RETRY.0)),
             };
         }
-        self.hand_out(volume);
+        self.hand_out_on_change(volume);
         if self.rewrite.is_running() {
             self.rewrite.step();
             return UnitStep::Worked;
@@ -199,7 +199,8 @@ impl<Backend: Io> CompactJob<Backend> {
         let Some(segment) = candidate else {
             // an unlink wins back the most for the least, so a rewrite waits until none is left to try
             let should_rewrite = mem::take(&mut self.should_rewrite);
-            if should_rewrite && self.rewrite.start() {
+            // workers go first, so the planner stays free to pick and walk
+            if should_rewrite && (self.hand_out(volume) || self.rewrite.start()) {
                 return UnitStep::Worked;
             }
             // a look takes a few segments at a time, and the rest still count
@@ -216,28 +217,35 @@ impl<Backend: Io> CompactJob<Backend> {
         }
     }
 
-    /// Start a rewrite on each idle worker, once something has changed that could give one a pick. The planner picks and the worker
-    /// runs, so more workers means more rewrites at once
-    pub fn hand_out(&mut self, volume: &Volume<Backend>) {
+    /// Look for work for idle workers once something has changed that could give one a pick
+    pub fn hand_out_on_change(&mut self, volume: &Volume<Backend>) {
         let left = volume.segments_rewritten.load(Ordering::Acquire) + volume.segments_unlinked.load(Ordering::Acquire);
         let changes = left + volume.seals_done.load(Ordering::Acquire);
-        if self.seats.is_empty() || changes == self.handed_at {
-            return;
+        if changes != self.handed_at {
+            self.handed_at = changes;
+            let _handed = self.hand_out(volume);
         }
-        self.handed_at = changes;
+    }
+
+    /// Start a rewrite on each idle worker while picks last, and say whether one started. The planner picks and the worker runs,
+    /// so more workers means more rewrites at once
+    pub fn hand_out(&self, volume: &Volume<Backend>) -> bool {
+        let mut has_started = false;
         for (index, seat) in self.seats.iter().enumerate() {
             let mut job = hold(&seat.job);
             if job.is_running() {
                 continue;
             }
             if !job.start() {
-                return;
+                return has_started;
             }
+            has_started = true;
             drop(job);
             if let Some(task) = volume.walk_slots[index].task.get() {
                 task.wake();
             }
         }
+        has_started
     }
 
     /// Come back after the retry wait

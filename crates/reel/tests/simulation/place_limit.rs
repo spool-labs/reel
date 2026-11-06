@@ -36,6 +36,7 @@ fn config() -> StoreConfig {
             name: "meta".to_string(),
             roots: ROOTS.iter().map(PathBuf::from).collect(),
             sync: SyncPolicy::Never,
+            device: Default::default(),
         }],
         columns: vec![ColumnConfig {
             id: COLUMN,

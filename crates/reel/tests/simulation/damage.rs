@@ -109,6 +109,7 @@ fn config() -> StoreConfig {
             name: "meta".to_string(),
             roots: vec![PathBuf::from(ROOT)],
             sync: SyncPolicy::Never,
+            device: Default::default(),
         }],
         columns: vec![
             ColumnConfig {

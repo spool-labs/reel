@@ -161,6 +161,7 @@ fn config(sync: SyncPolicy) -> StoreConfig {
             name: "meta".to_string(),
             roots: vec![PathBuf::from(ROOT)],
             sync,
+            device: Default::default(),
         }],
         columns: vec![ColumnConfig {
             id: COLUMN,

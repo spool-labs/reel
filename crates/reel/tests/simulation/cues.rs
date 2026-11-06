@@ -29,6 +29,7 @@ fn open(io: &SimulatedIo) -> Store {
             name: "cues".to_string(),
             roots: vec![PathBuf::from("/disk/cues")],
             sync: SyncPolicy::Never,
+            device: Default::default(),
         }],
         columns: vec![ColumnConfig {
             id: COLUMN,

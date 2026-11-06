@@ -29,6 +29,8 @@ pub const HOLDER_WIDTH: usize = 10;
 pub const FREE_PROBE_NAME: &str = "free-probe";
 /// Bytes of that file, two blocks of any filesystem reel runs on
 pub const FREE_PROBE_BYTES: usize = 8 * 1024;
+/// Layers of stacked devices a look at a disk goes down through
+pub const MOST_STACK_DEPTH: usize = 8;
 /// The stack of a job thread, which holds a seal's and a merge's deepest calls with room to spare
 pub const JOB_STACK_BYTES: ByteCount = ByteCount(1024 * 1024);
 /// What a job's touch leaves alone: the guard page, the thread's own data that glibc keeps in the stack, and the frames
@@ -147,6 +149,10 @@ impl Io for PlainIo {
         Ok(paths)
     }
 
+    fn is_rotational(&self, path: &Path) -> Option<bool> {
+        rotational_under(path)
+    }
+
     fn free_space(&self, path: &Path) -> Result<ByteCount> {
         let directory = File::open(path)?;
         let mut stats = MaybeUninit::<libc::statvfs>::zeroed();
@@ -252,4 +258,49 @@ pub fn parse_holder(buf: &[u8]) -> Result<ProcessId> {
 /// Widen a field whose width differs between platforms
 pub fn widen<Field: Into<u64>>(field: Field) -> u64 {
     field.into()
+}
+
+/// Say whether any disk under a path spins, following a stacked device down to its slaves
+#[cfg(target_os = "linux")]
+pub fn rotational_under(path: &Path) -> Option<bool> {
+    use std::os::linux::fs::MetadataExt;
+
+    let device = fs::metadata(path).ok()?.st_dev();
+    // the kernel's encoding of a device number
+    let major = ((device >> 8) & 0xFFF) | ((device >> 32) & !0xFFF);
+    let minor = (device & 0xFF) | ((device >> 12) & !0xFF);
+    let block = fs::canonicalize(format!("/sys/dev/block/{major}:{minor}")).ok()?;
+    block_spins(&block, 0)
+}
+
+/// Say whether a block device spins, for an operating system with no way to ask
+#[cfg(not(target_os = "linux"))]
+pub fn rotational_under(_path: &Path) -> Option<bool> {
+    None
+}
+
+/// Check a block device or anything stacked under it spins. A partition asks its disk
+#[cfg(target_os = "linux")]
+pub fn block_spins(block: &Path, depth: usize) -> Option<bool> {
+    if depth > MOST_STACK_DEPTH {
+        return None;
+    }
+    let slaves: Vec<_> = fs::read_dir(block.join("slaves")).map(|entries| entries.flatten().map(|entry| entry.path()).collect()).unwrap_or_default();
+    if !slaves.is_empty() {
+        let mut known = None;
+        for slave in slaves {
+            let device = fs::canonicalize(slave).ok()?;
+            match block_spins(&device, depth + 1) {
+                Some(true) => return Some(true),
+                Some(false) => known = Some(false),
+                None => {},
+            }
+        }
+        return known;
+    }
+    if block.join("partition").exists() {
+        return block_spins(block.parent()?, depth + 1);
+    }
+    let flag = fs::read_to_string(block.join("queue/rotational")).ok()?;
+    Some(flag.trim() == "1")
 }

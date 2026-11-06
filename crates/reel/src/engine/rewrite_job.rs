@@ -237,8 +237,6 @@ pub struct RewriteJob<Backend: Io> {
     staged_columns: Vec<StagedColumn>,
     staged_keys: Vec<u8>,
     pub forced: Option<SegmentNumber>,
-    /// The volume is quiet with too much dead, so the next pick goes below the trigger
-    pub is_quiet: bool,
     is_unwalked: bool,
     crowded_key: Vec<u8>,
     pub has_looks_left: bool,
@@ -304,7 +302,6 @@ impl<Backend: Io> RewriteJob<Backend> {
             staged_columns: touched_capacity(MOST_MERGE_OUTPUTS * MAX_COLUMNS, StagedColumn::default()),
             staged_keys: touched_capacity(MOST_MERGE_OUTPUTS * MAX_COLUMNS * (2 * SUMMARY_KEY_BYTES + 2), 0),
             forced: None,
-            is_quiet: false,
             is_unwalked: false,
             crowded_key: touched_capacity(SUMMARY_KEY_BYTES, 0),
             has_looks_left: false,
@@ -391,15 +388,6 @@ impl<Backend: Io> RewriteJob<Backend> {
         // a full pool refuses range deletes, so the segment holding the oldest cover back goes whatever the trigger says
         if let Some(row) = self.forced.take().and_then(|forced| rows.get(forced)).filter(|row| is_mergeable(volume, row)) {
             return Some((self.gather(volume, &rows, &row, 1, |_row| false), false));
-        }
-        // a quiet volume takes what wins back the most for the bytes read, whatever the trigger says
-        if mem::take(&mut self.is_quiet) {
-            let can_win = |row: &SummaryRow<'_>| is_mergeable(volume, row) && reclaim_share(row) > 0;
-            if let Some(first) = rows.rows().filter(can_win).max_by_key(reclaim_share) {
-                let is_grave_heavy = is_grave_heavy(&first);
-                let is_more = |row: &SummaryRow<'_>| can_win(row) && row.facts.segment > first.facts.segment;
-                return Some((self.gather(volume, &rows, &first, room, is_more), is_grave_heavy));
-            }
         }
         let is_ready = |row: &SummaryRow<'_>| {
             row.facts.is_walked() && is_rewrite_ready(volume, row, 0) && is_rewrite_ready(volume, row, freed_in_place(volume, row))

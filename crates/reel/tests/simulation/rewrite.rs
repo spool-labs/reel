@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
-use reel::engine::compact_job::{CompactJob, QUIET_DEAD_DIVISOR, QUIET_LOOK, park};
+use reel::engine::compact_job::{CompactJob, park};
 use reel::engine::cue::{Cue, CueTable};
 use reel::engine::open_segment::{OUTPUT_SUFFIX, data_path};
 use reel::engine::read_path::RecordWant;
@@ -35,6 +35,9 @@ const COLUMN: ColumnId = ColumnId(1);
 const BUDGET: ByteCount = ByteCount(64 * 1024 * 1024);
 const TICK: Nanoseconds = Nanoseconds(1_000_000);
 const STEPS: u64 = 20_000;
+const IDLE_KEYS: u64 = 600;
+const IDLE_VALUE_BYTES: usize = 1_000;
+const IDLE_LOOK: Nanoseconds = Nanoseconds(1_000_000_000);
 const CRASH_POINTS: u64 = 300;
 const KEYS: [&[u8]; 4] = [b"a", b"b", b"c", b"d"];
 const MOST_LOOPS: usize = 2_000;
@@ -43,9 +46,6 @@ const KEPT_LIVE_KEYS: u64 = 16;
 const MANY_GRAVES: u64 = 30_000;
 const SET_CRASH_STRIDE: u64 = 7;
 const IDLE_TICKS: u64 = 8;
-const QUIET_TICKS: u64 = 40;
-const QUIET_KEYS: u64 = 600;
-const QUIET_VALUE_BYTES: usize = 1_000;
 const TWO_BLOCK_ROWS: u64 = 12_000;
 const UNWALKED_CRASH_POINTS: u64 = 40;
 const UNWALKED_CRASH_STRIDE: u64 = 3;
@@ -2106,91 +2106,24 @@ fn idle_starts_no_merge() {
     store.close().expect("close");
 }
 
-fn sit_quiet(store: &Store, io: &SimulatedIo) {
-    for _tick in 0..QUIET_TICKS {
-        store.state.ask_compaction();
-        settle(io);
-        io.advance_clock(QUIET_LOOK);
-    }
-    settle(io);
-}
-
-fn dead_and_live(store: &Store) -> (u64, u64) {
-    let rows = hold(&store.state.volumes[0].summary);
-    let (mut dead, mut live) = (0, 0);
-    for row in rows.rows() {
-        let mut cursor = row.cursor();
-        while let Some(column) = cursor.column() {
-            dead += column.dead_bytes.0;
-            live += column.live_bytes.0;
-        }
-    }
-    (dead, live)
-}
-
-// a quiet volume keeps reclaiming below the trigger until what's dead sits within a tenth of what's live
+// a third of a volume dead sits under the trigger, and however long the volume stays idle no rewrite starts
 #[test]
-fn quiet_reclaims_to_its_line() {
-    let io = SimulatedIo::new(Seed(90));
+fn idle_under_the_trigger() {
+    let io = SimulatedIo::new(Seed(77));
     let store = open(&io);
-    let value = vec![7; QUIET_VALUE_BYTES];
-    for number in 0..QUIET_KEYS {
+    let value = vec![7; IDLE_VALUE_BYTES];
+    for number in 0..IDLE_KEYS {
         store.put(COLUMN, format!("key-{number:04}").as_bytes(), &value).expect("put");
     }
     seal(&store, &io);
-    for number in 0..QUIET_KEYS / 3 {
+    for number in 0..IDLE_KEYS / 3 {
         store.put(COLUMN, format!("key-{number:04}").as_bytes(), &value).expect("put");
     }
     seal(&store, &io);
-    assert_eq!(store.state.volumes[0].segments_rewritten.load(Ordering::Acquire), 0);
-    let (dead, live) = dead_and_live(&store);
-    assert!(dead * QUIET_DEAD_DIVISOR > live);
-
-    sit_quiet(&store, &io);
-    assert!(store.state.volumes[0].segments_rewritten.load(Ordering::Acquire) > 0);
-    let (dead, live) = dead_and_live(&store);
-    assert!(dead * QUIET_DEAD_DIVISOR <= live, "{dead} dead, {live} live");
-    store.close().expect("close");
-}
-
-// a volume inside its line starts no merge, however long it sits
-#[test]
-fn inside_the_line_starts_no_merge() {
-    let io = SimulatedIo::new(Seed(91));
-    let store = open(&io);
-    let value = vec![7; QUIET_VALUE_BYTES];
-    for number in 0..QUIET_KEYS {
-        store.put(COLUMN, format!("key-{number:04}").as_bytes(), &value).expect("put");
-    }
-    seal(&store, &io);
-    for number in 0..QUIET_KEYS / 20 {
-        store.put(COLUMN, format!("key-{number:04}").as_bytes(), &value).expect("put");
-    }
-    seal(&store, &io);
-    sit_quiet(&store, &io);
-    assert_eq!(store.state.volumes[0].segments_rewritten.load(Ordering::Acquire), 0);
-    store.close().expect("close");
-}
-
-// writes that keep coming hold a volume off its quiet reclaim
-#[test]
-fn writes_keep_a_volume_loud() {
-    let io = SimulatedIo::new(Seed(92));
-    let store = open(&io);
-    let value = vec![7; QUIET_VALUE_BYTES];
-    for number in 0..QUIET_KEYS {
-        store.put(COLUMN, format!("key-{number:04}").as_bytes(), &value).expect("put");
-    }
-    seal(&store, &io);
-    for number in 0..QUIET_KEYS / 3 {
-        store.put(COLUMN, format!("key-{number:04}").as_bytes(), &value).expect("put");
-    }
-    seal(&store, &io);
-    for tick in 0..QUIET_TICKS {
-        store.put(COLUMN, format!("other-{tick:04}").as_bytes(), b"v").expect("put");
+    for _tick in 0..IDLE_TICKS {
+        io.advance_clock(IDLE_LOOK);
         store.state.ask_compaction();
         settle(&io);
-        io.advance_clock(QUIET_LOOK);
     }
     assert_eq!(store.state.volumes[0].segments_rewritten.load(Ordering::Acquire), 0);
     store.close().expect("close");

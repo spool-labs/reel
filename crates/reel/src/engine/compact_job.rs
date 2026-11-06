@@ -20,7 +20,7 @@ use crate::config::MAX_KEY_BYTES;
 use crate::engine::cover_apply::is_in_range;
 use crate::engine::engine_state::EngineState;
 use crate::engine::planner::UnitStep;
-use crate::engine::rewrite_job::{RewriteJob, freed_in_place};
+use crate::engine::rewrite_job::RewriteJob;
 use crate::engine::volume::{ParkedSegment, Volume};
 use crate::engine::walk_job::{FREE_IN_PLACE_BYTES, FreeRecord, WALK_RETRY};
 use crate::guard::hold;
@@ -41,12 +41,6 @@ pub const MOST_SETTLE_LOOKS: usize = 16;
 pub const MOST_SETTLED_ROWS: usize = 1_024;
 /// Segments a look at a cover's list takes at a time
 pub const MOST_LISTED_LOOKS: usize = 64;
-/// A volume with no write for this long is quiet, and reclaims below the trigger
-pub const QUIET_AFTER: Nanoseconds = Nanoseconds(5_000_000_000);
-/// A volume with too much dead looks this often for its writes to have stopped
-pub const QUIET_LOOK: Nanoseconds = Nanoseconds(1_000_000_000);
-/// A quiet volume reclaims until what's dead is at most one part in this many of what's live
-pub const QUIET_DEAD_DIVISOR: u64 = 10;
 /// How long compaction waits before it looks at a parked segment's pins again
 pub const PARKED_RETRY: Nanoseconds = Nanoseconds(1_000_000);
 
@@ -81,8 +75,6 @@ pub struct CompactJob<Backend: Io> {
     settle_at: usize,
     settled_rows: Vec<DeadCount>,
     listed: Vec<SegmentNumber>,
-    quiet_point: WritePlace,
-    quiet_since: Nanoseconds,
     block: Vec<u8>,
     key: Vec<u8>,
     row_key: Vec<u8>,
@@ -105,8 +97,6 @@ impl<Backend: Io> CompactJob<Backend> {
             settle_at: 0,
             settled_rows: touched_capacity(MOST_SETTLED_ROWS, DeadCount::default()),
             listed: touched_capacity(MOST_LISTED_LOOKS, SegmentNumber(0)),
-            quiet_point: WritePlace(0),
-            quiet_since: Nanoseconds(0),
             block: touched_zeroes(ROW_BLOCK_BYTES),
             key: touched_capacity(MAX_KEY_BYTES as usize, 0),
             row_key: touched_capacity(MAX_KEY_BYTES as usize, 0),
@@ -204,7 +194,7 @@ impl<Backend: Io> CompactJob<Backend> {
             }
             // a look takes a few segments at a time, and the rest still count
             self.should_rewrite = should_rewrite && self.rewrite.has_looks_left;
-            return if self.should_rewrite { UnitStep::Worked } else { self.quiet_look(volume, now) };
+            return if self.should_rewrite { UnitStep::Worked } else { UnitStep::Idle };
         };
         match self.confirm(volume, segment) {
             Ok(()) => UnitStep::Worked,
@@ -214,23 +204,6 @@ impl<Backend: Io> CompactJob<Backend> {
                 UnitStep::RetryAt(at)
             },
         }
-    }
-
-    /// Reclaim below the trigger on a volume with no writes and more dead than its line allows, and leave any other alone
-    pub fn quiet_look(&mut self, volume: &Volume<Backend>, now: Nanoseconds) -> UnitStep {
-        if !has_dead_past_the_line(volume) {
-            return UnitStep::Idle;
-        }
-        let point = self.state.read_point();
-        if point != self.quiet_point {
-            self.quiet_point = point;
-            self.quiet_since = now;
-        }
-        if now.0 - self.quiet_since.0 < QUIET_AFTER.0 {
-            return UnitStep::RetryAt(Nanoseconds(now.0 + QUIET_LOOK.0));
-        }
-        self.rewrite.is_quiet = true;
-        if self.rewrite.start() { UnitStep::Worked } else { UnitStep::Idle }
     }
 
     /// Come back after the retry wait
@@ -655,26 +628,4 @@ pub fn is_wholly_dead(row: &SummaryRow<'_>) -> bool {
     }
     let mut cursor = row.cursor();
     (0..row.column_count).all(|_column| cursor.column().is_some_and(|column| column.dead_rows == column.row_count))
-}
-
-/// Check a volume holds more dead than a quiet one may, in rows or in bytes still on disk
-pub fn has_dead_past_the_line<Backend: Io>(volume: &Volume<Backend>) -> bool {
-    let (mut live_rows, mut dead_rows, mut live_bytes, mut dead_bytes) = (0, 0, 0, 0);
-    let rows = hold(&volume.summary);
-    for row in rows.rows() {
-        let mut row_dead_bytes = 0;
-        let mut cursor = row.cursor();
-        for _column in 0..row.column_count {
-            let Some(column) = cursor.column() else {
-                break;
-            };
-            let dead = column.dead_rows.0 + column.grave_count.0.saturating_sub(column.dead_graves.0);
-            dead_rows += dead;
-            live_rows += column.row_count.0.saturating_sub(dead);
-            live_bytes += column.live_bytes.0;
-            row_dead_bytes += column.dead_bytes.0;
-        }
-        dead_bytes += row_dead_bytes.saturating_sub(if row_dead_bytes > 0 { freed_in_place(volume, &row) } else { 0 });
-    }
-    QUIET_DEAD_DIVISOR * dead_rows > live_rows || QUIET_DEAD_DIVISOR * dead_bytes > live_bytes
 }

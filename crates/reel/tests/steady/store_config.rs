@@ -11,6 +11,7 @@ use reel_api::units::{ByteCount, RowCount, VolumeId};
 
 pub const META: ColumnId = ColumnId(1);
 pub const BULK: ColumnId = ColumnId(2);
+pub const PLAIN: ColumnId = ColumnId(3);
 const MOST_KEY_BYTES: u16 = 64;
 const TABLE_ROWS: RowCount = RowCount(4_000_000);
 
@@ -30,7 +31,7 @@ pub fn config(root: &Path, budget: ByteCount) -> StoreConfig {
             roots: vec![root.to_path_buf()],
             sync: SyncPolicy::Never,
         }],
-        columns: vec![column(META, "meta", Codec::None, Some(TABLE_ROWS)), column(BULK, "bulk", Codec::Lz4, None)],
+        columns: vec![column(META, "meta", Codec::None, Some(TABLE_ROWS)), column(BULK, "bulk", Codec::Lz4, None), column(PLAIN, "plain", Codec::None, None)],
     }
 }
 

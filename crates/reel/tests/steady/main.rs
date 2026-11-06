@@ -27,7 +27,7 @@ use reel_api::write_batch::WriteBatch;
 
 mod store_config;
 
-use store_config::{BULK, META, config, scratch_root};
+use store_config::{BULK, META, PLAIN, config, scratch_root};
 
 const BUDGET: ByteCount = ByteCount(192 * 1024 * 1024);
 // set in the child that makes the damaged store, so the measured process runs one open
@@ -397,6 +397,16 @@ fn round(store: &Store, inputs: &mut Inputs, number: usize) {
         }
     }
     drop(scan);
+    // the plain small shape runs beside the complete one, on the same keys
+    store.put(PLAIN, key, &inputs.small).expect("put plain");
+    assert!(store.get(PLAIN, key, buf).expect("get plain"));
+    assert!(!store.get(PLAIN, &inputs.missing, buf).expect("get a plain miss"));
+    store.get_many(PLAIN, &keys, &mut inputs.values).expect("get_many plain");
+    let cue = store.cue().expect("cue");
+    assert!(cue.get(PLAIN, key, buf).expect("get plain at a cue"));
+    cue.get_many(PLAIN, &keys, &mut inputs.values).expect("get_many plain at a cue");
+    drop(cue);
+    store.delete(PLAIN, other).expect("delete plain");
     store.delete(BULK, other).expect("delete");
     // a segment with covers sits out compaction, so every other one has none
     let has_covers = number.div_ceil(SEAL_ROUNDS).is_multiple_of(2);

@@ -27,6 +27,7 @@ use crate::counting::counted;
 const ROOT: &str = "/disk/allocations";
 const META: ColumnId = ColumnId(1);
 const BULK: ColumnId = ColumnId(2);
+const PLAIN: ColumnId = ColumnId(3);
 const BUDGET: ByteCount = ByteCount(171 * 1024 * 1024);
 const TABLE_ROWS: RowCount = RowCount(1_000_000);
 const LONG_ROWS: usize = 4_000;
@@ -76,7 +77,7 @@ fn config() -> StoreConfig {
             roots: vec![PathBuf::from(ROOT)],
             sync: SyncPolicy::Never,
         }],
-        columns: vec![column(META, "meta", Codec::None, Some(TABLE_ROWS)), column(BULK, "bulk", Codec::Lz4, None)],
+        columns: vec![column(META, "meta", Codec::None, Some(TABLE_ROWS)), column(BULK, "bulk", Codec::Lz4, None), column(PLAIN, "plain", Codec::None, None)],
     }
 }
 
@@ -111,6 +112,11 @@ fn round(store: &Store, io: &SimulatedIo, inputs: &mut Inputs, number: usize) ->
     total += both(counted(|| store.get(BULK, key, buf).expect("get lz4")));
     total += both(counted(|| store.get(META, b"missing", buf).expect("miss")));
     total += both(counted(|| store.contains(META, key).expect("contains")));
+    // the plain small shape runs beside the complete one, on the same keys
+    total += both(counted(|| store.put(PLAIN, key, &inputs.small).expect("put plain")));
+    total += both(counted(|| store.get(PLAIN, key, buf).expect("get plain")));
+    total += both(counted(|| store.get(PLAIN, b"missing", buf).expect("plain miss")));
+    total += both(counted(|| store.delete(PLAIN, other).expect("delete plain")));
     total += both(counted(|| store.delete(BULK, other).expect("delete")));
     // the one free here is the caller's own buffer, which the call takes
     let owned = inputs.small.clone();

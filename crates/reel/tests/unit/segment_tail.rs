@@ -25,7 +25,7 @@ fn head() -> TailHead {
         column_count: 2,
         input_count: 1,
         is_output: true,
-        is_grave_output: false,
+        is_partial: false,
         is_unwalked: false,
         inputs: [SegmentNumber(5); MOST_MERGE_SEGMENTS],
     }

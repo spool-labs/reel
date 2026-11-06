@@ -12,7 +12,7 @@ use reel::engine::open_segment::{OUTPUT_SUFFIX, data_path};
 use reel::engine::read_path::RecordWant;
 use reel::engine::planner::Planner;
 use reel::engine::reel_store::ReelStore;
-use reel::engine::rewrite_job::{MERGE_BUFFER_BYTES, MOST_OVERLAP, MOST_PARK_WAITS, RewritePhase, is_overlap_input};
+use reel::engine::rewrite_job::{MERGE_BUFFER_BYTES, MOST_OVERLAP, MOST_PARK_WAITS, RewritePhase, is_overlap_input, overlaps};
 use reel::engine::volume::{MOST_PARKED, NO_SEAL};
 use reel::engine::walk_job::WalkJob;
 use reel::guard::hold;
@@ -41,6 +41,7 @@ const MOST_LOOPS: usize = 2_000;
 const OVER_THE_BOUND: u64 = MOST_OVERLAP as u64 + 8;
 const KEPT_LIVE_KEYS: u64 = 16;
 const MANY_GRAVES: u64 = 30_000;
+const SET_CRASH_STRIDE: u64 = 7;
 const TWO_BLOCK_ROWS: u64 = 12_000;
 const UNWALKED_CRASH_POINTS: u64 = 40;
 const UNWALKED_CRASH_STRIDE: u64 = 3;
@@ -1852,4 +1853,215 @@ fn close_keeps_graves_with_a_stuck_output() {
     let store = open(&io);
     assert_eq!(read(&store, b"key"), None);
     store.close().expect("close");
+}
+
+const SET_KEYS: u64 = 400;
+const SET_VALUE_BYTES: usize = 100;
+
+fn set_value(number: u64, version: u8) -> Vec<u8> {
+    vec![version; SET_VALUE_BYTES + number as usize % 7]
+}
+
+fn set_key(number: u64) -> Vec<u8> {
+    format!("key-{number:05}").into_bytes()
+}
+
+// two segments over one range, the older mostly replaced, with enough bytes for a merge to cut
+fn set_of_inputs(store: &Store, io: &SimulatedIo) {
+    for number in 0..SET_KEYS {
+        store.put(COLUMN, &set_key(number), &set_value(number, 1)).expect("put");
+    }
+    seal(store, io);
+    for number in (0..SET_KEYS).filter(|number| number % 4 != 0) {
+        store.put(COLUMN, &set_key(number), &set_value(number, 2)).expect("put");
+    }
+    seal(store, io);
+}
+
+fn check_set(store: &Store) {
+    for number in 0..SET_KEYS {
+        let version = if number % 4 == 0 { 1 } else { 2 };
+        assert_eq!(read(store, &set_key(number)), Some(set_value(number, version)), "key {number}");
+    }
+}
+
+// run a merge up to its install, cutting at small sizes, with the outputs written so far
+fn run_to_set(job: &mut CompactJob<SimulatedIo>) -> usize {
+    job.rewrite.cut_floor = 0;
+    assert!(job.rewrite.start());
+    while job.rewrite.phase != RewritePhase::Installing {
+        job.rewrite.step();
+    }
+    let outputs = job.rewrite.staged_count() + 1;
+    assert!(outputs > 1);
+    outputs
+}
+
+// the outputs of one merge cover ranges that never meet
+#[test]
+fn outputs_never_overlap() {
+    let io = SimulatedIo::new(Seed(70));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    set_of_inputs(&store, &io);
+    let old: Vec<SegmentNumber> = hold(&store.state.volumes[0].summary).rows().map(|row| row.facts.segment).collect();
+
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    let count = run_to_set(&mut job);
+    job.rewrite.step();
+    assert!(!job.rewrite.is_running());
+
+    let volume = &store.state.volumes[0];
+    let rows = hold(&volume.summary);
+    let outputs: Vec<_> = rows.rows().filter(|row| !old.contains(&row.facts.segment)).collect();
+    assert_eq!(outputs.len(), count);
+    for (index, left) in outputs.iter().enumerate() {
+        assert!(outputs[index + 1..].iter().all(|right| !overlaps(left, right)));
+    }
+    drop(rows);
+    check_set(&store);
+    store.close().expect("close");
+}
+
+// a read with every output listed and the inputs still there finds every key, whichever output it landed in
+#[test]
+fn read_between_a_set_and_its_inputs() {
+    let io = SimulatedIo::new(Seed(71));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    set_of_inputs(&store, &io);
+
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    run_to_set(&mut job);
+    // the spot cache would answer a plain get, so this asks the footers, which go by the lists
+    let state = &store.state;
+    job.rewrite
+        .install_with(|| {
+            for number in 0..SET_KEYS {
+                let key = set_key(number);
+                let read = state.key_read_now(COLUMN, &key).expect("read");
+                assert!(state.search_footers(&state.volumes[0], &read).expect("search").is_some(), "key {number}");
+            }
+        })
+        .expect("install");
+    check_set(&store);
+    store.close().expect("close");
+}
+
+// a give-up that can't remove the last output keeps the whole set, and a power cut takes the set as the merge
+#[test]
+fn stuck_last_output_keeps_the_set() {
+    let io = SimulatedIo::new(Seed(72));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    set_of_inputs(&store, &io);
+
+    let state = &store.state;
+    let mut job = CompactJob::new(Arc::clone(state), 0);
+    let count = run_to_set(&mut job);
+    let slot = state.cues.take(WritePlace(state.read_point().0 - 3)).expect("a slot");
+    io.fail_removes(OperationCount(1));
+    job.rewrite.step();
+    state.cues.release(slot);
+    assert!(!job.rewrite.is_running());
+    assert_eq!(state.volumes[0].stray_outputs.load(Ordering::Acquire) as usize, count);
+
+    io.power_cut();
+    drop(job);
+    drop(store);
+    let store = open(&io);
+    check_set(&store);
+    store.close().expect("close");
+}
+
+// a key's versions stay in one output, kept for a cue with a cut due at every key
+#[test]
+fn cut_keeps_a_key_whole() {
+    let io = SimulatedIo::new(Seed(73));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    for number in 0..SET_KEYS {
+        store.put(COLUMN, &set_key(number), &set_value(number, 1)).expect("put");
+    }
+    let cue = store.cue().expect("cue");
+    for number in 0..SET_KEYS {
+        store.put(COLUMN, &set_key(number), &set_value(number, 2)).expect("put");
+    }
+    let only = seal(&store, &io);
+
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    job.rewrite.forced = Some(only);
+    job.rewrite.cut_floor = 0;
+    assert!(job.rewrite.start());
+    while job.rewrite.is_running() {
+        job.rewrite.step();
+    }
+
+    let volume = &store.state.volumes[0];
+    let rows = hold(&volume.summary);
+    let outputs: Vec<_> = rows.rows().collect();
+    assert!(outputs.len() > 1);
+    for (index, left) in outputs.iter().enumerate() {
+        assert!(outputs[index + 1..].iter().all(|right| !overlaps(left, right)));
+    }
+    drop(rows);
+    let mut buf = Vec::new();
+    for number in 0..SET_KEYS {
+        assert!(cue.get(COLUMN, &set_key(number), &mut buf).expect("get"));
+        assert_eq!(buf, set_value(number, 1));
+        assert_eq!(read(&store, &set_key(number)), Some(set_value(number, 2)));
+    }
+    drop(cue);
+    store.close().expect("close");
+}
+
+// a crash at any step leaves the inputs or the whole set, and every key reads and counts once either way
+#[test]
+fn set_crashes() {
+    let mut sets = 0;
+    let mut crash_at = 0;
+    loop {
+        let mut is_finished = false;
+        for is_power_cut in [false, true] {
+            let io = SimulatedIo::new(Seed(74));
+            let store = open(&io);
+            hold_compaction(&store, true);
+            set_of_inputs(&store, &io);
+
+            let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+            job.rewrite.cut_floor = 0;
+            assert!(job.rewrite.start());
+            let inputs = job.rewrite.input_numbers().to_vec();
+            io.arm_crash(OperationCount(crash_at));
+            while job.rewrite.is_running() && !io.is_crashed() {
+                job.rewrite.step();
+            }
+            is_finished |= !io.is_crashed();
+            io.disarm_crash();
+            if is_power_cut {
+                io.power_cut();
+            } else {
+                io.kill();
+            }
+            drop(job);
+            drop(store);
+
+            let store = open(&io);
+            assert!(!has_partial(&io), "crash at {crash_at}");
+            check_set(&store);
+            let volume = &store.state.volumes[0];
+            let held = inputs.iter().filter(|input| volume.table.holds(**input)).count();
+            assert!(held == 0 || held == inputs.len(), "crash at {crash_at}: {held} inputs of {}", inputs.len());
+            sets += u64::from(held == 0);
+            settle(&io);
+            check_set(&store);
+            assert!(hold(&volume.damaged).is_empty(), "crash at {crash_at}");
+            store.close().expect("close");
+        }
+        if is_finished {
+            break;
+        }
+        crash_at += SET_CRASH_STRIDE;
+    }
+    assert!(sets > 0);
 }

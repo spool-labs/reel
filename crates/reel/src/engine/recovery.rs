@@ -324,7 +324,7 @@ pub fn remove_or_hold<Backend: Io>(io: &Backend, root: &Path, volume: usize, num
 /// Remove every segment a whole data output lists, before anything counts them, since the output has all that still answers.
 /// A grave output whose inputs are still here belongs to a merge that never finished, and it goes instead
 pub fn drop_inputs<Backend: Io>(io: &Backend, scan: &mut RootScan<Backend::File>) {
-    let is_final = |found: &&FoundSealed<Backend::File>| !found.head.is_grave_output;
+    let is_final = |found: &&FoundSealed<Backend::File>| !found.head.is_partial;
     let inputs: Vec<SegmentNumber> = scan.sealed.iter().filter(is_final).flat_map(|found| found.head.inputs()).copied().collect();
     for input in inputs {
         if let Some(at) = scan.sealed.iter().position(|found| found.head.segment == input) {
@@ -345,7 +345,7 @@ pub fn drop_inputs<Backend: Io>(io: &Backend, scan: &mut RootScan<Backend::File>
     while index < scan.sealed.len() {
         let head = &scan.sealed[index].head;
         let is_held = |number: &SegmentNumber| scan.sealed.iter().any(|found| found.head.segment == *number);
-        if !head.is_grave_output || !head.inputs().iter().any(is_held) {
+        if !head.is_partial || !head.inputs().iter().any(is_held) {
             index += 1;
             continue;
         }

@@ -13,7 +13,7 @@ use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, FileOffset, WritePlace};
+use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
 use crate::config::MAX_KEY_BYTES;
 use crate::engine::compact_job::park;
@@ -21,7 +21,7 @@ use crate::engine::engine_state::EngineState;
 use crate::engine::read_path::SealedRow;
 use crate::engine::open_segment::{data_path, output_path};
 use crate::engine::seal_job::MOST_SEGMENT_BLOCKS;
-use crate::engine::volume::{RewriteOutput, Volume};
+use crate::engine::volume::{GRAVE_SLOT, MOST_MERGE_OUTPUTS, OutputSlots, RewriteOutput, Volume};
 use crate::engine::walk_job::add_count;
 use crate::guard::hold;
 use crate::io::{Io, IoFile};
@@ -31,8 +31,8 @@ use crate::segment::column_directory::DirectoryEntry;
 use crate::segment::footer_writer::{ColumnStart, FooterTotals, FooterWriter};
 use crate::segment::row_block::{FooterRow, ROW_BLOCK_BYTES, RowBlockWalk};
 use crate::segment::segment_table::SegmentPin;
-use crate::segment::segment_tail::{BlockCount, MOST_MERGE_SEGMENTS, SegmentNumber};
-use crate::segment::summary::{DeadCount, SegmentFacts, SummaryRow, SummaryRows};
+use crate::segment::segment_tail::{BlockCount, ColumnTail, MAX_COLUMNS, MOST_MERGE_SEGMENTS, SegmentNumber};
+use crate::segment::summary::{ColumnFacts, DeadCount, SUMMARY_KEY_BYTES, SegmentFacts, SummaryRow, SummaryRows};
 
 /// A segment is rewritten once this part of its rows or bytes is dead: 2 is a half, 4 a quarter
 pub const REWRITE_DIVISOR: u64 = 2;
@@ -51,6 +51,25 @@ pub const MOST_PARK_WAITS: u32 = 4_096;
 pub const MOST_OVERLAP: usize = 32;
 /// Most segments one look for an overlap starts from, which bounds what a look costs
 pub const OVERLAP_LOOKS: usize = 16;
+
+/// A column of a finished output that isn't the last of its set, kept for its list entry and its summary row
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StagedColumn {
+    pub tail: ColumnTail,
+    pub lowest_at: usize,
+    pub bound_at: usize,
+    pub end: usize,
+    pub live_bytes: ByteCount,
+}
+
+/// A finished output that waits in the table, in no list, for its set to install
+#[derive(Clone, Copy, Debug)]
+pub struct StagedOutput {
+    pub facts: SegmentFacts,
+    pub newest_place: WritePlace,
+    pub first_column: usize,
+    pub column_count: usize,
+}
 
 /// What a merge is copying
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -198,6 +217,17 @@ pub struct RewriteJob<Backend: Io> {
     kept_dead: Vec<DeadCount>,
     last_tried: SegmentNumber,
     park_waits: u32,
+    pub cut_floor: u64,
+    cut_bytes: u64,
+    data_slot: usize,
+    is_cutting: bool,
+    is_top_row: bool,
+    output_rows: u64,
+    output_last_key: Vec<u8>,
+    grave_last_key: Vec<u8>,
+    staged: Vec<StagedOutput>,
+    staged_columns: Vec<StagedColumn>,
+    staged_keys: Vec<u8>,
     pub forced: Option<SegmentNumber>,
     is_unwalked: bool,
     looked_up_to: SegmentNumber,
@@ -210,6 +240,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         drop(hold(&state.volumes[volume].partial_outputs));
         drop(hold(&state.volumes[volume].merging));
         let keys = MAX_KEY_BYTES as usize;
+        let cut_floor = state.volumes[volume].segment_bytes.0 / MOST_MERGE_OUTPUTS as u64;
         Self {
             state,
             volume,
@@ -248,6 +279,17 @@ impl<Backend: Io> RewriteJob<Backend> {
             kept_dead: touched_capacity(MOST_KEPT_BLOCKS, DeadCount::default()),
             last_tried: SegmentNumber(0),
             park_waits: 0,
+            cut_floor,
+            cut_bytes: 0,
+            data_slot: 0,
+            is_cutting: false,
+            is_top_row: false,
+            output_rows: 0,
+            output_last_key: touched_capacity(keys, 0),
+            grave_last_key: touched_capacity(keys, 0),
+            staged: Vec::with_capacity(MOST_MERGE_OUTPUTS),
+            staged_columns: touched_capacity(MOST_MERGE_OUTPUTS * MAX_COLUMNS, StagedColumn::default()),
+            staged_keys: touched_capacity(MOST_MERGE_OUTPUTS * MAX_COLUMNS * (2 * SUMMARY_KEY_BYTES + 2), 0),
             forced: None,
             is_unwalked: false,
             looked_up_to: SegmentNumber(0),
@@ -272,6 +314,11 @@ impl<Backend: Io> RewriteJob<Backend> {
     /// Check a merge is under way
     pub fn is_running(&self) -> bool {
         self.target.is_some()
+    }
+
+    /// Count the outputs that wait for this merge's last one
+    pub fn staged_count(&self) -> usize {
+        self.staged.len()
     }
 
     /// Read the newest segment a look for an overlap has passed
@@ -463,6 +510,7 @@ impl<Backend: Io> RewriteJob<Backend> {
     /// Create the data output and start every input over. It reserves the inputs' whole length, so a merge holds that much
     /// twice until its footer cuts the output down
     pub fn open_output(&mut self, volume: &Volume<Backend>, target: MergeTarget) -> Result<()> {
+        self.cut_bytes = (target.blocks_at.0 / MOST_MERGE_OUTPUTS as u64).max(self.cut_floor);
         let output = self.create_output(volume, target.length, 0)?;
         self.output = Some(output);
         let base = self.lowest_place_base(volume)?;
@@ -513,6 +561,14 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.highest_replacement = WritePlace(0);
         self.dropped_rows = 0;
         self.park_waits = 0;
+        self.data_slot = 0;
+        self.is_cutting = false;
+        self.output_rows = 0;
+        self.output_last_key.clear();
+        self.grave_last_key.clear();
+        self.staged.clear();
+        self.staged_columns.clear();
+        self.staged_keys.clear();
         self.kept_dead.clear();
         for input in &mut self.inputs {
             input.rewind();
@@ -525,7 +581,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             return;
         };
         let outcome = match self.phase {
-            RewritePhase::Deciding | RewritePhase::Copying if !self.is_drained => self.merge_rows(),
+            RewritePhase::Deciding | RewritePhase::Copying if !self.is_drained && !self.is_cutting => self.merge_rows(),
             RewritePhase::Deciding => self.end_deciding(target),
             RewritePhase::Copying => self.finish_rows(),
             RewritePhase::Moving => self.move_blocks(target),
@@ -567,6 +623,11 @@ impl<Backend: Io> RewriteJob<Backend> {
             self.key.clear();
             self.key.extend_from_slice(&input.key);
             self.decide(volume, &pins, pin, column, &row)?;
+            // a cut leaves the row where it is, for the next output to take from the top
+            if self.is_cutting {
+                self.last_column = None;
+                return Ok(());
+            }
             self.inputs[index].advance(volume, pin)?;
         }
         Ok(())
@@ -624,14 +685,26 @@ impl<Backend: Io> RewriteJob<Backend> {
             _kept if row.kind == RowKind::Grave && self.grave_writer.has_block_room() => {
                 self.keep_grave(volume, pins, column, row, replacement)
             },
+            _kept if self.is_top_row && self.is_cut_due() => {
+                self.is_cutting = true;
+                Ok(())
+            },
             _kept => self.keep(volume, pins, pin, column, row, replacement),
         }
+    }
+
+    /// Check the output has reached its share of the merge, and another may follow it. A cut only falls before a key's first
+    /// row, so a key's versions stay in one output
+    pub fn is_cut_due(&self) -> bool {
+        let bytes = self.records_end.0 + self.used as u64;
+        self.output_rows > 0 && self.data_slot + 1 < MOST_MERGE_OUTPUTS && bytes >= self.cut_bytes
     }
 
     /// Find the newest place above a row that replaces it: the key's first row across the inputs, or a row in a finished
     /// segment. A row replaced only in an open or unfinished segment stays, and that segment's walk counts it in the output
     pub fn replacement(&mut self, volume: &Volume<Backend>, column: ColumnId, row: &FooterRow) -> Result<Option<WritePlace>> {
         let is_top = self.last_column != Some(column) || self.last_key != self.key;
+        self.is_top_row = is_top;
         if is_top {
             self.last_column = Some(column);
             self.last_key.clear();
@@ -702,10 +775,13 @@ impl<Backend: Io> RewriteJob<Backend> {
             return Err(Error::from(ErrorKind::NotFound));
         };
         if self.output_column != Some(column) {
+            if self.output_column.is_some() {
+                self.writer.end_column(&self.output_last_key);
+            }
             self.load_edges(volume, pins, column)?;
             let start = ColumnStart {
                 column,
-                lowest: &self.lowest,
+                lowest: &self.key,
                 highest: &self.highest,
             };
             self.writer.start_column(&output.file, &start)?;
@@ -714,6 +790,9 @@ impl<Backend: Io> RewriteJob<Backend> {
         let offset = self.copy_record(&pin.file, &output.file, row)?;
         let kept = FooterRow { offset, ..*row };
         self.writer.push_row(&output.file, &self.key, &kept)?;
+        self.output_rows += 1;
+        self.output_last_key.clear();
+        self.output_last_key.extend_from_slice(&self.key);
         let block = self.writer.entries().len() as u32;
         self.note_kept_dead(output.number, column, block, &kept, replacement)
     }
@@ -728,7 +807,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         replacement: Option<WritePlace>,
     ) -> Result<()> {
         if self.grave_output.is_none() {
-            let output = self.create_output(volume, ByteCount(0), 1)?;
+            let output = self.create_output(volume, ByteCount(0), GRAVE_SLOT)?;
             let base = self.lowest_place_base(volume)?;
             self.grave_writer.start(FileOffset(0), base);
             self.grave_output = Some(output);
@@ -737,10 +816,13 @@ impl<Backend: Io> RewriteJob<Backend> {
             return Err(Error::from(ErrorKind::NotFound));
         };
         if self.grave_column != Some(column) {
+            if self.grave_column.is_some() {
+                self.grave_writer.end_column(&self.grave_last_key);
+            }
             self.load_edges(volume, pins, column)?;
             let start = ColumnStart {
                 column,
-                lowest: &self.lowest,
+                lowest: &self.key,
                 highest: &self.highest,
             };
             self.grave_writer.start_column(&output.file, &start)?;
@@ -752,6 +834,8 @@ impl<Backend: Io> RewriteJob<Backend> {
             ..*row
         };
         self.grave_writer.push_row(&output.file, &self.key, &kept)?;
+        self.grave_last_key.clear();
+        self.grave_last_key.extend_from_slice(&self.key);
         let block = self.grave_writer.entries().len() as u32;
         self.note_kept_dead(output.number, column, block, &kept, replacement)
     }
@@ -864,10 +948,13 @@ impl<Backend: Io> RewriteJob<Backend> {
         let Some(output) = self.output.clone() else {
             return Err(Error::from(ErrorKind::NotFound));
         };
-        if self.dropped_rows == 0 && self.input_count == 1 {
+        if self.dropped_rows == 0 && self.input_count == 1 && !self.is_cutting && self.staged.is_empty() {
             return Err(Error::from(ErrorKind::Interrupted));
         }
         self.flush(&output.file)?;
+        if self.output_column.is_some() {
+            self.writer.end_column(&self.output_last_key);
+        }
         self.writer.close_block(&output.file)?;
         self.phase = RewritePhase::Moving;
         Ok(())
@@ -882,7 +969,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         let from = target.blocks_at.0 + self.moved;
         let left = self.writer.position().0 - from;
         if distance == 0 || left == 0 || self.writer.columns().is_empty() {
-            return self.finish_outputs(&output, distance);
+            return if self.is_cutting { self.cut_output(target, &output, distance) } else { self.finish_outputs(&output, distance) };
         }
 
         let part = left.min(self.buffer.len() as u64) as usize;
@@ -890,6 +977,64 @@ impl<Backend: Io> RewriteJob<Backend> {
         output.file.write_at(FileOffset(from - distance), &[IoSlice::new(&self.buffer[..part])])?;
         self.moved += part as u64;
         Ok(())
+    }
+
+    /// End an output that isn't the last, and start the next. It goes in the table now, in no list, since the next output needs
+    /// the writer. Its tail marks it partial, so open keeps it only beside the last output's
+    pub fn cut_output(&mut self, target: MergeTarget, output: &RewriteOutput<Backend::File>, distance: u64) -> Result<()> {
+        let state = Arc::clone(&self.state);
+        let volume = &state.volumes[self.volume];
+        let numbers = self.numbers;
+        self.writer.move_down(ByteCount(distance));
+        self.writer.is_output = true;
+        self.writer.is_partial = true;
+        self.writer.is_unwalked = self.is_unwalked;
+        let totals = self.writer.finish(&output.file, output.number, self.records_end, &[], state.record_key, &numbers[..self.input_count])?;
+        self.name_output(output, self.data_slot)?;
+        if !volume.table.install(output.file.clone(), &totals.head, self.writer.columns(), self.writer.entries()) {
+            return Err(Error::from(ErrorKind::OutOfMemory));
+        }
+        self.stage_output(output.number, &totals);
+
+        self.data_slot += 1;
+        let next = self.create_output(volume, ByteCount(self.cut_bytes), self.data_slot)?;
+        self.output = Some(next);
+        let base = self.lowest_place_base(volume)?;
+        self.writer.start(target.blocks_at, base);
+        self.records_end = FileOffset(0);
+        self.used = 0;
+        self.moved = 0;
+        self.output_rows = 0;
+        self.output_column = None;
+        self.is_cutting = false;
+        self.phase = RewritePhase::Copying;
+        Ok(())
+    }
+
+    /// Keep what an output's summary row and list entries will need once the writer has moved on
+    pub fn stage_output(&mut self, number: SegmentNumber, totals: &FooterTotals) {
+        let first_column = self.staged_columns.len();
+        for (index, tail) in self.writer.columns().iter().enumerate() {
+            let facts = self.writer.column_facts(index);
+            let lowest_at = self.staged_keys.len();
+            self.staged_keys.extend_from_slice(facts.lowest);
+            let bound_at = self.staged_keys.len();
+            self.staged_keys.extend_from_slice(facts.bound);
+            self.staged_columns.push(StagedColumn {
+                tail: *tail,
+                lowest_at,
+                bound_at,
+                end: self.staged_keys.len(),
+                live_bytes: facts.live_bytes,
+            });
+        }
+        let block_count = self.writer.entries().len() as u32;
+        self.staged.push(StagedOutput {
+            facts: output_facts(number, totals, self.records_end, block_count, self.is_unwalked),
+            newest_place: totals.head.places.highest,
+            first_column,
+            column_count: self.staged_columns.len() - first_column,
+        });
     }
 
     /// Make the outputs whole, the graves first. The last tail lists the inputs, and open takes that as the merge having
@@ -900,13 +1045,14 @@ impl<Backend: Io> RewriteJob<Backend> {
         let inputs = &numbers[..self.input_count];
         let has_data = !self.writer.columns().is_empty();
         if let Some(graves) = self.grave_output.clone() {
+            self.grave_writer.end_column(&self.grave_last_key);
             self.grave_writer.close_block(&graves.file)?;
             self.grave_writer.is_output = true;
             self.grave_writer.is_unwalked = self.is_unwalked;
-            self.grave_writer.is_grave_output = has_data;
+            self.grave_writer.is_partial = has_data;
             let totals = self.grave_writer.finish(&graves.file, graves.number, FileOffset(0), &[], state.record_key, inputs)?;
             self.grave_totals = Some(totals);
-            self.name_output(&graves, 1)?;
+            self.name_output(&graves, GRAVE_SLOT)?;
         }
         if has_data {
             self.writer.move_down(ByteCount(distance));
@@ -914,7 +1060,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             self.writer.is_unwalked = self.is_unwalked;
             let totals = self.writer.finish(&output.file, output.number, self.records_end, &[], state.record_key, inputs)?;
             self.totals = Some(totals);
-            self.name_output(output, 0)?;
+            self.name_output(output, self.data_slot)?;
         }
         self.phase = RewritePhase::Installing;
         Ok(())
@@ -929,10 +1075,10 @@ impl<Backend: Io> RewriteJob<Backend> {
         // the name has landed from here, whatever the directory's sync says
         let named = RewriteOutput { is_named: true, ..output.clone() };
         hold(&volume.partial_outputs)[slot] = Some(named.clone());
-        if slot == 0 {
-            self.output = Some(named);
-        } else {
+        if slot == GRAVE_SLOT {
             self.grave_output = Some(named);
+        } else {
+            self.output = Some(named);
         }
         state.io.sync_directory(root)
     }
@@ -965,18 +1111,25 @@ impl<Backend: Io> RewriteJob<Backend> {
         let numbers = self.numbers;
         let inputs = &numbers[..self.input_count];
         self.enter_table(volume)?;
-        // a kept grave hides an older row outside the merge, so it's in a list before the inputs leave theirs, and until
-        // then a read finds it twice at one place
+        // every output is in a list before the inputs leave theirs, so a read in between finds a row twice at one place, and
+        // never not at all
         if let (Some(totals), Some(output)) = (self.grave_totals, &self.grave_output) {
-            list_output(&state, volume, output, &totals, &self.grave_writer, &[]);
+            list_output(&state, volume, output.number, totals.head.places.highest, self.grave_writer.columns().iter());
+        }
+        for staged in &self.staged {
+            let columns = self.staged_columns[staged.first_column..staged.first_column + staged.column_count].iter();
+            list_output(&state, volume, staged.facts.segment, staged.newest_place, columns.map(|column| &column.tail));
+        }
+        if let (Some(totals), Some(output)) = (self.totals, &self.output) {
+            list_output(&state, volume, output.number, totals.head.places.highest, self.writer.columns().iter());
         }
         between();
-        if let (Some(totals), Some(output)) = (self.totals, &self.output) {
-            list_output(&state, volume, output, &totals, &self.writer, inputs);
-        }
         // an unwalked merge's outputs owe a walk, and reads of finished segments leave them out until it's done
         // a walked merge marks its outputs after the lists, which only holds with no walk target running beside it
         if !self.is_unwalked {
+            for staged in &self.staged {
+                volume.table.mark_walked(staged.facts.segment);
+            }
             for output in [self.output.as_ref(), self.grave_output.as_ref()].into_iter().flatten() {
                 volume.table.mark_walked(output.number);
             }
@@ -996,10 +1149,12 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.summarize(volume, inputs);
         let saved = state.save_summary(volume);
 
-        *hold(&volume.partial_outputs) = [None, None];
+        *hold(&volume.partial_outputs) = Default::default();
         // a merge that kept no data never made its file a segment
         if let (None, Some(output)) = (self.totals, self.output.take()) {
-            self.leave_outputs(volume, Some(output), None);
+            let mut slots: OutputSlots<Backend::File> = Default::default();
+            slots[0] = Some(output);
+            self.leave_outputs(volume, slots);
         }
         self.output = None;
         self.grave_output = None;
@@ -1030,7 +1185,6 @@ impl<Backend: Io> RewriteJob<Backend> {
                 && let Some(retired) = volume.table.retire(output.number)
             {
                 volume.table.free_retired(&retired);
-                self.state.io.close_file(retired.file);
             }
             return Err(Error::from(ErrorKind::OutOfMemory));
         }
@@ -1043,6 +1197,24 @@ impl<Backend: Io> RewriteJob<Backend> {
         for number in inputs {
             rows.remove(*number);
         }
+        for staged in &self.staged {
+            let columns = self.staged_columns[staged.first_column..staged.first_column + staged.column_count].iter();
+            let keys = &self.staged_keys;
+            let facts = columns.map(|column| ColumnFacts {
+                column: column.tail.column,
+                lowest: &keys[column.lowest_at..column.bound_at],
+                bound: &keys[column.bound_at..column.end],
+                row_count: column.tail.row_count,
+                grave_count: column.tail.grave_count,
+                dead_rows: RowCount(0),
+                dead_graves: RowCount(0),
+                live_bytes: column.live_bytes,
+                dead_bytes: ByteCount(0),
+            });
+            if !rows.push(&staged.facts, facts, [].into_iter()) {
+                self.state.note_dropped_row();
+            }
+        }
         if let (Some(totals), Some(output)) = (self.totals, &self.output) {
             self.push_row(&mut rows, &self.writer, output.number, &totals, self.records_end);
         }
@@ -1050,7 +1222,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             self.push_row(&mut rows, &self.grave_writer, output.number, &totals, FileOffset(0));
         }
         if self.is_unwalked {
-            let outputs = u64::from(self.totals.is_some()) + u64::from(self.grave_totals.is_some());
+            let outputs = self.staged.len() as u64 + u64::from(self.totals.is_some()) + u64::from(self.grave_totals.is_some());
             let gone = inputs.len() as u64;
             let _waiting = volume.walks_waiting.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 Some(count.saturating_sub(gone) + outputs)
@@ -1076,20 +1248,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         data_end: FileOffset,
     ) {
         let block_count = writer.entries().len() as u32;
-        let facts = SegmentFacts {
-            segment: number,
-            file_length: totals.file_length,
-            data_end,
-            row_block_end: totals.head.index_at,
-            seal_mark: totals.head.index_sum,
-            places: totals.head.places,
-            is_damaged: false,
-            has_covers: false,
-            damage_place: WritePlace(0),
-            block_count,
-            walked_blocks: if self.is_unwalked { 0 } else { block_count },
-            is_backward: false,
-        };
+        let facts = output_facts(number, totals, data_end, block_count, self.is_unwalked);
         let columns = (0..writer.columns().len()).map(|index| writer.column_facts(index));
         if !rows.push(&facts, columns, [].into_iter()) {
             self.state.note_dropped_row();
@@ -1099,25 +1258,26 @@ impl<Backend: Io> RewriteJob<Backend> {
     /// Try again to remove outputs a failure left behind
     pub fn clear_stray(&self) {
         let volume = &self.state.volumes[self.volume];
-        let [data, graves] = mem::take(&mut *hold(&volume.partial_outputs));
-        self.leave_outputs(volume, data, graves);
+        let slots = mem::take(&mut *hold(&volume.partial_outputs));
+        self.leave_outputs(volume, slots);
     }
 
-    /// Remove outputs, or keep them listed, as strays that hold every grave back until they're gone. The data output goes
-    /// first: its tail lists the inputs, so at a crash open removes them, and the grave output has to be there to take over
-    pub fn leave_outputs(
-        &self,
-        volume: &Volume<Backend>,
-        data: Option<RewriteOutput<Backend::File>>,
-        graves: Option<RewriteOutput<Backend::File>>,
-    ) {
-        let data = data.and_then(|output| self.state.remove_output(volume, output).err());
-        let graves = match data {
-            Some(_) => graves,
-            None => graves.and_then(|output| self.state.remove_output(volume, output).err()),
-        };
-        let strays = usize::from(data.is_some()) + usize::from(graves.is_some());
-        *hold(&volume.partial_outputs) = [data, graves];
+    /// Remove outputs, or keep them listed, as strays that hold every grave back until they're gone. The last data output goes
+    /// first: its tail lists the inputs, so at a crash open removes them, and the rest of its set has to be there to take over
+    pub fn leave_outputs(&self, volume: &Volume<Backend>, mut outputs: OutputSlots<Backend::File>) {
+        let last = outputs[..MOST_MERGE_OUTPUTS].iter().rposition(Option::is_some);
+        let mut is_held = false;
+        if let Some(slot) = last {
+            outputs[slot] = outputs[slot].take().and_then(|output| self.state.remove_output(volume, output).err());
+            is_held = outputs[slot].is_some();
+        }
+        if !is_held {
+            for output in &mut outputs {
+                *output = output.take().and_then(|output| self.state.remove_output(volume, output).err());
+            }
+        }
+        let strays = outputs.iter().flatten().count();
+        *hold(&volume.partial_outputs) = outputs;
         volume.stray_outputs.store(strays as u64, Ordering::Release);
     }
 
@@ -1125,9 +1285,17 @@ impl<Backend: Io> RewriteJob<Backend> {
     pub fn abandon(&mut self) {
         let state = Arc::clone(&self.state);
         let volume = &state.volumes[self.volume];
-        *hold(&volume.partial_outputs) = [None, None];
-        let (data, graves) = (self.output.take(), self.grave_output.take());
-        self.leave_outputs(volume, data, graves);
+        let slots = mem::take(&mut *hold(&volume.partial_outputs));
+        // what the table holds waits for no read, since no list ever had it, and the removes below close the files
+        for staged in &self.staged {
+            if let Some(retired) = volume.table.retire(staged.facts.segment) {
+                volume.table.free_retired(&retired);
+            }
+        }
+        self.staged.clear();
+        self.output = None;
+        self.grave_output = None;
+        self.leave_outputs(volume, slots);
         self.target = None;
         volume.is_rewriting.store(false, Ordering::Release);
         *hold(&volume.merging) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
@@ -1142,27 +1310,44 @@ pub fn freed_in_place<Backend: Io>(volume: &Volume<Backend>, row: &SummaryRow<'_
     pin.file.held_bytes().map_or(0, |held| row.facts.file_length.0.saturating_sub(held.0))
 }
 
-/// Put a whole output in every directory, in place of the segments it replaces
-pub fn list_output<Backend: Io>(
+/// Build an output's summary facts
+pub fn output_facts(number: SegmentNumber, totals: &FooterTotals, data_end: FileOffset, block_count: u32, is_unwalked: bool) -> SegmentFacts {
+    SegmentFacts {
+        segment: number,
+        file_length: totals.file_length,
+        data_end,
+        row_block_end: totals.head.index_at,
+        seal_mark: totals.head.index_sum,
+        places: totals.head.places,
+        is_damaged: false,
+        has_covers: false,
+        damage_place: WritePlace(0),
+        block_count,
+        walked_blocks: if is_unwalked { 0 } else { block_count },
+        is_backward: false,
+    }
+}
+
+/// Put a whole output in every directory
+pub fn list_output<'tail, Backend: Io>(
     state: &EngineState<Backend>,
     volume: &Volume<Backend>,
-    output: &RewriteOutput<Backend::File>,
-    totals: &FooterTotals,
-    writer: &FooterWriter,
-    removed: &[SegmentNumber],
+    number: SegmentNumber,
+    newest_place: WritePlace,
+    columns: impl Iterator<Item = &'tail ColumnTail>,
 ) {
-    for column in writer.columns() {
+    for column in columns {
         let entry = DirectoryEntry {
             shared_length: column.shared_length,
             shared_sum: column.shared_sum,
             lowest: column.lowest,
             highest: column.highest,
             reach: column.highest,
-            segment: output.number,
-            newest_place: totals.head.places.highest,
+            segment: number,
+            newest_place,
         };
         if let Some(directory) = &state.directories[column.column.0 as usize]
-            && !directory.replace(Some(&entry), removed)
+            && !directory.replace(Some(&entry), &[])
         {
             volume.fail();
         }

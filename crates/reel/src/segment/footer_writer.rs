@@ -69,7 +69,7 @@ pub struct FooterWriter {
     place_base: WritePlace,
     row_count: RowCount,
     pub is_output: bool,
-    pub is_grave_output: bool,
+    pub is_partial: bool,
     pub is_unwalked: bool,
 }
 
@@ -93,7 +93,7 @@ impl FooterWriter {
             place_base: WritePlace(0),
             row_count: RowCount(0),
             is_output: false,
-            is_grave_output: false,
+            is_partial: false,
             is_unwalked: false,
         }
     }
@@ -166,7 +166,7 @@ impl FooterWriter {
         };
         self.row_count = RowCount(0);
         self.is_output = false;
-        self.is_grave_output = false;
+        self.is_partial = false;
         self.is_unwalked = false;
     }
 
@@ -196,6 +196,17 @@ impl FooterWriter {
             grave_count: RowCount(0),
         });
         Ok(())
+    }
+
+    /// End the current column at the last key it took, so its range says what it holds and nothing wider
+    pub fn end_column(&mut self, last_key: &[u8]) {
+        let (Some(tail), Some(keys)) = (self.columns.last_mut(), self.column_keys.last_mut()) else {
+            return;
+        };
+        tail.highest = KeyPrefix::of_key(last_key, tail.shared_length as usize);
+        self.key_bytes.truncate(keys.highest_at);
+        put_bound(last_key, &mut self.key_bytes);
+        keys.end = self.key_bytes.len();
     }
 
     /// Add the next row of the current column, in row order
@@ -344,7 +355,7 @@ impl FooterWriter {
             column_count: self.columns.len() as u32,
             input_count: inputs.len() as u32,
             is_output: self.is_output,
-            is_grave_output: self.is_grave_output,
+            is_partial: self.is_partial,
             is_unwalked: self.is_unwalked,
             inputs: listed,
         };

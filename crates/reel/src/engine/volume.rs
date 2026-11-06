@@ -36,6 +36,13 @@ pub struct ParkedSegment<File> {
     pub is_saved: bool,
 }
 
+/// Most segments one merge writes, its grave output aside
+pub const MOST_MERGE_OUTPUTS: usize = 8;
+/// The slot of a merge's grave output, past its data outputs
+pub const GRAVE_SLOT: usize = MOST_MERGE_OUTPUTS;
+/// The outputs a merge has made so far, the last data output and the grave output among them
+pub type OutputSlots<File> = [Option<RewriteOutput<File>>; MOST_MERGE_OUTPUTS + 1];
+
 /// The file a rewrite is writing
 #[derive(Clone, Debug)]
 pub struct RewriteOutput<File> {
@@ -124,7 +131,7 @@ pub struct Volume<Backend: Io> {
     pub merging: Mutex<[SegmentNumber; MOST_MERGE_SEGMENTS]>,
     /// Counts the turns a walk stood aside for a rewrite
     pub walks_held: AtomicU64,
-    pub partial_outputs: Mutex<[Option<RewriteOutput<Backend::File>>; 2]>,
+    pub partial_outputs: Mutex<OutputSlots<Backend::File>>,
     pub summary: Mutex<SummaryRows>,
     pub summary_paths: SummaryPaths,
     pub lost_rows: Mutex<LostRows>,

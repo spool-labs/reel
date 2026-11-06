@@ -34,7 +34,7 @@ use crate::engine::compact_job::{CompactJob, park};
 use crate::engine::cue::{Cue, CueTable};
 use crate::engine::planner::Planner;
 use crate::engine::walk_job::{BlockCounter, WalkJob, WalkSlot, WalkWorker};
-use crate::engine::volume::{ClaimState, MOST_PARKED, NO_SEAL, SyncState, Volume};
+use crate::engine::volume::{ClaimState, MOST_MERGE_OUTPUTS, MOST_PARKED, NO_SEAL, SyncState, Volume};
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
 use crate::index::spot_index::SpotIndex;
@@ -365,15 +365,16 @@ impl<Backend: Io> EngineState<Backend> {
             }
         }
         // a stopped rewrite leaves the store as it found it
-        let [data, graves] = mem::take(&mut *hold(&volume.partial_outputs));
-        let mut is_data_gone = true;
-        if let Some(Err(output)) = data.map(|output| self.remove_output(volume, output)) {
-            is_data_gone = false;
+        let mut outputs = mem::take(&mut *hold(&volume.partial_outputs));
+        // the last data output lists the inputs, and if it stays on disk the next open needs the rest of its set
+        let last = outputs[..MOST_MERGE_OUTPUTS].iter().rposition(Option::is_some);
+        let mut is_set_gone = true;
+        if let Some(Err(output)) = last.and_then(|slot| outputs[slot].take()).map(|output| self.remove_output(volume, output)) {
+            is_set_gone = false;
             self.io.close_file(output.file);
         }
-        // a data output left on disk needs its graves at the next open
-        if let Some(output) = graves {
-            let left = if is_data_gone { self.remove_output(volume, output) } else { Err(output) };
+        for output in outputs.into_iter().flatten() {
+            let left = if is_set_gone { self.remove_output(volume, output) } else { Err(output) };
             if let Err(output) = left {
                 self.io.close_file(output.file);
             }
@@ -862,7 +863,7 @@ pub fn build_state<Backend: Io>(
             is_applying: AtomicBool::new(false),
             merging: Mutex::new([SegmentNumber(0); MOST_MERGE_SEGMENTS]),
             walks_held: AtomicU64::new(0),
-            partial_outputs: Mutex::new([None, None]),
+            partial_outputs: Mutex::new(Default::default()),
             reserve: ByteCount(sizing.segment_bytes.0 * 2),
             summary: Mutex::new(summary.rows),
             summary_paths: summary.paths,

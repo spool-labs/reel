@@ -53,8 +53,8 @@ impl<Backend: Io> EngineState<Backend> {
         // a stale mark speaks for reads at or above the row that caused it, and a read behind the newest sealed row may not be.
         // The check comes after the slots, so a mark this read saw has its sealed row counted
         let is_behind = read.is_cue || volume.may_hide_under_sealed(read.read_point);
-        // a fold took the slots of rows such a read can still see, and their footers still hold them
-        if is_behind && matches.slots().iter().any(CompleteSlot::is_sticky) {
+        // a sticky slot says the footers answer for this tag
+        if matches.slots().iter().any(CompleteSlot::is_sticky) {
             return self.search_footers(volume, read);
         }
         self.footer_readers.with(|reader| {
@@ -133,6 +133,9 @@ impl<Backend: Io> EngineState<Backend> {
     ) -> Result<Option<SealedRow>, StoreError> {
         let mut matches = TagMatches::new();
         table.find(read.hash, &mut matches);
+        if matches.slots().iter().any(CompleteSlot::is_sticky) {
+            return self.newest_walked_footers(volume, read, skipped);
+        }
         self.footer_readers.with(|reader| {
             let mut best = None;
             for slot in matches.slots().iter().filter(|slot| !slot.is_stale() && !skipped.contains(&slot.segment_number())) {

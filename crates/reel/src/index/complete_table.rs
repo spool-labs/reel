@@ -26,7 +26,7 @@ pub const OVERFLOW_DIVISOR: usize = 64;
 pub const LEAST_OVERFLOW: usize = 8;
 /// Moves an insert makes between homes before it gives a slot to the overflow area
 pub const MOST_MOVES: usize = 64;
-/// Slots one tag can hold in its homes and the overflow area, so a get's candidates fit a fixed list
+/// Slots one tag can hold in its homes and the overflow area before it folds, so a get's candidates fit a fixed list
 pub const MOST_TAG_SLOTS: usize = 32;
 /// The bit of a slot's tag that marks a superseded row
 pub const STALE_BIT: u16 = 0x8000;
@@ -36,7 +36,7 @@ pub const TAG_MASK: u16 = !STALE_BIT;
 pub const NO_MARK: u64 = u64::MAX;
 /// The segment an unused slot holds
 pub const NO_SEGMENT: u32 = u32::MAX;
-/// The segment of a slot that stands for older rows of a tag whose stale slots had to go, so their grave stays until the next open
+/// The segment of a slot that says the footers answer for its tag, once the tag's list has filled
 pub const STICKY_SEGMENT: u32 = u32::MAX - 1;
 /// Spreads a tag over the buckets
 pub const TAG_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -255,11 +255,11 @@ impl CompleteShard {
         }
     }
 
-    /// Take a tag's stale slots out of its run of the overflow area, say how many went, and say whether a sticky slot stands
-    pub fn fold_overflow(&mut self, tag: u16) -> (u64, bool) {
-        let (mut folded, mut has_sticky) = (0, false);
+    /// Take a tag's slots out of its run of the overflow area, and say how many went
+    pub fn fold_overflow(&mut self, tag: u16) -> u64 {
+        let mut folded = 0;
         if self.overflow_used == 0 {
-            return (folded, has_sticky);
+            return folded;
         }
         let mut at = self.overflow_start(tag);
         for _step in 0..self.overflow.len() {
@@ -268,17 +268,14 @@ impl CompleteShard {
                 break;
             }
             if slot.key_tag() == tag {
-                has_sticky |= slot.is_sticky();
-                if slot.is_stale() && !slot.is_sticky() {
-                    // a later slot of the run can shift into this position, so the look stays here
-                    self.clear_overflow(at);
-                    folded += 1;
-                    continue;
-                }
+                // a later slot of the run can shift into this position, so the look stays here
+                self.clear_overflow(at);
+                folded += 1;
+                continue;
             }
             at = (at + 1) % self.overflow.len();
         }
-        (folded, has_sticky)
+        folded
     }
 
     /// Read a bucket's slots
@@ -495,39 +492,26 @@ impl CompleteTable {
         has_other
     }
 
-    /// Fold a tag's stale slots into one sticky slot, and say whether that made room. A key overwritten through many segments
-    /// would otherwise fill its homes with rows a get never reads
-    pub fn fold_stale(&self, shard: &mut CompleteShard, homes: &Homes) -> bool {
+    /// Give a tag whose list is full one sticky slot in place of the rest. Its readers go by the footers from here on, so a key
+    /// written into many segments costs that tag and no other
+    pub fn fold_tag(&self, shard: &mut CompleteShard, homes: &Homes) {
         let mut folded = 0;
-        let mut has_sticky = false;
         shard.change_homes(homes, |slot| {
-            has_sticky |= slot.is_sticky();
-            if slot.is_stale() && !slot.is_sticky() {
-                *slot = CompleteSlot::empty();
-                folded += 1;
-            }
+            *slot = CompleteSlot::empty();
+            folded += 1;
         });
-        let (in_overflow, held_sticky) = shard.fold_overflow(homes.tag);
-        folded += in_overflow;
-        has_sticky |= held_sticky;
-        if folded == 0 {
-            return false;
+        folded += shard.fold_overflow(homes.tag);
+        let sticky = CompleteSlot {
+            segment: STICKY_SEGMENT,
+            block: 0,
+            tag: homes.tag | STALE_BIT,
+        };
+        // the slots folded may all have sat in the overflow area, and then that's where room is
+        let is_placed = [homes.first, homes.second].into_iter().any(|bucket| shard.fill_bucket(bucket, sticky, &|_segment| false).is_some());
+        if !is_placed {
+            shard.fill_overflow(sticky);
         }
-        self.used.fetch_sub(folded, Ordering::AcqRel);
-        if !has_sticky {
-            let sticky = CompleteSlot {
-                segment: STICKY_SEGMENT,
-                block: 0,
-                tag: homes.tag | STALE_BIT,
-            };
-            // the slots folded may all have sat in the overflow area, and then that's where room is
-            let is_placed = [homes.first, homes.second].into_iter().any(|bucket| shard.fill_bucket(bucket, sticky, &|_segment| false).is_some());
-            if !is_placed {
-                shard.fill_overflow(sticky);
-            }
-            self.used.fetch_add(1, Ordering::AcqRel);
-        }
-        true
+        self.used.fetch_sub(folded - 1, Ordering::AcqRel);
     }
 
     /// Give a sealed row a slot. A row with no room marks the column at its segment, and a get searches the footers from there
@@ -543,10 +527,17 @@ impl CompleteTable {
     pub fn place(&self, hash: KeyHash, segment: u32, block: u16, is_gone: &impl Fn(u32) -> bool) -> bool {
         let mut shard = self.write_shard(shard_of(hash));
         let homes = shard.homes(hash);
-        let mut tag_slots = 0;
-        shard.visit_tag(&homes, |_slot| tag_slots += 1);
-        if tag_slots >= MOST_TAG_SLOTS && !self.fold_stale(&mut shard, &homes) {
-            return false;
+        let (mut tag_slots, mut has_sticky) = (0, false);
+        shard.visit_tag(&homes, |slot| {
+            tag_slots += 1;
+            has_sticky |= slot.is_sticky();
+        });
+        if has_sticky {
+            return true;
+        }
+        if tag_slots >= MOST_TAG_SLOTS {
+            self.fold_tag(&mut shard, &homes);
+            return true;
         }
 
         let slot = CompleteSlot { segment, block, tag: homes.tag };

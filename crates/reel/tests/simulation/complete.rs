@@ -696,3 +696,74 @@ fn read_behind_a_stale_mark() {
     assert_eq!(value, b"first");
     store.close().expect("close");
 }
+
+// a hot key's full tag costs that tag alone: a crash rebuilds the table with no stale marks, and the column takes no mark
+#[test]
+fn hot_key_leaves_no_mark_through_a_crash() {
+    let io = SimulatedIo::new(Seed(20));
+    let store = open(&io, CAPACITY);
+    let mut newest = Vec::new();
+    for round in 0..MOST_TAG_SLOTS * 2 {
+        newest = format!("round-{round}").into_bytes();
+        store.put(COLUMN, b"hot", &newest).expect("put");
+        for number in 0..KEPT_PER_ROUND {
+            store.put(COLUMN, format!("keep-{round}-{number}").as_bytes(), b"value").expect("put");
+        }
+        seal(&store, &io);
+    }
+    let table = store.state.complete_table(COLUMN).expect("a table");
+    assert_eq!(table.mark(), None, "running");
+    assert_eq!(read(&store, b"hot").as_ref(), Some(&newest));
+    store.flush().expect("flush");
+    io.kill();
+    drop(store);
+
+    let store = open(&io, CAPACITY);
+    let table = store.state.complete_table(COLUMN).expect("a table");
+    assert_eq!(table.mark(), None, "after a crash");
+    assert_eq!(read(&store, b"hot").as_ref(), Some(&newest));
+    store.close().expect("close");
+}
+
+// the same with the walk held behind every seal, and a saved image keeps the sticky slot
+#[test]
+fn hot_key_leaves_no_mark_with_a_held_walk() {
+    let io = SimulatedIo::new(Seed(21));
+    let store = open(&io, CAPACITY);
+    io.hold_jobs("reel-planner", true);
+    let mut newest = Vec::new();
+    for round in 0..MOST_TAG_SLOTS as u64 * 2 {
+        newest = format!("round-{round}").into_bytes();
+        store.put(COLUMN, b"hot", &newest).expect("put");
+        seal(&store, &io);
+    }
+    io.hold_jobs("reel-planner", false);
+    settle(&io);
+    let table = store.state.complete_table(COLUMN).expect("a table");
+    assert_eq!(table.mark(), None, "after the walk caught up");
+    assert_eq!(read(&store, b"hot").as_ref(), Some(&newest));
+    store.close().expect("close");
+
+    let store = open(&io, CAPACITY);
+    assert!(slots_of(&store, b"hot").iter().any(CompleteSlot::is_sticky));
+    assert_eq!(read(&store, b"hot").as_ref(), Some(&newest));
+    store.close().expect("close");
+}
+
+// a hot key's walk charges through the footers once its slots have gone, so the rows it replaced still count dead
+#[test]
+fn hot_key_charges_through_the_footers() {
+    let io = SimulatedIo::new(Seed(22));
+    let store = open(&io, CAPACITY);
+    for round in 0..MOST_TAG_SLOTS as u64 * 2 {
+        store.put(COLUMN, b"hot", format!("round-{round}").as_bytes()).expect("put");
+        for number in 0..KEPT_PER_ROUND {
+            store.put(COLUMN, format!("keep-{round}-{number}").as_bytes(), b"value").expect("put");
+        }
+        seal(&store, &io);
+    }
+    assert!(slots_of(&store, b"hot").iter().any(CompleteSlot::is_sticky));
+    let dead: u64 = sealed_numbers(&store).into_iter().map(|segment| dead_rows(&store, segment)).sum();
+    assert_eq!(dead, MOST_TAG_SLOTS as u64 * 2 - 1);
+    store.close().expect("close");
+}

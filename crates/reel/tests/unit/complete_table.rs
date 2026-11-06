@@ -59,7 +59,7 @@ fn full_marks_the_segment() {
     assert_eq!(table.used_slots().0 + table.past_capacity().0, ROWS);
 }
 
-// one key's slots fill its homes and go on in the overflow area, up to the most a get can list
+// one key's slots fill its homes and go on in the overflow area, and one past the most a get can list folds them into a sticky slot
 #[test]
 fn one_key_many_slots() {
     let table = CompleteTable::new(RowCount(ROWS));
@@ -70,7 +70,11 @@ fn one_key_many_slots() {
     assert_eq!(table.past_capacity(), RowCount(0));
     assert_eq!(matches_of(&table, hash).slots().len(), MOST_TAG_SLOTS);
     table.insert(hash, SegmentNumber(MOST_TAG_SLOTS as u64), 1, |_segment| false);
-    assert_eq!(table.mark(), Some(SegmentNumber(MOST_TAG_SLOTS as u64)));
+    assert_eq!(table.mark(), None);
+    let matches = matches_of(&table, hash);
+    assert_eq!(matches.slots().len(), 1);
+    assert!(matches.slots()[0].is_sticky());
+    assert_eq!(table.used_slots(), RowCount(1));
 }
 
 // a gone segment's slots clear when an insert visits their bucket
@@ -110,7 +114,7 @@ fn tag_count(shard: &CompleteShard, tag: u16) -> usize {
     count
 }
 
-// a slot whose run wrapped past the end of the overflow area stays in reach when a stale slot before it goes
+// a slot whose run wrapped past the end of the overflow area stays in reach when a slot before it goes
 #[test]
 fn fold_keeps_a_wrapped_run() {
     let mut shard = CompleteShard::new(OVERFLOW_SHARD_SLOTS);
@@ -118,21 +122,23 @@ fn fold_keeps_a_wrapped_run() {
         shard.fill_overflow(slot);
     }
     assert_eq!(tag_count(&shard, 6), 1);
-    assert_eq!(shard.fold_overflow(5), (1, false));
+    assert_eq!(shard.fold_overflow(5), 1);
     for tag in [13, 7, 6] {
         assert_eq!(tag_count(&shard, tag), 1, "tag {tag}");
     }
     assert_eq!(shard.overflow_used(), 3);
 }
 
-// a run of one tag with stale and live slots keeps the live ones, and a slot that shifts into a cleared position is looked at
+// a whole run of one tag goes, looking again wherever a slot shifts into a cleared position
 #[test]
 fn fold_clears_a_whole_run() {
     let mut shard = CompleteShard::new(OVERFLOW_SHARD_SLOTS);
     for is_stale in [true, true, false, true] {
         shard.fill_overflow(slot_of(3, is_stale));
     }
-    assert_eq!(shard.fold_overflow(3), (3, false));
-    assert_eq!(tag_count(&shard, 3), 1);
+    shard.fill_overflow(slot_of(4, false));
+    assert_eq!(shard.fold_overflow(3), 4);
+    assert_eq!(tag_count(&shard, 3), 0);
+    assert_eq!(tag_count(&shard, 4), 1);
     assert_eq!(shard.overflow_used(), 1);
 }

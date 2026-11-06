@@ -625,19 +625,29 @@ impl<Backend: Io> EngineState<Backend> {
         key: &[u8],
         skipped: &[SegmentNumber],
     ) -> Result<Option<SealedRow>, StoreError> {
-        let Some(directory) = &self.directories[column.0 as usize] else {
+        let read = self.key_read(column, key, WritePlace(u64::MAX), false)?;
+        match self.complete_table(column) {
+            Some(table) => self.newest_walked_complete(volume, &read, table, skipped),
+            None => self.newest_walked_footers(volume, &read, skipped),
+        }
+    }
+
+    /// Find a key's newest row among finished segments through the footers
+    pub fn newest_walked_footers(
+        &self,
+        volume: &Volume<Backend>,
+        read: &KeyRead,
+        skipped: &[SegmentNumber],
+    ) -> Result<Option<SealedRow>, StoreError> {
+        let Some(directory) = &self.directories[read.column.0 as usize] else {
             return Ok(None);
         };
-        let read = self.key_read(column, key, WritePlace(u64::MAX), false)?;
-        if let Some(table) = self.complete_table(column) {
-            return self.newest_walked_complete(volume, &read, table, skipped);
-        }
         self.footer_readers.with(|reader| {
-            self.walk_candidates(directory, key, reader, |segment, reader, best| {
+            self.walk_candidates(directory, read.key, reader, |segment, reader, best| {
                 if skipped.contains(&segment) {
                     return Ok(());
                 }
-                self.ask_walked(volume, &read, segment, reader, best)
+                self.ask_walked(volume, read, segment, reader, best)
             })
         })
     }

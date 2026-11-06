@@ -1,6 +1,7 @@
 //! Random work on two volumes with failed syncs, full disks, rot and crashes, also inside recovery
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use crate::seed_sets::seeds;
@@ -40,7 +41,7 @@ const MARK_SEED_STRIDE: u64 = 11;
 const MARK_SPREAD: u64 = 16;
 const MARK_STEP: u64 = 64;
 const MARK_EVERY_STEPS: u64 = 32;
-const ROT_SEEDS: [u64; 13] = [19, 125, 349, 959, 1_000, 1_001, 1_002, 1_003, 1_011, 1_031, 2_635, 6_185, 10_745];
+const ROT_SEEDS: [u64; 14] = [19, 125, 349, 959, 1_000, 1_001, 1_002, 1_003, 1_011, 1_031, 2_635, 6_185, 10_745, 38_086];
 const STEPS: u64 = 3_000;
 const KEY_SPACE: u64 = 30;
 const SETTLE_STEPS: u64 = 2_000_000;
@@ -265,7 +266,7 @@ fn data_files(io: &SimulatedIo) -> Vec<PathBuf> {
 // find how far a rows file is covered by a mark that a later sync covered too, and where the records of those
 // rows end: rot below that always has a surviving mark above it, and the spec accepts rot in a synced group
 // whose mark a power cut took
-fn durable_rows(io: &SimulatedIo, path: &Path) -> Option<(u64, u64)> {
+fn durable_rows(io: &SimulatedIo, path: &Path) -> Option<(u64, Vec<Range<u64>>)> {
     let superblock = Superblock::read(io, Path::new(ROOTS[0])).ok()??;
     let file = io.open_read_only(path).ok()?;
     let length = file.length();
@@ -277,14 +278,15 @@ fn durable_rows(io: &SimulatedIo, path: &Path) -> Option<(u64, u64)> {
     let mut groups = Vec::new();
     let mut at = 0;
     while let Some(group) = bytes.get(at..).and_then(|rest| parse_group(rest, superblock.record_key)) {
-        let record_end = group.walk().map(|row| row.offset.0 + row.length.0).max().unwrap_or(0);
-        groups.push((at as u64, group.synced_through.0, record_end));
+        let records: Vec<Range<u64>> = group.walk().map(|row| row.offset.0..row.offset.0 + row.length.0).collect();
+        groups.push((at as u64, group.synced_through.0, records));
         at += group.total_length.0 as usize;
     }
     let last_mark = groups.iter().map(|group| group.1).max()?;
     let covered = groups.iter().filter(|group| group.0 < last_mark).map(|group| group.1).max()?;
-    let data_end = groups.iter().filter(|group| group.0 < covered).map(|group| group.2).max().unwrap_or(0);
-    Some((covered, data_end))
+    // records of a later group can stand below these in the file, so only the records themselves are covered
+    let records = groups.into_iter().filter(|group| group.0 < covered).flat_map(|group| group.2).collect();
+    Some((covered, records))
 }
 
 fn random_key(random: &mut SeededRandom) -> Key {
@@ -455,12 +457,15 @@ impl Run {
             return;
         };
         if listing.contains(&rows) {
-            let Some((_covered, data_end)) = durable_rows(&self.io, &rows) else {
+            let Some((_covered, records)) = durable_rows(&self.io, &rows) else {
                 return;
             };
+            let data_end = records.iter().map(|record| record.end).max().unwrap_or(0);
             if data_end > 0 {
                 let at = self.streams.rot.below(data_end);
-                let _rotted = self.io.rot(path, FileOffset(at), BitMask(1));
+                if records.iter().any(|record| record.contains(&at)) {
+                    let _rotted = self.io.rot(path, FileOffset(at), BitMask(1));
+                }
             }
             return;
         }

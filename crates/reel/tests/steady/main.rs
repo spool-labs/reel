@@ -18,6 +18,8 @@ use reel::engine::reel_store::ReelStore;
 use reel::engine::walk_job::FREE_IN_PLACE_BYTES;
 use reel::io::plain::PlainIo;
 use reel::segment::segment_tail::SECOND_TAIL_DISTANCE;
+use reel_api::direction::Direction;
+use reel_api::scan::ScanStep;
 use reel_api::store_error::StoreError;
 use reel_api::units::ByteCount;
 use reel_api::value_list::ValueList;
@@ -35,6 +37,8 @@ const MOST_OPEN_BLOCKS: usize = 32_768;
 #[cfg(target_os = "linux")]
 const MOST_BLOCK_PAGES: usize = 65_536;
 const KEYS: usize = 512;
+const SCAN_ROWS: usize = 8;
+const SCAN_KEY_BYTES: usize = 128;
 const LONG_ROWS: usize = 4_000;
 const LONG_VALUE: &[u8] = b"a value on each column of a long batch, a value on each column of a long batch";
 const SMALL_BYTES: usize = 100;
@@ -215,6 +219,7 @@ struct Inputs {
     large_batch: WriteBatch,
     long_batch: WriteBatch,
     buf: Vec<u8>,
+    scan_key: Vec<u8>,
     values: ValueList,
 }
 
@@ -346,6 +351,7 @@ fn inputs() -> Inputs {
         large_batch,
         long_batch,
         buf: vec![1; CHUNKED_BYTES * 2],
+        scan_key: vec![1; SCAN_KEY_BYTES],
         values: ValueList::new(),
     }
 }
@@ -381,6 +387,16 @@ fn round(store: &Store, inputs: &mut Inputs, number: usize) {
     assert!(cue.contains(META, key).expect("contains at a cue"));
     cue.get_many(META, &keys, &mut inputs.values).expect("get_many at a cue");
     drop(cue);
+    let mut scan = store.iter_prefix(BULK, b"key-").expect("scan");
+    while scan.next_key(&mut inputs.scan_key).expect("step") == ScanStep::Found {}
+    drop(scan);
+    let mut scan = store.iter_from(BULK, b"key-z", Direction::Descending).expect("scan");
+    for _row in 0..SCAN_ROWS {
+        if scan.next_row(&mut inputs.scan_key, buf).expect("step") == ScanStep::End {
+            break;
+        }
+    }
+    drop(scan);
     store.delete(BULK, other).expect("delete");
     // a segment with covers sits out compaction, so every other one has none
     let has_covers = number.div_ceil(SEAL_ROUNDS).is_multiple_of(2);

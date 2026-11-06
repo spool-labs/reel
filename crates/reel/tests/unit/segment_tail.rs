@@ -1,5 +1,5 @@
 use reel::record::record_check::{Checksum, RecordKey};
-use reel::segment::block_entry::KeyPrefix;
+use reel::segment::block_entry::{KeyBound, KeyPrefix, SHARED_HEAD_BYTES, SharedHead};
 use reel::segment::segment_tail::*;
 use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
@@ -36,6 +36,7 @@ fn column(id: u8) -> ColumnTail {
         column: ColumnId(id),
         shared_length: 5,
         shared_sum: Checksum(6),
+        shared_head: SharedHead::of_shared(b"share"),
         lowest: KeyPrefix::of_key(b"low", 0),
         highest: KeyPrefix::of_key(b"high", 0),
         first_block: 1,
@@ -91,4 +92,27 @@ fn column_range() {
 
     assert!(columns_fit(&[column], lines));
     assert!(!columns_fit(&[column], lines - 1));
+}
+
+// a column's bounds hold its keys: the shared bytes, then the prefixes, and whatever the tail can't say stays open
+#[test]
+fn key_bounds() {
+    let tail = |shared: &[u8], lowest: &[u8], highest: &[u8]| ColumnTail {
+        shared_length: shared.len() as u16,
+        shared_head: SharedHead::of_shared(shared),
+        lowest: KeyPrefix::of_key(lowest, 0),
+        highest: KeyPrefix::of_key(highest, 0),
+        ..ColumnTail::default()
+    };
+    let (lowest, highest) = tail(b"tape", b"a", b"c").key_bounds();
+    assert_eq!(lowest, KeyBound::of_key(b"tapea"));
+    assert!(highest > KeyBound::of_key(b"tapec"));
+    assert!(highest < KeyBound::of_key(b"taped"));
+
+    let long = [7; SHARED_HEAD_BYTES + 2];
+    let (lowest, highest) = tail(&long, b"a", b"c").key_bounds();
+    assert_eq!(lowest, KeyBound::of_key(&long[..SHARED_HEAD_BYTES]));
+    let mut above = [7; SHARED_HEAD_BYTES + 3];
+    above[SHARED_HEAD_BYTES] = u8::MAX;
+    assert!(highest >= KeyBound::of_key(&above));
 }

@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use reel_api::column_id::ColumnId;
+use reel_api::direction::Direction;
 use reel_api::memory_report::MemoryReport;
 use reel_api::reads::ValueWindow;
 use reel_api::store_error::StoreError;
@@ -29,7 +30,9 @@ use crate::engine::recovery::{
 };
 use crate::engine::reserve_job::ReserveJob;
 use crate::engine::row_job::RowJob;
+use crate::engine::scan_state::{MOST_SCANS, ScanState, from_key, in_range, under_prefix};
 use crate::engine::seal_job::SealJob;
+use crate::engine::store_scan::StoreScan;
 use crate::engine::compact_job::{CompactJob, park};
 use crate::engine::cue::{Cue, CueTable};
 use crate::engine::planner::Planner;
@@ -229,6 +232,30 @@ impl<Backend: Io> ReelStore<Backend> {
     pub fn cue(&self) -> Result<Cue<Backend>, StoreError> {
         self.check_open()?;
         Cue::new(Arc::clone(&self.state))
+    }
+
+    /// Walk rows and keys from a key, which comes first when it has a row
+    pub fn iter_from(&self, column: ColumnId, start: &[u8], direction: Direction) -> Result<StoreScan<Backend>, StoreError> {
+        self.check_open()?;
+        StoreScan::new(Arc::clone(&self.state), &from_key(column, start, direction))
+    }
+
+    /// Walk rows and keys in [start, end)
+    pub fn iter_range(
+        &self,
+        column: ColumnId,
+        start: &[u8],
+        end: &[u8],
+        direction: Direction,
+    ) -> Result<StoreScan<Backend>, StoreError> {
+        self.check_open()?;
+        StoreScan::new(Arc::clone(&self.state), &in_range(column, start, end, direction))
+    }
+
+    /// Walk rows and keys under a prefix
+    pub fn iter_prefix(&self, column: ColumnId, prefix: &[u8]) -> Result<StoreScan<Backend>, StoreError> {
+        self.check_open()?;
+        StoreScan::new(Arc::clone(&self.state), &under_prefix(column, prefix))
     }
 
     /// Check whether the key has a value, without reading the value
@@ -900,6 +927,9 @@ pub fn build_state<Backend: Io>(
     let shares = (0..most_shares).map(|_share| touched_zeroes(SHARE_BYTES)).collect();
 
     let mut record_readers = Vec::with_capacity(READ_BUFFERS);
+    let widest_key = (0..config.volumes.len()).map(|volume| config.widest_key(volume)).max().unwrap_or(0);
+    let scans: Vec<ScanState> = (0..MOST_SCANS).map(|_scan| ScanState::new(widest_key, open_slots)).collect();
+    let scan_heap = ByteCount(scans.iter().map(|scan| scan.heap_bytes().0).sum());
     let mut footer_readers = Vec::with_capacity(READ_BUFFERS);
     for _reader in 0..READ_BUFFERS {
         record_readers.push(RecordReader::new());
@@ -946,6 +976,8 @@ pub fn build_state<Backend: Io>(
         longest_index_wait: AtomicU64::new(0),
         record_readers: Pool::new(record_readers),
         footer_readers: Pool::new(footer_readers),
+        scans: Mutex::new(scans),
+        scan_heap,
         superblock: Mutex::new(superblock),
         superblock_bytes: Mutex::new(Vec::new()),
         next_segment: AtomicU64::new(first_number),

@@ -3,6 +3,7 @@
 use reel_api::units::{ByteCount, RowCount};
 
 use crate::engine::open_segment::RECORD_WINDOW_BYTES;
+use crate::engine::scan_state::{MOST_SCANS, planned_scan_bytes};
 use crate::index::entry_slab::{PAGE_BYTES, PageCount};
 use crate::index::node_pool::{NODE_FANOUT, NodeCount};
 use crate::index::open_slots::MAX_OPEN_SLOTS;
@@ -37,7 +38,7 @@ pub const TABLE_DIVISOR: u64 = 16;
 /// Bytes the table plans for a segment before its columns
 pub const PLANNED_SEGMENT_BYTES: u64 = 512;
 /// Bytes the table and directories plan for a column of a segment
-pub const PLANNED_COLUMN_BYTES: u64 = 240;
+pub const PLANNED_COLUMN_BYTES: u64 = 576;
 /// Bytes the table plans for a line of a block index
 pub const PLANNED_LINE_BYTES: u64 = 32;
 /// The least a budget has to leave after the fixed parts
@@ -129,6 +130,7 @@ impl StoreShape {
         let gathers = WRITE_BUFFERS as u64 * GATHER_BYTES as u64;
         let windows = self.open_slots() as u64 * 3 * RECORD_WINDOW_BYTES as u64;
         let reads = READ_BUFFERS as u64 * READ_BUFFER_BYTES;
+        let scans = MOST_SCANS as u64 * planned_scan_bytes(self.widest_keys, self.open_slots());
         let large = if self.has_lz4 { LZ4_STORED_LIMIT.0 } else { 0 };
         let encoders = WRITE_BUFFERS as u64 * ENCODER_BYTES + large;
         let spans = 4 * MOST_DAMAGED_SPANS as u64 * (SPAN_KEY_BYTES as u64 * 2);
@@ -139,7 +141,7 @@ impl StoreShape {
         let cover_fixed = (COVER_SLOT_BYTES + COVER_RECORD_BYTES) as u64 * MOST_RANGE_COVERS as u64;
         let covers = 2 * cover_keys + volumes * cover_fixed;
         let jobs = SEAL_JOB_BYTES + WALK_JOB_BYTES + COMPACT_JOB_BYTES;
-        ByteCount(queues + gathers + windows + reads + encoders + covers + volumes * (jobs + spans) + workers * WALK_JOB_BYTES + stacks)
+        ByteCount(queues + gathers + windows + reads + scans + encoders + covers + volumes * (jobs + spans) + workers * WALK_JOB_BYTES + stacks)
     }
 
     /// Read the smallest budget this store can run in

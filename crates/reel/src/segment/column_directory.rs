@@ -8,8 +8,8 @@ use reel_api::units::{ByteCount, WritePlace};
 use crate::pool::touched_capacity;
 use crate::guard::hold;
 use crate::record::record_check::{Checksum, checksum};
-use crate::segment::block_entry::KeyPrefix;
-use crate::segment::segment_tail::SegmentNumber;
+use crate::segment::block_entry::{KeyBound, KeyPrefix};
+use crate::segment::segment_tail::{ColumnTail, SegmentNumber};
 
 /// Copies of the list: readers keep one while a seal builds the other
 pub const DIRECTORY_VERSIONS: usize = 2;
@@ -26,6 +26,22 @@ pub struct DirectoryEntry {
     pub newest_place: WritePlace,
 }
 
+/// One segment's keys in one column, in order among every segment's, for a walk over a range of keys
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RangeEntry {
+    pub lowest: KeyBound,
+    pub highest: KeyBound,
+    pub reach: u32,
+    pub segment: SegmentNumber,
+}
+
+/// What a list holds for one segment of a column
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Listing {
+    pub entry: DirectoryEntry,
+    pub range: RangeEntry,
+}
+
 /// A segment whose range holds a key, and the newest place any of its rows has
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Candidate {
@@ -37,6 +53,7 @@ pub struct Candidate {
 #[derive(Clone, Debug, Default)]
 pub struct DirectoryList {
     pub entries: Vec<DirectoryEntry>,
+    pub ranges: Vec<RangeEntry>,
     pub generation: u64,
 }
 
@@ -50,8 +67,8 @@ pub struct DirectoryPage {
 
 /// Counts the segments a search has passed and fills a page
 #[derive(Debug)]
-pub struct PageFill<'out> {
-    out: &'out mut Vec<Candidate>,
+pub struct PageFill<'out, Item> {
+    out: &'out mut Vec<Item>,
     skip: usize,
     seen: usize,
     is_cut: bool,
@@ -67,18 +84,39 @@ pub struct ColumnDirectory {
     writer: Mutex<()>,
 }
 
-impl PageFill<'_> {
+impl Listing {
+    /// Build a segment's listing from its tail
+    pub fn of_column(column: &ColumnTail, segment: SegmentNumber, newest_place: WritePlace) -> Self {
+        let (lowest, highest) = column.key_bounds();
+        Self {
+            entry: DirectoryEntry {
+                shared_length: column.shared_length,
+                shared_sum: column.shared_sum,
+                lowest: column.lowest,
+                highest: column.highest,
+                reach: column.highest,
+                segment,
+                newest_place,
+            },
+            range: RangeEntry {
+                lowest,
+                highest,
+                reach: 0,
+                segment,
+            },
+        }
+    }
+}
+
+impl<Item> PageFill<'_, Item> {
     /// Add a matching segment, or note that the page is full
-    pub fn add(&mut self, entry: &DirectoryEntry) {
+    pub fn add(&mut self, item: Item) {
         self.seen += 1;
         if self.seen <= self.skip {
             return;
         }
         if self.out.len() < self.out.capacity() {
-            self.out.push(Candidate {
-                segment: entry.segment,
-                newest_place: entry.newest_place,
-            });
+            self.out.push(item);
         } else {
             self.is_cut = true;
         }
@@ -100,7 +138,8 @@ impl ColumnDirectory {
     pub fn heap_bytes(&self) -> ByteCount {
         let mut total = 0;
         for version in &self.versions {
-            total += read_list(version).entries.capacity() * size_of::<DirectoryEntry>();
+            let list = read_list(version);
+            total += list.entries.capacity() * size_of::<DirectoryEntry>() + list.ranges.capacity() * size_of::<RangeEntry>();
         }
         ByteCount(total as u64)
     }
@@ -136,13 +175,49 @@ impl ColumnDirectory {
         }
     }
 
+    /// Fill a buffer with the segments whose keys can meet a range, past those a caller already has
+    pub fn overlapping(&self, low: &KeyBound, high: &KeyBound, skip: usize, out: &mut Vec<SegmentNumber>) -> DirectoryPage {
+        out.clear();
+        let current = self.current.load(Ordering::Acquire);
+        let copy = read_list(&self.versions[current]);
+        let mut fill = PageFill {
+            out,
+            skip,
+            seen: 0,
+            is_cut: false,
+        };
+        search_ranges(&copy.ranges, 0, copy.ranges.len(), low, high, &mut fill);
+        DirectoryPage {
+            generation: copy.generation,
+            skipped_past: fill.seen,
+            is_cut: fill.is_cut,
+        }
+    }
+
+    /// Find where the next segment past a bound starts
+    pub fn next_above(&self, bound: &KeyBound) -> Option<KeyBound> {
+        let current = self.current.load(Ordering::Acquire);
+        let copy = read_list(&self.versions[current]);
+        let at = copy.ranges.partition_point(|range| range.lowest <= *bound);
+        copy.ranges.get(at).map(|range| range.lowest)
+    }
+
+    /// Find where the next segment below a bound ends
+    pub fn next_below(&self, bound: &KeyBound) -> Option<KeyBound> {
+        let current = self.current.load(Ordering::Acquire);
+        let copy = read_list(&self.versions[current]);
+        let mut best = None;
+        highest_below(&copy.ranges, 0, copy.ranges.len(), bound, &mut best);
+        best
+    }
+
     /// Read the generation of the newest list, so a walk can tell one was published under it
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
 
     /// Publish a list with a segment added and some gone, or return false when it doesn't fit
-    pub fn replace(&self, added: Option<&DirectoryEntry>, removed: &[SegmentNumber]) -> bool {
+    pub fn replace(&self, added: Option<&Listing>, removed: &[SegmentNumber]) -> bool {
         let _one_writer = hold(&self.writer);
         let current = self.current.load(Ordering::Acquire);
         let next = (current + 1) % DIRECTORY_VERSIONS;
@@ -150,6 +225,7 @@ impl ColumnDirectory {
             let source = read_list(&self.versions[current]);
             let mut target = write_list(&self.versions[next]);
             target.entries.clear();
+            target.ranges.clear();
             target.generation = source.generation + 1;
 
             let room = target.entries.capacity();
@@ -168,11 +244,21 @@ impl ColumnDirectory {
                     target.entries.push(*entry);
                 }
             }
-            if let Some(entry) = added {
+            for range in &source.ranges {
+                if !removed.contains(&range.segment) {
+                    target.ranges.push(*range);
+                }
+            }
+            if let Some(listing) = added {
+                let entry = &listing.entry;
                 let at = target.entries.partition_point(|existing| sort_key(existing) <= sort_key(entry));
                 target.entries.insert(at, *entry);
+                let at = target.ranges.partition_point(|existing| existing.lowest <= listing.range.lowest);
+                target.ranges.insert(at, listing.range);
             }
             refresh_groups(&mut target.entries);
+            let count = target.ranges.len();
+            refresh_range_reach(&mut target.ranges, 0, count);
         }
         self.current.store(next, Ordering::Release);
         self.generation.fetch_add(1, Ordering::AcqRel);
@@ -182,6 +268,12 @@ impl ColumnDirectory {
 
 /// Build an empty copy with fixed room
 pub fn empty_list(capacity: usize) -> DirectoryList {
+    let blank_range = RangeEntry {
+        lowest: KeyBound::of_key(&[]),
+        highest: KeyBound::of_key(&[]),
+        reach: 0,
+        segment: SegmentNumber(0),
+    };
     let blank = DirectoryEntry {
         shared_length: 0,
         shared_sum: Checksum(0),
@@ -193,6 +285,7 @@ pub fn empty_list(capacity: usize) -> DirectoryList {
     };
     DirectoryList {
         entries: touched_capacity(capacity, blank),
+        ranges: touched_capacity(capacity, blank_range),
         generation: 0,
     }
 }
@@ -210,7 +303,7 @@ pub fn group_of(length_run: &[DirectoryEntry], sum: Checksum) -> &[DirectoryEntr
 }
 
 /// Add every segment of a group whose range holds a key, skipping whole runs that can't
-pub fn search_group(group: &[DirectoryEntry], key: KeyPrefix, fill: &mut PageFill) {
+pub fn search_group(group: &[DirectoryEntry], key: KeyPrefix, fill: &mut PageFill<Candidate>) {
     if group.is_empty() {
         return;
     }
@@ -227,9 +320,71 @@ pub fn search_group(group: &[DirectoryEntry], key: KeyPrefix, fill: &mut PageFil
         return;
     }
     if entry.highest >= key {
-        fill.add(entry);
+        fill.add(Candidate {
+            segment: entry.segment,
+            newest_place: entry.newest_place,
+        });
     }
     search_group(&group[middle + 1..], key, fill);
+}
+
+/// Add every segment whose keys can meet a range, skipping whole runs that can't. A segment comes out in order of its lowest key
+pub fn search_ranges(ranges: &[RangeEntry], start: usize, end: usize, low: &KeyBound, high: &KeyBound, fill: &mut PageFill<SegmentNumber>) {
+    if start == end {
+        return;
+    }
+
+    let middle = start + (end - start) / 2;
+    let entry = &ranges[middle];
+    if ranges[entry.reach as usize].highest < *low {
+        return;
+    }
+
+    search_ranges(ranges, start, middle, low, high, fill);
+    if entry.lowest > *high {
+        return;
+    }
+    if entry.highest >= *low {
+        fill.add(entry.segment);
+    }
+    search_ranges(ranges, middle + 1, end, low, high, fill);
+}
+
+/// Find the highest end below a bound, skipping every run that can't beat the best so far
+pub fn highest_below(ranges: &[RangeEntry], start: usize, end: usize, bound: &KeyBound, best: &mut Option<KeyBound>) {
+    if start == end {
+        return;
+    }
+
+    let middle = start + (end - start) / 2;
+    let entry = &ranges[middle];
+    if best.is_some_and(|found| ranges[entry.reach as usize].highest <= found) {
+        return;
+    }
+
+    highest_below(ranges, middle + 1, end, bound, best);
+    if entry.highest < *bound && best.is_none_or(|found| entry.highest > found) {
+        *best = Some(entry.highest);
+    }
+    highest_below(ranges, start, middle, bound, best);
+}
+
+/// Give each entry of a run the index of the highest end in its half, and return the run's
+pub fn refresh_range_reach(ranges: &mut [RangeEntry], start: usize, end: usize) -> Option<u32> {
+    if start == end {
+        return None;
+    }
+
+    let middle = start + (end - start) / 2;
+    let sides = [refresh_range_reach(ranges, start, middle), refresh_range_reach(ranges, middle + 1, end)];
+    let mut reach = middle as u32;
+    for side in sides.into_iter().flatten() {
+        if ranges[side as usize].highest > ranges[reach as usize].highest {
+            reach = side;
+        }
+    }
+    ranges[middle].reach = reach;
+    Some(reach)
 }
 
 /// Refresh the reach of every group in a list

@@ -43,6 +43,14 @@ pub struct DamageSlot {
     end: [u8; SPAN_KEY_BYTES],
 }
 
+/// A range of keys a walk is about to cross
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KeyRange<'key> {
+    pub low: &'key [u8],
+    pub high: Option<&'key [u8]>,
+    pub is_high_inclusive: bool,
+}
+
 /// A clear that needs a span the pool doesn't have
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PoolFull;
@@ -98,6 +106,16 @@ impl DamageSlot {
             },
             _too_long_or_none => self.end_length = NO_END,
         }
+    }
+
+    /// Check the span meets a range of keys, whose low end it may start at and whose high end comes as the caller says
+    pub fn meets(&self, column: ColumnId, range: &KeyRange) -> bool {
+        let is_above_low = self.end().is_none_or(|end| end > range.low);
+        let is_below_high = range.high.is_none_or(|high| {
+            let start = self.start();
+            start < high || (range.is_high_inclusive && start == high)
+        });
+        self.column == column && is_above_low && is_below_high
     }
 
     /// Check the span holds a key
@@ -198,6 +216,11 @@ impl DamageList {
             }
         }
         highest
+    }
+
+    /// Check any span meets a range of keys
+    pub fn meets(&self, column: ColumnId, range: &KeyRange) -> bool {
+        !self.is_empty() && read_slots(&self.slots).iter().any(|slot| slot.meets(column, range))
     }
 
     /// Clear the part of every span inside [start, end), and leave what lies outside it. A clear that would

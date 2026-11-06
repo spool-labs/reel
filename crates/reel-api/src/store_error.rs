@@ -29,6 +29,8 @@ pub enum StoreError {
     RangeDeletesFull { volume: VolumeId },
     #[error("{limit} cues are live, which is as many as a store holds")]
     CuesFull { limit: u64 },
+    #[error("{limit} scans are live, which is as many as a store holds")]
+    ScansFull { limit: u64 },
     #[error("a budget of {budget:?} is under the {least:?} this store needs")]
     BudgetTooSmall { budget: ByteCount, least: ByteCount },
     #[error("batch touches more than one volume")]

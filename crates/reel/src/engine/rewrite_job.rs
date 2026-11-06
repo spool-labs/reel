@@ -28,7 +28,7 @@ use crate::guard::hold;
 use crate::io::{Io, IoFile};
 use crate::pool::{touched_capacity, touched_zeroes};
 use crate::row_kind::RowKind;
-use crate::segment::column_directory::DirectoryEntry;
+use crate::segment::column_directory::Listing;
 use crate::segment::footer_writer::{ColumnStart, FooterTotals, FooterWriter};
 use crate::segment::row_block::{FooterRow, ROW_BLOCK_BYTES, RowBlockWalk};
 use crate::segment::segment_table::SegmentPin;
@@ -1314,15 +1314,7 @@ pub fn list_output<'tail, Backend: Io>(
     columns: impl Iterator<Item = &'tail ColumnTail>,
 ) {
     for column in columns {
-        let entry = DirectoryEntry {
-            shared_length: column.shared_length,
-            shared_sum: column.shared_sum,
-            lowest: column.lowest,
-            highest: column.highest,
-            reach: column.highest,
-            segment: number,
-            newest_place,
-        };
+        let entry = Listing::of_column(column, number, newest_place);
         if let Some(directory) = &state.directories[column.column.0 as usize]
             && !directory.replace(Some(&entry), &[])
         {

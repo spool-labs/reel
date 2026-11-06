@@ -17,6 +17,10 @@ reel-sim.workspace = true
 workspace = true
 
 [[test]]
+name = "churn"
+path = "tests/churn/main.rs"
+
+[[test]]
 name = "steady"
 path = "tests/steady/main.rs"
 harness = false

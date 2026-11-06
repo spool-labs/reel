@@ -1,11 +1,13 @@
 //! The end of a sealed segment: what open reads, and what makes a segment sealed
 
+use std::cmp::Ordering;
+
 use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::record::record_check::{Checksum, RecordKey};
-use crate::segment::block_entry::{KEY_PREFIX_BYTES, KeyPrefix};
+use crate::segment::block_entry::{KEY_BOUND_BYTES, KEY_PREFIX_BYTES, KeyBound, KeyPrefix, SHARED_HEAD_BYTES, SharedHead};
 
 /// Ends every sealed segment
 pub const TAIL_MAGIC: u32 = 0x5245_4C54;
@@ -16,7 +18,7 @@ pub const TAIL_FIXED_BYTES: usize = 100 + MOST_MERGE_SEGMENTS * size_of::<u64>()
 /// Most segments one compaction merges into one, which a tail lists as its inputs
 pub const MOST_MERGE_SEGMENTS: usize = 8;
 /// Bytes of one column's part of a tail
-pub const COLUMN_TAIL_BYTES: usize = 72;
+pub const COLUMN_TAIL_BYTES: usize = 72 + SHARED_HEAD_BYTES;
 /// Spare bytes in one column's part of a tail
 pub const COLUMN_PADDING_BYTES: usize = 4;
 /// Most bytes a segment can reach, since its offsets are 32 bits
@@ -59,6 +61,7 @@ pub struct ColumnTail {
     pub column: ColumnId,
     pub shared_length: u16,
     pub shared_sum: Checksum,
+    pub shared_head: SharedHead,
     pub lowest: KeyPrefix,
     pub highest: KeyPrefix,
     pub first_block: u32,
@@ -143,6 +146,13 @@ impl<'bytes> TailReader<'bytes> {
         Some(u32::from_le_bytes(half))
     }
 
+    /// Take a shared prefix's first bytes
+    pub fn shared_head(&mut self) -> Option<SharedHead> {
+        let mut head = [0; SHARED_HEAD_BYTES];
+        head.copy_from_slice(self.take(SHARED_HEAD_BYTES)?);
+        Some(SharedHead(head))
+    }
+
     /// Take a key prefix
     pub fn prefix(&mut self) -> Option<KeyPrefix> {
         let mut prefix = [0; KEY_PREFIX_BYTES];
@@ -218,11 +228,33 @@ impl TailHead {
 }
 
 impl ColumnTail {
+    /// Compare a key with the bytes the column's keys share, as far as the tail holds them
+    pub fn order_against_shared(&self, key: &[u8]) -> Ordering {
+        let known = (self.shared_length as usize).min(SHARED_HEAD_BYTES);
+        key[..key.len().min(known)].cmp(&self.shared_head.0[..known])
+    }
+
+    /// Build the bounds of the column's keys, which hold every key it has and can be wider
+    pub fn key_bounds(&self) -> (KeyBound, KeyBound) {
+        let shared = self.shared_length as usize;
+        let known = shared.min(SHARED_HEAD_BYTES);
+        let (mut lowest, mut highest) = ([0; KEY_BOUND_BYTES], [u8::MAX; KEY_BOUND_BYTES]);
+        lowest[..known].copy_from_slice(&self.shared_head.0[..known]);
+        highest[..known].copy_from_slice(&self.shared_head.0[..known]);
+        // past the head the prefixes stand at offsets this bound doesn't reach
+        if shared <= SHARED_HEAD_BYTES {
+            lowest[known..known + KEY_PREFIX_BYTES].copy_from_slice(&self.lowest.0);
+            highest[known..known + KEY_PREFIX_BYTES].copy_from_slice(&self.highest.0);
+        }
+        (KeyBound(lowest), KeyBound(highest))
+    }
+
     /// Write one column's fields
     pub fn write(&self, out: &mut TailCursor) {
         out.put(&[self.column.0, 0]);
         out.put(&self.shared_length.to_le_bytes());
         out.put(&self.shared_sum.0.to_le_bytes());
+        out.put(&self.shared_head.0);
         out.put(&self.lowest.0);
         out.put(&self.highest.0);
         out.put(&self.first_block.to_le_bytes());
@@ -239,6 +271,7 @@ impl ColumnTail {
             column: ColumnId(leading[0]),
             shared_length: u16::from_le_bytes([leading[2], leading[3]]),
             shared_sum: Checksum(input.word()?),
+            shared_head: input.shared_head()?,
             lowest: input.prefix()?,
             highest: input.prefix()?,
             first_block: input.half()?,

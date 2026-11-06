@@ -24,7 +24,7 @@ use crate::record::codec::Codec;
 use crate::record::record_check::RecordIdentity;
 use crate::record::record_reader::{RecordLocation, RecordRead};
 use crate::row_kind::RowKind;
-use crate::segment::column_directory::DirectoryEntry;
+use crate::segment::column_directory::Listing;
 use crate::segment::footer_writer::{ColumnStart, FooterTotals, FooterWriter};
 use crate::segment::range_covers::{Cover, put_cover};
 use crate::segment::row_block::FooterRow;
@@ -388,15 +388,7 @@ impl<Backend: Io> SealJob<Backend> {
         }
 
         while let Some(column) = self.writer.columns().get(self.columns_listed) {
-            let entry = DirectoryEntry {
-                shared_length: column.shared_length,
-                shared_sum: column.shared_sum,
-                lowest: column.lowest,
-                highest: column.highest,
-                reach: column.highest,
-                segment: target.number,
-                newest_place: totals.head.places.highest,
-            };
+            let entry = Listing::of_column(column, target.number, totals.head.places.highest);
             if let Some(directory) = &state.directories[column.column.0 as usize]
                 && !directory.replace(Some(&entry), &[])
             {

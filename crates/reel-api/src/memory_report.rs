@@ -16,6 +16,7 @@ pub struct MemoryReport {
     pub range_deletes: ByteCount,
     pub key_runs: ByteCount,
     pub read_buffers: ByteCount,
+    pub scans: ByteCount,
     pub copy_buffers: ByteCount,
     pub compress_buffers: ByteCount,
     pub queues: ByteCount,
@@ -38,6 +39,7 @@ impl MemoryReport {
                 + self.range_deletes.0
                 + self.key_runs.0
                 + self.read_buffers.0
+                + self.scans.0
                 + self.copy_buffers.0
                 + self.compress_buffers.0
                 + self.queues.0

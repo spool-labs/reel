@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use reel_api::column_id::ColumnId;
+use reel_api::direction::Direction;
 use reel_api::reads::ValueWindow;
 use reel_api::store_error::StoreError;
 use reel_api::units::WritePlace;
@@ -13,6 +14,8 @@ use reel_api::value_list::ValueList;
 
 use crate::engine::engine_state::EngineState;
 use crate::engine::read_path::RecordWant;
+use crate::engine::scan_state::{from_key, in_range, under_prefix};
+use crate::engine::store_scan::StoreScan;
 use crate::io::Io;
 
 /// The most cues a store holds at once. A get_many holds a slot while it reads, so callers inside one count toward this
@@ -194,6 +197,30 @@ impl<Backend: Io> Cue<Backend> {
         let read = self.state.read_keys(column, keys, self.point, handovers, values, &mut scratch);
         values.put_scratch(scratch);
         read
+    }
+
+    /// Walk rows and keys from a key at this cue
+    pub fn iter_from(&self, column: ColumnId, start: &[u8], direction: Direction) -> Result<StoreScan<Backend>, StoreError> {
+        self.check_open()?;
+        StoreScan::at_cue(Arc::clone(&self.state), &from_key(column, start, direction), self.point)
+    }
+
+    /// Walk rows and keys in [start, end) at this cue
+    pub fn iter_range(
+        &self,
+        column: ColumnId,
+        start: &[u8],
+        end: &[u8],
+        direction: Direction,
+    ) -> Result<StoreScan<Backend>, StoreError> {
+        self.check_open()?;
+        StoreScan::at_cue(Arc::clone(&self.state), &in_range(column, start, end, direction), self.point)
+    }
+
+    /// Walk rows and keys under a prefix at this cue
+    pub fn iter_prefix(&self, column: ColumnId, prefix: &[u8]) -> Result<StoreScan<Backend>, StoreError> {
+        self.check_open()?;
+        StoreScan::at_cue(Arc::clone(&self.state), &under_prefix(column, prefix), self.point)
     }
 
     /// Refuse a read once the store is going, whose files are closing under it

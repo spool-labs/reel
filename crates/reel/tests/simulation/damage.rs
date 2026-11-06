@@ -25,6 +25,8 @@ use reel::segment::summary::{
 use reel::rows::row_group::parse_group;
 use reel::superblock::{Superblock, SuperblockPaths};
 use reel_api::column_id::ColumnId;
+use reel_api::direction::Direction;
+use reel_api::scan::ScanStep;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, VolumeId, WritePlace};
 use reel_api::value_list::{ValueAnswer, ValueList};
@@ -361,6 +363,43 @@ fn both_tails() {
 
     assert_eq!(store.damaged_segments(), 1);
     assert!(assert_guarded(&store, &built, Cover::Edges(MIDDLE)) > 0);
+    store.close().expect("close");
+}
+
+// a walk serves up to a damaged range and stops there with an error, and one that never reaches it ends clean
+#[test]
+fn scan_reaches_damage() {
+    let built = build(41);
+    rot_first_tail(&built, MIDDLE);
+    rot_second_tail(&built, MIDDLE);
+    let store = open(&built.io);
+    let (lowest, highest) = edges(ORDERED, MIDDLE);
+
+    for (start, direction) in [(&b""[..], Direction::Ascending), (&b"zzz"[..], Direction::Descending)] {
+        let mut scan = store.iter_from(ORDERED, start, direction).expect("scan");
+        let (mut key, mut value, mut found) = (Vec::new(), Vec::new(), 0);
+        loop {
+            match scan.next_row(&mut key, &mut value) {
+                Ok(ScanStep::Found) => {
+                    assert!(key < lowest || key > highest, "key {key:?} came from inside");
+                    found += 1;
+                },
+                Err(StoreError::Corruption { .. }) => break,
+                other => panic!("walk ended {other:?}"),
+            }
+        }
+        assert!(found > 0);
+        assert!(matches!(scan.next_row(&mut key, &mut value), Err(StoreError::Corruption { .. })));
+    }
+
+    let (start, end) = (key_of(ORDERED, 270), key_of(ORDERED, KEY_COUNT));
+    let mut scan = store.iter_range(ORDERED, &start, &end, Direction::Ascending).expect("scan");
+    let (mut key, mut value, mut found) = (Vec::new(), Vec::new(), 0);
+    while scan.next_row(&mut key, &mut value).expect("step") == ScanStep::Found {
+        found += 1;
+    }
+    assert_eq!(found, KEY_COUNT - 270);
+    drop(scan);
     store.close().expect("close");
 }
 

@@ -13,6 +13,8 @@ use reel::record::codec::Codec;
 use reel::segment::range_covers::MOST_RANGE_COVERS;
 use reel::segment::segment_tail::SECOND_TAIL_DISTANCE;
 use reel_api::column_id::ColumnId;
+use reel_api::direction::Direction;
+use reel_api::scan::ScanStep;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, VolumeId};
 use reel_api::write_batch::WriteBatch;
 use reel_sim::count_pause::CountPause;
@@ -29,6 +31,8 @@ const BUDGET: ByteCount = ByteCount(165 * 1024 * 1024);
 const LONG_ROWS: usize = 4_000;
 const LONG_VALUE: &[u8] = b"a value on each column of a long batch, a value on each column of a long batch";
 const KEYS: usize = 64;
+const KEY_BUFFER_BYTES: usize = 128;
+const SCAN_ROWS: usize = 8;
 const CHUNKED_BYTES: usize = 200_000;
 const WARM_ROUNDS: usize = 8;
 const ROUNDS: usize = 64;
@@ -52,6 +56,7 @@ struct Inputs {
     large_batch: WriteBatch,
     long_batch: WriteBatch,
     buf: Vec<u8>,
+    scan_key: Vec<u8>,
 }
 
 fn config() -> StoreConfig {
@@ -112,6 +117,19 @@ fn round(store: &Store, io: &SimulatedIo, inputs: &mut Inputs, number: usize) ->
     total += both(counted(|| store.delete_range(META, b"range-a", b"range-b").expect("delete range")));
     total += both(counted(|| store.write_batch(&inputs.batch).expect("batch")));
     total += both(counted(|| store.write_batch(&inputs.large_batch).expect("large batch")));
+    let scan_key = &mut inputs.scan_key;
+    total += both(counted(|| {
+        let mut scan = store.iter_prefix(BULK, b"key-").expect("scan");
+        while scan.next_key(scan_key).expect("step") == ScanStep::Found {}
+    }));
+    total += both(counted(|| {
+        let mut scan = store.iter_from(BULK, b"key-z", Direction::Descending).expect("scan");
+        for _row in 0..SCAN_ROWS {
+            if scan.next_row(scan_key, buf).expect("step") == ScanStep::End {
+                break;
+            }
+        }
+    }));
     let refused = counted(|| store.get(META, DAMAGED_KEY, buf).is_err());
     assert!(refused.0);
     total += both(refused);
@@ -182,6 +200,7 @@ fn no_allocations() {
         large_batch,
         long_batch,
         buf: vec![1; CHUNKED_BYTES * 2],
+        scan_key: vec![1; KEY_BUFFER_BYTES],
     };
 
     for number in 0..WARM_ROUNDS {

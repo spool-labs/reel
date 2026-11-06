@@ -35,7 +35,7 @@ use crate::rows::row_group::{
     GROUP_HEADER_BYTES, GROUP_MAGIC, GROUP_SUM_BYTES, GroupHead, RowEntry, RowWalk, parse_group, parse_head,
 };
 use crate::segment::block_entry::BlockEntry;
-use crate::segment::column_directory::DirectoryEntry;
+use crate::segment::column_directory::Listing;
 use crate::segment::damage_list::{DamagedRange, highest_of, spans_of};
 use crate::segment::range_covers::{Cover, RangeCovers, read_covers};
 use crate::segment::footer_reader::FooterReader;
@@ -514,15 +514,7 @@ impl<Backend: Io> EngineState<Backend> {
 
         volume.note_sealed(found.head.places.highest);
         for column in &found.columns {
-            let entry = DirectoryEntry {
-                shared_length: column.shared_length,
-                shared_sum: column.shared_sum,
-                lowest: column.lowest,
-                highest: column.highest,
-                reach: column.highest,
-                segment: found.head.segment,
-                newest_place: found.head.places.highest,
-            };
+            let entry = Listing::of_column(column, found.head.segment, found.head.places.highest);
             if let Some(directory) = &self.directories[column.column.0 as usize]
                 && !directory.replace(Some(&entry), &[])
             {

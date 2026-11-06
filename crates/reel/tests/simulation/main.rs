@@ -13,6 +13,7 @@ mod place_limit;
 mod range_deletes;
 mod range_apply;
 mod rewrite;
+mod scans;
 mod records;
 mod seed_sets;
 mod write_index;

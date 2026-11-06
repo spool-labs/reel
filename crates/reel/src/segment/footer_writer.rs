@@ -10,7 +10,7 @@ use crate::index::key_hash::{KeyHash, hash_key};
 use crate::io::IoFile;
 use crate::record::record_check::{Checksum, RecordKey, checksum};
 use crate::row_kind::RowKind;
-use crate::segment::block_entry::{BLOCK_ENTRY_BYTES, BlockEntry, KeyPrefix};
+use crate::segment::block_entry::{BLOCK_ENTRY_BYTES, BlockEntry, KeyPrefix, SharedHead};
 use crate::segment::block_filter::{FILTER_SUM_BYTES, add_key, filter_bytes, seal_filter};
 use crate::segment::row_block::{
     BLOCK_HEADER_BYTES, BlockHeader, FooterRow, ROW_BLOCK_BYTES, RowBlockBuilder, write_block_header,
@@ -188,6 +188,7 @@ impl FooterWriter {
             column: start.column,
             shared_length: shared as u16,
             shared_sum: checksum(&start.lowest[..shared]),
+            shared_head: SharedHead::of_shared(&start.lowest[..shared]),
             lowest: KeyPrefix::of_key(start.lowest, shared),
             highest: KeyPrefix::of_key(start.highest, shared),
             first_block: self.entries.len() as u32,

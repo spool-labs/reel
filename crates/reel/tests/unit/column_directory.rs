@@ -1,5 +1,5 @@
 use reel::record::record_check::checksum;
-use reel::segment::block_entry::KeyPrefix;
+use reel::segment::block_entry::{KeyBound, KeyPrefix};
 use reel::segment::column_directory::*;
 use reel::segment::footer_writer::shared_prefix;
 use reel::segment::segment_tail::SegmentNumber;
@@ -8,16 +8,24 @@ use reel_api::units::WritePlace;
 const CAPACITY: usize = 64;
 const MANY: u64 = 1_000;
 
-fn entry(number: u64, lowest: &[u8], highest: &[u8]) -> DirectoryEntry {
+fn entry(number: u64, lowest: &[u8], highest: &[u8]) -> Listing {
     let shared = shared_prefix(lowest, highest);
-    DirectoryEntry {
-        shared_length: shared as u16,
-        shared_sum: checksum(&lowest[..shared]),
-        lowest: KeyPrefix::of_key(lowest, shared),
-        highest: KeyPrefix::of_key(highest, shared),
-        reach: KeyPrefix::default(),
-        segment: SegmentNumber(number),
-        newest_place: WritePlace(number),
+    Listing {
+        entry: DirectoryEntry {
+            shared_length: shared as u16,
+            shared_sum: checksum(&lowest[..shared]),
+            lowest: KeyPrefix::of_key(lowest, shared),
+            highest: KeyPrefix::of_key(highest, shared),
+            reach: KeyPrefix::default(),
+            segment: SegmentNumber(number),
+            newest_place: WritePlace(number),
+        },
+        range: RangeEntry {
+            lowest: KeyBound::of_key(lowest),
+            highest: KeyBound::of_key(highest),
+            reach: 0,
+            segment: SegmentNumber(number),
+        },
     }
 }
 
@@ -137,4 +145,62 @@ fn full_directory() {
     assert!(!directory.replace(Some(&entry(2, b"d", b"f")), &[]));
 
     assert_eq!(found(&directory, b"b"), vec![1]);
+}
+
+fn meeting(directory: &ColumnDirectory, low: &[u8], high: &[u8]) -> Vec<u64> {
+    let mut out = Vec::with_capacity(CAPACITY);
+    let page = directory.overlapping(&KeyBound::of_key(low), &KeyBound::of_key(high), 0, &mut out);
+    assert!(!page.is_cut);
+    out.into_iter().map(|segment| segment.0).collect()
+}
+
+// a range finds every segment it meets, lowest first, and a gap finds none
+#[test]
+fn overlapping_ranges() {
+    let directory = ColumnDirectory::new(CAPACITY);
+    assert!(directory.replace(Some(&entry(1, b"a", b"c")), &[]));
+    assert!(directory.replace(Some(&entry(2, b"d", b"f")), &[]));
+    assert!(directory.replace(Some(&entry(3, b"b", b"z")), &[]));
+    assert!(directory.replace(Some(&entry(4, b"m", b"p")), &[]));
+
+    assert_eq!(meeting(&directory, b"a", b"z"), vec![1, 3, 2, 4]);
+    assert_eq!(meeting(&directory, b"c", b"d"), vec![1, 3, 2]);
+    assert_eq!(meeting(&directory, b"g", b"h"), vec![3]);
+    assert_eq!(meeting(&directory, b"n", b"n"), vec![3, 4]);
+    assert!(directory.replace(None, &[SegmentNumber(3)]));
+    assert_eq!(meeting(&directory, b"g", b"h"), Vec::<u64>::new());
+    assert_eq!(meeting(&directory, b"o", b"zz"), vec![4]);
+}
+
+// a page takes what fits, and the next one goes on from it
+#[test]
+fn overlapping_pages() {
+    let directory = ColumnDirectory::new(CAPACITY);
+    for number in 0..10 {
+        assert!(directory.replace(Some(&entry(number, &[number as u8], &[number as u8, 1])), &[]));
+    }
+    let (low, high) = (KeyBound::of_key(&[]), KeyBound::HIGHEST);
+    let mut out = Vec::with_capacity(4);
+    let first = directory.overlapping(&low, &high, 0, &mut out);
+    assert!(first.is_cut);
+    assert_eq!(out, [0, 1, 2, 3].map(SegmentNumber));
+    let last = directory.overlapping(&low, &high, 8, &mut out);
+    assert!(!last.is_cut);
+    assert_eq!(out, [8, 9].map(SegmentNumber));
+}
+
+// the walk's next stop is the nearest start above and the nearest end below, whatever stands wide around it
+#[test]
+fn next_stops() {
+    let directory = ColumnDirectory::new(CAPACITY);
+    assert!(directory.replace(Some(&entry(1, b"a", b"z")), &[]));
+    assert!(directory.replace(Some(&entry(2, b"c", b"d")), &[]));
+    assert!(directory.replace(Some(&entry(3, b"f", b"g")), &[]));
+    assert!(directory.replace(Some(&entry(4, b"m", b"n")), &[]));
+
+    assert_eq!(directory.next_above(&KeyBound::of_key(b"d")), Some(KeyBound::of_key(b"f")));
+    assert_eq!(directory.next_above(&KeyBound::of_key(b"m")), None);
+    assert_eq!(directory.next_below(&KeyBound::of_key(b"m")), Some(KeyBound::of_key(b"g")));
+    assert_eq!(directory.next_below(&KeyBound::of_key(b"zz")), Some(KeyBound::of_key(b"z")));
+    assert_eq!(directory.next_below(&KeyBound::of_key(b"d")), None);
 }

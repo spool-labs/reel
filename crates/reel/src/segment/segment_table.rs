@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use reel_api::column_id::ColumnId;
+use reel_api::direction::Direction;
 use reel_api::units::{ByteCount, WritePlace};
 
 use crate::pool::touched_capacity;
@@ -446,6 +447,39 @@ impl<File: Clone> SegmentTable<File> {
         let prefix = KeyPrefix::of_key(key, column_tail.shared_length as usize);
         let start = column_tail.first_block + first_candidate(lines, prefix) as u32;
         Some((start, column_tail.first_block + column_tail.block_count.0))
+    }
+
+    /// Copy out a segment's tail for a column
+    pub fn column_tail(&self, number: SegmentNumber, column: ColumnId) -> Option<ColumnTail> {
+        let guard = self.read_shard(shard_of(number));
+        let slot = guard.map.get(number)?;
+        let entry = guard.segments[slot as usize].as_ref()?;
+        guard.column_of(entry, column).copied()
+    }
+
+    /// Copy out one block line, and the highest place that replaced any of the segment's rows
+    pub fn block_line(&self, number: SegmentNumber, index: u32) -> Option<(BlockEntry, WritePlace)> {
+        let guard = self.read_shard(shard_of(number));
+        let slot = guard.map.get(number)?;
+        let entry = guard.segments[slot as usize].as_ref()?;
+        let line = guard.blocks.get(entry.blocks.start as usize + index as usize)?;
+        Some((*line, entry.highest_replacement))
+    }
+
+    /// Find the block a walk enters a column at, for a key known to start with the bytes the column shares. Going up that is
+    /// the block its rows can start in, and going down the last block that starts at or before it
+    pub fn entry_block(&self, number: SegmentNumber, tail: &ColumnTail, key: &[u8], direction: Direction) -> Option<u32> {
+        let guard = self.read_shard(shard_of(number));
+        let slot = guard.map.get(number)?;
+        let entry = guard.segments[slot as usize].as_ref()?;
+        let first = entry.blocks.start as usize + tail.first_block as usize;
+        let lines = guard.blocks.get(first..first + tail.block_count.0 as usize)?;
+        let prefix = KeyPrefix::of_key(key, tail.shared_length as usize);
+        let at = match direction {
+            Direction::Ascending => first_candidate(lines, prefix),
+            Direction::Descending => lines.partition_point(|line| line.first_key <= prefix).checked_sub(1)?,
+        };
+        Some(tail.first_block + at as u32)
     }
 
     /// Copy out the block lines that can hold a key, from a block onward

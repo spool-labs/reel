@@ -16,12 +16,15 @@ use reel::rows::row_group::parse_group;
 use reel::segment::summary::SummaryPaths;
 use reel::superblock::Superblock;
 use reel_api::column_id::ColumnId;
+use reel_api::direction::Direction;
+use reel_api::scan::ScanStep;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, VolumeId};
 use reel_api::write_batch::WriteBatch;
 
 const ROOTS: [&str; 3] = ["/disk/faults-meta", "/disk/faults-meta-two", "/disk/faults-bulk"];
 const COLUMNS: [ColumnId; 2] = [ColumnId(1), ColumnId(2)];
+const HIGHEST_KEY: &[u8] = b"zzz";
 const BUDGET: ByteCount = ByteCount(76 * 1024 * 1024);
 // a test holds each seed with a traced bug: 0 `failed_open` and `failed_close`, 1 `rows_sync` and `tail_sync`, 37 and
 // 349 `covered_last` and `later_sync`, 125 `one_copy`, 681 `tail_then_cut`, 959 `flushed_unknown`, 1000 `open_covers`, 1002
@@ -621,6 +624,55 @@ impl Run {
             versions.floor = versions.history.len() - 1;
         }
         self.check_sets(store);
+        self.check_scans(store);
+    }
+
+    // a full walk after a reopen shows what the gets showed, in both directions
+    fn check_scans(&self, store: &Store) {
+        for column in COLUMNS {
+            for direction in [Direction::Ascending, Direction::Descending] {
+                self.check_scan(store, column, direction);
+            }
+        }
+    }
+
+    fn check_scan(&self, store: &Store, column: ColumnId, direction: Direction) {
+        let mut expected: Vec<(&Vec<u8>, &Versions)> =
+            self.model.iter().filter(|((owner, _key), _versions)| *owner == column).map(|((_owner, key), versions)| (key, versions)).collect();
+        let start: &[u8] = if direction == Direction::Ascending { b"" } else { HIGHEST_KEY };
+        if direction == Direction::Descending {
+            expected.reverse();
+        }
+        let mut expected = expected.into_iter();
+        let mut scan = store.iter_from(column, start, direction).expect("scan");
+        let (mut key, mut value) = (Vec::new(), Vec::new());
+        loop {
+            let step = match scan.next_row(&mut key, &mut value) {
+                Ok(step) => step,
+                Err(StoreError::Corruption { .. }) if self.has_rot => return,
+                Err(error) => panic!("seed {}: a walk failed: {error}", self.seed),
+            };
+            if step == ScanStep::Corrupt {
+                assert!(self.has_rot, "seed {}: {key:?} corrupt with no rot", self.seed);
+            }
+            let is_end = step == ScanStep::End;
+            // a key the walk passed has no value, or an answer no get could give
+            let found = expected.by_ref().find(|(name, versions)| {
+                let is_here = !is_end && **name == key;
+                let has_value = versions.history.last().is_some_and(Option::is_some) && !versions.is_unknown();
+                assert!(is_here || !has_value, "seed {}: the walk missed {name:?}", self.seed);
+                is_here
+            });
+            if is_end {
+                return;
+            }
+            let Some((_name, versions)) = found else {
+                panic!("seed {}: the walk found {key:?} out of order or unknown", self.seed);
+            };
+            if step == ScanStep::Found && !versions.is_unknown() {
+                assert_eq!(versions.history.last(), Some(&Some(value.clone())), "seed {}: {key:?}", self.seed);
+            }
+        }
     }
 
     fn settle(&self) {

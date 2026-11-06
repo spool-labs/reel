@@ -341,6 +341,25 @@ impl FooterReader {
         Ok(FilterAnswer::of(may_contain(bits, hash)))
     }
 
+    /// Read and check a row block and keep it in the cache, or return nothing when it fails its check
+    pub fn load_block<File: IoFile>(
+        &mut self,
+        file: &File,
+        key: BlockKey,
+        entry: &BlockEntry,
+        rows: &BlockCache,
+    ) -> Result<Option<&[u8]>> {
+        let length = entry.block_length().0 as usize;
+        if length > self.block.len() || !read_or_damaged(file, entry.block_at(), &mut self.block[..length])? {
+            return Ok(None);
+        }
+        if RowBlockWalk::open(&self.block[..length], WritePlace(0)).is_none() {
+            return Ok(None);
+        }
+        rows.insert(key, &self.block[..length]);
+        Ok(Some(&self.block[..length]))
+    }
+
     /// Search a row block, reading and checking it once when the cache lacks it
     pub fn search_cached<File: IoFile>(
         &mut self,

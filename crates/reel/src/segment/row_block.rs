@@ -76,6 +76,7 @@ pub struct RowBlockWalk<'block> {
     restarts: &'block [u8],
     position: usize,
     place_base: WritePlace,
+    row_count: usize,
 }
 
 impl RowBlockBuilder {
@@ -196,11 +197,13 @@ impl<'block> RowBlockWalk<'block> {
         let restarts = u16::from_le_bytes([block[count_at], block[count_at + 1]]) as usize;
         let rows_count_at = count_at.checked_sub(COUNT_BYTES)?;
         let restarts_at = rows_count_at.checked_sub(restarts * size_of::<u16>())?;
+        let row_count = read_half(block, rows_count_at)? as usize;
         Some(Self {
             rows: &block[..restarts_at],
             restarts: &block[restarts_at..rows_count_at],
             position: 0,
             place_base,
+            row_count,
         })
     }
 
@@ -211,11 +214,13 @@ impl<'block> RowBlockWalk<'block> {
         let restarts = u16::from_le_bytes([block[count_at], block[count_at + 1]]) as usize;
         let rows_count_at = count_at.checked_sub(COUNT_BYTES)?;
         let restarts_at = rows_count_at.checked_sub(restarts * size_of::<u16>())?;
+        let row_count = read_half(block, rows_count_at)? as usize;
         Some(Self {
             rows: &block[..restarts_at],
             restarts: &block[restarts_at..rows_count_at],
             position: 0,
             place_base,
+            row_count,
         })
     }
 
@@ -270,6 +275,56 @@ impl<'block> RowBlockWalk<'block> {
             length: ByteCount(length),
             kind,
         })
+    }
+
+    /// Count the rows of a restart point's run
+    pub fn rows_at_restart(&self, index: usize) -> usize {
+        let run = RESTART_INTERVAL as usize;
+        self.row_count.saturating_sub(index * run).min(run)
+    }
+
+    /// Read a row of a run by its place in the run, leaving its key in the buffer
+    pub fn row_in_run(&mut self, restart: usize, index: usize, key: &mut Vec<u8>) -> Option<FooterRow> {
+        let mut row = self.key_at_restart(restart, key)?;
+        for _row in 0..index {
+            row = self.next_row(key)?;
+        }
+        Some(row)
+    }
+
+    /// Find the last run with a row at or before a key, and count that run's rows there, or return nothing when no row is
+    pub fn seek_back(&mut self, target: &[u8], is_inclusive: bool, key: &mut Vec<u8>) -> Option<(usize, usize)> {
+        let is_before = |row_key: &[u8]| row_key < target || (is_inclusive && row_key == target);
+        if self.restart_count() == 0 {
+            return None;
+        }
+        self.key_at_restart(0, key)?;
+        if !is_before(key) {
+            return None;
+        }
+
+        let mut low = 0;
+        let mut high = self.restart_count();
+        while low + 1 < high {
+            let middle = (low + high) / 2;
+            self.key_at_restart(middle, key)?;
+            if is_before(key) {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+
+        self.key_at_restart(low, key)?;
+        let mut rows = 1;
+        while rows < self.rows_at_restart(low) {
+            self.next_row(key)?;
+            if !is_before(key) {
+                break;
+            }
+            rows += 1;
+        }
+        Some((low, rows))
     }
 
     /// Read the key at a restart point, leaving the walk there

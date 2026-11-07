@@ -1,14 +1,18 @@
 //! A landed mark a volume: a write waits for its own volume alone, and a cue still holds one moment across them
 
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::thread;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::cue::Cue;
 use reel::engine::reel_store::ReelStore;
 use reel::engine::write_path::ClaimRequest;
+use reel::guard::hold;
 use reel::record::codec::Codec;
+use reel::segment::segment_tail::SegmentNumber;
 use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, Nanoseconds, RowCount, VolumeId};
+use reel_api::units::{ByteCount, Nanoseconds, RowCount, VolumeId, WritePlace};
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_io::SimulatedIo;
 
@@ -214,7 +218,7 @@ fn seal_passes_a_write_in_flight() {
     let claim = store.state.claim(&store.state.volumes[0], &ONE_ROW).expect("claim");
     store.state.seal_fullest(&store.state.volumes[1]);
     settle(&io);
-    let seals = store.state.volumes[1].seals_done.load(std::sync::atomic::Ordering::Acquire);
+    let seals = store.state.volumes[1].seals_done.load(Ordering::Acquire);
     assert_eq!(seals, 1);
     assert_eq!(read(&store, META, b"key"), Some(b"value".to_vec()));
     drop(claim);
@@ -231,5 +235,145 @@ fn places_stay_store_wide() {
     store.put(META, b"key", b"value").expect("put");
     let meta = store.state.volumes[1].order.mark();
     assert!(meta > bulk);
+    store.close().expect("close");
+}
+
+fn seal_meta(store: &Store2, io: &SimulatedIo) -> SegmentNumber {
+    let number = hold(&store.state.volumes[1].claims).open[0].number;
+    store.state.seal_fullest(&store.state.volumes[1]);
+    settle(io);
+    number
+}
+
+// a cue cut around a put held up on meta: its meta point stands below that put and its bulk point past it
+fn cue_around_put(store: &Store2, key: &[u8], value: &[u8]) -> Cue<SimulatedIo> {
+    let meta = &store.state.volumes[1];
+    let earlier = store.state.claim(meta, &ONE_ROW).expect("claim");
+    thread::scope(|scope| {
+        let writer = scope.spawn(|| store.put(META, key, value));
+        let place = loop {
+            if let Some(row) = store.state.index.lookup(META, key, WritePlace(u64::MAX), meta.view()).row {
+                break row.place;
+            }
+            thread::yield_now();
+        };
+        store.put(BULK, b"past", b"value").expect("put");
+        let cue = store.cue().expect("cue");
+        assert!(cue.point_of(META).expect("point") < place);
+        assert!(cue.point_of(BULK).expect("point") > place);
+        drop(earlier);
+        writer.join().expect("join").expect("put");
+        cue
+    })
+}
+
+// a cue cut after a bulk write that stands between a meta key's two rows, so its bulk point sits between them and its meta
+// point sits past them
+fn cue_past_rows(store: &Store2, keys: &[&[u8]], value: &[u8]) -> Cue<SimulatedIo> {
+    store.put(BULK, b"between", b"value").expect("put");
+    for key in keys {
+        store.put(META, key, value).expect("put");
+    }
+    let cue = store.cue().expect("cue");
+    assert!(cue.point_of(BULK).expect("point") < cue.point_of(META).expect("point"));
+    cue
+}
+
+// meta's rows of one sealed segment, with a live row, and the key a cue will hold written last
+fn write_older(store: &Store2, io: &SimulatedIo) -> SegmentNumber {
+    for key in [&b"keep"[..], b"b", b"c", b"d", b"a"] {
+        store.put(META, key, b"first").expect("put");
+    }
+    seal_meta(store, io)
+}
+
+fn release_compaction(store: &Store2, io: &SimulatedIo) {
+    store.state.volumes[1].is_compaction_held.store(false, Ordering::Release);
+    store.state.ask_compaction();
+    settle(io);
+}
+
+// a cue's low point on the second volume keeps a dead segment there, with its point on the first past every replacement
+#[test]
+fn second_point_holds_an_unlink() {
+    let io = SimulatedIo::new(Seed(9));
+    let store = open(&io);
+    store.put(META, b"key", b"older").expect("put");
+    let older = seal_meta(&store, &io);
+    let cue = cue_around_put(&store, b"key", b"newer");
+    seal_meta(&store, &io);
+
+    let meta = &store.state.volumes[1];
+    assert!(meta.table.holds(older));
+    let mut buf = Vec::new();
+    assert!(cue.get(META, b"key", &mut buf).expect("get"));
+    assert_eq!(buf, b"older");
+
+    drop(cue);
+    settle(&io);
+    assert!(!meta.table.holds(older));
+    store.close().expect("close");
+}
+
+// a cue's low point on the first volume holds no dead segment back on the second
+#[test]
+fn first_point_holds_no_unlink() {
+    let io = SimulatedIo::new(Seed(10));
+    let store = open(&io);
+    store.put(META, b"key", b"older").expect("put");
+    let older = seal_meta(&store, &io);
+    let cue = cue_past_rows(&store, &[b"key"], b"newer");
+    seal_meta(&store, &io);
+
+    assert!(!store.state.volumes[1].table.holds(older));
+    let mut buf = Vec::new();
+    assert!(cue.get(META, b"key", &mut buf).expect("get"));
+    assert_eq!(buf, b"newer");
+    drop(cue);
+    store.close().expect("close");
+}
+
+// a rewrite on the second volume keeps a replaced row a cue reads there, with the cue's point on the first past the replacement
+#[test]
+fn second_point_keeps_a_row() {
+    let io = SimulatedIo::new(Seed(11));
+    let store = open(&io);
+    let meta = &store.state.volumes[1];
+    meta.is_compaction_held.store(true, Ordering::Release);
+    let older = write_older(&store, &io);
+    for key in [&b"b"[..], b"c", b"d"] {
+        store.put(META, key, b"second").expect("put");
+    }
+    let cue = cue_around_put(&store, b"a", b"second");
+    seal_meta(&store, &io);
+    release_compaction(&store, &io);
+
+    assert!(!meta.table.holds(older));
+    assert_eq!(read(&store, META, b"a"), Some(b"second".to_vec()));
+    assert_eq!(read(&store, META, b"keep"), Some(b"first".to_vec()));
+    let mut buf = Vec::new();
+    assert!(cue.get(META, b"a", &mut buf).expect("get"));
+    assert_eq!(buf, b"first");
+    drop(cue);
+    store.close().expect("close");
+}
+
+// a rewrite on the second volume drops a replaced row with only the cue's point on the first between its two rows
+#[test]
+fn first_point_keeps_no_row() {
+    let io = SimulatedIo::new(Seed(12));
+    let store = open(&io);
+    let meta = &store.state.volumes[1];
+    meta.is_compaction_held.store(true, Ordering::Release);
+    let older = write_older(&store, &io);
+    let cue = cue_past_rows(&store, &[b"a", b"b", b"c", b"d"], b"second");
+    seal_meta(&store, &io);
+    release_compaction(&store, &io);
+
+    assert!(!meta.table.holds(older));
+    let output = hold(&meta.summary).rows().map(|row| row.facts.segment).max().expect("a row");
+    let rows = hold(&meta.summary).get(output).expect("a row").cursor().column().expect("a column").dead_rows.0;
+    assert_eq!(rows, 0);
+    drop(cue);
     store.close().expect("close");
 }

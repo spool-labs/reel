@@ -1,3 +1,7 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+
+use reel::index::key_hash::KeyHash;
 use reel::segment::filter_arena::*;
 use reel::segment::segment_tail::SegmentNumber;
 use reel_api::units::ByteCount;
@@ -12,7 +16,7 @@ fn arena() -> FilterArena {
 }
 
 fn stored(arena: &FilterArena, segment: SegmentNumber, offset: u32) -> Option<Vec<u8>> {
-    arena.with_filter(segment, offset, <[u8]>::to_vec)
+    arena.copy_filter(segment, offset)
 }
 
 // a block's bits come back by its offset, and an offset it never held finds nothing
@@ -96,4 +100,67 @@ fn tiny_share() {
 fn heap_inside_the_share() {
     let share = ByteCount(1024 * 1024);
     assert!(FilterArena::new(share, 1_000_000).heap_bytes() <= share);
+}
+
+const LOW_PATTERN: u8 = 0x5A;
+const HIGH_PATTERN: u8 = 0xA5;
+const PATTERN_BYTES: usize = 1_024;
+const RACE_OFFSET: u32 = 100;
+const RACE_ROUNDS: u64 = 20_000;
+const RACE_READERS: usize = 3;
+
+fn fill(arena: &FilterArena, segment: SegmentNumber, pattern: u8) {
+    assert!(arena.begin(segment, 1, PATTERN_BYTES as u32));
+    arena.add(segment, RACE_OFFSET, &[pattern; PATTERN_BYTES]);
+}
+
+// a reader racing a drop and a reload of the same room only ever answers from the segment it asked for, or not at all
+#[test]
+fn race_answers_from_the_asked_segment() {
+    let arena = FilterArena::new(ByteCount(64 * 1024), SEGMENTS);
+    let is_done = AtomicBool::new(false);
+    fill(&arena, FIRST, LOW_PATTERN);
+    thread::scope(|scope| {
+        let readers: Vec<_> = (0..RACE_READERS)
+            .map(|_reader| {
+                scope.spawn(|| {
+                    let (mut answers, mut misses) = (0_u64, 0_u64);
+                    while !is_done.load(Ordering::Acquire) {
+                        match arena.copy_filter(FIRST, RACE_OFFSET) {
+                            Some(bits) => {
+                                assert!(bits.iter().all(|byte| *byte == LOW_PATTERN), "a probe read another segment's bytes");
+                                answers += 1;
+                            },
+                            None => misses += 1,
+                        }
+                    }
+                    (answers, misses)
+                })
+            })
+            .collect();
+        for _round in 0..RACE_ROUNDS {
+            arena.drop_segment(FIRST);
+            fill(&arena, SECOND, HIGH_PATTERN);
+            arena.drop_segment(SECOND);
+            fill(&arena, FIRST, LOW_PATTERN);
+        }
+        is_done.store(true, Ordering::Release);
+        let (answers, misses) = readers.into_iter().map(|reader| reader.join().expect("join")).fold((0, 0), |sum, one| (sum.0 + one.0, sum.1 + one.1));
+        assert!(answers > 0 && misses > 0, "{answers} answers and {misses} misses");
+    });
+}
+
+// a filling extent answers nothing, and a probe for a block it doesn't hold is no verdict
+#[test]
+fn probe_says_nothing_it_cant_prove() {
+    let arena = arena();
+    let hash = KeyHash(7);
+    assert!(arena.begin(FIRST, 2, 8));
+    arena.add(FIRST, 100, &[0xFF; 4]);
+    assert_eq!(arena.probe(FIRST, 100, hash), None);
+    arena.add(FIRST, 200, &[0; 4]);
+    assert_eq!(arena.probe(FIRST, 100, hash), Some(true));
+    assert_eq!(arena.probe(FIRST, 200, hash), Some(false));
+    assert_eq!(arena.probe(FIRST, 150, hash), None);
+    assert_eq!(arena.probe(SECOND, 100, hash), None);
 }

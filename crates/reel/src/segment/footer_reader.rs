@@ -336,7 +336,7 @@ impl FooterReader {
             offset: entry.filter_offset,
         };
         let hash = query.hash;
-        if let Some(may_hold) = caches.resident.with_filter(segment, entry.filter_offset, |bits| may_contain(bits, hash)) {
+        if let Some(may_hold) = caches.resident.probe(segment, entry.filter_offset, hash) {
             return Ok(FilterAnswer::of(may_hold));
         }
         if let Some(may_hold) = caches.filters.with(key, |bits| may_contain(bits, hash)) {

@@ -69,6 +69,25 @@ pub fn may_contain(filter: &[u8], hash: KeyHash) -> bool {
     true
 }
 
+/// Check whether a key may be in a filter read a byte at a time, or say nothing when a byte can't be read
+pub fn may_contain_bytes(length: usize, byte_at: impl Fn(usize) -> Option<u8>, hash: KeyHash) -> Option<bool> {
+    if length == 0 {
+        return Some(false);
+    }
+
+    let bits = length as u64 * u64::from(u8::BITS);
+    let stride = probe_stride(hash);
+    let mut probe = hash.0;
+    for _round in 0..PROBE_COUNT {
+        let bit = probe % bits;
+        if byte_at((bit / u64::from(u8::BITS)) as usize)? & (1 << (bit % u64::from(u8::BITS))) == 0 {
+            return Some(false);
+        }
+        probe = probe.wrapping_add(stride);
+    }
+    Some(true)
+}
+
 /// Pick the odd stride between a key's probes
 pub fn probe_stride(hash: KeyHash) -> u64 {
     (hash.0 >> STRIDE_SHIFT) | 1

@@ -17,6 +17,8 @@ use std::time::Duration;
 use reel::engine::reel_store::ReelStore;
 use reel::engine::walk_job::FREE_IN_PLACE_BYTES;
 use reel::io::plain::PlainIo;
+use reel::segment::filter_arena::FilterArena;
+use reel::segment::segment_tail::SegmentNumber;
 use reel_api::direction::Direction;
 use reel_api::scan::ScanStep;
 use reel_api::store_error::StoreError;
@@ -55,6 +57,13 @@ const MOST_WINDOW_ROUNDS: usize = 20 * ROUNDS;
 const SEAL_WAIT: Duration = Duration::from_millis(1);
 const MOST_SEAL_WAITS: u32 = 20_000;
 const MOST_SITES: u64 = 8;
+const ARENA_SHARE: ByteCount = ByteCount(64 * 1024);
+const ARENA_SEGMENTS: usize = 8;
+const ARENA_BLOCK_BYTES: usize = 1_024;
+const ARENA_OFFSET: u32 = 100;
+const ARENA_READERS: usize = 3;
+const ARENA_ROUNDS: u64 = 20_000;
+const LOW_PATTERN: u8 = 0x5A;
 const STAT_BYTES: usize = 1_024;
 const STAT_PATH: &str = "/proc/self/stat";
 const MINOR_FAULTS_FIELD: usize = 7;
@@ -566,11 +575,41 @@ fn prepare(root: &Path) {
     assert!(status.success());
 }
 
+// readers on real threads race a drop and a reload of one extent's room, and only ever answer from the segment they asked for
+fn check_arena_race() {
+    let arena = FilterArena::new(ARENA_SHARE, ARENA_SEGMENTS);
+    let fill = |segment: SegmentNumber, pattern: u8| {
+        assert!(arena.begin(segment, 1, ARENA_BLOCK_BYTES as u32));
+        arena.add(segment, ARENA_OFFSET, &[pattern; ARENA_BLOCK_BYTES]);
+    };
+    let is_done = AtomicBool::new(false);
+    fill(SegmentNumber(1), LOW_PATTERN);
+    thread::scope(|scope| {
+        for _reader in 0..ARENA_READERS {
+            scope.spawn(|| {
+                while !is_done.load(Ordering::Acquire) {
+                    if let Some(bits) = arena.copy_filter(SegmentNumber(1), ARENA_OFFSET) {
+                        assert!(bits.iter().all(|byte| *byte == LOW_PATTERN), "a probe read another segment's bytes");
+                    }
+                }
+            });
+        }
+        for _round in 0..ARENA_ROUNDS {
+            arena.drop_segment(SegmentNumber(1));
+            fill(SegmentNumber(2), !LOW_PATTERN);
+            arena.drop_segment(SegmentNumber(2));
+            fill(SegmentNumber(1), LOW_PATTERN);
+        }
+        is_done.store(true, Ordering::Release);
+    });
+}
+
 fn main() {
     if let Some(root) = env::var_os(PREPARE_ROOT) {
         damage(Path::new(&root), &inputs());
         return;
     }
+    check_arena_race();
 
     let root = scratch_root();
     let cleanup = ScratchRoot(root.clone());

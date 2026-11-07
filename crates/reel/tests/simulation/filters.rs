@@ -175,7 +175,7 @@ fn rotted_filter_stays_out() {
 
     let store = open(&io);
     settle(&io);
-    assert!(store.state.filter_arena.with_filter(segment, line.filter_offset, |_bits| ()).is_none());
+    assert!(store.state.filter_arena.copy_filter(segment, line.filter_offset).is_none());
     store.close().expect("close");
 }
 

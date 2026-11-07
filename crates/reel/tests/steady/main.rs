@@ -612,7 +612,21 @@ fn check_arena_race() {
     });
 }
 
+// a host's reclaim takes resident pages back and the next touch counts as a fault, so a page stays once it's touched. A page
+// nothing has touched still faults, which is the fault this test looks for
+#[cfg(target_os = "linux")]
+fn lock_touched_pages() {
+    let locked = unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE | libc::MCL_ONFAULT) };
+    if locked != 0 {
+        println!("pages stay unlocked, so a host's reclaim can show as faults");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn lock_touched_pages() {}
+
 fn main() {
+    lock_touched_pages();
     if let Some(root) = env::var_os(PREPARE_ROOT) {
         damage(Path::new(&root), &inputs());
         return;

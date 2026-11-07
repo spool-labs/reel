@@ -617,13 +617,14 @@ fn check_arena_race() {
 #[cfg(target_os = "linux")]
 fn lock_touched_pages() {
     let locked = unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE | libc::MCL_ONFAULT) };
-    if locked != 0 {
-        println!("pages stay unlocked, so a host's reclaim can show as faults");
-    }
+    println!("touched pages {}", if locked == 0 { "locked" } else { "unlocked" });
+    assert_eq!(locked, 0, "steady needs its pages locked: raise the memlock limit");
 }
 
 #[cfg(not(target_os = "linux"))]
-fn lock_touched_pages() {}
+fn lock_touched_pages() {
+    println!("touched pages unlocked");
+}
 
 fn main() {
     lock_touched_pages();

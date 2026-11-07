@@ -455,3 +455,23 @@ fn read_future_size() {
     drop(read);
     store.close().expect("close");
 }
+
+// a caller woken by a release and dropped with no poll hands the wake to the caller behind it
+#[test]
+fn unused_wake_passes_on() {
+    let (_io, store) = ringed(35);
+    let ring = ring(&store);
+    let mut seats: Vec<_> = (0..RING_READS).map(|_seat| ring.try_seat().expect("open").expect("a free seat")).collect();
+    let mut first = Box::pin(ring.seat());
+    assert!(first.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+    let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+    let waker = Waker::from(Arc::clone(&wakes));
+    let mut context = Context::from_waker(&waker);
+    let mut second = pin!(ring.seat());
+    assert!(second.as_mut().poll(&mut context).is_pending());
+
+    drop(seats.pop());
+    assert_eq!(wakes.0.load(Ordering::Acquire), 0);
+    drop(first);
+    assert_eq!(wakes.0.load(Ordering::Acquire), 1, "a seat is free and the caller in line sleeps");
+}

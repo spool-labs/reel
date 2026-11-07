@@ -13,6 +13,7 @@ use reel::engine::read_path::RecordWant;
 use reel::engine::reel_store::ReelStore;
 use reel::engine::ring_job::RingReaper;
 use reel::engine::scan_state::MOST_SCANS;
+use reel::guard::hold;
 use reel::io::InPlace;
 use reel::io::job::{Job, JobStep};
 use reel::io::ring::{RING_READS, RING_SLOT_BYTES, RING_SLOTS, ReadRing};
@@ -25,6 +26,7 @@ use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, Nanoseconds, VolumeId};
 use reel_api::value_list::{ValueAnswer, ValueList};
 use reel_sim::seeded_random::Seed;
+use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_io::SimulatedIo;
 use reel_sim::simulated_ring::SimulatedRing;
 
@@ -37,6 +39,7 @@ const TICK: Nanoseconds = Nanoseconds(1_000_000);
 const STEPS: u64 = 400_000;
 const KEYS: u64 = 3_000;
 const MANY_READS: u64 = 3 * RING_SLOTS as u64;
+const OVERLAPPING: u64 = 4;
 const MOST_FUTURE_BYTES: usize = 64 * 1024;
 
 type Store2 = ReelStore<SimulatedIo>;
@@ -534,6 +537,109 @@ fn half_warm_read_answers_whole() {
     let mut buf = b"left over".to_vec();
     assert!(run(&io, Reads::get_async(&store, COLUMN, &name, &mut buf)).expect("get"));
     assert_eq!(buf, value(25));
+    store.close().expect("close");
+}
+
+// segments that overlap with the key in the oldest, so a walk probes the newer ones and finds it last
+fn key_under_overlap(seed: u64) -> (SimulatedIo, Store2) {
+    let io = SimulatedIo::new(Seed(seed));
+    io.use_ring();
+    let store = open(&io);
+    store.put(COLUMN, b"m-key", b"value").expect("put");
+    store.put(COLUMN, b"a-low", b"low").expect("put");
+    store.put(COLUMN, b"z-high", b"high").expect("put");
+    store.seal_now();
+    settle(&io);
+    for round in 0..OVERLAPPING {
+        store.put(COLUMN, b"a-low", &[round as u8]).expect("put");
+        store.put(COLUMN, b"z-high", &[round as u8]).expect("put");
+        store.seal_now();
+        settle(&io);
+    }
+    store.close().expect("close");
+    drop(store);
+    let store = open(&io);
+    settle(&io);
+    (io, store)
+}
+
+fn try_deltas(io: &SimulatedIo, before: (OperationCount, OperationCount, OperationCount)) -> (u64, u64, u64) {
+    let after = io.try_counts();
+    (after.0.0 - before.0.0, after.1.0 - before.1.0, after.2.0 - before.2.0)
+}
+
+// a cold get pays one failed try, and the ring pass reads each thing once from where the try stopped
+#[test]
+fn cold_get_tries_once() {
+    let (io, store) = key_under_overlap(40);
+    let mut buf = Vec::new();
+    let before = io.try_counts();
+    assert!(run(&io, Reads::get_async(&store, COLUMN, b"m-key", &mut buf)).expect("get"));
+    assert_eq!(buf, b"value");
+    let (tries, cold, ring_reads) = try_deltas(&io, before);
+    assert_eq!(cold, 1);
+    assert_eq!(tries, 1, "one failed try and none in the ring pass");
+    assert_eq!(ring_reads, 2, "a row block and a record");
+    store.close().expect("close");
+}
+
+// a warm get tries every read and never meets the ring
+#[test]
+fn warm_get_tries_every_read() {
+    let (io, store) = key_under_overlap(41);
+    io.set_warm_bytes(usize::MAX);
+    let mut buf = Vec::new();
+    let before = io.try_counts();
+    assert!(run(&io, Reads::get_async(&store, COLUMN, b"m-key", &mut buf)).expect("get"));
+    let (tries, cold, ring_reads) = try_deltas(&io, before);
+    assert_eq!((tries, cold, ring_reads), (2, 0, 0));
+    store.close().expect("close");
+}
+
+// a get whose row block was warm and whose record wasn't reads no block twice and walks the filters once
+#[test]
+fn ring_pass_goes_on_from_the_try() {
+    let (io, store) = key_under_overlap(42);
+    io.set_warm_tries(1);
+    let mut buf = Vec::new();
+    let before = io.try_counts();
+    assert!(run(&io, Reads::get_async(&store, COLUMN, b"m-key", &mut buf)).expect("get"));
+    assert_eq!(buf, b"value");
+    let (tries, cold, ring_reads) = try_deltas(&io, before);
+    assert_eq!((tries, cold, ring_reads), (2, 1, 1), "the block came warm and only the record went to the ring");
+    let walked_again = store.state.ring_footer_readers.with(|reader| reader.asked);
+    assert_eq!(walked_again, 0);
+    store.close().expect("close");
+}
+
+// a candidate that retires between the try and the ring pass moves the list, so the get starts over and answers right
+#[test]
+fn ring_pass_starts_over_on_a_moved_list() {
+    let (io, store) = key_under_overlap(43);
+    let candidate = hold(&store.state.volumes[0].summary).rows().map(|row| row.facts.segment).max().expect("a row");
+    let ring = ring(&store);
+    let seats: Vec<_> = (0..RING_READS).map(|_seat| ring.try_seat().expect("open").expect("a free seat")).collect();
+    let mut buf = Vec::new();
+    {
+        let mut read = pin!(Reads::get_async(&store, COLUMN, b"m-key", &mut buf));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(read.as_mut().poll(&mut context).is_pending());
+
+        store.put(COLUMN, b"a-low", b"later").expect("put");
+        store.put(COLUMN, b"z-high", b"later").expect("put");
+        store.seal_now();
+        settle(&io);
+        assert!(!store.state.volumes[0].table.holds(candidate));
+        drop(seats);
+        for _step in 0..STEPS {
+            if let Poll::Ready(found) = read.as_mut().poll(&mut context) {
+                assert!(found.expect("get"));
+                break;
+            }
+            step(&io);
+        }
+    }
+    assert_eq!(buf, b"value");
     store.close().expect("close");
 }
 

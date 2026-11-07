@@ -13,7 +13,7 @@ use std::task::{Context, Poll, Waker};
 use reel_api::units::{ByteCount, FileOffset};
 
 use crate::guard::hold;
-use crate::io::{DeviceReads, IoFile};
+use crate::io::{DeviceReads, IoFile, WalkMark};
 use crate::pool::touched_queue;
 
 /// Reads a ring holds in flight at once
@@ -234,7 +234,14 @@ pub struct RingSeat<'ring, Driver> {
 
 /// Reads that complete through a ring, so a caller waits with no thread held
 #[derive(Debug)]
-pub struct OnRing<'ring, Driver>(pub &'ring ReadRing<Driver>);
+pub struct OnRing<'ring, Driver>(pub &'ring ReadRing<Driver>, pub Option<&'ring WalkMark>);
+
+impl<Driver> OnRing<'_, Driver> {
+    /// Check this get's try already met a read that would block, so its reads go to the ring with no try of their own
+    pub fn is_cold(&self) -> bool {
+        self.1.is_some()
+    }
+}
 
 impl<Driver> ReadRing<Driver> {
     /// Build a ring on a driver, with every slot allocated
@@ -350,14 +357,14 @@ impl<Driver> ReadRing<Driver> {
     }
 
     /// Fill a buffer a slot at a time
-    pub async fn read_into<File>(&self, file: &File, offset: FileOffset, buf: &mut [u8]) -> Result<()>
+    pub async fn read_into<File>(&self, file: &File, offset: FileOffset, buf: &mut [u8], is_cold: bool) -> Result<()>
     where
         Driver: RingDriver<File>,
         File: IoFile + Sync,
     {
         let mut done = 0;
         // what the kernel holds answers here, with no submit and no wake
-        while done < buf.len() {
+        while !is_cold && done < buf.len() {
             match file.try_read_at(FileOffset(offset.0 + done as u64), &mut buf[done..]) {
                 Ok(Some(ByteCount(count))) if count > 0 => done += count as usize,
                 Ok(Some(_) | None) | Err(_) => break,
@@ -375,19 +382,19 @@ impl<Driver> ReadRing<Driver> {
     }
 
     /// Fill parts in one read when a slot holds them all, and part by part when one doesn't
-    pub async fn read_into_parts<File>(&self, file: &File, offset: FileOffset, parts: &mut [IoSliceMut<'_>]) -> Result<()>
+    pub async fn read_into_parts<File>(&self, file: &File, offset: FileOffset, parts: &mut [IoSliceMut<'_>], is_cold: bool) -> Result<()>
     where
         Driver: RingDriver<File>,
         File: IoFile + Sync,
     {
         let total: usize = parts.iter().map(|part| part.len()).sum();
-        if matches!(file.try_read_parts_at(offset, parts), Ok(Some(ByteCount(count))) if count == total as u64) {
+        if !is_cold && matches!(file.try_read_parts_at(offset, parts), Ok(Some(ByteCount(count))) if count == total as u64) {
             return Ok(());
         }
         if total > RING_SLOT_BYTES {
             let mut at = offset.0;
             for part in parts {
-                self.read_into(file, FileOffset(at), part).await?;
+                self.read_into(file, FileOffset(at), part, is_cold).await?;
                 at += part.len() as u64;
             }
             return Ok(());
@@ -400,7 +407,7 @@ impl<Driver> ReadRing<Driver> {
             drop(lease);
             let mut at = offset.0;
             for part in parts {
-                self.read_into(file, FileOffset(at), part).await?;
+                self.read_into(file, FileOffset(at), part, is_cold).await?;
                 at += part.len() as u64;
             }
             return Ok(());
@@ -465,14 +472,18 @@ impl<Driver> Drop for RingSeat<'_, Driver> {
 
 impl<File: IoFile, Driver: RingDriver<File>> DeviceReads<File> for OnRing<'_, Driver> {
     fn read_exact(&self, file: &File, offset: FileOffset, buf: &mut [u8]) -> impl Future<Output = Result<()>> + Send {
-        self.0.read_into(file, offset, buf)
+        self.0.read_into(file, offset, buf, self.is_cold())
     }
 
     fn read_parts(&self, file: &File, offset: FileOffset, parts: &mut [IoSliceMut<'_>]) -> impl Future<Output = Result<()>> + Send {
-        self.0.read_into_parts(file, offset, parts)
+        self.0.read_into_parts(file, offset, parts, self.is_cold())
     }
 
     fn holds_across_waits(&self) -> bool {
         true
+    }
+
+    fn resume_mark(&self) -> Option<&WalkMark> {
+        self.1
     }
 }

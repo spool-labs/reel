@@ -189,7 +189,7 @@ impl IoFile for SimulatedFile {
     }
 
     fn try_read_at(&self, offset: FileOffset, buf: &mut [u8]) -> Result<Option<ByteCount>> {
-        let warm = hold(&self.disk).warm_bytes.min(buf.len());
+        let warm = hold(&self.disk).take_try(buf.len());
         if warm == 0 {
             return Ok(None);
         }
@@ -198,7 +198,7 @@ impl IoFile for SimulatedFile {
 
     fn try_read_parts_at(&self, offset: FileOffset, parts: &mut [IoSliceMut]) -> Result<Option<ByteCount>> {
         let total: usize = parts.iter().map(|part| part.len()).sum();
-        if hold(&self.disk).warm_bytes < total {
+        if hold(&self.disk).take_try(total) < total {
             return Ok(None);
         }
         self.read_parts_at(offset, parts)?;

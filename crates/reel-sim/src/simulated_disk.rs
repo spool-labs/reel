@@ -97,6 +97,10 @@ pub struct SimulatedDisk {
     pub reads: OperationCount,
     pub writeback_bytes: u64,
     pub warm_bytes: usize,
+    pub warm_tries: u64,
+    pub tries: OperationCount,
+    pub cold_tries: OperationCount,
+    pub ring_reads: OperationCount,
     pub writes: OperationCount,
     pub bytes_read: ByteCount,
     pub operations_until_crash: Option<OperationCount>,
@@ -139,6 +143,10 @@ impl SimulatedDisk {
             reads: OperationCount::default(),
             writeback_bytes: 0,
             warm_bytes: 0,
+            warm_tries: 0,
+            tries: OperationCount::default(),
+            cold_tries: OperationCount::default(),
+            ring_reads: OperationCount::default(),
             writes: OperationCount::default(),
             bytes_read: ByteCount::default(),
             operations_until_crash: None,
@@ -377,6 +385,20 @@ impl SimulatedDisk {
         }
         self.file_sync_fault = None;
         true
+    }
+
+    /// Count a try, and say how many bytes of a read the kernel holds
+    pub fn take_try(&mut self, wanted: usize) -> usize {
+        self.tries = OperationCount(self.tries.0 + 1);
+        if self.warm_tries > 0 {
+            self.warm_tries -= 1;
+            return wanted;
+        }
+        let warm = self.warm_bytes.min(wanted);
+        if warm < wanted {
+            self.cold_tries = OperationCount(self.cold_tries.0 + 1);
+        }
+        warm
     }
 
     /// Close a handle, and count a second close as a fault

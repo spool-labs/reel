@@ -45,6 +45,7 @@ impl RingDriver<SimulatedFile> for SimulatedRing {
     fn start(&self, slot: usize, file: &SimulatedFile, offset: FileOffset, length: usize) -> Result<()> {
         let _pause = CountPause::new();
         hold(&self.waiting).push(WaitingRead { slot, file: file.clone(), offset, length });
+        self.io.note_ring_read();
         self.io.wake_jobs(RING_JOB);
         Ok(())
     }

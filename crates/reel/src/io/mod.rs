@@ -14,13 +14,18 @@ use std::future::{Future, pending, ready};
 use std::io::{IoSlice, IoSliceMut, Result};
 use std::path::{Path, PathBuf};
 use std::pin::pin;
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 
-use reel_api::units::{ByteCount, FileOffset, Nanoseconds};
+use reel_api::units::{ByteCount, FileOffset, Nanoseconds, WritePlace};
 
+use crate::engine::read_path::SealedRow;
 use crate::io::job::Job;
 use crate::io::lock_outcome::LockOutcome;
 use crate::io::ring::RingDriver;
+use crate::row_kind::RowKind;
+use crate::segment::row_block::FooterRow;
+use crate::segment::segment_tail::SegmentNumber;
 
 /// One open file, whose handles clone with no allocation
 pub trait IoFile: Clone + Send + Sync {
@@ -82,6 +87,70 @@ impl<Device, Target> Clone for ReadOn<'_, Device, Target> {
 
 impl<Device, Target> Copy for ReadOn<'_, Device, Target> {}
 
+/// How far a try's walk over a key's segments got. It lives in the get's own future, so the ring pass goes on from the read that
+/// would block, and starts over when the list moved under it
+#[derive(Debug, Default)]
+pub struct WalkMark {
+    generation: AtomicU64,
+    next: AtomicUsize,
+    best_segment: AtomicU64,
+    best_place: AtomicU64,
+    best_offset: AtomicU64,
+    best_length: AtomicU64,
+    best_kind: AtomicU8,
+    best_block: AtomicU32,
+}
+
+/// Where a ring pass goes on from
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WalkResume {
+    pub next: usize,
+    pub best: Option<SealedRow>,
+}
+
+impl WalkMark {
+    /// Note the walk is about to ask a segment of its first page, and the bound on overlap keeps a walk there. A generation of zero
+    /// means no walk has run, so the count is kept one above it
+    pub fn note(&self, generation: u64, next: usize) {
+        self.generation.store(generation + 1, Ordering::Relaxed);
+        self.next.store(next, Ordering::Relaxed);
+    }
+
+    /// Forget the place, for a walk past its first page
+    pub fn clear(&self) {
+        self.generation.store(0, Ordering::Relaxed);
+    }
+
+    /// Note the newest row so far
+    pub fn note_best(&self, row: &SealedRow) {
+        self.best_segment.store(row.segment.0 + 1, Ordering::Relaxed);
+        self.best_place.store(row.row.place.0, Ordering::Relaxed);
+        self.best_offset.store(row.row.offset.0, Ordering::Relaxed);
+        self.best_length.store(row.row.length.0, Ordering::Relaxed);
+        self.best_kind.store(row.row.kind.as_byte(), Ordering::Relaxed);
+        self.best_block.store(row.block_offset, Ordering::Relaxed);
+    }
+
+    /// Take the place a try left, when the list still stands as it saw it. It goes either way, so a read that starts over walks whole
+    pub fn take(&self, generation: u64) -> Option<WalkResume> {
+        if self.generation.swap(0, Ordering::Relaxed) != generation + 1 {
+            return None;
+        }
+        let segment = self.best_segment.load(Ordering::Relaxed);
+        let best = segment.checked_sub(1).and_then(|segment| {
+            let kind = RowKind::from_byte(self.best_kind.load(Ordering::Relaxed))?;
+            let row = FooterRow {
+                place: WritePlace(self.best_place.load(Ordering::Relaxed)),
+                offset: FileOffset(self.best_offset.load(Ordering::Relaxed)),
+                length: ByteCount(self.best_length.load(Ordering::Relaxed)),
+                kind,
+            };
+            Some(SealedRow { segment: SegmentNumber(segment), row, block_offset: self.best_block.load(Ordering::Relaxed) })
+        });
+        Some(WalkResume { next: self.next.load(Ordering::Relaxed), best })
+    }
+}
+
 /// How a read waits for its device, so one read path serves the blocking calls and the completion ring
 pub trait DeviceReads<File>: Sync {
     /// Fill the whole buffer from the offset
@@ -93,6 +162,16 @@ pub trait DeviceReads<File>: Sync {
     /// Say whether a read can sit waiting with buffers in hand, so it needs buffers no blocking read waits for
     fn holds_across_waits(&self) -> bool {
         false
+    }
+
+    /// Read the mark a try leaves its place in
+    fn try_mark(&self) -> Option<&WalkMark> {
+        None
+    }
+
+    /// Read the mark a ring pass takes over from
+    fn resume_mark(&self) -> Option<&WalkMark> {
+        None
     }
 }
 
@@ -113,9 +192,13 @@ impl<File: IoFile> DeviceReads<File> for InPlace {
 /// Reads that answer from what the kernel holds and never finish past that, so a poll that comes back pending found a read
 /// that would block, or one that failed, and the long way hears the real answer
 #[derive(Clone, Copy, Debug, Default)]
-pub struct OnlyWarm;
+pub struct OnlyWarm<'mark>(pub Option<&'mark WalkMark>);
 
-impl<File: IoFile> DeviceReads<File> for OnlyWarm {
+impl<File: IoFile> DeviceReads<File> for OnlyWarm<'_> {
+    fn try_mark(&self) -> Option<&WalkMark> {
+        self.0
+    }
+
     fn read_exact(&self, file: &File, offset: FileOffset, buf: &mut [u8]) -> impl Future<Output = Result<()>> + Send {
         let mut done = 0;
         while done < buf.len() {

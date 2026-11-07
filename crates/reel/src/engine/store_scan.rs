@@ -89,7 +89,7 @@ impl<Backend: Io> StoreScan<Backend> {
         };
         let mut held = HeldScan { state: &state, scan: Some(scan) };
         let answer = match &mut held.scan {
-            Some(scan) => state.scan_block_on(&OnRing(ring), scan, keys).await,
+            Some(scan) => state.scan_block_on(&OnRing(ring, None), scan, keys).await,
             None => Ok(false),
         };
         self.scan = held.scan.take();

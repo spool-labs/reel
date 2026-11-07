@@ -186,6 +186,23 @@ impl SimulatedIo {
         hold(&self.disk).warm_bytes = bytes;
     }
 
+    /// Count a read the ring took
+    pub fn note_ring_read(&self) {
+        let mut disk = hold(&self.disk);
+        disk.ring_reads = OperationCount(disk.ring_reads.0 + 1);
+    }
+
+    /// Let this many tries find the kernel holding their bytes, before the warm bytes decide again
+    pub fn set_warm_tries(&self, tries: u64) {
+        hold(&self.disk).warm_tries = tries;
+    }
+
+    /// Read how many tries the store made, how many found the kernel without the bytes, and how many reads went to the ring
+    pub fn try_counts(&self) -> (OperationCount, OperationCount, OperationCount) {
+        let disk = hold(&self.disk);
+        (disk.tries, disk.cold_tries, disk.ring_reads)
+    }
+
     /// Read how many bytes files have started for the device
     pub fn writeback_bytes(&self) -> ByteCount {
         ByteCount(hold(&self.disk).writeback_bytes)

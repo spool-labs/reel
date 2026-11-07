@@ -791,6 +791,10 @@ impl<Backend: Io> EngineState<Backend> {
         let mut generation = None;
         loop {
             let page = directory.candidates(read.key, skip, &mut reader.candidates);
+            // a try's place holds only while the list stands as the try saw it
+            let resume = device.resume_mark().and_then(|mark| mark.take(page.generation));
+            let first = resume.map_or(0, |resume| resume.next);
+            best = resume.map_or(best, |resume| resume.best);
 
             // a list that changed between pages could hide a segment, and asking twice is harmless
             if generation.is_some_and(|seen| seen != page.generation) {
@@ -802,12 +806,25 @@ impl<Backend: Io> EngineState<Backend> {
             // newest first, so a key with a row stops at its previous version and the older segments cost nothing
             reader.candidates.sort_unstable_by_key(|candidate| Reverse(candidate.newest_place));
 
-            for index in 0..reader.candidates.len() {
+            for index in first..reader.candidates.len() {
                 let candidate = reader.candidates[index];
                 if best.is_some_and(|row| row.row.place >= candidate.newest_place) {
                     break;
                 }
+                if let Some(mark) = device.try_mark().filter(|_mark| skip == 0) {
+                    mark.note(page.generation, index);
+                }
+                let before = best.map(|row| row.row.place);
                 self.ask_candidate(ReadOn::new(device, volume), read, candidate.segment, reader, &mut best, ask).await?;
+                if let (Some(mark), Some(row)) = (device.try_mark(), best.filter(|row| Some(row.row.place) != before)) {
+                    mark.note_best(&row);
+                }
+            }
+            if let Some(mark) = device.try_mark() {
+                match skip {
+                    0 => mark.note(page.generation, reader.candidates.len()),
+                    _later => mark.clear(),
+                }
             }
             skip += reader.candidates.len();
 

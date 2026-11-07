@@ -23,7 +23,7 @@ use crate::engine::scan_state::ScanState;
 use crate::guard::hold;
 use crate::io::job::{Job, JobStep};
 use crate::io::ring::{OnRing, ReadRing};
-use crate::io::{DeviceReads, InPlace, Io, IoTask, OnlyWarm, in_place, poll_once};
+use crate::io::{DeviceReads, InPlace, Io, IoTask, OnlyWarm, WalkMark, in_place, poll_once};
 use crate::pool::{touched_capacity, touched_queue};
 
 /// Async reads in flight at once
@@ -367,11 +367,16 @@ impl<Backend: Io> EngineState<Backend> {
             return Err(StoreError::Closed);
         }
         // what the kernel holds answers on this task, with no hop to a worker
-        if let Some(answer) = poll_once(self.get_one_on(&OnlyWarm, column, key, want, point, buf)) {
+        let mark = WalkMark::default();
+        if let Some(answer) = poll_once(self.get_one_on(&OnlyWarm(Some(&mark)), column, key, want, point, buf)) {
             return self.counted(answer);
         }
         if let Some(ring) = &self.ring {
-            return self.get_on_ring(ring, column, key, want, point, buf).await;
+            let Ok(_seat) = ring.seat().await else {
+                return Err(StoreError::Closed);
+            };
+            let answer = self.get_one_on(&OnRing(ring, Some(&mark)), column, key, want, point, buf).await;
+            return self.counted(answer);
         }
         let lease = self.read_pool.claim().await;
         let value = mem::take(buf);
@@ -398,7 +403,7 @@ impl<Backend: Io> EngineState<Backend> {
         }
         values.clear();
         let mut scratch = values.take_scratch();
-        let warm = poll_once(self.read_keys(&OnlyWarm, column, keys, ReadAt { point, handovers }, values, &mut scratch));
+        let warm = poll_once(self.read_keys(&OnlyWarm(None), column, keys, ReadAt { point, handovers }, values, &mut scratch));
         values.put_scratch(scratch);
         if let Some(answer) = warm {
             self.corruption_errors.fetch_add(values.corrupt_count(), Ordering::Relaxed);
@@ -437,7 +442,7 @@ impl<Backend: Io> EngineState<Backend> {
             return Err(StoreError::Closed);
         };
         let mut scratch = values.take_scratch();
-        let answer = self.read_keys(&OnRing(ring), column, keys, ReadAt { point, handovers }, values, &mut scratch).await;
+        let answer = self.read_keys(&OnRing(ring, None), column, keys, ReadAt { point, handovers }, values, &mut scratch).await;
         values.put_scratch(scratch);
         self.corruption_errors.fetch_add(values.corrupt_count(), Ordering::Relaxed);
         answer
@@ -495,23 +500,6 @@ impl<Backend: Io> EngineState<Backend> {
         let handovers = self.volumes[info.volume.0 as usize].handover_count();
         let read = self.key_read(column, key, point, true)?;
         self.get_at(device, &read, handovers, want, value).await
-    }
-
-    /// Run a get on the ring, on the caller's task, and hold no thread while the device works
-    pub async fn get_on_ring(
-        &self,
-        ring: &ReadRing<Backend::Ring>,
-        column: ColumnId,
-        key: &[u8],
-        want: RecordWant,
-        point: Option<WritePlace>,
-        value: &mut Vec<u8>,
-    ) -> Result<bool, StoreError> {
-        let Ok(_seat) = ring.seat().await else {
-            return Err(StoreError::Closed);
-        };
-        let answer = self.get_one_on(&OnRing(ring), column, key, want, point, value).await;
-        self.counted(answer)
     }
 
     /// Fill a list with the next block of a scan's keys, and say whether the walk has more

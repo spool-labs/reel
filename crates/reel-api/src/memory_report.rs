@@ -1,6 +1,6 @@
 //! Heap held by each structure, with no profiler attached
 
-use crate::units::ByteCount;
+use crate::units::{ByteCount, SegmentCount};
 
 /// Every named part of the engine's heap
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -30,6 +30,10 @@ pub struct MemoryReport {
     pub maintenance_workers: usize,
     /// The filter arena holds every filter it can, and gets search the footers' own filters until it does
     pub is_arena_full: bool,
+    /// Segments with filters the arena lacks, which a full arena left out for want of room
+    pub arena_segments_left_out: SegmentCount,
+    /// Columns of those segments
+    pub arena_columns_left_out: usize,
 }
 
 impl MemoryReport {

@@ -244,6 +244,11 @@ impl FilterArena {
         self.find(segment).is_some()
     }
 
+    /// Check the arena can answer for a segment's filters
+    pub fn has_filters(&self, segment: SegmentNumber) -> bool {
+        self.in_window(segment, |extent| (extent.blocks.load(Ordering::Relaxed) > 0).then_some(())).is_some()
+    }
+
     /// Set aside an extent for a segment's blocks and bits, or say there's no room
     pub fn begin(&self, segment: SegmentNumber, blocks: u32, bits: u32) -> bool {
         let mut books = hold(&self.books);

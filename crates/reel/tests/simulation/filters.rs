@@ -9,7 +9,7 @@ use reel::io::Io;
 use reel::record::codec::Codec;
 use reel_api::column_id::ColumnId;
 use reel_api::maintenance_report::MaintenanceReport;
-use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RowCount, VolumeId};
+use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RowCount, SegmentCount, VolumeId};
 use reel_sim::file_image::BitMask;
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_io::SimulatedIo;
@@ -127,6 +127,15 @@ fn reports_show_the_fill() {
     store.maintenance_report(&mut report);
     assert!(store.memory_report().is_arena_full);
     assert!(report.arena_fill.is_some());
+    assert_eq!(store.memory_report().arena_segments_left_out, SegmentCount(0));
+
+    // an empty extent says the arena tried and had no room
+    let segment = reel::guard::hold(&store.state.volumes[0].summary).rows().next().expect("a row").facts.segment;
+    store.state.filter_arena.drop_segment(segment);
+    assert!(store.state.filter_arena.begin(segment, 0, 0));
+    let memory = store.memory_report();
+    assert_eq!(memory.arena_segments_left_out, SegmentCount(1));
+    assert_eq!(memory.arena_columns_left_out, 1);
     store.close().expect("close");
 }
 

@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use reel_api::column_id::ColumnId;
 use reel_api::memory_report::MemoryReport;
 use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, FileOffset, Nanoseconds, WritePlace};
+use reel_api::units::{ByteCount, FileOffset, Nanoseconds, SegmentCount, WritePlace};
 
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::cue::{CueTable, JobCounts};
@@ -40,7 +40,7 @@ use crate::segment::filter_arena::FilterArena;
 use crate::segment::row_block::ROW_BLOCK_BYTES;
 use crate::segment::column_directory::ColumnDirectory;
 use crate::segment::footer_reader::FooterReader;
-use crate::segment::segment_tail::SegmentNumber;
+use crate::segment::segment_tail::{MAX_COLUMNS, SegmentNumber};
 use crate::segment::summary::write_summary;
 use crate::superblock::Superblock;
 use crate::write_order::PlaceCount;
@@ -474,6 +474,21 @@ impl<Backend: Io> EngineState<Backend> {
         }
         true
     }
+    /// Count the segments with filters the arena lacks, and their columns. Gets read those filters through the block cache
+    pub fn arena_left_out(&self) -> (SegmentCount, usize) {
+        let (mut segments, mut columns) = (0, 0);
+        for volume in &self.volumes {
+            let rows = hold(&volume.summary);
+            for row in rows.rows().filter(|row| !row.facts.is_damaged && !self.filter_arena.has_filters(row.facts.segment)) {
+                let searched = (0..MAX_COLUMNS).map(|id| ColumnId(id as u8)).filter(|column| self.complete_table(*column).is_none());
+                let left = searched.filter(|column| volume.table.column_blocks(row.facts.segment, *column).is_some()).count();
+                segments += u64::from(left > 0);
+                columns += left;
+            }
+        }
+        (SegmentCount(segments), columns)
+    }
+
     /// Note whether filters wait for the arena, and keep how long the first fill took after open
     pub fn note_arena(&self, has_filters_left: bool) {
         self.is_arena_full.store(!has_filters_left, Ordering::Release);
@@ -518,6 +533,7 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// Report the heap each structure holds
     pub fn memory_report(&self) -> MemoryReport {
+        let (arena_segments_left_out, arena_columns_left_out) = self.arena_left_out();
         let mut report = MemoryReport {
             budget: self.memory_budget,
             write_index: self.index.heap_bytes(),
@@ -530,6 +546,8 @@ impl<Backend: Io> EngineState<Backend> {
             open_slots: self.queues.len(),
             maintenance_workers: self.sizing.walk_workers,
             is_arena_full: self.is_arena_full.load(Ordering::Acquire),
+            arena_segments_left_out,
+            arena_columns_left_out,
             ..MemoryReport::default()
         };
         for directory in self.directories.iter().flatten() {

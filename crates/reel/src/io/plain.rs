@@ -54,6 +54,7 @@ pub const PAUSE_WAIT: Duration = Duration::from_micros(100);
 #[derive(Clone, Debug)]
 pub struct PlainIo {
     origin: Instant,
+    #[cfg_attr(not(target_os = "linux"), expect(dead_code, reason = "only Linux has a ring"))]
     has_ring: bool,
 }
 

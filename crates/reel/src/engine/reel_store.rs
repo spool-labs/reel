@@ -599,6 +599,8 @@ pub fn bring_up<Backend: Io>(
     for volume in &state.volumes {
         drop(hold(&volume.locks));
     }
+    drop(hold(&state.superblock));
+    drop(hold(&state.superblock_bytes));
 
     // an open is not a state: the limits say what a run-through would seal, from the same rows
     for volume in &state.volumes {

@@ -103,13 +103,19 @@ impl<Item: HollowItem> Pool<Item> {
 impl<Item> Pool<Item> {
     /// Build a pool from its items
     pub fn new(items: Vec<Item>) -> Self {
-        Self {
+        let pool = Self {
             slots: items.into_iter().map(|item| PoolSlot { item: Mutex::new(Some(item)) }).collect(),
             line: Mutex::new(PoolLine { next_ticket: 0, serving: 0 }),
             queued: AtomicU64::new(0),
             freed: Condvar::new(),
             wakes: AtomicU64::new(0),
+        };
+        // some platforms set a lock up at its first use, and that's a job for open
+        for slot in &pool.slots {
+            drop(hold(&slot.item));
         }
+        drop(hold(&pool.line));
+        pool
     }
 
     /// Add up what the free items hold

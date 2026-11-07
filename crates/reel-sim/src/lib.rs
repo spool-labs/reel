@@ -2,6 +2,7 @@
 
 pub mod count_pause;
 pub mod file_image;
+pub mod harness_io;
 pub mod seeded_random;
 pub mod simulated_disk;
 pub mod simulated_file;

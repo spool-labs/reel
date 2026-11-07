@@ -54,8 +54,6 @@ pub const PAUSE_WAIT: Duration = Duration::from_micros(100);
 #[derive(Clone, Debug)]
 pub struct PlainIo {
     origin: Instant,
-    #[cfg_attr(not(target_os = "linux"), expect(dead_code, reason = "only Linux has a ring"))]
-    has_ring: bool,
 }
 
 /// A held file lock, released when the file closes
@@ -65,14 +63,9 @@ pub struct PlainLock {
 }
 
 impl PlainIo {
-    /// Start a backend whose clock counts from now, with reads that would block on the kernel's ring
+    /// Start a backend whose clock counts from now
     pub fn new() -> Self {
-        Self { origin: Instant::now(), has_ring: true }
-    }
-
-    /// Start a backend whose reads that would block run on the blocking pool
-    pub fn without_ring() -> Self {
-        Self { origin: Instant::now(), has_ring: false }
+        Self { origin: Instant::now() }
     }
 }
 
@@ -94,7 +87,7 @@ impl Io for PlainIo {
     #[cfg(target_os = "linux")]
     fn open_ring(&self) -> Result<Option<UringDriver>> {
         // a kernel or a sandbox with no ring leaves the blocking pool, and the report says so
-        Ok(if self.has_ring { UringDriver::open().ok() } else { None })
+        Ok(UringDriver::open().ok())
     }
 
     #[cfg(not(target_os = "linux"))]

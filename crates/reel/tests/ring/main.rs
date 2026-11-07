@@ -18,6 +18,7 @@ use reel_api::column_id::ColumnId;
 use reel_api::reads::{Reads, ValueWindow};
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, VolumeId};
+use reel_sim::harness_io::HarnessIo;
 
 const COLUMN: ColumnId = ColumnId(1);
 const BUDGET: ByteCount = ByteCount(256 * 1024 * 1024);
@@ -161,7 +162,7 @@ fn many_at_once() {
 fn pool_still_answers() {
     let root = root("pool");
     filled(&root).close().expect("close");
-    let store: Store = ReelStore::open(PlainIo::without_ring(), &config(&root)).expect("open");
+    let store = ReelStore::open(HarnessIo::ringless(), &config(&root)).expect("open");
     assert!(store.state.ring.is_none());
     let mut buf = Vec::new();
     assert!(run(Reads::get_async(&store, COLUMN, &key(5), &mut buf)).expect("get"));
@@ -177,8 +178,8 @@ fn warm_get_answers_first_poll() {
     let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("reel-warm-{}", std::process::id()));
     let _gone = fs::remove_dir_all(&root);
     filled(&root).close().expect("close");
-    for io in [PlainIo::new(), PlainIo::without_ring()] {
-        let store: Store = ReelStore::open(io, &config(&root)).expect("open");
+    for io in [HarnessIo::ringed(), HarnessIo::ringless()] {
+        let store = ReelStore::open(io, &config(&root)).expect("open");
         let (name, mut buf) = (key(7), Vec::new());
         assert!(store.get(COLUMN, &name, &mut buf).expect("get"));
         buf.clear();

@@ -475,3 +475,25 @@ fn unused_wake_passes_on() {
     drop(first);
     assert_eq!(wakes.0.load(Ordering::Acquire), 1, "a seat is free and the caller in line sleeps");
 }
+
+// a slot the device still has stays out of every claim until its completion comes in
+#[test]
+fn dropped_read_keeps_its_slot() {
+    let (io, store) = ringed(36);
+    let name = key(12);
+    let mut buf = Vec::new();
+    {
+        let mut read = pin!(Reads::get_async(&store, COLUMN, &name, &mut buf));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(read.as_mut().poll(&mut context).is_pending());
+    }
+    let leases: Vec<_> = (1..RING_SLOTS).map(|_slot| ring(&store).try_claim().expect("open").expect("a free slot")).collect();
+    assert!(ring(&store).try_claim().expect("open").is_none(), "a claim took a slot the device has");
+
+    settle(&io);
+    let last = ring(&store).try_claim().expect("open");
+    assert!(last.is_some(), "the completion left its slot held");
+    drop(last);
+    drop(leases);
+    store.close().expect("close");
+}

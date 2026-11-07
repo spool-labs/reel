@@ -7,6 +7,7 @@ use std::thread;
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::cue::Cue;
 use reel::engine::reel_store::ReelStore;
+use reel::engine::walk_job::FREE_IN_PLACE_BYTES;
 use reel::engine::write_path::ClaimRequest;
 use reel::guard::hold;
 use reel::record::codec::Codec;
@@ -374,6 +375,57 @@ fn first_point_keeps_no_row() {
     let output = hold(&meta.summary).rows().map(|row| row.facts.segment).max().expect("a row");
     let rows = hold(&meta.summary).get(output).expect("a row").cursor().column().expect("a column").dead_rows.0;
     assert_eq!(rows, 0);
+    drop(cue);
+    store.close().expect("close");
+}
+
+fn large(byte: u8) -> Vec<u8> {
+    vec![byte; FREE_IN_PLACE_BYTES.0 as usize]
+}
+
+// keep a segment's dead share under what triggers a rewrite
+fn keep_live(store: &Store2) {
+    store.put(META, b"keep", b"value").expect("put");
+    store.put(META, b"keep-1", &large(3)).expect("put");
+    store.put(META, b"keep-2", &large(4)).expect("put");
+}
+
+// a free on the second volume waits for a cue's low point there, with its point on the first past the replacement
+#[test]
+fn second_point_keeps_blocks() {
+    let io = SimulatedIo::new(Seed(13));
+    let store = open(&io);
+    keep_live(&store);
+    store.put(META, b"key", &large(1)).expect("put");
+    seal_meta(&store, &io);
+    let cue = cue_around_put(&store, b"key", &large(2));
+    seal_meta(&store, &io);
+
+    let meta = &store.state.volumes[1];
+    assert_eq!(meta.bytes_freed.load(Ordering::Acquire), 0);
+    let mut buf = Vec::new();
+    assert!(cue.get(META, b"key", &mut buf).expect("get"));
+    assert_eq!(buf, large(1));
+
+    drop(cue);
+    settle(&io);
+    assert!(meta.bytes_freed.load(Ordering::Acquire) > 0);
+    store.close().expect("close");
+}
+
+// a free on the second volume runs with only the cue's point on the first between the record and its replacement
+#[test]
+fn first_point_keeps_no_blocks() {
+    let io = SimulatedIo::new(Seed(14));
+    let store = open(&io);
+    keep_live(&store);
+    store.put(META, b"key", &large(1)).expect("put");
+    seal_meta(&store, &io);
+    let cue = cue_past_rows(&store, &[b"key"], &large(2));
+    seal_meta(&store, &io);
+
+    assert!(store.state.volumes[1].bytes_freed.load(Ordering::Acquire) > 0);
+    assert_eq!(read(&store, META, b"key"), Some(large(2)));
     drop(cue);
     store.close().expect("close");
 }

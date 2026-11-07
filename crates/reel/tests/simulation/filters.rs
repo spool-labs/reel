@@ -108,6 +108,24 @@ fn reopen_loads_again() {
     store.close().expect("close");
 }
 
+// a probe that finds its extent mid-change says nothing, and the get answers from the footer's own filter
+#[test]
+fn probe_mid_change_reads_the_footer() {
+    let io = SimulatedIo::new(Seed(5));
+    let store = filled(&io);
+    let segment = reel::guard::hold(&store.state.volumes[0].summary).rows().next().expect("a row").facts.segment;
+    let arena = &store.state.filter_arena;
+    arena.drop_segment(segment);
+    assert!(arena.begin(segment, 2, 8));
+
+    let mut buf = Vec::new();
+    let before = io.read_count().0;
+    assert!(!store.get(COLUMN, &key(1), &mut buf).expect("get"));
+    assert!(io.read_count().0 > before);
+    assert!(store.get(COLUMN, &key(0), &mut buf).expect("get"));
+    store.close().expect("close");
+}
+
 // a segment's going takes its filters with it
 #[test]
 fn unlink_frees_the_room() {

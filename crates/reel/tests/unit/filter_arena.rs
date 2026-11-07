@@ -1,5 +1,7 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::hint;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use reel::index::key_hash::KeyHash;
 use reel::segment::filter_arena::*;
@@ -108,6 +110,7 @@ const PATTERN_BYTES: usize = 1_024;
 const RACE_OFFSET: u32 = 100;
 const RACE_ROUNDS: u64 = 20_000;
 const RACE_READERS: usize = 3;
+const RACE_SETTLE: Duration = Duration::from_millis(1);
 
 fn fill(arena: &FilterArena, segment: SegmentNumber, pattern: u8) {
     assert!(arena.begin(segment, 1, PATTERN_BYTES as u32));
@@ -119,6 +122,7 @@ fn fill(arena: &FilterArena, segment: SegmentNumber, pattern: u8) {
 fn race_answers_from_the_asked_segment() {
     let arena = FilterArena::new(ByteCount(64 * 1024), SEGMENTS);
     let is_done = AtomicBool::new(false);
+    let answered = AtomicU64::new(0);
     fill(&arena, FIRST, LOW_PATTERN);
     thread::scope(|scope| {
         let readers: Vec<_> = (0..RACE_READERS)
@@ -130,6 +134,7 @@ fn race_answers_from_the_asked_segment() {
                             Some(bits) => {
                                 assert!(bits.iter().all(|byte| *byte == LOW_PATTERN), "a probe read another segment's bytes");
                                 answers += 1;
+                                answered.fetch_add(1, Ordering::Relaxed);
                             },
                             None => misses += 1,
                         }
@@ -143,6 +148,11 @@ fn race_answers_from_the_asked_segment() {
             fill(&arena, SECOND, HIGH_PATTERN);
             arena.drop_segment(SECOND);
             fill(&arena, FIRST, LOW_PATTERN);
+            // a writer that never stops leaves a slow reader no whole window, and the race needs both outcomes
+            let (seen, start) = (answered.load(Ordering::Relaxed), Instant::now());
+            while answered.load(Ordering::Relaxed) == seen && start.elapsed() < RACE_SETTLE {
+                hint::spin_loop();
+            }
         }
         is_done.store(true, Ordering::Release);
         let (answers, misses) = readers.into_iter().map(|reader| reader.join().expect("join")).fold((0, 0), |sum, one| (sum.0 + one.0, sum.1 + one.1));

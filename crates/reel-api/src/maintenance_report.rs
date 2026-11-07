@@ -121,6 +121,8 @@ pub struct MaintenanceReport {
     pub segments_parked: SegmentCount,
     pub empties_left: SegmentCount,
     pub stray_outputs: SegmentCount,
+    /// How long the filter arena took to fill after open, which is the store's restart window
+    pub arena_fill: Option<Nanoseconds>,
     /// Async reads complete through the ring, and through the blocking pool when this is false
     pub has_ring: bool,
 }
@@ -165,6 +167,7 @@ impl MaintenanceReport {
             segments_parked: SegmentCount::default(),
             empties_left: SegmentCount::default(),
             stray_outputs: SegmentCount::default(),
+            arena_fill: None,
             has_ring: false,
         }
     }

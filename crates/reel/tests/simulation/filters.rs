@@ -8,6 +8,7 @@ use reel::engine::reel_store::ReelStore;
 use reel::io::Io;
 use reel::record::codec::Codec;
 use reel_api::column_id::ColumnId;
+use reel_api::maintenance_report::MaintenanceReport;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RowCount, VolumeId};
 use reel_sim::file_image::BitMask;
 use reel_sim::seeded_random::Seed;
@@ -105,6 +106,27 @@ fn reopen_loads_again() {
     let before = io.read_count().0;
     assert!(!store.get(COLUMN, &key(3), &mut buf).expect("get"));
     assert_eq!(io.read_count().0, before);
+    store.close().expect("close");
+}
+
+// the reports say the arena isn't full until the loader has run out, and give the fill's time from then on
+#[test]
+fn reports_show_the_fill() {
+    let io = SimulatedIo::new(Seed(6));
+    let store = filled(&io);
+    store.close().expect("close");
+    drop(store);
+
+    let store = open(&io);
+    let mut report = MaintenanceReport::new();
+    store.maintenance_report(&mut report);
+    assert!(!store.memory_report().is_arena_full);
+    assert_eq!(report.arena_fill, None);
+
+    settle(&io);
+    store.maintenance_report(&mut report);
+    assert!(store.memory_report().is_arena_full);
+    assert!(report.arena_fill.is_some());
     store.close().expect("close");
 }
 

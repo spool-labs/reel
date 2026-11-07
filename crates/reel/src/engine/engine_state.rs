@@ -114,6 +114,8 @@ pub struct EngineState<Backend: Io> {
     pub graves_carried: AtomicU64,
     pub empty_rewrites: AtomicU64,
     pub corruption_errors: AtomicU64,
+    pub is_arena_full: AtomicBool,
+    pub arena_fill: AtomicU64,
     pub memory_budget: ByteCount,
     pub seal_heap: AtomicU64,
     pub compaction_heap: AtomicU64,
@@ -472,6 +474,15 @@ impl<Backend: Io> EngineState<Backend> {
         }
         true
     }
+    /// Note whether filters wait for the arena, and keep how long the first fill took after open
+    pub fn note_arena(&self, has_filters_left: bool) {
+        self.is_arena_full.store(!has_filters_left, Ordering::Release);
+        if !has_filters_left && self.arena_fill.load(Ordering::Relaxed) == 0 {
+            let took = self.io.now().0.saturating_sub(self.opened_at.0);
+            self.arena_fill.store(took.max(1), Ordering::Relaxed);
+        }
+    }
+
     /// Bring the planner back to every volume's compaction
     pub fn ask_compaction(&self) {
         for volume in &self.volumes {
@@ -518,6 +529,7 @@ impl<Backend: Io> EngineState<Backend> {
             thread_stacks: ByteCount(self.job_count.load(Ordering::Acquire) * self.io.job_stack_bytes().0),
             open_slots: self.queues.len(),
             maintenance_workers: self.sizing.walk_workers,
+            is_arena_full: self.is_arena_full.load(Ordering::Acquire),
             ..MemoryReport::default()
         };
         for directory in self.directories.iter().flatten() {

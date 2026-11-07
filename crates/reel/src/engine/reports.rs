@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use reel_api::column_id::ColumnId;
 use reel_api::maintenance_report::{CompleteReading, JOB_KINDS, JobKind, JobState, MOST_REPORTED_LANES, MaintenanceReport, VolumeReading};
 use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, RootId, RowCount, SegmentCount, VolumeId};
+use reel_api::units::{ByteCount, Nanoseconds, RootId, RowCount, SegmentCount, VolumeId};
 use reel_api::usage::{ColumnRootUsage, ColumnUsage, RootUsage, UsageReport, VolumeUsage};
 
 use crate::engine::engine_state::EngineState;
@@ -181,6 +181,8 @@ impl<Backend: Io> EngineState<Backend> {
         report.empties_left = SegmentCount(empties);
         report.stray_outputs = SegmentCount(strays);
         report.has_ring = self.ring.is_some();
+        let fill = self.arena_fill.load(Ordering::Relaxed);
+        report.arena_fill = (fill > 0).then_some(Nanoseconds(fill));
         report.reclaim_retries = RowCount(retries);
         report.graves_at_open = RowCount(self.graves_at_open.load(Ordering::Acquire));
         report.deletes_since_open = RowCount(self.deletes.load(Ordering::Relaxed));

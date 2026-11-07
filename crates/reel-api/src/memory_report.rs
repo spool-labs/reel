@@ -28,6 +28,8 @@ pub struct MemoryReport {
     pub open_slots: usize,
     /// Workers each volume runs beside its planner, which the budget may have set below the default
     pub maintenance_workers: usize,
+    /// The filter arena holds every filter it can, and gets search the footers' own filters until it does
+    pub is_arena_full: bool,
 }
 
 impl MemoryReport {

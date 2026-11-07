@@ -1213,6 +1213,8 @@ pub fn build_state<Backend: Io>(
         graves_carried: AtomicU64::new(0),
         empty_rewrites: AtomicU64::new(0),
         corruption_errors: AtomicU64::new(0),
+        is_arena_full: AtomicBool::new(false),
+        arena_fill: AtomicU64::new(0),
         memory_budget: config.memory_budget,
         seal_heap: AtomicU64::new(0),
         compaction_heap: AtomicU64::new(0),

@@ -130,6 +130,7 @@ impl<Backend: Io> Job for Planner<Backend> {
         for loader in &mut self.filters {
             has_filters_left |= loader.step();
         }
+        self.state.note_arena(has_filters_left);
         if has_filters_left {
             return JobStep::Worked;
         }

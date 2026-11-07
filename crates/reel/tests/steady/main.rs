@@ -15,7 +15,9 @@ use std::thread;
 use std::time::Duration;
 
 use reel::engine::reel_store::ReelStore;
+use reel::engine::rewrite_job::{SHARE_SCALE, reclaim_share};
 use reel::engine::walk_job::FREE_IN_PLACE_BYTES;
+use reel::guard::hold;
 use reel::io::plain::PlainIo;
 use reel::segment::filter_arena::FilterArena;
 use reel::segment::segment_tail::SegmentNumber;
@@ -449,6 +451,12 @@ fn round(store: &Store, inputs: &mut Inputs, number: usize) {
     }
 }
 
+/// Read the dead share of the volume's most dead segment
+fn most_dead_percent(store: &Store) -> u64 {
+    let summary = hold(&store.state.volumes[0].summary);
+    100 * summary.rows().map(|row| reclaim_share(&row)).max().unwrap_or(0) / SHARE_SCALE
+}
+
 // an unlink and a free in place have both run since these counts
 fn has_reclaimed(store: &Store, unlinked_before: u64, freed_before: u64) -> bool {
     let volume = &store.state.volumes[0];
@@ -647,8 +655,17 @@ fn main() {
 
     // the first run of a path faults in the binary's own pages, so every path runs before the window
     let mut number = 0;
-    while number <= 2 * SEAL_ROUNDS || store.state.volumes[0].segments_unlinked.load(Ordering::Acquire) == 0 {
-        assert!(number < MOST_WARM_ROUNDS, "no unlink ran before the window");
+    // a rewrite needs a half-dead segment, and only more writes make one, so the rounds go on until a rewrite has run
+    let has_warmed = || {
+        let volume = &store.state.volumes[0];
+        volume.segments_unlinked.load(Ordering::Acquire) > 0 && volume.segments_rewritten.load(Ordering::Acquire) > 0
+    };
+    while number <= 2 * SEAL_ROUNDS || !has_warmed() {
+        assert!(
+            number < MOST_WARM_ROUNDS,
+            "no segment reached the bar in {number} rounds, the most dead stands at {}%",
+            most_dead_percent(&store),
+        );
         round(&store, &mut inputs, number);
         number += 1;
     }
@@ -660,13 +677,6 @@ fn main() {
 
     let unlinked_before = store.state.volumes[0].segments_unlinked.load(Ordering::Acquire);
     let freed_before = store.state.volumes[0].bytes_freed.load(Ordering::Acquire);
-    // a rewrite is a path too, and it follows the last walk
-    let mut waits = 0;
-    while store.state.volumes[0].segments_rewritten.load(Ordering::Acquire) == 0 {
-        waits += 1;
-        assert!(waits < MOST_SEAL_WAITS, "no rewrite ran before the window");
-        thread::sleep(SEAL_WAIT);
-    }
     let rewritten_before = store.state.volumes[0].segments_rewritten.load(Ordering::Acquire);
     touch_stack();
     let mut faults = FaultCounter::new();

@@ -1,6 +1,7 @@
 //! Async reads through the completion ring: each answers as its blocking twin does, on the caller's task
 
 use std::future::Future;
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::pin::{Pin, pin};
 use std::sync::Arc;
@@ -496,4 +497,23 @@ fn dropped_read_keeps_its_slot() {
     drop(last);
     drop(leases);
     store.close().expect("close");
+}
+
+// a close wakes a caller waiting for a seat, and that caller hears the ring has closed
+#[test]
+fn close_wakes_the_seat_line() {
+    let (_io, store) = ringed(37);
+    let ring = ring(&store);
+    let seats: Vec<_> = (0..RING_READS).map(|_seat| ring.try_seat().expect("open").expect("a free seat")).collect();
+    let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+    let waker = Waker::from(Arc::clone(&wakes));
+    let mut context = Context::from_waker(&waker);
+    let mut waiting = pin!(ring.seat());
+    assert!(waiting.as_mut().poll(&mut context).is_pending());
+
+    ring.close();
+    assert_eq!(wakes.0.load(Ordering::Acquire), 1, "the ring closed and the caller in line sleeps");
+    let answer = waiting.as_mut().poll(&mut context);
+    assert!(matches!(answer, Poll::Ready(Err(error)) if error.kind() == ErrorKind::BrokenPipe));
+    drop(seats);
 }

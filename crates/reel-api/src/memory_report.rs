@@ -30,6 +30,8 @@ pub struct MemoryReport {
     pub maintenance_workers: usize,
     /// The least budget this store opens in with the workers and the ring it runs, a figure with no target on it
     pub least_budget: ByteCount,
+    /// The fixed room the plan keeps for heap no part names: the rounding, and room a foreground job for its allocator's state
+    pub room: ByteCount,
     /// How long the last open took, from the root locks to every job running
     pub open_time: Nanoseconds,
     /// The part of that open spent building and touching the pools, the jobs' included

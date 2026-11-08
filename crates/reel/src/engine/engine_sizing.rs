@@ -29,17 +29,17 @@ pub const FULL_BUDGET: ByteCount = ByteCount(512 * 1024 * 1024);
 pub const OPEN_PER_ROOT: usize = 4;
 /// Open slots each open segment can need: its own, and one while it seals
 pub const SLOTS_PER_OPEN: usize = 2;
-/// The write index gets one part in this many of what the fixed parts leave
+/// The write index gets one part in this many of what the fixed parts and the room leave
 pub const WRITE_INDEX_DIVISOR: u64 = 2;
-/// The spot cache gets one part in this many of what the fixed parts leave
+/// The spot cache gets one part in this many of what the fixed parts and the room leave
 pub const SPOT_DIVISOR: u64 = 8;
-/// The block cache gets one part in this many of what the fixed parts leave
+/// The block cache gets one part in this many of what the fixed parts and the room leave
 pub const BLOCK_CACHE_DIVISOR: u64 = 8;
-/// The summaries get one part in this many of what the fixed parts leave, rows and the save buffer together. A row costs
+/// The summaries get one part in this many of what the fixed parts and the room leave, rows and the save buffer together. A row costs
 /// about 100 B a column and four bytes a row block, about 0.003 B a key at 1,400 rows a block, so 1B keys take 2.8 MB of
 /// it. A row that doesn't fit is dropped: its segment is never walked or counted against, which only understates
 pub const SUMMARY_DIVISOR: u64 = 16;
-/// The segment tables and column directories get one part in this many of what the fixed parts leave
+/// The segment tables and column directories get one part in this many of what the fixed parts and the room leave
 pub const TABLE_DIVISOR: u64 = 16;
 /// Bytes the table plans for a segment before its columns
 pub const PLANNED_SEGMENT_BYTES: u64 = 512;
@@ -51,6 +51,8 @@ pub const PLANNED_LINE_BYTES: u64 = 32;
 pub const LEAST_SHARED_BYTES: ByteCount = ByteCount(8 * 1024 * 1024);
 /// Room for the index's power-of-two table and the caches' least sizes, which run past their shares at a small budget
 pub const ROUNDING_ROOM: u64 = 1024 * 1024;
+/// Heap a foreground job's thread holds past what the plan names, its allocator's own state, which the room keeps for each
+pub const JOB_ROOM_BYTES: u64 = 128 * 1024;
 /// Bytes a read buffer pair is planned at: a record reader and a footer reader
 pub const READ_BUFFER_BYTES: u64 = 512 * 1024;
 /// Bytes a record encoder is planned at, with no share of the compress pool
@@ -68,8 +70,8 @@ pub const SHARED_JOBS: u64 = 3;
 /// Bytes a row of the write index really takes, node, page and table share included, with a long batch's length of it
 pub const PLANNED_ROW_BYTES: u64 = 227;
 /// A volume seals at this share of what the index holds, in eighths, to keep room for writers in flight. With one
-/// lz4 column and 64 B keys that gives these rows a segment: 35,568 at 128 MiB, 127,954 at 192 MiB, 589,881 at 512 MiB and
-/// 5,763,472 at 4 GiB. A segment seals at its byte target or at this limit, whichever comes first, so small
+/// lz4 column and 64 B keys that gives these rows a segment: 21,742 at 128 MiB, 114,128 at 192 MiB, 576,055 at 512 MiB and
+/// 5,749,646 at 4 GiB. A segment seals at its byte target or at this limit, whichever comes first, so small
 /// records seal smaller and reach their size through merges, whose outputs the write index doesn't bound
 /// A volume holds its open segment and one spare at full size even when its sealed data is small: the reserve is twice the
 /// segment size, 128 MiB at a 128 MiB budget, 192 MiB at 192 MiB, and 2 GiB from the default 512 MiB up. The space gate adds
@@ -134,6 +136,7 @@ pub struct EngineSizing {
     pub lz4_stored_limit: ByteCount,
     pub walk_workers: usize,
     pub least_budget: ByteCount,
+    pub room: ByteCount,
 }
 
 impl StoreShape {
@@ -174,19 +177,35 @@ impl StoreShape {
         let encoders = WRITE_BUFFERS as u64 * ENCODER_BYTES + large;
         let spans = 4 * MOST_DAMAGED_SPANS as u64 * (SPAN_KEY_BYTES as u64 * 2);
         let workers = volumes * self.walk_workers() as u64;
-        let stacks = (SHARED_JOBS + self.threads.read_threads as u64 + volumes + workers) * JOB_STACK_PLAN_BYTES;
+        let stacks = self.job_count() * JOB_STACK_PLAN_BYTES;
         // the pool holds both keys of every cover, and a seal job has room to write them all to a footer
         let cover_keys = 2 * MOST_RANGE_COVERS as u64 * self.widest_keys;
         let cover_fixed = (COVER_SLOT_BYTES + COVER_RECORD_BYTES) as u64 * MOST_RANGE_COVERS as u64;
         let covers = 2 * cover_keys + volumes * cover_fixed;
         let jobs = SEAL_JOB_BYTES + WALK_JOB_BYTES + COMPACT_JOB_BYTES;
         let worker_jobs = workers * COMPACT_JOB_BYTES;
-        ByteCount(ROUNDING_ROOM + queues + gathers + windows + reads + scans + read_slots + encoders + covers + volumes * (jobs + spans) + worker_jobs + workers * WALK_JOB_BYTES + stacks)
+        ByteCount(queues + gathers + windows + reads + scans + read_slots + encoders + covers + volumes * (jobs + spans) + worker_jobs + workers * WALK_JOB_BYTES + stacks)
+    }
+
+    /// Count the jobs a store runs: the shared ones, its read threads, a seal job a volume and the workers
+    pub fn job_count(&self) -> u64 {
+        self.foreground_jobs() + self.volumes as u64 * self.walk_workers() as u64
+    }
+
+    /// Count the jobs that serve calls: the shared ones, the read threads and a seal job a volume
+    pub fn foreground_jobs(&self) -> u64 {
+        SHARED_JOBS + self.threads.read_threads as u64 + self.volumes as u64
+    }
+
+    /// Read the fixed room the plan keeps for heap no part names, in place of a share of the budget: the rounding, and room a
+    /// foreground job for its allocator's state
+    pub fn room(&self) -> ByteCount {
+        ByteCount(ROUNDING_ROOM + self.foreground_jobs() * JOB_ROOM_BYTES)
     }
 
     /// Read the smallest budget this store can run in
     pub fn least_budget(&self) -> ByteCount {
-        ByteCount(self.fixed_bytes().0 + LEAST_SHARED_BYTES.0)
+        ByteCount(self.fixed_bytes().0 + self.room().0 + LEAST_SHARED_BYTES.0)
     }
 }
 
@@ -195,7 +214,8 @@ impl EngineSizing {
     pub fn for_store(shape: &StoreShape) -> Self {
         let open_slots = shape.open_slots();
         let budget = shape.budget;
-        let shared = budget.0.saturating_sub(shape.fixed_bytes().0);
+        // the room comes out before the shares
+        let shared = budget.0.saturating_sub(shape.fixed_bytes().0 + shape.room().0);
         let index_share = shared / WRITE_INDEX_DIVISOR;
         let rows_total = index_share / PLANNED_ROW_BYTES;
         let rows_per_shard = (rows_total / SHARD_COUNT as u64).max(64);
@@ -226,6 +246,7 @@ impl EngineSizing {
             lz4_stored_limit: LZ4_STORED_LIMIT,
             walk_workers: shape.walk_workers(),
             least_budget: shape.least_budget(),
+            room: shape.room(),
         }
     }
 }

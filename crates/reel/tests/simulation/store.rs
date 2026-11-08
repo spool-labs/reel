@@ -30,7 +30,7 @@ use reel_api::write_batch::WriteBatch;
 
 const ROOT: &str = "/disk/meta";
 const COLUMN: ColumnId = ColumnId(1);
-const BUDGET: ByteCount = ByteCount(56 * 1024 * 1024);
+const BUDGET: ByteCount = ByteCount(61 * 1024 * 1024);
 const KEY_SPACE: u64 = 400;
 const OPERATIONS: u64 = 3_000;
 const SEED_COUNT: u64 = 8;

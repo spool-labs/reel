@@ -1078,6 +1078,7 @@ pub fn build_state<Backend: Io>(
             gave_up: Mutex::new(GaveUp::new()),
             early_bar_rewrites: AtomicU64::new(0),
             plain_bar_rewrites: AtomicU64::new(0),
+            key_order_copies: AtomicU64::new(0),
             order: WriteOrder::new(Arc::clone(&places)),
             rows_in_index: AtomicU64::new(0),
             seal_steps: SealStepTimes::default(),

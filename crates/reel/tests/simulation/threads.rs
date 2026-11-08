@@ -19,7 +19,7 @@ use reel_sim::simulated_io::SimulatedIo;
 
 const ROOT: &str = "/disk/threads";
 const COLUMN: ColumnId = ColumnId(1);
-const BUDGET: ByteCount = ByteCount(128 * 1024 * 1024);
+const BUDGET: ByteCount = ByteCount(148 * 1024 * 1024);
 const TICK: Nanoseconds = Nanoseconds(1_000_000);
 const STEPS: u64 = 400_000;
 const ROUNDS: u64 = 6;

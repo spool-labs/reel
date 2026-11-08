@@ -436,6 +436,9 @@ impl<Backend: Io> RewriteJob<Backend> {
         *hold(&volume.lanes[self.lane].inputs) = inputs;
         // one input copies in offset order, and a deciding pass says which rows go across
         self.is_ordered = self.input_count == 1 && self.rebuild.is_none() && !self.is_key_order_held && self.inputs[0].row_room(self.placed.len());
+        if !self.is_ordered {
+            volume.key_order_copies.fetch_add(1, Ordering::Relaxed);
+        }
         self.marks.fill(0);
         self.row_ordinal = 0;
         if is_grave_heavy || self.is_ordered {

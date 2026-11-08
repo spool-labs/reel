@@ -548,6 +548,7 @@ impl<Backend: Io> EngineState<Backend> {
             open_slots: self.queues.len(),
             maintenance_workers: self.sizing.walk_workers,
             least_budget: self.sizing.least_budget,
+            room: self.sizing.room,
             open_time: Nanoseconds(self.open_time.load(Ordering::Acquire)),
             prefault_time: Nanoseconds(self.prefault_time.load(Ordering::Acquire)),
             is_arena_full: self.is_arena_full.load(Ordering::Acquire),

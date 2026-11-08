@@ -86,6 +86,8 @@ pub struct VolumeReading {
     /// Marked segments rewritten at the plain bar, once the current mark had passed their highest
     pub plain_bar_rewrites: u64,
     pub longest_seal_steps: SealSteps,
+    /// Record rewrites that copied in key order, reading records at random
+    pub key_order_copies: u64,
 }
 
 /// Lanes a volume reading has room for. Workers past this show in the last one

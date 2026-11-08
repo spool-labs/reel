@@ -21,7 +21,7 @@ use store_config::{config, scratch_root};
 const MIB: u64 = 1024 * 1024;
 const BUDGETS: [u64; 4] = [128, 192, 512, 4_096];
 const WORKER_COUNTS: [usize; 3] = [0, 1, 4];
-// the spec lets memory_report miss the process heap by this share, as a divisor
+// the spec lets memory_report miss the process heap by this share, as a divisor, until maintenance memory has its own report
 const REPORT_SLACK_DIVISOR: u64 = 10;
 /// The budget a store opens with when its caller gives none
 const DEFAULT_CELL_MIB: u64 = 512;

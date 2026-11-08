@@ -72,6 +72,7 @@ fn seal(store: &Store, io: &SimulatedIo) -> SegmentNumber {
     let number = hold(&store.state.volumes[0].claims).open[0].number;
     store.seal_now();
     settle(io);
+    cool(store, io);
     number
 }
 
@@ -80,6 +81,8 @@ fn keep_live(store: &Store) {
     store.put(COLUMN, b"keep", b"value").expect("put");
     store.put(COLUMN, b"keep-1", &large(3)).expect("put");
     store.put(COLUMN, b"keep-2", &large(4)).expect("put");
+    store.put(COLUMN, b"keep-3", &large(5)).expect("put");
+    store.put(COLUMN, b"keep-4", &large(6)).expect("put");
 }
 
 fn large(byte: u8) -> Vec<u8> {
@@ -376,8 +379,10 @@ fn freed_outlasts_a_reopen() {
     drop(store);
 
     let store = open(&io);
-    settle(&io);
     let volume = &store.state.volumes[0];
+    // the quiet volume's line would rewrite the older segment, and this looks at its row as the reopen left it
+    volume.is_compaction_held.store(true, Ordering::Release);
+    settle(&io);
     let rows = hold(&volume.summary);
     let row = rows.rows().find(|row| row.facts.segment == older).expect("a row");
     assert!(freed_in_place(volume, &row) >= FREE_IN_PLACE_BYTES.0 - 2 * FREE_BLOCK_BYTES);
@@ -530,4 +535,11 @@ fn pass_waits_for_a_new_cue() {
     assert_eq!(volume.table.next_held_frees(), None);
     assert!(volume.bytes_freed.load(Ordering::Acquire) > 0);
     store.close().expect("close");
+}
+
+// the writer pauses once a seal lands, so the hot window closes and the rewrites hot ingest put off can start
+fn cool(store: &Store, io: &SimulatedIo) {
+    let until = store.state.volumes.iter().map(|volume| volume.hot_until().0).max().unwrap_or(0);
+    io.advance_clock(Nanoseconds(until.saturating_sub(io.clock_reading().0)));
+    settle(io);
 }

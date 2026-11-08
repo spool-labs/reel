@@ -25,6 +25,7 @@ const WRITE_ROUNDS: u64 = 80;
 const VALUE_BYTES: usize = 120;
 const SEAL_WAIT: Duration = Duration::from_millis(1);
 const MOST_SEAL_WAITS: u32 = 20_000;
+const MOST_REWRITE_WAITS: u32 = 20_000;
 const HIGH_KEY: &[u8] = b"zzz";
 const FIRST_ROUND: u64 = 0;
 const MOST_VIEWS: u32 = 20;
@@ -166,6 +167,14 @@ fn churn(has_cue: bool) -> JobsRun {
                 store.put(META, &key, &value_of(&key, round)).expect("put");
             }
             store.seal_now();
+        }
+        // the merges hot ingest put off run once the writes stop, still under the walks
+        let volume = &store.state.volumes[0];
+        for _wait in 0..MOST_REWRITE_WAITS {
+            if volume.segments_rewritten.load(Ordering::Acquire) > 0 {
+                break;
+            }
+            thread::sleep(SEAL_WAIT);
         }
         is_done.store(true, Ordering::Release);
         views = viewer.join().expect("join");

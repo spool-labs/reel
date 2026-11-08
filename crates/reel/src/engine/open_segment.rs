@@ -58,6 +58,7 @@ pub struct OpenSegment<File> {
     pub has_deletes: bool,
     pub seen_rows: RowCount,
     pub quiet_since: Nanoseconds,
+    pub first_row_at: Option<Nanoseconds>,
     pub delete_seen: Option<Nanoseconds>,
 }
 

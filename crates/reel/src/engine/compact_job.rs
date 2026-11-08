@@ -20,7 +20,7 @@ use crate::config::MAX_KEY_BYTES;
 use crate::engine::cover_apply::is_in_range;
 use crate::engine::engine_state::EngineState;
 use crate::engine::planner::UnitStep;
-use crate::engine::rewrite_job::{PLANNER_LANE, RewriteJob, RewriteSeat};
+use crate::engine::rewrite_job::{PLANNER_LANE, RewriteJob, RewriteSeat, is_past_line};
 use crate::engine::rebuild::MOST_REBUILD_TRIES;
 use crate::engine::volume::{ParkedSegment, Volume};
 use crate::engine::walk_job::{FREE_IN_PLACE_BYTES, FreeRecord, WALK_RETRY};
@@ -98,6 +98,8 @@ pub struct CompactJob<Backend: Io> {
     held_pass: Option<HeldPass>,
     confirm_pass: Option<ConfirmPass>,
     should_rewrite: bool,
+    /// An ask came while writes were arriving, and record rewrites take it up once they stop
+    is_ask_held: bool,
     last_tried: SegmentNumber,
     settle_at: usize,
     settled_rows: FixedList<DeadCount>,
@@ -123,6 +125,7 @@ impl<Backend: Io> CompactJob<Backend> {
             seats: Arc::new(seats),
             handed_at: 0,
             should_rewrite: false,
+            is_ask_held: false,
             unit: None,
             held_pass: None,
             confirm_pass: None,
@@ -251,27 +254,45 @@ impl<Backend: Io> CompactJob<Backend> {
                 return UnitStep::Worked;
             }
         }
+        // an ask outlives the unlink steps below, as it outlived them before
         self.should_rewrite |= is_asked;
-        let candidate = if is_asked { self.pick_dead(volume) } else { None };
-        let Some(segment) = candidate else {
-            // an unlink wins back the most for the least, so a rewrite waits until none is left to try
-            let should_rewrite = mem::take(&mut self.should_rewrite);
-            // workers go first, so the planner stays free to pick and walk
-            if should_rewrite && (self.hand_out() || self.rewrite.start()) {
+        // a whole unlink wins back the most for the least, so each step tries one ahead of the rewrites, after the covers settle.
+        // A segment a cue still holds starts no pass, and the rewrites go on
+        if let Some(segment) = self.pick_dead(volume) {
+            if self.confirm(volume, segment).is_err() {
+                return self.wait_for_retry(now);
+            }
+            if self.confirm_pass.is_some() {
                 return UnitStep::Worked;
             }
-            // a look takes a few segments at a time, and the rest still count
-            self.should_rewrite = should_rewrite && self.rewrite.has_looks_left;
-            return if self.should_rewrite { UnitStep::Worked } else { UnitStep::Idle };
-        };
-        match self.confirm(volume, segment) {
-            Ok(()) => UnitStep::Worked,
-            Err(_) => {
-                let at = Nanoseconds(now.0 + WALK_RETRY.0);
-                self.retry_at = Some(at);
-                UnitStep::RetryAt(at)
-            },
         }
+        // a quiet volume past its dead line fills its idle time with reclaiming toward it, and one past the bound merges back first
+        let is_short = volume.is_short_of_room();
+        let is_deferring = volume.is_hot(now) && !is_short;
+        let is_holding_records = volume.is_ingesting(now) && !is_short;
+        let is_owed = !is_deferring && volume.is_over_bound.load(Ordering::Acquire);
+        let is_quiet_past_line = !is_holding_records && is_past_line(&hold(&volume.summary));
+        let mut should_rewrite = mem::take(&mut self.should_rewrite) || is_quiet_past_line || is_owed;
+        // an ask that arriving writes held back comes due once they stop
+        if is_holding_records {
+            self.is_ask_held |= should_rewrite;
+        } else {
+            should_rewrite |= mem::take(&mut self.is_ask_held);
+        }
+        // workers go first, so the planner stays free to pick and walk
+        if should_rewrite && (self.hand_out() || self.rewrite.start()) {
+            return UnitStep::Worked;
+        }
+        // a look takes a few segments at a time, and the rest still count. Hot ingest looks at none
+        self.should_rewrite = should_rewrite && !is_deferring && self.rewrite.has_looks_left;
+        if self.should_rewrite {
+            return UnitStep::Worked;
+        }
+        // what hot ingest or arriving writes put off starts once the window closes
+        if is_deferring || is_holding_records {
+            return UnitStep::RetryAt(volume.hot_until());
+        }
+        UnitStep::Idle
     }
 
     /// Look for work for idle workers once something has changed that could give one a pick
@@ -749,6 +770,7 @@ impl<Backend: Io> CompactJob<Backend> {
         park(volume, Some(retired), segment, saved.is_ok());
         saved?;
         volume.segments_unlinked.fetch_add(1, Ordering::AcqRel);
+        volume.unlinked_bytes.fetch_add(length.0, Ordering::Relaxed);
         Ok(())
     }
 }

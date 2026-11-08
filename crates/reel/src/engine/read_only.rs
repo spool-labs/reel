@@ -178,6 +178,7 @@ impl<Backend: Io> EngineState<Backend> {
             has_deletes: recovered.has_deletes,
             seen_rows: RowCount(0),
             quiet_since: Nanoseconds(0),
+            first_row_at: None,
             delete_seen: None,
         });
         Ok(())

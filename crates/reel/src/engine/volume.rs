@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use reel_api::maintenance_report::{PICK_OUTCOMES, PickOutcome, SPAN_RUN_BUCKETS, SealSteps};
+use reel_api::maintenance_report::{PICK_OUTCOMES, PickOutcome, SHARE_KINDS, SPAN_RUN_BUCKETS, SealSteps};
 use reel_api::units::{ByteCount, Nanoseconds, RowCount, VolumeId, WritePlace};
 
 use crate::config::SyncPolicy;
@@ -123,6 +123,9 @@ impl Default for GaveUp {
     }
 }
 
+/// Ingest periods past a volume's last seal start that it stays hot, one missed seal
+pub const HOT_PERIODS: u64 = 2;
+
 /// What one running rewrite shares with the rest of the volume
 #[derive(Debug)]
 pub struct RewriteLane<File> {
@@ -221,6 +224,12 @@ pub struct Volume<Backend: Io> {
     pub rewrite_inputs_gone: AtomicU64,
     /// File bytes of finished rewrites' outputs
     pub rewrite_written: AtomicU64,
+    /// Bytes the outputs took, by the kinds the report counts them in
+    pub rewrite_written_by_share: [AtomicU64; SHARE_KINDS],
+    /// Rewrites done, by the same kinds
+    pub rewrites_by_share: [AtomicU64; SHARE_KINDS],
+    /// File bytes whole unlinks took off the disk
+    pub unlinked_bytes: AtomicU64,
     /// Dead bytes the inputs that left held
     pub rewrite_dead_gone: AtomicU64,
     /// Dead bytes the outputs carry
@@ -292,6 +301,16 @@ pub struct Volume<Backend: Io> {
     pub seal_rate: AtomicU64,
     /// Rows a second the volume took between the last two seals, or 0 before there are two
     pub ingest_rate: AtomicU64,
+    /// When the last sealed segment last took a write, in the clock's nanoseconds, or 0 before a seal
+    pub seal_started_at: AtomicU64,
+    /// Nanoseconds from the last sealed segment's first row to its seal start, the time the writes took to fill it, or 0 before a
+    /// seal
+    pub seal_interval: AtomicU64,
+    /// Nanoseconds the last overlap merge took for each input it merged, or 0 before one has run
+    pub merge_interval: AtomicU64,
+    /// A seal may have taken overlap past the bound at a point a merge can start, so record picks wait until the planner's
+    /// look says otherwise
+    pub is_over_bound: AtomicBool,
     /// The segment the walk has as its target, or `NO_SEAL`
     pub walk_segment: AtomicU64,
     /// A test holds the walk here to leave segments unwalked
@@ -374,15 +393,47 @@ impl<Backend: Io> Volume<Backend> {
         self.has_held_frees.store(true, Ordering::Release);
     }
 
+    /// Check the volume takes writes hot: its writes fill a segment faster than the last overlap merge took one, so merging
+    /// would fall behind and only tax ingest, and its last seal started less than two fill times ago. A fill time runs from the
+    /// sealed segment's first row to its seal start. A trickle that a merge outpaces, a volume no merge has run on yet, and one
+    /// whose writes stopped are quiet
+    pub fn is_hot(&self, now: Nanoseconds) -> bool {
+        let fill = self.seal_interval.load(Ordering::Relaxed);
+        let merge = self.merge_interval.load(Ordering::Relaxed);
+        fill < merge && self.is_ingesting(now)
+    }
+
+    /// Check writes are still arriving: the last seal started less than two fill times ago. Record rewrites, which spend writes
+    /// only to win space back, wait while it holds, and a volume with no seal yet or whose writes stopped is past it
+    pub fn is_ingesting(&self, now: Nanoseconds) -> bool {
+        let fill = self.seal_interval.load(Ordering::Relaxed);
+        fill > 0 && now.0.saturating_sub(self.seal_started_at.load(Ordering::Relaxed)) < HOT_PERIODS * fill
+    }
+
+    /// Read when the hot window closes: two fill times past the last seal start
+    pub fn hot_until(&self) -> Nanoseconds {
+        let interval = self.seal_interval.load(Ordering::Relaxed);
+        Nanoseconds(self.seal_started_at.load(Ordering::Relaxed).saturating_add(HOT_PERIODS.saturating_mul(interval)))
+    }
+
+    /// Check the volume runs short of room: the fullest shard of its table or its park is past half, so merges run under hot
+    /// ingest
+    pub fn is_short_of_room(&self) -> bool {
+        let parked = hold(&self.parked).iter().filter(|slot| slot.is_some()).count();
+        2 * parked > MOST_PARKED || self.table.is_past_half()
+    }
+
     /// Check the park has room for this many segments
     pub fn can_park(&self, count: usize) -> bool {
         self.park_room() >= count
     }
 
     /// Count what a finished rewrite took off the disk and wrote back
-    pub fn note_rewrite_bytes(&self, gone: RowBytes, written: RowBytes) {
+    pub fn note_rewrite_bytes(&self, gone: RowBytes, written: RowBytes, kind: usize) {
         self.rewrite_inputs_gone.fetch_add(gone.file, Ordering::Relaxed);
         self.rewrite_written.fetch_add(written.file, Ordering::Relaxed);
+        self.rewrite_written_by_share[kind].fetch_add(written.file, Ordering::Relaxed);
+        self.rewrites_by_share[kind].fetch_add(1, Ordering::Relaxed);
         self.rewrite_dead_gone.fetch_add(gone.dead, Ordering::Relaxed);
         self.rewrite_dead_kept.fetch_add(written.dead, Ordering::Relaxed);
         if written.file >= gone.file {

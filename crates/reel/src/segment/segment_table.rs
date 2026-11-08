@@ -297,6 +297,15 @@ impl<File: Clone> SegmentTable<File> {
         TABLE_SHARDS * self.read_shard(0).segments.len()
     }
 
+    /// Check the fullest shard has used more than half of its segment slots, its column pool or its block pool
+    pub fn is_past_half(&self) -> bool {
+        (0..TABLE_SHARDS).any(|shard| {
+            let shard = self.read_shard(shard);
+            let used = shard.segments.len() - shard.free_slots.len();
+            2 * used > shard.segments.len() || 2 * shard.columns.len() > shard.columns.capacity() || 2 * shard.blocks.len() > shard.blocks.capacity()
+        })
+    }
+
     /// Count the segments in the table
     pub fn segment_count(&self) -> u64 {
         let mut count = 0;

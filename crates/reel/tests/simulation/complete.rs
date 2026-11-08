@@ -93,6 +93,7 @@ fn settle(io: &SimulatedIo) {
 fn seal(store: &Store, io: &SimulatedIo) {
     store.seal_now();
     settle(io);
+    cool(store, io);
 }
 
 fn key(number: u64) -> Vec<u8> {
@@ -823,4 +824,11 @@ fn output_slots_outlast_a_rewrite_in_flight() {
     }
     volume.is_compaction_held.store(false, Ordering::Release);
     store.close().expect("close");
+}
+
+// the writer pauses once a seal lands, so the hot window closes and the rewrites hot ingest put off can start
+fn cool(store: &Store, io: &SimulatedIo) {
+    let until = store.state.volumes.iter().map(|volume| volume.hot_until().0).max().unwrap_or(0);
+    io.advance_clock(Nanoseconds(until.saturating_sub(io.clock_reading().0)));
+    settle(io);
 }

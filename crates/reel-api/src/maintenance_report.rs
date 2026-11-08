@@ -255,10 +255,14 @@ pub enum PickOutcome {
     Record,
     /// Nothing was ready
     Nothing,
+    /// An overlap merge or record rewrite waited for quiet, since the volume takes writes hot and has room to spare
+    Deferred,
+    /// A record rewrite waited behind an overlap merge that runs or can start
+    Behind,
 }
 
 /// Outcomes a look for rewrite work can come to
-pub const PICK_OUTCOMES: usize = 9;
+pub const PICK_OUTCOMES: usize = 11;
 
 impl PickOutcome {
     /// Read this outcome's place in a reading
@@ -280,7 +284,26 @@ pub struct RewriteBytes {
     pub dead_kept: ByteCount,
     /// Rewrites that wrote at least the bytes their leaving inputs held
     pub unreclaimed: u64,
+    /// Bytes the outputs took, by what the rewrite was: a record rewrite whose inputs won back under three quarters of their
+    /// bytes, one that won back three quarters or more, an overlap merge, and a rebuild or forced merge
+    pub written_by_share: [ByteCount; SHARE_KINDS],
+    /// Rewrites of each of those kinds
+    pub rewrites_by_share: [u64; SHARE_KINDS],
+    /// File bytes whole unlinks took off the disk, which write nothing
+    pub unlinked: ByteCount,
 }
+
+/// The kinds a rewrite's written bytes are counted by: record rewrites under three quarters dead, at three quarters and up,
+/// overlap merges, and rebuilds and forced merges
+pub const SHARE_KINDS: usize = 4;
+/// A record rewrite whose inputs won back under three quarters of their bytes
+pub const RECORD_UNDER_EARLY_BAR: usize = 0;
+/// A record rewrite whose inputs won back three quarters or more
+pub const RECORD_PAST_EARLY_BAR: usize = 1;
+/// An overlap merge
+pub const OVERLAP_MERGE: usize = 2;
+/// A rebuild or a forced merge
+pub const OTHER_MERGE: usize = 3;
 
 /// What the maintenance jobs' regions have held, and what admission found at its last start
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

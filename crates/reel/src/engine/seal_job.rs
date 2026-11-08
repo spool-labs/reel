@@ -148,9 +148,15 @@ impl<Backend: Io> SealJob<Backend> {
                 volume.sealing.store(segment.number.0, Ordering::Release);
                 let now = self.state.io.now();
                 if self.seal_started.0 > 0 {
-                    let rate = rows_per_second(segment.row_count, now.0.saturating_sub(self.seal_started.0));
-                    volume.ingest_rate.store(rate, Ordering::Relaxed);
+                    let interval = now.0.saturating_sub(self.seal_started.0);
+                    volume.ingest_rate.store(rows_per_second(segment.row_count, interval), Ordering::Relaxed);
                 }
+                // the period runs from the first row to the last, so idle gaps on either side read quiet: one before the first row,
+                // and one an idle seal waited out after the last. A recovered segment has none
+                let last_write = if segment.quiet_since.0 > 0 { segment.quiet_since } else { now };
+                let period = segment.first_row_at.map_or(0, |first| last_write.0.saturating_sub(first.0).max(1));
+                volume.seal_interval.store(period, Ordering::Relaxed);
+                volume.seal_started_at.store(last_write.0, Ordering::Relaxed);
                 self.seal_started = now;
                 self.step_started = now;
                 self.rows_walked = 0;
@@ -205,6 +211,7 @@ impl<Backend: Io> SealJob<Backend> {
         self.volume().seals_done.fetch_add(1, Ordering::AcqRel);
         // each seal can take a column's overlap past the bound
         self.volume().wants_compaction.store(true, Ordering::Release);
+        self.volume().is_over_bound.store(true, Ordering::Release);
         if let Some(task) = self.state.planner_task.get() {
             task.wake();
         }

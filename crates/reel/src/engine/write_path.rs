@@ -826,6 +826,10 @@ impl<Backend: Io> EngineState<Backend> {
                 if request.is_alone {
                     segment.phase = SegmentPhase::Alone;
                 }
+                // the seal measures the ingest period from the first row, one clock read a segment
+                if segment.first_row_at.is_none() {
+                    segment.first_row_at = Some(self.io.now());
+                }
                 let offset = segment.write_end;
                 segment.write_end = FileOffset(offset.0 + request.bytes.0);
                 segment.row_count = RowCount(segment.row_count.0 + request.rows.0);
@@ -1167,6 +1171,7 @@ impl<Backend: Io> EngineState<Backend> {
             has_deletes: false,
             seen_rows: RowCount(0),
             quiet_since: Nanoseconds(0),
+            first_row_at: None,
             delete_seen: None,
         })
     }

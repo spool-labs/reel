@@ -91,6 +91,7 @@ fn contents(workers: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
         store.seal_now();
         settle(&io);
     }
+    cool(&store, &io);
     let mut found = Vec::new();
     let mut scan = store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan");
     let (mut key, mut value) = (Vec::new(), Vec::new());
@@ -145,6 +146,7 @@ fn workers_run_rewrites() {
         store.seal_now();
         settle(&io);
     }
+    cool(&store, &io);
     let volume = &store.state.volumes[0];
     let mut report = MaintenanceReport::default();
     store.maintenance_report(&mut report);
@@ -175,13 +177,15 @@ fn most_rewrites_at_once(device: DeviceClass) -> usize {
         store.seal_now();
         settle(&io);
     }
+    cool(&store, &io);
     for round in 0..DEAD_SEGMENTS {
-        for number in 0..KEYS {
+        for number in 0..KEYS / 2 {
             store.put(COLUMN, format!("key-{round}-{number:04}").as_bytes(), b"second").expect("put");
         }
     }
     store.seal_now();
     settle(&io);
+    cool(&store, &io);
 
     volume.is_compaction_held.store(false, Ordering::Release);
     store.state.ask_compaction();
@@ -337,4 +341,11 @@ fn workers_serve_every_volume() {
     let (shared, blocks) = two_volume_contents(3);
     assert_eq!(shared, alone);
     assert!(blocks.iter().all(|blocks| *blocks > 0), "a volume walked nothing: {blocks:?}");
+}
+
+// the writer pauses once a seal lands, so the hot window closes and the rewrites hot ingest put off can start
+fn cool(store: &Store, io: &SimulatedIo) {
+    let until = store.state.volumes.iter().map(|volume| volume.hot_until().0).max().unwrap_or(0);
+    io.advance_clock(Nanoseconds(until.saturating_sub(io.clock_reading().0)));
+    settle(io);
 }

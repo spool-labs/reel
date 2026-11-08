@@ -15,8 +15,8 @@ use reel::engine::open_segment::{OUTPUT_SUFFIX, data_path};
 use reel::engine::read_path::{RecordWant, WalkAsk};
 use reel::engine::planner::{Planner, unit_bound};
 use reel::engine::reel_store::ReelStore;
-use reel::engine::rewrite_job::{MERGE_BUFFER_BYTES, MOST_OVERLAP, MOST_PARK_WAITS, PLANNER_LANE, RewriteJob, RewritePhase, is_overlap_input, overlaps};
-use reel::engine::volume::{MOST_PARKED, NO_SEAL};
+use reel::engine::rewrite_job::{DEAD_LINE_DIVISOR, is_past_line, MERGE_BUFFER_BYTES, MOST_OVERLAP, MOST_PARK_WAITS, PLANNER_LANE, RewriteJob, RewritePhase, is_overlap_input, overlaps};
+use reel::engine::volume::{MOST_PARKED, NO_SEAL, Volume};
 use reel::engine::walk_job::{BlockCounter, WalkJob, WalkWorker};
 use reel::guard::hold;
 use reel::io::{DeviceReads, InPlace, Io, IoFile, in_place};
@@ -25,13 +25,13 @@ use reel::record::codec::Codec;
 use reel::segment::column_directory::ColumnDirectory;
 use reel::segment::damage_list::DamagedRange;
 use reel::segment::footer_reader::FooterReader;
-use reel::segment::segment_table::{RetiredSegment, shard_of};
+use reel::segment::segment_table::{RetiredSegment, TABLE_SHARDS, shard_of};
 use reel::segment::segment_tail::{BlockCount, MOST_MERGE_SEGMENTS, SegmentNumber, TailHead};
 use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::{MaintenanceReport, UnitKind};
+use reel_api::maintenance_report::{MaintenanceReport, PickOutcome, UnitKind};
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RootId, VolumeId, WritePlace};
 use reel_api::write_batch::WriteBatch;
-use reel_sim::seeded_random::Seed;
+use reel_sim::seeded_random::{Seed, SeededRandom};
 use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_file::SimulatedFile;
 use reel::io::host_memory::HostMemory;
@@ -64,6 +64,11 @@ const LEAST_VALUE: u64 = 100;
 const STEPPED_COPY_KEYS: u64 = 512;
 const HAND_OUT_LINE: Duration = Duration::from_millis(1);
 const PARK_WAIT: Duration = Duration::from_secs(10);
+const HOT_ROUNDS: u64 = 600;
+const HOT_ROUND_KEYS: u64 = 8;
+const HOT_FILL: Nanoseconds = Nanoseconds(100 * TICK.0);
+const PLANNER_STEPS: usize = 200_000;
+const WIDE_VALUE_BYTES: usize = 64 * 1024;
 
 type Store = ReelStore<SimulatedIo>;
 
@@ -110,6 +115,7 @@ fn seal(store: &Store, io: &SimulatedIo) -> SegmentNumber {
     let number = hold(&store.state.volumes[0].claims).open[0].number;
     store.seal_now();
     settle(io);
+    cool(store, io);
     number
 }
 
@@ -1709,9 +1715,10 @@ fn large_merge_when_alone() {
     store.close().expect("close");
 }
 
-// small segments go first, and whole segments fill what's left, since the output is cut to size
+// small segments go first and merge among themselves, so the large ones wait for a merge of their own size and aren't copied
+// again with the small
 #[test]
-fn whole_segments_fill_a_merge() {
+fn small_segments_merge_by_size() {
     let io = SimulatedIo::new(Seed(63));
     let store = open(&io);
     hold_compaction(&store, true);
@@ -1733,8 +1740,8 @@ fn whole_segments_fill_a_merge() {
     assert!(start_merge(&mut job));
     let mut inputs = job.rewrite.input_numbers().to_vec();
     inputs.sort_unstable();
-    assert!(small.iter().all(|segment| inputs.contains(segment)));
-    assert_eq!(inputs.len(), MOST_MERGE_SEGMENTS);
+    small.sort_unstable();
+    assert_eq!(inputs, small, "a large segment joined the small ones' merge");
     job.rewrite.abandon();
     store.close().expect("close");
 }
@@ -2147,9 +2154,9 @@ fn idle_starts_no_merge() {
     store.close().expect("close");
 }
 
-// a third of a volume dead sits under the trigger, and however long the volume stays idle no rewrite starts
+// a third of a quiet volume dead is past its ten percent line, and its idle time goes to reclaiming down to the line
 #[test]
-fn idle_under_the_trigger() {
+fn idle_volume_reclaims_to_its_line() {
     let io = SimulatedIo::new(Seed(77));
     let store = open(&io);
     let value = vec![7; IDLE_VALUE_BYTES];
@@ -2166,7 +2173,11 @@ fn idle_under_the_trigger() {
         store.state.ask_compaction();
         settle(&io);
     }
-    assert_eq!(store.state.volumes[0].segments_rewritten.load(Ordering::Acquire), 0);
+    let volume = &store.state.volumes[0];
+    assert!(volume.segments_rewritten.load(Ordering::Acquire) > 0, "an idle volume past its line rewrote nothing");
+    let rows = hold(&volume.summary);
+    assert!(rows.orders().dead_bytes() * DEAD_LINE_DIVISOR <= rows.file_bytes().0, "the volume stopped short of its line");
+    drop(rows);
     store.close().expect("close");
 }
 
@@ -2257,7 +2268,7 @@ fn hiding_graves_get_one_look() {
         store.put(COLUMN, format!("key-{number:04}").as_bytes(), &value).expect("put");
     }
     seal(&store, &io);
-    for number in 0..IDLE_KEYS / 4 {
+    for number in 0..IDLE_KEYS / 5 {
         store.delete(COLUMN, format!("key-{number:04}").as_bytes()).expect("delete");
     }
     let graves = seal(&store, &io);
@@ -2397,7 +2408,7 @@ impl DeviceReads<SimulatedFile> for ChangesList<'_> {
     }
 }
 
-// an overlap merge copies records, so it starts on the planner's lane and a worker leaves it there
+// an overlap merge copies records, so while writes arrive it starts on the planner's lane and a worker leaves it there
 #[test]
 fn workers_leave_overlap() {
     let io = SimulatedIo::new(Seed(74));
@@ -2409,6 +2420,10 @@ fn workers_leave_overlap() {
     hold_walk(&store, true);
     pile_up(&store, &io, OVER_THE_BOUND);
     hold_compaction(&store, false);
+    // a seal just started and the last fill took an hour, so writes still arrive
+    let volume = &store.state.volumes[0];
+    volume.seal_interval.store(3_600_000_000_000, Ordering::Relaxed);
+    volume.seal_started_at.store(io.clock_reading().0, Ordering::Relaxed);
 
     let state = &store.state;
     let mut worker = RewriteJob::new(Arc::clone(state), 0, PLANNER_LANE + 1);
@@ -2442,6 +2457,8 @@ fn seat_lock_is_held_for_a_swap() {
     }
     seal(&store, &io);
 
+    // no overlap stands, so the record rewrite needs no look ahead of it
+    state.volumes[0].is_over_bound.store(false, Ordering::Release);
     let job = CompactJob::new(Arc::clone(state), 0);
     assert_eq!(job.seats.len(), 1);
     assert!(job.hand_out(), "no rewrite started");
@@ -2665,5 +2682,368 @@ fn dropped_held_row_lands_nothing() {
     assert_eq!(present, [newer, charged], "the merge kept a row");
     assert_eq!(dead_rows(&store, newer) + dead_rows(&store, charged), 0);
     assert_eq!(read(&store, KEYS[3]), Some(b"third".to_vec()));
+    store.close().expect("close");
+}
+
+// an ask for a rewrite outlives the steps an unlink takes ahead of it, on a quiet volume under its dead line, where only the ask
+// brings a rewrite
+#[test]
+fn ask_outlives_an_unlink() {
+    let io = SimulatedIo::new(Seed(79));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    // enough live bytes that the dead ones sit under the line
+    let value = vec![7; IDLE_VALUE_BYTES];
+    for number in 0..IDLE_KEYS {
+        store.put(COLUMN, format!("live-{number:04}").as_bytes(), &value).expect("put");
+    }
+    seal(&store, &io);
+    half_dead(&store, &io);
+    store.put(COLUMN, b"w", b"first").expect("put");
+    let gone = seal(&store, &io);
+    store.put(COLUMN, b"w", b"second").expect("put");
+    seal(&store, &io);
+    io.hold_jobs("reel-planner", true);
+    hold_compaction(&store, false);
+    // no overlap stands, so nothing past the ask brings a rewrite
+    volume.is_over_bound.store(false, Ordering::Release);
+    assert!(!volume.is_hot(io.clock_reading()) && !is_past_line(&hold(&volume.summary)), "something past the ask would rewrite");
+
+    let mut job = CompactJob::new(Arc::clone(state), 0);
+    volume.wants_compaction.store(true, Ordering::Release);
+    let mut is_started = false;
+    for _step in 0..MOST_LOOPS {
+        job.step_unit(io.clock_reading());
+        if job.rewrite.is_running() {
+            is_started = true;
+            break;
+        }
+    }
+    assert!(!volume.table.holds(gone), "the wholly dead segment didn't go first");
+    assert!(is_started, "the ask went with the unlink");
+    while job.rewrite.is_running() {
+        job.rewrite.step();
+    }
+    io.hold_jobs("reel-planner", false);
+    store.close().expect("close");
+}
+
+// a fill time runs from a segment's first row to its seal: a volume idle before a quick fill reads quiet a minute after its
+// seal, and one sealing back to back faster than a merge takes a segment reads hot
+#[test]
+fn fill_time_runs_from_the_first_row() {
+    let io = SimulatedIo::new(Seed(80));
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    let second = Nanoseconds(1_000_000_000);
+    let minute = Nanoseconds(60 * second.0);
+    assert!(!volume.is_hot(io.clock_reading()), "a volume with no seal read hot");
+    // the first gap is the idle open, the second the hour between seals
+    for _gap in 0..2 {
+        io.advance_clock(Nanoseconds(60 * minute.0));
+        store.put(COLUMN, b"key", b"value").expect("put");
+        seal(&store, &io);
+        let fill = volume.seal_interval.load(Ordering::Relaxed);
+        assert!(fill > 0 && fill < minute.0, "the idle gap counted in the fill time: {fill}");
+        io.advance_clock(minute);
+        assert!(!volume.is_hot(io.clock_reading()), "a volume idle between seals read hot");
+    }
+    // the last merge took a minute a segment, so seals a second apart outrun it
+    volume.merge_interval.store(minute.0, Ordering::Relaxed);
+    for _seal in 0..2 {
+        store.put(COLUMN, b"key", b"value").expect("put");
+        io.advance_clock(second);
+        store.seal_now();
+        settle(&io);
+    }
+    assert!(volume.is_hot(io.clock_reading()), "a volume sealing back to back read quiet");
+    store.close().expect("close");
+}
+
+// a trickle that fills each segment slower than a merge takes one reads quiet however steady it is, so maintenance keeps up
+// with it, and no merge yet reads quiet too
+#[test]
+fn trickle_a_merge_outpaces_reads_quiet() {
+    let io = SimulatedIo::new(Seed(85));
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    let second = Nanoseconds(1_000_000_000);
+    let minute = Nanoseconds(60 * second.0);
+    for _seal in 0..3 {
+        store.put(COLUMN, b"key", b"value").expect("put");
+        io.advance_clock(minute);
+        store.seal_now();
+        settle(&io);
+        assert!(!volume.is_hot(io.clock_reading()), "a volume no merge has run on read hot");
+    }
+    volume.merge_interval.store(second.0, Ordering::Relaxed);
+    for _seal in 0..3 {
+        store.put(COLUMN, b"key", b"value").expect("put");
+        io.advance_clock(minute);
+        store.seal_now();
+        settle(&io);
+        assert!(!volume.is_hot(io.clock_reading()), "a trickle a merge outpaces read hot");
+    }
+    store.close().expect("close");
+}
+
+// the writer pauses once a seal lands, so the hot window closes and the rewrites hot ingest put off can start
+fn cool(store: &Store, io: &SimulatedIo) {
+    let until = store.state.volumes.iter().map(|volume| volume.hot_until().0).max().unwrap_or(0);
+    io.advance_clock(Nanoseconds(until.saturating_sub(io.clock_reading().0)));
+    settle(io);
+}
+
+
+// an overlap merge takes the widest ranges over its point first, so segments that span every key merge ahead of narrow ones,
+// small as those are
+#[test]
+fn overlap_takes_the_widest_first() {
+    let io = SimulatedIo::new(Seed(82));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let value = vec![7; WIDE_VALUE_BYTES];
+    let mut wide = Vec::new();
+    for number in 0..OVER_THE_BOUND {
+        store.put(COLUMN, b"m-shared", format!("{number}").as_bytes()).expect("put");
+        if number % 2 == 0 {
+            store.put(COLUMN, format!("a-{number:03}").as_bytes(), &value).expect("put");
+            store.put(COLUMN, format!("z-{number:03}").as_bytes(), &value).expect("put");
+            wide.push(seal(&store, &io));
+        } else {
+            seal(&store, &io);
+        }
+    }
+
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(start_merge(&mut job));
+    let inputs = job.rewrite.input_numbers().to_vec();
+    assert!(inputs.len() > 1 && inputs.iter().all(|input| wide.contains(input)), "a narrow segment went ahead of a wide one: {inputs:?}");
+    run_to_end(&mut job);
+    store.close().expect("close");
+}
+
+// a quiet volume merges back to the bound before it reclaims: a record rewrite waits on every lane while an overlap merge runs or
+// can start, and runs once the planner's look finds no point a merge can take
+#[test]
+fn records_wait_behind_overlap() {
+    let io = SimulatedIo::new(Seed(83));
+    let mut config = config();
+    config.threads.maintenance_workers = Some(1);
+    config.memory_budget = WORKER_BUDGET;
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    hold_compaction(&store, true);
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    pile_up(&store, &io, OVER_THE_BOUND);
+    half_dead(&store, &io);
+    let records = || volume.picks[PickOutcome::Record.index()].load(Ordering::Acquire);
+
+    let mut job = CompactJob::new(Arc::clone(state), 0);
+    // a worker may take an overlap merge of its own, and no record rewrite starts ahead of the merges
+    let _handed = job.hand_out();
+    assert_eq!(records(), 0, "a worker's record rewrite started ahead of the overlap merge");
+    // the planner's own unit drives the merges, the hand-outs and the park
+    io.hold_jobs("reel-planner", true);
+    hold_compaction(&store, false);
+    for _step in 0..PLANNER_STEPS {
+        job.step_unit(io.clock_reading());
+        if records() > 0 {
+            break;
+        }
+    }
+    assert!(records() > 0, "the record rewrite never ran once overlap was back at the bound");
+    assert!(!volume.is_over_bound.load(Ordering::Acquire), "a record rewrite ran while overlap stood past the bound");
+    assert!(volume.picks[PickOutcome::Overlap.index()].load(Ordering::Acquire) > 0, "no overlap merge ran ahead of it");
+    while job.rewrite.is_running() {
+        job.rewrite.step();
+    }
+    for seat in job.seats.iter() {
+        if let Some(rewrite) = hold(&seat.job).as_mut() {
+            while rewrite.is_running() {
+                rewrite.step();
+            }
+        }
+    }
+    io.hold_jobs("reel-planner", false);
+    store.close().expect("close");
+}
+
+// hot ingest puts merges off while the table has room, and once its fullest shard passes half they run under the ingest, so no
+// write meets a full table
+#[test]
+fn hot_ingest_merges_once_room_runs_short() {
+    let io = SimulatedIo::new(Seed(84));
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    let mut random = SeededRandom::new(Seed(84));
+    let mut short_at = None;
+    // the last merge took an hour a segment, so every fill outruns it
+    volume.merge_interval.store(3_600_000_000_000, Ordering::Relaxed);
+    for round in 0..HOT_ROUNDS {
+        // random keys put every segment's range over the whole key space, and none goes dead
+        for _key in 0..HOT_ROUND_KEYS {
+            store.put(COLUMN, &random.next_word().to_be_bytes(), b"hot").expect("a write met a full table");
+        }
+        let could_pass_half = is_near_half(volume);
+        io.advance_clock(HOT_FILL);
+        store.seal_now();
+        settle(&io);
+        // the merge that room forces sets the merge time from the sim's clock, which stands still, so only the rounds before it
+        // read hot
+        if volume.segments_rewritten.load(Ordering::Acquire) > 0 {
+            assert!(could_pass_half || short_at.is_some(), "a merge ran under hot ingest with room to spare");
+            assert!(volume.picks[PickOutcome::Deferred.index()].load(Ordering::Acquire) > 0, "nothing was put off");
+            store.close().expect("close");
+            return;
+        }
+        assert!(volume.is_hot(io.clock_reading()), "round {round} read quiet");
+        if let Some(at) = short_at {
+            assert!(round <= at + 1, "no merge ran once the table passed half");
+        } else if volume.is_short_of_room() {
+            short_at = Some(round);
+        }
+    }
+    panic!("the table never passed half");
+}
+
+// check one more segment would take the table's fullest shard past half
+fn is_near_half(volume: &Volume<SimulatedIo>) -> bool {
+    (0..TABLE_SHARDS).any(|shard| {
+        let shard = volume.table.read_shard(shard);
+        2 * (shard.segments.len() - shard.free_slots.len() + 1) > shard.segments.len()
+    })
+}
+
+// random keys with deletes put every segment over the whole key space, and once more than the bound stand quiet, overlap
+// merges bring them back under it with the walk running beside them
+#[test]
+fn random_churn_merges_back_to_the_bound() {
+    let io = SimulatedIo::new(Seed(86));
+    let mut config = config();
+    config.threads.maintenance_workers = Some(2);
+    config.memory_budget = WORKER_BUDGET;
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let volume = &store.state.volumes[0];
+    let mut random = SeededRandom::new(Seed(86));
+    let mut written = Vec::new();
+    for _round in 0..OVER_THE_BOUND + 8 {
+        for count in 0..HOT_ROUND_KEYS * 4 {
+            let mut key = [0u8; 32];
+            for chunk in key.chunks_mut(8) {
+                chunk.copy_from_slice(&random.next_word().to_be_bytes());
+            }
+            store.put(COLUMN, &key, b"churn").expect("put");
+            written.push(key);
+            if count % 8 == 7 {
+                let old = written[(random.next_word() % written.len() as u64) as usize];
+                store.delete(COLUMN, &old).expect("delete");
+            }
+        }
+        seal(&store, &io);
+    }
+    for _step in 0..PLANNER_STEPS {
+        io.advance_clock(TICK);
+        settle(&io);
+    }
+    let overlap = volume.picks[PickOutcome::Overlap.index()].load(Ordering::Acquire);
+    let misses = volume.picks[PickOutcome::OverlapMiss.index()].load(Ordering::Acquire);
+    let lone = volume.picks[PickOutcome::OverlapLone.index()].load(Ordering::Acquire);
+    assert!(overlap > 0, "no overlap merge ran: misses {misses} lone {lone}");
+    store.close().expect("close");
+}
+
+// segments a running rewrite holds still count toward the crowd, so overlap past the bound merges what's free and never waits
+// on the held ones to fall under it
+#[test]
+fn held_segments_count_toward_the_crowd() {
+    let io = SimulatedIo::new(Seed(87));
+    let mut config = config();
+    config.threads.maintenance_workers = Some(1);
+    config.memory_budget = WORKER_BUDGET;
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    hold_compaction(&store, true);
+    let volume = &store.state.volumes[0];
+    pile_up(&store, &io, OVER_THE_BOUND);
+    // a worker's rewrite holds enough of the pile to leave the rest at the bound
+    let held: Vec<SegmentNumber> = hold(&volume.summary).rows().map(|row| row.facts.segment).take(MOST_MERGE_SEGMENTS).collect();
+    hold(&volume.lanes[1].inputs)[..held.len()].copy_from_slice(&held);
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(start_merge(&mut job), "no merge started with the held segments counted out of the crowd");
+    assert!(job.rewrite.input_numbers().iter().all(|input| !held.contains(input)), "a held segment went into the merge");
+    run_to_end(&mut job);
+    *hold(&volume.lanes[1].inputs) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
+    check_pile(&store, OVER_THE_BOUND);
+    store.close().expect("close");
+}
+
+// a mostly dead segment waits for its record rewrite while writes still arrive, even with merges keeping up, and is rewritten
+// once they stop
+#[test]
+fn records_wait_while_writes_arrive() {
+    let io = SimulatedIo::new(Seed(88));
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    let records = || volume.picks[PickOutcome::Record.index()].load(Ordering::Acquire);
+    for key in KEYS {
+        store.put(COLUMN, key, b"first").expect("put");
+    }
+    io.advance_clock(TICK);
+    store.seal_now();
+    settle(&io);
+    for key in &KEYS[..3] {
+        store.put(COLUMN, key, b"second").expect("put");
+    }
+    io.advance_clock(TICK);
+    store.seal_now();
+    settle(&io);
+    assert!(volume.is_ingesting(io.clock_reading()), "a seal just landed and writes read stopped");
+    assert_eq!(records(), 0, "a record rewrite ran while writes arrived");
+    assert!(volume.picks[PickOutcome::Deferred.index()].load(Ordering::Acquire) > 0, "nothing was put off");
+    cool(&store, &io);
+    assert!(records() > 0, "the record rewrite put off never ran once writes stopped");
+    check_reads(&store);
+    store.close().expect("close");
+}
+
+// once writes stop, an idle worker takes an overlap merge of its own beside the planner's, over segments no other merge holds
+#[test]
+fn workers_merge_back_once_writes_stop() {
+    let io = SimulatedIo::new(Seed(89));
+    let mut config = config();
+    config.threads.maintenance_workers = Some(1);
+    config.memory_budget = WORKER_BUDGET;
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    hold_compaction(&store, true);
+    let volume = &store.state.volumes[0];
+    pile_up(&store, &io, 2 * OVER_THE_BOUND);
+    assert!(!volume.is_ingesting(io.clock_reading()), "writes read as still arriving");
+    hold_compaction(&store, false);
+    let job = CompactJob::new(Arc::clone(&store.state), 0);
+    // a look takes a few segments at a time, and this pile is first crowded past the bound's count of them
+    let handed = (0..2 * OVER_THE_BOUND).any(|_look| job.hand_out());
+    assert!(handed, "no worker took an overlap merge once writes stopped");
+    let worker_inputs = *hold(&volume.lanes[1].inputs);
+    assert!(worker_inputs.iter().filter(|input| input.0 != 0).count() > 1, "the worker's merge took fewer than two inputs");
+    assert_eq!(volume.picks[PickOutcome::Overlap.index()].load(Ordering::Acquire), 1);
+    store.close().expect("close");
+}
+
+// a segment sealed after its writes went quiet reads as writes stopped, so the work they held back starts at once
+#[test]
+fn idle_seal_reads_quiet() {
+    let io = SimulatedIo::new(Seed(90));
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    store.put(COLUMN, b"key", b"value").expect("put");
+    io.advance_clock(TICK);
+    settle(&io);
+    io.advance_clock(Nanoseconds(600 * 1_000_000_000));
+    store.seal_now();
+    settle(&io);
+    assert!(volume.seal_interval.load(Ordering::Relaxed) > 0, "the seal measured no fill time");
+    assert!(!volume.is_ingesting(io.clock_reading()), "a seal after ten quiet minutes read as writes arriving");
     store.close().expect("close");
 }

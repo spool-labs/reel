@@ -389,6 +389,8 @@ fn keep_live(store: &Store2) {
     store.put(META, b"keep", b"value").expect("put");
     store.put(META, b"keep-1", &large(3)).expect("put");
     store.put(META, b"keep-2", &large(4)).expect("put");
+    store.put(META, b"keep-3", &large(5)).expect("put");
+    store.put(META, b"keep-4", &large(6)).expect("put");
 }
 
 // a free on the second volume waits for a cue's low point there, with its point on the first past the replacement

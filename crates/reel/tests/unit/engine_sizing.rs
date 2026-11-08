@@ -232,7 +232,7 @@ fn disk_sets_the_entries() {
     assert_eq!(disk_entries(Some(hz02), SEGMENT_TARGET), Some(29_568));
     assert_eq!(disk_entries(None, SEGMENT_TARGET), None);
     assert_eq!(disk_entries(Some(ByteCount(1)), SEGMENT_TARGET), Some(floor_entries()));
-    assert_eq!(asked, ByteCount(64_576_512));
+    assert_eq!(asked, ByteCount(67_296_768));
     assert_eq!(disked.least_budget().0, bare.least_budget().0 + floor.0);
     assert_eq!(disked.entry_line(), asked);
     assert!(EngineSizing::for_store(&disked).table_share < EngineSizing::for_store(&bare).table_share);

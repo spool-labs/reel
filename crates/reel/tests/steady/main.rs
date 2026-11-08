@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use reel::engine::planner::unit_bound;
 use reel::engine::reel_store::ReelStore;
-use reel::engine::rewrite_job::{SHARE_SCALE, reclaim_share};
+use reel::segment::summary_orders::{SHARE_SCALE, reclaim_share};
 use reel::engine::walk_job::FREE_IN_PLACE_BYTES;
 use reel::guard::hold;
 use reel::io::plain::PlainIo;

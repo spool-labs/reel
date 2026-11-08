@@ -15,6 +15,7 @@ mod idle_seal;
 mod io_contract;
 mod latest;
 mod marks;
+mod picks;
 mod place_limit;
 mod prefix_counts;
 mod range_deletes;

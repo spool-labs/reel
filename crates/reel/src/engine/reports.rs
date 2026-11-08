@@ -157,8 +157,8 @@ impl<Backend: Io> EngineState<Backend> {
             strays += volume.stray_outputs.load(Ordering::Acquire);
             retries += volume.reclaim_retries.load(Ordering::Acquire);
             let rows = hold(&volume.summary);
-            let segment_count = rows.rows().count() as u64;
-            let used_bytes: u64 = rows.rows().map(|row| row.facts.file_length.0).sum();
+            let segment_count = rows.orders().len() as u64;
+            let used_bytes = rows.file_bytes().0;
             report.volumes.push(VolumeReading {
                 volume: VolumeId(index as u8),
                 segment_count: SegmentCount(segment_count),
@@ -241,10 +241,12 @@ impl<Backend: Io> EngineState<Backend> {
         report.unlinks_refused = SegmentCount(self.unlinks_refused.load(Ordering::Relaxed));
         report.damaged_segments = SegmentCount(self.damaged_segments.load(Ordering::Acquire));
         report.summary_rows_dropped = RowCount(self.dropped_summary_rows.load(Ordering::Acquire));
+        report.summary_rows_unordered = RowCount(self.volumes.iter().map(|volume| hold(&volume.summary).orders().left_out()).sum());
         report.refused_reads = RowCount(self.cues.refused_reads());
         report.workers = self.workers.len() as u64;
         report.active_workers = self.workers.active();
         report.worker_priority = *hold(&self.worker_priority);
+        report.longest_holds = self.pick_holds.each_ref().map(|held| Nanoseconds(held.load(Ordering::Relaxed)));
         report.memory = MaintenanceMemory { walk_fixed: ByteCount(self.walk_heap.load(Ordering::Acquire)), ..self.admission.reading() };
     }
 

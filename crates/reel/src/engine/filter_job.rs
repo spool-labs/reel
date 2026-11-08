@@ -5,12 +5,11 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::UnitKind;
+use reel_api::maintenance_report::{PickKind, UnitKind};
 use reel_api::units::FileOffset;
 
 use crate::engine::engine_state::EngineState;
 use crate::engine::volume::Volume;
-use crate::guard::hold;
 use crate::io::{Io, IoFile};
 use crate::pool::touched_capacity;
 use crate::segment::block_filter::open_filter;
@@ -18,6 +17,8 @@ use crate::segment::segment_tail::{MAX_COLUMNS, SegmentNumber};
 
 /// Filters a step reads, so a step stays short beside the planner's other work
 pub const FILTER_STEP_BLOCKS: usize = 64;
+/// Most segments one pick looks at from the newest down, and as many again from where the last pick's sweep stopped
+pub const FILTER_LOOKS: usize = 64;
 
 /// A run of a segment's block lines
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -34,6 +35,7 @@ pub struct FilterLoader<Backend: Io> {
     runs: Vec<BlockRun>,
     looked_at: u64,
     loaded: u64,
+    swept_to: SegmentNumber,
 }
 
 impl<Backend: Io> FilterLoader<Backend> {
@@ -46,6 +48,7 @@ impl<Backend: Io> FilterLoader<Backend> {
             runs: touched_capacity(MAX_COLUMNS, BlockRun::default()),
             looked_at: u64::MAX,
             loaded: 0,
+            swept_to: SegmentNumber(0),
         }
     }
 
@@ -89,14 +92,25 @@ impl<Backend: Io> FilterLoader<Backend> {
         if changes == self.looked_at {
             return false;
         }
-        let arena = &self.state.filter_arena;
-        let next = {
-            let rows = hold(&volume.summary);
-            let wanted = rows.rows().filter(|row| !row.facts.is_damaged);
-            wanted.map(|row| row.facts.segment).filter(|segment| !arena.holds(*segment)).max()
+        let state = Arc::clone(&self.state);
+        let arena = &state.filter_arena;
+        let (next, is_swept) = {
+            let rows = state.hold_for_pick(self.volume, PickKind::Filter);
+            let is_wanted = |segment: &&SegmentNumber| !arena.holds(**segment) && rows.get(**segment).is_some_and(|row| !row.facts.is_damaged);
+            let present = rows.orders().present();
+            let newest = present.iter().rev().take(FILTER_LOOKS).find(is_wanted);
+            // a sweep down the older segments goes on from where the last one stopped, and starts at the top again past the oldest
+            let below = if self.swept_to.0 == 0 { present } else { rows.orders().below(self.swept_to) };
+            let window = &below[below.len().saturating_sub(FILTER_LOOKS)..];
+            let swept = window.iter().rev().find(is_wanted);
+            self.swept_to = swept.or(window.first()).copied().filter(|_segment| window.len() == FILTER_LOOKS).unwrap_or(SegmentNumber(0));
+            (newest.or(swept).copied(), window.len() < FILTER_LOOKS)
         };
         let Some(segment) = next else {
-            self.looked_at = changes;
+            // nothing wanted waits once a sweep has reached the oldest segment
+            if is_swept {
+                self.looked_at = changes;
+            }
             return false;
         };
         if !self.plan_extent(volume, segment) {

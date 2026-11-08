@@ -21,6 +21,9 @@ pub const LINE_END: u8 = b'\n';
 pub const CLIPPY_ARGUMENTS: [&str; 9] = ["clippy", "--workspace", "--all-targets", "--locked", "--features", TEST_HOOKS, "--", "-D", "warnings"];
 /// Cargo arguments for the test pass, which keeps going after a failure
 pub const TEST_ARGUMENTS: [&str; 6] = ["test", "--workspace", "--locked", "--no-fail-fast", "--features", TEST_HOOKS];
+/// Cargo arguments for the pick gate: every kind of pick at 100,000 segments a volume, timed in a release build against its line
+pub const PICK_GATE_ARGUMENTS: [&str; 12] =
+    ["test", "--release", "--locked", "-p", "reel", "--features", TEST_HOOKS, "--test", "simulation", "picks::", "--", "--nocapture"];
 /// The feature that lets the sims set a volume's worker count, which no node build turns on
 pub const TEST_HOOKS: &str = "reel/test-hooks";
 
@@ -54,6 +57,11 @@ pub fn run_ci() -> Result<(), TaskError> {
         failures.push("a test failed or a test binary stopped early".to_string());
     }
     check_lines(&tests.lines, &harnesses, &mut failures);
+
+    let picks = run_cargo(&root, &PICK_GATE_ARGUMENTS)?;
+    if !picks.is_success {
+        failures.push("a pick held the summary past its line at 100,000 segments".to_string());
+    }
 
     if failures.is_empty() {
         println!("ci passed");

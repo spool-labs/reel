@@ -81,6 +81,14 @@ impl KeyBound {
         bytes[..length].copy_from_slice(&key[..length]);
         Self(bytes)
     }
+
+    /// Take the bound above every key that starts with a key's bytes, for a key a summary row cut short
+    pub fn past_prefix(key: &[u8]) -> Self {
+        let mut bytes = [u8::MAX; KEY_BOUND_BYTES];
+        let length = key.len().min(KEY_BOUND_BYTES);
+        bytes[..length].copy_from_slice(&key[..length]);
+        Self(bytes)
+    }
 }
 
 impl BlockEntry {

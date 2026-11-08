@@ -16,6 +16,7 @@ use crate::little_endian::read_half;
 use crate::record::record_check::{Checksum, checksum};
 use crate::segment::segment_table::NumberMap;
 use crate::segment::segment_tail::{PlaceRange, SegmentNumber};
+use crate::segment::summary_orders::SummaryOrders;
 
 /// The bit of a row's flags that says its footer keeps range deletes
 pub const HAS_COVERS_BIT: u8 = 1;
@@ -148,6 +149,9 @@ pub struct SummaryRows {
     listed: usize,
     is_index_whole: bool,
     footer_bytes: u64,
+    file_bytes: u64,
+    orders: SummaryOrders,
+    is_checked: bool,
 }
 
 /// One row read back
@@ -261,6 +265,9 @@ impl SummaryRows {
             listed: 0,
             is_index_whole: false,
             footer_bytes: 0,
+            file_bytes: 0,
+            orders: SummaryOrders::new(0),
+            is_checked: true,
         }
     }
 
@@ -274,10 +281,36 @@ impl SummaryRows {
         self.bytes.truncate(length);
     }
 
-    /// Size the lookup from a segment to its row, so a walk step goes to its rows with no walk over them all
+    /// Size the lookup from a segment to its row and the orders the picks ask, so a walk step and a pick go to their rows with no
+    /// walk over them all
     pub fn make_index(&mut self, segments: usize) {
         self.index = NumberMap::new(segments);
+        self.orders = SummaryOrders::new(segments);
+        // rows from a file pass their checks here once, and after that every row is checked as it changes
+        self.is_checked = self.is_checked || !self.has_bad_row();
         self.rebuild_index();
+        let mut orders = std::mem::replace(&mut self.orders, SummaryOrders::new(0));
+        for row in self.rows() {
+            orders.place(&row);
+        }
+        self.orders = orders;
+    }
+
+    /// Read the orders the picks ask
+    pub fn orders(&self) -> &SummaryOrders {
+        &self.orders
+    }
+
+    /// Move a row to the end of its share list after a pick, so the next pick there starts with another
+    pub fn rotate(&mut self, segment: SegmentNumber) {
+        self.orders.rotate(segment);
+    }
+
+    /// Put the row at an offset on the lists its counts call for
+    fn place_at(&mut self, at: usize) {
+        if let Some((_length, Some(row))) = read_row_at(&self.bytes, at, self.is_checked) {
+            self.orders.place(&row);
+        }
     }
 
     /// Read the bytes the rows have room for
@@ -296,7 +329,7 @@ impl SummaryRows {
         self.listed = 0;
         self.is_index_whole = true;
         let mut at = 0;
-        while let Some((length, row)) = read_row(&self.bytes[at..]) {
+        while let Some((length, row)) = self.read_at(at) {
             if let Some(number) = row.map(|row| row.facts.segment) {
                 self.note_row(number, at);
             }
@@ -325,13 +358,18 @@ impl SummaryRows {
             return self.index.get(segment).map(|at| at as usize);
         }
         let mut at = 0;
-        while let Some((length, row)) = read_row(&self.bytes[at..]) {
+        while let Some((length, row)) = self.read_at(at) {
             if row.is_some_and(|row| row.facts.segment == segment) {
                 return Some(at);
             }
             at += length;
         }
         None
+    }
+
+    /// Read how far the row at an offset reaches and the row, with no checksum once every row is checked
+    fn read_at(&self, at: usize) -> Option<(usize, Option<SummaryRow<'_>>)> {
+        read_row_at(&self.bytes, at, self.is_checked)
     }
 
     /// Read the stored rows
@@ -341,7 +379,7 @@ impl SummaryRows {
 
     /// Read the heap the rows hold
     pub fn heap_bytes(&self) -> ByteCount {
-        ByteCount((self.bytes.capacity() + self.index.heap_bytes()) as u64)
+        ByteCount((self.bytes.capacity() + self.index.heap_bytes()) as u64 + self.orders.heap_bytes().0)
     }
 
     /// Add a row, or return false when it doesn't fit
@@ -384,6 +422,7 @@ impl SummaryRows {
         self.bytes.extend_from_slice(&sum.0.to_le_bytes());
         debug_assert_eq!(self.bytes.len() - start, ROW_HEAD_BYTES + body + ROW_SUM_BYTES);
         self.note_row(facts.segment, start);
+        self.place_at(start);
         true
     }
 
@@ -531,6 +570,7 @@ impl SummaryRows {
         let body_end = at + length - ROW_SUM_BYTES;
         let sum = checksum(&self.bytes[body_at..body_end]);
         self.bytes[body_end..body_end + ROW_SUM_BYTES].copy_from_slice(&sum.0.to_le_bytes());
+        self.place_at(at);
     }
 
     /// Add a segment's counts to its row and move its walk on, resealing the row once
@@ -560,15 +600,18 @@ impl SummaryRows {
         let body_end = at + length - ROW_SUM_BYTES;
         let sum = checksum(&self.bytes[body_at..body_end]);
         self.bytes[body_end..body_end + ROW_SUM_BYTES].copy_from_slice(&sum.0.to_le_bytes());
+        self.place_at(at);
     }
 
     /// Start a segment's counts over for a backward walk, which rebuilds them from its own rows. Its row may be behind
     /// counts other rows already hold, so it can't resume as a forward walk
     pub fn restart_backward(&mut self, segment: SegmentNumber) {
-        let mut at = 0;
-        while let Some((length, row)) = read_row(&self.bytes[at..]) {
-            let found = row.filter(|row| row.facts.segment == segment).map(|row| (row.column_count, row.facts.block_count));
-            if let Some((column_count, block_count)) = found {
+        let Some(at) = self.find_row(segment) else {
+            return;
+        };
+        if let Some((length, Some(row))) = self.read_at(at) {
+            let (column_count, block_count) = (row.column_count, row.facts.block_count);
+            {
                 let body_at = at + ROW_HEAD_BYTES;
                 self.bytes[body_at + WALKED_BLOCKS_AT..body_at + WALKED_BLOCKS_AT + size_of::<u32>()].fill(0);
                 self.bytes[body_at + ROW_FLAGS_AT] |= 1 << IS_BACKWARD_BIT;
@@ -584,9 +627,8 @@ impl SummaryRows {
                 let body_end = at + length - ROW_SUM_BYTES;
                 let sum = checksum(&self.bytes[body_at..body_end]);
                 self.bytes[body_end..body_end + ROW_SUM_BYTES].copy_from_slice(&sum.0.to_le_bytes());
-                return;
+                self.place_at(at);
             }
-            at += length;
         }
     }
 
@@ -620,6 +662,7 @@ impl SummaryRows {
     /// Write a row's fixed fields
     pub fn put_facts(&mut self, facts: &SegmentFacts, columns: u16, spans: u16) {
         self.footer_bytes += footer_of(facts);
+        self.file_bytes += facts.file_length.0;
         self.bytes.extend_from_slice(&facts.segment.0.to_le_bytes());
         self.bytes.extend_from_slice(&facts.file_length.0.to_le_bytes());
         self.bytes.extend_from_slice(&facts.data_end.0.to_le_bytes());
@@ -640,7 +683,7 @@ impl SummaryRows {
 
     /// Walk the rows that pass their checks
     pub fn rows(&self) -> RowWalk<'_> {
-        RowWalk { bytes: &self.bytes }
+        RowWalk { bytes: &self.bytes, is_checked: self.is_checked }
     }
 
     /// Read the bytes the rows' segments give their footers, past their records
@@ -648,23 +691,35 @@ impl SummaryRows {
         ByteCount(self.footer_bytes)
     }
 
+    /// Read the bytes the rows' segment files take
+    pub fn file_bytes(&self) -> ByteCount {
+        ByteCount(self.file_bytes)
+    }
+
     /// Find a segment's row
     pub fn get(&self, segment: SegmentNumber) -> Option<SummaryRow<'_>> {
-        self.row_at(self.find_row(segment)?)
+        self.read_at(self.find_row(segment)?)?.1
     }
 
     /// Take a segment's row out
     pub fn remove(&mut self, segment: SegmentNumber) {
-        let mut at = 0;
-        while let Some((length, row)) = read_row(&self.bytes[at..]) {
-            if let Some(row) = row.filter(|row| row.facts.segment == segment) {
-                self.footer_bytes = self.footer_bytes.saturating_sub(footer_of(&row.facts));
-                self.bytes.copy_within(at + length.., at);
-                self.bytes.truncate(self.bytes.len() - length);
-                self.rebuild_index();
-                return;
-            }
-            at += length;
+        let Some(at) = self.find_row(segment) else {
+            return;
+        };
+        let Some((length, facts)) = self.read_at(at).and_then(|(length, row)| Some((length, row?.facts))) else {
+            return;
+        };
+        self.footer_bytes = self.footer_bytes.saturating_sub(footer_of(&facts));
+        self.file_bytes = self.file_bytes.saturating_sub(facts.file_length.0);
+        self.orders.forget(segment);
+        self.bytes.copy_within(at + length.., at);
+        self.bytes.truncate(self.bytes.len() - length);
+        if self.is_index_whole {
+            self.index.remove(segment);
+            self.index.shift_past(at as u32, length as u32);
+            self.listed -= 1;
+        } else {
+            self.rebuild_index();
         }
     }
 
@@ -717,7 +772,9 @@ impl SummaryRows {
         self.bytes.extend_from_slice(&from.bytes[at..at + length]);
         if let Some(facts) = from.row_at(at).map(|row| row.facts) {
             self.footer_bytes += footer_of(&facts);
+            self.file_bytes += facts.file_length.0;
             self.note_row(facts.segment, start);
+            self.place_at(start);
         }
         true
     }
@@ -727,12 +784,18 @@ impl SummaryRows {
 #[derive(Clone, Copy, Debug)]
 pub struct RowWalk<'bytes> {
     bytes: &'bytes [u8],
+    is_checked: bool,
 }
 
 impl<'bytes> Iterator for RowWalk<'bytes> {
     type Item = SummaryRow<'bytes>;
 
     fn next(&mut self) -> Option<SummaryRow<'bytes>> {
+        if self.is_checked {
+            let (length, row) = read_trusted_row(self.bytes)?;
+            self.bytes = &self.bytes[length..];
+            return Some(row);
+        }
         loop {
             let (length, row) = read_row(self.bytes)?;
             self.bytes = &self.bytes[length..];
@@ -823,6 +886,25 @@ pub fn read_row_head(bytes: &[u8]) -> Option<usize> {
     let body_length = read_half(head, 4)? as usize;
     bytes.get(..ROW_HEAD_BYTES + body_length + ROW_SUM_BYTES)?;
     Some(body_length)
+}
+
+/// Read the row at an offset, with no checksum when every row passed its checks
+pub fn read_row_at(bytes: &[u8], at: usize, is_checked: bool) -> Option<(usize, Option<SummaryRow<'_>>)> {
+    let bytes = bytes.get(at..)?;
+    if is_checked { read_trusted_row(bytes).map(|(length, row)| (length, Some(row))) } else { read_row(bytes) }
+}
+
+/// Read a row of rows that passed their checks when they were written or loaded, with no checksum: the marker and the length
+/// frame it
+pub fn read_trusted_row(bytes: &[u8]) -> Option<(usize, SummaryRow<'_>)> {
+    if read_half(bytes, 0)? != ROW_MARKER {
+        return None;
+    }
+    let body_length = read_half(bytes, 4)? as usize;
+    let total = ROW_HEAD_BYTES + body_length + ROW_SUM_BYTES;
+    let body = bytes.get(ROW_HEAD_BYTES..ROW_HEAD_BYTES + body_length)?;
+    bytes.get(..total)?;
+    Some((total, parse_row(body)?))
 }
 
 /// Read how far a row reaches and the row itself, which is nothing when it fails its check, and
@@ -1035,10 +1117,12 @@ pub fn read_summary<Backend: Io>(
     let mark = newer.mark();
     rows.highest_forward = forward.unwrap_or(FORWARD_UNKNOWN);
     rows.bytes = newer.rows;
+    rows.is_checked = false;
     if let Some(older) = older {
         let has_two_marks = mark.is_some() && older.mark().is_some() && mark != older.mark();
         let mut older_rows = SummaryRows::new(ByteCount(0));
         older_rows.bytes = older.rows;
+        older_rows.is_checked = false;
         let listed = rows.offsets();
         // with two marks, a row the newer copy lost may hold more than the older copy's, so it can't stand as it is
         lost.has_lost_row = has_two_marks && rows.has_bad_row();

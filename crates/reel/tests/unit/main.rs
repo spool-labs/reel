@@ -26,6 +26,7 @@ mod scan_window;
 mod segment_table;
 mod segment_tail;
 mod summary;
+mod summary_orders;
 mod superblock;
 mod varint;
 mod workers;

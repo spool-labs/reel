@@ -1335,6 +1335,7 @@ pub fn build_state<Backend: Io>(
         seal_heap: AtomicU64::new(0),
         walk_heap: AtomicU64::new(0),
         worker_priority: Mutex::new(WorkerPriority::default()),
+        pick_holds: Default::default(),
         workers: Workers::new(sizing.workers),
         compaction_heap: AtomicU64::new(0),
         admission: Admission::default(),

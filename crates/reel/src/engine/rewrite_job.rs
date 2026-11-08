@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::{JobKind, PickOutcome, SPAN_RUN_BUCKETS, UnitKind};
+use reel_api::maintenance_report::{JobKind, PickKind, PickOutcome, SPAN_RUN_BUCKETS, UnitKind};
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, DeathMark, FileOffset, RootId, RowCount, WritePlace};
 
@@ -34,7 +34,8 @@ use crate::region::{REGION_HEAD_BYTES, Region, list_bytes};
 use crate::engine::admission::{Admit, JobRole, PICK_HALVINGS};
 use crate::row_kind::RowKind;
 use crate::segment::damage_list::DamagedRange;
-use crate::segment::column_directory::Listing;
+use crate::segment::block_entry::KeyBound;
+use crate::segment::column_directory::{ColumnDirectory, Listing};
 use crate::segment::footer_writer::{ColumnStart, FooterTotals, FooterWriter};
 use crate::index::complete_table::CompleteTable;
 use crate::index::key_hash::{KeyHash, hash_key};
@@ -42,6 +43,7 @@ use crate::segment::row_block::{BLOCK_TRAILER_BYTES, FooterRow, ROW_BLOCK_BYTES,
 use crate::segment::segment_table::SegmentPin;
 use crate::segment::segment_tail::{BlockCount, ColumnTail, MAX_COLUMNS, MOST_MERGE_SEGMENTS, SegmentNumber};
 use crate::segment::summary::{ColumnFacts, DeadCount, SUMMARY_KEY_BYTES, SegmentFacts, SummaryRow, SummaryRows};
+use crate::segment::summary_orders::{COVERS_LIST, ROW_FOOTER_BYTES, SHARE_BUCKETS, SHARE_SCALE, reclaim_share, share_bucket};
 
 /// A bar counts in quarters of a segment's bytes
 pub const BAR_QUARTERS: u64 = 4;
@@ -50,13 +52,9 @@ pub const PLAIN_BAR_QUARTERS: u64 = 2;
 /// A marked segment waits for this many while its highest mark stands, since it dies whole soon. A rewrite there copies at
 /// most a third of a byte for each byte freed, so a record freed early still comes back
 pub const EARLY_BAR_QUARTERS: u64 = 3;
-/// Bytes a footer row takes, about, so a rewrite weighs rows it drops beside records. A segment of graves holds rows and no records
-pub const ROW_FOOTER_BYTES: u64 = 41;
 /// Bytes of one job's merge buffer, which carries records and then row blocks. With a row block for each input, a job's
 /// merge buffers come to about 2 MiB
 pub const MERGE_BUFFER_BYTES: usize = 3 * 512 * 1024;
-/// The whole of a share, for comparing what segments win back
-pub const SHARE_SCALE: u64 = 1_000_000;
 /// Most row blocks of an output that can hold rows kept for a cue, past which the merge waits for the cue to go
 pub const MOST_KEPT_BLOCKS: usize = 1_024;
 /// Rows one step of a merge decides
@@ -84,6 +82,14 @@ pub const PLANNER_LANE: usize = 0;
 pub const OVERLAP_PROBES: usize = 16;
 /// Most segments one look for an overlap starts from, which bounds what a look costs
 pub const OVERLAP_LOOKS: usize = 16;
+/// Most rows of one share bucket a pick looks at before it moves down to the next
+pub const BUCKET_LOOKS: usize = 64;
+/// Most rows a merge looks along the segment order for each input past its first
+pub const GATHER_LOOKS: usize = 64;
+/// Most segments one directory listing of an overlap look holds
+pub const OVERLAP_LISTED: usize = 4 * (MOST_OVERLAP + 1);
+/// Most listings a count of the segments over one key pages through
+pub const CROWD_PAGES: usize = 4;
 
 /// A column of a finished output that isn't the last of its set, kept for its list entry and its summary row
 #[derive(Clone, Copy, Debug, Default)]
@@ -324,7 +330,6 @@ pub struct RewriteJob<Backend: Io> {
     dropped_rows: u64,
     dropped_graves: u64,
     kept_dead: FixedList<DeadCount>,
-    last_tried: SegmentNumber,
     park_waits: u32,
     pub cut_floor: u64,
     cut_bytes: u64,
@@ -392,6 +397,8 @@ pub struct RewriteJob<Backend: Io> {
     pub lost_spans: Vec<DamagedRange>,
     is_unwalked: bool,
     crowded_key: FixedList<u8>,
+    listed: FixedList<SegmentNumber>,
+    crowd: FixedList<SegmentNumber>,
     pub has_looks_left: bool,
     looked_up_to: SegmentNumber,
 }
@@ -441,7 +448,6 @@ impl<Backend: Io> RewriteJob<Backend> {
             dropped_rows: 0,
             dropped_graves: 0,
             kept_dead: FixedList::empty(),
-            last_tried: SegmentNumber(0),
             park_waits: 0,
             cut_floor,
             cut_bytes: 0,
@@ -487,6 +493,8 @@ impl<Backend: Io> RewriteJob<Backend> {
             lost_spans: Vec::new(),
             is_unwalked: false,
             crowded_key: FixedList::on_heap(SUMMARY_KEY_BYTES),
+            listed: FixedList::on_heap(OVERLAP_LISTED),
+            crowd: FixedList::on_heap(OVERLAP_LISTED),
             has_looks_left: false,
             looked_up_to: SegmentNumber(0),
         }
@@ -495,7 +503,8 @@ impl<Backend: Io> RewriteJob<Backend> {
     /// Read the heap the job's buffers hold
     pub fn heap_bytes(&self) -> ByteCount {
         let inputs = self.inputs.capacity() * size_of::<MergeInput>();
-        ByteCount((self.crowded_key.held_bytes() + inputs) as u64)
+        let lists = self.listed.held_bytes() + self.crowd.held_bytes();
+        ByteCount((self.crowded_key.held_bytes() + lists + inputs) as u64)
     }
 
     /// Read the bytes the run's region maps, nothing between runs
@@ -747,7 +756,9 @@ impl<Backend: Io> RewriteJob<Backend> {
             volume.note_pick(PickOutcome::Refused);
             return None;
         }
-        let rows = hold(&volume.summary);
+        let state = Arc::clone(&self.state);
+        let kind = if self.lane == PLANNER_LANE { PickKind::Overlap } else { PickKind::Rewrite };
+        let mut rows = state.hold_for_pick(self.volume, kind);
         self.is_unwalked = false;
         self.bars_fired = BarsFired::default();
         // its rows counted for nothing a walk can trust, so the output goes through the forward walk they owe
@@ -782,15 +793,15 @@ impl<Backend: Io> RewriteJob<Backend> {
         let is_ready = |row: &SummaryRow<'_>| {
             row.facts.is_walked() && !gave_up.holds(row.facts.segment) && is_rewrite_ready(volume, row, 0, current) && is_rewrite_ready(volume, row, freed_in_place(volume, row), current)
         };
-        let ready = rows.rows().filter(is_ready);
-        // the most won back for the bytes read goes first, past the one last tried, so a merge that gave way lets the next one up
-        let after = ready.clone().filter(|row| row.facts.segment > self.last_tried).max_by_key(reclaim_share);
-        if let Some(first) = after.or_else(|| ready.max_by_key(reclaim_share)) {
+        // the most won back for the bytes read goes first, and a picked row moves to its bucket's end, so a merge that gave way
+        // lets the next one up
+        if let Some(first) = first_ready(&rows, is_ready) {
             let is_grave_heavy = is_grave_heavy(&first);
-            let lifetime = first.facts.marks;
-            let is_more = |row: &SummaryRow<'_>| is_ready(row) && row.facts.segment > first.facts.segment && row.facts.marks.shares_lifetime(lifetime);
+            let (segment, lifetime) = (first.facts.segment, first.facts.marks);
+            let is_more = |row: &SummaryRow<'_>| is_ready(row) && row.facts.segment > segment && row.facts.marks.shares_lifetime(lifetime);
             let target = self.gather(volume, &rows, &first, room, is_more);
             self.note_bars(&rows, current);
+            rows.rotate(segment);
             volume.note_pick(PickOutcome::Record);
             return Some((target, is_grave_heavy));
         }
@@ -807,10 +818,12 @@ impl<Backend: Io> RewriteJob<Backend> {
             let segment = row.facts.segment.0;
             is_overlap_input(row) && segment != sealing && segment != walking && !volume.is_taken(row.facts.segment)
         };
-        let has_bound = |column: ColumnId| self.state.complete_table(column).is_none();
-        let found = overlap_start(rows, &mut self.looked_up_to, can_merge, has_bound, &mut self.crowded_key);
-        let looked_up_to = self.looked_up_to;
-        self.has_looks_left = rows.rows().any(|row| row.facts.segment > looked_up_to);
+        let state = Arc::clone(&self.state);
+        // a column with a complete table has no overlap bound
+        let directory_of = |column: ColumnId| state.complete_table(column).is_none().then(|| state.directories[column.0 as usize].as_ref()).flatten();
+        let lists = (&mut self.listed, &mut self.crowd);
+        let found = overlap_start(rows, directory_of, &mut self.looked_up_to, can_merge, &mut self.crowded_key, lists);
+        self.has_looks_left = !rows.orders().after(self.looked_up_to).is_empty();
         let Some((crowded, column)) = found else {
             volume.note_pick(PickOutcome::OverlapMiss);
             return None;
@@ -818,15 +831,20 @@ impl<Backend: Io> RewriteJob<Backend> {
         let point = &self.crowded_key;
         let lifetime = crowded.facts.marks;
         let is_near = |row: &SummaryRow<'_>| can_merge(row) && covers_point(row, column, point) && row.facts.marks.shares_lifetime(lifetime);
+        // the segments over the point are the merge's candidates, and the directory lists them
+        if let Some(directory) = directory_of(column) {
+            directory.overlapping(&KeyBound::of_key(point), &KeyBound::past_prefix(point), 0, &mut self.listed);
+        }
+        let near = self.listed.iter().filter_map(|segment| rows.get(*segment)).filter(is_near);
         // unwalked segments go first, since they need nothing from the walk
-        let is_unwalked = rows.rows().filter(|row| is_near(row) && !row.facts.is_walked()).take(2).count() == 2;
+        let is_unwalked = near.filter(|row| !row.facts.is_walked()).take(2).count() == 2;
         if !is_unwalked && volume.has_walk_target.load(Ordering::Acquire) {
             // the walk goes first and asks again when it ends, and a look left here would keep the planner from it
             self.has_looks_left = false;
             return None;
         }
         let is_more = |row: &SummaryRow<'_>| is_near(row) && row.facts.is_walked() != is_unwalked;
-        let target = gather_smallest(volume, rows, room, is_more, &mut self.inputs, &mut self.numbers, &mut self.input_count);
+        let target = gather_smallest(volume, (rows, &self.listed), room, is_more, &mut self.inputs, &mut self.numbers, &mut self.input_count);
         // one segment alone wins back no overlap, and the next look starts past it
         if self.input_count < 2 {
             self.looked_up_to = crowded.facts.segment;
@@ -855,7 +873,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
     }
 
-    /// Take a first segment and the next ones a test passes, while they fit one output, and note the last as tried
+    /// Take a first segment and the next ones a test passes, while they fit one output
     pub fn gather(
         &mut self,
         volume: &Volume<Backend>,
@@ -883,14 +901,14 @@ impl<Backend: Io> RewriteJob<Backend> {
             length += facts.file_length.0;
             blocks += facts.block_count;
             marks = marks.join(facts.marks);
-            self.last_tried = facts.segment;
             if self.input_count == most {
                 break;
             }
-            next = rows
-                .rows()
-                .filter(|row| row.facts.segment > facts.segment && is_more(row))
-                .min_by_key(|row| row.facts.segment)
+            // the next row up that passes, within a few looks along the segment order
+            let after = rows.orders().after(facts.segment).iter().take(GATHER_LOOKS);
+            next = after
+                .filter_map(|segment| rows.get(*segment))
+                .find(|row| is_more(row))
                 .filter(|row| {
                     data + row.facts.data_end.0 <= volume.segment_bytes.0
                         && blocks + row.facts.block_count <= MOST_SEGMENT_BLOCKS.0
@@ -2232,22 +2250,6 @@ pub fn is_rewrite_ready<Backend: Io>(volume: &Volume<Backend>, row: &SummaryRow<
     BAR_QUARTERS * won_back >= bar_quarters(row.facts.marks, current) * (bytes + rows * ROW_FOOTER_BYTES)
 }
 
-/// Read what a rewrite of a segment wins back, as a share of its record and footer bytes
-pub fn reclaim_share(row: &SummaryRow<'_>) -> u64 {
-    let (mut rows, mut dead_rows, mut bytes, mut dead_bytes) = (0, 0, 0, 0);
-    let mut cursor = row.cursor();
-    for _column in 0..row.column_count {
-        let Some(column) = cursor.column() else {
-            break;
-        };
-        rows += column.row_count.0;
-        dead_rows += column.dead_rows.0 + column.grave_count.0.saturating_sub(column.dead_graves.0);
-        bytes += column.live_bytes.0 + column.dead_bytes.0;
-        dead_bytes += column.dead_bytes.0;
-    }
-    SHARE_SCALE * (dead_bytes + dead_rows * ROW_FOOTER_BYTES) / (bytes + rows * ROW_FOOTER_BYTES).max(1)
-}
-
 /// Check a row's graves make up the share that would trigger a merge, so deciding first can save the copy
 pub fn is_grave_heavy(row: &SummaryRow<'_>) -> bool {
     let (mut rows, mut graves) = (0, 0);
@@ -2266,7 +2268,7 @@ pub fn is_grave_heavy(row: &SummaryRow<'_>) -> bool {
 /// merge rewrites as little as it takes to bring a crowded point down
 pub fn gather_smallest<Backend: Io>(
     volume: &Volume<Backend>,
-    rows: &SummaryRows,
+    (rows, candidates): (&SummaryRows, &[SegmentNumber]),
     most: usize,
     is_more: impl Fn(&SummaryRow<'_>) -> bool,
     inputs: &mut [MergeInput],
@@ -2282,7 +2284,8 @@ pub fn gather_smallest<Backend: Io>(
             let is_inside = data + row.facts.data_end.0 <= MOST_MERGE_OUTPUTS as u64 * volume.segment_bytes.0;
             is_inside && blocks + row.facts.block_count <= MOST_MERGE_OUTPUTS as u32 * MOST_SEGMENT_BLOCKS.0 && !taken.contains(&row.facts.segment)
         };
-        let Some(row) = rows.rows().filter(|row| is_more(row) && fits(row)).min_by_key(|row| row.facts.data_end) else {
+        let listed = candidates.iter().filter_map(|segment| rows.get(*segment));
+        let Some(row) = listed.filter(|row| is_more(row) && fits(row)).min_by_key(|row| row.facts.data_end) else {
             break;
         };
         let facts = row.facts;
@@ -2349,34 +2352,64 @@ pub fn overlaps(left: &SummaryRow<'_>, right: &SummaryRow<'_>) -> bool {
 /// Find a point more segments cover than the bound allows, in a segment no look has passed, and fill in the key. Overlap only
 /// grows when a segment arrives, so each one takes one look, and with none new a look costs nothing. It rises at a segment's
 /// lowest key, so the points worth trying are the new segment's own and those of a few that begin inside it
-pub fn overlap_start<'rows>(
+pub fn overlap_start<'rows, 'state>(
     rows: &'rows SummaryRows,
+    directory_of: impl Fn(ColumnId) -> Option<&'state ColumnDirectory>,
     looked_up_to: &mut SegmentNumber,
     can_merge: impl Fn(&SummaryRow<'_>) -> bool,
-    has_bound: impl Fn(ColumnId) -> bool,
     point: &mut FixedList<u8>,
+    lists: (&mut FixedList<SegmentNumber>, &mut FixedList<SegmentNumber>),
 ) -> Option<(SummaryRow<'rows>, ColumnId)> {
-    let is_crowded = |column: ColumnId, key: &[u8]| {
-        rows.rows().filter(|row| can_merge(row) && covers_point(row, column, key)).take(MOST_OVERLAP + 1).count() > MOST_OVERLAP
-    };
+    let (listed, crowd) = lists;
     for _look in 0..OVERLAP_LOOKS {
-        let row = rows.rows().filter(|row| row.facts.segment > *looked_up_to).min_by_key(|row| row.facts.segment)?;
+        let segment = *rows.orders().after(*looked_up_to).first()?;
+        let row = rows.get(segment)?;
         let mut columns = row.cursor();
         for _column in 0..row.column_count {
             let facts = columns.column()?;
-            if !has_bound(facts.column) {
+            let Some(directory) = directory_of(facts.column) else {
                 continue;
-            }
-            let inside = rows.rows().filter_map(|other| lowest_inside(&other, facts.column, facts.lowest, facts.bound));
-            let found = iter::once(facts.lowest).chain(inside.take(OVERLAP_PROBES)).find(|key| is_crowded(facts.column, key));
+            };
+            let high = if facts.bound.is_empty() { KeyBound::HIGHEST } else { KeyBound::past_prefix(facts.bound) };
+            directory.starting_inside(&KeyBound::of_key(facts.lowest), &high, listed);
+            let others = listed.iter().filter_map(|other| rows.get(*other));
+            let inside = others.filter_map(|other| lowest_inside(&other, facts.column, facts.lowest, facts.bound));
+            let mut probes = iter::once(facts.lowest).chain(inside.take(OVERLAP_PROBES));
+            let found = probes.find(|key| is_crowded(rows, directory, &can_merge, (facts.column, key), crowd));
             if let Some(key) = found.filter(|_key| can_merge(&row)) {
                 point.set_from(key).ok()?;
                 return Some((row, facts.column));
             }
         }
-        *looked_up_to = row.facts.segment;
+        *looked_up_to = segment;
     }
     None
+}
+
+/// Check more than the bound's mergeable segments hold a key, counting the directory's segments over it against their rows
+pub fn is_crowded(
+    rows: &SummaryRows,
+    directory: &ColumnDirectory,
+    can_merge: impl Fn(&SummaryRow<'_>) -> bool,
+    (column, key): (ColumnId, &[u8]),
+    crowd: &mut FixedList<SegmentNumber>,
+) -> bool {
+    // a summary row keeps a key cut short, so the directory is asked for every key that starts with it
+    let (low, high) = (KeyBound::of_key(key), KeyBound::past_prefix(key));
+    let (mut covering, mut skip) = (0, 0);
+    for _page in 0..CROWD_PAGES {
+        let page = directory.overlapping(&low, &high, skip, crowd);
+        skip += crowd.len();
+        let over = crowd.iter().filter_map(|segment| rows.get(*segment));
+        covering += over.filter(|row| can_merge(row) && covers_point(row, column, key)).count();
+        if covering > MOST_OVERLAP {
+            return true;
+        }
+        if !page.is_cut {
+            return false;
+        }
+    }
+    false
 }
 
 /// Read a segment's lowest key for a column when it falls inside a range
@@ -2529,4 +2562,16 @@ pub fn blocks_for_rows(rows: u64, block_bytes: usize, columns: usize) -> u32 {
 pub fn fewest_block_rows(block_bytes: usize) -> u64 {
     let widest_row = ROW_ROOM_NUMBERS + MAX_KEY_BYTES as usize + size_of::<u16>();
     (block_bytes.saturating_sub(BLOCK_TRAILER_BYTES) / widest_row).saturating_sub(1).max(1) as u64
+}
+
+/// Find the ready row that wins most back in the highest share bucket that has one, down to the least share the plain bar lets
+/// in, and then among the rows with covers. A pick looks at no more than the first few rows of a bucket, and of equal shares
+/// takes the last, which leaves the rows before it to other lanes
+pub fn first_ready<'rows>(rows: &'rows SummaryRows, is_ready: impl Fn(&SummaryRow<'_>) -> bool) -> Option<SummaryRow<'rows>> {
+    let least = share_bucket(SHARE_SCALE * PLAIN_BAR_QUARTERS / BAR_QUARTERS);
+    let mut lists = (least..SHARE_BUCKETS).rev().chain(iter::once(COVERS_LIST));
+    lists.find_map(|list| {
+        let looked = rows.orders().share_list(list).take(BUCKET_LOOKS).filter_map(|segment| rows.get(segment));
+        looked.filter(|row| is_ready(row)).max_by_key(reclaim_share)
+    })
 }

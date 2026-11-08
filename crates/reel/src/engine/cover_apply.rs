@@ -9,7 +9,7 @@ use std::io::{Error, ErrorKind, Result};
 use std::sync::Arc;
 
 use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::JobKind;
+use reel_api::maintenance_report::{JobKind, PickKind};
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, WritePlace};
 
@@ -144,15 +144,16 @@ impl<Backend: Io> CoverApply<Backend> {
         column: ColumnId,
         place: WritePlace,
     ) -> Result<()> {
-        let rows = hold(&volume.summary);
+        let state = Arc::clone(&self.state);
+        let rows = state.hold_for_pick(self.volume, PickKind::Cover);
         let is_under = |row: &SummaryRow<'_>| {
             row.facts.is_walked()
-                && row.facts.segment > self.last_other
                 && row.facts.places.lowest < place
                 && !row.facts.is_damaged
                 && is_in_range(row, column, &self.start, &self.end)
         };
-        let next = rows.rows().filter(is_under).min_by_key(|row| row.facts.segment).map(|row| row.facts.segment);
+        let after = rows.orders().after(self.last_other).iter().filter_map(|segment| rows.get(*segment));
+        let next = after.filter(is_under).map(|row| row.facts.segment).next();
         drop(rows);
         let Some(other) = next else {
             volume.covers.mark_applied(place);

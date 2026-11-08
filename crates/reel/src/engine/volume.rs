@@ -142,7 +142,7 @@ pub struct RewriteLane<File> {
 impl<File> RewriteLane<File> {
     /// Start a lane with nothing running
     pub fn new() -> Self {
-        Self {
+        let lane = Self {
             is_rewriting: AtomicBool::new(false),
             output_floor: AtomicU64::new(NO_SEAL),
             merging: Mutex::new([SegmentNumber(0); MOST_MERGE_SEGMENTS]),
@@ -150,7 +150,12 @@ impl<File> RewriteLane<File> {
             partial_outputs: Mutex::new(Default::default()),
             strays: AtomicU64::new(0),
             rewrites_done: AtomicU64::new(0),
-        }
+        };
+        // a mutex's first lock can allocate, and a pick that asks a lane after open allocates nothing
+        drop(hold(&lane.merging));
+        drop(hold(&lane.inputs));
+        drop(hold(&lane.partial_outputs));
+        lane
     }
 }
 

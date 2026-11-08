@@ -166,6 +166,13 @@ impl NumberMap {
         self.slots[index] = slot;
     }
 
+    /// Move every slot past an offset back by a length, for rows that moved down over a removed one
+    pub fn shift_past(&mut self, at: u32, length: u32) {
+        for slot in self.slots.iter_mut().filter(|slot| **slot != NO_SLOT && **slot > at) {
+            *slot -= length;
+        }
+    }
+
     /// Remove a number, moving later ones back so no probe breaks
     pub fn remove(&mut self, number: SegmentNumber) {
         let mut hole = self.probe(number);

@@ -11,6 +11,7 @@ pub mod damage_list;
 pub mod range_covers;
 pub mod segment_table;
 pub mod summary;
+pub mod summary_orders;
 pub mod row_block;
 pub mod segment_tail;
 pub mod varint;

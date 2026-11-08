@@ -23,6 +23,7 @@ use crate::segment::footer_reader::CANDIDATE_PAGE;
 use crate::segment::row_block::{BLOCK_TRAILER_BYTES, COMPLETE_BLOCK_BYTES, ROW_BLOCK_BYTES, ROW_ROOM_NUMBERS};
 use crate::segment::segment_table::TABLE_SHARDS;
 use crate::segment::segment_tail::{MAX_TAIL_BYTES, MOST_SEGMENT_BYTES};
+use crate::segment::summary_orders::ORDER_BYTES;
 
 /// A segment's target size on a store with a full budget, and a smaller budget targets half of itself
 pub const SEGMENT_TARGET: ByteCount = ByteCount(1024 * 1024 * 1024);
@@ -45,8 +46,9 @@ pub const SUMMARY_DIVISOR: u64 = 16;
 /// The segment tables and column directories get one part in this many of what the fixed parts and the room leave
 pub const TABLE_DIVISOR: u64 = 16;
 /// Bytes a segment's entry plans for before its columns: its table entry, slot and pin, its places in the table's and the
-/// summary's number maps at their worst rounding, and the 16 B the planner's covered list holds for it
-pub const PLANNED_SEGMENT_BYTES: u64 = 280;
+/// summary's number maps at their worst rounding, the 16 B the planner's covered list holds for it, and its place in the
+/// summary's orders
+pub const PLANNED_SEGMENT_BYTES: u64 = 280 + ORDER_BYTES;
 /// Bytes a column of a segment plans for: its tail in the table, and an entry in each list of both its directories
 pub const PLANNED_COLUMN_BYTES: u64 = 952;
 /// Entries a volume plans for each segment its disks hold at the segment size, since small records seal smaller

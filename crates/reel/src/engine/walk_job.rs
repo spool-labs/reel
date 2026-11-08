@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::{JobKind, UnitKind};
+use reel_api::maintenance_report::{JobKind, PickKind, UnitKind};
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, WritePlace};
 
@@ -30,6 +30,7 @@ use crate::io::device_error::is_device_error;
 use crate::io::job::{Job, JobStep};
 use crate::io::{Io, IoFile, IoTask};
 use crate::engine::admission::JobRole;
+use crate::segment::summary_orders::WalkList;
 use crate::segment::summary::SegmentFacts;
 use crate::fixed_list::{FixedList, ListFull, full};
 use crate::region::{REGION_HEAD_BYTES, Region, list_bytes};
@@ -38,7 +39,7 @@ use crate::segment::footer_writer::MOST_BLOCK_ROWS;
 use crate::segment::row_block::{FooterRow, ROW_BLOCK_BYTES, RowBlockWalk};
 use crate::segment::segment_table::{SegmentPin, WalkBlock};
 use crate::segment::segment_tail::SegmentNumber;
-use crate::segment::summary::{DeadCount, SummaryRow};
+use crate::segment::summary::DeadCount;
 
 /// How long a walk waits after a failed read before it tries the block again
 pub const WALK_RETRY: Nanoseconds = Nanoseconds(1_000_000_000);
@@ -448,13 +449,13 @@ impl<Backend: Io> WalkJob<Backend> {
         let volume = &state.volumes[self.volume];
         // a seal only ends past the mark, so every row a walk counts by is published, and its slot has let go of the file
         let sealing = volume.sealing.load(Ordering::Acquire);
-        let rows = hold(&volume.summary);
-        let can_walk = |row: &SummaryRow<'_>| {
-            !row.facts.is_walked() && row.facts.segment.0 != sealing && !volume.is_merging(row.facts.segment)
-        };
-        let waiting = rows.rows().filter(can_walk);
-        let backward = waiting.clone().filter(|row| row.facts.is_backward).max_by_key(|row| row.facts.places.highest);
-        let picked = backward.or_else(|| waiting.min_by_key(|row| row.facts.segment));
+        let rows = state.hold_for_pick(self.volume, PickKind::Walk);
+        let can_walk = |segment: &SegmentNumber| segment.0 != sealing && !volume.is_merging(*segment);
+        let orders = rows.orders();
+        // the walk lists hold only unwalked rows, and the forward one runs in segment order
+        let backward = orders.walk_list(WalkList::Backward).filter(can_walk).filter_map(|segment| rows.get(segment));
+        let backward = backward.max_by_key(|row| row.facts.places.highest);
+        let picked = backward.or_else(|| orders.walk_list(WalkList::Unwalked).find(can_walk).and_then(|segment| rows.get(segment)));
         self.target = picked.map(|row| WalkTarget {
             segment: row.facts.segment,
             next_block: row.facts.walked_blocks,

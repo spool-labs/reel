@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::{JobKind, UnitKind};
+use reel_api::maintenance_report::{JobKind, PickKind, UnitKind};
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, Nanoseconds, WritePlace};
 
@@ -35,6 +35,7 @@ use crate::segment::row_block::{ROW_BLOCK_BYTES, RowBlockWalk};
 use crate::segment::segment_table::RetiredSegment;
 use crate::segment::segment_tail::SegmentNumber;
 use crate::segment::summary::{DeadCount, SummaryRow};
+use crate::segment::summary_orders::WalkList;
 
 /// Covers one ask of compaction looks at, which bounds what settling them costs
 pub const MOST_SETTLE_LOOKS: usize = 16;
@@ -477,13 +478,14 @@ impl<Backend: Io> CompactJob<Backend> {
         if !volume.covers.are_all_applied() {
             return;
         }
-        let mut rows = hold(&volume.summary);
+        let mut rows = self.state.hold_for_pick(self.volume, PickKind::Cover);
         let mut last = SegmentNumber(0);
         loop {
             let is_settled = |row: &SummaryRow<'_>| {
-                row.facts.has_covers && row.facts.segment > last && row.facts.is_walked() && !volume.covers.holds_any(row.facts.segment)
+                row.facts.has_covers && row.facts.is_walked() && !volume.covers.holds_any(row.facts.segment)
             };
-            let Some(segment) = rows.rows().filter(is_settled).map(|row| row.facts.segment).min() else {
+            let after = rows.orders().after(last).iter().filter_map(|segment| rows.get(*segment));
+            let Some(segment) = after.filter(is_settled).map(|row| row.facts.segment).next() else {
                 return;
             };
             rows.clear_covers(segment);
@@ -504,14 +506,14 @@ impl<Backend: Io> CompactJob<Backend> {
         }
         let mut last = SegmentNumber(0);
         loop {
-            let rows = hold(&volume.summary);
+            let rows = self.state.hold_for_pick(self.volume, PickKind::Cover);
             let is_under = |row: &SummaryRow<'_>| {
-                row.facts.segment > last
-                    && row.facts.segment != segment
+                row.facts.segment != segment
                     && row.facts.places.lowest < place
                     && is_in_range(row, column, &self.key, &self.end)
             };
-            let next = rows.rows().filter(is_under).min_by_key(|row| row.facts.segment).map(|row| (row.facts.segment, row.facts.is_damaged));
+            let after = rows.orders().after(last).iter().filter_map(|segment| rows.get(*segment));
+            let next = after.filter(is_under).map(|row| (row.facts.segment, row.facts.is_damaged)).next();
             drop(rows);
             let Some((other, is_damaged)) = next else {
                 return self.unrowed_blocker(volume, column, place, segment);
@@ -595,11 +597,12 @@ impl<Backend: Io> CompactJob<Backend> {
         if volume.is_applying.load(Ordering::Acquire) {
             return None;
         }
-        let rows = hold(&volume.summary);
-        let dead = rows.rows().filter(is_wholly_dead).filter(|row| !volume.table.is_unproven(row.facts.segment));
-        let after = dead.clone().filter(|row| row.facts.segment > self.last_tried).min_by_key(|row| row.facts.segment);
-        let picked = after.or_else(|| dead.min_by_key(|row| row.facts.segment));
-        picked.map(|row| row.facts.segment)
+        let rows = self.state.hold_for_pick(self.volume, PickKind::Dead);
+        let is_proven = |segment: &SegmentNumber| !volume.table.is_unproven(*segment);
+        // the dead list holds the wholly dead rows in segment order
+        let dead = rows.orders().walk_list(WalkList::Dead);
+        let (mut after, mut all) = (dead.filter(|segment| *segment > self.last_tried), dead);
+        after.find(is_proven).or_else(|| all.find(is_proven))
     }
 
     /// Check a candidate's counts and start the pass that proves its rows dead. A cue that stands in the way brings the planner
@@ -786,13 +789,4 @@ pub fn is_under_applied_cover<Backend: Io>(volume: &Volume<Backend>, segment: Se
             !facts.bound.is_empty() && covers.is_inside_newer(&cover, true)
         })
     })
-}
-
-/// Check a row's counts say nothing in its segment is live. Rows with damage or covers answer for more than their rows
-pub fn is_wholly_dead(row: &SummaryRow<'_>) -> bool {
-    if !row.facts.is_walked() || row.facts.is_damaged || row.facts.has_covers || row.facts.block_count == 0 {
-        return false;
-    }
-    let mut cursor = row.cursor();
-    (0..row.column_count).all(|_column| cursor.column().is_some_and(|column| column.dead_rows == column.row_count))
 }

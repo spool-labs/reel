@@ -104,6 +104,33 @@ impl UnitKind {
     }
 }
 
+/// Every kind of pick that reads a volume's summary under its lock, in the order a report lists them
+pub const PICK_KINDS: [PickKind; 6] = [PickKind::Rewrite, PickKind::Overlap, PickKind::Walk, PickKind::Dead, PickKind::Filter, PickKind::Cover];
+
+/// A kind of pick. Each holds the summary's lock, which a seal and an install also take
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum PickKind {
+    /// A rewrite lane's pick of the segments a record rewrite wins most back from
+    Rewrite,
+    /// The planner's pick: an overlap merge first, then a record rewrite
+    Overlap,
+    /// The dead-byte walk's pick of its next segment
+    Walk,
+    /// The pick of a wholly dead segment to unlink
+    Dead,
+    /// The filter loader's pick of a segment the arena lacks
+    Filter,
+    /// A range delete's look for the next segment under it
+    Cover,
+}
+
+impl PickKind {
+    /// Read this kind's place in `PICK_KINDS`
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
 /// The largest unit of one kind since open, in work and in wall time, and the sums over every unit. The two largest can come
 /// from different units
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -349,6 +376,8 @@ pub struct MaintenanceReport {
     pub corruption_errors: RowCount,
     pub damaged_segments: SegmentCount,
     pub summary_rows_dropped: RowCount,
+    /// Summary rows the pick orders had no slot for, which no pick sees, and which stays none
+    pub summary_rows_unordered: RowCount,
     pub refused_reads: RowCount,
     pub reclaim_retries: RowCount,
     pub segments_parked: SegmentCount,
@@ -361,6 +390,8 @@ pub struct MaintenanceReport {
     /// Async reads complete through the ring, and through the blocking pool when this is false
     pub has_ring: bool,
     pub longest_units: [UnitReading; UNIT_KINDS.len()],
+    /// The longest one pick of each kind held a volume's summary since open
+    pub longest_holds: [Nanoseconds; PICK_KINDS.len()],
     /// The maintenance jobs' regions and their admission
     pub memory: MaintenanceMemory,
     /// Maintenance workers the store runs, one an online CPU across its volumes
@@ -408,6 +439,7 @@ impl MaintenanceReport {
             corruption_errors: RowCount::default(),
             damaged_segments: SegmentCount::default(),
             summary_rows_dropped: RowCount::default(),
+            summary_rows_unordered: RowCount::default(),
             refused_reads: RowCount::default(),
             reclaim_retries: RowCount::default(),
             segments_parked: SegmentCount::default(),
@@ -417,6 +449,7 @@ impl MaintenanceReport {
             unlinks_refused: SegmentCount::default(),
             has_ring: false,
             longest_units: [UnitReading::default(); UNIT_KINDS.len()],
+            longest_holds: [Nanoseconds(0); PICK_KINDS.len()],
             memory: MaintenanceMemory::default(),
             workers: 0,
             active_workers: 0,

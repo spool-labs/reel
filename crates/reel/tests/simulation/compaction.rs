@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
-use reel::engine::compact_job::{CompactJob, ConfirmPass, RowsProof, is_under_applied_cover, is_wholly_dead};
+use reel::engine::compact_job::{CompactJob, ConfirmPass, RowsProof, is_under_applied_cover};
+use reel::segment::summary_orders::is_wholly_dead;
 use reel::engine::cue::MOST_CUES;
 use reel::engine::engine_sizing::COMPACT_JOB_BYTES;
 use reel::engine::open_segment::data_path;

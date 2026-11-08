@@ -196,6 +196,48 @@ impl ColumnDirectory {
         }
     }
 
+    /// Fill a buffer with the segments whose range starts inside a range, in key order, up to the buffer's room. Bounds can only
+    /// widen a range, so a caller checks each one against its keys
+    pub fn starting_inside(&self, low: &KeyBound, high: &KeyBound, out: &mut impl ListOut<SegmentNumber>) {
+        out.clear();
+        let current = self.current.load(Ordering::Acquire);
+        let copy = read_list(&self.versions[current]);
+        let first = copy.ranges.partition_point(|range| range.lowest < *low);
+        for range in copy.ranges[first..].iter().take_while(|range| range.lowest <= *high) {
+            if !out.push_if_room(range.segment) {
+                return;
+            }
+        }
+    }
+
+    /// Publish a list of every listing at once, sorted here, or return false when they don't fit. A listing at a time copies the
+    /// whole list for each one, and one sort fills a directory of any size
+    pub fn publish_all(&self, listings: &[Listing]) -> bool {
+        let _one_writer = hold(&self.writer);
+        let current = self.current.load(Ordering::Acquire);
+        let next = (current + 1) % DIRECTORY_VERSIONS;
+        {
+            let generation = read_list(&self.versions[current]).generation;
+            let mut target = write_list(&self.versions[next]);
+            if listings.len() > target.entries.capacity() {
+                return false;
+            }
+            target.entries.clear();
+            target.ranges.clear();
+            target.generation = generation + 1;
+            target.entries.extend(listings.iter().map(|listing| listing.entry));
+            target.ranges.extend(listings.iter().map(|listing| listing.range));
+            target.entries.sort_unstable_by_key(sort_key);
+            target.ranges.sort_unstable_by_key(|range| range.lowest);
+            refresh_groups(&mut target.entries);
+            let count = target.ranges.len();
+            refresh_range_reach(&mut target.ranges, 0, count);
+        }
+        self.current.store(next, Ordering::Release);
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        true
+    }
+
     /// Find where the next segment past a bound starts
     pub fn next_above(&self, bound: &KeyBound) -> Option<KeyBound> {
         let current = self.current.load(Ordering::Acquire);
@@ -306,7 +348,8 @@ pub fn group_of(length_run: &[DirectoryEntry], sum: Checksum) -> &[DirectoryEntr
 
 /// Add every segment of a group whose range holds a key, skipping whole runs that can't
 pub fn search_group(group: &[DirectoryEntry], key: KeyPrefix, fill: &mut PageFill<impl ListOut<Candidate>>) {
-    if group.is_empty() {
+    // a full page ends the search, and the next page starts past what this one holds
+    if group.is_empty() || fill.is_cut {
         return;
     }
 
@@ -332,7 +375,8 @@ pub fn search_group(group: &[DirectoryEntry], key: KeyPrefix, fill: &mut PageFil
 
 /// Add every segment whose keys can meet a range, skipping whole runs that can't. A segment comes out in order of its lowest key
 pub fn search_ranges(ranges: &[RangeEntry], start: usize, end: usize, low: &KeyBound, high: &KeyBound, fill: &mut PageFill<impl ListOut<SegmentNumber>>) {
-    if start == end {
+    // a full page ends the search, and the next page starts past what this one holds
+    if start == end || fill.is_cut {
         return;
     }
 

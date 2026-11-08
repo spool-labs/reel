@@ -15,6 +15,7 @@ pub mod filter_job;
 pub mod job_tally;
 pub mod reports;
 pub mod open_segment;
+pub mod pick_hold;
 pub mod planner;
 pub mod ration;
 pub mod read_only;

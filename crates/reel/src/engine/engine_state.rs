@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::UnitKind;
+use reel_api::maintenance_report::{PICK_KINDS, UnitKind};
 use reel_api::memory_report::MemoryReport;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, SegmentCount, WritePlace};
@@ -23,6 +23,7 @@ use crate::engine::compact_job::park;
 use crate::engine::open_segment::{data_path, output_path, rows_path};
 use crate::engine::read_pool::ReadPool;
 use crate::engine::walk_job::{FREE_BLOCK_BYTES, FreeRecord};
+use crate::segment::summary_orders::WalkList;
 use crate::engine::workers::Workers;
 use crate::engine::volume::{ParkedSegment, RewriteOutput, Volume};
 use crate::segment::range_covers::Cover;
@@ -131,6 +132,7 @@ pub struct EngineState<Backend: Io> {
     pub seal_heap: AtomicU64,
     pub walk_heap: AtomicU64,
     pub worker_priority: Mutex<WorkerPriority>,
+    pub pick_holds: [AtomicU64; PICK_KINDS.len()],
     pub workers: Workers<Backend::Task>,
     pub compaction_heap: AtomicU64,
     pub admission: Admission,
@@ -355,7 +357,8 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// Count a volume's segments waiting for the dead-byte walk
     pub fn pending_walks(&self, volume: usize) -> usize {
-        hold(&self.volumes[volume].summary).rows().filter(|row| !row.facts.is_walked()).count()
+        let rows = hold(&self.volumes[volume].summary);
+        rows.orders().walk_count(WalkList::Unwalked) + rows.orders().walk_count(WalkList::Backward)
     }
 
     /// Count the times a volume's walk has had to try a block again

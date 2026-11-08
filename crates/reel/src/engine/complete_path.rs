@@ -145,7 +145,7 @@ impl<Backend: Io> EngineState<Backend> {
         if matches.slots().iter().any(CompleteSlot::is_sticky) {
             return self.newest_walked_footers(volume, read, skipped);
         }
-        self.footer_readers.with(|reader| {
+        self.job_footer_readers.with(|reader| {
             let mut best = None;
             for slot in matches.slots().iter().filter(|slot| !slot.is_stale() && !skipped.contains(&slot.segment_number())) {
                 if volume.table.pin(slot.segment_number()).is_some_and(|pin| pin.is_walked) {

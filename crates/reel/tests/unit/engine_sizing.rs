@@ -43,6 +43,7 @@ fn shape(budget: ByteCount, roots: usize) -> StoreShape {
         has_ring: false,
         disk_entry_bytes: ByteCount(0),
         floor_entry_bytes: ByteCount(0),
+        workers: None,
     }
 }
 
@@ -59,7 +60,7 @@ fn least_budget() {
 // the rows a segment takes at each budget, as `SEAL_ROWS_EIGHTHS` documents them
 #[test]
 fn documented_rows() {
-    for (mib, rows) in [(128, 31_653), (192, 137_236), (512, 665_154), (4_096, 6_577_830)] {
+    for (mib, rows) in [(128, 31_190), (192, 136_774), (512, 664_691), (4_096, 6_577_366)] {
         let store = StoreShape {
             budget: ByteCount(mib * 1024 * 1024),
             roots: 1,
@@ -70,6 +71,7 @@ fn documented_rows() {
             has_ring: false,
             disk_entry_bytes: ByteCount(0),
             floor_entry_bytes: ByteCount(0),
+            workers: None,
         };
 
         assert_eq!(EngineSizing::for_store(&store).segment_rows, RowCount(rows), "{mib} MiB");
@@ -89,6 +91,7 @@ fn summary_holds_blocks() {
         has_ring: false,
         disk_entry_bytes: ByteCount(0),
         floor_entry_bytes: ByteCount(0),
+        workers: None,
     };
     let rows_room = EngineSizing::for_store(&store).summary_share.0 / 2;
     let blocks = 1_000_000_000 / ROWS_PER_BLOCK;
@@ -111,6 +114,7 @@ fn documented_reserve() {
             has_ring: false,
             disk_entry_bytes: ByteCount(0),
             floor_entry_bytes: ByteCount(0),
+            workers: None,
         };
 
         let segment = EngineSizing::for_store(&store).segment_bytes;

@@ -34,4 +34,5 @@ pub mod store_scan;
 pub mod store_traits;
 pub mod volume;
 pub mod walk_job;
+pub mod workers;
 pub mod write_path;

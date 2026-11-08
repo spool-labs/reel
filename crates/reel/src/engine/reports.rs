@@ -242,6 +242,9 @@ impl<Backend: Io> EngineState<Backend> {
         report.damaged_segments = SegmentCount(self.damaged_segments.load(Ordering::Acquire));
         report.summary_rows_dropped = RowCount(self.dropped_summary_rows.load(Ordering::Acquire));
         report.refused_reads = RowCount(self.cues.refused_reads());
+        report.workers = self.workers.len() as u64;
+        report.active_workers = self.workers.active();
+        report.worker_priority = *hold(&self.worker_priority);
         report.memory = MaintenanceMemory { walk_fixed: ByteCount(self.walk_heap.load(Ordering::Acquire)), ..self.admission.reading() };
     }
 

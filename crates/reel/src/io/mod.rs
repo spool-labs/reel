@@ -18,6 +18,7 @@ use std::pin::pin;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 
+use reel_api::maintenance_report::WorkerPriority;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, WritePlace};
 
 use crate::engine::read_path::SealedRow;
@@ -344,6 +345,12 @@ pub trait Io: Clone + Send + Sync + 'static {
 
     /// Start a job on an engine thread
     fn spawn_job<Work: Job>(&self, name: &'static str, job: Work) -> Result<Self::Task>;
+
+    /// Start a maintenance worker on an engine thread at the platform's lowest normal priority, and return the priority its
+    /// thread read back once it set it
+    fn spawn_worker<Work: Job>(&self, name: &'static str, job: Work) -> Result<(Self::Task, WorkerPriority)> {
+        Ok((self.spawn_job(name, job)?, WorkerPriority::default()))
+    }
 
     /// Read the stack a job's thread holds, which memory_report shows
     fn job_stack_bytes(&self) -> ByteCount;

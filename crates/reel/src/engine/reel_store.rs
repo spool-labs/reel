@@ -16,8 +16,9 @@ use reel_api::units::{ByteCount, DeathMark, Nanoseconds, RowCount, VolumeId, Wri
 use reel_api::usage::{ColumnUsage, UsageReport};
 use reel_api::write_batch::WriteBatch;
 
-use crate::config::{ColumnConfig, DeviceClass, NO_WORKERS, StoreConfig, VolumeConfig};
+use crate::config::{ColumnConfig, DeviceClass, StoreConfig, VolumeConfig};
 use crate::engine::admission::Admission;
+use reel_api::maintenance_report::WorkerPriority;
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::engine_sizing::{
     complete_block_rows, complete_row_limit,
@@ -48,6 +49,7 @@ use crate::engine::cue::{Cue, CueTable};
 use crate::engine::filter_job::FilterLoader;
 use crate::engine::planner::Planner;
 use crate::engine::walk_job::{BlockCounter, WalkJob, WalkSlot, WalkWorker};
+use crate::engine::workers::Workers;
 use crate::engine::volume::{SealStepTimes, ClaimState, GaveUp, MOST_MERGE_OUTPUTS, MOST_PARKED, NO_SEAL, RewriteLane, SyncState, Volume};
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
@@ -476,11 +478,7 @@ impl<Backend: Io> EngineState<Backend> {
         if let Some(task) = self.reserve_task.get() {
             task.stop()?;
         }
-        for slot in self.volumes.iter().flat_map(|volume| &volume.walk_slots) {
-            if let Some(task) = slot.task.get() {
-                task.stop()?;
-            }
-        }
+        self.workers.stop()?;
         if let Some(task) = self.planner_task.get() {
             task.stop()?;
         }
@@ -639,23 +637,25 @@ pub fn bring_up<Backend: Io>(
         state.compaction_heap.fetch_add(compaction.heap_bytes().0, Ordering::AcqRel);
         compactions.push(compaction);
     }
-    let mut workers = 0;
-    for (volume, held) in state.volumes.iter().enumerate() {
-        for (index, slot) in held.walk_slots.iter().enumerate() {
-            let worker = WalkWorker {
-                state: Arc::clone(state),
-                volume,
-                slot: index,
-                counter: BlockCounter::new(Arc::clone(state)),
-                seats: Arc::clone(&compactions[volume].seats),
-                rewrite: None,
-            };
-            state.walk_heap.fetch_add(worker.counter.heap_bytes().0 + slot.heap_bytes().0, Ordering::AcqRel);
-            let task = state.io.spawn_job("reel-walk", worker).map_err(open_error("starting a job"))?;
-            let _set = slot.task.set(task);
-            workers += 1;
-        }
+    let slots: u64 = state.volumes.iter().flat_map(|volume| &volume.walk_slots).map(|slot| slot.heap_bytes().0).sum();
+    state.walk_heap.fetch_add(slots, Ordering::AcqRel);
+    let seats: Vec<_> = compactions.iter().map(|compaction| Arc::clone(&compaction.seats)).collect();
+    for (index, cell) in state.workers.cells.iter().enumerate() {
+        let worker = WalkWorker {
+            state: Arc::clone(state),
+            index,
+            next_volume: index % state.volumes.len().max(1),
+            counter: BlockCounter::new(Arc::clone(state)),
+            seats: seats.clone(),
+            rewrite: None,
+            seat: (0, 0),
+        };
+        state.walk_heap.fetch_add(worker.counter.heap_bytes().0, Ordering::AcqRel);
+        let (task, priority) = state.io.spawn_worker("reel-walk", worker).map_err(open_error("starting a job"))?;
+        *hold(&state.worker_priority) = priority;
+        let _set = cell.task.set(task);
     }
+    let workers = state.workers.len() as u64;
     let planner = Planner {
         state: Arc::clone(state),
         walks,
@@ -699,6 +699,7 @@ pub fn store_shape(config: &StoreConfig, has_ring: bool, disks: &[Option<ByteCou
         has_ring,
         disk_entry_bytes: ByteCount(0),
         floor_entry_bytes: entry_line(config, &disks.iter().map(|disk| disk.map(|_size| floor_entries())).collect::<Vec<_>>()),
+        workers: None,
     };
     // a segment's rows come from the shares, so the disks ask at the rows a plan with no line of theirs gives
     let rows = EngineSizing::for_store(&bare.with_workers_settled()).segment_rows;
@@ -763,7 +764,7 @@ pub fn volume_disks<Backend: Io>(io: &Backend, config: &StoreConfig) -> Result<V
 
 /// Check a budget holds the ring beside the least a store runs on. A smaller one keeps async reads on the blocking pool
 pub fn ring_fits(config: &StoreConfig, disks: &[Option<ByteCount>]) -> bool {
-    let shape = StoreShape { threads: NO_WORKERS, ..store_shape(config, true, disks) };
+    let shape = StoreShape { workers: Some(0), ..store_shape(config, true, disks) };
     shape.least_budget() <= config.memory_budget
 }
 
@@ -771,13 +772,13 @@ pub fn ring_fits(config: &StoreConfig, disks: &[Option<ByteCount>]) -> bool {
 pub fn store_sizing(config: &StoreConfig, has_ring: bool, disks: &[Option<ByteCount>]) -> Result<EngineSizing, StoreError> {
     let shape = store_shape(config, has_ring, disks);
     let shape = shape.with_workers_settled();
-    let least_shape = StoreShape { threads: NO_WORKERS, ..shape };
+    let least_shape = StoreShape { workers: Some(0), ..shape };
     if config.threads.read_threads == 0 {
         return Err(StoreError::NoReadThreads);
     }
     if config.memory_budget >= least_shape.least_budget() && config.memory_budget < shape.least_budget() {
         return Err(StoreError::ThreadsPastBudget {
-            maintenance_workers: shape.walk_workers(),
+            maintenance_workers: shape.workers(),
             read_threads: config.threads.read_threads,
             budget: config.memory_budget,
             least: shape.least_budget(),
@@ -1162,7 +1163,7 @@ pub fn build_state<Backend: Io>(
             rewrites_unreclaimed: AtomicU64::new(0),
             walk_blocks: AtomicU64::new(0),
             sealing: AtomicU64::new(NO_SEAL),
-            lanes: (0..=sizing.walk_workers).map(|_lane| RewriteLane::new()).collect(),
+            lanes: (0..=sizing.walk_slots).map(|_lane| RewriteLane::new()).collect(),
             gave_up: Mutex::new(GaveUp::new()),
             early_bar_rewrites: AtomicU64::new(0),
             plain_bar_rewrites: AtomicU64::new(0),
@@ -1188,7 +1189,7 @@ pub fn build_state<Backend: Io>(
             seal_point: AtomicU64::new(volume_rows(config, index, sizing.segment_rows).0),
             seal_rate: AtomicU64::new(0),
             ingest_rate: AtomicU64::new(0),
-            walk_slots: (0..sizing.walk_workers).map(|_slot| WalkSlot::new()).collect(),
+            walk_slots: (0..sizing.walk_slots).map(|_slot| WalkSlot::new()).collect(),
             can_free_blocks: volume.roots.iter().all(|root| io.can_free_blocks(root)),
             bytes_freed: AtomicU64::new(0),
             has_held_frees: AtomicBool::new(false),
@@ -1306,6 +1307,8 @@ pub fn build_state<Backend: Io>(
         prefault_time: AtomicU64::new(0),
         record_readers: Pool::new(record_readers),
         footer_readers: Pool::new(footer_readers),
+        // each volume's planner and each of the store's workers, each holding one at a time
+        job_footer_readers: Pool::new((0..config.volumes.len() + sizing.workers).map(|_reader| FooterReader::new()).collect()),
         scan_heap,
         // a reservation rewrites these bytes, and the first must not grow the buffer on a job thread
         superblock_bytes: Mutex::new(superblock.to_bytes()),
@@ -1331,6 +1334,8 @@ pub fn build_state<Backend: Io>(
         memory_budget: config.memory_budget,
         seal_heap: AtomicU64::new(0),
         walk_heap: AtomicU64::new(0),
+        worker_priority: Mutex::new(WorkerPriority::default()),
+        workers: Workers::new(sizing.workers),
         compaction_heap: AtomicU64::new(0),
         admission: Admission::default(),
         job_count: AtomicU64::new(0),

@@ -676,7 +676,7 @@ impl<Backend: Io> EngineState<Backend> {
         };
         let read = self.key_read(column, key, WritePlace(place.0.saturating_sub(1)), false)?;
         let found = self.index.lookup(column, key, read.read_point, volume.view());
-        let mut reader = self.footer_readers.lease();
+        let mut reader = self.job_footer_readers.lease();
         let sealed = in_place(self.walk_candidates(&InPlace, volume, directory, &read, &mut reader, WalkAsk { skipped, ..WalkAsk::EVERY }))?;
         Ok(newest_of(found.row, sealed).place().is_some())
     }
@@ -706,7 +706,7 @@ impl<Backend: Io> EngineState<Backend> {
         let Some(directory) = &self.directories[read.column.0 as usize] else {
             return Ok(None);
         };
-        let mut reader = self.footer_readers.lease();
+        let mut reader = self.job_footer_readers.lease();
         in_place(self.walk_candidates(&InPlace, volume, directory, read, &mut reader, WalkAsk { skipped, is_finished_only: true, ..WalkAsk::EVERY }))
     }
 

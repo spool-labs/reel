@@ -152,7 +152,7 @@ impl<Backend: Io> FilterLoader<Backend> {
         };
         self.loaded = 0;
         let mut left = FILTER_STEP_BLOCKS;
-        let mut buffer = self.state.footer_readers.lease();
+        let mut buffer = self.state.job_footer_readers.lease();
         for index in 0..self.runs.len() {
             while left > 0 && self.runs[index].next < self.runs[index].end {
                 let block = self.runs[index].next;

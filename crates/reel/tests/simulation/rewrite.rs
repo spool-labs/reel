@@ -2423,7 +2423,6 @@ fn seat_lock_is_held_for_a_swap() {
     let store = ReelStore::open(io.clone(), &config).expect("open");
     hold_compaction(&store, true);
     let state = &store.state;
-    let volume = &state.volumes[0];
     let key = |number: u64| format!("k-{number:05}").into_bytes();
     for number in 0..SEAT_KEYS {
         store.put(COLUMN, &key(number), b"first").expect("put");
@@ -2436,10 +2435,23 @@ fn seat_lock_is_held_for_a_swap() {
 
     let job = CompactJob::new(Arc::clone(state), 0);
     assert_eq!(job.seats.len(), 1);
-    assert!(job.hand_out(volume), "no rewrite started");
+    assert!(job.hand_out(), "no rewrite started");
     let seat = &job.seats[0];
-    let mut worker =
-        WalkWorker { state: Arc::clone(state), volume: 0, slot: 0, counter: BlockCounter::new(Arc::clone(state)), seats: Arc::clone(&job.seats), rewrite: None };
+    let mut worker = WalkWorker {
+        state: Arc::clone(state),
+        index: 0,
+        next_volume: 0,
+        counter: BlockCounter::new(Arc::clone(state)),
+        seats: vec![Arc::clone(&job.seats)],
+        rewrite: None,
+        seat: (0, 0),
+    };
+    // the planner claims and leaves the populate to the worker: the first step maps the region and opens the output, and the steps
+    // after it read
+    assert!(hold(&job.seats[0].job).as_ref().is_some_and(|held| held.is_claimed() && held.region_bytes().0 == 0));
+    assert!(worker.take_seat(), "the worker never took the handed-out rewrite");
+    assert_eq!(worker.step_rewrite(), JobStep::Worked);
+    assert!(worker.rewrite.as_ref().is_some_and(|held| !held.is_claimed() && held.region_bytes().0 > 0));
     let (parked, is_parked) = mpsc::channel();
     let (release, released) = mpsc::channel::<()>();
     let released = Mutex::new(released);
@@ -2457,7 +2469,7 @@ fn seat_lock_is_held_for_a_swap() {
         let job = &job;
         scope.spawn(move || {
             let started = Instant::now();
-            let has_started = job.hand_out(volume);
+            let has_started = job.hand_out();
             let _sent = done.send((has_started, started.elapsed()));
         });
         let handed = is_done.recv_timeout(PARK_WAIT);
@@ -2471,7 +2483,7 @@ fn seat_lock_is_held_for_a_swap() {
     assert!(worker.rewrite.as_ref().is_some_and(RewriteJob::is_running), "the rewrite ended in one step");
     assert!(seat.job.try_lock().is_ok_and(|held| held.is_none()), "the seat kept its rewrite through a step");
     assert!(seat.is_busy() && seat.heap_bytes() > 0);
-    assert!(!job.hand_out(volume), "a second rewrite started on a busy seat");
+    assert!(!job.hand_out(), "a second rewrite started on a busy seat");
     while worker.rewrite.is_some() {
         assert_eq!(worker.step_rewrite(), JobStep::Worked);
     }

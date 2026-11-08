@@ -26,7 +26,7 @@ use crate::engine::volume::{ParkedSegment, Volume};
 use crate::engine::walk_job::{FREE_IN_PLACE_BYTES, FreeRecord, WALK_RETRY};
 use crate::guard::hold;
 use crate::io::device_error::is_device_error;
-use crate::io::{InPlace, Io, IoFile, IoTask, in_place};
+use crate::io::{InPlace, Io, IoFile, in_place};
 use crate::fixed_list::FixedList;
 use crate::row_kind::RowKind;
 use crate::segment::block_entry::KeyBound;
@@ -256,7 +256,7 @@ impl<Backend: Io> CompactJob<Backend> {
             // an unlink wins back the most for the least, so a rewrite waits until none is left to try
             let should_rewrite = mem::take(&mut self.should_rewrite);
             // workers go first, so the planner stays free to pick and walk
-            if should_rewrite && (self.hand_out(volume) || self.rewrite.start()) {
+            if should_rewrite && (self.hand_out() || self.rewrite.start()) {
                 return UnitStep::Worked;
             }
             // a look takes a few segments at a time, and the rest still count
@@ -279,28 +279,27 @@ impl<Backend: Io> CompactJob<Backend> {
         let changes = left + volume.seals_done.load(Ordering::Acquire);
         if changes != self.handed_at {
             self.handed_at = changes;
-            let _handed = self.hand_out(volume);
+            let _handed = self.hand_out();
         }
     }
 
-    /// Start a rewrite on each idle worker while picks last, and say whether one started. The planner picks and the worker runs,
-    /// so more workers means more rewrites at once
-    pub fn hand_out(&self, volume: &Volume<Backend>) -> bool {
+    /// Start a rewrite in each idle seat while picks last, waking a worker for each, and say whether one started. The planner picks
+    /// and a worker runs, so more workers means more rewrites at once
+    pub fn hand_out(&self) -> bool {
         let mut has_started = false;
-        for (index, seat) in self.seats.iter().enumerate() {
+        for seat in self.seats.iter() {
             let mut held = hold(&seat.job);
             // a worker holds its running rewrite out of the seat, and one started here waits for the worker to take it
             let Some(job) = held.as_mut().filter(|job| !job.is_running()) else {
                 continue;
             };
-            if !job.start() {
+            if !job.claim() {
                 return has_started;
             }
             has_started = true;
             drop(held);
-            if let Some(task) = volume.walk_slots[index].task.get() {
-                task.wake();
-            }
+            seat.is_waiting.store(true, Ordering::SeqCst);
+            self.state.workers.wake_one();
         }
         has_started
     }

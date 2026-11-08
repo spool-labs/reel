@@ -44,6 +44,7 @@ pub struct Pool<Item> {
     queued: AtomicU64,
     freed: Condvar,
     wakes: AtomicU64,
+    waits: AtomicU64,
 }
 
 /// One item's place, on cache lines of its own
@@ -109,6 +110,7 @@ impl<Item> Pool<Item> {
             queued: AtomicU64::new(0),
             freed: Condvar::new(),
             wakes: AtomicU64::new(0),
+            waits: AtomicU64::new(0),
         };
         // some platforms set a lock up at its first use, and that's a job for open
         for slot in &pool.slots {
@@ -127,6 +129,11 @@ impl<Item> Pool<Item> {
             }
         }
         ByteCount(total)
+    }
+
+    /// Count the takes that found every item out or a line ahead, and queued
+    pub fn waits(&self) -> u64 {
+        self.waits.load(Ordering::Relaxed)
     }
 
     /// Count the wake-ups so far, each a system call
@@ -246,6 +253,7 @@ impl<Item> Pool<Item> {
         let ticket = line.next_ticket;
         line.next_ticket += 1;
         self.queued.fetch_add(1, Ordering::AcqRel);
+        self.waits.fetch_add(1, Ordering::Relaxed);
         // pairs with the fence in `wake_if_waited_for`: this look or that one sees the other's write
         fence(Ordering::SeqCst);
         while line.serving != ticket || self.free_count() < count {

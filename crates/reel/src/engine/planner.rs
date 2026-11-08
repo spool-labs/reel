@@ -162,6 +162,6 @@ pub fn unit_bound(kind: UnitKind) -> Option<u64> {
         UnitKind::CoverSweep => Some(MOST_RANGE_COVERS as u64),
         UnitKind::FilterLoad => Some(FILTER_STEP_BLOCKS as u64),
         UnitKind::CoverApply | UnitKind::ParkedClear | UnitKind::Pick => Some(1),
-        UnitKind::SummaryCopy | UnitKind::SummarySave => None,
+        UnitKind::SummaryCopy | UnitKind::SummarySave | UnitKind::Start => None,
     }
 }

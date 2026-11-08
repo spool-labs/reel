@@ -10,13 +10,15 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread::{self, Builder};
 use std::time::{Duration, Instant};
 
+use reel_api::maintenance_report::{PriorityClass, WorkerPriority};
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, ProcessId};
 
 use crate::io::host_memory::{HostMemory, read_host_memory};
+use crate::guard::hold;
 use crate::io::{DiskSize, Io, IoFile};
 use crate::io::job::Job;
 use crate::io::lock_outcome::LockOutcome;
@@ -38,6 +40,8 @@ pub const FREE_PROBE_BYTES: usize = 8 * 1024;
 pub const MOST_STACK_DEPTH: usize = 8;
 /// The stack of a job thread, which holds a seal's and a merge's deepest calls with room to spare
 pub const JOB_STACK_BYTES: ByteCount = ByteCount(1024 * 1024);
+/// The nice value a maintenance worker runs at, the lowest normal one
+pub const MAINTENANCE_NICE: i32 = 19;
 /// What a job's touch leaves alone: the guard page, the thread's own data that glibc keeps in the stack, and the frames
 /// above the touch, about 15 KiB in a debug build. A kernel with 64 KiB pages takes 64 KiB for the guard alone
 pub const STACK_SLACK_BYTES: usize = 128 * 1024;
@@ -225,6 +229,29 @@ impl Io for PlainIo {
         JOB_STACK_BYTES
     }
 
+    fn spawn_worker<Work: Job>(&self, name: &'static str, job: Work) -> Result<(PlainTask, WorkerPriority)> {
+        let signal = Arc::new(TaskSignal::default());
+        let thread_signal = Arc::clone(&signal);
+        let thread_io = self.clone();
+        let priority = Arc::new(Mutex::new(WorkerPriority::default()));
+        let thread_priority = Arc::clone(&priority);
+        let ready = Arc::new(Barrier::new(2));
+        let thread_ready = Arc::clone(&ready);
+        let thread = Builder::new()
+            .name(name.to_string())
+            .stack_size(JOB_STACK_BYTES.0 as usize)
+            .spawn(move || {
+                // the thread lowers its own priority, since a class set from outside would reach the whole process
+                *hold(&thread_priority) = lower_priority();
+                touch_stack();
+                thread_ready.wait();
+                run_job(job, &thread_signal, &thread_io);
+            })?;
+        ready.wait();
+        let set = *hold(&priority);
+        Ok((PlainTask::new(signal, thread), set))
+    }
+
     fn spawn_job<Work: Job>(&self, name: &'static str, job: Work) -> Result<PlainTask> {
         let signal = Arc::new(TaskSignal::default());
         let thread_signal = Arc::clone(&signal);
@@ -335,4 +362,44 @@ pub fn block_spins(block: &Path, depth: usize) -> Option<bool> {
     }
     let flag = fs::read_to_string(block.join("queue/rotational")).ok()?;
     Some(flag.trim() == "1")
+}
+
+/// Put the calling thread in the batch class at nice 19, which callers preempt but which still gets a slice within milliseconds,
+/// and read back what took
+#[cfg(target_os = "linux")]
+pub fn lower_priority() -> WorkerPriority {
+    let param = libc::sched_param { sched_priority: 0 };
+    // SAFETY: zero names the calling thread, and the parameter lives for the call
+    unsafe { libc::sched_setscheduler(0, libc::SCHED_BATCH, &param) };
+    // SAFETY: gettid reads the calling thread's id
+    let thread = unsafe { libc::gettid() };
+    // SAFETY: on Linux a thread id names that thread alone for these calls
+    unsafe { libc::setpriority(libc::PRIO_PROCESS, thread as libc::id_t, MAINTENANCE_NICE) };
+    // SAFETY: as above, and each call reads a number
+    let (policy, nice) = unsafe { (libc::sched_getscheduler(0), libc::getpriority(libc::PRIO_PROCESS, thread as libc::id_t)) };
+    let class = match policy {
+        libc::SCHED_BATCH => PriorityClass::Batch,
+        libc::SCHED_OTHER => PriorityClass::Normal,
+        _ => PriorityClass::Unknown,
+    };
+    WorkerPriority { class, nice }
+}
+
+/// Put the calling thread in the utility QoS class, the nearest macOS has to a per-thread nice 19, since background throttles
+/// its reads as an idle class would, and read back what took
+#[cfg(target_os = "macos")]
+pub fn lower_priority() -> WorkerPriority {
+    // SAFETY: the call sets the calling thread's class and touches no memory of ours
+    unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0) };
+    let (mut class, mut relative) = (0u32, 0);
+    // SAFETY: the class is read as its plain number, so an unknown one can't make a bad enum, and both outs live for the call
+    unsafe { libc::pthread_get_qos_class_np(libc::pthread_self(), (&raw mut class).cast(), &mut relative) };
+    let class = if class == libc::qos_class_t::QOS_CLASS_UTILITY as u32 { PriorityClass::Utility } else { PriorityClass::Unknown };
+    WorkerPriority { class, nice: relative }
+}
+
+/// Leave the thread as it is where no lower class is known
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn lower_priority() -> WorkerPriority {
+    WorkerPriority::default()
 }

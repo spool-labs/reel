@@ -15,7 +15,7 @@ pub const ASSERTIONS_VARIABLE: &str = "CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS";
 /// Keeps overflow checks in the optimized build a sweep runs
 pub const OVERFLOW_VARIABLE: &str = "CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS";
 /// Cargo arguments for a sweep, which keeps going after a failure
-pub const SWEEP_ARGUMENTS: [&str; 8] = [
+pub const SWEEP_ARGUMENTS: [&str; 10] = [
     "test",
     "--package",
     "reel",
@@ -24,6 +24,8 @@ pub const SWEEP_ARGUMENTS: [&str; 8] = [
     "--locked",
     "--release",
     "--no-fail-fast",
+    "--features",
+    "test-hooks",
 ];
 
 /// A count of seeds

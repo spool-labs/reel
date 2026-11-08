@@ -40,3 +40,7 @@ path = "tests/ring/main.rs"
 [[test]]
 name = "cut"
 path = "tests/cut/main.rs"
+
+[features]
+# lets the sims and the bench set a volume's worker count, which a node's build never reaches
+test-hooks = []

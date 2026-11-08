@@ -14,9 +14,16 @@ pub const FORMAT_ROW_FLOOR: u64 = (SMALL_HEAD_BYTES + SMALLEST_ROW_BYTES) as u64
 
 /// The memory budget when the caller doesn't set one
 pub const DEFAULT_MEMORY_BUDGET: ByteCount = ByteCount(512 * 1024 * 1024);
-/// Maintenance workers a volume runs by default, fewer where the budget can't hold them. On the 4-core box four cost 13% of one
-/// writer's rate while writing, and drained the walk backlog inside the idle time where none and one did not
-pub const DEFAULT_MAINTENANCE_WORKERS: usize = 4;
+/// The most walk slots and rewrite seats a volume has, which the 64-bit mask of slots carved from a walk target holds
+pub const MOST_VOLUME_SLOTS: usize = 64;
+/// The most maintenance workers a store runs, past any host's online CPUs
+pub const MOST_WORKERS: usize = 1_024;
+
+/// Count the maintenance workers a store runs when no test sets the count: one an online CPU, which every volume shares
+pub fn default_workers() -> usize {
+    let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    cpus.clamp(1, MOST_WORKERS)
+}
 /// Async read threads a store runs by default
 pub const DEFAULT_READ_THREADS: usize = 4;
 /// The longest key a column can declare
@@ -81,14 +88,16 @@ pub struct VolumeConfig {
 /// open, and a count the budget can't hold is refused there. One seal thread a volume runs whatever these say
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ThreadCounts {
-    /// Workers a volume's planner hands jobs to, beside the planner itself. Nothing takes the default, or as many of it as
-    /// the budget holds, and a count set here that the budget can't hold is refused
+    /// Workers the store runs for every volume, a hook only the sims and the bench reach through the test-hooks feature, refused
+    /// when the budget can't hold it. A store's count is otherwise one an online CPU, as many as the budget holds
+    #[cfg(feature = "test-hooks")]
     pub maintenance_workers: Option<usize>,
     /// Threads that serve the async read forms
     pub read_threads: usize,
 }
 
 /// A planner alone on each volume, with no workers beside it
+#[cfg(feature = "test-hooks")]
 pub const NO_WORKERS: ThreadCounts = ThreadCounts {
     maintenance_workers: Some(0),
     read_threads: DEFAULT_READ_THREADS,
@@ -97,9 +106,20 @@ pub const NO_WORKERS: ThreadCounts = ThreadCounts {
 impl Default for ThreadCounts {
     fn default() -> Self {
         Self {
+            #[cfg(feature = "test-hooks")]
             maintenance_workers: None,
             read_threads: DEFAULT_READ_THREADS,
         }
+    }
+}
+
+impl ThreadCounts {
+    /// Read the worker count a test set, or nothing for a store that counts its CPUs
+    pub fn set_workers(&self) -> Option<usize> {
+        #[cfg(feature = "test-hooks")]
+        return self.maintenance_workers;
+        #[cfg(not(feature = "test-hooks"))]
+        None
     }
 }
 

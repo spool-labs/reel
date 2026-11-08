@@ -92,12 +92,11 @@ impl Admission {
         Decision::Wait
     }
 
-    /// Count a region taken
-    pub fn take(&self, role: JobRole, need: ByteCount, mapped: ByteCount, is_floor: bool) {
+    /// Count a region admitted at its need, which its job maps on its own thread
+    pub fn take(&self, role: JobRole, need: ByteCount, is_floor: bool) {
         self.regions.fetch_add(1, Ordering::AcqRel);
-        let held = self.held.fetch_add(mapped.0, Ordering::AcqRel) + mapped.0;
+        let held = self.held.fetch_add(need.0, Ordering::AcqRel) + need.0;
         self.peak.fetch_max(held, Ordering::Relaxed);
-        self.mapped_total.fetch_add(mapped.0, Ordering::Relaxed);
         self.admits.fetch_add(1, Ordering::Relaxed);
         if is_floor {
             self.floor_admits.fetch_add(1, Ordering::Relaxed);
@@ -126,12 +125,21 @@ impl Admission {
         }
     }
 
-    /// Count a region given back, with the bytes its lists wrote
-    pub fn give_back(&self, role: JobRole, mapped: ByteCount, touched: ByteCount) {
+    /// Count a region given back at the need it was admitted with, and the bytes its lists wrote
+    pub fn give_back(&self, role: JobRole, need: ByteCount, touched: ByteCount) {
         self.regions.fetch_sub(1, Ordering::AcqRel);
-        self.held.fetch_sub(mapped.0, Ordering::AcqRel);
+        self.held.fetch_sub(need.0, Ordering::AcqRel);
         self.roles[role.index()].touched_peak.fetch_max(touched.0, Ordering::Relaxed);
     }
+}
+
+/// A need admission let in, which its job maps on its own thread and gives back at its end
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Admit {
+    /// The job's role
+    pub role: JobRole,
+    /// The bytes admitted
+    pub need: ByteCount,
 }
 
 /// What admission says to a need
@@ -183,7 +191,7 @@ mod tests {
         assert_eq!(room_for(&limited, ByteCount(4 * GIB)), ByteCount(0));
         let admission = Admission::default();
         assert_eq!(admission.decide(ByteCount(10), ByteCount(0)), Decision::Floor);
-        admission.take(JobRole::Rewrite, ByteCount(10), ByteCount(4_096), true);
+        admission.take(JobRole::Rewrite, ByteCount(4_096), true);
         assert_eq!(admission.decide(ByteCount(10), ByteCount(0)), Decision::Wait);
         admission.give_back(JobRole::Rewrite, ByteCount(4_096), ByteCount(8));
         assert_eq!(admission.held.load(Ordering::Relaxed), 0);

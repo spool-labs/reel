@@ -163,7 +163,7 @@ fn check_default_cell() -> u32 {
 
 // the seal jobs and the walks hold their buffers at or under the lines the budget plans for them
 fn check_job_plans(report: &MemoryReport, volumes: u64) -> u32 {
-    let workers = volumes * report.maintenance_workers as u64;
+    let workers = report.maintenance_workers as u64;
     let footer_plan = volumes * (SEAL_JOB_BYTES + WALK_JOB_BYTES) + workers * WALK_JOB_BYTES;
     println!("jobs: {:?} footer space against {footer_plan} B planned, {:?} compaction", report.footer_space, report.compaction);
     if report.footer_space.0 > footer_plan {

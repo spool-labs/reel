@@ -10,7 +10,7 @@ use std::iter;
 use std::io::{Error, ErrorKind, IoSlice, Result};
 use std::mem;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use reel_api::column_id::ColumnId;
 use reel_api::maintenance_report::{JobKind, PickOutcome, SPAN_RUN_BUCKETS, UnitKind};
@@ -31,7 +31,7 @@ use crate::lifetime::MarkRange;
 use crate::io::{Io, IoFile};
 use crate::fixed_list::{FixedList, ListFull};
 use crate::region::{REGION_HEAD_BYTES, Region, list_bytes};
-use crate::engine::admission::{JobRole, PICK_HALVINGS};
+use crate::engine::admission::{Admit, JobRole, PICK_HALVINGS};
 use crate::row_kind::RowKind;
 use crate::segment::damage_list::DamagedRange;
 use crate::segment::column_directory::Listing;
@@ -338,6 +338,12 @@ pub struct RewriteJob<Backend: Io> {
     staged_columns: FixedList<StagedColumn>,
     staged_keys: FixedList<u8>,
     pub forced: Option<SegmentNumber>,
+    /// A need admission let in for a pick, with its bound, which the job maps and carves at its first step
+    admitted: Option<(Admit, RewriteBound)>,
+    /// A claimed pick waiting for its first step: its target, and whether it decides its graves first
+    claimed: Option<(MergeTarget, bool)>,
+    /// The need the region in hand was admitted with, which goes back at the job's end
+    region_need: ByteCount,
     /// The forced segment a pick took, which goes back when admission turns the pick away
     forced_pick: Option<SegmentNumber>,
     /// The mapping this run's lists are carved from, held from an admitted start to the install or the abandon
@@ -449,6 +455,9 @@ impl<Backend: Io> RewriteJob<Backend> {
             staged_columns: FixedList::empty(),
             staged_keys: FixedList::empty(),
             forced: None,
+            admitted: None,
+            claimed: None,
+            region_need: ByteCount(0),
             forced_pick: None,
             region: None,
             most_grave_blocks: MOST_GRAVE_BLOCKS,
@@ -584,9 +593,8 @@ impl<Backend: Io> RewriteJob<Backend> {
         for stage in &mut self.stages {
             touched += mem::take(stage).peak_bytes();
         }
-        let mapped = region.mapped_bytes();
         drop(region);
-        self.state.give_back(JobRole::Rewrite, mapped, ByteCount(touched as u64));
+        self.state.give_back(JobRole::Rewrite, self.region_need, ByteCount(touched as u64));
     }
 
     /// Pick, and halve the inputs while the need is past what admission gives, up to a few times before the lane waits
@@ -596,23 +604,19 @@ impl<Backend: Io> RewriteJob<Backend> {
             let picked = self.pick_within(volume, most)?;
             let mut bound = self.bound(volume);
             // offset order first, and the same pick in key order when its lists don't fit, which the floor alone admits
-            let mut region = None;
+            let mut admit = None;
             if bound.is_ordered {
-                region = self.state.admit(JobRole::Rewrite, bound.region_bytes(), false);
+                admit = self.state.decide_admit(JobRole::Rewrite, bound.region_bytes(), false);
             }
-            if region.is_none() {
+            if admit.is_none() {
                 bound.is_ordered = false;
-                region = self.state.admit(JobRole::Rewrite, bound.region_bytes(), true);
+                admit = self.state.decide_admit(JobRole::Rewrite, bound.region_bytes(), true);
             }
-            if let Some(region) = region {
-                if self.attach(region, &bound).is_ok() {
-                    self.forced_pick = None;
-                    return Some(picked);
-                }
-                // the bound came out short of its own carving, a bug the full count shows
-                self.release_region();
-                self.unpick(volume);
-                return None;
+            if let Some(admit) = admit {
+                // the job maps and carves on its own thread, at its first step
+                self.admitted = Some((admit, bound));
+                self.forced_pick = None;
+                return Some(picked);
             }
             self.unpick(volume);
             if self.input_count < 2 {
@@ -662,6 +666,12 @@ impl<Backend: Io> RewriteJob<Backend> {
     /// of walked segments needs no walk target in progress, since it would count rows this merge has decided on, and the walks
     /// wait from here to the install. A grave-heavy segment is decided first, and copies nothing if no row would drop
     pub fn start(&mut self) -> bool {
+        self.claim() && self.begin()
+    }
+
+    /// Pick, take admission's word on the pick's need and claim the inputs, so no other lane picks them. The job maps its region
+    /// and opens its output at its first step, on whichever thread steps it, which keeps a populate off the planner
+    pub fn claim(&mut self) -> bool {
         let state = Arc::clone(&self.state);
         let volume = &state.volumes[self.volume];
         let Some((target, is_grave_heavy)) = self.pick_admitted(volume) else {
@@ -672,6 +682,33 @@ impl<Backend: Io> RewriteJob<Backend> {
         let mut inputs = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
         inputs[..self.input_count].copy_from_slice(&self.numbers[..self.input_count]);
         *hold(&volume.lanes[self.lane].inputs) = inputs;
+        self.claimed = Some((target, is_grave_heavy));
+        true
+    }
+
+    /// Check a claimed pick waits for its first step to map its region
+    pub fn is_claimed(&self) -> bool {
+        self.claimed.is_some()
+    }
+
+    /// Map the claimed pick's region, carve its lists and set the job going, or give the merge up and say so
+    pub fn begin(&mut self) -> bool {
+        let state = Arc::clone(&self.state);
+        let volume = &state.volumes[self.volume];
+        let (Some((target, is_grave_heavy)), Some((admit, bound))) = (self.claimed.take(), self.admitted.take()) else {
+            return false;
+        };
+        let Some(region) = self.state.map_admitted(&admit) else {
+            self.abandon();
+            return false;
+        };
+        self.region_need = admit.need;
+        if self.attach(region, &bound).is_err() {
+            // the bound came out short of its own carving, a bug the full count shows
+            self.abandon();
+            return false;
+        }
+        self.clear(target);
         // the inputs copy in offset order when their lists fit, and a deciding pass says which rows go across and to which output
         let rows: u64 = self.inputs[..self.input_count].iter().map(|input| input.block_rows).sum();
         self.is_ordered = self.is_ordered_bound && rows as usize <= self.placed.len();
@@ -940,6 +977,15 @@ impl<Backend: Io> RewriteJob<Backend> {
 
     /// Run one bounded step, and give the merge up on any failure, which leaves the inputs as they were
     pub fn step(&mut self) {
+        // a claimed pick maps and carves here, on the thread that runs it, as a unit of its own
+        if self.claimed.is_some() {
+            let started = self.state.io.now();
+            let need = self.admitted.map_or(0, |(admit, _bound)| admit.need.0);
+            if self.begin() {
+                self.state.note_unit(UnitKind::Start, need, started);
+            }
+            return;
+        }
         let Some(target) = self.target else {
             return;
         };
@@ -1317,7 +1363,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             };
             let (lowest, highest) = (&mut self.edge_lowest, &mut self.edge_highest);
             let base = pin.head.place_base;
-            let is_read = self.state.footer_readers.with(|reader| reader.edge_keys(&pin.file, &lines, base, lowest, highest))?;
+            let is_read = self.state.job_footer_readers.with(|reader| reader.edge_keys(&pin.file, &lines, base, lowest, highest))?;
             if !is_read {
                 return Err(Error::from(ErrorKind::InvalidData));
             }
@@ -2068,6 +2114,11 @@ impl<Backend: Io> RewriteJob<Backend> {
 
     /// Give the merge up: the inputs stay, and the outputs go whatever name they have reached
     pub fn abandon(&mut self) {
+        // a claimed pick that never began gives its admission back with nothing written
+        self.claimed = None;
+        if let Some((admit, _bound)) = self.admitted.take() {
+            self.state.give_back(admit.role, admit.need, ByteCount(0));
+        }
         let state = Arc::clone(&self.state);
         let volume = &state.volumes[self.volume];
         let slots = mem::take(&mut *hold(&volume.lanes[self.lane].partial_outputs));
@@ -2346,12 +2397,13 @@ pub fn lowest_inside<'row>(row: &SummaryRow<'row>, column: ColumnId, lowest: &[u
 pub struct RewriteSeat<Backend: Io> {
     pub job: Mutex<Option<RewriteJob<Backend>>>,
     pub heap: AtomicU64,
+    pub is_waiting: AtomicBool,
 }
 
 impl<Backend: Io> RewriteSeat<Backend> {
     /// Seat an idle rewrite for a lane
     pub fn new(state: Arc<EngineState<Backend>>, volume: usize, lane: usize) -> Self {
-        Self { job: Mutex::new(Some(RewriteJob::new(state, volume, lane))), heap: AtomicU64::new(0) }
+        Self { job: Mutex::new(Some(RewriteJob::new(state, volume, lane))), heap: AtomicU64::new(0), is_waiting: AtomicBool::new(false) }
     }
 
     /// Read the heap of the seat's job, wherever it is

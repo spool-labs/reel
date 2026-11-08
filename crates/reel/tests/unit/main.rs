@@ -28,4 +28,5 @@ mod segment_tail;
 mod summary;
 mod superblock;
 mod varint;
+mod workers;
 mod write_order;

@@ -41,7 +41,7 @@ impl JobKind {
 }
 
 /// Every kind of maintenance unit, in the order a report lists them
-pub const UNIT_KINDS: [UnitKind; 15] = [
+pub const UNIT_KINDS: [UnitKind; 16] = [
     UnitKind::WalkBlock,
     UnitKind::MergeRows,
     UnitKind::StripeCopy,
@@ -57,6 +57,7 @@ pub const UNIT_KINDS: [UnitKind; 15] = [
     UnitKind::Pick,
     UnitKind::SummaryCopy,
     UnitKind::SummarySave,
+    UnitKind::Start,
 ];
 
 /// A kind of maintenance unit. A job runs as units, and each kind's work is counted in what its line says
@@ -92,6 +93,8 @@ pub enum UnitKind {
     SummaryCopy,
     /// Saving the whole summary, the copy and the write, in bytes
     SummarySave,
+    /// A rewrite mapping its region, its pages faulted in, and opening its output, on the thread that runs it, in bytes mapped
+    Start,
 }
 
 impl UnitKind {
@@ -282,6 +285,29 @@ pub struct MaintenanceMemory {
     pub walk_fixed: ByteCount,
 }
 
+/// The scheduling class a maintenance worker's thread runs in, as the thread read it back
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PriorityClass {
+    /// The platform gave no reading, or the backend sets no class
+    #[default]
+    Unknown,
+    /// The normal class, the one callers run in
+    Normal,
+    /// Linux's batch class, which a waking caller preempts
+    Batch,
+    /// macOS's utility QoS, below a caller's default class and above background
+    Utility,
+}
+
+/// The class and nice value a maintenance worker runs at
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WorkerPriority {
+    /// The scheduling class
+    pub class: PriorityClass,
+    /// The nice value, 19 the lowest normal one
+    pub nice: i32,
+}
+
 /// Buckets the offset-order copy's run lengths fall in, a power of two each, the last holding every longer run
 pub const SPAN_RUN_BUCKETS: usize = 16;
 
@@ -337,6 +363,12 @@ pub struct MaintenanceReport {
     pub longest_units: [UnitReading; UNIT_KINDS.len()],
     /// The maintenance jobs' regions and their admission
     pub memory: MaintenanceMemory,
+    /// Maintenance workers the store runs, one an online CPU across its volumes
+    pub workers: u64,
+    /// Workers holding a walk block or a rewrite now
+    pub active_workers: u64,
+    /// The priority the workers run at
+    pub worker_priority: WorkerPriority,
 }
 
 impl JobReport {
@@ -386,6 +418,9 @@ impl MaintenanceReport {
             has_ring: false,
             longest_units: [UnitReading::default(); UNIT_KINDS.len()],
             memory: MaintenanceMemory::default(),
+            workers: 0,
+            active_workers: 0,
+            worker_priority: WorkerPriority::default(),
         }
     }
 }

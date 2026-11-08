@@ -303,6 +303,12 @@ impl SimulatedIo {
         }
     }
 
+    /// Count the jobs of a name that can run now
+    pub fn runnable_jobs(&self, name: &str) -> usize {
+        let now = self.clock_reading();
+        hold(&self.slots).iter().filter(|slot| slot.name == name && slot.is_runnable(now)).count()
+    }
+
     /// Count the jobs that have not ended
     pub fn live_jobs(&self) -> JobCount {
         let mut live = 0;

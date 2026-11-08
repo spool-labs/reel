@@ -12,7 +12,8 @@ use reel_api::memory_report::MemoryReport;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, SegmentCount, WritePlace};
 
-use crate::engine::admission::{Admission, Decision, JobRole, reserve_for, room_for};
+use crate::engine::admission::{Admission, Admit, Decision, JobRole, reserve_for, room_for};
+use reel_api::maintenance_report::WorkerPriority;
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::cue::{CueTable, JobCounts};
 use crate::engine::engine_sizing::EngineSizing;
@@ -22,6 +23,7 @@ use crate::engine::compact_job::park;
 use crate::engine::open_segment::{data_path, output_path, rows_path};
 use crate::engine::read_pool::ReadPool;
 use crate::engine::walk_job::{FREE_BLOCK_BYTES, FreeRecord};
+use crate::engine::workers::Workers;
 use crate::engine::volume::{ParkedSegment, RewriteOutput, Volume};
 use crate::segment::range_covers::Cover;
 use crate::guard::hold;
@@ -103,6 +105,7 @@ pub struct EngineState<Backend: Io> {
     pub prefault_time: AtomicU64,
     pub record_readers: Pool<RecordReader>,
     pub footer_readers: Pool<FooterReader>,
+    pub job_footer_readers: Pool<FooterReader>,
     pub scan_heap: ByteCount,
     pub superblock: Mutex<Superblock>,
     pub superblock_bytes: Mutex<Vec<u8>>,
@@ -127,6 +130,8 @@ pub struct EngineState<Backend: Io> {
     pub memory_budget: ByteCount,
     pub seal_heap: AtomicU64,
     pub walk_heap: AtomicU64,
+    pub worker_priority: Mutex<WorkerPriority>,
+    pub workers: Workers<Backend::Task>,
     pub compaction_heap: AtomicU64,
     pub admission: Admission,
     pub job_count: AtomicU64,
@@ -517,30 +522,44 @@ impl<Backend: Io> EngineState<Backend> {
     /// Map a maintenance job's region when its need fits the host's free memory past the reserve, or when no region is held,
     /// and count a wait when it doesn't
     pub fn admit(&self, role: JobRole, need: ByteCount, may_floor: bool) -> Option<Region> {
+        let admit = self.decide_admit(role, need, may_floor)?;
+        self.map_admitted(&admit)
+    }
+
+    /// Decide a job's need against the host's free memory past the reserve, or let it in when no region is held, and count
+    /// it held with no mapping yet, so the job maps on its own thread. A refused start counts a wait
+    pub fn decide_admit(&self, role: JobRole, need: ByteCount, may_floor: bool) -> Option<Admit> {
         let memory = self.io.host_memory();
         let footers = ByteCount(self.volumes.iter().map(|volume| hold(&volume.summary).footer_bytes().0).sum());
         let reserve = reserve_for(memory.reserve_total(), footers);
         self.admission.note_reading(memory.free(), reserve);
         let decision = self.admission.decide(need, room_for(&memory, reserve));
         // a need the floor may not take waits, and only a start with no smaller need to try counts the wait
-        let region = match decision {
-            Decision::Admit => Region::map(need).ok(),
-            Decision::Floor if may_floor => Region::map(need).ok(),
-            Decision::Floor | Decision::Wait => None,
-        };
-        let Some(region) = region else {
+        let is_admitted = matches!(decision, Decision::Admit) || (decision == Decision::Floor && may_floor);
+        if !is_admitted {
             if may_floor {
                 self.admission.waits.fetch_add(1, Ordering::Relaxed);
             }
             return None;
+        }
+        self.admission.take(role, need, decision == Decision::Floor);
+        Some(Admit { role, need })
+    }
+
+    /// Map an admitted need, its pages faulted in here, or give the admission back and count a wait when the map fails
+    pub fn map_admitted(&self, admit: &Admit) -> Option<Region> {
+        let Ok(region) = Region::map(admit.need) else {
+            self.admission.give_back(admit.role, admit.need, ByteCount(0));
+            self.admission.waits.fetch_add(1, Ordering::Relaxed);
+            return None;
         };
-        self.admission.take(role, need, region.mapped_bytes(), decision == Decision::Floor);
+        self.admission.mapped_total.fetch_add(region.mapped_bytes().0, Ordering::Relaxed);
         Some(region)
     }
 
-    /// Note a job gave its region back, with the bytes its lists wrote
-    pub fn give_back(&self, role: JobRole, mapped: ByteCount, touched: ByteCount) {
-        self.admission.give_back(role, mapped, touched);
+    /// Note a job gave its region back at the need it was admitted with, and the bytes its lists wrote
+    pub fn give_back(&self, role: JobRole, need: ByteCount, touched: ByteCount) {
+        self.admission.give_back(role, need, touched);
     }
 
     /// Bring the planner back to every volume's compaction
@@ -589,7 +608,7 @@ impl<Backend: Io> EngineState<Backend> {
             compaction: ByteCount(self.compaction_heap.load(Ordering::Acquire)),
             thread_stacks: ByteCount(self.job_count.load(Ordering::Acquire) * self.io.job_stack_bytes().0),
             open_slots: self.queues.len(),
-            maintenance_workers: self.sizing.walk_workers,
+            maintenance_workers: self.sizing.workers,
             least_budget: self.sizing.least_budget,
             room: self.sizing.room,
             open_time: Nanoseconds(self.open_time.load(Ordering::Acquire)),
@@ -614,7 +633,7 @@ impl<Backend: Io> EngineState<Backend> {
         }
         let readers = self.record_readers.heap_bytes(RecordReader::heap_bytes);
         let footers = self.footer_readers.heap_bytes(FooterReader::heap_bytes);
-        report.read_buffers = ByteCount(readers.0 + footers.0);
+        report.read_buffers = ByteCount(readers.0 + footers.0 + self.job_footer_readers.heap_bytes(FooterReader::heap_bytes).0);
         report.scans = self.scan_heap;
         // the tables and their block lines come on top of the budget
         report.budget = ByteCount(report.budget.0 + report.complete_tables.0 + self.complete_line_bytes.0);

@@ -198,7 +198,7 @@ impl<Backend: Io> CoverApply<Backend> {
         let lines = [low.entry, high.entry];
         let (lowest, highest) = (&mut self.lowest, &mut self.highest);
         let base = pin.head.place_base;
-        let is_read = self.state.footer_readers.with(|reader| reader.edge_keys(&pin.file, &lines, base, lowest, highest))?;
+        let is_read = self.state.job_footer_readers.with(|reader| reader.edge_keys(&pin.file, &lines, base, lowest, highest))?;
         Ok(is_read && self.lowest >= self.start && self.highest < self.end)
     }
 
@@ -268,7 +268,7 @@ impl<Backend: Io> CoverApply<Backend> {
             return Ok(walked);
         };
         let read = state.key_read(column, &self.key, WritePlace(u64::MAX), true)?;
-        let own = state.footer_readers.with(|reader| {
+        let own = state.job_footer_readers.with(|reader| {
             let mut best = None;
             if let Some(pin) = volume.table.pin(segment) {
                 in_place(state.ask_rows(ReadOn::new(&InPlace, volume), &read, segment, &pin, reader, &mut best))?;

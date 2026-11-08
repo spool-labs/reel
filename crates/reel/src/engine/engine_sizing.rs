@@ -2,7 +2,7 @@
 
 use reel_api::units::{ByteCount, RowCount};
 
-use crate::config::{DEFAULT_MAINTENANCE_WORKERS, ThreadCounts};
+use crate::config::{MOST_VOLUME_SLOTS, ThreadCounts, default_workers};
 use crate::engine::open_segment::RECORD_WINDOW_BYTES;
 use crate::engine::read_pool::{READ_SLOTS, SLOT_KEY_BYTES, SLOT_KEYS};
 use crate::engine::seal_job::MOST_SEGMENT_BLOCKS;
@@ -18,9 +18,11 @@ use crate::record::codec::CHUNK_BYTES;
 use crate::record::record_head::SMALL_HEAD_BYTES;
 use crate::segment::damage_list::{MOST_DAMAGED_SPANS, SPAN_KEY_BYTES};
 use crate::segment::range_covers::{COVER_RECORD_BYTES, COVER_SLOT_BYTES, MOST_RANGE_COVERS};
-use crate::segment::row_block::{BLOCK_TRAILER_BYTES, COMPLETE_BLOCK_BYTES, ROW_ROOM_NUMBERS};
+use crate::segment::column_directory::Candidate;
+use crate::segment::footer_reader::CANDIDATE_PAGE;
+use crate::segment::row_block::{BLOCK_TRAILER_BYTES, COMPLETE_BLOCK_BYTES, ROW_BLOCK_BYTES, ROW_ROOM_NUMBERS};
 use crate::segment::segment_table::TABLE_SHARDS;
-use crate::segment::segment_tail::MOST_SEGMENT_BYTES;
+use crate::segment::segment_tail::{MAX_TAIL_BYTES, MOST_SEGMENT_BYTES};
 
 /// A segment's target size on a store with a full budget, and a smaller budget targets half of itself
 pub const SEGMENT_TARGET: ByteCount = ByteCount(1024 * 1024 * 1024);
@@ -64,6 +66,9 @@ pub const ROUNDING_ROOM: u64 = 1024 * 1024;
 pub const JOB_ROOM_BYTES: u64 = 128 * 1024;
 /// Bytes a read buffer pair is planned at: a record reader and a footer reader
 pub const READ_BUFFER_BYTES: u64 = 512 * 1024;
+/// Bytes a maintenance thread's footer reader is planned at: a tail, a block, a filter, a key of a block's length and a page of
+/// candidates
+pub const JOB_READER_BYTES: u64 = (MAX_TAIL_BYTES + 4 * ROW_BLOCK_BYTES + CANDIDATE_PAGE * size_of::<Candidate>()) as u64;
 /// Bytes a record encoder is planned at, with no share of the compress pool
 pub const ENCODER_BYTES: u64 = 256 * 1024;
 /// Bytes a seal job's own buffers are planned at
@@ -82,8 +87,8 @@ pub const SHARED_JOBS: u64 = 3;
 /// Bytes a row of the write index really takes, node, page and table share included, with a long batch's length of it
 pub const PLANNED_ROW_BYTES: u64 = 227;
 /// A volume seals at this share of what the index holds, in eighths, to keep room for writers in flight. With one
-/// lz4 column and 64 B keys that gives these rows a segment: 31,653 at 128 MiB, 137,236 at 192 MiB, 665,154 at 512 MiB and
-/// 6,577,830 at 4 GiB. A segment seals at its byte target or at this limit, whichever comes first, so small
+/// lz4 column and 64 B keys that gives these rows a segment: 31,190 at 128 MiB, 136,774 at 192 MiB, 664,691 at 512 MiB and
+/// 6,577,366 at 4 GiB. A segment seals at its byte target or at this limit, whichever comes first, so small
 /// records seal smaller and reach their size through merges, whose outputs the write index doesn't bound
 /// A volume holds its open segment and one spare at full size even when its sealed data is small: the reserve is twice the
 /// segment size, 128 MiB at a 128 MiB budget, 192 MiB at 192 MiB, and 2 GiB from the default 512 MiB up. The space gate adds
@@ -135,6 +140,7 @@ pub struct StoreShape {
     pub has_ring: bool,
     pub disk_entry_bytes: ByteCount,
     pub floor_entry_bytes: ByteCount,
+    pub workers: Option<usize>,
 }
 
 /// What a budget buys
@@ -148,29 +154,32 @@ pub struct EngineSizing {
     pub summary_share: ByteCount,
     pub table_share: ByteCount,
     pub lz4_stored_limit: ByteCount,
-    pub walk_workers: usize,
+    pub workers: usize,
+    pub walk_slots: usize,
     pub least_budget: ByteCount,
     pub room: ByteCount,
     pub entry_line: ByteCount,
 }
 
 impl StoreShape {
-    /// Count the walk workers each volume gets
-    pub fn walk_workers(&self) -> usize {
-        self.threads.maintenance_workers.unwrap_or(DEFAULT_MAINTENANCE_WORKERS)
+    /// Count the maintenance workers the store runs, which its volumes share
+    pub fn workers(&self) -> usize {
+        self.workers.or_else(|| self.threads.set_workers()).unwrap_or_else(default_workers)
     }
 
-    /// Build the shape with the workers settled: the count set, or the most of the default the budget holds
+    /// Count the walk slots each volume has, and the rewrite seats beside its planner's lane
+    pub fn walk_slots(&self) -> usize {
+        self.workers().min(MOST_VOLUME_SLOTS)
+    }
+
+    /// Build the shape with the workers settled: the count a test set, or the most of one an online CPU the budget holds
     pub fn with_workers_settled(self) -> Self {
-        if self.threads.maintenance_workers.is_some() {
+        if self.workers.is_some() || self.threads.set_workers().is_some() {
             return self;
         }
-        let with_workers = |workers: usize| {
-            let threads = ThreadCounts { maintenance_workers: Some(workers), ..self.threads };
-            Self { threads, ..self }
-        };
+        let with_workers = |workers: usize| Self { workers: Some(workers), ..self };
         let fits = |workers: &usize| with_workers(*workers).least_budget() <= self.budget;
-        with_workers((0..=DEFAULT_MAINTENANCE_WORKERS).rev().find(fits).unwrap_or(0))
+        with_workers((0..=default_workers()).rev().find(fits).unwrap_or(0))
     }
 
     /// Count the open slots the roots and the lifetime groups can use
@@ -186,25 +195,28 @@ impl StoreShape {
         let windows = self.open_slots() as u64 * 3 * RECORD_WINDOW_BYTES as u64;
         let ring = if self.has_ring { (RING_SLOTS * RING_SLOT_BYTES) as u64 + RING_READS as u64 * RING_READ_BYTES } else { 0 };
         let reads = READ_BUFFERS as u64 * READ_BUFFER_BYTES + ring;
+        // each planner and each worker holds one footer reader of the job pool at a time, so none waits on a caller's
+        let workers = self.workers() as u64;
+        let job_reads = (volumes + workers) * JOB_READER_BYTES;
         let scans = MOST_SCANS as u64 * planned_scan_bytes(self.widest_keys, self.open_slots());
         let read_slots = READ_SLOTS as u64 * (SLOT_KEY_BYTES + SLOT_KEYS * size_of::<usize>()) as u64;
         let large = if self.has_lz4 { LZ4_STORED_LIMIT.0 } else { 0 };
         let encoders = WRITE_BUFFERS as u64 * ENCODER_BYTES + large;
         let spans = 4 * MOST_DAMAGED_SPANS as u64 * (SPAN_KEY_BYTES as u64 * 2);
-        let workers = volumes * self.walk_workers() as u64;
+        let seats = volumes * self.walk_slots() as u64;
         let stacks = self.job_count() * JOB_STACK_PLAN_BYTES;
         // the pool holds both keys of every cover, and a seal job has room to write them all to a footer
         let cover_keys = 2 * MOST_RANGE_COVERS as u64 * self.widest_keys;
         let cover_fixed = (COVER_SLOT_BYTES + COVER_RECORD_BYTES) as u64 * MOST_RANGE_COVERS as u64;
         let covers = 2 * cover_keys + volumes * cover_fixed;
         let jobs = SEAL_JOB_BYTES + WALK_JOB_BYTES + COMPACT_JOB_BYTES;
-        let worker_jobs = workers * LANE_JOB_BYTES;
-        ByteCount(queues + gathers + windows + reads + scans + read_slots + encoders + covers + volumes * (jobs + spans) + worker_jobs + workers * WALK_JOB_BYTES + stacks)
+        let worker_jobs = seats * LANE_JOB_BYTES;
+        ByteCount(queues + gathers + windows + reads + job_reads + scans + read_slots + encoders + covers + volumes * (jobs + spans) + worker_jobs + workers * WALK_JOB_BYTES + stacks)
     }
 
     /// Count the jobs a store runs: the shared ones, its read threads, a seal job a volume and the workers
     pub fn job_count(&self) -> u64 {
-        self.foreground_jobs() + self.volumes as u64 * self.walk_workers() as u64
+        self.foreground_jobs() + self.workers() as u64
     }
 
     /// Count the jobs that serve calls: the shared ones, the read threads and a seal job a volume
@@ -260,7 +272,8 @@ impl EngineSizing {
             summary_share: ByteCount(share_of(shared, SUMMARY_DIVISOR)),
             table_share: ByteCount(share_of(shared, TABLE_DIVISOR)),
             lz4_stored_limit: LZ4_STORED_LIMIT,
-            walk_workers: shape.walk_workers(),
+            workers: shape.workers(),
+            walk_slots: shape.walk_slots(),
             least_budget: shape.least_budget(),
             room: shape.room(),
             entry_line: shape.entry_line(),

@@ -218,7 +218,7 @@ pub struct Volume<Backend: Io> {
     pub walk_blocks: AtomicU64,
     /// The segment a seal is working on, or `NO_SEAL`. Its rows can still answer through its open slot, so no walk starts on it
     pub sealing: AtomicU64,
-    pub walk_slots: Vec<WalkSlot<Backend::Task>>,
+    pub walk_slots: Vec<WalkSlot>,
     /// Every root's filesystem can give a file's blocks back in place
     pub can_free_blocks: bool,
     pub bytes_freed: AtomicU64,

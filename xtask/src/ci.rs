@@ -18,9 +18,11 @@ pub const COMMENT_PREFIX: char = '#';
 /// Byte that ends a line of output
 pub const LINE_END: u8 = b'\n';
 /// Cargo arguments for the lint pass
-pub const CLIPPY_ARGUMENTS: [&str; 7] = ["clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings"];
+pub const CLIPPY_ARGUMENTS: [&str; 9] = ["clippy", "--workspace", "--all-targets", "--locked", "--features", TEST_HOOKS, "--", "-D", "warnings"];
 /// Cargo arguments for the test pass, which keeps going after a failure
-pub const TEST_ARGUMENTS: [&str; 4] = ["test", "--workspace", "--locked", "--no-fail-fast"];
+pub const TEST_ARGUMENTS: [&str; 6] = ["test", "--workspace", "--locked", "--no-fail-fast", "--features", TEST_HOOKS];
+/// The feature that lets the sims set a volume's worker count, which no node build turns on
+pub const TEST_HOOKS: &str = "reel/test-hooks";
 
 /// What one cargo run printed and how it ended
 #[derive(Debug, Default)]

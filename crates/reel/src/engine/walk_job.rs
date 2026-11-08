@@ -10,7 +10,7 @@
 use std::io::{Error, ErrorKind, Result};
 use std::mem;
 use std::sync::atomic::AtomicU8;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
@@ -23,6 +23,7 @@ use crate::engine::cover_apply::{ApplyStep, CoverApply};
 use crate::engine::engine_state::EngineState;
 use crate::engine::planner::UnitStep;
 use crate::engine::rewrite_job::{RewriteJob, RewriteSeat};
+use crate::engine::workers::Workers;
 use crate::engine::volume::{NO_SEAL, Volume};
 use crate::guard::hold;
 use crate::io::device_error::is_device_error;
@@ -50,14 +51,16 @@ pub const MOST_BLOCK_FREES: usize = 64;
 /// How far back a count looks for an entry to add to
 pub const COUNT_SEARCH: usize = 32;
 
-/// A worker's slot has no block
+/// A walk slot has no block
 pub const SLOT_FREE: u8 = 0;
-/// A worker's slot has a block to count
+/// A walk slot has a block for any worker to count
 pub const SLOT_ASSIGNED: u8 = 1;
-/// A worker's slot holds a block's counts, waiting for the planner to land them in block order
+/// A walk slot holds a block's counts, waiting for the planner to land them in block order
 pub const SLOT_COUNTED: u8 = 2;
-/// A worker's slot holds a block it couldn't count
+/// A walk slot holds a block its worker couldn't count
 pub const SLOT_FAILED: u8 = 3;
+/// A worker has taken a walk slot's block and is counting it
+pub const SLOT_COUNTING: u8 = 4;
 
 /// The segment a walk is on
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -176,16 +179,15 @@ pub struct SlotWork {
     pub counts: BlockCounts,
 }
 
-/// A worker's place to take a block and hand its counts back. Workers only read, and the planner alone lands counts, so
-/// a volume still has one walk: it keeps one target, one position and one order of landing
+/// A place on a volume for a block any worker takes, and for the counts it hands back. Workers only read, and the planner alone
+/// lands counts, so a volume still has one walk: it keeps one target, one position and one order of landing
 #[derive(Debug)]
-pub struct WalkSlot<Task> {
+pub struct WalkSlot {
     pub phase: AtomicU8,
     pub work: Mutex<SlotWork>,
-    pub task: OnceLock<Task>,
 }
 
-impl<Task> WalkSlot<Task> {
+impl WalkSlot {
     /// Build an empty slot with room for one block's counts
     pub fn new() -> Self {
         Self {
@@ -193,7 +195,6 @@ impl<Task> WalkSlot<Task> {
             work: Mutex::new(SlotWork {
                 ..SlotWork::default()
             }),
-            task: OnceLock::new(),
         }
     }
 
@@ -203,7 +204,7 @@ impl<Task> WalkSlot<Task> {
     }
 }
 
-impl<Task> Default for WalkSlot<Task> {
+impl Default for WalkSlot {
     fn default() -> Self {
         Self::new()
     }
@@ -233,17 +234,19 @@ pub struct WalkJob<Backend: Io> {
     pub apply: CoverApply<Backend>,
     region: Option<Region>,
     block_rows: usize,
+    region_need: ByteCount,
     slots_carved: u64,
 }
 
-/// A worker that counts the blocks and runs the rewrites the planner hands it
+/// A worker of the store's, which counts any volume's blocks and runs the rewrites any planner hands out
 pub struct WalkWorker<Backend: Io> {
     pub state: Arc<EngineState<Backend>>,
-    pub volume: usize,
-    pub slot: usize,
+    pub index: usize,
+    pub next_volume: usize,
     pub counter: BlockCounter<Backend>,
-    pub seats: Arc<Vec<RewriteSeat<Backend>>>,
+    pub seats: Vec<Arc<Vec<RewriteSeat<Backend>>>>,
     pub rewrite: Option<RewriteJob<Backend>>,
+    pub seat: (usize, usize),
 }
 
 impl<Backend: Io> BlockCounter<Backend> {
@@ -427,6 +430,7 @@ impl<Backend: Io> WalkJob<Backend> {
             failed_slot: None,
             region: None,
             block_rows: 0,
+            region_need: ByteCount(0),
             slots_carved: 0,
         }
     }
@@ -483,6 +487,7 @@ impl<Backend: Io> WalkJob<Backend> {
         let Some(mut region) = self.state.admit(JobRole::Walk, ByteCount(need as u64), true) else {
             return false;
         };
+        self.region_need = ByteCount(need as u64);
         let carved = self.carve(&mut region, block_rows);
         self.region = Some(region);
         if carved.is_err() {
@@ -526,9 +531,8 @@ impl<Backend: Io> WalkJob<Backend> {
             }
         }
         self.slots_carved = 0;
-        let mapped = region.mapped_bytes();
         drop(region);
-        self.state.give_back(JobRole::Walk, mapped, ByteCount(touched as u64));
+        self.state.give_back(JobRole::Walk, self.region_need, ByteCount(touched as u64));
     }
 
     /// Walk one row block here. A failure leaves the last key wherever the attempt stood, so the retry finds it again
@@ -694,7 +698,7 @@ impl<Backend: Io> WalkJob<Backend> {
                 };
                 drop(work);
                 self.next_handed_out += 1;
-                assign(slot);
+                assign(&self.state.workers, slot);
             }
         }
     }
@@ -754,7 +758,7 @@ impl<Backend: Io> WalkJob<Backend> {
         self.retry_at = None;
         self.free_waiting(volume);
         if let Some(index) = self.failed_slot.take() {
-            assign(&volume.walk_slots[index]);
+            assign(&self.state.workers, &volume.walk_slots[index]);
         }
         // a target holds its counts from its first step, and waits for room when admission has none
         if self.target.is_some() && !self.ensure_region(volume) {
@@ -789,51 +793,38 @@ impl<Backend: Io> WalkJob<Backend> {
     }
 }
 
-/// Put a slot's block in its worker's hands
-pub fn assign<Task: IoTask>(slot: &WalkSlot<Task>) {
-    slot.phase.store(SLOT_ASSIGNED, Ordering::Release);
-    if let Some(task) = slot.task.get() {
-        task.wake();
-    }
+/// Put a slot's block in any worker's hands, and wake one that sleeps
+pub fn assign<Task: IoTask>(workers: &Workers<Task>, slot: &WalkSlot) {
+    slot.phase.store(SLOT_ASSIGNED, Ordering::SeqCst);
+    workers.wake_one();
 }
 
 impl<Backend: Io> WalkWorker<Backend> {
-    /// Run one step of this worker's rewrite, and bring the planner back when it ends, for the next pick. The worker takes a
-    /// started rewrite out of its seat and steps it with no lock held
-    pub fn step_rewrite(&mut self) -> JobStep {
-        let seat = &self.seats[self.slot];
-        if self.rewrite.is_none() {
-            let mut held = hold(&seat.job);
-            if !held.as_ref().is_some_and(RewriteJob::is_running) {
-                return JobStep::Idle;
-            }
-            seat.heap.store(held.as_ref().map_or(0, |job| job.heap_bytes().0), Ordering::Release);
-            self.rewrite = held.take();
-        }
-        let Some(job) = &mut self.rewrite else {
-            return JobStep::Idle;
-        };
-        job.step();
-        if job.is_running() {
-            return JobStep::Worked;
-        }
-        *hold(&seat.job) = self.rewrite.take();
-        if let Some(task) = self.state.planner_task.get() {
-            task.wake();
-        }
-        JobStep::Worked
-    }
-}
-
-impl<Backend: Io> Job for WalkWorker<Backend> {
-    fn step(&mut self) -> JobStep {
+    /// Take a block any volume handed out and count it, looking at the volumes in turn, and say whether there was one
+    pub fn count_one(&mut self) -> bool {
         let state = Arc::clone(&self.state);
-        let volume = &state.volumes[self.volume];
-        let slot = &volume.walk_slots[self.slot];
-        if slot.phase.load(Ordering::Acquire) != SLOT_ASSIGNED {
-            return self.step_rewrite();
+        let volumes = state.volumes.len();
+        for turn in 0..volumes {
+            let at = (self.next_volume + turn) % volumes;
+            let volume = &state.volumes[at];
+            let is_taken = |slot: &&WalkSlot| {
+                slot.phase.load(Ordering::SeqCst) == SLOT_ASSIGNED
+                    && slot.phase.compare_exchange(SLOT_ASSIGNED, SLOT_COUNTING, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+            };
+            let Some(slot) = volume.walk_slots.iter().find(is_taken) else {
+                continue;
+            };
+            self.next_volume = (at + 1) % volumes;
+            self.count_slot(&state, volume, slot);
+            return true;
         }
+        false
+    }
 
+    /// Count a taken slot's block and hand the counts back to the planner
+    fn count_slot(&mut self, state: &EngineState<Backend>, volume: &Volume<Backend>, slot: &WalkSlot) {
+        let cell = &state.workers.cells[self.index];
+        cell.is_active.store(true, Ordering::Release);
         let mut work = hold(&slot.work);
         let SlotWork { target, next_block, counts } = &mut *work;
         // blocks reach a worker out of order, so each one finds the key before it
@@ -851,10 +842,70 @@ impl<Backend: Io> Job for WalkWorker<Backend> {
         };
         drop(work);
         slot.phase.store(phase, Ordering::Release);
+        cell.is_active.store(self.rewrite.is_some(), Ordering::Release);
         if let Some(task) = state.planner_task.get() {
             task.wake();
         }
+    }
+
+    /// Take a rewrite a planner started in a seat, looking at the volumes in turn, and say whether there was one
+    pub fn take_seat(&mut self) -> bool {
+        let volumes = self.seats.len();
+        for turn in 0..volumes {
+            let at = (self.next_volume + turn) % volumes;
+            for (index, seat) in self.seats[at].iter().enumerate() {
+                if !seat.is_waiting.load(Ordering::SeqCst) || !seat.is_waiting.swap(false, Ordering::SeqCst) {
+                    continue;
+                }
+                let mut held = hold(&seat.job);
+                if !held.as_ref().is_some_and(RewriteJob::is_running) {
+                    continue;
+                }
+                seat.heap.store(held.as_ref().map_or(0, |job| job.heap_bytes().0), Ordering::Release);
+                self.rewrite = held.take();
+                self.seat = (at, index);
+                self.next_volume = (at + 1) % volumes;
+                self.state.workers.cells[self.index].is_active.store(true, Ordering::Release);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Run one step of the worker's rewrite, and give it back to its seat and bring the planner back when it ends, for the next
+    /// pick. The worker steps a rewrite it took out of its seat with no lock held
+    pub fn step_rewrite(&mut self) -> JobStep {
+        let Some(job) = &mut self.rewrite else {
+            return JobStep::Idle;
+        };
+        job.step();
+        if job.is_running() {
+            return JobStep::Worked;
+        }
+        let (volume, seat) = self.seat;
+        *hold(&self.seats[volume][seat].job) = self.rewrite.take();
+        self.state.workers.cells[self.index].is_active.store(false, Ordering::Release);
+        if let Some(task) = self.state.planner_task.get() {
+            task.wake();
+        }
         JobStep::Worked
+    }
+}
+
+impl<Backend: Io> Job for WalkWorker<Backend> {
+    fn step(&mut self) -> JobStep {
+        // a handed-out block goes first, so walk units run between a rewrite's units
+        if self.count_one() {
+            return JobStep::Worked;
+        }
+        if self.rewrite.is_some() || self.take_seat() {
+            return self.step_rewrite();
+        }
+        let state = Arc::clone(&self.state);
+        if state.workers.look_or_idle(self.index, || self.count_one() || self.take_seat()) {
+            return JobStep::Worked;
+        }
+        JobStep::Idle
     }
 }
 

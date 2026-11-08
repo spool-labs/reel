@@ -3,8 +3,9 @@
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
-use reel::config::{DEFAULT_MAINTENANCE_WORKERS, ColumnConfig, DeviceClass, KeyShape, StoreConfig, SyncPolicy, ThreadCounts, VolumeConfig};
+use reel::config::{default_workers, ColumnConfig, DeviceClass, KeyShape, StoreConfig, SyncPolicy, ThreadCounts, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
+use reel::engine::walk_job::SLOT_ASSIGNED;
 use reel::guard::hold;
 use reel::record::codec::Codec;
 use reel::segment::segment_tail::SegmentNumber;
@@ -20,14 +21,19 @@ use reel_sim::simulated_io::SimulatedIo;
 const ROOT: &str = "/disk/threads";
 const COLUMN: ColumnId = ColumnId(1);
 const BUDGET: ByteCount = ByteCount(148 * 1024 * 1024);
+// workers a 64 MiB budget can't hold, whatever the host's CPU count
+const PAST_A_SMALL_BUDGET: usize = 32;
 const TICK: Nanoseconds = Nanoseconds(1_000_000);
 const STEPS: u64 = 400_000;
 const ROUNDS: u64 = 6;
 const KEYS: u64 = 400;
 const MANY_WORKERS: usize = 100_000;
 const DEAD_SEGMENTS: u64 = 6;
+const TWO_VOLUME_BUDGET: ByteCount = ByteCount(256 * 1024 * 1024);
 
 type Store = ReelStore<SimulatedIo>;
+// keys and values in scan order
+type Rows = Vec<(Vec<u8>, Vec<u8>)>;
 
 fn config(threads: ThreadCounts) -> StoreConfig {
     config_on(threads, DeviceClass::Detect)
@@ -223,11 +229,11 @@ fn config_at(threads: ThreadCounts, budget: ByteCount) -> StoreConfig {
     StoreConfig { memory_budget: budget, ..config(threads) }
 }
 
-// a store that leaves the count alone runs the default where the budget holds it
+// a store that leaves the count alone runs one worker an online CPU where the budget holds them
 #[test]
 fn default_runs_at_full_budget() {
     let store: Store = ReelStore::open(SimulatedIo::new(Seed(8)), &config_at(ThreadCounts::default(), ByteCount(512 * 1024 * 1024))).expect("open");
-    assert_eq!(store.memory_report().maintenance_workers, DEFAULT_MAINTENANCE_WORKERS);
+    assert_eq!(store.memory_report().maintenance_workers, default_workers());
     store.close().expect("close");
 }
 
@@ -236,7 +242,7 @@ fn default_runs_at_full_budget() {
 fn default_fits_a_small_budget() {
     let small = ByteCount(64 * 1024 * 1024);
     let store: Store = ReelStore::open(SimulatedIo::new(Seed(9)), &config_at(ThreadCounts::default(), small)).expect("open");
-    assert!(store.memory_report().maintenance_workers < DEFAULT_MAINTENANCE_WORKERS);
+    assert!(store.memory_report().maintenance_workers <= default_workers());
     store.close().expect("close");
 }
 
@@ -244,7 +250,91 @@ fn default_fits_a_small_budget() {
 #[test]
 fn set_count_is_refused() {
     let small = ByteCount(64 * 1024 * 1024);
-    let threads = ThreadCounts { maintenance_workers: Some(DEFAULT_MAINTENANCE_WORKERS), ..ThreadCounts::default() };
+    let threads = ThreadCounts { maintenance_workers: Some(PAST_A_SMALL_BUDGET), ..ThreadCounts::default() };
     let opened: Result<Store, StoreError> = ReelStore::open(SimulatedIo::new(Seed(10)), &config_at(threads, small));
     assert!(matches!(opened, Err(StoreError::ThreadsPastBudget { .. })));
+}
+
+// two volumes, each with a column
+fn two_volumes(threads: ThreadCounts) -> StoreConfig {
+    let volume = |name: &str| VolumeConfig {
+        name: name.to_string(),
+        roots: vec![PathBuf::from(format!("{ROOT}-{name}"))],
+        sync: SyncPolicy::Never,
+        device: DeviceClass::Detect,
+    };
+    let column = |id: u8, volume: u8| ColumnConfig {
+        id: ColumnId(id),
+        name: format!("column-{id}"),
+        key_shape: KeyShape::Variable { most: 64 },
+        codec: Codec::None,
+        volume: VolumeId(volume),
+        complete_rows: None,
+        least_value: None,
+    };
+    StoreConfig {
+        memory_budget: TWO_VOLUME_BUDGET,
+        threads,
+        volumes: vec![volume("a"), volume("b")],
+        columns: vec![column(1, 0), column(2, 1)],
+    }
+}
+
+// step the jobs until they go quiet, and after each step check that a block handed out on any volume has a worker that can run
+fn settle_checked(store: &Store, io: &SimulatedIo) {
+    let is_assigned = || store.state.volumes.iter().flat_map(|volume| &volume.walk_slots).any(|slot| slot.phase.load(Ordering::SeqCst) == SLOT_ASSIGNED);
+    for _step in 0..STEPS {
+        let stepped = io.step_any().or_else(|| {
+            io.advance_clock(TICK);
+            io.step_any()
+        });
+        assert!(!is_assigned() || io.runnable_jobs("reel-walk") > 0, "a handed-out block waits while every worker sleeps");
+        if stepped.is_none() {
+            return;
+        }
+    }
+    panic!("jobs never went quiet");
+}
+
+// both volumes' keys and values after a seeded run, and the walk blocks each volume counted
+fn two_volume_contents(workers: usize) -> (Rows, [u64; 2]) {
+    let io = SimulatedIo::new(Seed(11));
+    let threads = ThreadCounts { maintenance_workers: Some(workers), ..ThreadCounts::default() };
+    let store: Store = ReelStore::open(io.clone(), &two_volumes(threads)).expect("open");
+    let mut random = SeededRandom::new(Seed(12));
+    for round in 0..ROUNDS {
+        for _write in 0..KEYS {
+            let column = ColumnId(1 + random.below(2) as u8);
+            let key = format!("key-{:04}", random.below(KEYS));
+            if random.below(4) == 0 {
+                store.delete(column, key.as_bytes()).expect("delete");
+            } else {
+                store.put(column, key.as_bytes(), format!("value-{round}").as_bytes()).expect("put");
+            }
+        }
+        store.seal_now();
+        settle_checked(&store, &io);
+    }
+    let mut found = Vec::new();
+    for column in [ColumnId(1), ColumnId(2)] {
+        let mut scan = store.iter_from(column, b"", Direction::Ascending).expect("scan");
+        let (mut key, mut value) = (Vec::new(), Vec::new());
+        while scan.next_row(&mut key, &mut value).expect("step") == ScanStep::Found {
+            found.push((key.clone(), value.clone()));
+        }
+    }
+    let blocks = [0, 1].map(|volume| store.state.volumes[volume].walk_blocks.load(Ordering::Acquire));
+    assert_eq!(store.memory_report().maintenance_workers, workers);
+    store.close().expect("close");
+    (found, blocks)
+}
+
+// one set of workers serves both volumes, walks each, and leaves the same keys and values as the planners alone
+#[test]
+fn workers_serve_every_volume() {
+    let (alone, _blocks) = two_volume_contents(0);
+    assert!(!alone.is_empty());
+    let (shared, blocks) = two_volume_contents(3);
+    assert_eq!(shared, alone);
+    assert!(blocks.iter().all(|blocks| *blocks > 0), "a volume walked nothing: {blocks:?}");
 }

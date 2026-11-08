@@ -42,6 +42,8 @@ const INTERLEAVE_KEYS: u64 = 600;
 const INTERLEAVE_ROUNDS: u64 = 6;
 const INTERLEAVE_STEPS: u64 = 40;
 const INTERLEAVE_WORKERS: usize = 4;
+const CHURN_ROUNDS: u64 = 12;
+const CHURN_DELETE_ONE_IN: u64 = 8;
 const KEYS: u64 = 2_000;
 const CAPACITY: RowCount = RowCount(100_000);
 const SMALL_CAPACITY: RowCount = RowCount(200);
@@ -82,7 +84,10 @@ fn config(capacity: RowCount) -> StoreConfig {
 }
 
 fn open(io: &SimulatedIo, capacity: RowCount) -> Store {
-    ReelStore::open(io.clone(), &config(capacity)).expect("open")
+    let store = ReelStore::open(io.clone(), &config(capacity)).expect("open");
+    // these segments keep the few dead rows they were built with
+    store.state.volumes[0].is_reclaim_held.store(true, Ordering::Release);
+    store
 }
 
 fn settle(io: &SimulatedIo) {
@@ -936,4 +941,38 @@ fn scans_between_job_steps() {
         settle(&io);
         store.close().expect("close");
     }
+}
+
+// random overwrites and deletes over many seals leave the table one slot a key once the walk and the rewrites settle, and a
+// reopen finds the same count
+#[test]
+fn churn_settles_to_a_slot_a_key() {
+    let io = SimulatedIo::new(Seed(41));
+    let mut config = config(CAPACITY);
+    config.threads.maintenance_workers = Some(INTERLEAVE_WORKERS);
+    config.memory_budget = ByteCount(256 * 1024 * 1024);
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let mut random = SeededRandom::new(Seed(41));
+    for round in 0..CHURN_ROUNDS {
+        for _write in 0..KEYS {
+            let number = random.below(KEYS);
+            if random.below(CHURN_DELETE_ONE_IN) == 0 {
+                store.delete(COLUMN, &key(number)).expect("delete");
+            } else {
+                store.put(COLUMN, &key(number), format!("round-{round}").as_bytes()).expect("put");
+            }
+        }
+        seal(&store, &io);
+    }
+    cool(&store, &io);
+    let table = store.state.complete_table(COLUMN).expect("a table");
+    let live = (0..KEYS).filter(|number| read(&store, &key(*number)).is_some()).count() as u64;
+    let used = table.used_slots().0;
+    assert!(used <= KEYS, "{used} slots for {live} live keys of {KEYS}");
+    store.close().expect("close");
+
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let reopened = store.state.complete_table(COLUMN).expect("a table").used_slots().0;
+    assert!(reopened <= KEYS, "{reopened} slots after a reopen for {live} live keys of {KEYS}");
+    store.close().expect("close");
 }

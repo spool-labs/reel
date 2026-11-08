@@ -1211,6 +1211,7 @@ pub fn build_state<Backend: Io>(
             has_walk_target: AtomicBool::new(false),
             walk_segment: AtomicU64::new(NO_SEAL),
             is_walk_held: AtomicBool::new(false),
+            is_reclaim_held: AtomicBool::new(false),
             is_rebuild_held: AtomicBool::new(false),
             is_applying: AtomicBool::new(false),
             claim_lock: Mutex::new(()),

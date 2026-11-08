@@ -46,7 +46,7 @@ use crate::segment::row_block::{BLOCK_TRAILER_BYTES, FooterRow, ROW_BLOCK_BYTES,
 use crate::segment::segment_table::SegmentPin;
 use crate::segment::segment_tail::{BlockCount, ColumnTail, MAX_COLUMNS, MOST_MERGE_SEGMENTS, SegmentNumber};
 use crate::segment::summary::{ColumnFacts, DeadCount, SUMMARY_KEY_BYTES, SegmentFacts, SummaryRow, SummaryRows};
-use crate::segment::summary_orders::{COVERS_LIST, ROW_FOOTER_BYTES, SHARE_BUCKETS, SHARE_SCALE, reclaim_share, share_bucket};
+use crate::segment::summary_orders::{COVERS_LIST, ROW_FOOTER_BYTES, SHARE_BUCKETS, SHARE_SCALE, WalkList, reclaim_share, share_bucket};
 
 /// A bar counts in quarters of a segment's bytes
 pub const BAR_QUARTERS: u64 = 4;
@@ -55,10 +55,8 @@ pub const PLAIN_BAR_QUARTERS: u64 = 2;
 /// A marked segment waits for this many while its highest mark stands, since it dies whole soon. A rewrite there copies at
 /// most a third of a byte for each byte freed, so a record freed early still comes back
 pub const EARLY_BAR_QUARTERS: u64 = 3;
-/// A quiet volume whose dead bytes pass its line rewrites any segment a quarter dead or more, highest share first
-pub const QUIET_BAR_QUARTERS: u64 = 1;
-/// A quiet volume reclaims while its dead bytes pass one part in this many of its file bytes, the spec's ten percent line
-pub const DEAD_LINE_DIVISOR: u64 = 10;
+/// A quiet volume with dead bytes rewrites any segment that wins a byte back, highest share first
+pub const QUIET_BAR_QUARTERS: u64 = 0;
 /// Bytes of one job's merge buffer, which carries records and then row blocks. With a row block for each input, a job's
 /// merge buffers come to about 2 MiB
 pub const MERGE_BUFFER_BYTES: usize = 3 * 512 * 1024;
@@ -383,6 +381,8 @@ pub struct RewriteJob<Backend: Io> {
     /// Tests set this low to fill the grave output
     pub most_grave_blocks: BlockCount,
     pub last_slot: Option<(KeyHash, SegmentNumber, u32)>,
+    /// Slots given in one column since the last count went to its table, each leaving an input's slot behind
+    stale_given: (Option<ColumnId>, u64),
     /// One bit a row of the inputs, each input's rows from its base, set when the deciding pass keeps its record
     marks: FixedList<u64>,
     /// Where each marked row's record landed in its output, by the row's base and place in its input
@@ -510,6 +510,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             region: None,
             most_grave_blocks: MOST_GRAVE_BLOCKS,
             last_slot: None,
+            stale_given: (None, 0),
             marks: FixedList::empty(),
             placed: FixedList::empty(),
             stripe: FixedList::empty(),
@@ -885,7 +886,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             return None;
         }
         let current = DeathMark(self.state.current_mark.load(Ordering::Relaxed));
-        let plain = plain_bar(is_ingesting, &rows);
+        let plain = plain_bar(is_ingesting || volume.is_reclaim_held.load(Ordering::Acquire), &rows);
         let gave_up = self.gave_up_list(volume);
         let is_ready_at = |row: &SummaryRow<'_>, plain: u64| {
             let bar = (current, plain);
@@ -1469,7 +1470,20 @@ impl<Backend: Io> RewriteJob<Backend> {
             if self.last_slot != Some((hash, number, block)) {
                 table.insert(hash, number, block as u16, |segment| self.state.is_slot_gone(volume, segment));
                 self.last_slot = Some((hash, number, block));
+                if self.stale_given.0 != Some(column) {
+                    self.note_stale();
+                    self.stale_given.0 = Some(column);
+                }
+                self.stale_given.1 += 1;
             }
+        }
+    }
+
+    /// Hand the slots given since the last note to their table's stale count
+    pub fn note_stale(&mut self) {
+        let (column, given) = std::mem::take(&mut self.stale_given);
+        if let Some(table) = column.and_then(|column| self.state.complete_table(column)) {
+            table.note_stale(given);
         }
     }
 
@@ -2021,6 +2035,7 @@ impl<Backend: Io> RewriteJob<Backend> {
 
     /// Install, and run some work once the grave output is listed and the inputs are not yet gone
     pub fn install_with(&mut self, between: impl FnOnce()) -> Result<()> {
+        self.note_stale();
         let state = Arc::clone(&self.state);
         let volume = &state.volumes[self.volume];
         // a full park clears as reads finish, and this step comes round again until the wait runs out
@@ -3017,15 +3032,17 @@ pub fn coalesce(counts: &mut FixedList<DeadCount>) {
     counts.truncate(kept);
 }
 
-/// Work out the plain bar a pick holds unmarked segments to: the quiet bar while the volume is quiet and its dead bytes pass the
-/// line, and the plain bar otherwise, which a volume short of room under hot ingest holds to
+/// Work out the plain bar a pick holds unmarked segments to: the quiet bar while the volume is quiet, walked and holds dead bytes, and the
+/// plain bar otherwise, which a volume short of room under hot ingest holds to
 pub fn plain_bar(is_hot: bool, rows: &SummaryRows) -> u64 {
-    if !is_hot && is_past_line(rows) { QUIET_BAR_QUARTERS } else { PLAIN_BAR_QUARTERS }
+    if !is_hot && is_reclaim_due(rows) { QUIET_BAR_QUARTERS } else { PLAIN_BAR_QUARTERS }
 }
 
-/// Check a quiet volume's dead bytes pass the line, so idle time goes to reclaiming toward it
-pub fn is_past_line(rows: &SummaryRows) -> bool {
-    rows.orders().dead_bytes() * DEAD_LINE_DIVISOR > rows.file_bytes().0
+/// Check a volume holds dead bytes and the walk has counted every segment, so its idle time goes to reclaiming them all with each
+/// segment copied once
+pub fn is_reclaim_due(rows: &SummaryRows) -> bool {
+    let orders = rows.orders();
+    orders.dead_bytes() > 0 && orders.walk_count(WalkList::Unwalked) + orders.walk_count(WalkList::Backward) == 0
 }
 
 /// Check a segment could join an overlap merge once whatever holds it now lets go: damage, pending covers and an empty row block

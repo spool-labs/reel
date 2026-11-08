@@ -5,6 +5,7 @@
 //! its rows. The summary never overstates dead, so that takes no lookups. Damage and covers keep a segment, since their
 //! rows answer for more than themselves.
 
+use std::cell::Cell;
 use std::io::{Error, ErrorKind, Result};
 use std::mem;
 use std::slice;
@@ -21,7 +22,7 @@ use crate::engine::complete_path::{REFILL_STEP_BLOCKS, Refill};
 use crate::engine::cover_apply::is_in_range;
 use crate::engine::engine_state::EngineState;
 use crate::engine::planner::UnitStep;
-use crate::engine::rewrite_job::{PLANNER_LANE, RewriteJob, RewriteSeat, is_past_line};
+use crate::engine::rewrite_job::{PLANNER_LANE, RewriteJob, RewriteSeat, is_reclaim_due};
 use crate::engine::rebuild::MOST_REBUILD_TRIES;
 use crate::engine::volume::{ParkedSegment, Volume};
 use crate::engine::walk_job::{FREE_IN_PLACE_BYTES, FreeRecord, WALK_RETRY};
@@ -29,6 +30,7 @@ use crate::guard::hold;
 use crate::io::device_error::is_device_error;
 use crate::io::{InPlace, Io, IoFile, in_place};
 use crate::fixed_list::FixedList;
+use crate::index::complete_table::{COMPLETE_SHARDS, CompleteTable, SWEEP_STEP_BUCKETS};
 use crate::row_kind::RowKind;
 use crate::segment::block_entry::KeyBound;
 use crate::segment::footer_reader::FooterReader;
@@ -89,6 +91,22 @@ pub enum Blocker {
     Segment(SegmentNumber),
 }
 
+/// Segments a sweep step keeps its gone answers for
+pub const SWEEP_SEEN: usize = 256;
+
+/// A sweep's place in a complete table
+#[derive(Clone, Copy)]
+pub struct Sweep {
+    /// The table's column
+    pub column: ColumnId,
+    /// The shard the next step clears
+    pub shard: usize,
+    /// The bucket the next step starts at
+    pub from: usize,
+    /// The stale count when the sweep began, which a whole pass clears
+    pub counted: u64,
+}
+
 /// The compaction of one volume
 pub struct CompactJob<Backend: Io> {
     pub state: Arc<EngineState<Backend>>,
@@ -105,6 +123,7 @@ pub struct CompactJob<Backend: Io> {
     refill_key: FixedList<u8>,
     refill_below: u64,
     refill_reader: FooterReader,
+    sweep: Option<Sweep>,
     last_tried: SegmentNumber,
     settle_at: usize,
     settled_rows: FixedList<DeadCount>,
@@ -149,6 +168,7 @@ impl<Backend: Io> CompactJob<Backend> {
             refill: None,
             refill_key: FixedList::on_heap(MAX_KEY_BYTES as usize),
             refill_below: u64::MAX,
+            sweep: None,
             refill_reader: FooterReader::new(),
         }
     }
@@ -227,6 +247,9 @@ impl<Backend: Io> CompactJob<Backend> {
         if self.step_refill() {
             return UnitStep::Worked;
         }
+        if self.step_sweep() {
+            return UnitStep::Worked;
+        }
         // a live cue may still need what it kept, and its going brings the planner back
         if state.cues.is_empty() && volume.has_kept_covers.swap(false, Ordering::AcqRel) {
             self.unit = Some((UnitKind::CoverSweep, 0));
@@ -278,13 +301,13 @@ impl<Backend: Io> CompactJob<Backend> {
                 return UnitStep::Worked;
             }
         }
-        // a quiet volume past its dead line fills its idle time with reclaiming toward it, and one past the bound merges back first
+        // a quiet volume with dead bytes fills its idle time with reclaiming them, and one past the bound merges back first
         let is_short = volume.is_short_of_room();
         let is_deferring = volume.is_hot(now) && !is_short;
         let is_holding_records = volume.is_ingesting(now) && !is_short;
         let is_owed = !is_deferring && volume.is_over_bound.load(Ordering::Acquire);
-        let is_quiet_past_line = !is_holding_records && is_past_line(&hold(&volume.summary));
-        let mut should_rewrite = mem::take(&mut self.should_rewrite) || is_quiet_past_line || is_owed;
+        let is_quiet_with_dead = !is_holding_records && !volume.is_reclaim_held.load(Ordering::Acquire) && is_reclaim_due(&hold(&volume.summary));
+        let mut should_rewrite = mem::take(&mut self.should_rewrite) || is_quiet_with_dead || is_owed;
         // an ask that arriving writes held back comes due once they stop
         if is_holding_records {
             self.is_ask_held |= should_rewrite;
@@ -305,6 +328,58 @@ impl<Backend: Io> CompactJob<Backend> {
             return UnitStep::RetryAt(volume.hot_until());
         }
         UnitStep::Idle
+    }
+
+    /// Clear one step's buckets of slots that point at gone segments, once enough may, and say whether a step ran
+    pub fn step_sweep(&mut self) -> bool {
+        let state = Arc::clone(&self.state);
+        let volume = &state.volumes[self.volume];
+        if self.sweep.is_none() {
+            let on_volume = |id: usize| state.columns[id].is_some_and(|info| info.volume.0 as usize == self.volume);
+            let due = (0..state.columns.len()).filter(|id| on_volume(*id)).map(|id| ColumnId(id as u8));
+            let mut due = due.filter(|column| state.complete_table(*column).is_some_and(CompleteTable::is_sweep_due));
+            self.sweep = due.next().and_then(|column| {
+                state.complete_table(column).map(|table| Sweep {
+                    column,
+                    shard: 0,
+                    from: 0,
+                    counted: table.stale_slots(),
+                })
+            });
+        }
+        let Some(mut sweep) = self.sweep else {
+            return false;
+        };
+        let Some(table) = state.complete_table(sweep.column) else {
+            self.sweep = None;
+            return false;
+        };
+        self.unit = Some((UnitKind::SlotSweep, SWEEP_STEP_BUCKETS as u64));
+        // a step meets a few hundred segments at most, so each one's answer is kept for the step
+        let seen: [Cell<u64>; SWEEP_SEEN] = [const { Cell::new(0) }; SWEEP_SEEN];
+        let is_gone = |segment: u32| {
+            let cell = &seen[segment as usize % SWEEP_SEEN];
+            let known = cell.get();
+            if known >> 1 == u64::from(segment) + 1 {
+                return known & 1 == 1;
+            }
+            let is_gone = state.is_slot_gone(volume, segment);
+            cell.set((u64::from(segment) + 1) << 1 | u64::from(is_gone));
+            is_gone
+        };
+        if table.sweep_step(sweep.shard, sweep.from, &is_gone) {
+            sweep.shard += 1;
+            sweep.from = 0;
+        } else {
+            sweep.from += SWEEP_STEP_BUCKETS;
+        }
+        if sweep.shard == COMPLETE_SHARDS {
+            table.end_sweep(sweep.counted);
+            self.sweep = None;
+        } else {
+            self.sweep = Some(sweep);
+        }
+        true
     }
 
     /// Give a few row blocks past a complete table's mark their slots once it has room again, and say whether a step ran

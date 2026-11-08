@@ -215,6 +215,8 @@ fn read_head(io: &SimulatedIo, path: &Path) -> TailHead {
 fn build(seed: u64) -> Built {
     let io = SimulatedIo::new(Seed(seed));
     let store = open(&io);
+    // reclaim would take the dead rows these segments are built to hold
+    store.state.volumes[0].is_compaction_held.store(true, Ordering::Release);
     let mut model = Model::new();
     for column in COLUMNS {
         for number in numbers_of(OLDEST) {

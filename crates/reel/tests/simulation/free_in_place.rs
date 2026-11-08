@@ -53,7 +53,12 @@ fn open(io: &SimulatedIo) -> Store {
             least_value: None,
         }],
     };
-    ReelStore::open(io.clone(), &config).expect("open")
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    // these segments keep the few dead rows they were built with
+    for volume in &store.state.volumes {
+        volume.is_reclaim_held.store(true, Ordering::Release);
+    }
+    store
 }
 
 fn settle(io: &SimulatedIo) {

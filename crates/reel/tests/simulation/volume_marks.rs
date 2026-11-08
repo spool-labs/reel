@@ -64,7 +64,12 @@ fn open(io: &SimulatedIo) -> Store2 {
         volumes: vec![volume("bulk", BULK_ROOT), volume("meta", META_ROOT)],
         columns: vec![column(BULK, "bulk", 0), column(META, "meta", 1)],
     };
-    ReelStore::open(io.clone(), &config).expect("open")
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    // these segments keep the few dead rows they were built with
+    for volume in &store.state.volumes {
+        volume.is_reclaim_held.store(true, Ordering::Release);
+    }
+    store
 }
 
 fn settle(io: &SimulatedIo) {

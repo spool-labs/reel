@@ -15,7 +15,7 @@ use reel::engine::open_segment::{OUTPUT_SUFFIX, data_path};
 use reel::engine::read_path::{RecordWant, WalkAsk};
 use reel::engine::planner::{Planner, unit_bound};
 use reel::engine::reel_store::ReelStore;
-use reel::engine::rewrite_job::{DEAD_LINE_DIVISOR, is_past_line, MERGE_BUFFER_BYTES, MOST_OVERLAP, MOST_PARK_WAITS, PLANNER_LANE, RewriteJob, RewritePhase, is_overlap_input, overlaps};
+use reel::engine::rewrite_job::{MERGE_BUFFER_BYTES, MOST_OVERLAP, MOST_PARK_WAITS, PLANNER_LANE, RewriteJob, RewritePhase, is_overlap_input, overlaps};
 use reel::engine::volume::{MOST_PARKED, NO_SEAL, Volume};
 use reel::engine::walk_job::{BlockCounter, WalkJob, WalkWorker};
 use reel::guard::hold;
@@ -122,6 +122,11 @@ fn seal(store: &Store, io: &SimulatedIo) -> SegmentNumber {
 fn read(store: &Store, key: &[u8]) -> Option<Vec<u8>> {
     let mut buf = Vec::new();
     store.get(COLUMN, key, &mut buf).expect("get").then_some(buf)
+}
+
+// the segment keeps the few dead rows it was built with
+fn hold_reclaim(store: &Store) {
+    store.state.volumes[0].is_reclaim_held.store(true, Ordering::Release);
 }
 
 fn has_file(io: &SimulatedIo, number: SegmentNumber) -> bool {
@@ -365,6 +370,7 @@ fn crashes() {
         for is_power_cut in [false, true] {
             let io = SimulatedIo::new(Seed(7));
             let store = open(&io);
+            hold_reclaim(&store);
             store.put(COLUMN, b"a", b"zero").expect("put");
             for key in [b"keep-0", b"keep-1", b"keep-2"] {
                 store.put(COLUMN, key, b"value").expect("put");
@@ -399,6 +405,7 @@ fn crashes() {
             drop(store);
 
             let store = open(&io);
+            hold_reclaim(&store);
             let state = &store.state;
             assert!(!has_partial(&io), "crash at {crash_at}");
             let is_rebuilt = hold(&state.volumes[0].summary).rows().any(|row| row.facts.is_backward);
@@ -571,6 +578,7 @@ fn grave_hides_nothing() {
 fn grave_stays_over_older() {
     let io = SimulatedIo::new(Seed(13));
     let store = open(&io);
+    hold_reclaim(&store);
     hold_compaction(&store, true);
     store.put(COLUMN, b"keep", b"value").expect("put");
     for key in KEYS {
@@ -2154,9 +2162,9 @@ fn idle_starts_no_merge() {
     store.close().expect("close");
 }
 
-// a third of a quiet volume dead is past its ten percent line, and its idle time goes to reclaiming down to the line
+// a quiet volume a third dead spends its idle time reclaiming every dead byte
 #[test]
-fn idle_volume_reclaims_to_its_line() {
+fn idle_volume_reclaims_every_dead_byte() {
     let io = SimulatedIo::new(Seed(77));
     let store = open(&io);
     let value = vec![7; IDLE_VALUE_BYTES];
@@ -2174,10 +2182,8 @@ fn idle_volume_reclaims_to_its_line() {
         settle(&io);
     }
     let volume = &store.state.volumes[0];
-    assert!(volume.segments_rewritten.load(Ordering::Acquire) > 0, "an idle volume past its line rewrote nothing");
-    let rows = hold(&volume.summary);
-    assert!(rows.orders().dead_bytes() * DEAD_LINE_DIVISOR <= rows.file_bytes().0, "the volume stopped short of its line");
-    drop(rows);
+    assert!(volume.segments_rewritten.load(Ordering::Acquire) > 0, "an idle volume with dead bytes rewrote nothing");
+    assert_eq!(hold(&volume.summary).orders().dead_bytes(), 0, "the volume left dead bytes");
     store.close().expect("close");
 }
 
@@ -2236,6 +2242,7 @@ fn most_won_back_goes_first() {
 fn rows_alone_start_no_copy() {
     let io = SimulatedIo::new(Seed(78));
     let store = open(&io);
+    hold_reclaim(&store);
     store.put(COLUMN, b"big", &vec![7; MERGE_BUFFER_BYTES]).expect("put");
     store.put(COLUMN, b"a", b"first").expect("put");
     store.put(COLUMN, b"b", b"first").expect("put");
@@ -2262,6 +2269,7 @@ fn run_to_end(job: &mut CompactJob<SimulatedIo>) {
 fn hiding_graves_get_one_look() {
     let io = SimulatedIo::new(Seed(79));
     let store = open(&io);
+    hold_reclaim(&store);
     hold_compaction(&store, true);
     let value = vec![7; IDLE_VALUE_BYTES];
     for number in 0..IDLE_KEYS {
@@ -2685,8 +2693,7 @@ fn dropped_held_row_lands_nothing() {
     store.close().expect("close");
 }
 
-// an ask for a rewrite outlives the steps an unlink takes ahead of it, on a quiet volume under its dead line, where only the ask
-// brings a rewrite
+// a rewrite starts once the steps an unlink takes ahead of it are done, and the wholly dead segment goes first
 #[test]
 fn ask_outlives_an_unlink() {
     let io = SimulatedIo::new(Seed(79));
@@ -2694,7 +2701,6 @@ fn ask_outlives_an_unlink() {
     hold_compaction(&store, true);
     let state = &store.state;
     let volume = &state.volumes[0];
-    // enough live bytes that the dead ones sit under the line
     let value = vec![7; IDLE_VALUE_BYTES];
     for number in 0..IDLE_KEYS {
         store.put(COLUMN, format!("live-{number:04}").as_bytes(), &value).expect("put");
@@ -2709,7 +2715,7 @@ fn ask_outlives_an_unlink() {
     hold_compaction(&store, false);
     // no overlap stands, so nothing past the ask brings a rewrite
     volume.is_over_bound.store(false, Ordering::Release);
-    assert!(!volume.is_hot(io.clock_reading()) && !is_past_line(&hold(&volume.summary)), "something past the ask would rewrite");
+    assert!(!volume.is_hot(io.clock_reading()), "the volume read hot");
 
     let mut job = CompactJob::new(Arc::clone(state), 0);
     volume.wants_compaction.store(true, Ordering::Release);
@@ -2926,6 +2932,7 @@ fn random_churn_merges_back_to_the_bound() {
     config.threads.maintenance_workers = Some(2);
     config.memory_budget = WORKER_BUDGET;
     let store = ReelStore::open(io.clone(), &config).expect("open");
+    hold_reclaim(&store);
     let volume = &store.state.volumes[0];
     let mut random = SeededRandom::new(Seed(86));
     let mut written = Vec::new();

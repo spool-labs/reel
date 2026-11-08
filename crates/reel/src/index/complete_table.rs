@@ -3,6 +3,7 @@
 //! A slot holds a tag, a segment and a row block, and no key, so a match is a candidate that the block's key settles. A slot
 //! sits in one of two home buckets, and the second comes from the first and the tag, so a slot can move with no key to hand.
 
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -28,6 +29,10 @@ pub const LEAST_OVERFLOW: usize = 8;
 pub const MOST_MOVES: usize = 64;
 /// The furthest a slot may sit from its run's start in the overflow area, so a full area costs a walk this long and no more
 pub const MOST_RUN_SLOTS: usize = 16;
+/// Buckets one sweep step clears gone slots from, so a step holds a shard's lock a short while
+pub const SWEEP_STEP_BUCKETS: usize = 16_384;
+/// A sweep starts once one used slot in this many may point at a gone segment
+pub const STALE_DIVISOR: u64 = 8;
 /// Slots one tag can hold in its homes and the overflow area before it folds, so a get's candidates fit a fixed list
 pub const MOST_TAG_SLOTS: usize = 2 * BUCKET_SLOTS + MOST_RUN_SLOTS;
 /// The bit of a slot's tag that marks a superseded row
@@ -82,6 +87,7 @@ pub struct CompleteTable {
     mark: AtomicU64,
     used: AtomicU64,
     past_capacity: AtomicU64,
+    stale: AtomicU64,
 }
 
 impl CompleteSlot {
@@ -374,6 +380,38 @@ impl CompleteShard {
         is_placed.then_some(freed)
     }
 
+    /// Clear the slots of gone segments in a run of buckets, and say how many went
+    pub fn sweep_buckets(&mut self, buckets: Range<usize>, is_gone: &impl Fn(u32) -> bool) -> u64 {
+        let mut cleared = 0;
+        for held in &mut self.slots[buckets.start * BUCKET_SLOTS..buckets.end * BUCKET_SLOTS] {
+            if held.is_used() && !held.is_sticky() && is_gone(held.segment) {
+                *held = CompleteSlot::empty();
+                cleared += 1;
+            }
+        }
+        cleared
+    }
+
+    /// Clear the slots of gone segments in the overflow area, and say how many went
+    pub fn sweep_overflow(&mut self, is_gone: &impl Fn(u32) -> bool) -> u64 {
+        let mut cleared = 0;
+        let mut at = 0;
+        // a clear shifts later slots back, so the look stays where it cleared
+        for _step in 0..2 * self.overflow.len() {
+            if at == self.overflow.len() || self.overflow_used == 0 {
+                break;
+            }
+            let slot = self.overflow[at];
+            if slot.is_used() && !slot.is_sticky() && is_gone(slot.segment) {
+                self.clear_overflow(at);
+                cleared += 1;
+            } else {
+                at += 1;
+            }
+        }
+        cleared
+    }
+
     /// Put a slot in its run of the overflow area, or say there's no room in reach of the run's start
     pub fn fill_overflow(&mut self, slot: CompleteSlot) -> bool {
         let mut at = self.overflow_start(slot.tag);
@@ -427,6 +465,7 @@ impl CompleteTable {
             mark: AtomicU64::new(NO_MARK),
             used: AtomicU64::new(0),
             past_capacity: AtomicU64::new(0),
+            stale: AtomicU64::new(0),
         }
     }
 
@@ -548,6 +587,41 @@ impl CompleteTable {
             shard.overflow_used = 0;
         }
         self.used.store(0, Ordering::Release);
+    }
+
+    /// Count slots a merge left on its inputs, which point at gone segments once the inputs go
+    pub fn note_stale(&self, slots: u64) {
+        self.stale.fetch_add(slots, Ordering::AcqRel);
+    }
+
+    /// Check enough slots may point at gone segments that a sweep is due
+    pub fn is_sweep_due(&self) -> bool {
+        let stale = self.stale.load(Ordering::Acquire);
+        stale > 0 && stale * STALE_DIVISOR >= self.used.load(Ordering::Acquire)
+    }
+
+    /// Clear gone slots from one step's buckets of a shard, the overflow area with the last step, and say whether the shard is done
+    pub fn sweep_step(&self, shard: usize, from: usize, is_gone: &impl Fn(u32) -> bool) -> bool {
+        let mut guard = self.write_shard(shard);
+        let end = (from + SWEEP_STEP_BUCKETS).min(guard.buckets);
+        let mut cleared = guard.sweep_buckets(from..end, is_gone);
+        let is_done = end == guard.buckets;
+        if is_done {
+            cleared += guard.sweep_overflow(is_gone);
+        }
+        drop(guard);
+        self.used.fetch_sub(cleared, Ordering::AcqRel);
+        is_done
+    }
+
+    /// Start the stale count over once a sweep has passed every shard
+    pub fn end_sweep(&self, counted: u64) {
+        let _updated = self.stale.fetch_update(Ordering::AcqRel, Ordering::Acquire, |stale| Some(stale.saturating_sub(counted)));
+    }
+
+    /// Read how many slots may point at gone segments
+    pub fn stale_slots(&self) -> u64 {
+        self.stale.load(Ordering::Acquire)
     }
 
     /// Fill a list with the slots a key's tag matches

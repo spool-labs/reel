@@ -13,6 +13,7 @@ use reel_api::units::Nanoseconds;
 
 use crate::engine::compact_job::CompactJob;
 use crate::engine::complete_path::REFILL_STEP_BLOCKS;
+use crate::index::complete_table::SWEEP_STEP_BUCKETS;
 use crate::engine::engine_state::EngineState;
 use crate::engine::filter_job::{FILTER_STEP_BLOCKS, FilterLoader};
 use crate::engine::open_segment::{OpenSegment, SegmentPhase};
@@ -163,6 +164,7 @@ pub fn unit_bound(kind: UnitKind) -> Option<u64> {
         UnitKind::CoverSweep => Some(MOST_RANGE_COVERS as u64),
         UnitKind::FilterLoad => Some(FILTER_STEP_BLOCKS as u64),
         UnitKind::SlotRefill => Some(REFILL_STEP_BLOCKS as u64),
+        UnitKind::SlotSweep => Some(SWEEP_STEP_BUCKETS as u64),
         UnitKind::CoverApply | UnitKind::ParkedClear | UnitKind::Pick => Some(1),
         UnitKind::SummaryCopy | UnitKind::SummarySave | UnitKind::Start => None,
     }

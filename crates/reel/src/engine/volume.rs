@@ -317,6 +317,8 @@ pub struct Volume<Backend: Io> {
     pub is_walk_held: AtomicBool,
     /// A test holds rebuilds off, to see what damage does before one runs
     pub is_rebuild_held: AtomicBool,
+    /// A test holds quiet-time reclaim off, so a segment keeps the few dead rows it was built with
+    pub is_reclaim_held: AtomicBool,
     /// A walk is counting what its covers hide, and a row that left now would make an older one look live
     pub is_applying: AtomicBool,
     /// Orders a walk's landing against a rewrite that begins or ends holding its inputs

@@ -48,9 +48,11 @@ pub const TABLE_DIVISOR: u64 = 16;
 /// Bytes a segment's entry plans for before its columns: its table entry, slot and pin, its places in the table's and the
 /// summary's number maps at their worst rounding, the 16 B the planner's covered list holds for it, and its place in the
 /// summary's orders
-pub const PLANNED_SEGMENT_BYTES: u64 = 280 + ORDER_BYTES;
-/// Bytes a column of a segment plans for: its tail in the table, and an entry in each list of both its directories
-pub const PLANNED_COLUMN_BYTES: u64 = 952;
+pub const PLANNED_SEGMENT_BYTES: u64 = 280 + ORDER_BYTES + PLANNED_SPARE_BYTES;
+/// Bytes a column of a segment plans for: its tail in the table, and an entry in each list of its directory
+pub const PLANNED_COLUMN_BYTES: u64 = 536;
+/// Bytes a segment plans for in its volume's spare directory, which every column of the volume builds its changes in
+pub const PLANNED_SPARE_BYTES: u64 = 416;
 /// Entries a volume plans for each segment its disks hold at the segment size, since small records seal smaller
 pub const ENTRY_MARGIN: u64 = 2;
 /// Entries a table shard holds at the least, whatever the disks

@@ -67,7 +67,7 @@ use crate::record::record_reader::RecordReader;
 use crate::rows::row_group::RowGroupBuffer;
 use crate::segment::block_cache::{BlockCache, CACHE_SHARDS, CACHE_WAYS};
 use crate::segment::filter_arena::FilterArena;
-use crate::segment::column_directory::ColumnDirectory;
+use crate::segment::column_directory::{ColumnDirectory, DirectoryList, empty_list};
 use crate::segment::damage_list::{DamageList, MOST_DAMAGED_SPANS, SPAN_KEY_BYTES};
 use crate::segment::range_covers::RangeCovers;
 use crate::segment::summary::{MOST_ROW_COLUMN_BYTES, MOST_ROW_FIXED_BYTES, MOST_ROW_SPAN_FIXED_BYTES};
@@ -1079,6 +1079,8 @@ pub fn build_state<Backend: Io>(
     for _column in 0..MAX_COLUMNS {
         directories.push(None);
     }
+    // the columns of a volume have the same room, so they share one spare
+    let mut spares: Vec<Option<Arc<Mutex<DirectoryList>>>> = vec![None; config.volumes.len()];
     let mut has_lz4 = false;
     for column in &config.columns {
         has_lz4 |= column.codec == Codec::Lz4;
@@ -1091,7 +1093,8 @@ pub fn build_state<Backend: Io>(
         });
         let found = scan.sealed.len();
         let room = (planned[column.volume.0 as usize].segments_per_shard * TABLE_SHARDS).max(found * 2);
-        directories[column.id.0 as usize] = Some(ColumnDirectory::new(room));
+        let spare = spares[column.volume.0 as usize].get_or_insert_with(|| Arc::new(Mutex::new(empty_list(room))));
+        directories[column.id.0 as usize] = Some(ColumnDirectory::with_spare(room, Arc::clone(spare)));
     }
 
     let open_slots = sizing.shard.open_slots;

@@ -198,8 +198,8 @@ fn rates() {
     assert_eq!(rows_per_second(RowCount(500), 0), 0);
 }
 
-// a planned entry covers what the table, both directories of each column, the summary's lookup and the covered list hold for a
-// segment
+// a planned entry covers what the table, each column's directory, the volume's spare, the summary's lookup and the covered list hold
+// for a segment
 #[test]
 fn planned_entries_cover_the_heap() {
     for columns in [1, 2, 4] {
@@ -207,7 +207,7 @@ fn planned_entries_cover_the_heap() {
             let segments = per_shard * TABLE_SHARDS;
             let sizing = TableSizing { segments_per_shard: per_shard, columns_per_shard: per_shard * columns, blocks_per_shard: 0 };
             let table: SegmentTable<PlainFile> = SegmentTable::new(&sizing);
-            let directories = 2 * columns as u64 * ColumnDirectory::new(segments).heap_bytes().0;
+            let directories = (columns as u64 + 1) * ColumnDirectory::new(segments).heap_bytes().0;
             let lookup = NumberMap::new(segments).heap_bytes() as u64;
             let covered = (2 * segments * size_of::<u64>()) as u64;
             let held = table.heap_bytes().0 + directories + lookup + covered;
@@ -232,7 +232,7 @@ fn disk_sets_the_entries() {
     assert_eq!(disk_entries(Some(hz02), SEGMENT_TARGET), Some(29_568));
     assert_eq!(disk_entries(None, SEGMENT_TARGET), None);
     assert_eq!(disk_entries(Some(ByteCount(1)), SEGMENT_TARGET), Some(floor_entries()));
-    assert_eq!(asked, ByteCount(67_533_312));
+    assert_eq!(asked, ByteCount(55_233_024));
     assert_eq!(disked.least_budget().0, bare.least_budget().0 + floor.0);
     assert_eq!(disked.entry_line(), asked);
     assert!(EngineSizing::for_store(&disked).table_share < EngineSizing::for_store(&bare).table_share);

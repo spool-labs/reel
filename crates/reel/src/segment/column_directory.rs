@@ -1,19 +1,17 @@
-//! Which sealed segments can hold a key of one column, published with no lock on readers' writers
+//! Which sealed segments can hold a key of one column, in one list a change swaps whole
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::mem;
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use reel_api::units::{ByteCount, WritePlace};
 
 use crate::fixed_list::ListOut;
-use crate::pool::touched_capacity;
 use crate::guard::hold;
+use crate::pool::touched_capacity;
 use crate::record::record_check::{Checksum, checksum};
 use crate::segment::block_entry::{KeyBound, KeyPrefix};
 use crate::segment::segment_tail::{ColumnTail, SegmentNumber};
-
-/// Copies of the list: readers keep one while a seal builds the other
-pub const DIRECTORY_VERSIONS: usize = 2;
 
 /// One segment's range in one column
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,7 +48,7 @@ pub struct Candidate {
     pub newest_place: WritePlace,
 }
 
-/// One copy of the list, with the generation it was published under
+/// The list, with the generation of its last change
 #[derive(Clone, Debug, Default)]
 pub struct DirectoryList {
     pub entries: Vec<DirectoryEntry>,
@@ -75,14 +73,13 @@ pub struct PageFill<'out, Out> {
     is_cut: bool,
 }
 
-/// A column's segments, grouped by the bytes each one's keys share and sorted by lowest key in
-/// a group, in two copies with room fixed at open
+/// A column's segments, grouped by the bytes each one's keys share and sorted by lowest key in a group, with room fixed at open.
+/// A change builds the new list in a spare the volume's columns share and swaps it in, so readers wait for the swap alone
 #[derive(Debug)]
 pub struct ColumnDirectory {
-    versions: [RwLock<DirectoryList>; DIRECTORY_VERSIONS],
-    current: AtomicUsize,
+    list: RwLock<DirectoryList>,
+    spare: Arc<Mutex<DirectoryList>>,
     generation: AtomicU64,
-    writer: Mutex<()>,
 }
 
 impl Listing {
@@ -126,31 +123,39 @@ impl<Out> PageFill<'_, Out> {
 }
 
 impl ColumnDirectory {
-    /// Allocate room for a number of segments
+    /// Allocate room for a number of segments, with a spare of its own
     pub fn new(capacity: usize) -> Self {
+        Self::with_spare(capacity, Arc::new(Mutex::new(empty_list(capacity))))
+    }
+
+    /// Allocate room for a number of segments, with a spare other columns of the volume share. The spare has the same room
+    pub fn with_spare(capacity: usize, spare: Arc<Mutex<DirectoryList>>) -> Self {
         Self {
-            versions: [RwLock::new(empty_list(capacity)), RwLock::new(empty_list(capacity))],
-            current: AtomicUsize::new(0),
+            list: RwLock::new(empty_list(capacity)),
+            spare,
             generation: AtomicU64::new(0),
-            writer: Mutex::new(()),
         }
     }
 
-    /// Read the heap this directory holds
+    /// Read the heap the spare holds
+    pub fn spare_bytes(&self) -> ByteCount {
+        list_bytes(&hold(&self.spare))
+    }
+
+    /// Check two directories build their changes in one spare
+    pub fn shares_spare(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.spare, &other.spare)
+    }
+
+    /// Read the heap this directory's own list holds, its share of the spare aside
     pub fn heap_bytes(&self) -> ByteCount {
-        let mut total = 0;
-        for version in &self.versions {
-            let list = read_list(version);
-            total += list.entries.capacity() * size_of::<DirectoryEntry>() + list.ranges.capacity() * size_of::<RangeEntry>();
-        }
-        ByteCount(total as u64)
+        list_bytes(&read_list(&self.list))
     }
 
     /// Fill a buffer with the segments whose range holds a key, past those a caller already has
     pub fn candidates(&self, key: &[u8], skip: usize, out: &mut Vec<Candidate>) -> DirectoryPage {
         out.clear();
-        let current = self.current.load(Ordering::Acquire);
-        let copy = read_list(&self.versions[current]);
+        let copy = read_list(&self.list);
         let list = &copy.entries;
         let mut fill = PageFill {
             out,
@@ -180,8 +185,7 @@ impl ColumnDirectory {
     /// Fill a buffer with the segments whose keys can meet a range, past those a caller already has
     pub fn overlapping(&self, low: &KeyBound, high: &KeyBound, skip: usize, out: &mut impl ListOut<SegmentNumber>) -> DirectoryPage {
         out.clear();
-        let current = self.current.load(Ordering::Acquire);
-        let copy = read_list(&self.versions[current]);
+        let copy = read_list(&self.list);
         let mut fill = PageFill {
             out,
             skip,
@@ -200,8 +204,7 @@ impl ColumnDirectory {
     /// widen a range, so a caller checks each one against its keys
     pub fn starting_inside(&self, low: &KeyBound, high: &KeyBound, out: &mut impl ListOut<SegmentNumber>) {
         out.clear();
-        let current = self.current.load(Ordering::Acquire);
-        let copy = read_list(&self.versions[current]);
+        let copy = read_list(&self.list);
         let first = copy.ranges.partition_point(|range| range.lowest < *low);
         for range in copy.ranges[first..].iter().take_while(|range| range.lowest <= *high) {
             if !out.push_if_room(range.segment) {
@@ -213,43 +216,42 @@ impl ColumnDirectory {
     /// Publish a list of every listing at once, sorted here, or return false when they don't fit. A listing at a time copies the
     /// whole list for each one, and one sort fills a directory of any size
     pub fn publish_all(&self, listings: &[Listing]) -> bool {
-        let _one_writer = hold(&self.writer);
-        let current = self.current.load(Ordering::Acquire);
-        let next = (current + 1) % DIRECTORY_VERSIONS;
-        {
-            let generation = read_list(&self.versions[current]).generation;
-            let mut target = write_list(&self.versions[next]);
-            if listings.len() > target.entries.capacity() {
-                return false;
-            }
-            target.entries.clear();
-            target.ranges.clear();
-            target.generation = generation + 1;
-            target.entries.extend(listings.iter().map(|listing| listing.entry));
-            target.ranges.extend(listings.iter().map(|listing| listing.range));
-            target.entries.sort_unstable_by_key(sort_key);
-            target.ranges.sort_unstable_by_key(|range| range.lowest);
-            refresh_groups(&mut target.entries);
-            let count = target.ranges.len();
-            refresh_range_reach(&mut target.ranges, 0, count);
+        let mut target = hold(&self.spare);
+        if listings.len() > target.entries.capacity() {
+            return false;
         }
-        self.current.store(next, Ordering::Release);
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        target.entries.clear();
+        target.ranges.clear();
+        target.entries.extend(listings.iter().map(|listing| listing.entry));
+        target.ranges.extend(listings.iter().map(|listing| listing.range));
+        target.entries.sort_unstable_by_key(sort_key);
+        target.ranges.sort_unstable_by_key(|range| range.lowest);
+        refresh_groups(&mut target.entries);
+        let count = target.ranges.len();
+        refresh_range_reach(&mut target.ranges, 0, count);
+        self.swap_in(&mut target);
         true
+    }
+
+    /// Put a list built in the spare in place, and leave the old one there as the next spare
+    pub fn swap_in(&self, spare: &mut DirectoryList) {
+        let mut list = write_list(&self.list);
+        spare.generation = list.generation + 1;
+        mem::swap(&mut *list, spare);
+        drop(list);
+        self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Find where the next segment past a bound starts
     pub fn next_above(&self, bound: &KeyBound) -> Option<KeyBound> {
-        let current = self.current.load(Ordering::Acquire);
-        let copy = read_list(&self.versions[current]);
+        let copy = read_list(&self.list);
         let at = copy.ranges.partition_point(|range| range.lowest <= *bound);
         copy.ranges.get(at).map(|range| range.lowest)
     }
 
     /// Find where the next segment below a bound ends
     pub fn next_below(&self, bound: &KeyBound) -> Option<KeyBound> {
-        let current = self.current.load(Ordering::Acquire);
-        let copy = read_list(&self.versions[current]);
+        let copy = read_list(&self.list);
         let mut best = None;
         highest_below(&copy.ranges, 0, copy.ranges.len(), bound, &mut best);
         best
@@ -262,52 +264,37 @@ impl ColumnDirectory {
 
     /// Publish a list with a segment added and some gone, or return false when it doesn't fit
     pub fn replace(&self, added: Option<&Listing>, removed: &[SegmentNumber]) -> bool {
-        let _one_writer = hold(&self.writer);
-        let current = self.current.load(Ordering::Acquire);
-        let next = (current + 1) % DIRECTORY_VERSIONS;
+        let mut target = hold(&self.spare);
+        target.entries.clear();
+        target.ranges.clear();
         {
-            let source = read_list(&self.versions[current]);
-            let mut target = write_list(&self.versions[next]);
-            target.entries.clear();
-            target.ranges.clear();
-            target.generation = source.generation + 1;
-
-            let room = target.entries.capacity();
-            let mut kept = 0;
-            for entry in &source.entries {
-                if !removed.contains(&entry.segment) {
-                    kept += 1;
-                }
-            }
-            if kept + usize::from(added.is_some()) > room {
+            // the spare's one writer is this one, so the list can't change under the copy
+            let source = read_list(&self.list);
+            let kept = source.entries.iter().filter(|entry| !removed.contains(&entry.segment)).count();
+            if kept + usize::from(added.is_some()) > target.entries.capacity() {
                 return false;
             }
-
-            for entry in &source.entries {
-                if !removed.contains(&entry.segment) {
-                    target.entries.push(*entry);
-                }
-            }
-            for range in &source.ranges {
-                if !removed.contains(&range.segment) {
-                    target.ranges.push(*range);
-                }
-            }
-            if let Some(listing) = added {
-                let entry = &listing.entry;
-                let at = target.entries.partition_point(|existing| sort_key(existing) <= sort_key(entry));
-                target.entries.insert(at, *entry);
-                let at = target.ranges.partition_point(|existing| existing.lowest <= listing.range.lowest);
-                target.ranges.insert(at, listing.range);
-            }
-            refresh_groups(&mut target.entries);
-            let count = target.ranges.len();
-            refresh_range_reach(&mut target.ranges, 0, count);
+            target.entries.extend(source.entries.iter().filter(|entry| !removed.contains(&entry.segment)));
+            target.ranges.extend(source.ranges.iter().filter(|range| !removed.contains(&range.segment)));
         }
-        self.current.store(next, Ordering::Release);
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        if let Some(listing) = added {
+            let entry = &listing.entry;
+            let at = target.entries.partition_point(|existing| sort_key(existing) <= sort_key(entry));
+            target.entries.insert(at, *entry);
+            let at = target.ranges.partition_point(|existing| existing.lowest <= listing.range.lowest);
+            target.ranges.insert(at, listing.range);
+        }
+        refresh_groups(&mut target.entries);
+        let count = target.ranges.len();
+        refresh_range_reach(&mut target.ranges, 0, count);
+        self.swap_in(&mut target);
         true
     }
+}
+
+/// Read the heap a list holds
+pub fn list_bytes(list: &DirectoryList) -> ByteCount {
+    ByteCount((list.entries.capacity() * size_of::<DirectoryEntry>() + list.ranges.capacity() * size_of::<RangeEntry>()) as u64)
 }
 
 /// Build an empty copy with fixed room

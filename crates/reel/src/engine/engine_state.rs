@@ -624,8 +624,13 @@ impl<Backend: Io> EngineState<Backend> {
             disk_covered: ByteCount(self.volumes.iter().map(|volume| volume.disk_covered.0).sum()),
             ..MemoryReport::default()
         };
-        for directory in self.directories.iter().flatten() {
+        for (index, directory) in self.directories.iter().enumerate().filter_map(|(index, directory)| Some((index, directory.as_ref()?))) {
             report.block_indexes = ByteCount(report.block_indexes.0 + directory.heap_bytes().0);
+            // a volume's columns share one spare, which counts once
+            let is_first = !self.directories[..index].iter().flatten().any(|earlier| earlier.shares_spare(directory));
+            if is_first {
+                report.block_indexes = ByteCount(report.block_indexes.0 + directory.spare_bytes().0);
+            }
         }
         for volume in &self.volumes {
             report.segment_table = ByteCount(report.segment_table.0 + volume.table.heap_bytes().0);

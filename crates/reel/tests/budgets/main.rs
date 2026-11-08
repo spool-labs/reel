@@ -8,7 +8,7 @@ use std::fs;
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use reel::engine::reel_store::ReelStore;
+use reel::engine::reel_store::{ReelStore, ring_fits};
 use reel::io::plain::PlainIo;
 use reel_api::store_error::StoreError;
 use reel_api::units::ByteCount;
@@ -23,6 +23,8 @@ const BUDGETS: [u64; 4] = [128, 192, 512, 4_096];
 const WORKER_COUNTS: [usize; 3] = [0, 1, 4];
 // the spec lets memory_report miss the process heap by this share, as a divisor
 const REPORT_SLACK_DIVISOR: u64 = 10;
+/// The budget a store opens with when its caller gives none
+const DEFAULT_CELL_MIB: u64 = 512;
 
 static LIVE_BYTES: AtomicU64 = AtomicU64::new(0);
 
@@ -104,7 +106,30 @@ fn main() {
         drop(store);
         fs::remove_dir_all(&root).expect("remove");
     }
+    failures += check_default_cell();
     if failures > 0 {
         process::exit(1);
     }
+}
+
+// the default budget opens with the ring, and the report gives the least budget as a figure
+fn check_default_cell() -> u32 {
+    let root = scratch_root();
+    let budget = ByteCount(DEFAULT_CELL_MIB * MIB);
+    let config = config(&root, budget);
+    let mut failures = 0;
+    match ReelStore::open(PlainIo::new(), &config) {
+        Ok(store) => {
+            let report = store.memory_report();
+            println!("the default at {DEFAULT_CELL_MIB} MiB: ring fits {}, least {:?}", ring_fits(&config), report.least_budget);
+            failures += u32::from(!ring_fits(&config) || report.least_budget.0 == 0 || report.least_budget > budget);
+            store.close().expect("close");
+        },
+        Err(error) => {
+            println!("the default refused: {error}");
+            failures += 1;
+        },
+    }
+    fs::remove_dir_all(&root).expect("remove");
+    failures
 }

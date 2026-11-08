@@ -133,6 +133,7 @@ pub struct EngineSizing {
     pub table_share: ByteCount,
     pub lz4_stored_limit: ByteCount,
     pub walk_workers: usize,
+    pub least_budget: ByteCount,
 }
 
 impl StoreShape {
@@ -224,6 +225,7 @@ impl EngineSizing {
             table_share: ByteCount(shared / TABLE_DIVISOR),
             lz4_stored_limit: LZ4_STORED_LIMIT,
             walk_workers: shape.walk_workers(),
+            least_budget: shape.least_budget(),
         }
     }
 }

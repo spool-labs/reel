@@ -28,6 +28,8 @@ pub struct MemoryReport {
     pub open_slots: usize,
     /// Workers each volume runs beside its planner, which the budget may have set below the default
     pub maintenance_workers: usize,
+    /// The least budget this store opens in with the workers and the ring it runs, a figure with no target on it
+    pub least_budget: ByteCount,
     /// How long the last open took, from the root locks to every job running
     pub open_time: Nanoseconds,
     /// The part of that open spent building and touching the pools, the jobs' included

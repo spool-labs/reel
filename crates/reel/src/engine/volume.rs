@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use reel_api::maintenance_report::{PICK_OUTCOMES, PickOutcome, SealSteps};
+use reel_api::maintenance_report::{PICK_OUTCOMES, PickOutcome, SPAN_RUN_BUCKETS, SealSteps};
 use reel_api::units::{ByteCount, Nanoseconds, RowCount, VolumeId, WritePlace};
 
 use crate::config::SyncPolicy;
@@ -242,8 +242,24 @@ pub struct Volume<Backend: Io> {
     pub gave_up: Mutex<GaveUp>,
     pub early_bar_rewrites: AtomicU64,
     pub plain_bar_rewrites: AtomicU64,
-    /// Record rewrites that copied in key order, reading records at random
+    /// Rewrites that copied in key order, reading records at random
     pub key_order_copies: AtomicU64,
+    /// Rewrites that copied each input's records in offset order
+    pub offset_order_copies: AtomicU64,
+    /// Reads the offset-order copy took a run of records in
+    pub span_reads: AtomicU64,
+    /// Records those reads took
+    pub span_records: AtomicU64,
+    /// Bytes those reads took between their records
+    pub span_gap_bytes: AtomicU64,
+    /// Records the offset-order copy read alone
+    pub lone_copies: AtomicU64,
+    /// Records a merge read one at a time as their keys came, in key order or kept on the second look
+    pub keyed_copies: AtomicU64,
+    /// Row-block bytes merges read deciding, placing and copying
+    pub footer_reads: [AtomicU64; 3],
+    /// The offset-order copy's reads by the records each took, a bucket a power of two
+    pub span_runs: [AtomicU64; SPAN_RUN_BUCKETS],
     /// Whole summary saves since open
     pub summary_saves: AtomicU64,
     pub order: WriteOrder,

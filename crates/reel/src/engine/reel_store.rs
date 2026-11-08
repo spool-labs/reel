@@ -17,6 +17,7 @@ use reel_api::usage::{ColumnUsage, UsageReport};
 use reel_api::write_batch::WriteBatch;
 
 use crate::config::{ColumnConfig, DeviceClass, NO_WORKERS, StoreConfig, VolumeConfig};
+use crate::engine::admission::Admission;
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::engine_sizing::{
     complete_block_rows, complete_row_limit,
@@ -632,7 +633,7 @@ pub fn bring_up<Backend: Io>(
     let mut compactions = Vec::with_capacity(state.volumes.len());
     for volume in 0..state.volumes.len() {
         let walk = WalkJob::new(Arc::clone(state), volume);
-        state.seal_heap.fetch_add(walk.heap_bytes().0, Ordering::AcqRel);
+        state.walk_heap.fetch_add(walk.heap_bytes().0, Ordering::AcqRel);
         walks.push(walk);
         let compaction = CompactJob::new(Arc::clone(state), volume);
         state.compaction_heap.fetch_add(compaction.heap_bytes().0, Ordering::AcqRel);
@@ -649,7 +650,7 @@ pub fn bring_up<Backend: Io>(
                 seats: Arc::clone(&compactions[volume].seats),
                 rewrite: None,
             };
-            state.seal_heap.fetch_add(worker.counter.heap_bytes().0 + slot.heap_bytes().0, Ordering::AcqRel);
+            state.walk_heap.fetch_add(worker.counter.heap_bytes().0 + slot.heap_bytes().0, Ordering::AcqRel);
             let task = state.io.spawn_job("reel-walk", worker).map_err(open_error("starting a job"))?;
             let _set = slot.task.set(task);
             workers += 1;
@@ -1166,6 +1167,14 @@ pub fn build_state<Backend: Io>(
             early_bar_rewrites: AtomicU64::new(0),
             plain_bar_rewrites: AtomicU64::new(0),
             key_order_copies: AtomicU64::new(0),
+            offset_order_copies: AtomicU64::new(0),
+            span_reads: AtomicU64::new(0),
+            span_records: AtomicU64::new(0),
+            span_gap_bytes: AtomicU64::new(0),
+            lone_copies: AtomicU64::new(0),
+            keyed_copies: AtomicU64::new(0),
+            footer_reads: Default::default(),
+            span_runs: Default::default(),
             summary_saves: AtomicU64::new(0),
             order: WriteOrder::new(Arc::clone(&places)),
             rows_in_index: AtomicU64::new(0),
@@ -1321,7 +1330,9 @@ pub fn build_state<Backend: Io>(
         unlinks_refused: AtomicU64::new(0),
         memory_budget: config.memory_budget,
         seal_heap: AtomicU64::new(0),
+        walk_heap: AtomicU64::new(0),
         compaction_heap: AtomicU64::new(0),
+        admission: Admission::default(),
         job_count: AtomicU64::new(0),
         row_task: OnceLock::new(),
         reserve_task: OnceLock::new(),

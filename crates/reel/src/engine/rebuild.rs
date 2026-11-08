@@ -57,9 +57,7 @@ impl<Backend: Io> CompactJob<Backend> {
         let Some(number) = next else {
             return false;
         };
-        if self.rebuilds_tried.len() < MOST_REBUILD_TRIES {
-            self.rebuilds_tried.push(number);
-        }
+        self.rebuilds_tried.push_if_room(number);
         let facts = hold(&volume.summary).get(number).map(|row| row.facts);
         let Some(facts) = facts.filter(|facts| facts.row_block_end > facts.data_end && !facts.has_lost_rows) else {
             return false;

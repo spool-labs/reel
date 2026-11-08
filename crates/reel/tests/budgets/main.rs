@@ -8,7 +8,7 @@ use std::fs;
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use reel::engine::engine_sizing::{ENTRY_LINE_DIVISOR, SEAL_JOB_BYTES, WALK_JOB_BYTES, floor_entries};
+use reel::engine::engine_sizing::{COMPACT_JOB_BYTES, ENTRY_LINE_DIVISOR, LANE_JOB_BYTES, SEAL_JOB_BYTES, WALK_JOB_BYTES, floor_entries};
 use reel::engine::reel_store::{ReelStore, ring_fits, store_shape, volume_disks};
 use reel::segment::segment_table::TABLE_SHARDS;
 use reel::io::plain::PlainIo;
@@ -25,8 +25,6 @@ use store_config::{config, scratch_root};
 const MIB: u64 = 1024 * 1024;
 const BUDGETS: [u64; 4] = [128, 192, 512, 4_096];
 const WORKER_COUNTS: [usize; 3] = [0, 1, 4];
-// the spec lets memory_report miss the process heap by this share, as a divisor, until maintenance memory has its own report
-const REPORT_SLACK_DIVISOR: u64 = 10;
 /// The budget a store opens with when its caller gives none
 const DEFAULT_CELL_MIB: u64 = 512;
 /// The thinnest budget the harness opens, where the ring may not fit
@@ -99,7 +97,8 @@ fn main() {
             shard.table_slots,
         );
         println!("{report:?}");
-        if held > report.budget.0 || live.abs_diff(report.heap_total().0) > report.heap_total().0 / REPORT_SLACK_DIVISOR {
+        // the report may miss the heap by the plan's named room, so a hole past it shows at any budget
+        if held > report.budget.0 || live.abs_diff(report.heap_total().0) > report.room.0 {
             println!("budget {} MiB fails", budget.0 / MIB);
             failures += 1;
         }
@@ -169,6 +168,10 @@ fn check_job_plans(report: &MemoryReport, volumes: u64) -> u32 {
     println!("jobs: {:?} footer space against {footer_plan} B planned, {:?} compaction", report.footer_space, report.compaction);
     if report.footer_space.0 > footer_plan {
         println!("a seal or a walk holds more than its plan");
+        return 1;
+    }
+    if report.compaction.0 > volumes * COMPACT_JOB_BYTES + workers * LANE_JOB_BYTES {
+        println!("a compaction job holds more than its plan");
         return 1;
     }
     0

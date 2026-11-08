@@ -1,6 +1,7 @@
 //! The one interface every file operation, clock read and engine thread goes through
 
 pub mod device_error;
+pub mod host_memory;
 pub mod job;
 pub mod lock_outcome;
 pub mod plain;
@@ -20,6 +21,7 @@ use std::task::{Context, Poll, Waker};
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, WritePlace};
 
 use crate::engine::read_path::SealedRow;
+use crate::io::host_memory::HostMemory;
 use crate::io::job::Job;
 use crate::io::lock_outcome::LockOutcome;
 use crate::io::ring::RingDriver;
@@ -316,6 +318,9 @@ pub trait Io: Clone + Send + Sync + 'static {
 
     /// Read the size of the disk under a directory and its filesystem, or nothing when the disk has no set size
     fn capacity(&self, path: &Path) -> Result<Option<DiskSize>>;
+
+    /// Read the host's memory and the control group's room now, for a maintenance job's admission
+    fn host_memory(&self) -> HostMemory;
 
     /// Say whether any disk under a path spins, or nothing when this backend can't tell
     fn is_rotational(&self, path: &Path) -> Option<bool>;

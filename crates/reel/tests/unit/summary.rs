@@ -26,6 +26,7 @@ fn facts(number: u64) -> SegmentFacts {
         is_backward: false,
         has_lost_rows: false,
         marks: MarkRange { lowest: DeathMark(40), highest: DeathMark(70) },
+        most_block_rows: 12,
     }
 }
 
@@ -147,12 +148,12 @@ fn head_rot() {
 #[test]
 fn key_bound() {
     let mut bound = Vec::new();
-    put_bound(b"pear", &mut bound);
+    put_bound(b"pear", &mut bound).expect("bound");
     assert_eq!(bound, b"pear\0");
 
     let long = [7; 2 * SUMMARY_KEY_BYTES];
     bound.clear();
-    put_bound(&long, &mut bound);
+    put_bound(&long, &mut bound).expect("bound");
     let mut above = long[..SUMMARY_KEY_BYTES].to_vec();
     above[SUMMARY_KEY_BYTES - 1] += 1;
     assert_eq!(bound, above);
@@ -164,7 +165,7 @@ fn key_bound() {
 fn no_bound() {
     let mut bound = Vec::new();
 
-    put_bound(&[u8::MAX; SUMMARY_KEY_BYTES], &mut bound);
+    put_bound(&[u8::MAX; SUMMARY_KEY_BYTES], &mut bound).expect("bound");
 
     assert!(bound.is_empty());
 }
@@ -175,7 +176,7 @@ fn key_prefix() {
     let long = [7; 2 * SUMMARY_KEY_BYTES];
     let mut lowest = Vec::new();
 
-    put_lowest(&long, &mut lowest);
+    put_lowest(&long, &mut lowest).expect("lowest");
 
     assert_eq!(lowest.len(), SUMMARY_KEY_BYTES);
     assert!(lowest.as_slice() <= long.as_slice());
@@ -292,4 +293,23 @@ fn lookup_full() {
 
     assert!(!rows.is_lookup_whole());
     assert_eq!(rows.get(SegmentNumber(5)).expect("a row").facts.segment, SegmentNumber(5));
+}
+
+// the footer bytes the rows add up to follow every push, remove and copy, and match a walk over the rows
+#[test]
+fn footer_total_follows_rows() {
+    let walked = |rows: &SummaryRows| ByteCount(rows.rows().map(|row| footer_of(&row.facts)).sum());
+    let mut rows = filled();
+    assert_eq!(rows.footer_bytes(), walked(&rows));
+    assert!(rows.footer_bytes().0 > 0);
+
+    let offsets = rows.offsets();
+    let mut copied = SummaryRows::new(ROOM);
+    assert!(copied.copy_row(&rows, offsets[&SegmentNumber(2)]));
+    assert_eq!(copied.footer_bytes(), walked(&copied));
+
+    rows.remove(SegmentNumber(1));
+    assert_eq!(rows.footer_bytes(), walked(&rows));
+    rows.remove(SegmentNumber(2));
+    assert_eq!(rows.footer_bytes(), ByteCount(0));
 }

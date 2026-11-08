@@ -20,7 +20,7 @@ use crate::engine::volume::Volume;
 use crate::engine::walk_job::BlockCounts;
 use crate::guard::hold;
 use crate::io::{InPlace, Io, IoFile, ReadOn, in_place};
-use crate::pool::{touched_capacity, touched_zeroes};
+use crate::fixed_list::FixedList;
 use crate::row_kind::RowKind;
 use crate::segment::row_block::{ROW_BLOCK_BYTES, RowBlockWalk};
 use crate::segment::segment_tail::SegmentNumber;
@@ -51,15 +51,15 @@ pub struct CoverApply<Backend: Io> {
     pub segment: Option<SegmentNumber>,
     position: usize,
     cover: Option<(ColumnId, WritePlace)>,
-    start: Vec<u8>,
-    end: Vec<u8>,
+    start: FixedList<u8>,
+    end: FixedList<u8>,
     last_other: SegmentNumber,
     target: Option<ApplyTarget>,
-    block: Vec<u8>,
-    key: Vec<u8>,
-    lowest: Vec<u8>,
-    highest: Vec<u8>,
-    counts: BlockCounts,
+    block: FixedList<u8>,
+    key: FixedList<u8>,
+    lowest: FixedList<u8>,
+    highest: FixedList<u8>,
+    pub counts: BlockCounts,
 }
 
 impl<Backend: Io> CoverApply<Backend> {
@@ -72,15 +72,15 @@ impl<Backend: Io> CoverApply<Backend> {
             segment: None,
             position: 0,
             cover: None,
-            start: touched_capacity(keys, 0),
-            end: touched_capacity(keys, 0),
+            start: FixedList::on_heap(keys),
+            end: FixedList::on_heap(keys),
             last_other: SegmentNumber(0),
             target: None,
-            block: touched_zeroes(ROW_BLOCK_BYTES),
-            key: touched_capacity(keys, 0),
-            lowest: touched_capacity(keys, 0),
-            highest: touched_capacity(keys, 0),
-            counts: BlockCounts::new(),
+            block: FixedList::filled_on_heap(ROW_BLOCK_BYTES, 0),
+            key: FixedList::on_heap(keys),
+            lowest: FixedList::on_heap(keys),
+            highest: FixedList::on_heap(keys),
+            counts: BlockCounts::default(),
         }
     }
 
@@ -249,7 +249,7 @@ impl<Backend: Io> CoverApply<Backend> {
                 Err(_error) => return Err(Error::from(ErrorKind::Interrupted)),
             };
             if newest.is_some_and(|found| found.segment == target.segment && found.row.place == row.place) {
-                self.counts.count_dead(target.segment, column, target.next_block, &row, place);
+                self.counts.count_dead(target.segment, column, target.next_block, &row, place)?;
             }
         }
         self.land(volume, target.segment)
@@ -308,7 +308,7 @@ impl<Backend: Io> CoverApply<Backend> {
             bytes,
             kept_bytes: ByteCount(0),
             replacement: place,
-        });
+        })?;
         self.land(volume, target.segment)
     }
 

@@ -5,7 +5,7 @@ use std::io::Error;
 use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::{
+use reel_api::maintenance_report::{MaintenanceMemory, 
     CompleteReading, JOB_KINDS, JobKind, JobState, LeastValueReading, MOST_REPORTED_LANES, MaintenanceReport, RewriteBytes, UnitKind, VolumeReading,
 };
 use reel_api::store_error::StoreError;
@@ -174,6 +174,14 @@ impl<Backend: Io> EngineState<Backend> {
                 plain_bar_rewrites: volume.plain_bar_rewrites.load(Ordering::Acquire),
                 longest_seal_steps: volume.seal_steps.reading(),
                 key_order_copies: volume.key_order_copies.load(Ordering::Acquire),
+                offset_order_copies: volume.offset_order_copies.load(Ordering::Acquire),
+                span_reads: volume.span_reads.load(Ordering::Acquire),
+                span_records: volume.span_records.load(Ordering::Acquire),
+                span_gap_bytes: ByteCount(volume.span_gap_bytes.load(Ordering::Acquire)),
+                lone_copies: volume.lone_copies.load(Ordering::Acquire),
+                keyed_copies: volume.keyed_copies.load(Ordering::Acquire),
+                footer_reads: volume.footer_reads.each_ref().map(|bytes| ByteCount(bytes.load(Ordering::Acquire))),
+                span_runs: volume.span_runs.each_ref().map(|count| count.load(Ordering::Acquire)),
                 summary_saves: volume.summary_saves.load(Ordering::Acquire),
                 entries_used: SegmentCount(volume.table.segment_count()),
                 entry_room: SegmentCount(volume.table.capacity() as u64),
@@ -234,6 +242,7 @@ impl<Backend: Io> EngineState<Backend> {
         report.damaged_segments = SegmentCount(self.damaged_segments.load(Ordering::Acquire));
         report.summary_rows_dropped = RowCount(self.dropped_summary_rows.load(Ordering::Acquire));
         report.refused_reads = RowCount(self.cues.refused_reads());
+        report.memory = MaintenanceMemory { walk_fixed: ByteCount(self.walk_heap.load(Ordering::Acquire)), ..self.admission.reading() };
     }
 
     /// Check a kind of job has work standing, which is what makes moving nothing a stall

@@ -5,6 +5,7 @@ use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use reel_api::units::{ByteCount, WritePlace};
 
+use crate::fixed_list::ListOut;
 use crate::pool::touched_capacity;
 use crate::guard::hold;
 use crate::record::record_check::{Checksum, checksum};
@@ -67,8 +68,8 @@ pub struct DirectoryPage {
 
 /// Counts the segments a search has passed and fills a page
 #[derive(Debug)]
-pub struct PageFill<'out, Item> {
-    out: &'out mut Vec<Item>,
+pub struct PageFill<'out, Out> {
+    out: &'out mut Out,
     skip: usize,
     seen: usize,
     is_cut: bool,
@@ -108,16 +109,17 @@ impl Listing {
     }
 }
 
-impl<Item> PageFill<'_, Item> {
+impl<Out> PageFill<'_, Out> {
     /// Add a matching segment, or note that the page is full
-    pub fn add(&mut self, item: Item) {
+    pub fn add<Item: Copy>(&mut self, item: Item)
+    where
+        Out: ListOut<Item>,
+    {
         self.seen += 1;
         if self.seen <= self.skip {
             return;
         }
-        if self.out.len() < self.out.capacity() {
-            self.out.push(item);
-        } else {
+        if !self.out.push_if_room(item) {
             self.is_cut = true;
         }
     }
@@ -176,7 +178,7 @@ impl ColumnDirectory {
     }
 
     /// Fill a buffer with the segments whose keys can meet a range, past those a caller already has
-    pub fn overlapping(&self, low: &KeyBound, high: &KeyBound, skip: usize, out: &mut Vec<SegmentNumber>) -> DirectoryPage {
+    pub fn overlapping(&self, low: &KeyBound, high: &KeyBound, skip: usize, out: &mut impl ListOut<SegmentNumber>) -> DirectoryPage {
         out.clear();
         let current = self.current.load(Ordering::Acquire);
         let copy = read_list(&self.versions[current]);
@@ -303,7 +305,7 @@ pub fn group_of(length_run: &[DirectoryEntry], sum: Checksum) -> &[DirectoryEntr
 }
 
 /// Add every segment of a group whose range holds a key, skipping whole runs that can't
-pub fn search_group(group: &[DirectoryEntry], key: KeyPrefix, fill: &mut PageFill<Candidate>) {
+pub fn search_group(group: &[DirectoryEntry], key: KeyPrefix, fill: &mut PageFill<impl ListOut<Candidate>>) {
     if group.is_empty() {
         return;
     }
@@ -329,7 +331,7 @@ pub fn search_group(group: &[DirectoryEntry], key: KeyPrefix, fill: &mut PageFil
 }
 
 /// Add every segment whose keys can meet a range, skipping whole runs that can't. A segment comes out in order of its lowest key
-pub fn search_ranges(ranges: &[RangeEntry], start: usize, end: usize, low: &KeyBound, high: &KeyBound, fill: &mut PageFill<SegmentNumber>) {
+pub fn search_ranges(ranges: &[RangeEntry], start: usize, end: usize, low: &KeyBound, high: &KeyBound, fill: &mut PageFill<impl ListOut<SegmentNumber>>) {
     if start == end {
         return;
     }

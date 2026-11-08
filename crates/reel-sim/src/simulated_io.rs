@@ -10,6 +10,7 @@ use std::time::Instant;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, ProcessId};
 
 use reel::guard::hold;
+use reel::io::host_memory::HostMemory;
 use reel::io::{DiskSize, Io};
 use reel::io::job::{Job, JobStep};
 use reel::io::lock_outcome::LockOutcome;
@@ -190,6 +191,11 @@ impl SimulatedIo {
     pub fn note_ring_read(&self) {
         let mut disk = hold(&self.disk);
         disk.ring_reads = OperationCount(disk.ring_reads.0 + 1);
+    }
+
+    /// Set what a read of the host's memory finds from now on
+    pub fn set_host_memory(&self, memory: HostMemory) {
+        hold(&self.disk).host_memory = memory;
     }
 
     /// Let this many tries find the kernel holding their bytes, before the warm bytes decide again
@@ -491,6 +497,10 @@ impl Io for SimulatedIo {
         let mut disk = hold(&self.disk);
         disk.enter()?;
         Ok(disk.disk_size(path))
+    }
+
+    fn host_memory(&self) -> HostMemory {
+        hold(&self.disk).host_memory
     }
 
     fn lock(&self, path: &Path) -> Result<LockOutcome<SimulatedLock>> {

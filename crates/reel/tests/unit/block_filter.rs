@@ -45,3 +45,46 @@ fn false_rate() {
     }
     assert!((false_hits as f64 / CHECKS as f64) <= MOST_FALSE_RATE);
 }
+
+// the multiply-high reduction with its full stride keeps the false positive rate the modulo and its half stride had, from the least filter up to a full block
+#[test]
+fn reduction_rate_matches_modulo() {
+    let modulo_contains = |filter: &[u8], hash: KeyHash| {
+        let bits = filter.len() as u64 * u64::from(u8::BITS);
+        let stride = (hash.0 >> 32) | 1;
+        let mut probe = hash.0;
+        (0..PROBE_COUNT).all(|_round| {
+            let bit = probe % bits;
+            probe = probe.wrapping_add(stride);
+            filter[(bit / 8) as usize] & (1 << (bit % 8)) != 0
+        })
+    };
+    let modulo_add = |filter: &mut [u8], hash: KeyHash| {
+        let bits = filter.len() as u64 * u64::from(u8::BITS);
+        let stride = (hash.0 >> 32) | 1;
+        let mut probe = hash.0;
+        for _round in 0..PROBE_COUNT {
+            let bit = probe % bits;
+            filter[(bit / 8) as usize] |= 1 << (bit % 8);
+            probe = probe.wrapping_add(stride);
+        }
+    };
+    for rows in [4_u64, 64, 1_400, 16_384] {
+        let (mut reduced, mut modulo) = (vec![0; filter_bytes(rows as usize)], vec![0; filter_bytes(rows as usize)]);
+        for number in 0..rows {
+            add_key(&mut reduced, hash_of(number));
+            modulo_add(&mut modulo, hash_of(number));
+        }
+        let checks = CHECKS.max(rows * 20);
+        let mut hits = (0, 0);
+        for number in rows..rows + checks {
+            hits.0 += u64::from(may_contain(&reduced, hash_of(number)));
+            hits.1 += u64::from(modulo_contains(&modulo, hash_of(number)));
+        }
+        let (reduced_rate, modulo_rate) = (hits.0 as f64 / checks as f64, hits.1 as f64 / checks as f64);
+        // a few standard deviations of the modulo's own count
+        let noise = 4.0 * (modulo_rate * (1.0 - modulo_rate) / checks as f64).sqrt() + 1.0 / checks as f64;
+        assert!(reduced_rate <= modulo_rate + noise, "{rows} rows: reduced {reduced_rate} against modulo {modulo_rate}");
+        assert!((0..rows).all(|number| may_contain(&reduced, hash_of(number))));
+    }
+}

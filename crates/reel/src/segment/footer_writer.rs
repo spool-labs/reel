@@ -5,7 +5,9 @@ use std::io::{Error, IoSlice, Result};
 use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
-use crate::pool::{touched_capacity, touched_zeroes};
+use crate::config::MAX_KEY_BYTES;
+use crate::fixed_list::{FixedList, ListFull};
+use crate::region::{Region, list_bytes};
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::io::IoFile;
 use crate::lifetime::MarkRange;
@@ -26,6 +28,10 @@ use crate::segment::segment_tail::{
 pub const SMALLEST_ROW_BYTES: usize = 4;
 /// Most rows a block of the smallest rows can hold
 pub const MOST_BLOCK_ROWS: usize = ROW_BLOCK_BYTES / SMALLEST_ROW_BYTES;
+/// Bytes the filter buffer takes: the bits for a block of the most rows and the sum
+pub const FILTER_LIST_BYTES: usize = filter_bytes(MOST_BLOCK_ROWS) + FILTER_SUM_BYTES;
+/// Bytes the columns' kept lowest keys and bounds take, a bound one byte past its key
+pub const KEY_BYTES_ROOM: usize = MAX_COLUMNS * (2 * SUMMARY_KEY_BYTES + 1);
 
 /// What the writer knows about a column before its first row
 #[derive(Clone, Copy, Debug)]
@@ -52,27 +58,29 @@ pub struct FooterTotals {
     pub file_length: ByteCount,
     pub block_count: BlockCount,
     pub row_count: RowCount,
+    pub most_block_rows: u32,
 }
 
 /// A footer in the writing, with buffers that never grow
 #[derive(Debug)]
 pub struct FooterWriter {
     builder: RowBlockBuilder,
-    filter: Vec<u8>,
-    hashes: Vec<KeyHash>,
-    entries: Vec<BlockEntry>,
-    columns: Vec<ColumnTail>,
-    column_keys: Vec<ColumnKeys>,
-    key_bytes: Vec<u8>,
-    tail: Vec<u8>,
-    index: Vec<u8>,
+    filter: FixedList<u8>,
+    hashes: FixedList<KeyHash>,
+    entries: FixedList<BlockEntry>,
+    columns: FixedList<ColumnTail>,
+    column_keys: FixedList<ColumnKeys>,
+    key_bytes: FixedList<u8>,
+    tail: FixedList<u8>,
+    index: FixedList<u8>,
     position: FileOffset,
-    first_key: Vec<u8>,
-    last_key: Vec<u8>,
+    first_key: FixedList<u8>,
+    last_key: FixedList<u8>,
     places: PlaceRange,
     place_base: WritePlace,
     marks: MarkRange,
     row_count: RowCount,
+    most_block_rows: u32,
     pub is_output: bool,
     pub is_partial: bool,
     pub is_unwalked: bool,
@@ -83,25 +91,98 @@ impl FooterWriter {
     pub fn new(most_blocks: BlockCount) -> Self {
         Self {
             builder: RowBlockBuilder::new(),
-            filter: touched_zeroes(filter_bytes(MOST_BLOCK_ROWS) + FILTER_SUM_BYTES),
-            hashes: touched_capacity(MOST_BLOCK_ROWS, KeyHash::default()),
-            entries: touched_capacity(most_blocks.0 as usize, BlockEntry::default()),
-            columns: touched_capacity(MAX_COLUMNS, ColumnTail::default()),
-            column_keys: touched_capacity(MAX_COLUMNS, ColumnKeys::default()),
-            key_bytes: touched_capacity(MAX_COLUMNS * (2 * SUMMARY_KEY_BYTES + 1), 0),
-            tail: touched_zeroes(MAX_TAIL_BYTES),
-            index: touched_zeroes(ROW_BLOCK_BYTES),
+            filter: FixedList::filled_on_heap(FILTER_LIST_BYTES, 0),
+            hashes: FixedList::on_heap(MOST_BLOCK_ROWS),
+            entries: FixedList::on_heap(most_blocks.0 as usize),
+            columns: FixedList::on_heap(MAX_COLUMNS),
+            column_keys: FixedList::on_heap(MAX_COLUMNS),
+            key_bytes: FixedList::on_heap(KEY_BYTES_ROOM),
+            tail: FixedList::filled_on_heap(MAX_TAIL_BYTES, 0),
+            index: FixedList::filled_on_heap(ROW_BLOCK_BYTES, 0),
             position: FileOffset(0),
-            first_key: touched_capacity(ROW_BLOCK_BYTES, 0),
-            last_key: touched_capacity(ROW_BLOCK_BYTES, 0),
+            first_key: FixedList::on_heap(MAX_KEY_BYTES as usize),
+            last_key: FixedList::on_heap(MAX_KEY_BYTES as usize),
             places: PlaceRange::default(),
             place_base: WritePlace(0),
             marks: MarkRange::NONE,
             row_count: RowCount(0),
+            most_block_rows: 0,
             is_output: false,
             is_partial: false,
             is_unwalked: false,
         }
+    }
+
+    /// Make a writer with no buffers, which a job fills from its region at its start
+    pub fn empty() -> Self {
+        Self {
+            builder: RowBlockBuilder::empty(),
+            filter: FixedList::empty(),
+            hashes: FixedList::empty(),
+            entries: FixedList::empty(),
+            columns: FixedList::empty(),
+            column_keys: FixedList::empty(),
+            key_bytes: FixedList::empty(),
+            tail: FixedList::empty(),
+            index: FixedList::empty(),
+            position: FileOffset(0),
+            first_key: FixedList::empty(),
+            last_key: FixedList::empty(),
+            places: PlaceRange::default(),
+            place_base: WritePlace(0),
+            marks: MarkRange::NONE,
+            row_count: RowCount(0),
+            most_block_rows: 0,
+            is_output: false,
+            is_partial: false,
+            is_unwalked: false,
+        }
+    }
+
+    /// Count the bytes the lists hold and the most they have written, for a job's touched high water
+    pub fn list_bytes(&self) -> (usize, usize) {
+        let held = self.filter.held_bytes() + self.hashes.held_bytes() + self.entries.held_bytes() + self.columns.held_bytes();
+        let held = held + self.column_keys.held_bytes() + self.key_bytes.held_bytes() + self.tail.held_bytes() + self.index.held_bytes();
+        let held = held + self.first_key.held_bytes() + self.last_key.held_bytes() + self.builder.held_bytes();
+        let peak = self.filter.peak_bytes() + self.hashes.peak_bytes() + self.entries.peak_bytes() + self.columns.peak_bytes();
+        let peak = peak + self.column_keys.peak_bytes() + self.key_bytes.peak_bytes() + self.tail.peak_bytes() + self.index.peak_bytes();
+        let peak = peak + self.first_key.peak_bytes() + self.last_key.peak_bytes() + self.builder.peak_bytes();
+        (held, peak)
+    }
+
+    /// Carve the buffers for a segment of up to this many row blocks from a job's region
+    pub fn in_region(region: &mut Region, most_blocks: BlockCount) -> std::result::Result<Self, ListFull> {
+        Ok(Self {
+            builder: RowBlockBuilder::in_region(region)?,
+            filter: region.carve_filled(FILTER_LIST_BYTES, 0)?,
+            hashes: region.carve(MOST_BLOCK_ROWS)?,
+            entries: region.carve(most_blocks.0 as usize)?,
+            columns: region.carve(MAX_COLUMNS)?,
+            column_keys: region.carve(MAX_COLUMNS)?,
+            key_bytes: region.carve(KEY_BYTES_ROOM)?,
+            tail: region.carve_filled(MAX_TAIL_BYTES, 0)?,
+            index: region.carve_filled(ROW_BLOCK_BYTES, 0)?,
+            position: FileOffset(0),
+            first_key: region.carve(MAX_KEY_BYTES as usize)?,
+            last_key: region.carve(MAX_KEY_BYTES as usize)?,
+            places: PlaceRange::default(),
+            place_base: WritePlace(0),
+            marks: MarkRange::NONE,
+            row_count: RowCount(0),
+            most_block_rows: 0,
+            is_output: false,
+            is_partial: false,
+            is_unwalked: false,
+        })
+    }
+
+    /// Count the region bytes a writer for this many row blocks takes, each list with its alignment room
+    pub fn region_bytes(most_blocks: BlockCount) -> usize {
+        let buffers = list_bytes::<u8>(FILTER_LIST_BYTES) + list_bytes::<u8>(KEY_BYTES_ROOM) + list_bytes::<u8>(MAX_TAIL_BYTES) + list_bytes::<u8>(ROW_BLOCK_BYTES);
+        let keys = 2 * list_bytes::<u8>(MAX_KEY_BYTES as usize);
+        let lists = list_bytes::<KeyHash>(MOST_BLOCK_ROWS) + list_bytes::<BlockEntry>(most_blocks.0 as usize);
+        let columns = list_bytes::<ColumnTail>(MAX_COLUMNS) + list_bytes::<ColumnKeys>(MAX_COLUMNS);
+        RowBlockBuilder::region_bytes() + buffers + keys + lists + columns
     }
 
     /// Read the heap these buffers hold
@@ -176,6 +257,7 @@ impl FooterWriter {
             lowest: WritePlace(u64::MAX),
             highest: WritePlace(0),
         };
+        self.most_block_rows = 0;
         self.row_count = RowCount(0);
         self.is_output = false;
         self.is_partial = false;
@@ -188,15 +270,15 @@ impl FooterWriter {
         self.builder.set_block_bytes(start.block_bytes);
         let shared = shared_prefix(start.lowest, start.highest);
         let lowest_at = self.key_bytes.len();
-        put_lowest(start.lowest, &mut self.key_bytes);
+        put_lowest(start.lowest, &mut self.key_bytes)?;
         let highest_at = self.key_bytes.len();
-        put_bound(start.highest, &mut self.key_bytes);
+        put_bound(start.highest, &mut self.key_bytes)?;
         self.column_keys.push(ColumnKeys {
             lowest_at,
             highest_at,
             end: self.key_bytes.len(),
             value_bytes: ByteCount(0),
-        });
+        })?;
         self.columns.push(ColumnTail {
             column: start.column,
             shared_length: shared as u16,
@@ -208,19 +290,20 @@ impl FooterWriter {
             block_count: BlockCount(0),
             row_count: RowCount(0),
             grave_count: RowCount(0),
-        });
+        })?;
         Ok(())
     }
 
     /// End the current column at the last key it took, so its range says what it holds and nothing wider
-    pub fn end_column(&mut self, last_key: &[u8]) {
+    pub fn end_column(&mut self, last_key: &[u8]) -> std::result::Result<(), ListFull> {
         let (Some(tail), Some(keys)) = (self.columns.last_mut(), self.column_keys.last_mut()) else {
-            return;
+            return Ok(());
         };
         tail.highest = KeyPrefix::of_key(last_key, tail.shared_length as usize);
         self.key_bytes.truncate(keys.highest_at);
-        put_bound(last_key, &mut self.key_bytes);
+        put_bound(last_key, &mut self.key_bytes)?;
         keys.end = self.key_bytes.len();
+        Ok(())
     }
 
     /// Add the next row of the current column, in row order
@@ -230,19 +313,19 @@ impl FooterWriter {
         }
         if !self.builder.push(key, row) {
             self.close_block(file)?;
-            self.builder.push(key, row);
+            if !self.builder.push(key, row) {
+                return Err(Error::other("a row is past what an empty block holds"));
+            }
         }
 
         if self.builder.row_count().0 == 1 {
-            self.first_key.clear();
-            self.first_key.extend_from_slice(key);
+            self.first_key.set_from(key)?;
         }
         if self.hashes.is_empty() || self.last_key != key {
             if let Some(column) = self.columns.last() {
-                self.hashes.push(hash_key(column.column, key));
+                self.hashes.push(hash_key(column.column, key))?;
             }
-            self.last_key.clear();
-            self.last_key.extend_from_slice(key);
+            self.last_key.set_from(key)?;
         }
 
         self.places.lowest = self.places.lowest.min(row.place);
@@ -307,7 +390,8 @@ impl FooterWriter {
             block_offset: block_at.0 as u32,
             filter_offset: filter_at as u32,
             live_rows: row_count.0 as u32,
-        });
+        })?;
+        self.most_block_rows = self.most_block_rows.max(row_count.0 as u32);
         if let Some(column) = self.columns.last_mut() {
             column.block_count = BlockCount(column.block_count.0 + 1);
         }
@@ -387,6 +471,7 @@ impl FooterWriter {
             file_length,
             block_count: head.block_count,
             row_count: self.row_count,
+            most_block_rows: self.most_block_rows,
         })
     }
 

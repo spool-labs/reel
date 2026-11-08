@@ -4,7 +4,9 @@ use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
 use xxhash_rust::xxh3::xxh3_64;
 
-use crate::pool::{touched_capacity, touched_zeroes};
+use crate::fixed_list::{FixedList, ListFull, ListOut};
+use crate::config::MAX_KEY_BYTES;
+use crate::region::{Region, list_bytes};
 use crate::little_endian::{read_half, read_word};
 use crate::row_kind::RowKind;
 use crate::segment::varint::{MAX_VARINT_BYTES, read_varint, write_varint};
@@ -69,10 +71,10 @@ pub struct FooterRow {
 /// A block being filled, in buffers that never grow
 #[derive(Debug)]
 pub struct RowBlockBuilder {
-    bytes: Vec<u8>,
+    bytes: FixedList<u8>,
     used: usize,
-    restarts: Vec<u16>,
-    last_key: Vec<u8>,
+    restarts: FixedList<u16>,
+    last_key: FixedList<u8>,
     row_count: u32,
     place_base: WritePlace,
     block_bytes: usize,
@@ -92,14 +94,55 @@ impl RowBlockBuilder {
     /// Allocate the buffers
     pub fn new() -> Self {
         Self {
-            bytes: touched_zeroes(ROW_BLOCK_BYTES),
+            bytes: FixedList::filled_on_heap(ROW_BLOCK_BYTES, 0),
             used: 0,
-            restarts: touched_capacity(MAX_RESTARTS, 0),
-            last_key: touched_capacity(ROW_BLOCK_BYTES, 0),
+            restarts: FixedList::on_heap(MAX_RESTARTS),
+            last_key: FixedList::on_heap(MAX_KEY_BYTES as usize),
             row_count: 0,
             place_base: WritePlace(0),
             block_bytes: ROW_BLOCK_BYTES,
         }
+    }
+
+    /// Make a builder with no buffers, which a job fills from its region at its start
+    pub fn empty() -> Self {
+        Self {
+            bytes: FixedList::empty(),
+            used: 0,
+            restarts: FixedList::empty(),
+            last_key: FixedList::empty(),
+            row_count: 0,
+            place_base: WritePlace(0),
+            block_bytes: ROW_BLOCK_BYTES,
+        }
+    }
+
+    /// Carve the buffers from a job's region
+    pub fn in_region(region: &mut Region) -> Result<Self, ListFull> {
+        Ok(Self {
+            bytes: region.carve_filled(ROW_BLOCK_BYTES, 0)?,
+            used: 0,
+            restarts: region.carve(MAX_RESTARTS)?,
+            last_key: region.carve(MAX_KEY_BYTES as usize)?,
+            row_count: 0,
+            place_base: WritePlace(0),
+            block_bytes: ROW_BLOCK_BYTES,
+        })
+    }
+
+    /// Count the bytes the buffers hold
+    pub fn held_bytes(&self) -> usize {
+        self.bytes.held_bytes() + self.restarts.held_bytes() + self.last_key.held_bytes()
+    }
+
+    /// Count the most bytes the buffers have written
+    pub fn peak_bytes(&self) -> usize {
+        self.bytes.peak_bytes() + self.restarts.peak_bytes() + self.last_key.peak_bytes()
+    }
+
+    /// Count the region bytes the buffers take
+    pub fn region_bytes() -> usize {
+list_bytes::<u8>(ROW_BLOCK_BYTES) + list_bytes::<u16>(MAX_RESTARTS) + list_bytes::<u8>(MAX_KEY_BYTES as usize)
     }
 
     /// Read the heap these buffers hold
@@ -137,12 +180,13 @@ impl RowBlockBuilder {
         let restarts_after = self.restarts.len() + usize::from(is_restart);
         let trailer = restarts_after * size_of::<u16>() + BLOCK_TRAILER_BYTES;
         let most_row_bytes = ROW_ROOM_NUMBERS + suffix.len();
-        if self.used + most_row_bytes + trailer > self.block_bytes {
+        if self.used + most_row_bytes + trailer > self.block_bytes || (is_restart && self.restarts.room() == 0) {
             return false;
         }
-
-        if is_restart {
-            self.restarts.push(self.used as u16);
+        // the key goes in first, so a key past the list's room leaves the block's bytes as they were
+        self.last_key.truncate(shared);
+        if self.last_key.extend_from_slice(suffix).is_err() || (is_restart && !self.restarts.push_if_room(self.used as u16)) {
+            return false;
         }
         self.put_varint(((shared as u64) << KIND_BITS) | u64::from(row.kind.as_byte()));
         self.put_varint(suffix.len() as u64);
@@ -151,9 +195,6 @@ impl RowBlockBuilder {
         self.put_varint(row.place.0 - self.place_base.0);
         self.put_varint(row.offset.0);
         self.put_varint(row.length.0);
-
-        self.last_key.truncate(shared);
-        self.last_key.extend_from_slice(suffix);
         self.row_count += 1;
         true
     }
@@ -261,7 +302,7 @@ impl<'block> RowBlockWalk<'block> {
     }
 
     /// Fill the key buffer with the next row's key and return its row, or nothing at the end
-    pub fn next_row(&mut self, key: &mut Vec<u8>) -> Option<FooterRow> {
+    pub fn next_row(&mut self, key: &mut impl ListOut<u8>) -> Option<FooterRow> {
         let bytes = self.rows.get(self.position..)?;
         if bytes.is_empty() {
             return None;
@@ -274,7 +315,7 @@ impl<'block> RowBlockWalk<'block> {
         let suffix_at = shared_bytes + suffix_bytes;
         let suffix = bytes.get(suffix_at..suffix_at + suffix_length as usize)?;
         key.truncate(shared as usize);
-        key.extend_from_slice(suffix);
+        key.extend_from_slice(suffix).ok()?;
 
         let place_at = suffix_at + suffix_length as usize;
         let (place, place_bytes) = read_varint(bytes.get(place_at..)?)?;
@@ -299,7 +340,7 @@ impl<'block> RowBlockWalk<'block> {
     }
 
     /// Read a row of a run by its place in the run, leaving its key in the buffer
-    pub fn row_in_run(&mut self, restart: usize, index: usize, key: &mut Vec<u8>) -> Option<FooterRow> {
+    pub fn row_in_run(&mut self, restart: usize, index: usize, key: &mut impl ListOut<u8>) -> Option<FooterRow> {
         let mut row = self.key_at_restart(restart, key)?;
         for _row in 0..index {
             row = self.next_row(key)?;
@@ -308,7 +349,7 @@ impl<'block> RowBlockWalk<'block> {
     }
 
     /// Find the last run with a row at or before a key, and count that run's rows there, or return nothing when no row is
-    pub fn seek_back(&mut self, target: &[u8], is_inclusive: bool, key: &mut Vec<u8>) -> Option<(usize, usize)> {
+    pub fn seek_back(&mut self, target: &[u8], is_inclusive: bool, key: &mut impl ListOut<u8>) -> Option<(usize, usize)> {
         let is_before = |row_key: &[u8]| row_key < target || (is_inclusive && row_key == target);
         if self.restart_count() == 0 {
             return None;
@@ -343,14 +384,14 @@ impl<'block> RowBlockWalk<'block> {
     }
 
     /// Read the key at a restart point, leaving the walk there
-    pub fn key_at_restart(&mut self, index: usize, key: &mut Vec<u8>) -> Option<FooterRow> {
+    pub fn key_at_restart(&mut self, index: usize, key: &mut impl ListOut<u8>) -> Option<FooterRow> {
         self.position = self.restart_at(index);
         key.clear();
         self.next_row(key)
     }
 
     /// Move to the first row at or after a key, return its row, and leave its key in the buffer
-    pub fn seek(&mut self, target: &[u8], key: &mut Vec<u8>) -> Option<FooterRow> {
+    pub fn seek(&mut self, target: &[u8], key: &mut impl ListOut<u8>) -> Option<FooterRow> {
         if self.restart_count() == 0 {
             return None;
         }
@@ -360,7 +401,7 @@ impl<'block> RowBlockWalk<'block> {
         while low + 1 < high {
             let middle = (low + high) / 2;
             self.key_at_restart(middle, key)?;
-            if key.as_slice() < target {
+            if **key < *target {
                 low = middle;
             } else {
                 high = middle;
@@ -368,7 +409,7 @@ impl<'block> RowBlockWalk<'block> {
         }
 
         let mut row = self.key_at_restart(low, key)?;
-        while key.as_slice() < target {
+        while **key < *target {
             row = self.next_row(key)?;
         }
         Some(row)

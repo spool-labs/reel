@@ -15,7 +15,7 @@ use reel::engine::open_segment::{OUTPUT_SUFFIX, data_path};
 use reel::engine::read_path::{RecordWant, WalkAsk};
 use reel::engine::planner::{Planner, unit_bound};
 use reel::engine::reel_store::ReelStore;
-use reel::engine::rewrite_job::{COPY_STEP_RECORDS, MERGE_BUFFER_BYTES, MOST_OVERLAP, MOST_PARK_WAITS, PLANNER_LANE, RewriteJob, RewritePhase, is_overlap_input, overlaps};
+use reel::engine::rewrite_job::{MERGE_BUFFER_BYTES, MOST_OVERLAP, MOST_PARK_WAITS, PLANNER_LANE, RewriteJob, RewritePhase, is_overlap_input, overlaps};
 use reel::engine::volume::{MOST_PARKED, NO_SEAL};
 use reel::engine::walk_job::{BlockCounter, WalkJob, WalkWorker};
 use reel::guard::hold;
@@ -25,7 +25,6 @@ use reel::record::codec::Codec;
 use reel::segment::column_directory::ColumnDirectory;
 use reel::segment::damage_list::DamagedRange;
 use reel::segment::footer_reader::FooterReader;
-use reel::segment::footer_writer::FooterWriter;
 use reel::segment::segment_table::{RetiredSegment, shard_of};
 use reel::segment::segment_tail::{BlockCount, MOST_MERGE_SEGMENTS, SegmentNumber, TailHead};
 use reel_api::column_id::ColumnId;
@@ -35,6 +34,7 @@ use reel_api::write_batch::WriteBatch;
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_file::SimulatedFile;
+use reel::io::host_memory::HostMemory;
 use reel_sim::simulated_io::SimulatedIo;
 
 const ROOT: &str = "/disk/rewrite";
@@ -61,7 +61,7 @@ const UNWALKED_CRASH_STRIDE: u64 = 3;
 const SEAT_KEYS: u64 = 400;
 const WORKER_BUDGET: ByteCount = ByteCount(96 * 1024 * 1024);
 const LEAST_VALUE: u64 = 100;
-const STEPPED_COPY_KEYS: u64 = 8 * COPY_STEP_RECORDS as u64;
+const STEPPED_COPY_KEYS: u64 = 512;
 const HAND_OUT_LINE: Duration = Duration::from_millis(1);
 const PARK_WAIT: Duration = Duration::from_secs(10);
 
@@ -1296,7 +1296,7 @@ fn graves_past_the_output() {
 
     let volume = &store.state.volumes[0];
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
-    job.rewrite.grave_writer = FooterWriter::new(BlockCount(2));
+    job.rewrite.most_grave_blocks = BlockCount(2);
     assert!(start_merge(&mut job));
     let inputs = job.rewrite.input_numbers().to_vec();
     let (mut has_full_writer, mut has_graves_in_data) = (false, false);
@@ -2537,7 +2537,51 @@ fn stripe_copies_in_steps() {
     store.maintenance_report(&mut report);
     let copy = report.longest_units[UnitKind::StripeCopy.index()];
     assert!(copy.work > 0, "no stripe copied");
-    assert!(copy.work <= unit_bound(UnitKind::StripeCopy).expect("a bound"), "a stripe copy took {} records", copy.work);
+    assert!(copy.work <= unit_bound(UnitKind::StripeCopy).expect("a bound"), "a stripe copy took {} bytes", copy.work);
     assert_eq!(read(&store, &key(STEPPED_COPY_KEYS - 1)), Some(b"first".to_vec()));
+    store.close().expect("close");
+}
+
+// a merge cut into several outputs places each output's records in offset order in its own file, and every key reads back
+#[test]
+fn cut_merge_copies_in_offset_order() {
+    let io = SimulatedIo::new(Seed(74));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    set_of_inputs(&store, &io);
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    job.rewrite.cut_floor = 0;
+    assert!(job.rewrite.start());
+    while job.rewrite.is_running() {
+        job.rewrite.step();
+    }
+    let mut report = MaintenanceReport::new();
+    store.maintenance_report(&mut report);
+    let volume = &report.volumes[0];
+    assert_eq!((volume.offset_order_copies, volume.key_order_copies), (1, 0));
+    assert!(volume.span_reads + volume.lone_copies > 0, "no record was placed");
+    check_set(&store);
+    store.close().expect("close");
+}
+
+// a host with no room past its reserve refuses the offset-order lists, and the floor takes the same pick in key order
+#[test]
+fn short_host_copies_in_key_order() {
+    let io = SimulatedIo::new(Seed(75));
+    io.set_host_memory(HostMemory { total: ByteCount(1 << 30), available: ByteCount(0), group_room: None, group_limit: None });
+    let store = open(&io);
+    hold_compaction(&store, true);
+    set_of_inputs(&store, &io);
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(job.rewrite.start());
+    while job.rewrite.is_running() {
+        job.rewrite.step();
+    }
+    let mut report = MaintenanceReport::new();
+    store.maintenance_report(&mut report);
+    let volume = &report.volumes[0];
+    assert_eq!((volume.offset_order_copies, volume.key_order_copies), (0, 1));
+    assert!(report.memory.floor_admits >= 1, "the floor took no start");
+    check_set(&store);
     store.close().expect("close");
 }

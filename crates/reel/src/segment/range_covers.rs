@@ -8,6 +8,7 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, WritePlace};
 
+use crate::fixed_list::ListOut;
 use crate::little_endian::read_word;
 use crate::pool::{touched_filled, touched_room, touched_zeroes};
 use crate::segment::segment_tail::SegmentNumber;
@@ -515,14 +516,14 @@ impl RangeCovers {
     }
 
     /// Copy out the oldest applied cover
-    pub fn oldest_applied(&self, start: &mut Vec<u8>, end: &mut Vec<u8>) -> Option<(ColumnId, WritePlace, SegmentNumber)> {
+    pub fn oldest_applied(&self, start: &mut impl ListOut<u8>, end: &mut impl ListOut<u8>) -> Option<(ColumnId, WritePlace, SegmentNumber)> {
         let pool = self.read();
         let is_ready = |slot: &&u16| pool.slots[**slot as usize].is_applied;
         let slot = *pool.order.iter().filter(is_ready).min_by_key(|slot| pool.slots[**slot as usize].place)?;
         start.clear();
-        start.extend_from_slice(pool.start(slot));
+        start.extend_from_slice(pool.start(slot)).ok()?;
         end.clear();
-        end.extend_from_slice(pool.end(slot));
+        end.extend_from_slice(pool.end(slot)).ok()?;
         let fields = &pool.slots[slot as usize];
         Some((fields.column, fields.place, fields.segment))
     }
@@ -604,13 +605,13 @@ impl RangeCovers {
     }
 
     /// Copy out the cover at a position in key order, or return false past the end
-    pub fn cover_at(&self, position: usize, start: &mut Vec<u8>, end: &mut Vec<u8>) -> Option<(ColumnId, WritePlace, SegmentNumber)> {
+    pub fn cover_at(&self, position: usize, start: &mut impl ListOut<u8>, end: &mut impl ListOut<u8>) -> Option<(ColumnId, WritePlace, SegmentNumber)> {
         let pool = self.read();
         let slot = *pool.order.get(position)?;
         start.clear();
-        start.extend_from_slice(pool.start(slot));
+        start.extend_from_slice(pool.start(slot)).ok()?;
         end.clear();
-        end.extend_from_slice(pool.end(slot));
+        end.extend_from_slice(pool.end(slot)).ok()?;
         let fields = &pool.slots[slot as usize];
         Some((fields.column, fields.place, fields.segment))
     }

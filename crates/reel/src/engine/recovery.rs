@@ -1691,6 +1691,7 @@ pub fn settle_sealed<Backend: Io>(
         // holds rows its input's walk already counted
         is_backward: found.head.segment <= rows.highest_forward || (found.head.is_output && !found.head.is_unwalked),
         has_lost_rows: false,
+        most_block_rows: found.entries.iter().map(|entry| entry.live_rows).max().unwrap_or(0),
     };
 
     if let Some(at) = listed.get(&facts.segment)
@@ -1724,8 +1725,8 @@ pub fn settle_sealed<Backend: Io>(
         }
         let mut kept_lowest = Vec::with_capacity(SUMMARY_KEY_BYTES);
         let mut bound = Vec::with_capacity(SUMMARY_KEY_BYTES + 1);
-        put_lowest(&lowest, &mut kept_lowest);
-        put_bound(&highest, &mut bound);
+        put_lowest(&lowest, &mut kept_lowest)?;
+        put_bound(&highest, &mut bound)?;
         keys.push((kept_lowest, bound));
     }
 

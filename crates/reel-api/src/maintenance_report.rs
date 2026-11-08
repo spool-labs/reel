@@ -161,8 +161,24 @@ pub struct VolumeReading {
     /// Marked segments rewritten at the plain bar, once the current mark had passed their highest
     pub plain_bar_rewrites: u64,
     pub longest_seal_steps: SealSteps,
-    /// Record rewrites that copied in key order, reading records at random
+    /// Rewrites that copied in key order, reading records at random
     pub key_order_copies: u64,
+    /// Rewrites that copied each input's records in offset order
+    pub offset_order_copies: u64,
+    /// Reads the offset-order copy took a run of records in
+    pub span_reads: u64,
+    /// Records those reads took, so a run's mean length is these over the reads
+    pub span_records: u64,
+    /// Bytes those reads took between their records
+    pub span_gap_bytes: ByteCount,
+    /// Records the offset-order copy read alone, with no neighbour near enough
+    pub lone_copies: u64,
+    /// Records a merge read one at a time as their keys came, in key order or kept on the second look
+    pub keyed_copies: u64,
+    /// Row-block bytes merges read in their deciding, placing and copying passes
+    pub footer_reads: [ByteCount; 3],
+    /// The offset-order copy's reads by the records each took, bucket b holding reads of 2^b up to 2^(b+1) records
+    pub span_runs: [u64; SPAN_RUN_BUCKETS],
     /// Whole summary saves since open
     pub summary_saves: u64,
     /// Segments the table holds now
@@ -233,6 +249,42 @@ pub struct RewriteBytes {
     pub unreclaimed: u64,
 }
 
+/// What the maintenance jobs' regions have held, and what admission found at its last start
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MaintenanceMemory {
+    /// Bytes the jobs' regions take now, past the fixed memory the memory report counts
+    pub now: ByteCount,
+    /// The most bytes the regions have taken at once
+    pub peak: ByteCount,
+    /// Bytes every region has mapped since open, whose pages fault in at their jobs' starts and at no step after
+    pub mapped_total: ByteCount,
+    /// The host's free bytes the last start read, no more than the control group's room
+    pub free_at_start: ByteCount,
+    /// The bytes the last start kept back for the page cache
+    pub reserve_at_start: ByteCount,
+    /// Starts admitted
+    pub admits: u64,
+    /// Starts that found too little room and waited
+    pub waits: u64,
+    /// Starts admitted past the room because no region was held, so reclaim never stops
+    pub floor_admits: u64,
+    /// Pushes past a list's capacity in this process, each a bound that came out short
+    pub lists_full: u64,
+    /// The largest need a rewrite was admitted with
+    pub rewrite_need: ByteCount,
+    /// The most bytes a rewrite's lists wrote
+    pub rewrite_touched: ByteCount,
+    /// The largest need a walk target was admitted with
+    pub walk_need: ByteCount,
+    /// The most bytes a walk target's counts wrote
+    pub walk_touched: ByteCount,
+    /// Bytes the walk holds from open: its block counters and the frees a cue holds back
+    pub walk_fixed: ByteCount,
+}
+
+/// Buckets the offset-order copy's run lengths fall in, a power of two each, the last holding every longer run
+pub const SPAN_RUN_BUCKETS: usize = 16;
+
 /// Lanes a volume reading has room for. Workers past this show in the last one
 pub const MOST_REPORTED_LANES: usize = 16;
 
@@ -283,6 +335,8 @@ pub struct MaintenanceReport {
     /// Async reads complete through the ring, and through the blocking pool when this is false
     pub has_ring: bool,
     pub longest_units: [UnitReading; UNIT_KINDS.len()],
+    /// The maintenance jobs' regions and their admission
+    pub memory: MaintenanceMemory,
 }
 
 impl JobReport {
@@ -331,6 +385,7 @@ impl MaintenanceReport {
             unlinks_refused: SegmentCount::default(),
             has_ring: false,
             longest_units: [UnitReading::default(); UNIT_KINDS.len()],
+            memory: MaintenanceMemory::default(),
         }
     }
 }

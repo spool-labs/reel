@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, ProcessId};
 
+use crate::io::host_memory::{HostMemory, read_host_memory};
 use crate::io::{DiskSize, Io, IoFile};
 use crate::io::job::Job;
 use crate::io::lock_outcome::LockOutcome;
@@ -181,6 +182,10 @@ impl Io for PlainIo {
         let stats = disk_stats(path)?;
         let bytes = ByteCount(widen(stats.f_blocks).saturating_mul(widen(stats.f_frsize)));
         Ok(Some(DiskSize { filesystem: widen(stats.f_fsid), bytes }))
+    }
+
+    fn host_memory(&self) -> HostMemory {
+        read_host_memory()
     }
 
     fn lock(&self, path: &Path) -> Result<LockOutcome<PlainLock>> {

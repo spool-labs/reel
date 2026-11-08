@@ -412,6 +412,7 @@ impl<Backend: Io> SealJob<Backend> {
                 walked_blocks: 0,
                 is_backward: false,
                 has_lost_rows: false,
+                most_block_rows: totals.most_block_rows,
             };
             let writer = &self.writer;
             let columns = (0..writer.columns().len()).map(|index| writer.column_facts(index));

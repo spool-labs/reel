@@ -1,5 +1,6 @@
 //! The store itself: sizing, volumes, open segments and the read and write paths
 
+pub mod admission;
 pub mod batch_path;
 pub mod claim;
 pub mod column_info;

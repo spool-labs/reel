@@ -27,7 +27,7 @@ use crate::engine::walk_job::{FREE_IN_PLACE_BYTES, FreeRecord, WALK_RETRY};
 use crate::guard::hold;
 use crate::io::device_error::is_device_error;
 use crate::io::{InPlace, Io, IoFile, IoTask, in_place};
-use crate::pool::{touched_capacity, touched_zeroes};
+use crate::fixed_list::FixedList;
 use crate::row_kind::RowKind;
 use crate::segment::block_entry::KeyBound;
 use crate::segment::range_covers::{Cover, MOST_RANGE_COVERS};
@@ -99,13 +99,13 @@ pub struct CompactJob<Backend: Io> {
     should_rewrite: bool,
     last_tried: SegmentNumber,
     settle_at: usize,
-    settled_rows: Vec<DeadCount>,
-    listed: Vec<SegmentNumber>,
-    pub rebuilds_tried: Vec<SegmentNumber>,
-    block: Vec<u8>,
-    key: Vec<u8>,
-    row_key: Vec<u8>,
-    end: Vec<u8>,
+    settled_rows: FixedList<DeadCount>,
+    listed: FixedList<SegmentNumber>,
+    pub rebuilds_tried: FixedList<SegmentNumber>,
+    block: FixedList<u8>,
+    key: FixedList<u8>,
+    row_key: FixedList<u8>,
+    end: FixedList<u8>,
     unit: Option<(UnitKind, u64)>,
 }
 
@@ -130,13 +130,13 @@ impl<Backend: Io> CompactJob<Backend> {
             retry_at: None,
             last_tried: SegmentNumber(0),
             settle_at: 0,
-            settled_rows: touched_capacity(MOST_SETTLED_ROWS, DeadCount::default()),
-            listed: touched_capacity(MOST_LISTED_LOOKS, SegmentNumber(0)),
-            rebuilds_tried: touched_capacity(MOST_REBUILD_TRIES, SegmentNumber(0)),
-            block: touched_zeroes(ROW_BLOCK_BYTES),
-            key: touched_capacity(MAX_KEY_BYTES as usize, 0),
-            row_key: touched_capacity(MAX_KEY_BYTES as usize, 0),
-            end: touched_capacity(MAX_KEY_BYTES as usize + 1, 0),
+            settled_rows: FixedList::on_heap(MOST_SETTLED_ROWS),
+            listed: FixedList::on_heap(MOST_LISTED_LOOKS),
+            rebuilds_tried: FixedList::on_heap(MOST_REBUILD_TRIES),
+            block: FixedList::filled_on_heap(ROW_BLOCK_BYTES, 0),
+            key: FixedList::on_heap(MAX_KEY_BYTES as usize),
+            row_key: FixedList::on_heap(MAX_KEY_BYTES as usize),
+            end: FixedList::on_heap(MAX_KEY_BYTES as usize + 1),
         }
     }
 
@@ -458,16 +458,14 @@ impl<Backend: Io> CompactJob<Backend> {
             while let Some(row) = walk.next_row(&mut self.row_key) {
                 if row.place == place && row.kind == RowKind::RangeDelete {
                     // a list that's full leaves the row live, which only keeps its segment a while longer
-                    if self.settled_rows.len() < self.settled_rows.capacity() {
-                        self.settled_rows.push(DeadCount {
-                            segment,
-                            column,
-                            block: index,
-                            rows: 1,
-                            replacement: place,
-                            ..DeadCount::default()
-                        });
-                    }
+                    self.settled_rows.push_if_room(DeadCount {
+                        segment,
+                        column,
+                        block: index,
+                        rows: 1,
+                        replacement: place,
+                        ..DeadCount::default()
+                    });
                     return;
                 }
             }

@@ -137,3 +137,21 @@ fn odd_keys() {
     assert_eq!(walk.next_row(&mut key), Some(row_of(3)));
     assert_eq!(key, b"same");
 }
+
+// a key past the builder's key list is refused before any of its bytes go in, so a retry can't write the row twice
+#[test]
+fn long_key_writes_nothing() {
+    let mut builder = RowBlockBuilder::new();
+    let long = vec![b'k'; reel::config::MAX_KEY_BYTES as usize + 1];
+
+    assert!(!builder.push(&long, &row_of(1)));
+
+    assert!(builder.is_empty());
+    assert!(builder.push(&key_of(1), &row_of(1)));
+    let block = builder.finish().to_vec();
+    let mut walk = RowBlockWalk::open(&block, WritePlace(0)).expect("a block");
+    let mut key = Vec::new();
+    assert_eq!(walk.next_row(&mut key), Some(row_of(1)));
+    assert_eq!(key, key_of(1));
+    assert_eq!(walk.next_row(&mut key), None);
+}

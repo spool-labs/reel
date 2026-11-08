@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::{JobKind, PickOutcome, UnitKind};
+use reel_api::maintenance_report::{JobKind, PickOutcome, SPAN_RUN_BUCKETS, UnitKind};
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, DeathMark, FileOffset, RootId, RowCount, WritePlace};
 
@@ -29,14 +29,16 @@ use crate::engine::walk_job::add_count;
 use crate::guard::hold;
 use crate::lifetime::MarkRange;
 use crate::io::{Io, IoFile};
-use crate::pool::{touched_capacity, touched_filled, touched_zeroes};
+use crate::fixed_list::{FixedList, ListFull};
+use crate::region::{REGION_HEAD_BYTES, Region, list_bytes};
+use crate::engine::admission::{JobRole, PICK_HALVINGS};
 use crate::row_kind::RowKind;
 use crate::segment::damage_list::DamagedRange;
 use crate::segment::column_directory::Listing;
 use crate::segment::footer_writer::{ColumnStart, FooterTotals, FooterWriter};
 use crate::index::complete_table::CompleteTable;
 use crate::index::key_hash::{KeyHash, hash_key};
-use crate::segment::row_block::{FooterRow, ROW_BLOCK_BYTES, RowBlockWalk};
+use crate::segment::row_block::{BLOCK_TRAILER_BYTES, FooterRow, ROW_BLOCK_BYTES, ROW_ROOM_NUMBERS, RowBlockWalk};
 use crate::segment::segment_table::SegmentPin;
 use crate::segment::segment_tail::{BlockCount, ColumnTail, MAX_COLUMNS, MOST_MERGE_SEGMENTS, SegmentNumber};
 use crate::segment::summary::{ColumnFacts, DeadCount, SUMMARY_KEY_BYTES, SegmentFacts, SummaryRow, SummaryRows};
@@ -59,12 +61,17 @@ pub const SHARE_SCALE: u64 = 1_000_000;
 pub const MOST_KEPT_BLOCKS: usize = 1_024;
 /// Rows one step of a merge decides
 pub const MERGE_STEP_ROWS: usize = 4_096;
-/// Records one step of a stripe's copy takes, a few waves of eight ranged reads
-pub const COPY_STEP_RECORDS: usize = 64;
-/// The widest span of a segment one stripe of a record rewrite covers
-pub const MOST_STRIPE_BYTES: u64 = 256 * 1024 * 1024;
-/// Rows a stripe lists at once. A span with more narrows to the half with the lowest offsets
-pub const MOST_STRIPE_ROWS: usize = 65_536;
+/// Bytes a stripe copy step takes across before it stops, a buffer's worth, past which only the run in hand finishes
+pub const COPY_STEP_BYTES: u64 = MERGE_BUFFER_BYTES as u64;
+/// Bytes each output's stage holds before it goes out in one write
+pub const STAGE_BYTES: usize = 192 * 1024;
+/// The most bytes between two records the offset-order copy reads through to take both in one read, past which the second
+/// starts a read of its own
+pub const SPAN_GAP_BYTES: u64 = 4 * 1024;
+/// Bytes one staged column's kept lowest key and bound take, each up to a summary key and a byte past it
+pub const STAGED_COLUMN_KEY_BYTES: usize = 2 * SUMMARY_KEY_BYTES + 2;
+/// Keys a running rewrite holds a key's length of: the row's, the last, two pairs of edges and each output's last
+pub const RUN_KEYS: usize = 8;
 /// Most row blocks the output for kept graves can have, past which the merge gives way
 pub const MOST_GRAVE_BLOCKS: BlockCount = BlockCount(2_048);
 /// Rounds an install waits for room to park its inputs, past which the merge gives way
@@ -100,9 +107,21 @@ pub struct StagedOutput {
 /// A marked row a stripe will copy
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct StripeRow {
-    pub offset: FileOffset,
-    pub length: ByteCount,
+    pub offset: u32,
+    pub length: u32,
     pub ordinal: u32,
+}
+
+impl StripeRow {
+    /// Read where the record starts in its input
+    pub fn start(&self) -> u64 {
+        u64::from(self.offset)
+    }
+
+    /// Read where the record ends in its input
+    pub fn end(&self) -> u64 {
+        u64::from(self.offset) + u64::from(self.length)
+    }
 }
 
 /// Marked segments a rewrite took, by the bar each one passed
@@ -141,27 +160,35 @@ pub struct MergeInput {
     pub segment: SegmentNumber,
     pub block_count: u32,
     pub block_rows: u64,
+    pub data_end: u64,
+    pub base: u64,
+    rows_seen: u64,
+    pub read_bytes: u64,
     next_block: u32,
-    block: Vec<u8>,
+    block: FixedList<u8>,
     length: usize,
     position: usize,
-    key: Vec<u8>,
+    key: FixedList<u8>,
     column: ColumnId,
     row: Option<FooterRow>,
 }
 
 impl MergeInput {
-    /// Allocate the fixed buffers
+    /// Make an input with no buffers, which its job carves from its region at the start
     pub fn new() -> Self {
         Self {
             segment: SegmentNumber(0),
             block_count: 0,
             block_rows: 0,
+            data_end: 0,
+            base: 0,
+            rows_seen: 0,
+            read_bytes: 0,
             next_block: 0,
-            block: touched_zeroes(ROW_BLOCK_BYTES),
+            block: FixedList::empty(),
             length: 0,
             position: 0,
-            key: touched_capacity(MAX_KEY_BYTES as usize, 0),
+            key: FixedList::empty(),
             column: ColumnId(0),
             row: None,
         }
@@ -172,13 +199,39 @@ impl MergeInput {
         self.block.capacity() + self.key.capacity()
     }
 
+    /// Carve the input's block and key from its job's region
+    pub fn carve(&mut self, region: &mut Region) -> std::result::Result<(), ListFull> {
+        self.block = region.carve_filled(ROW_BLOCK_BYTES, 0)?;
+        self.key = region.carve(MAX_KEY_BYTES as usize)?;
+        Ok(())
+    }
+
+    /// Count the region bytes an input takes
+    pub fn region_bytes() -> usize {
+        list_bytes::<u8>(ROW_BLOCK_BYTES) + list_bytes::<u8>(MAX_KEY_BYTES as usize)
+    }
+
+    /// Give the block and key back, and return the most bytes they wrote
+    pub fn release(&mut self) -> usize {
+        let peak = self.block.peak_bytes() + self.key.peak_bytes();
+        self.block = FixedList::empty();
+        self.key = FixedList::empty();
+        peak
+    }
+
     /// Check a row list this long has room for every row of the input
     pub fn row_room(&self, rows: usize) -> bool {
         self.block_rows <= rows as u64
     }
 
+    /// Read the row in hand's place among the input's rows, or the count of them once they've run out
+    pub fn ordinal(&self) -> u64 {
+        if self.row.is_some() { self.rows_seen - 1 } else { self.rows_seen }
+    }
+
     /// Go back to the first row
     pub fn rewind(&mut self) {
+        self.rows_seen = 0;
         self.next_block = 0;
         self.length = 0;
         self.position = 0;
@@ -197,6 +250,7 @@ impl MergeInput {
                 self.row = walk.next_row(&mut self.key);
                 self.position = walk.position();
                 if self.row.is_some() {
+                    self.rows_seen += 1;
                     return Ok(());
                 }
             }
@@ -212,6 +266,7 @@ impl MergeInput {
                 return Err(Error::from(ErrorKind::InvalidData));
             }
             pin.file.read_exact_at(block.entry.block_at(), &mut self.block[..length])?;
+            self.read_bytes += length as u64;
             if RowBlockWalk::open(&self.block[..length], base).is_none() {
                 return Err(Error::from(ErrorKind::InvalidData));
             }
@@ -247,16 +302,16 @@ pub struct RewriteJob<Backend: Io> {
     numbers: [SegmentNumber; MOST_MERGE_SEGMENTS],
     input_count: usize,
     is_drained: bool,
-    buffer: Vec<u8>,
+    buffer: FixedList<u8>,
     used: usize,
     records_end: FileOffset,
     moved: u64,
-    key: Vec<u8>,
-    last_key: Vec<u8>,
-    lowest: Vec<u8>,
-    highest: Vec<u8>,
-    edge_lowest: Vec<u8>,
-    edge_highest: Vec<u8>,
+    key: FixedList<u8>,
+    last_key: FixedList<u8>,
+    lowest: FixedList<u8>,
+    highest: FixedList<u8>,
+    edge_lowest: FixedList<u8>,
+    edge_highest: FixedList<u8>,
     edges_column: Option<ColumnId>,
     last_column: Option<ColumnId>,
     output_column: Option<ColumnId>,
@@ -268,7 +323,7 @@ pub struct RewriteJob<Backend: Io> {
     pub highest_replacement: WritePlace,
     dropped_rows: u64,
     dropped_graves: u64,
-    kept_dead: Vec<DeadCount>,
+    kept_dead: FixedList<DeadCount>,
     last_tried: SegmentNumber,
     park_waits: u32,
     pub cut_floor: u64,
@@ -277,24 +332,51 @@ pub struct RewriteJob<Backend: Io> {
     is_cutting: bool,
     is_top_row: bool,
     output_rows: u64,
-    output_last_key: Vec<u8>,
-    grave_last_key: Vec<u8>,
-    staged: Vec<StagedOutput>,
-    staged_columns: Vec<StagedColumn>,
-    staged_keys: Vec<u8>,
+    output_last_key: FixedList<u8>,
+    grave_last_key: FixedList<u8>,
+    staged: FixedList<StagedOutput>,
+    staged_columns: FixedList<StagedColumn>,
+    staged_keys: FixedList<u8>,
     pub forced: Option<SegmentNumber>,
+    /// The forced segment a pick took, which goes back when admission turns the pick away
+    forced_pick: Option<SegmentNumber>,
+    /// The mapping this run's lists are carved from, held from an admitted start to the install or the abandon
+    region: Option<Region>,
+    /// Tests set this low to fill the grave output
+    pub most_grave_blocks: BlockCount,
     pub last_slot: Option<(KeyHash, SegmentNumber, u32)>,
-    /// One bit a row of a single input, set when the deciding pass keeps its record
-    marks: Vec<u64>,
-    /// Where each marked row's record landed in the output, by the row's place in the input
-    placed: Vec<u32>,
-    stripe: Vec<StripeRow>,
-    stripe_start: u64,
-    stripe_end: u64,
+    /// One bit a row of the inputs, each input's rows from its base, set when the deciding pass keeps its record
+    marks: FixedList<u64>,
+    /// Where each marked row's record landed in its output, by the row's base and place in its input
+    placed: FixedList<u32>,
+    /// The input being placed's kept records, sorted by offset before they go across
+    stripe: FixedList<StripeRow>,
+    /// Each output's records on their way out, a buffer an output
+    stages: [FixedList<u8>; MOST_MERGE_OUTPUTS],
     stripe_copied: Option<usize>,
     unit: (UnitKind, u64),
-    row_ordinal: usize,
+    /// The input the row in hand came from
+    row_input: usize,
+    /// The row in hand's place among every input's rows, its input's base and its place in that input
+    row_at: u64,
     is_ordered: bool,
+    /// The deciding pass's cuts, each input's place there, a row at or past it going to a later output
+    cut_ordinals: [[u64; MOST_MERGE_SEGMENTS]; MOST_MERGE_OUTPUTS],
+    /// Cuts the deciding pass made
+    cuts: usize,
+    /// Kept bytes and rows the deciding pass has given the output it's on
+    decide_bytes: u64,
+    decide_rows: u64,
+    /// The most kept rows one output takes, so its blocks fit the writer
+    cut_rows: u64,
+    /// The outputs past the first an offset-order copy places records in before the copying pass reaches them
+    slot_outputs: [Option<RewriteOutput<Backend::File>>; MOST_MERGE_OUTPUTS],
+    /// Where each output's records end
+    outputs_end: [u64; MOST_MERGE_OUTPUTS],
+    /// The input the placing pass walks
+    placing_input: usize,
+    /// The pick's bound took the offset-order lists
+    is_ordered_bound: bool,
     /// Tests of a merge's cut set this, since an offset-order copy runs to one output
     pub is_key_order_held: bool,
     /// A damaged segment the next pick copies whole, and the spans its lost blocks leave
@@ -303,7 +385,7 @@ pub struct RewriteJob<Backend: Io> {
     pub bars_fired: BarsFired,
     pub lost_spans: Vec<DamagedRange>,
     is_unwalked: bool,
-    crowded_key: Vec<u8>,
+    crowded_key: FixedList<u8>,
     pub has_looks_left: bool,
     looked_up_to: SegmentNumber,
 }
@@ -311,11 +393,9 @@ pub struct RewriteJob<Backend: Io> {
 impl<Backend: Io> RewriteJob<Backend> {
     /// Allocate the job's fixed buffers
     pub fn new(state: Arc<EngineState<Backend>>, volume: usize, lane: usize) -> Self {
-        let most_rows = state.volumes[volume].segment_rows.0 as usize;
         // a mutex's first lock can allocate, and this one's first real use could be in a close
         drop(hold(&state.volumes[volume].lanes[lane].partial_outputs));
         drop(hold(&state.volumes[volume].lanes[lane].merging));
-        let keys = MAX_KEY_BYTES as usize;
         let cut_floor = state.volumes[volume].segment_bytes.0 / MOST_MERGE_OUTPUTS as u64;
         Self {
             state,
@@ -325,24 +405,24 @@ impl<Backend: Io> RewriteJob<Backend> {
             phase: RewritePhase::Copying,
             output: None,
             grave_output: None,
-            writer: FooterWriter::new(MOST_SEGMENT_BLOCKS),
-            grave_writer: FooterWriter::new(MOST_GRAVE_BLOCKS),
+            writer: FooterWriter::empty(),
+            grave_writer: FooterWriter::empty(),
             totals: None,
             grave_totals: None,
             inputs: (0..MOST_MERGE_SEGMENTS).map(|_input| MergeInput::new()).collect(),
             numbers: [SegmentNumber(0); MOST_MERGE_SEGMENTS],
             input_count: 0,
             is_drained: false,
-            buffer: touched_zeroes(MERGE_BUFFER_BYTES),
+            buffer: FixedList::empty(),
             used: 0,
             records_end: FileOffset(0),
             moved: 0,
-            key: touched_capacity(keys, 0),
-            last_key: touched_capacity(keys, 0),
-            lowest: touched_capacity(keys, 0),
-            highest: touched_capacity(keys, 0),
-            edge_lowest: touched_capacity(keys, 0),
-            edge_highest: touched_capacity(keys, 0),
+            key: FixedList::empty(),
+            last_key: FixedList::empty(),
+            lowest: FixedList::empty(),
+            highest: FixedList::empty(),
+            edge_lowest: FixedList::empty(),
+            edge_highest: FixedList::empty(),
             edges_column: None,
             last_column: None,
             output_column: None,
@@ -354,7 +434,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             highest_replacement: WritePlace(0),
             dropped_rows: 0,
             dropped_graves: 0,
-            kept_dead: touched_capacity(MOST_KEPT_BLOCKS, DeadCount::default()),
+            kept_dead: FixedList::empty(),
             last_tried: SegmentNumber(0),
             park_waits: 0,
             cut_floor,
@@ -363,29 +443,41 @@ impl<Backend: Io> RewriteJob<Backend> {
             is_cutting: false,
             is_top_row: false,
             output_rows: 0,
-            output_last_key: touched_capacity(keys, 0),
-            grave_last_key: touched_capacity(keys, 0),
-            staged: touched_capacity(MOST_MERGE_OUTPUTS, StagedOutput { facts: SegmentFacts::default(), newest_place: WritePlace(0), first_column: 0, column_count: 0 }),
-            staged_columns: touched_capacity(MOST_MERGE_OUTPUTS * MAX_COLUMNS, StagedColumn::default()),
-            staged_keys: touched_capacity(MOST_MERGE_OUTPUTS * MAX_COLUMNS * (2 * SUMMARY_KEY_BYTES + 2), 0),
+            output_last_key: FixedList::empty(),
+            grave_last_key: FixedList::empty(),
+            staged: FixedList::empty(),
+            staged_columns: FixedList::empty(),
+            staged_keys: FixedList::empty(),
             forced: None,
+            forced_pick: None,
+            region: None,
+            most_grave_blocks: MOST_GRAVE_BLOCKS,
             last_slot: None,
-            marks: touched_filled(most_rows.div_ceil(u64::BITS as usize), 0),
-            placed: touched_filled(most_rows, 0),
-            stripe: touched_capacity(MOST_STRIPE_ROWS, StripeRow::default()),
-            stripe_start: 0,
-            stripe_end: 0,
+            marks: FixedList::empty(),
+            placed: FixedList::empty(),
+            stripe: FixedList::empty(),
+            stages: Default::default(),
             stripe_copied: None,
             unit: (UnitKind::MergeRows, 0),
-            row_ordinal: 0,
+            row_input: 0,
+            row_at: 0,
             is_ordered: false,
+            cut_ordinals: [[0; MOST_MERGE_SEGMENTS]; MOST_MERGE_OUTPUTS],
+            cuts: 0,
+            decide_bytes: 0,
+            decide_rows: 0,
+            cut_rows: u64::MAX,
+            slot_outputs: Default::default(),
+            outputs_end: [0; MOST_MERGE_OUTPUTS],
+            placing_input: 0,
+            is_ordered_bound: false,
             is_key_order_held: false,
             rebuild: None,
             rebuild_blocks: 0,
             bars_fired: BarsFired::default(),
             lost_spans: Vec::new(),
             is_unwalked: false,
-            crowded_key: touched_capacity(SUMMARY_KEY_BYTES, 0),
+            crowded_key: FixedList::on_heap(SUMMARY_KEY_BYTES),
             has_looks_left: false,
             looked_up_to: SegmentNumber(0),
         }
@@ -393,12 +485,152 @@ impl<Backend: Io> RewriteJob<Backend> {
 
     /// Read the heap the job's buffers hold
     pub fn heap_bytes(&self) -> ByteCount {
-        let keys = self.key.capacity() + self.last_key.capacity() + self.lowest.capacity() + self.highest.capacity();
-        let edges = self.edge_lowest.capacity() + self.edge_highest.capacity();
-        let inputs: usize = self.inputs.iter().map(MergeInput::heap_bytes).sum();
-        let counts = self.kept_dead.capacity() * size_of::<DeadCount>();
-        let writers = self.writer.heap_bytes().0 + self.grave_writer.heap_bytes().0;
-        ByteCount(writers + (self.buffer.capacity() + keys + edges + inputs + counts) as u64)
+        let inputs = self.inputs.capacity() * size_of::<MergeInput>();
+        ByteCount((self.crowded_key.held_bytes() + inputs) as u64)
+    }
+
+    /// Read the bytes the run's region maps, nothing between runs
+    pub fn region_bytes(&self) -> ByteCount {
+        self.region.as_ref().map_or(ByteCount(0), Region::mapped_bytes)
+    }
+
+    /// Work out what the picked inputs hold, from their summary rows
+    pub fn bound(&self, volume: &Volume<Backend>) -> RewriteBound {
+        let rows = hold(&volume.summary);
+        let mut bound = RewriteBound { inputs: self.input_count, block_bytes: ROW_BLOCK_BYTES, most_grave_blocks: self.most_grave_blocks, ..RewriteBound::default() };
+        for number in self.input_numbers() {
+            let Some(row) = rows.get(*number) else {
+                continue;
+            };
+            bound.rows += rows_of(&row);
+            bound.most_input_rows = bound.most_input_rows.max(rows_of(&row));
+            bound.columns += usize::from(row.column_count);
+            let mut cursor = row.cursor();
+            for _column in 0..row.column_count {
+                if let Some(column) = cursor.column() {
+                    bound.block_bytes = bound.block_bytes.min(self.state.block_bytes_of(column.column));
+                }
+            }
+        }
+        bound.columns = bound.columns.min(MAX_COLUMNS);
+        bound.is_ordered = self.rebuild.is_none() && !self.is_key_order_held;
+        bound
+    }
+
+    /// Carve every list of the run from its region
+    pub fn attach(&mut self, mut region: Region, bound: &RewriteBound) -> std::result::Result<(), ListFull> {
+        let carved = self.carve(&mut region, bound);
+        self.is_ordered_bound = bound.is_ordered;
+        self.cut_rows = (MOST_SEGMENT_BLOCKS.0 as u64 - 2) * fewest_block_rows(bound.block_bytes);
+        let mut base = 0;
+        for input in &mut self.inputs[..bound.inputs] {
+            input.base = base;
+            base += input.block_rows;
+        }
+        self.region = Some(region);
+        carved
+    }
+
+    /// Carve the lists in the order the bound counts them
+    fn carve(&mut self, region: &mut Region, bound: &RewriteBound) -> std::result::Result<(), ListFull> {
+        let keys = MAX_KEY_BYTES as usize;
+        self.writer = FooterWriter::in_region(region, bound.output_blocks())?;
+        self.grave_writer = FooterWriter::in_region(region, bound.grave_blocks())?;
+        for input in &mut self.inputs[..bound.inputs] {
+            input.carve(region)?;
+        }
+        self.buffer = region.carve_filled(MERGE_BUFFER_BYTES, 0)?;
+        self.kept_dead = region.carve(MOST_KEPT_BLOCKS)?;
+        for key in [&mut self.key, &mut self.last_key, &mut self.lowest, &mut self.highest] {
+            *key = region.carve(keys)?;
+        }
+        for key in [&mut self.edge_lowest, &mut self.edge_highest, &mut self.output_last_key, &mut self.grave_last_key] {
+            *key = region.carve(keys)?;
+        }
+        self.staged = region.carve(MOST_MERGE_OUTPUTS)?;
+        self.staged_columns = region.carve(MOST_MERGE_OUTPUTS * bound.columns)?;
+        self.staged_keys = region.carve(MOST_MERGE_OUTPUTS * bound.columns * STAGED_COLUMN_KEY_BYTES)?;
+        let rows = bound.ordered_rows();
+        self.marks = region.carve_filled(rows.div_ceil(u64::BITS as usize), 0)?;
+        self.placed = region.carve_filled(rows, 0)?;
+        self.stripe = region.carve(bound.ordered_input_rows())?;
+        for stage in &mut self.stages[..bound.stages()] {
+            *stage = region.carve(STAGE_BYTES)?;
+        }
+        Ok(())
+    }
+
+    /// Give the run's lists and region back, and count the bytes they wrote
+    pub fn release_region(&mut self) {
+        let Some(region) = self.region.take() else {
+            return;
+        };
+        let (_held, mut touched) = self.writer.list_bytes();
+        touched += self.grave_writer.list_bytes().1;
+        self.writer = FooterWriter::empty();
+        self.grave_writer = FooterWriter::empty();
+        for input in &mut self.inputs {
+            touched += input.release();
+        }
+        for key in [&mut self.buffer, &mut self.key, &mut self.last_key, &mut self.lowest, &mut self.highest, &mut self.staged_keys] {
+            touched += mem::take(key).peak_bytes();
+        }
+        for key in [&mut self.edge_lowest, &mut self.edge_highest, &mut self.output_last_key, &mut self.grave_last_key] {
+            touched += mem::take(key).peak_bytes();
+        }
+        touched += mem::take(&mut self.kept_dead).peak_bytes() + mem::take(&mut self.staged).peak_bytes();
+        touched += mem::take(&mut self.staged_columns).peak_bytes() + mem::take(&mut self.marks).peak_bytes();
+        touched += mem::take(&mut self.placed).peak_bytes() + mem::take(&mut self.stripe).peak_bytes();
+        for stage in &mut self.stages {
+            touched += mem::take(stage).peak_bytes();
+        }
+        let mapped = region.mapped_bytes();
+        drop(region);
+        self.state.give_back(JobRole::Rewrite, mapped, ByteCount(touched as u64));
+    }
+
+    /// Pick, and halve the inputs while the need is past what admission gives, up to a few times before the lane waits
+    pub fn pick_admitted(&mut self, volume: &Volume<Backend>) -> Option<(MergeTarget, bool)> {
+        let mut most = MOST_MERGE_SEGMENTS;
+        for _halving in 0..=PICK_HALVINGS {
+            let picked = self.pick_within(volume, most)?;
+            let mut bound = self.bound(volume);
+            // offset order first, and the same pick in key order when its lists don't fit, which the floor alone admits
+            let mut region = None;
+            if bound.is_ordered {
+                region = self.state.admit(JobRole::Rewrite, bound.region_bytes(), false);
+            }
+            if region.is_none() {
+                bound.is_ordered = false;
+                region = self.state.admit(JobRole::Rewrite, bound.region_bytes(), true);
+            }
+            if let Some(region) = region {
+                if self.attach(region, &bound).is_ok() {
+                    self.forced_pick = None;
+                    return Some(picked);
+                }
+                // the bound came out short of its own carving, a bug the full count shows
+                self.release_region();
+                self.unpick(volume);
+                return None;
+            }
+            self.unpick(volume);
+            if self.input_count < 2 {
+                return None;
+            }
+            most = self.input_count / 2;
+        }
+        None
+    }
+
+    /// Put back what a pick took when admission turned it away
+    pub fn unpick(&mut self, volume: &Volume<Backend>) {
+        if self.is_unwalked {
+            *hold(&volume.lanes[self.lane].merging) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
+        }
+        if let Some(forced) = self.forced_pick.take() {
+            self.forced = Some(forced);
+        }
     }
 
     /// Check a merge of unwalked segments is under way, which runs ahead of the walk and needs nothing from it
@@ -432,7 +664,7 @@ impl<Backend: Io> RewriteJob<Backend> {
     pub fn start(&mut self) -> bool {
         let state = Arc::clone(&self.state);
         let volume = &state.volumes[self.volume];
-        let Some((target, is_grave_heavy)) = self.pick(volume) else {
+        let Some((target, is_grave_heavy)) = self.pick_admitted(volume) else {
             return false;
         };
         self.clear(target);
@@ -440,13 +672,19 @@ impl<Backend: Io> RewriteJob<Backend> {
         let mut inputs = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
         inputs[..self.input_count].copy_from_slice(&self.numbers[..self.input_count]);
         *hold(&volume.lanes[self.lane].inputs) = inputs;
-        // one input copies in offset order, and a deciding pass says which rows go across
-        self.is_ordered = self.input_count == 1 && self.rebuild.is_none() && !self.is_key_order_held && self.inputs[0].row_room(self.placed.len());
-        if !self.is_ordered {
+        // the inputs copy in offset order when their lists fit, and a deciding pass says which rows go across and to which output
+        let rows: u64 = self.inputs[..self.input_count].iter().map(|input| input.block_rows).sum();
+        self.is_ordered = self.is_ordered_bound && rows as usize <= self.placed.len();
+        if self.is_ordered {
+            volume.offset_order_copies.fetch_add(1, Ordering::Relaxed);
+            self.cut_bytes = (target.data.0 / MOST_MERGE_OUTPUTS as u64).max(self.cut_floor);
+        } else {
             volume.key_order_copies.fetch_add(1, Ordering::Relaxed);
         }
         self.marks.fill(0);
-        self.row_ordinal = 0;
+        self.cuts = 0;
+        self.decide_bytes = 0;
+        self.decide_rows = 0;
         if is_grave_heavy || self.is_ordered {
             self.phase = RewritePhase::Deciding;
             return true;
@@ -462,7 +700,12 @@ impl<Backend: Io> RewriteJob<Backend> {
 
     /// Pick the inputs: a run of segments over the overlap bound first, since that comes ahead of the walk, then ready segments
     pub fn pick(&mut self, volume: &Volume<Backend>) -> Option<(MergeTarget, bool)> {
-        let room = volume.park_room().min(MOST_MERGE_SEGMENTS);
+        self.pick_within(volume, MOST_MERGE_SEGMENTS)
+    }
+
+    /// Pick up to this many inputs
+    pub fn pick_within(&mut self, volume: &Volume<Backend>, most: usize) -> Option<(MergeTarget, bool)> {
+        let room = volume.park_room().min(most);
         if !volume.can_start_rewrite() || volume.stray_outputs.load(Ordering::Acquire) > 0 || room == 0 {
             volume.note_pick(PickOutcome::Refused);
             return None;
@@ -492,6 +735,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
         // a full pool refuses range deletes, so the segment holding the oldest cover back goes whatever the trigger says
         if let Some(row) = self.forced.take().and_then(|forced| rows.get(forced)).filter(|row| is_mergeable(volume, row)) {
+            self.forced_pick = Some(row.facts.segment);
             let target = self.gather(volume, &rows, &row, 1, |_row| false);
             volume.note_pick(PickOutcome::Forced);
             return Some((target, false));
@@ -595,6 +839,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             input.segment = facts.segment;
             input.block_count = facts.block_count;
             input.block_rows = rows_of(&row);
+            input.data_end = facts.data_end.0;
             self.numbers[self.input_count] = facts.segment;
             self.input_count += 1;
             data += facts.data_end.0;
@@ -700,6 +945,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         };
         let started = self.state.io.now();
         self.unit = (UnitKind::MergeRows, 0);
+        let phase = self.phase;
         let outcome = match self.phase {
             RewritePhase::Deciding | RewritePhase::Copying if !self.is_drained && !self.is_cutting => self.merge_rows(),
             RewritePhase::Deciding => self.end_deciding(target),
@@ -708,6 +954,14 @@ impl<Backend: Io> RewriteJob<Backend> {
             RewritePhase::Moving => self.move_blocks(target),
             RewritePhase::Installing => self.install(),
         };
+        // the row blocks a pass reads, so a merge's deciding and placing reads show beside its copying one
+        let pass = match phase {
+            RewritePhase::Deciding => 0,
+            RewritePhase::Placing => 1,
+            _ => 2,
+        };
+        let read: u64 = self.inputs.iter_mut().map(|input| mem::take(&mut input.read_bytes)).sum();
+        self.state.volumes[self.volume].footer_reads[pass].fetch_add(read, Ordering::Relaxed);
         self.state.note_unit(self.unit.0, self.unit.1, started);
         if outcome.is_err() {
             self.abandon();
@@ -743,8 +997,13 @@ impl<Backend: Io> RewriteJob<Backend> {
             let (Some(row), column) = (input.row, input.column) else {
                 return Err(Error::from(ErrorKind::NotFound));
             };
-            self.key.clear();
-            self.key.extend_from_slice(&input.key);
+            self.key.set_from(&input.key)?;
+            self.row_input = index;
+            self.row_at = input.base + input.ordinal();
+            // the lists are sized to the summary's rows, and a row past its input's count says the summary counted short
+            if self.is_ordered && input.ordinal() >= input.block_rows {
+                return Err(Error::from(ErrorKind::InvalidData));
+            }
             self.decide(volume, &pins, pin, column, &row)?;
             // a cut leaves the row where it is, for the next output to take from the top
             if self.is_cutting {
@@ -784,7 +1043,6 @@ impl<Backend: Io> RewriteJob<Backend> {
         column: ColumnId,
         row: &FooterRow,
     ) -> Result<()> {
-        self.row_ordinal += 1;
         // its cover left the pool before this segment could merge, so nothing older sits under it
         if row.kind == RowKind::RangeDelete {
             self.dropped_rows += 1;
@@ -806,15 +1064,12 @@ impl<Backend: Io> RewriteJob<Backend> {
                 self.dropped_rows += 1;
                 Ok(())
             },
-            _kept if self.phase == RewritePhase::Deciding => {
-                self.mark_kept(row);
-                Ok(())
-            },
+            _kept if self.phase == RewritePhase::Deciding => self.mark_kept(row),
             // a grave output that's full leaves the rest of the graves as footer rows in the data output
             _kept if row.kind == RowKind::Grave && self.grave_writer.has_block_room() => {
                 self.keep_grave(volume, pins, column, row, replacement)
             },
-            _kept if self.is_top_row && self.is_cut_due() => {
+            _kept if self.is_cut_due() => {
                 self.is_cutting = true;
                 Ok(())
             },
@@ -825,9 +1080,28 @@ impl<Backend: Io> RewriteJob<Backend> {
     /// Check the output has reached its share of the merge, and another may follow it. A cut only falls before a key's first
     /// row, so a key's versions stay in one output
     pub fn is_cut_due(&self) -> bool {
+        // an offset-order copy cuts where the deciding pass did, by the row's place in its input
+        if self.is_ordered {
+            return self.output_of(self.row_input, self.inputs[self.row_input].ordinal()) > self.data_slot;
+        }
         let bytes = self.records_end.0 + self.used as u64;
         let is_full = bytes >= self.cut_bytes || self.writer.entries().len() + 2 >= MOST_SEGMENT_BLOCKS.0 as usize;
-        !self.is_ordered && self.output_rows > 0 && self.data_slot + 1 < MOST_MERGE_OUTPUTS && is_full
+        self.is_top_row && self.output_rows > 0 && self.data_slot + 1 < MOST_MERGE_OUTPUTS && is_full
+    }
+
+    /// Read which output a row goes to: the cuts at or before its place in its input
+    pub fn output_of(&self, input: usize, ordinal: u64) -> usize {
+        self.cut_ordinals[..self.cuts].iter().filter(|cut| ordinal >= cut[input]).count()
+    }
+
+    /// Cut the deciding pass's output before the row in hand, at each input's place
+    pub fn note_cut(&mut self) {
+        for (input, at) in self.inputs[..self.input_count].iter().zip(&mut self.cut_ordinals[self.cuts]) {
+            *at = input.ordinal();
+        }
+        self.cuts += 1;
+        self.decide_bytes = 0;
+        self.decide_rows = 0;
     }
 
     /// Find the newest place above a row that replaces it: the key's first row across the inputs, or a row in a finished
@@ -837,8 +1111,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.is_top_row = is_top;
         if is_top {
             self.last_column = Some(column);
-            self.last_key.clear();
-            self.last_key.extend_from_slice(&self.key);
+            self.last_key.set_from(&self.key)?;
             self.top_place = row.place;
             // a cover whose walk has counted what it hides replaces a row as a newer row does
             self.cover_place = if self.is_unwalked { None } else { volume.covers.newest_applied(column, &self.key) };
@@ -920,7 +1193,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         };
         if self.output_column != Some(column) {
             if self.output_column.is_some() {
-                self.writer.end_column(&self.output_last_key);
+                self.writer.end_column(&self.output_last_key)?;
             }
             self.load_edges(volume, pins, column)?;
             let start = ColumnStart {
@@ -934,13 +1207,15 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
         let offset = match self.placed_offset() {
             Some(offset) => offset,
-            None => self.copy_record(&pin.file, &output.file, row)?,
+            None => {
+                volume.keyed_copies.fetch_add(1, Ordering::Relaxed);
+                self.copy_record(&pin.file, &output.file, row)?
+            },
         };
         let kept = FooterRow { offset, ..*row };
         self.writer.push_row(&output.file, &self.key, &kept)?;
         self.output_rows += 1;
-        self.output_last_key.clear();
-        self.output_last_key.extend_from_slice(&self.key);
+        self.output_last_key.set_from(&self.key)?;
         let block = self.writer.entries().len() as u32;
         self.give_slot(volume, output.number, column, block);
         self.note_kept_dead(output.number, column, block, &kept, replacement)
@@ -966,7 +1241,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         };
         if self.grave_column != Some(column) {
             if self.grave_column.is_some() {
-                self.grave_writer.end_column(&self.grave_last_key);
+                self.grave_writer.end_column(&self.grave_last_key)?;
             }
             self.load_edges(volume, pins, column)?;
             let start = ColumnStart {
@@ -984,8 +1259,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             ..*row
         };
         self.grave_writer.push_row(&output.file, &self.key, &kept)?;
-        self.grave_last_key.clear();
-        self.grave_last_key.extend_from_slice(&self.key);
+        self.grave_last_key.set_from(&self.key)?;
         let block = self.grave_writer.entries().len() as u32;
         self.give_slot(volume, output.number, column, block);
         self.note_kept_dead(output.number, column, block, &kept, replacement)
@@ -1015,7 +1289,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             if self.kept_dead.len() == self.kept_dead.capacity() {
                 return Err(Error::from(ErrorKind::OutOfMemory));
             }
-            add_count(&mut self.kept_dead, output, column, block, kept, replacement);
+            add_count(&mut self.kept_dead, output, column, block, kept, replacement)?;
         }
         Ok(())
     }
@@ -1048,12 +1322,10 @@ impl<Backend: Io> RewriteJob<Backend> {
                 return Err(Error::from(ErrorKind::InvalidData));
             }
             if !has_edges || self.edge_lowest < self.lowest {
-                self.lowest.clear();
-                self.lowest.extend_from_slice(&self.edge_lowest);
+                self.lowest.set_from(&self.edge_lowest)?;
             }
             if !has_edges || self.edge_highest > self.highest {
-                self.highest.clear();
-                self.highest.extend_from_slice(&self.edge_highest);
+                self.highest.set_from(&self.edge_highest)?;
             }
             has_edges = true;
         }
@@ -1101,113 +1373,260 @@ impl<Backend: Io> RewriteJob<Backend> {
 
     /// End the deciding: copy from the first row if one would drop, and leave the segments alone if none would
     pub fn end_deciding(&mut self, target: MergeTarget) -> Result<()> {
-        if self.dropped_rows == 0 {
+        // several inputs becoming one win back overlap whatever they drop
+        if self.dropped_rows == 0 && self.input_count == 1 {
             self.note_gave_up();
             return Err(Error::from(ErrorKind::Interrupted));
         }
         let state = Arc::clone(&self.state);
-        self.open_output(&state.volumes[self.volume], target)?;
-        self.row_ordinal = 0;
+        let volume = &state.volumes[self.volume];
+        self.open_output(volume, target)?;
         if self.is_ordered {
+            // every output the deciding pass cut takes its records before the copying pass reaches it
+            for slot in 1..=self.cuts {
+                self.slot_outputs[slot] = Some(self.create_output(volume, ByteCount(self.cut_bytes), slot)?);
+            }
+            self.outputs_end = [0; MOST_MERGE_OUTPUTS];
+            self.placing_input = 0;
             self.stripe.clear();
-            self.stripe_start = 0;
-            self.stripe_end = MOST_STRIPE_BYTES;
             self.phase = RewritePhase::Placing;
         }
         Ok(())
     }
 
     /// Note a kept row of a deciding pass, for the copy to take in offset order
-    pub fn mark_kept(&mut self, row: &FooterRow) {
+    pub fn mark_kept(&mut self, row: &FooterRow) -> Result<()> {
         if self.is_ordered && row.kind == RowKind::Value {
-            let ordinal = self.row_ordinal - 1;
-            self.marks[ordinal / u64::BITS as usize] |= 1 << (ordinal % u64::BITS as usize);
+            // a cut falls only before a key's first row, so a key's versions stay in one output
+            let is_full = self.decide_bytes >= self.cut_bytes || self.decide_rows >= self.cut_rows;
+            if self.is_top_row && self.decide_rows > 0 && is_full && self.cuts + 1 < MOST_MERGE_OUTPUTS {
+                self.note_cut();
+            }
+            self.decide_bytes += row.length.0;
+            self.decide_rows += 1;
+            let ordinal = self.row_at as usize;
+            // the marks are sized to the input's rows, and a row past them says the summary counted short
+            let Some(word) = self.marks.get_mut(ordinal / u64::BITS as usize) else {
+                return Err(Error::from(ErrorKind::InvalidData));
+            };
+            *word |= 1 << (ordinal % u64::BITS as usize);
         }
+        Ok(())
     }
 
     /// Check a row was marked
     pub fn is_marked(&self, ordinal: usize) -> bool {
-        self.marks[ordinal / u64::BITS as usize] >> (ordinal % u64::BITS as usize) & 1 != 0
+        self.marks.get(ordinal / u64::BITS as usize).is_some_and(|word| word >> (ordinal % u64::BITS as usize) & 1 != 0)
     }
 
     /// Read where the row in hand's record landed, if a stripe copied it
     pub fn placed_offset(&self) -> Option<FileOffset> {
-        let ordinal = self.row_ordinal - 1;
-        (self.is_ordered && self.is_marked(ordinal)).then(|| FileOffset(u64::from(self.placed[ordinal])))
+        let ordinal = self.row_at as usize;
+        self.placed.get(ordinal).filter(|_placed| self.is_ordered && self.is_marked(ordinal)).map(|placed| FileOffset(u64::from(*placed)))
     }
 
-    /// Walk a step of the input's rows, listing the marked ones in this stripe, and copy the stripe a step at a time once the
-    /// rows run out
+    /// Walk a step of an input's rows, listing its marked ones, and once its rows run out copy them in offset order a step at a
+    /// time, then go on to the next input, and to the copying pass once every input's records are across
     pub fn place_rows(&mut self) -> Result<()> {
         let state = Arc::clone(&self.state);
         let volume = &state.volumes[self.volume];
-        let Some(pin) = volume.table.pin(self.numbers[0]) else {
+        let input = self.placing_input;
+        if input >= self.input_count {
+            return self.end_placing();
+        }
+        let Some(pin) = volume.table.pin(self.numbers[input]) else {
             return Err(Error::from(ErrorKind::NotFound));
         };
         if self.stripe_copied.is_some() {
             return self.copy_stripe(&pin.file);
         }
-        if self.inputs[0].row.is_none() && self.inputs[0].length == 0 {
-            self.inputs[0].advance(volume, &pin)?;
+        if self.inputs[input].row.is_none() && self.inputs[input].length == 0 {
+            self.inputs[input].advance(volume, &pin)?;
         }
         for _row in 0..MERGE_STEP_ROWS {
             self.unit.1 += 1;
-            let Some(row) = self.inputs[0].row else {
+            let Some(row) = self.inputs[input].row else {
+                // the input's kept records go in offset order, whichever output each one belongs to
                 self.stripe.sort_unstable_by_key(|listed| listed.offset);
                 self.stripe_copied = Some(0);
                 return self.copy_stripe(&pin.file);
             };
-            let ordinal = self.row_ordinal;
-            self.row_ordinal += 1;
-            if self.is_marked(ordinal) && row.offset.0 >= self.stripe_start && row.offset.0 < self.stripe_end {
-                self.list_stripe_row(&row, ordinal);
+            let at = (self.inputs[input].base + self.inputs[input].ordinal()) as usize;
+            if self.is_marked(at) {
+                // a record's place and length fit four bytes each, as the places the copy keeps do
+                let (Ok(offset), Ok(length)) = (u32::try_from(row.offset.0), u32::try_from(row.length.0)) else {
+                    return Err(Error::from(ErrorKind::InvalidData));
+                };
+                self.stripe.push(StripeRow { offset, length, ordinal: at as u32 })?;
             }
-            self.inputs[0].advance(volume, &pin)?;
+            self.inputs[input].advance(volume, &pin)?;
         }
         Ok(())
     }
 
-    /// List a row, narrowing the stripe to its lowest half when the list is full. The rows that leave wait for the next stripe
-    pub fn list_stripe_row(&mut self, row: &FooterRow, ordinal: usize) {
-        if self.stripe.len() == MOST_STRIPE_ROWS {
-            self.stripe.sort_unstable_by_key(|listed| listed.offset);
-            self.stripe.truncate(MOST_STRIPE_ROWS / 2);
-            self.stripe_end = self.stripe.last().map_or(self.stripe_end, |listed| listed.offset.0 + 1);
-            if row.offset.0 >= self.stripe_end {
-                return;
-            }
-        }
-        self.stripe.push(StripeRow { offset: row.offset, length: row.length, ordinal: ordinal as u32 });
-    }
-
-    /// Copy a step of a stripe's records in offset order, and once the stripe is across go round for the next one, or on to the
-    /// footer once the records run out
+    /// Copy a step of an input's listed records in offset order, a run to a read, staging each into its output's buffer, and once
+    /// they're all across go on to the next input
     pub fn copy_stripe(&mut self, from: &Backend::File) -> Result<()> {
-        let Some(output) = self.output.clone() else {
-            return Err(Error::from(ErrorKind::NotFound));
-        };
-        let first = self.stripe_copied.unwrap_or(0);
-        let end = (first + COPY_STEP_RECORDS).min(self.stripe.len());
-        self.unit = (UnitKind::StripeCopy, (end - first) as u64);
-        for index in first..end {
-            let listed = self.stripe[index];
-            let row = FooterRow { place: WritePlace(0), offset: listed.offset, length: listed.length, kind: RowKind::Value };
-            let at = self.copy_record(from, &output.file, &row)?;
-            self.placed[listed.ordinal as usize] = at.0 as u32;
+        // a step takes runs until a buffer's bytes are across, and a run ends only at a gap or the buffer's edge
+        let end = self.stripe.len();
+        let (mut lone, mut runs, mut run_records, mut gaps, mut copied) = (0, 0, 0, 0, 0);
+        let mut index = self.stripe_copied.unwrap_or(0);
+        let state = Arc::clone(&self.state);
+        let volume = &state.volumes[self.volume];
+        while index < end && copied < COPY_STEP_BYTES {
+            let last = self.run_end(index, end);
+            copied += self.stripe[index..=last].iter().map(|listed| u64::from(listed.length)).sum::<u64>();
+            gaps += self.copy_run(from, index, last)?;
+            let records = (last + 1 - index) as u64;
+            if records == 1 {
+                lone += 1;
+            } else {
+                runs += 1;
+                run_records += records;
+            }
+            volume.span_runs[(records.ilog2() as usize).min(SPAN_RUN_BUCKETS - 1)].fetch_add(1, Ordering::Relaxed);
+            index = last + 1;
         }
-        if end < self.stripe.len() {
-            self.stripe_copied = Some(end);
+        self.unit = (UnitKind::StripeCopy, copied);
+        volume.lone_copies.fetch_add(lone, Ordering::Relaxed);
+        volume.span_reads.fetch_add(runs, Ordering::Relaxed);
+        volume.span_records.fetch_add(run_records, Ordering::Relaxed);
+        volume.span_gap_bytes.fetch_add(gaps, Ordering::Relaxed);
+        if index < end {
+            self.stripe_copied = Some(index);
             return Ok(());
         }
         self.stripe_copied = None;
         self.stripe.clear();
-        self.row_ordinal = 0;
-        self.inputs[0].rewind();
-        self.stripe_start = self.stripe_end;
-        self.stripe_end = self.stripe_start + MOST_STRIPE_BYTES;
-        if self.stripe_start >= self.inputs_data_end() {
-            self.phase = RewritePhase::Copying;
+        self.placing_input += 1;
+        Ok(())
+    }
+
+    /// Read an output's file: the first is the output in hand, and the later ones wait in their slots
+    pub fn slot_file(&self, slot: usize) -> Result<Backend::File> {
+        let output = if slot == 0 { self.output.as_ref() } else { self.slot_outputs.get(slot).and_then(Option::as_ref) };
+        output.map(|output| output.file.clone()).ok_or_else(|| Error::from(ErrorKind::NotFound))
+    }
+
+    /// End the placing: write out every output's staged records, and start the copying pass on the first output
+    pub fn end_placing(&mut self) -> Result<()> {
+        for output in 0..=self.cuts {
+            self.flush_stage(output)?;
         }
+        self.records_end = FileOffset(self.outputs_end[0]);
+        self.used = 0;
+        for input in &mut self.inputs[..self.input_count] {
+            input.rewind();
+        }
+        self.phase = RewritePhase::Copying;
+        Ok(())
+    }
+
+    /// Find the last listed record a run from this one takes: each next one starts within the gap bound of the one before, and
+    /// the run's bytes fit the read buffer
+    pub fn run_end(&self, index: usize, end: usize) -> usize {
+        let start = self.stripe[index].start();
+        let mut span_end = self.stripe[index].end();
+        let mut last = index;
+        while last + 1 < end {
+            let next = self.stripe[last + 1];
+            let next_end = next.end();
+            if next.start() > span_end + SPAN_GAP_BYTES || next_end - start > self.buffer.len() as u64 {
+                break;
+            }
+            span_end = next_end;
+            last += 1;
+        }
+        last
+    }
+
+    /// Copy a run of listed records with one read into the buffer, staging each into its output's buffer, and return the gap bytes
+    /// the read took. A record past the buffer goes across alone, in parts
+    pub fn copy_run(&mut self, from: &Backend::File, index: usize, last: usize) -> Result<u64> {
+        let start = self.stripe[index].start();
+        let span = (self.stripe[last].end() - start) as usize;
+        if span > self.buffer.len() {
+            return self.copy_large(from, index).map(|()| 0);
+        }
+        from.read_exact_at(FileOffset(start), &mut self.buffer[..span])?;
+        let mut kept = 0;
+        for position in index..=last {
+            let listed = self.stripe[position];
+            let output = self.listed_output(listed.ordinal);
+            let at = self.stage(output, (listed.start() - start) as usize, listed.length as usize)?;
+            self.place(listed.ordinal, at)?;
+            kept += u64::from(listed.length);
+        }
+        Ok(span as u64 - kept)
+    }
+
+    /// Read which output a listed record of the input being placed goes to
+    pub fn listed_output(&self, ordinal: u32) -> usize {
+        let input = self.placing_input;
+        self.output_of(input, u64::from(ordinal) - self.inputs[input].base)
+    }
+
+    /// Put a record from the read buffer in its output's stage, writing the stage out first when it lacks the room, and return
+    /// where the record lands in the output
+    pub fn stage(&mut self, output: usize, read: usize, length: usize) -> Result<FileOffset> {
+        if length > self.stages[output].room() {
+            self.flush_stage(output)?;
+        }
+        let at = self.outputs_end[output] + self.stages[output].len() as u64;
+        // the row blocks sit past this, and a key's versions kept for a cue are all that can reach them
+        if self.target.is_none_or(|target| at + length as u64 > target.blocks_at.0) {
+            return Err(Error::from(ErrorKind::OutOfMemory));
+        }
+        if length > self.stages[output].capacity() {
+            let file = self.slot_file(output)?;
+            file.write_at(FileOffset(at), &[IoSlice::new(&self.buffer[read..read + length])])?;
+            self.outputs_end[output] += length as u64;
+            return Ok(FileOffset(at));
+        }
+        self.stages[output].extend_from_slice(&self.buffer[read..read + length])?;
+        Ok(FileOffset(at))
+    }
+
+    /// Write an output's staged records out at its records' end
+    pub fn flush_stage(&mut self, output: usize) -> Result<()> {
+        if self.stages[output].is_empty() {
+            return Ok(());
+        }
+        let file = self.slot_file(output)?;
+        file.write_at(FileOffset(self.outputs_end[output]), &[IoSlice::new(&self.stages[output])])?;
+        self.outputs_end[output] += self.stages[output].len() as u64;
+        self.stages[output].clear();
+        Ok(())
+    }
+
+    /// Copy one listed record past the read buffer to its output in parts, after the records staged before it
+    pub fn copy_large(&mut self, from: &Backend::File, index: usize) -> Result<()> {
+        let listed = self.stripe[index];
+        let output = self.listed_output(listed.ordinal);
+        self.flush_stage(output)?;
+        let at = self.outputs_end[output];
+        let length = u64::from(listed.length);
+        if self.target.is_none_or(|target| at + length > target.blocks_at.0) {
+            return Err(Error::from(ErrorKind::OutOfMemory));
+        }
+        let file = self.slot_file(output)?;
+        let mut done = 0;
+        while done < length {
+            let part = (length - done).min(self.buffer.len() as u64) as usize;
+            from.read_exact_at(FileOffset(listed.start() + done), &mut self.buffer[..part])?;
+            file.write_at(FileOffset(at + done), &[IoSlice::new(&self.buffer[..part])])?;
+            done += part as u64;
+        }
+        self.outputs_end[output] += length;
+        self.place(listed.ordinal, FileOffset(at))
+    }
+
+    /// Note where a listed record landed in the output
+    pub fn place(&mut self, ordinal: u32, at: FileOffset) -> Result<()> {
+        let Some(placed) = self.placed.get_mut(ordinal as usize) else {
+            return Err(Error::from(ErrorKind::InvalidData));
+        };
+        *placed = at.0 as u32;
         Ok(())
     }
 
@@ -1229,7 +1648,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
         self.flush(&output.file)?;
         if self.output_column.is_some() {
-            self.writer.end_column(&self.output_last_key);
+            self.writer.end_column(&self.output_last_key)?;
         }
         self.writer.close_block(&output.file)?;
         self.phase = RewritePhase::Moving;
@@ -1272,15 +1691,19 @@ impl<Backend: Io> RewriteJob<Backend> {
         if !volume.table.install(output.file.clone(), RootId(output.root as u8), &totals.head, self.writer.columns(), self.writer.entries()) {
             return Err(Error::from(ErrorKind::OutOfMemory));
         }
-        self.stage_output(output.number, &totals);
+        self.stage_output(output.number, &totals)?;
 
         self.data_slot += 1;
-        let next = self.create_output(volume, ByteCount(self.cut_bytes), self.data_slot)?;
+        // an offset-order copy placed the next output's records already
+        let next = match self.slot_outputs.get_mut(self.data_slot).and_then(Option::take) {
+            Some(placed) => placed,
+            None => self.create_output(volume, ByteCount(self.cut_bytes), self.data_slot)?,
+        };
         self.output = Some(next);
         let base = self.lowest_place_base(volume)?;
         self.writer.start(target.blocks_at, base);
         self.writer.set_marks(target.marks);
-        self.records_end = FileOffset(0);
+        self.records_end = FileOffset(if self.is_ordered { self.outputs_end[self.data_slot] } else { 0 });
         self.used = 0;
         self.moved = 0;
         self.output_rows = 0;
@@ -1320,21 +1743,21 @@ impl<Backend: Io> RewriteJob<Backend> {
     }
 
     /// Keep what an output's summary row and list entries will need once the writer has moved on
-    pub fn stage_output(&mut self, number: SegmentNumber, totals: &FooterTotals) {
+    pub fn stage_output(&mut self, number: SegmentNumber, totals: &FooterTotals) -> std::result::Result<(), ListFull> {
         let first_column = self.staged_columns.len();
         for (index, tail) in self.writer.columns().iter().enumerate() {
             let facts = self.writer.column_facts(index);
             let lowest_at = self.staged_keys.len();
-            self.staged_keys.extend_from_slice(facts.lowest);
+            self.staged_keys.extend_from_slice(facts.lowest)?;
             let bound_at = self.staged_keys.len();
-            self.staged_keys.extend_from_slice(facts.bound);
+            self.staged_keys.extend_from_slice(facts.bound)?;
             self.staged_columns.push(StagedColumn {
                 tail: *tail,
                 lowest_at,
                 bound_at,
                 end: self.staged_keys.len(),
                 live_bytes: facts.live_bytes,
-            });
+            })?;
         }
         let block_count = self.writer.entries().len() as u32;
         self.staged.push(StagedOutput {
@@ -1342,7 +1765,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             newest_place: totals.head.places.highest,
             first_column,
             column_count: self.staged_columns.len() - first_column,
-        });
+        })
     }
 
     /// Make the outputs whole, the graves first. The last tail lists the inputs, and open takes that as the merge having
@@ -1353,7 +1776,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         let inputs = &numbers[..self.input_count];
         let has_data = !self.writer.columns().is_empty();
         if let Some(graves) = self.grave_output.clone() {
-            self.grave_writer.end_column(&self.grave_last_key);
+            self.grave_writer.end_column(&self.grave_last_key)?;
             self.grave_writer.close_block(&graves.file)?;
             self.grave_writer.is_output = true;
             self.grave_writer.is_unwalked = self.is_unwalked;
@@ -1494,6 +1917,7 @@ impl<Backend: Io> RewriteJob<Backend> {
                 park(volume, Some(retired), *segment, saved.is_ok());
             }
         }
+        self.release_region();
         saved
     }
 
@@ -1662,6 +2086,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         volume.lanes[self.lane].is_rewriting.store(false, Ordering::Release);
         *hold(&volume.lanes[self.lane].merging) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
         *hold(&volume.lanes[self.lane].inputs) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
+        self.release_region();
     }
 }
 
@@ -1690,6 +2115,7 @@ pub fn output_facts(number: SegmentNumber, totals: &FooterTotals, data_end: File
         walked_blocks: if is_unwalked { 0 } else { block_count },
         is_backward: false,
         has_lost_rows: false,
+        most_block_rows: totals.most_block_rows,
     }
 }
 
@@ -1811,6 +2237,8 @@ pub fn gather_smallest<Backend: Io>(
         let facts = row.facts;
         inputs[*input_count].segment = facts.segment;
         inputs[*input_count].block_count = facts.block_count;
+        inputs[*input_count].block_rows = rows_of(&row);
+        inputs[*input_count].data_end = facts.data_end.0;
         numbers[*input_count] = facts.segment;
         *input_count += 1;
         data += facts.data_end.0;
@@ -1875,7 +2303,7 @@ pub fn overlap_start<'rows>(
     looked_up_to: &mut SegmentNumber,
     can_merge: impl Fn(&SummaryRow<'_>) -> bool,
     has_bound: impl Fn(ColumnId) -> bool,
-    point: &mut Vec<u8>,
+    point: &mut FixedList<u8>,
 ) -> Option<(SummaryRow<'rows>, ColumnId)> {
     let is_crowded = |column: ColumnId, key: &[u8]| {
         rows.rows().filter(|row| can_merge(row) && covers_point(row, column, key)).take(MOST_OVERLAP + 1).count() > MOST_OVERLAP
@@ -1891,8 +2319,7 @@ pub fn overlap_start<'rows>(
             let inside = rows.rows().filter_map(|other| lowest_inside(&other, facts.column, facts.lowest, facts.bound));
             let found = iter::once(facts.lowest).chain(inside.take(OVERLAP_PROBES)).find(|key| is_crowded(facts.column, key));
             if let Some(key) = found.filter(|_key| can_merge(&row)) {
-                point.clear();
-                point.extend_from_slice(key);
+                point.set_from(key).ok()?;
                 return Some((row, facts.column));
             }
         }
@@ -1973,4 +2400,81 @@ pub fn rows_bytes(rows: &SummaryRows, segments: impl Iterator<Item = SegmentNumb
         }
     }
     bytes
+}
+
+/// What a pick's inputs hold, which bounds every list its run carves
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RewriteBound {
+    /// Inputs picked
+    pub inputs: usize,
+    /// Rows the inputs hold in all, every row an output can take
+    pub rows: u64,
+    /// Rows the largest input holds, every row the placing pass lists at once
+    pub most_input_rows: u64,
+    /// Columns the inputs hold in all, the most an output can carry
+    pub columns: usize,
+    /// The smallest block any of those columns writes
+    pub block_bytes: usize,
+    /// One input copies in offset order, with marks, places and a stripe for its rows
+    pub is_ordered: bool,
+    /// The most blocks the grave output takes
+    pub most_grave_blocks: BlockCount,
+}
+
+impl RewriteBound {
+    /// Count the most row blocks one output can write
+    pub fn output_blocks(&self) -> BlockCount {
+        BlockCount(blocks_for_rows(self.rows, self.block_bytes, self.columns).min(MOST_SEGMENT_BLOCKS.0))
+    }
+
+    /// Count the most row blocks the grave output can write
+    pub fn grave_blocks(&self) -> BlockCount {
+        BlockCount(blocks_for_rows(self.rows, self.block_bytes, self.columns).min(self.most_grave_blocks.0))
+    }
+
+    /// Count the rows the placing pass lists at once, none for a key-order copy
+    pub fn ordered_input_rows(&self) -> usize {
+        if self.is_ordered { self.most_input_rows as usize } else { 0 }
+    }
+
+    /// Count the stages an offset-order copy carves, one an output it can cut into
+    pub fn stages(&self) -> usize {
+        if self.is_ordered { MOST_MERGE_OUTPUTS } else { 0 }
+    }
+
+    /// Count the rows the offset-order copy marks and places, none for a key-order copy
+    pub fn ordered_rows(&self) -> usize {
+        if self.is_ordered { self.rows as usize } else { 0 }
+    }
+
+    /// Count the region bytes every list of the run takes, each with its alignment room
+    pub fn region_bytes(&self) -> ByteCount {
+        let writers = FooterWriter::region_bytes(self.output_blocks()) + FooterWriter::region_bytes(self.grave_blocks());
+        let inputs = self.inputs * MergeInput::region_bytes();
+        let keys = RUN_KEYS * list_bytes::<u8>(MAX_KEY_BYTES as usize);
+        let buffers = list_bytes::<u8>(MERGE_BUFFER_BYTES) + list_bytes::<DeadCount>(MOST_KEPT_BLOCKS);
+        let staged = list_bytes::<StagedOutput>(MOST_MERGE_OUTPUTS)
+            + list_bytes::<StagedColumn>(MOST_MERGE_OUTPUTS * self.columns)
+            + list_bytes::<u8>(MOST_MERGE_OUTPUTS * self.columns * STAGED_COLUMN_KEY_BYTES);
+        let rows = self.ordered_rows();
+        let ordered = list_bytes::<u64>(rows.div_ceil(u64::BITS as usize))
+            + list_bytes::<u32>(rows)
+            + list_bytes::<StripeRow>(self.ordered_input_rows())
+            + self.stages() * list_bytes::<u8>(STAGE_BYTES);
+        ByteCount((REGION_HEAD_BYTES + writers + inputs + keys + buffers + staged + ordered) as u64)
+    }
+}
+
+/// Count the most row blocks these rows can fill. A block closes only when the next row can't fit, so each one a writer
+/// closes before its column or output ends holds at least the fewest rows of the widest key, and each column and output
+/// leaves one block short
+pub fn blocks_for_rows(rows: u64, block_bytes: usize, columns: usize) -> u32 {
+    let blocks = rows.div_ceil(fewest_block_rows(block_bytes)) + columns as u64 + 1;
+    u32::try_from(blocks).unwrap_or(u32::MAX)
+}
+
+/// Count the fewest rows a block a writer closes before its column or output ends can hold, at the widest key
+pub fn fewest_block_rows(block_bytes: usize) -> u64 {
+    let widest_row = ROW_ROOM_NUMBERS + MAX_KEY_BYTES as usize + size_of::<u16>();
+    (block_bytes.saturating_sub(BLOCK_TRAILER_BYTES) / widest_row).saturating_sub(1).max(1) as u64
 }

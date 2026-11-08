@@ -12,6 +12,7 @@ use reel_api::memory_report::MemoryReport;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, SegmentCount, WritePlace};
 
+use crate::engine::admission::{Admission, Decision, JobRole, reserve_for, room_for};
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::cue::{CueTable, JobCounts};
 use crate::engine::engine_sizing::EngineSizing;
@@ -24,6 +25,7 @@ use crate::engine::walk_job::{FREE_BLOCK_BYTES, FreeRecord};
 use crate::engine::volume::{ParkedSegment, RewriteOutput, Volume};
 use crate::segment::range_covers::Cover;
 use crate::guard::hold;
+use crate::region::Region;
 use crate::index::open_slots::OpenSlot;
 use crate::index::spot_index::SpotIndex;
 use crate::index::write_index::WriteIndex;
@@ -124,7 +126,9 @@ pub struct EngineState<Backend: Io> {
     pub unlinks_refused: AtomicU64,
     pub memory_budget: ByteCount,
     pub seal_heap: AtomicU64,
+    pub walk_heap: AtomicU64,
     pub compaction_heap: AtomicU64,
+    pub admission: Admission,
     pub job_count: AtomicU64,
     pub row_task: OnceLock<Backend::Task>,
     pub reserve_task: OnceLock<Backend::Task>,
@@ -510,6 +514,35 @@ impl<Backend: Io> EngineState<Backend> {
         }
     }
 
+    /// Map a maintenance job's region when its need fits the host's free memory past the reserve, or when no region is held,
+    /// and count a wait when it doesn't
+    pub fn admit(&self, role: JobRole, need: ByteCount, may_floor: bool) -> Option<Region> {
+        let memory = self.io.host_memory();
+        let footers = ByteCount(self.volumes.iter().map(|volume| hold(&volume.summary).footer_bytes().0).sum());
+        let reserve = reserve_for(memory.reserve_total(), footers);
+        self.admission.note_reading(memory.free(), reserve);
+        let decision = self.admission.decide(need, room_for(&memory, reserve));
+        // a need the floor may not take waits, and only a start with no smaller need to try counts the wait
+        let region = match decision {
+            Decision::Admit => Region::map(need).ok(),
+            Decision::Floor if may_floor => Region::map(need).ok(),
+            Decision::Floor | Decision::Wait => None,
+        };
+        let Some(region) = region else {
+            if may_floor {
+                self.admission.waits.fetch_add(1, Ordering::Relaxed);
+            }
+            return None;
+        };
+        self.admission.take(role, need, region.mapped_bytes(), decision == Decision::Floor);
+        Some(region)
+    }
+
+    /// Note a job gave its region back, with the bytes its lists wrote
+    pub fn give_back(&self, role: JobRole, mapped: ByteCount, touched: ByteCount) {
+        self.admission.give_back(role, mapped, touched);
+    }
+
     /// Bring the planner back to every volume's compaction
     pub fn ask_compaction(&self) {
         for volume in &self.volumes {
@@ -552,7 +585,7 @@ impl<Backend: Io> EngineState<Backend> {
             spot_cache: self.spot.heap_bytes(),
             complete_tables: ByteCount(self.complete.iter().flatten().map(|table| table.heap_bytes().0).sum()),
             block_cache: ByteCount(self.filter_arena.heap_bytes().0 + self.filter_cache.heap_bytes().0 + self.row_cache.heap_bytes().0 + self.complete_cache_bytes()),
-            footer_space: ByteCount(self.seal_heap.load(Ordering::Acquire)),
+            footer_space: ByteCount(self.seal_heap.load(Ordering::Acquire) + self.walk_heap.load(Ordering::Acquire)),
             compaction: ByteCount(self.compaction_heap.load(Ordering::Acquire)),
             thread_stacks: ByteCount(self.job_count.load(Ordering::Acquire) * self.io.job_stack_bytes().0),
             open_slots: self.queues.len(),

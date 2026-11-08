@@ -433,6 +433,7 @@ fn cut_during_footer(rows: &[(Vec<u8>, FooterRow)], crash_at: OperationCount, se
             file_length: ByteCount(0),
             block_count: head.block_count,
             row_count: RowCount(0),
+            most_block_rows: 0,
         },
     };
     let loaded = Loaded { head, columns, entries };
@@ -441,4 +442,36 @@ fn cut_during_footer(rows: &[(Vec<u8>, FooterRow)], crash_at: OperationCount, se
         assert_eq!(found, FooterAnswer::Found(*row));
     }
     1
+}
+
+// a row past what an empty block holds is refused, and the writer drops no row on the way
+#[test]
+fn row_past_an_empty_block_is_refused() {
+    let io = SimulatedIo::new(Seed(2));
+    let root = PathBuf::from(ROOT);
+    io.create_directory(&root).expect("directory");
+    let file = io.create_file(&root.join("segment"), ByteCount(DATA_END.0)).expect("create");
+    let small = b"a".to_vec();
+    let long = vec![b'z'; 200];
+    let mut writer = FooterWriter::new(MOST_BLOCKS);
+    writer.start(DATA_END, WritePlace(0));
+    let start = ColumnStart { column: FIRST_COLUMN, lowest: &small, highest: &long, block_bytes: 128 };
+    writer.start_column(&file, &start).expect("column");
+    let row = FooterRow { place: WritePlace(1), offset: FileOffset(0), length: ByteCount(1), kind: RowKind::Value };
+
+    writer.push_row(&file, &small, &row).expect("a short row");
+    assert!(writer.push_row(&file, &long, &row).is_err(), "a row past an empty block went nowhere");
+}
+
+// the totals carry the most rows any one block took, and the written index says the same of each block
+#[test]
+fn most_block_rows_in_totals() {
+    let written = write_rows(&[(FIRST_COLUMN, ordered_rows())]);
+    let mut reader = FooterReader::new();
+    let head = written.totals.head;
+    let mut entries = Vec::new();
+    assert!(reader.read_index(&written.file, &head, &mut entries).expect("index"));
+    let most = entries.iter().map(|entry| entry.live_rows).max().expect("a block");
+    assert_eq!(written.totals.most_block_rows, most);
+    assert!(most > 1 && u64::from(most) < ROWS);
 }

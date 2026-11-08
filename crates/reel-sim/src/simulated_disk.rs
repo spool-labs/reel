@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use reel::io::DiskSize;
+use reel::io::host_memory::HostMemory;
 use reel_api::units::{ByteCount, ProcessId};
 
 use crate::file_image::FileImage;
@@ -15,6 +16,8 @@ use crate::seeded_random::{Seed, SeededRandom};
 
 /// The disk size used under a path with no declared disk
 pub const UNBOUNDED_CAPACITY: ByteCount = ByteCount(1 << 50);
+/// The host a simulation runs on: 64 GiB with 48 free and no control group limit, so admission always has room
+pub const SIMULATED_HOST: HostMemory = HostMemory { total: ByteCount(64 << 30), available: ByteCount(48 << 30), group_room: None, group_limit: None };
 /// Process ids in a simulation count up from here
 pub const FIRST_PROCESS: ProcessId = ProcessId(1_000);
 /// Each unsynced directory change survives a power cut one time in this many
@@ -111,6 +114,7 @@ pub struct SimulatedDisk {
     pub handle_faults: OperationCount,
     pub refuses_free_blocks: bool,
     pub freed_bytes: ByteCount,
+    pub host_memory: HostMemory,
 }
 
 impl SimulatedDisk {
@@ -157,6 +161,7 @@ impl SimulatedDisk {
             handle_faults: OperationCount::default(),
             refuses_free_blocks: false,
             freed_bytes: ByteCount(0),
+            host_memory: SIMULATED_HOST,
         }
     }
 

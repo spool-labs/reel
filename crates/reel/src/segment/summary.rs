@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, DeathMark, FileOffset, RowCount, WritePlace};
 
+use crate::fixed_list::{ListFull, ListOut};
 use crate::io::device_error::{SECTOR_BYTES, read_or_damaged};
 use crate::io::{Io, IoFile};
 use crate::lifetime::MarkRange;
@@ -45,7 +46,7 @@ pub const ROW_HEAD_BYTES: usize = 3 * size_of::<u32>();
 /// Bytes of a row's checksum
 pub const ROW_SUM_BYTES: usize = size_of::<u64>();
 /// Bytes of the fields every row has, before its columns
-pub const ROW_FACT_BYTES: usize = 93;
+pub const ROW_FACT_BYTES: usize = 97;
 /// Where a row's body keeps its span count
 /// Where a row's body keeps its flags
 pub const ROW_FLAGS_AT: usize = 56;
@@ -90,6 +91,7 @@ pub struct SegmentFacts {
     pub is_backward: bool,
     pub has_lost_rows: bool,
     pub marks: MarkRange,
+    pub most_block_rows: u32,
 }
 
 impl SegmentFacts {
@@ -145,6 +147,7 @@ pub struct SummaryRows {
     index: NumberMap,
     listed: usize,
     is_index_whole: bool,
+    footer_bytes: u64,
 }
 
 /// One row read back
@@ -257,6 +260,7 @@ impl SummaryRows {
             index: NumberMap::new(0),
             listed: 0,
             is_index_whole: false,
+            footer_bytes: 0,
         }
     }
 
@@ -615,6 +619,7 @@ impl SummaryRows {
 
     /// Write a row's fixed fields
     pub fn put_facts(&mut self, facts: &SegmentFacts, columns: u16, spans: u16) {
+        self.footer_bytes += footer_of(facts);
         self.bytes.extend_from_slice(&facts.segment.0.to_le_bytes());
         self.bytes.extend_from_slice(&facts.file_length.0.to_le_bytes());
         self.bytes.extend_from_slice(&facts.data_end.0.to_le_bytes());
@@ -630,11 +635,17 @@ impl SummaryRows {
         self.bytes.extend_from_slice(&facts.walked_blocks.to_le_bytes());
         self.bytes.extend_from_slice(&facts.marks.lowest.0.to_le_bytes());
         self.bytes.extend_from_slice(&facts.marks.highest.0.to_le_bytes());
+        self.bytes.extend_from_slice(&facts.most_block_rows.to_le_bytes());
     }
 
     /// Walk the rows that pass their checks
     pub fn rows(&self) -> RowWalk<'_> {
         RowWalk { bytes: &self.bytes }
+    }
+
+    /// Read the bytes the rows' segments give their footers, past their records
+    pub fn footer_bytes(&self) -> ByteCount {
+        ByteCount(self.footer_bytes)
     }
 
     /// Find a segment's row
@@ -646,7 +657,8 @@ impl SummaryRows {
     pub fn remove(&mut self, segment: SegmentNumber) {
         let mut at = 0;
         while let Some((length, row)) = read_row(&self.bytes[at..]) {
-            if row.is_some_and(|row| row.facts.segment == segment) {
+            if let Some(row) = row.filter(|row| row.facts.segment == segment) {
+                self.footer_bytes = self.footer_bytes.saturating_sub(footer_of(&row.facts));
                 self.bytes.copy_within(at + length.., at);
                 self.bytes.truncate(self.bytes.len() - length);
                 self.rebuild_index();
@@ -703,8 +715,9 @@ impl SummaryRows {
         }
         let start = self.bytes.len();
         self.bytes.extend_from_slice(&from.bytes[at..at + length]);
-        if let Some(number) = from.row_at(at).map(|row| row.facts.segment) {
-            self.note_row(number, start);
+        if let Some(facts) = from.row_at(at).map(|row| row.facts) {
+            self.footer_bytes += footer_of(&facts);
+            self.note_row(facts.segment, start);
         }
         true
     }
@@ -761,29 +774,34 @@ pub fn row_bytes<'key>(
 }
 
 /// Add the part of a lowest key a row keeps
-pub fn put_lowest(key: &[u8], out: &mut Vec<u8>) {
-    out.extend_from_slice(&key[..key.len().min(SUMMARY_KEY_BYTES)]);
+pub fn put_lowest(key: &[u8], out: &mut impl ListOut<u8>) -> std::result::Result<(), ListFull> {
+    out.extend_from_slice(&key[..key.len().min(SUMMARY_KEY_BYTES)])
 }
 
 /// Add an exclusive bound above every key sharing a highest key's first bytes, which is nothing
 /// when no key can sit above them, and which can only widen a range
-pub fn put_bound(key: &[u8], out: &mut Vec<u8>) {
+pub fn put_bound(key: &[u8], out: &mut impl ListOut<u8>) -> std::result::Result<(), ListFull> {
     let start = out.len();
     if key.len() < SUMMARY_KEY_BYTES {
-        out.extend_from_slice(key);
-        out.push(0);
-        return;
+        out.extend_from_slice(key)?;
+        return out.push(0);
     }
 
-    out.extend_from_slice(&key[..SUMMARY_KEY_BYTES]);
+    out.extend_from_slice(&key[..SUMMARY_KEY_BYTES])?;
     while out.len() > start {
         let last = out.len() - 1;
         if out[last] < u8::MAX {
             out[last] += 1;
-            return;
+            return Ok(());
         }
-        out.pop();
+        out.truncate(last);
     }
+    Ok(())
+}
+
+/// Count the bytes a segment's footer takes, past its records
+pub fn footer_of(facts: &SegmentFacts) -> u64 {
+    facts.file_length.0.saturating_sub(facts.data_end.0)
 }
 
 /// Lay out a row's head
@@ -851,6 +869,7 @@ pub fn parse_row(body: &[u8]) -> Option<SummaryRow<'_>> {
         lowest: DeathMark(cursor.word()?),
         highest: DeathMark(cursor.word()?),
     };
+    let most_block_rows = cursor.half()?;
     let block_dead = cursor.take(block_count as usize * size_of::<u32>())?;
     let facts = SegmentFacts {
         segment,
@@ -867,6 +886,7 @@ pub fn parse_row(body: &[u8]) -> Option<SummaryRow<'_>> {
         is_backward,
         has_lost_rows,
         marks,
+        most_block_rows,
     };
     Some(SummaryRow {
         facts,

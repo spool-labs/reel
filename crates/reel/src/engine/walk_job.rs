@@ -28,7 +28,10 @@ use crate::guard::hold;
 use crate::io::device_error::is_device_error;
 use crate::io::job::{Job, JobStep};
 use crate::io::{Io, IoFile, IoTask};
-use crate::pool::{touched_capacity, touched_zeroes};
+use crate::engine::admission::JobRole;
+use crate::segment::summary::SegmentFacts;
+use crate::fixed_list::{FixedList, ListFull, full};
+use crate::region::{REGION_HEAD_BYTES, Region, list_bytes};
 use crate::row_kind::RowKind;
 use crate::segment::footer_writer::MOST_BLOCK_ROWS;
 use crate::segment::row_block::{FooterRow, ROW_BLOCK_BYTES, RowBlockWalk};
@@ -77,11 +80,11 @@ pub struct FreeRecord {
 }
 
 /// What counting one block found
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Debug, Default, Eq, PartialEq)]
 pub struct BlockCounts {
-    pub counts: Vec<DeadCount>,
-    pub frees: Vec<FreeRecord>,
-    pub overflowed: Vec<SegmentNumber>,
+    pub counts: FixedList<DeadCount>,
+    pub frees: FixedList<FreeRecord>,
+    pub overflowed: FixedList<SegmentNumber>,
     pub read_bytes: ByteCount,
     pub rows: u64,
 }
@@ -90,12 +93,35 @@ impl BlockCounts {
     /// Allocate room for any block
     pub fn new() -> Self {
         Self {
-            counts: touched_capacity(MOST_BLOCK_ROWS, DeadCount::default()),
-            frees: touched_capacity(MOST_BLOCK_FREES, FreeRecord::default()),
-            overflowed: touched_capacity(MOST_BLOCK_FREES, SegmentNumber(0)),
+            counts: FixedList::on_heap(MOST_BLOCK_ROWS),
+            frees: FixedList::on_heap(MOST_BLOCK_FREES),
+            overflowed: FixedList::on_heap(MOST_BLOCK_FREES),
             read_bytes: ByteCount(0),
             rows: 0,
         }
+    }
+
+    /// Carve room for a block of up to this many rows from a walk's region: a count for each row and one for the block itself
+    pub fn in_region(region: &mut Region, rows: usize) -> std::result::Result<Self, ListFull> {
+        Ok(Self {
+            counts: region.carve(rows + 1)?,
+            frees: region.carve(MOST_BLOCK_FREES)?,
+            overflowed: region.carve(MOST_BLOCK_FREES)?,
+            read_bytes: ByteCount(0),
+            rows: 0,
+        })
+    }
+
+    /// Count the region bytes room for a block of up to this many rows takes
+    pub fn region_bytes(rows: usize) -> usize {
+        list_bytes::<DeadCount>(rows + 1) + list_bytes::<FreeRecord>(MOST_BLOCK_FREES) + list_bytes::<SegmentNumber>(MOST_BLOCK_FREES)
+    }
+
+    /// Give the lists back, and return the most bytes they wrote
+    pub fn release(&mut self) -> usize {
+        let peak = self.counts.peak_bytes() + self.frees.peak_bytes() + self.overflowed.peak_bytes();
+        *self = Self::default();
+        peak
     }
 
     /// Read the heap they hold
@@ -114,16 +140,23 @@ impl BlockCounts {
     }
 
     /// Count a row dead, and note a large record so its blocks can go
-    pub fn count_dead(&mut self, segment: SegmentNumber, column: ColumnId, block: u32, row: &FooterRow, replacement: WritePlace) {
-        add_count(&mut self.counts, segment, column, block, row, Some(replacement));
+    pub fn count_dead(
+        &mut self,
+        segment: SegmentNumber,
+        column: ColumnId,
+        block: u32,
+        row: &FooterRow,
+        replacement: WritePlace,
+    ) -> std::result::Result<(), ListFull> {
+        add_count(&mut self.counts, segment, column, block, row, Some(replacement))?;
         if row.kind != RowKind::Value || row.length < FREE_IN_PLACE_BYTES {
-            return;
+            return Ok(());
         }
-        if self.frees.len() == self.frees.capacity() {
-            if !self.overflowed.contains(&segment) && self.overflowed.len() < self.overflowed.capacity() {
-                self.overflowed.push(segment);
+        if self.frees.room() == 0 {
+            if !self.overflowed.contains(&segment) && self.overflowed.room() > 0 {
+                self.overflowed.push(segment)?;
             }
-            return;
+            return Ok(());
         }
         self.frees.push(FreeRecord {
             segment,
@@ -131,12 +164,12 @@ impl BlockCounts {
             length: row.length,
             place: row.place,
             replacement,
-        });
+        })
     }
 }
 
 /// One block's counts on their way from a worker to the planner
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Debug, Default, Eq, PartialEq)]
 pub struct SlotWork {
     pub target: WalkTarget,
     pub next_block: u32,
@@ -158,7 +191,6 @@ impl<Task> WalkSlot<Task> {
         Self {
             phase: AtomicU8::new(SLOT_FREE),
             work: Mutex::new(SlotWork {
-                counts: BlockCounts::new(),
                 ..SlotWork::default()
             }),
             task: OnceLock::new(),
@@ -180,9 +212,9 @@ impl<Task> Default for WalkSlot<Task> {
 /// What it takes to count one row block: nothing here changes the store
 pub struct BlockCounter<Backend: Io> {
     pub state: Arc<EngineState<Backend>>,
-    block: Vec<u8>,
-    key: Vec<u8>,
-    last_key: Vec<u8>,
+    block: FixedList<u8>,
+    key: FixedList<u8>,
+    last_key: FixedList<u8>,
     pub last_column: Option<ColumnId>,
     is_next_key_unknown: bool,
 }
@@ -195,10 +227,13 @@ pub struct WalkJob<Backend: Io> {
     pub retry_at: Option<Nanoseconds>,
     counter: BlockCounter<Backend>,
     counts: BlockCounts,
-    waiting_frees: Vec<FreeRecord>,
+    waiting_frees: FixedList<FreeRecord>,
     next_handed_out: u32,
     failed_slot: Option<usize>,
     pub apply: CoverApply<Backend>,
+    region: Option<Region>,
+    block_rows: usize,
+    slots_carved: u64,
 }
 
 /// A worker that counts the blocks and runs the rewrites the planner hands it
@@ -216,9 +251,9 @@ impl<Backend: Io> BlockCounter<Backend> {
     pub fn new(state: Arc<EngineState<Backend>>) -> Self {
         Self {
             state,
-            block: touched_zeroes(ROW_BLOCK_BYTES),
-            key: touched_capacity(MAX_KEY_BYTES as usize, 0),
-            last_key: touched_capacity(MAX_KEY_BYTES as usize, 0),
+            block: FixedList::filled_on_heap(ROW_BLOCK_BYTES, 0),
+            key: FixedList::on_heap(MAX_KEY_BYTES as usize),
+            last_key: FixedList::on_heap(MAX_KEY_BYTES as usize),
             last_column: None,
             is_next_key_unknown: false,
         }
@@ -285,8 +320,7 @@ impl<Backend: Io> BlockCounter<Backend> {
             };
             while let Some(row) = walk.next_row(&mut self.key) {
                 if row.kind != RowKind::RangeDelete {
-                    self.last_key.clear();
-                    self.last_key.extend_from_slice(&self.key);
+                    self.last_key.set_from(&self.key)?;
                     self.last_column = Some(block.column);
                 }
             }
@@ -324,26 +358,24 @@ impl<Backend: Io> BlockCounter<Backend> {
                 continue;
             }
             if target.is_backward {
-                add_count(&mut counts.counts, target.segment, block.column, target.next_block, &row, None);
+                add_count(&mut counts.counts, target.segment, block.column, target.next_block, &row, None)?;
             }
             let is_top = self.last_column != Some(block.column) || self.last_key != self.key;
             // a key that may have begun in a block no read can give has a top no walk can name
             if is_top && self.is_next_key_unknown {
                 self.is_next_key_unknown = false;
-                self.last_key.clear();
-                self.last_key.extend_from_slice(&self.key);
+                self.last_key.set_from(&self.key)?;
                 self.last_column = Some(block.column);
                 continue;
             }
             if !is_top {
                 // the key's top is in this segment, and its highest place is at or above that
                 let replacement = pin.head.places.highest;
-                counts.count_dead(target.segment, block.column, target.next_block, &row, replacement);
+                counts.count_dead(target.segment, block.column, target.next_block, &row, replacement)?;
                 continue;
             }
 
-            self.last_key.clear();
-            self.last_key.extend_from_slice(&self.key);
+            self.last_key.set_from(&self.key)?;
             self.last_column = Some(block.column);
             let found = self.state.newest_walked(volume, block.column, &self.key, &[target.segment]);
             let newest = match found {
@@ -359,16 +391,16 @@ impl<Backend: Io> BlockCounter<Backend> {
                 Some(found) if found.row.place > row.place => {
                     let replacement = found.row.place;
                     self.state.mark_slot_stale(volume, block.column, &self.key, target.segment, block.entry.block_offset);
-                    counts.count_dead(target.segment, block.column, target.next_block, &row, replacement);
+                    counts.count_dead(target.segment, block.column, target.next_block, &row, replacement)?;
                 },
                 // a row under an applied cover is dead by it, and so is any older one a row here would find
                 _ if is_covered(row.place) => {
                     let replacement = covered.unwrap_or(row.place);
-                    counts.count_dead(target.segment, block.column, target.next_block, &row, replacement);
+                    counts.count_dead(target.segment, block.column, target.next_block, &row, replacement)?;
                 },
                 Some(found) if !target.is_backward && !is_covered(found.row.place) => {
                     if let Some(index) = volume.table.block_at(found.segment, found.block_offset) {
-                        counts.count_dead(found.segment, block.column, index, &found.row, row.place);
+                        counts.count_dead(found.segment, block.column, index, &found.row, row.place)?;
                         self.state.mark_slot_stale(volume, block.column, &self.key, found.segment, found.block_offset);
                     }
                 },
@@ -389,10 +421,13 @@ impl<Backend: Io> WalkJob<Backend> {
             volume,
             target: None,
             retry_at: None,
-            counts: BlockCounts::new(),
-            waiting_frees: touched_capacity(MOST_BLOCK_FREES, FreeRecord::default()),
+            counts: BlockCounts::default(),
+            waiting_frees: FixedList::on_heap(MOST_BLOCK_FREES),
             next_handed_out: 0,
             failed_slot: None,
+            region: None,
+            block_rows: 0,
+            slots_carved: 0,
         }
     }
 
@@ -430,8 +465,78 @@ impl<Backend: Io> WalkJob<Backend> {
         self.target.is_some()
     }
 
+    /// Take the target's region when it has none yet, sized from the most rows one of its blocks holds
+    pub fn ensure_region(&mut self, volume: &Volume<Backend>) -> bool {
+        if self.region.is_some() {
+            return true;
+        }
+        let Some(target) = self.target else {
+            return false;
+        };
+        let facts = hold(&volume.summary).get(target.segment).map(|row| row.facts);
+        self.take_region(volume, facts.as_ref().map_or(MOST_BLOCK_ROWS, block_rows_bound))
+    }
+
+    /// Map the target's region and carve its counts, the planner's, the cover apply's and a slot's each, or say the walk waits
+    pub fn take_region(&mut self, volume: &Volume<Backend>, block_rows: usize) -> bool {
+        let need = REGION_HEAD_BYTES + (2 + volume.walk_slots.len()) * BlockCounts::region_bytes(block_rows);
+        let Some(mut region) = self.state.admit(JobRole::Walk, ByteCount(need as u64), true) else {
+            return false;
+        };
+        let carved = self.carve(&mut region, block_rows);
+        self.region = Some(region);
+        if carved.is_err() {
+            self.release_region(volume);
+            return false;
+        }
+        true
+    }
+
+    /// Carve the planner's and the cover apply's counts, and leave room for a slot's each, which a slot takes at its first block
+    fn carve(&mut self, region: &mut Region, block_rows: usize) -> std::result::Result<(), ListFull> {
+        self.counts = BlockCounts::in_region(region, block_rows)?;
+        self.apply.counts = BlockCounts::in_region(region, block_rows)?;
+        self.block_rows = block_rows;
+        self.slots_carved = 0;
+        Ok(())
+    }
+
+    /// Give a free slot this target's counts the first time it takes one of the target's blocks
+    fn carve_slot(&mut self, index: usize, work: &mut SlotWork) -> std::result::Result<(), ListFull> {
+        if self.slots_carved >> index & 1 == 0 {
+            let Some(region) = self.region.as_mut() else {
+                return Err(full());
+            };
+            work.counts = BlockCounts::in_region(region, self.block_rows)?;
+            self.slots_carved |= 1 << index;
+        }
+        Ok(())
+    }
+
+    /// Give the target's counts and region back, and count the bytes they wrote
+    pub fn release_region(&mut self, volume: &Volume<Backend>) {
+        let Some(region) = self.region.take() else {
+            return;
+        };
+        let mut touched = self.counts.release() + self.apply.counts.release();
+        // a slot still holding a stale count keeps its list, and the region's hold keeps the memory under it until the list goes
+        for (index, slot) in volume.walk_slots.iter().enumerate() {
+            if self.slots_carved >> index & 1 == 1 && slot.phase.load(Ordering::Acquire) == SLOT_FREE {
+                touched += hold(&slot.work).counts.release();
+            }
+        }
+        self.slots_carved = 0;
+        let mapped = region.mapped_bytes();
+        drop(region);
+        self.state.give_back(JobRole::Walk, mapped, ByteCount(touched as u64));
+    }
+
     /// Walk one row block here. A failure leaves the last key wherever the attempt stood, so the retry finds it again
     pub fn walk_block(&mut self, target: WalkTarget) -> Result<()> {
+        let state = Arc::clone(&self.state);
+        if !self.ensure_region(&state.volumes[self.volume]) {
+            return Err(Error::from(ErrorKind::Interrupted));
+        }
         let outcome = self.count_and_land(target);
         if outcome.is_err() {
             self.counter.last_column = None;
@@ -492,7 +597,7 @@ impl<Backend: Io> WalkJob<Backend> {
                 volume.note_held_frees(free.segment);
                 continue;
             }
-            self.waiting_frees.push(*free);
+            self.waiting_frees.push(*free)?;
         }
         if next_block < target.block_count {
             self.target = Some(WalkTarget { next_block, ..target });
@@ -556,6 +661,7 @@ impl<Backend: Io> WalkJob<Backend> {
         // a row dropped for room after its seal counted can leave this at zero
         let _waiting = volume.walks_waiting.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| count.checked_sub(1));
         self.target = None;
+        self.release_region(volume);
         self.state.save_summary(volume)
     }
 
@@ -572,15 +678,21 @@ impl<Backend: Io> WalkJob<Backend> {
     /// Give every free worker the next block. The slots bound how far ahead of the landing the workers get
     pub fn hand_out(&mut self, volume: &Volume<Backend>, target: WalkTarget) {
         self.next_handed_out = self.next_handed_out.max(target.next_block);
-        for slot in &volume.walk_slots {
+        for (index, slot) in volume.walk_slots.iter().enumerate() {
             if self.next_handed_out >= target.block_count {
                 return;
             }
             if slot.phase.load(Ordering::Acquire) == SLOT_FREE {
-                hold(&slot.work).target = WalkTarget {
+                let mut work = hold(&slot.work);
+                // a slot with no room for this target's counts waits for the next hand-out
+                if self.carve_slot(index, &mut work).is_err() {
+                    continue;
+                }
+                work.target = WalkTarget {
                     next_block: self.next_handed_out,
                     ..target
                 };
+                drop(work);
                 self.next_handed_out += 1;
                 assign(slot);
             }
@@ -644,6 +756,10 @@ impl<Backend: Io> WalkJob<Backend> {
         if let Some(index) = self.failed_slot.take() {
             assign(&volume.walk_slots[index]);
         }
+        // a target holds its counts from its first step, and waits for room when admission has none
+        if self.target.is_some() && !self.ensure_region(volume) {
+            return self.wait_for_retry(now);
+        }
         if self.apply.segment.is_some() {
             return self.step_apply(volume, now);
         }
@@ -660,6 +776,9 @@ impl<Backend: Io> WalkJob<Backend> {
         let Some(target) = self.target else {
             return UnitStep::Idle;
         };
+        if !self.ensure_region(volume) {
+            return self.wait_for_retry(now);
+        }
         if !volume.walk_slots.is_empty() && !target.is_damaged {
             return self.step_slots(volume, target, now);
         }
@@ -742,13 +861,13 @@ impl<Backend: Io> Job for WalkWorker<Backend> {
 /// Add one row to a block's counts. A row with a replacement is dead, and its bytes move from live to dead. A backward walk
 /// first adds every row's bytes as live, since it rebuilds them
 pub fn add_count(
-    counts: &mut Vec<DeadCount>,
+    counts: &mut FixedList<DeadCount>,
     segment: SegmentNumber,
     column: ColumnId,
     block: u32,
     row: &FooterRow,
     replacement: Option<WritePlace>,
-) {
+) -> std::result::Result<(), ListFull> {
     // keys run in order, so a repeat is near the end, and a miss only costs another entry
     let recent = counts.len().saturating_sub(COUNT_SEARCH);
     let found = counts[recent..].iter().rposition(|count| count.segment == segment && count.block == block);
@@ -760,17 +879,23 @@ pub fn add_count(
                 column,
                 block,
                 ..DeadCount::default()
-            });
+            })?;
             counts.len() - 1
         },
     };
     let count = &mut counts[index];
     let Some(replacement) = replacement else {
         count.kept_bytes = ByteCount(count.kept_bytes.0 + row.length.0);
-        return;
+        return Ok(());
     };
     count.replacement = count.replacement.max(replacement);
     count.rows += 1;
     count.graves += u32::from(row.kind == RowKind::Grave);
     count.bytes = ByteCount(count.bytes.0 + row.length.0);
+    Ok(())
+}
+
+/// Read the most rows one of a segment's blocks holds, or the most any block can when the fact is missing
+pub fn block_rows_bound(facts: &SegmentFacts) -> usize {
+    if facts.most_block_rows > 0 { facts.most_block_rows as usize } else { MOST_BLOCK_ROWS }
 }

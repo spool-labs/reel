@@ -70,8 +70,11 @@ pub const ENCODER_BYTES: u64 = 256 * 1024;
 pub const SEAL_JOB_BYTES: u64 = 13 * 256 * 1024;
 /// Bytes a dead-byte walk's own buffers are planned at
 pub const WALK_JOB_BYTES: u64 = 9 * 256 * 1024;
-/// Bytes a compaction job's own buffers are planned at
-pub const COMPACT_JOB_BYTES: u64 = 11 * 512 * 1024;
+/// Bytes a volume's compaction job holds from open: its block, keys and settled rows, and the planner lane's pick key. A
+/// rewrite's lists come from the region it maps at its start, outside the budget
+pub const COMPACT_JOB_BYTES: u64 = 128 * 1024;
+/// Bytes a worker's rewrite lane holds from open: its pick key and its inputs' places
+pub const LANE_JOB_BYTES: u64 = 4 * 1024;
 /// Bytes a job's stack is planned at
 pub const JOB_STACK_PLAN_BYTES: u64 = 1024 * 1024;
 /// Jobs a store runs beside one seal job a volume: row write-out, reservations and the planner
@@ -79,8 +82,8 @@ pub const SHARED_JOBS: u64 = 3;
 /// Bytes a row of the write index really takes, node, page and table share included, with a long batch's length of it
 pub const PLANNED_ROW_BYTES: u64 = 227;
 /// A volume seals at this share of what the index holds, in eighths, to keep room for writers in flight. With one
-/// lz4 column and 64 B keys that gives these rows a segment: 19,938 at 128 MiB, 112,323 at 192 MiB, 574,251 at 512 MiB and
-/// 5,747,841 at 4 GiB. A segment seals at its byte target or at this limit, whichever comes first, so small
+/// lz4 column and 64 B keys that gives these rows a segment: 31,653 at 128 MiB, 137,236 at 192 MiB, 665,154 at 512 MiB and
+/// 6,577,830 at 4 GiB. A segment seals at its byte target or at this limit, whichever comes first, so small
 /// records seal smaller and reach their size through merges, whose outputs the write index doesn't bound
 /// A volume holds its open segment and one spare at full size even when its sealed data is small: the reserve is twice the
 /// segment size, 128 MiB at a 128 MiB budget, 192 MiB at 192 MiB, and 2 GiB from the default 512 MiB up. The space gate adds
@@ -195,7 +198,7 @@ impl StoreShape {
         let cover_fixed = (COVER_SLOT_BYTES + COVER_RECORD_BYTES) as u64 * MOST_RANGE_COVERS as u64;
         let covers = 2 * cover_keys + volumes * cover_fixed;
         let jobs = SEAL_JOB_BYTES + WALK_JOB_BYTES + COMPACT_JOB_BYTES;
-        let worker_jobs = workers * COMPACT_JOB_BYTES;
+        let worker_jobs = workers * LANE_JOB_BYTES;
         ByteCount(queues + gathers + windows + reads + scans + read_slots + encoders + covers + volumes * (jobs + spans) + worker_jobs + workers * WALK_JOB_BYTES + stacks)
     }
 
@@ -234,7 +237,7 @@ impl EngineSizing {
         let budget = shape.budget;
         // the room and the entries come out before the shares
         let shared = budget.0.saturating_sub(shape.fixed_bytes().0 + shape.room().0 + shape.entry_line().0);
-        let index_share = shared / WRITE_INDEX_DIVISOR;
+        let index_share = share_of(shared, WRITE_INDEX_DIVISOR);
         let rows_total = index_share / PLANNED_ROW_BYTES;
         let rows_per_shard = (rows_total / SHARD_COUNT as u64).max(64);
 
@@ -252,10 +255,10 @@ impl EngineSizing {
                 table_slots: (rows_per_shard as usize * 2).next_power_of_two(),
                 open_slots,
             },
-            spot_share: ByteCount(shared / SPOT_DIVISOR),
-            cache_share: ByteCount(shared / BLOCK_CACHE_DIVISOR),
-            summary_share: ByteCount(shared / SUMMARY_DIVISOR),
-            table_share: ByteCount(shared / TABLE_DIVISOR),
+            spot_share: ByteCount(share_of(shared, SPOT_DIVISOR)),
+            cache_share: ByteCount(share_of(shared, BLOCK_CACHE_DIVISOR)),
+            summary_share: ByteCount(share_of(shared, SUMMARY_DIVISOR)),
+            table_share: ByteCount(share_of(shared, TABLE_DIVISOR)),
             lz4_stored_limit: LZ4_STORED_LIMIT,
             walk_workers: shape.walk_workers(),
             least_budget: shape.least_budget(),
@@ -263,6 +266,12 @@ impl EngineSizing {
             entry_line: shape.entry_line(),
         }
     }
+}
+
+/// Read one share of what the fixed parts, the room and the entries leave. The divisors' parts add to seven eighths, so each
+/// scales by eight sevenths and the shares together take the whole
+pub const fn share_of(shared: u64, divisor: u64) -> u64 {
+    shared * 8 / (7 * divisor)
 }
 
 /// Read the entries a volume's table plans for: the segments its disks hold at the segment size times the margin, in whole

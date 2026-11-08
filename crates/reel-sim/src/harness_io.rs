@@ -4,6 +4,7 @@ use std::io::Result;
 use std::path::{Path, PathBuf};
 
 use reel::io::plain::PlainIo;
+use reel::io::host_memory::HostMemory;
 use reel::io::{DiskSize, Io};
 use reel::io::job::Job;
 use reel::io::lock_outcome::LockOutcome;
@@ -84,6 +85,10 @@ impl Io for HarnessIo {
 
     fn capacity(&self, path: &Path) -> Result<Option<DiskSize>> {
         self.plain.capacity(path)
+    }
+
+    fn host_memory(&self) -> HostMemory {
+        self.plain.host_memory()
     }
 
     fn is_rotational(&self, path: &Path) -> Option<bool> {

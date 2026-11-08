@@ -4,6 +4,7 @@ use std::io::Result;
 
 use reel_api::units::{ByteCount, FileOffset, WritePlace};
 
+use crate::fixed_list::ListOut;
 use crate::pool::{HollowItem, touched_capacity, touched_zeroes};
 use crate::index::key_hash::KeyHash;
 use crate::io::{DeviceReads, InPlace, IoFile, ReadOn, in_place};
@@ -255,8 +256,8 @@ impl FooterReader {
         file: &File,
         lines: &[BlockEntry],
         place_base: WritePlace,
-        lowest: &mut Vec<u8>,
-        highest: &mut Vec<u8>,
+        lowest: &mut impl ListOut<u8>,
+        highest: &mut impl ListOut<u8>,
     ) -> Result<bool> {
         let (Some(first), Some(last)) = (lines.first(), lines.last()) else {
             return Ok(false);
@@ -435,7 +436,7 @@ impl Default for FooterReader {
 }
 
 /// Find a key's newest row at a read point in a block already checked
-pub fn search_rows(block: &[u8], place_base: WritePlace, query: &FooterQuery<'_>, key: &mut Vec<u8>) -> FooterAnswer {
+pub fn search_rows(block: &[u8], place_base: WritePlace, query: &FooterQuery<'_>, key: &mut impl ListOut<u8>) -> FooterAnswer {
     let Some(mut walk) = RowBlockWalk::open_checked(block, place_base) else {
         return FooterAnswer::Damaged;
     };
@@ -443,13 +444,13 @@ pub fn search_rows(block: &[u8], place_base: WritePlace, query: &FooterQuery<'_>
 }
 
 /// Walk from a seek to the key's newest row at a read point
-pub fn newest_at(walk: &mut RowBlockWalk, query: &FooterQuery<'_>, key: &mut Vec<u8>) -> FooterAnswer {
+pub fn newest_at(walk: &mut RowBlockWalk, query: &FooterQuery<'_>, key: &mut impl ListOut<u8>) -> FooterAnswer {
     let Some(mut row) = walk.seek(query.key, key) else {
         return FooterAnswer::Absent;
     };
 
     loop {
-        if key.as_slice() != query.key {
+        if **key != *query.key {
             return FooterAnswer::Absent;
         }
         if row.place <= query.read_point {

@@ -15,7 +15,7 @@ use crate::engine::compact_job::CompactJob;
 use crate::engine::engine_state::EngineState;
 use crate::engine::filter_job::{FILTER_STEP_BLOCKS, FilterLoader};
 use crate::engine::open_segment::{OpenSegment, SegmentPhase};
-use crate::engine::rewrite_job::{COPY_STEP_RECORDS, MERGE_BUFFER_BYTES, MERGE_STEP_ROWS};
+use crate::engine::rewrite_job::{COPY_STEP_BYTES, MERGE_BUFFER_BYTES, MERGE_STEP_ROWS};
 use crate::engine::seal_job::MOST_SEGMENT_BLOCKS;
 use crate::engine::volume::{MOST_MERGE_OUTPUTS, Volume};
 use crate::engine::walk_job::WalkJob;
@@ -155,7 +155,7 @@ pub fn unit_bound(kind: UnitKind) -> Option<u64> {
     match kind {
         UnitKind::WalkBlock | UnitKind::UnlinkCheck | UnitKind::HeldFrees => Some(row_block),
         UnitKind::MergeRows => Some(MERGE_STEP_ROWS as u64),
-        UnitKind::StripeCopy => Some(COPY_STEP_RECORDS as u64),
+        UnitKind::StripeCopy => Some(COPY_STEP_BYTES + MERGE_BUFFER_BYTES as u64),
         UnitKind::BlockMove => Some(MERGE_BUFFER_BYTES.div_ceil(ROW_BLOCK_BYTES) as u64),
         UnitKind::Footer => Some(u64::from(MOST_SEGMENT_BLOCKS.0)),
         UnitKind::Install => Some((MOST_MERGE_SEGMENTS + MOST_MERGE_OUTPUTS + 1) as u64),

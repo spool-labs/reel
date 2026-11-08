@@ -3,7 +3,9 @@
 use std::future::{Future, ready};
 use std::io::{IoSlice, IoSliceMut};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
@@ -15,10 +17,10 @@ use reel::engine::planner::Planner;
 use reel::engine::reel_store::ReelStore;
 use reel::engine::rewrite_job::{MERGE_BUFFER_BYTES, MOST_OVERLAP, MOST_PARK_WAITS, PLANNER_LANE, RewriteJob, RewritePhase, is_overlap_input, overlaps};
 use reel::engine::volume::{MOST_PARKED, NO_SEAL};
-use reel::engine::walk_job::WalkJob;
+use reel::engine::walk_job::{BlockCounter, WalkJob, WalkWorker};
 use reel::guard::hold;
 use reel::io::{DeviceReads, InPlace, Io, IoFile, in_place};
-use reel::io::job::Job;
+use reel::io::job::{Job, JobStep};
 use reel::record::codec::Codec;
 use reel::segment::column_directory::ColumnDirectory;
 use reel::segment::damage_list::DamagedRange;
@@ -54,6 +56,10 @@ const IDLE_TICKS: u64 = 8;
 const TWO_BLOCK_ROWS: u64 = 12_000;
 const UNWALKED_CRASH_POINTS: u64 = 40;
 const UNWALKED_CRASH_STRIDE: u64 = 3;
+const SEAT_KEYS: u64 = 400;
+const WORKER_BUDGET: ByteCount = ByteCount(96 * 1024 * 1024);
+const HAND_OUT_LINE: Duration = Duration::from_millis(1);
+const PARK_WAIT: Duration = Duration::from_secs(10);
 
 type Store = ReelStore<SimulatedIo>;
 
@@ -2398,5 +2404,77 @@ fn workers_leave_overlap() {
     planner.abandon();
     drop(planner);
     drop(worker);
+    store.close().expect("close");
+}
+
+// a worker takes its running rewrite out of the seat and steps it with no lock held, so the planner's hand-out finishes
+// inside its line while a step parks on a read, and the rewrite goes back once it ends
+#[test]
+fn seat_lock_is_held_for_a_swap() {
+    let io = SimulatedIo::new(Seed(80));
+    let mut config = config();
+    config.threads.maintenance_workers = Some(1);
+    config.memory_budget = WORKER_BUDGET;
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    hold_compaction(&store, true);
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    let key = |number: u64| format!("k-{number:05}").into_bytes();
+    for number in 0..SEAT_KEYS {
+        store.put(COLUMN, &key(number), b"first").expect("put");
+    }
+    seal(&store, &io);
+    for number in 0..SEAT_KEYS * 3 / 4 {
+        store.put(COLUMN, &key(number), b"second").expect("put");
+    }
+    seal(&store, &io);
+
+    let job = CompactJob::new(Arc::clone(state), 0);
+    assert_eq!(job.seats.len(), 1);
+    assert!(job.hand_out(volume), "no rewrite started");
+    let seat = &job.seats[0];
+    let mut worker =
+        WalkWorker { state: Arc::clone(state), volume: 0, slot: 0, counter: BlockCounter::new(Arc::clone(state)), seats: Arc::clone(&job.seats), rewrite: None };
+    let (parked, is_parked) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let released = Mutex::new(released);
+    let is_armed = AtomicBool::new(true);
+    io.on_every_read(Some(Arc::new(move || {
+        if is_armed.swap(false, Ordering::AcqRel) {
+            let _sent = parked.send(());
+            let _woken = hold(&released).recv();
+        }
+    })));
+    let handed = thread::scope(|scope| {
+        let stepping = scope.spawn(|| worker.step_rewrite());
+        is_parked.recv_timeout(PARK_WAIT).expect("the step never read");
+        let (done, is_done) = mpsc::channel();
+        let job = &job;
+        scope.spawn(move || {
+            let started = Instant::now();
+            let has_started = job.hand_out(volume);
+            let _sent = done.send((has_started, started.elapsed()));
+        });
+        let handed = is_done.recv_timeout(PARK_WAIT);
+        release.send(()).expect("release");
+        assert_eq!(stepping.join().expect("step"), JobStep::Worked);
+        handed.unwrap_or_else(|_late| is_done.recv().expect("hand-out"))
+    });
+    io.on_every_read(None);
+    assert!(!handed.0, "a second rewrite started on a busy seat");
+    assert!(handed.1 < HAND_OUT_LINE, "the hand-out took {:?} beside a parked step", handed.1);
+    assert!(worker.rewrite.as_ref().is_some_and(RewriteJob::is_running), "the rewrite ended in one step");
+    assert!(seat.job.try_lock().is_ok_and(|held| held.is_none()), "the seat kept its rewrite through a step");
+    assert!(seat.is_busy() && seat.heap_bytes() > 0);
+    assert!(!job.hand_out(volume), "a second rewrite started on a busy seat");
+    while worker.rewrite.is_some() {
+        assert_eq!(worker.step_rewrite(), JobStep::Worked);
+    }
+    assert!(!seat.is_busy(), "the rewrite never went back to its seat");
+    assert_eq!(worker.step_rewrite(), JobStep::Idle);
+    for number in 0..SEAT_KEYS {
+        let value: &[u8] = if number < SEAT_KEYS * 3 / 4 { b"second" } else { b"first" };
+        assert_eq!(read(&store, &key(number)), Some(value.to_vec()));
+    }
     store.close().expect("close");
 }

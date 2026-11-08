@@ -8,7 +8,7 @@
 use std::io::{Error, ErrorKind, Result};
 use std::mem;
 use std::slice;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
@@ -93,7 +93,7 @@ impl<Backend: Io> CompactJob<Backend> {
         drop(hold(&state.volumes[volume].parked));
         let workers = state.volumes[volume].walk_slots.len();
         let seats: Vec<RewriteSeat<Backend>> =
-            (1..=workers).map(|lane| RewriteSeat { job: Mutex::new(RewriteJob::new(Arc::clone(&state), volume, lane)) }).collect();
+            (1..=workers).map(|lane| RewriteSeat::new(Arc::clone(&state), volume, lane)).collect();
         Self {
             rewrite: RewriteJob::new(Arc::clone(&state), volume, PLANNER_LANE),
             seats: Arc::new(seats),
@@ -119,7 +119,7 @@ impl<Backend: Io> CompactJob<Backend> {
     pub fn heap_bytes(&self) -> ByteCount {
         let buffers = self.block.capacity() + self.key.capacity() + self.row_key.capacity() + self.end.capacity();
         let settled = self.settled_rows.capacity() * size_of::<DeadCount>() + self.listed.capacity() * size_of::<SegmentNumber>();
-        let seats: u64 = self.seats.iter().map(|seat| hold(&seat.job).heap_bytes().0).sum();
+        let seats: u64 = self.seats.iter().map(RewriteSeat::heap_bytes).sum();
         ByteCount((buffers + settled) as u64 + self.rewrite.heap_bytes().0 + seats)
     }
 
@@ -238,15 +238,16 @@ impl<Backend: Io> CompactJob<Backend> {
     pub fn hand_out(&self, volume: &Volume<Backend>) -> bool {
         let mut has_started = false;
         for (index, seat) in self.seats.iter().enumerate() {
-            let mut job = hold(&seat.job);
-            if job.is_running() {
+            let mut held = hold(&seat.job);
+            // a worker holds its running rewrite out of the seat, and one started here waits for the worker to take it
+            let Some(job) = held.as_mut().filter(|job| !job.is_running()) else {
                 continue;
-            }
+            };
             if !job.start() {
                 return has_started;
             }
             has_started = true;
-            drop(job);
+            drop(held);
             if let Some(task) = volume.walk_slots[index].task.get() {
                 task.wake();
             }

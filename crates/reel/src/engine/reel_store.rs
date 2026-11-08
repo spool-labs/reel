@@ -639,6 +639,7 @@ pub fn bring_up<Backend: Io>(
                 slot: index,
                 counter: BlockCounter::new(Arc::clone(state)),
                 seats: Arc::clone(&compactions[volume].seats),
+                rewrite: None,
             };
             state.seal_heap.fetch_add(worker.counter.heap_bytes().0 + slot.heap_bytes().0, Ordering::AcqRel);
             let task = state.io.spawn_job("reel-walk", worker).map_err(open_error("starting a job"))?;

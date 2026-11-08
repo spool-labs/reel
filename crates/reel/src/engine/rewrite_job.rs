@@ -10,7 +10,7 @@ use std::iter;
 use std::io::{Error, ErrorKind, IoSlice, Result};
 use std::mem;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use reel_api::column_id::ColumnId;
 use reel_api::maintenance_report::JobKind;
@@ -1869,9 +1869,28 @@ pub fn lowest_inside<'row>(row: &SummaryRow<'row>, column: ColumnId, lowest: &[u
     None
 }
 
-/// A rewrite a worker runs. The planner starts one here and the worker steps it, and the lock only ever waits on one step
+/// A rewrite a worker runs. The planner starts one in the seat, and the worker takes it out to step it and puts it back once
+/// it ends, so the lock is held for a swap and never across a step. While the worker holds the job, the seat keeps its heap
 pub struct RewriteSeat<Backend: Io> {
-    pub job: Mutex<RewriteJob<Backend>>,
+    pub job: Mutex<Option<RewriteJob<Backend>>>,
+    pub heap: AtomicU64,
+}
+
+impl<Backend: Io> RewriteSeat<Backend> {
+    /// Seat an idle rewrite for a lane
+    pub fn new(state: Arc<EngineState<Backend>>, volume: usize, lane: usize) -> Self {
+        Self { job: Mutex::new(Some(RewriteJob::new(state, volume, lane))), heap: AtomicU64::new(0) }
+    }
+
+    /// Read the heap of the seat's job, wherever it is
+    pub fn heap_bytes(&self) -> u64 {
+        hold(&self.job).as_ref().map_or(self.heap.load(Ordering::Acquire), |job| job.heap_bytes().0)
+    }
+
+    /// Check the seat's rewrite is running, which it is while a worker holds it
+    pub fn is_busy(&self) -> bool {
+        hold(&self.job).as_ref().is_none_or(RewriteJob::is_running)
+    }
 }
 
 /// Count the rows a summary row's columns hold

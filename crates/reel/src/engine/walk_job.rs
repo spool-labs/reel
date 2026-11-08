@@ -22,7 +22,7 @@ use crate::config::MAX_KEY_BYTES;
 use crate::engine::cover_apply::{ApplyStep, CoverApply};
 use crate::engine::engine_state::EngineState;
 use crate::engine::planner::UnitStep;
-use crate::engine::rewrite_job::RewriteSeat;
+use crate::engine::rewrite_job::{RewriteJob, RewriteSeat};
 use crate::engine::volume::{NO_SEAL, Volume};
 use crate::guard::hold;
 use crate::io::device_error::is_device_error;
@@ -205,6 +205,7 @@ pub struct WalkWorker<Backend: Io> {
     pub slot: usize,
     pub counter: BlockCounter<Backend>,
     pub seats: Arc<Vec<RewriteSeat<Backend>>>,
+    pub rewrite: Option<RewriteJob<Backend>>,
 }
 
 impl<Backend: Io> BlockCounter<Backend> {
@@ -668,16 +669,27 @@ pub fn assign<Task: IoTask>(slot: &WalkSlot<Task>) {
 }
 
 impl<Backend: Io> WalkWorker<Backend> {
-    /// Run one step of this worker's rewrite, and bring the planner back when it ends, for the next pick
+    /// Run one step of this worker's rewrite, and bring the planner back when it ends, for the next pick. The worker takes a
+    /// started rewrite out of its seat and steps it with no lock held
     pub fn step_rewrite(&mut self) -> JobStep {
-        let mut job = hold(&self.seats[self.slot].job);
-        if !job.is_running() {
-            return JobStep::Idle;
+        let seat = &self.seats[self.slot];
+        if self.rewrite.is_none() {
+            let mut held = hold(&seat.job);
+            if !held.as_ref().is_some_and(RewriteJob::is_running) {
+                return JobStep::Idle;
+            }
+            seat.heap.store(held.as_ref().map_or(0, |job| job.heap_bytes().0), Ordering::Release);
+            self.rewrite = held.take();
         }
+        let Some(job) = &mut self.rewrite else {
+            return JobStep::Idle;
+        };
         job.step();
-        if !job.is_running()
-            && let Some(task) = self.state.planner_task.get()
-        {
+        if job.is_running() {
+            return JobStep::Worked;
+        }
+        *hold(&seat.job) = self.rewrite.take();
+        if let Some(task) = self.state.planner_task.get() {
             task.wake();
         }
         JobStep::Worked

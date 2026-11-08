@@ -22,6 +22,7 @@ use crate::record::record_check::RecordIdentity;
 use crate::record::codec::Codec;
 use crate::record::record_reader::{RecordRead, form_of, open_small};
 use crate::row_kind::RowKind;
+use crate::segment::footer_reader::RowAt;
 use crate::segment::block_cache::BlockKey;
 use crate::segment::block_entry::{BlockEntry, KeyBound, SHARED_HEAD_BYTES};
 use crate::segment::column_directory::ColumnDirectory;
@@ -549,6 +550,7 @@ impl<Backend: Io> EngineState<Backend> {
                         segment: source.segment,
                         row: source.row,
                         block_offset: source.line.block_offset,
+                        at: RowAt::UNKNOWN,
                     });
                 }
                 step = self.step_source(ReadOn::new(device, volume), column, source, direction, point, take.as_mut()).await?;

@@ -2,7 +2,7 @@
 
 use std::array;
 use std::io::Error;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use reel_api::column_id::ColumnId;
 use reel_api::maintenance_report::{MaintenanceMemory, 
@@ -242,6 +242,13 @@ impl<Backend: Io> EngineState<Backend> {
         report.damaged_segments = SegmentCount(self.damaged_segments.load(Ordering::Acquire));
         report.summary_rows_dropped = RowCount(self.dropped_summary_rows.load(Ordering::Acquire));
         report.summary_rows_unordered = RowCount(self.volumes.iter().map(|volume| hold(&volume.summary).orders().left_out()).sum());
+        let sum = |counter: fn(&Volume<Backend>) -> &AtomicU64| self.volumes.iter().map(|volume| counter(volume).load(Ordering::Relaxed)).sum::<u64>();
+        report.walks_held = sum(|volume| &volume.walks_held);
+        report.walk_claim_waits = sum(|volume| &volume.walk_claim_waits);
+        report.walk_claim_held = Nanoseconds(sum(|volume| &volume.walk_claim_held));
+        report.walk_claim_longest = Nanoseconds(self.volumes.iter().map(|volume| volume.walk_claim_longest.load(Ordering::Relaxed)).max().unwrap_or(0));
+        report.held_drain_blocks = sum(|volume| &volume.held_drain_blocks);
+        report.held_drain_bytes = ByteCount(sum(|volume| &volume.held_drain_bytes));
         report.refused_reads = RowCount(self.cues.refused_reads());
         report.workers = self.workers.len() as u64;
         report.active_workers = self.workers.active();

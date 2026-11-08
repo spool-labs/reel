@@ -1,5 +1,8 @@
 //! The dead-byte walk: every superseded row counts once, whatever order segments seal and walk in
 
+use std::iter;
+use std::thread;
+use std::time::{Duration, Instant};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
@@ -9,7 +12,9 @@ use reel::engine::engine_state::IndexWait;
 use reel::engine::open_segment::SegmentPhase;
 use reel::engine::planner::{Planner, WALK_LAG_SEGMENTS, UnitStep};
 use reel::engine::reel_store::ReelStore;
-use reel::engine::walk_job::{SLOT_COUNTED, WalkJob, WalkTarget};
+use reel::engine::held_bits::HeldBits;
+use reel::fixed_list::FixedList;
+use reel::engine::walk_job::{SLOT_COUNTED, WalkJob, WalkTarget, FREE_IN_PLACE_BYTES};
 use reel::guard::hold;
 use reel::index::key_hash::hash_key;
 use reel::io::IoTask;
@@ -42,6 +47,9 @@ const LONG_KEYS: u64 = 62;
 const LONG_KEY_BYTES: usize = 1_000;
 const RANGE_ROWS: u64 = 4_000;
 const ORDERS: [[usize; 3]; 6] = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+// how long a test waits for a landing to take the claim lock, and for a begin to show it waited
+const LOCK_WAIT: Duration = Duration::from_secs(5);
+const BEGIN_WAIT: Duration = Duration::from_millis(50);
 
 type Store = ReelStore<SimulatedIo>;
 
@@ -816,5 +824,228 @@ fn newer_value_sealed_first() {
     let mut value = Vec::new();
     assert!(store.get(COLUMN, b"key", &mut value).expect("get"));
     assert_eq!(value, b"newer");
+    store.close().expect("close");
+}
+
+// an older segment of a..d and a newer one of a..c, both walked, so the older is ready for a rewrite and d stays live in it,
+// then a third segment of some keys again, sealed with the walk held. Returns the three
+fn three_segments(store: &Store, io: &SimulatedIo, third: &[&[u8]]) -> (SegmentNumber, SegmentNumber, SegmentNumber) {
+    let volume = &store.state.volumes[0];
+    let newest = || *hold(&volume.summary).orders().present().last().expect("a segment");
+    for key in [b"a", b"b", b"c", b"d"] {
+        store.put(COLUMN, key, b"first").expect("put");
+    }
+    store.seal_now();
+    settle(io);
+    let older = newest();
+    for key in [b"a", b"b", b"c"] {
+        store.put(COLUMN, key, b"second").expect("put");
+    }
+    store.seal_now();
+    settle(io);
+    let newer = newest();
+    io.hold_jobs(WALK_JOB, true);
+    io.hold_jobs("reel-walk", true);
+    for key in third {
+        store.put(COLUMN, key, b"third").expect("put");
+    }
+    store.seal_now();
+    settle(io);
+    (older, newer, newest())
+}
+
+// let the workers count what they were handed, and hold them again
+fn count_slots(io: &SimulatedIo) {
+    io.hold_jobs("reel-walk", false);
+    while io.step_any().is_some() {}
+    io.hold_jobs("reel-walk", true);
+}
+
+// the dead rows a segment's summary row counts, over its columns
+fn dead_rows_of(store: &Store, segment: SegmentNumber) -> u64 {
+    let rows = hold(&store.state.volumes[0].summary);
+    let Some(row) = rows.get(segment) else {
+        return 0;
+    };
+    let mut cursor = row.cursor();
+    (0..row.column_count).filter_map(|_column| cursor.column()).map(|column| column.dead_rows.0).sum()
+}
+
+// a lane holding one segment's rows by hand, its bits on the heap, maybe already closed to the walk
+fn hold_lane(store: &Store, lane: usize, segment: SegmentNumber, is_closed: bool) {
+    let volume = &store.state.volumes[0];
+    let facts = hold(&volume.summary).get(segment).expect("a row").facts;
+    let inputs = || iter::once((facts.block_count, facts.most_block_rows));
+    let words = FixedList::filled_on_heap(HeldBits::words_for(inputs()), 0);
+    let mut bits = HeldBits::open(iter::once((segment, facts.block_count, facts.most_block_rows)), words);
+    bits.is_closed = is_closed;
+    let _claim = hold(&volume.claim_lock);
+    *hold(&volume.lanes[lane].held) = bits;
+    hold(&volume.lanes[lane].inputs)[0] = segment;
+    volume.lanes[lane].is_holding.store(true, Ordering::Release);
+    volume.claims_changed.fetch_add(1, Ordering::AcqRel);
+}
+
+// let a lane go, as a rewrite's end does
+fn release_lane(store: &Store, lane: usize) {
+    let volume = &store.state.volumes[0];
+    let _claim = hold(&volume.claim_lock);
+    *hold(&volume.lanes[lane].held) = HeldBits::default();
+    hold(&volume.lanes[lane].inputs)[0] = SegmentNumber(0);
+    volume.lanes[lane].is_holding.store(false, Ordering::Release);
+    volume.claims_changed.fetch_add(1, Ordering::AcqRel);
+}
+
+// a block counted before a rewrite began holding counts again, and lands once: its row in the held input goes to a bit, which
+// lands nowhere, since the newer row the walk counted also replaces it in the merge
+#[test]
+fn recounted_block_lands_once() {
+    let io = SimulatedIo::new(Seed(62));
+    let store = open_workers(&io);
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    let (older, newer, third) = three_segments(&store, &io, &[b"d"]);
+
+    let mut job = WalkJob::new(state.clone(), 0);
+    job.step_unit(io.clock_reading());
+    count_slots(&io);
+    let mut merge = CompactJob::new(state.clone(), 0);
+    while !merge.rewrite.start() {
+        assert!(merge.rewrite.has_looks_left, "no rewrite started");
+    }
+    assert_eq!(merge.rewrite.input_numbers(), [older]);
+    let blocks = volume.walk_blocks.load(Ordering::Relaxed);
+    assert_eq!(job.step_unit(io.clock_reading()), UnitStep::Worked);
+    assert_eq!(volume.walk_blocks.load(Ordering::Relaxed), blocks, "a block counted before the hold landed");
+    count_slots(&io);
+    assert_eq!(job.step_unit(io.clock_reading()), UnitStep::Worked);
+    assert_eq!(volume.walk_blocks.load(Ordering::Relaxed), blocks + 1);
+    assert_eq!(hold(&volume.lanes[0].held).marked, 1);
+
+    while merge.rewrite.is_running() {
+        merge.rewrite.step();
+    }
+    assert_eq!(hold(&volume.summary).orders().present(), [newer, third], "the merge kept the older d");
+    assert_eq!(dead_rows_of(&store, newer) + dead_rows_of(&store, third), 0, "the held row landed somewhere");
+    drop(job);
+    io.hold_jobs(WALK_JOB, false);
+    io.hold_jobs("reel-walk", false);
+    store.close().expect("close");
+}
+
+// a block with held rows in two lanes, one closed, waits and marks neither, and lands none of its counts; after the release
+// it counts again and lands each row once
+#[test]
+fn waiting_block_marks_no_lane() {
+    let io = SimulatedIo::new(Seed(63));
+    let store = open_workers(&io);
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    let (older, newer, _third) = three_segments(&store, &io, &[b"c", b"d"]);
+    // the open lane holds c, which comes first in the block, and the closed one holds d
+    hold_lane(&store, 1, newer, false);
+    hold_lane(&store, 2, older, true);
+    let blocks = volume.walk_blocks.load(Ordering::Relaxed);
+    let older_dead = dead_rows_of(&store, older);
+
+    let mut job = WalkJob::new(state.clone(), 0);
+    job.step_unit(io.clock_reading());
+    count_slots(&io);
+    assert_eq!(job.step_unit(io.clock_reading()), UnitStep::Idle);
+    assert_eq!(hold(&volume.lanes[1].held).marked, 0, "a waiting block marked a lane");
+    assert_eq!(volume.walk_blocks.load(Ordering::Relaxed), blocks, "a waiting block landed its counts");
+    assert_eq!(volume.walk_claim_waits.load(Ordering::Relaxed), 1);
+    assert_eq!(job.step_unit(io.clock_reading()), UnitStep::Idle, "a wait counted again before the release");
+
+    release_lane(&store, 2);
+    assert_eq!(job.step_unit(io.clock_reading()), UnitStep::Worked);
+    count_slots(&io);
+    assert_eq!(job.step_unit(io.clock_reading()), UnitStep::Worked);
+    assert_eq!(volume.walk_blocks.load(Ordering::Relaxed), blocks + 1);
+    assert_eq!(hold(&volume.lanes[1].held).marked, 1);
+    assert_eq!(dead_rows_of(&store, older), older_dead + 1);
+    release_lane(&store, 1);
+    drop(job);
+    io.hold_jobs(WALK_JOB, false);
+    io.hold_jobs("reel-walk", false);
+    store.close().expect("close");
+}
+
+// a rewrite that begins holding while a block lands waits for the landing, so the block's counts land before the hold and none
+// lands on an input after its rewrite has begun to decide
+#[test]
+fn claim_waits_for_a_landing_block() {
+    let io = SimulatedIo::new(Seed(64));
+    let store = open_workers(&io);
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    let (older, _newer, _third) = three_segments(&store, &io, &[b"d"]);
+    let mut merge = CompactJob::new(state.clone(), 0);
+    while !merge.rewrite.claim() {
+        assert!(merge.rewrite.has_looks_left, "no rewrite claimed");
+    }
+    assert_eq!(merge.rewrite.input_numbers(), [older]);
+    let blocks = volume.walk_blocks.load(Ordering::Relaxed);
+    let older_dead = dead_rows_of(&store, older);
+
+    let mut job = WalkJob::new(state.clone(), 0);
+    job.step_unit(io.clock_reading());
+    count_slots(&io);
+    // the landing stops at the summary, inside the claim lock
+    let summary = hold(&volume.summary);
+    thread::scope(|scope| {
+        let landing = scope.spawn(|| job.step_unit(io.clock_reading()));
+        let started = Instant::now();
+        while volume.claim_lock.try_lock().is_ok() {
+            assert!(started.elapsed() < LOCK_WAIT, "the landing never took the claim lock");
+            thread::yield_now();
+        }
+        let begin = scope.spawn(|| merge.rewrite.begin());
+        thread::sleep(BEGIN_WAIT);
+        assert!(!volume.lanes[0].is_holding.load(Ordering::Acquire), "a rewrite began holding inside a landing");
+        drop(summary);
+        assert_eq!(landing.join().expect("landing"), UnitStep::Worked);
+        assert!(begin.join().expect("begin"));
+    });
+    assert_eq!(volume.walk_blocks.load(Ordering::Relaxed), blocks + 1);
+    assert_eq!(dead_rows_of(&store, older), older_dead + 1, "the block's charge went other than to the input before the hold");
+    assert_eq!(hold(&volume.lanes[0].held).marked, 0);
+    assert!(volume.lanes[0].is_holding.load(Ordering::Acquire));
+    while merge.rewrite.is_running() {
+        merge.rewrite.step();
+    }
+    drop(job);
+    io.hold_jobs(WALK_JOB, false);
+    io.hold_jobs("reel-walk", false);
+    store.close().expect("close");
+}
+
+// a free the walk finds on a segment a rewrite has claimed is dropped, so the record stays whole for the rewrite's copy
+#[test]
+fn free_on_a_claimed_segment_is_dropped() {
+    let io = SimulatedIo::new(Seed(65));
+    let store = open(&io);
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    let large = vec![7; FREE_IN_PLACE_BYTES.0 as usize * 2];
+    store.put(COLUMN, b"large", &large).expect("put");
+    store.seal_now();
+    settle(&io);
+    let older = *hold(&volume.summary).orders().present().last().expect("a segment");
+    io.hold_jobs(WALK_JOB, true);
+    store.put(COLUMN, b"large", b"small").expect("put");
+    store.seal_now();
+    settle(&io);
+    // a rewrite claims the older segment and hasn't begun, so the walk charges it directly
+    hold(&volume.lanes[0].inputs)[0] = older;
+    let freed = volume.bytes_freed.load(Ordering::Acquire);
+
+    let mut job = WalkJob::new(state.clone(), 0);
+    assert_eq!(job.step_unit(io.clock_reading()), UnitStep::Worked);
+    assert_eq!(dead_rows_of(&store, older), 1);
+    assert_eq!(volume.bytes_freed.load(Ordering::Acquire), freed, "a free cut a record a rewrite claimed");
+    hold(&volume.lanes[0].inputs)[0] = SegmentNumber(0);
+    drop(job);
+    io.hold_jobs(WALK_JOB, false);
     store.close().expect("close");
 }

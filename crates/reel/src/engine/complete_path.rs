@@ -122,7 +122,7 @@ impl<Backend: Io> EngineState<Backend> {
         };
         match answer {
             FooterAnswer::Found(row) if best.is_none_or(|current| current.row.place < row.place) => {
-                *best = Some(SealedRow { segment, row, block_offset: entry.block_offset });
+                *best = Some(SealedRow { segment, row, block_offset: entry.block_offset, at: reader.found_at });
                 Ok(())
             },
             FooterAnswer::Found(..) | FooterAnswer::Absent => Ok(()),

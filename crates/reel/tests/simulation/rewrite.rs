@@ -273,9 +273,10 @@ fn install_looks_again() {
     store.close().expect("close");
 }
 
-// a walk starts no target while a rewrite runs, says so, and goes ahead once it's done
+// a walk runs beside a rewrite, its charges on the rewrite's inputs held for the install, and counts the turn it once stood
+// aside for
 #[test]
-fn walk_stands_aside() {
+fn walk_runs_beside_a_rewrite() {
     let io = SimulatedIo::new(Seed(4));
     let store = open(&io);
     hold_compaction(&store, true);
@@ -287,8 +288,10 @@ fn walk_stands_aside() {
     assert!(start_merge(&mut job));
     store.put(COLUMN, b"e", b"value").expect("put");
     seal(&store, &io);
-    assert_eq!(state.pending_walks(0), 1);
+    assert!(job.rewrite.is_running());
+    assert_eq!(state.pending_walks(0), 0, "the walk waited for the rewrite");
     assert!(volume.walks_held.load(Ordering::Acquire) > 0);
+    assert_eq!(volume.walk_claim_waits.load(Ordering::Acquire), 0);
 
     while job.rewrite.is_running() {
         job.rewrite.step();
@@ -746,19 +749,25 @@ fn ahead_of_waiting_walks() {
     store.close().expect("close");
 }
 
-// a target in progress keeps a rewrite from starting, or its counts would land on rows the rewrite decided on
+// a target in progress lets a rewrite start, and keeps the target itself out of its inputs
 #[test]
-fn walk_target_holds_rewrite() {
+fn walk_target_lets_a_rewrite_start() {
     let io = SimulatedIo::new(Seed(20));
     let store = open(&io);
     hold_compaction(&store, true);
-    half_dead(&store, &io);
-    store.state.volumes[0].has_walk_target.store(true, Ordering::Release);
-
+    let (older, newer) = half_dead(&store, &io);
+    let volume = &store.state.volumes[0];
+    volume.has_walk_target.store(true, Ordering::Release);
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
-    assert!(!job.rewrite.start());
-    store.state.volumes[0].has_walk_target.store(false, Ordering::Release);
+    // the walk on the one segment ready for a rewrite leaves nothing to pick
+    volume.walk_segment.store(older.0, Ordering::Release);
+    assert!(!start_merge(&mut job), "the walk's target went into a rewrite");
+    // the walk on another segment refuses nothing
+    volume.walk_segment.store(newer.0, Ordering::Release);
     assert!(start_merge(&mut job));
+    assert!(!job.rewrite.input_numbers().contains(&newer));
+    volume.has_walk_target.store(false, Ordering::Release);
+    volume.walk_segment.store(NO_SEAL, Ordering::Release);
     while job.rewrite.is_running() {
         job.rewrite.step();
     }
@@ -2595,5 +2604,66 @@ fn short_host_copies_in_key_order() {
     assert_eq!((volume.offset_order_copies, volume.key_order_copies), (0, 1));
     assert!(report.memory.floor_admits >= 1, "the floor took no start");
     check_set(&store);
+    store.close().expect("close");
+}
+
+// a row the walk finds dead in an input a rewrite holds lands once, on the output's copy of it, at the install
+#[test]
+fn held_row_lands_on_its_copy() {
+    let io = SimulatedIo::new(Seed(70));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let (older, newer) = half_dead(&store, &io);
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    let mut job = CompactJob::new(Arc::clone(state), 0);
+    assert!(start_merge(&mut job));
+    assert_eq!(job.rewrite.input_numbers(), [older]);
+    while job.rewrite.phase != RewritePhase::Draining {
+        job.rewrite.step();
+    }
+
+    // the merge kept d, and a newer d makes the walk charge the held one
+    store.put(COLUMN, KEYS[3], b"third").expect("put");
+    let charged = seal(&store, &io);
+    assert_eq!(state.pending_walks(0), 0);
+    assert_eq!(hold(&volume.lanes[PLANNER_LANE].held).marked, 1);
+    while job.rewrite.is_running() {
+        job.rewrite.step();
+    }
+    let present: Vec<SegmentNumber> = hold(&volume.summary).orders().present().to_vec();
+    let outputs: Vec<SegmentNumber> = present.into_iter().filter(|segment| *segment != newer && *segment != charged).collect();
+    assert_eq!(outputs.len(), 1, "one output holds d");
+    assert_eq!(dead_rows(&store, outputs[0]), 1);
+    assert_eq!(volume.walk_claim_waits.load(Ordering::Acquire), 0);
+    assert!(!volume.lanes[PLANNER_LANE].is_holding.load(Ordering::Acquire));
+    assert_eq!(read(&store, KEYS[3]), Some(b"third".to_vec()));
+    store.close().expect("close");
+}
+
+// a held row the merge dropped lands nothing, since no output holds it
+#[test]
+fn dropped_held_row_lands_nothing() {
+    let io = SimulatedIo::new(Seed(71));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let (older, newer) = half_dead(&store, &io);
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    let mut job = CompactJob::new(Arc::clone(state), 0);
+    assert!(start_merge(&mut job));
+    assert_eq!(job.rewrite.input_numbers(), [older]);
+
+    // before the merge decides d, a newer d lands, so the walk holds the older d and the merge drops it
+    store.put(COLUMN, KEYS[3], b"third").expect("put");
+    let charged = seal(&store, &io);
+    assert_eq!(hold(&volume.lanes[PLANNER_LANE].held).marked, 1);
+    while job.rewrite.is_running() {
+        job.rewrite.step();
+    }
+    let present: Vec<SegmentNumber> = hold(&volume.summary).orders().present().to_vec();
+    assert_eq!(present, [newer, charged], "the merge kept a row");
+    assert_eq!(dead_rows(&store, newer) + dead_rows(&store, charged), 0);
+    assert_eq!(read(&store, KEYS[3]), Some(b"third".to_vec()));
     store.close().expect("close");
 }

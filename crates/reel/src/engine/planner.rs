@@ -153,7 +153,7 @@ impl<Backend: Io> Job for Planner<Backend> {
 pub fn unit_bound(kind: UnitKind) -> Option<u64> {
     let row_block = MOST_BLOCK_ROWS as u64;
     match kind {
-        UnitKind::WalkBlock | UnitKind::UnlinkCheck | UnitKind::HeldFrees => Some(row_block),
+        UnitKind::WalkBlock | UnitKind::UnlinkCheck | UnitKind::HeldFrees | UnitKind::HeldDrain => Some(row_block),
         UnitKind::MergeRows => Some(MERGE_STEP_ROWS as u64),
         UnitKind::StripeCopy => Some(COPY_STEP_BYTES + MERGE_BUFFER_BYTES as u64),
         UnitKind::BlockMove => Some(MERGE_BUFFER_BYTES.div_ceil(ROW_BLOCK_BYTES) as u64),

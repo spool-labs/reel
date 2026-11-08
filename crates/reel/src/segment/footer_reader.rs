@@ -87,6 +87,30 @@ pub struct WindowRead<'window> {
     pub place_base: WritePlace,
 }
 
+/// Where a found row sits in its block: its place among the block's rows, and how many the block holds
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RowAt {
+    /// The row's place among the block's rows
+    pub index: u32,
+    /// The rows the block holds
+    pub rows: u32,
+}
+
+impl RowAt {
+    /// A row whose place in its block no read gave
+    pub const UNKNOWN: Self = Self { index: u32::MAX, rows: 0 };
+
+    /// Check a read gave the row's place
+    pub fn is_known(self) -> bool {
+        self.index < self.rows
+    }
+
+    /// Read where a walk's last row sits
+    pub fn of_walk(walk: &RowBlockWalk<'_>) -> Self {
+        Self { index: walk.row_index() as u32, rows: walk.rows() as u32 }
+    }
+}
+
 /// The buffers one footer read borrows from the pool
 #[derive(Debug)]
 pub struct FooterReader {
@@ -96,6 +120,7 @@ pub struct FooterReader {
     key: Vec<u8>,
     pub candidates: Vec<Candidate>,
     pub found_block: u32,
+    pub found_at: RowAt,
     pub tail_inputs: TailInputs,
     /// Segments the last directory walk asked
     pub asked: u64,
@@ -111,6 +136,7 @@ impl FooterReader {
             key: touched_capacity(ROW_BLOCK_BYTES, 0),
             candidates: touched_capacity(CANDIDATE_PAGE, Candidate::default()),
             found_block: 0,
+            found_at: RowAt::UNKNOWN,
             tail_inputs: TailInputs::default(),
             asked: 0,
         }
@@ -396,7 +422,8 @@ impl FooterReader {
         };
         let buffer = &mut self.key;
         let cached = caches.rows.with(key, |block| search_rows(block, place_base, query, buffer));
-        if let Some(answer) = cached {
+        if let Some((answer, at)) = cached {
+            self.found_at = at;
             return Ok(answer);
         }
 
@@ -425,7 +452,9 @@ impl FooterReader {
         let Some(mut walk) = RowBlockWalk::open(&self.block[..length], place_base) else {
             return Ok(FooterAnswer::Damaged);
         };
-        Ok(newest_at(&mut walk, query, &mut self.key))
+        let (answer, at) = newest_at(&mut walk, query, &mut self.key);
+        self.found_at = at;
+        Ok(answer)
     }
 }
 
@@ -436,29 +465,29 @@ impl Default for FooterReader {
 }
 
 /// Find a key's newest row at a read point in a block already checked
-pub fn search_rows(block: &[u8], place_base: WritePlace, query: &FooterQuery<'_>, key: &mut impl ListOut<u8>) -> FooterAnswer {
+pub fn search_rows(block: &[u8], place_base: WritePlace, query: &FooterQuery<'_>, key: &mut impl ListOut<u8>) -> (FooterAnswer, RowAt) {
     let Some(mut walk) = RowBlockWalk::open_checked(block, place_base) else {
-        return FooterAnswer::Damaged;
+        return (FooterAnswer::Damaged, RowAt::UNKNOWN);
     };
     newest_at(&mut walk, query, key)
 }
 
-/// Walk from a seek to the key's newest row at a read point
-pub fn newest_at(walk: &mut RowBlockWalk, query: &FooterQuery<'_>, key: &mut impl ListOut<u8>) -> FooterAnswer {
+/// Walk from a seek to the key's newest row at a read point, and say where a found row sits in the block
+pub fn newest_at(walk: &mut RowBlockWalk, query: &FooterQuery<'_>, key: &mut impl ListOut<u8>) -> (FooterAnswer, RowAt) {
     let Some(mut row) = walk.seek(query.key, key) else {
-        return FooterAnswer::Absent;
+        return (FooterAnswer::Absent, RowAt::UNKNOWN);
     };
 
     loop {
         if **key != *query.key {
-            return FooterAnswer::Absent;
+            return (FooterAnswer::Absent, RowAt::UNKNOWN);
         }
         if row.place <= query.read_point {
-            return FooterAnswer::Found(row);
+            return (FooterAnswer::Found(row), RowAt::of_walk(walk));
         }
         match walk.next_row(key) {
             Some(next) => row = next,
-            None => return FooterAnswer::Absent,
+            None => return (FooterAnswer::Absent, RowAt::UNKNOWN),
         }
     }
 }
@@ -485,6 +514,7 @@ impl HollowItem for FooterReader {
             key: Vec::new(),
             candidates: Vec::new(),
             found_block: 0,
+            found_at: RowAt::UNKNOWN,
             tail_inputs: TailInputs::default(),
             asked: 0,
         }

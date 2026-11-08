@@ -41,7 +41,7 @@ impl JobKind {
 }
 
 /// Every kind of maintenance unit, in the order a report lists them
-pub const UNIT_KINDS: [UnitKind; 16] = [
+pub const UNIT_KINDS: [UnitKind; 17] = [
     UnitKind::WalkBlock,
     UnitKind::MergeRows,
     UnitKind::StripeCopy,
@@ -58,6 +58,7 @@ pub const UNIT_KINDS: [UnitKind; 16] = [
     UnitKind::SummaryCopy,
     UnitKind::SummarySave,
     UnitKind::Start,
+    UnitKind::HeldDrain,
 ];
 
 /// A kind of maintenance unit. A job runs as units, and each kind's work is counted in what its line says
@@ -95,6 +96,8 @@ pub enum UnitKind {
     SummarySave,
     /// A rewrite mapping its region, its pages faulted in, and opening its output, on the thread that runs it, in bytes mapped
     Start,
+    /// Landing one held block of a rewrite's inputs on its outputs before the install, in rows
+    HeldDrain,
 }
 
 impl UnitKind {
@@ -378,6 +381,18 @@ pub struct MaintenanceReport {
     pub summary_rows_dropped: RowCount,
     /// Summary rows the pick orders had no slot for, which no pick sees, and which stays none
     pub summary_rows_unordered: RowCount,
+    /// The turns the walk stood aside while a rewrite ran
+    pub walks_held: u64,
+    /// Waits of a block whose charges land on an input a rewrite has claimed, none until the held bits come
+    pub walk_claim_waits: u64,
+    /// The time those waits held the walk, in all
+    pub walk_claim_held: Nanoseconds,
+    /// The longest one wait held the walk
+    pub walk_claim_longest: Nanoseconds,
+    /// Held blocks the drains read, each once
+    pub held_drain_blocks: u64,
+    /// The bytes those reads took
+    pub held_drain_bytes: ByteCount,
     pub refused_reads: RowCount,
     pub reclaim_retries: RowCount,
     pub segments_parked: SegmentCount,
@@ -440,6 +455,12 @@ impl MaintenanceReport {
             damaged_segments: SegmentCount::default(),
             summary_rows_dropped: RowCount::default(),
             summary_rows_unordered: RowCount::default(),
+            walks_held: 0,
+            walk_claim_waits: 0,
+            walk_claim_held: Nanoseconds(0),
+            walk_claim_longest: Nanoseconds(0),
+            held_drain_blocks: 0,
+            held_drain_bytes: ByteCount(0),
             refused_reads: RowCount::default(),
             reclaim_retries: RowCount::default(),
             segments_parked: SegmentCount::default(),

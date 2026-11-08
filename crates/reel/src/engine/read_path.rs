@@ -25,7 +25,7 @@ use crate::record::record_check::RecordIdentity;
 use crate::record::record_reader::{RecordLocation, RecordRead, RecordReader};
 use crate::row_kind::RowKind;
 use crate::segment::column_directory::ColumnDirectory;
-use crate::segment::footer_reader::{FooterAnswer, FooterCaches, FooterQuery, FooterReader, WindowRead};
+use crate::segment::footer_reader::{FooterAnswer, FooterCaches, FooterQuery, FooterReader, RowAt, WindowRead};
 use crate::segment::row_block::FooterRow;
 use crate::segment::segment_table::{SegmentPin, WINDOW_BLOCKS};
 use crate::segment::segment_tail::SegmentNumber;
@@ -39,6 +39,7 @@ pub struct SealedRow {
     pub segment: SegmentNumber,
     pub row: FooterRow,
     pub block_offset: u32,
+    pub at: RowAt,
 }
 
 /// Where a key's newest row sits
@@ -751,7 +752,7 @@ impl<Backend: Io> EngineState<Backend> {
         while let Some(found) = self.search_segment(device, volume, &point, segment, pin, reader).await? {
             if found.kind != RowKind::RangeDelete {
                 if best.is_none_or(|current| current.row.place < found.place) {
-                    *best = Some(SealedRow { segment, row: found, block_offset: reader.found_block });
+                    *best = Some(SealedRow { segment, row: found, block_offset: reader.found_block, at: reader.found_at });
                 }
                 return Ok(());
             }
@@ -877,7 +878,7 @@ impl<Backend: Io> EngineState<Backend> {
         if let Some(found) = row
             && best.is_none_or(|current| current.row.place < found.place)
         {
-            *best = Some(SealedRow { segment, row: found, block_offset: reader.found_block });
+            *best = Some(SealedRow { segment, row: found, block_offset: reader.found_block, at: reader.found_at });
         }
         Ok(())
     }

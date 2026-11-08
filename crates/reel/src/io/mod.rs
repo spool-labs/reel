@@ -27,6 +27,7 @@ use crate::io::job::Job;
 use crate::io::lock_outcome::LockOutcome;
 use crate::io::ring::RingDriver;
 use crate::row_kind::RowKind;
+use crate::segment::footer_reader::RowAt;
 use crate::segment::row_block::FooterRow;
 use crate::segment::segment_tail::SegmentNumber;
 
@@ -148,7 +149,7 @@ impl WalkMark {
                 length: ByteCount(self.best_length.load(Ordering::Relaxed)),
                 kind,
             };
-            Some(SealedRow { segment: SegmentNumber(segment), row, block_offset: self.best_block.load(Ordering::Relaxed) })
+            Some(SealedRow { segment: SegmentNumber(segment), row, block_offset: self.best_block.load(Ordering::Relaxed), at: RowAt::UNKNOWN })
         });
         Some(WalkResume { next: self.next.load(Ordering::Relaxed), best })
     }

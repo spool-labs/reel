@@ -88,6 +88,7 @@ pub struct RowBlockWalk<'block> {
     position: usize,
     place_base: WritePlace,
     row_count: usize,
+    next_index: usize,
 }
 
 impl RowBlockBuilder {
@@ -258,6 +259,7 @@ impl<'block> RowBlockWalk<'block> {
             rows: &block[..restarts_at],
             restarts: &block[restarts_at..rows_count_at],
             position: 0,
+            next_index: 0,
             place_base,
             row_count,
         })
@@ -275,6 +277,7 @@ impl<'block> RowBlockWalk<'block> {
             rows: &block[..restarts_at],
             restarts: &block[restarts_at..rows_count_at],
             position: 0,
+            next_index: 0,
             place_base,
             row_count,
         })
@@ -283,6 +286,21 @@ impl<'block> RowBlockWalk<'block> {
     /// Read how far the walk has come, to resume it later
     pub fn position(&self) -> usize {
         self.position
+    }
+
+    /// Read the place the next row has among the block's rows
+    pub fn next_index(&self) -> usize {
+        self.next_index
+    }
+
+    /// Read the place the last row read has among the block's rows
+    pub fn row_index(&self) -> usize {
+        self.next_index.saturating_sub(1)
+    }
+
+    /// Read the rows the block holds
+    pub fn rows(&self) -> usize {
+        self.row_count
     }
 
     /// Go on from where another walk stopped, with its key still in the buffer
@@ -325,6 +343,7 @@ impl<'block> RowBlockWalk<'block> {
         let (length, length_bytes) = read_varint(bytes.get(length_at..)?)?;
 
         self.position += length_at + length_bytes;
+        self.next_index += 1;
         Some(FooterRow {
             place: WritePlace(self.place_base.0 + place),
             offset: FileOffset(offset),
@@ -386,6 +405,7 @@ impl<'block> RowBlockWalk<'block> {
     /// Read the key at a restart point, leaving the walk there
     pub fn key_at_restart(&mut self, index: usize, key: &mut impl ListOut<u8>) -> Option<FooterRow> {
         self.position = self.restart_at(index);
+        self.next_index = index * RESTART_INTERVAL as usize;
         key.clear();
         self.next_row(key)
     }

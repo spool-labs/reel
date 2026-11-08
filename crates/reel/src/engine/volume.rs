@@ -10,6 +10,7 @@ use reel_api::units::{ByteCount, Nanoseconds, RowCount, VolumeId, WritePlace};
 use crate::config::SyncPolicy;
 use crate::engine::open_segment::{OpenSegment, SegmentPhase};
 use crate::engine::ration::Ration;
+use crate::engine::held_bits::HeldBits;
 use crate::engine::walk_job::WalkSlot;
 use crate::guard::hold;
 use crate::index::open_slots::{OpenSlot, OpenSlots};
@@ -133,6 +134,10 @@ pub struct RewriteLane<File> {
     /// Every input of the rewrite running here
     pub inputs: Mutex<[SegmentNumber; MOST_MERGE_SEGMENTS]>,
     pub partial_outputs: Mutex<OutputSlots<File>>,
+    /// The rows the walk found dead in this rewrite's inputs while it held them, as bits in the rewrite's region
+    pub held: Mutex<HeldBits>,
+    /// Whether the rewrite holds its inputs, so a charge on them goes to its bits
+    pub is_holding: AtomicBool,
     /// Rewrites this lane has finished
     pub rewrites_done: AtomicU64,
     /// Outputs a failed remove left here. A lane with any starts nothing until they go
@@ -148,6 +153,8 @@ impl<File> RewriteLane<File> {
             merging: Mutex::new([SegmentNumber(0); MOST_MERGE_SEGMENTS]),
             inputs: Mutex::new([SegmentNumber(0); MOST_MERGE_SEGMENTS]),
             partial_outputs: Mutex::new(Default::default()),
+            held: Mutex::new(HeldBits::default()),
+            is_holding: AtomicBool::new(false),
             strays: AtomicU64::new(0),
             rewrites_done: AtomicU64::new(0),
         };
@@ -155,6 +162,7 @@ impl<File> RewriteLane<File> {
         drop(hold(&lane.merging));
         drop(hold(&lane.inputs));
         drop(hold(&lane.partial_outputs));
+        drop(hold(&lane.held));
         lane
     }
 }
@@ -292,8 +300,22 @@ pub struct Volume<Backend: Io> {
     pub is_rebuild_held: AtomicBool,
     /// A walk is counting what its covers hide, and a row that left now would make an older one look live
     pub is_applying: AtomicBool,
+    /// Orders a walk's landing against a rewrite that begins or ends holding its inputs
+    pub claim_lock: Mutex<()>,
+    /// Moves each time a rewrite begins or ends holding, so a block counted before it counts again
+    pub claims_changed: AtomicU64,
     /// Counts the turns a walk stood aside for a rewrite
     pub walks_held: AtomicU64,
+    /// Counts the waits of a block whose charges land on an input a rewrite has claimed, none until the held bits come
+    pub walk_claim_waits: AtomicU64,
+    /// Nanoseconds those waits held the walk, in all
+    pub walk_claim_held: AtomicU64,
+    /// Nanoseconds the longest one held the walk
+    pub walk_claim_longest: AtomicU64,
+    /// Held blocks the drains read, each once
+    pub held_drain_blocks: AtomicU64,
+    /// The bytes those reads took
+    pub held_drain_bytes: AtomicU64,
     pub summary: Mutex<SummaryRows>,
     pub summary_paths: SummaryPaths,
     pub lost_rows: Mutex<LostRows>,

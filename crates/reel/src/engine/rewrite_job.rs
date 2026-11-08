@@ -30,7 +30,8 @@ use crate::guard::hold;
 use crate::lifetime::MarkRange;
 use crate::io::{Io, IoFile};
 use crate::fixed_list::{FixedList, ListFull};
-use crate::region::{REGION_HEAD_BYTES, Region, list_bytes};
+use crate::region::{LIST_ALIGN_ROOM, REGION_HEAD_BYTES, Region, list_bytes};
+use crate::engine::held_bits::{HeldBits, WORD_BITS};
 use crate::engine::admission::{Admit, JobRole, PICK_HALVINGS};
 use crate::row_kind::RowKind;
 use crate::segment::damage_list::DamagedRange;
@@ -57,6 +58,10 @@ pub const EARLY_BAR_QUARTERS: u64 = 3;
 pub const MERGE_BUFFER_BYTES: usize = 3 * 512 * 1024;
 /// Most row blocks of an output that can hold rows kept for a cue, past which the merge waits for the cue to go
 pub const MOST_KEPT_BLOCKS: usize = 1_024;
+/// A row the merge dropped, which a held bit lands nowhere for
+pub const NO_HOME: u32 = u32::MAX;
+/// Bits of a row's home that give its block in the output, past which the bits give the output
+pub const HOME_BLOCK_BITS: u32 = 28;
 /// Rows one step of a merge decides
 pub const MERGE_STEP_ROWS: usize = 4_096;
 /// Bytes a stripe copy step takes across before it stops, a buffer's worth, past which only the run in hand finishes
@@ -157,6 +162,8 @@ pub enum RewritePhase {
     Copying,
     /// Row blocks are moving down to the records' end
     Moving,
+    /// The rows the walk held in the inputs land on the outputs, a held block at a time
+    Draining,
     /// The outputs are whole segments and wait to replace their inputs
     Installing,
 }
@@ -166,6 +173,7 @@ pub struct MergeInput {
     pub segment: SegmentNumber,
     pub block_count: u32,
     pub block_rows: u64,
+    pub most_block_rows: u32,
     pub data_end: u64,
     pub base: u64,
     rows_seen: u64,
@@ -177,6 +185,7 @@ pub struct MergeInput {
     key: FixedList<u8>,
     column: ColumnId,
     row: Option<FooterRow>,
+    block_firsts: FixedList<u32>,
 }
 
 impl MergeInput {
@@ -186,6 +195,7 @@ impl MergeInput {
             segment: SegmentNumber(0),
             block_count: 0,
             block_rows: 0,
+            most_block_rows: 0,
             data_end: 0,
             base: 0,
             rows_seen: 0,
@@ -197,6 +207,7 @@ impl MergeInput {
             key: FixedList::empty(),
             column: ColumnId(0),
             row: None,
+            block_firsts: FixedList::empty(),
         }
     }
 
@@ -219,10 +230,16 @@ impl MergeInput {
 
     /// Give the block and key back, and return the most bytes they wrote
     pub fn release(&mut self) -> usize {
-        let peak = self.block.peak_bytes() + self.key.peak_bytes();
+        let peak = self.block.peak_bytes() + self.key.peak_bytes() + self.block_firsts.peak_bytes();
         self.block = FixedList::empty();
         self.key = FixedList::empty();
+        self.block_firsts = FixedList::empty();
         peak
+    }
+
+    /// Read the ordinal of a block's first row, which the deciding pass noted as it read the block
+    pub fn block_first(&self, block: u32) -> Option<u64> {
+        self.block_firsts.get(block as usize).map(|first| u64::from(*first))
     }
 
     /// Check a row list this long has room for every row of the input
@@ -275,6 +292,10 @@ impl MergeInput {
             self.read_bytes += length as u64;
             if RowBlockWalk::open(&self.block[..length], base).is_none() {
                 return Err(Error::from(ErrorKind::InvalidData));
+            }
+            // the drain finds a held row's ordinal from its block's first one and its place in the block
+            if let Some(first) = self.block_firsts.get_mut(self.next_block as usize) {
+                *first = self.rows_seen as u32;
             }
             self.next_block += 1;
             self.length = length;
@@ -400,6 +421,15 @@ pub struct RewriteJob<Backend: Io> {
     listed: FixedList<SegmentNumber>,
     crowd: FixedList<SegmentNumber>,
     pub has_looks_left: bool,
+    held_words: FixedList<u64>,
+    row_home: FixedList<u32>,
+    drained: FixedList<DeadCount>,
+    held: HeldBits,
+    drain_input: usize,
+    drain_block: u32,
+    home_outputs: [SegmentNumber; MOST_MERGE_OUTPUTS + 1],
+    home_count: usize,
+    is_holding: bool,
     looked_up_to: SegmentNumber,
 }
 
@@ -409,6 +439,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         // a mutex's first lock can allocate, and this one's first real use could be in a close
         drop(hold(&state.volumes[volume].lanes[lane].partial_outputs));
         drop(hold(&state.volumes[volume].lanes[lane].merging));
+        drop(hold(&state.volumes[volume].claim_lock));
         let cut_floor = state.volumes[volume].segment_bytes.0 / MOST_MERGE_OUTPUTS as u64;
         Self {
             state,
@@ -496,6 +527,15 @@ impl<Backend: Io> RewriteJob<Backend> {
             listed: FixedList::on_heap(OVERLAP_LISTED),
             crowd: FixedList::on_heap(OVERLAP_LISTED),
             has_looks_left: false,
+            held_words: FixedList::empty(),
+            row_home: FixedList::empty(),
+            drained: FixedList::empty(),
+            held: HeldBits::default(),
+            drain_input: 0,
+            drain_block: 0,
+            home_outputs: [SegmentNumber(0); MOST_MERGE_OUTPUTS + 1],
+            home_count: 0,
+            is_holding: false,
             looked_up_to: SegmentNumber(0),
         }
     }
@@ -532,6 +572,16 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
         bound.columns = bound.columns.min(MAX_COLUMNS);
         bound.is_ordered = self.rebuild.is_none() && !self.is_key_order_held;
+        // the walk charges only walked segments, so an unwalked merge holds nothing
+        bound.is_holding = !self.is_unwalked && self.rebuild.is_none();
+        if bound.is_holding {
+            for number in self.input_numbers() {
+                if let Some(facts) = rows.get(*number).map(|row| row.facts) {
+                    bound.blocks += u64::from(facts.block_count);
+                    bound.held_words += HeldBits::words_for(iter::once((facts.block_count, facts.most_block_rows)));
+                }
+            }
+        }
         bound
     }
 
@@ -572,6 +622,14 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.marks = region.carve_filled(rows.div_ceil(u64::BITS as usize), 0)?;
         self.placed = region.carve_filled(rows, 0)?;
         self.stripe = region.carve(bound.ordered_input_rows())?;
+        if bound.is_holding {
+            for input in &mut self.inputs[..bound.inputs] {
+                input.block_firsts = region.carve_filled(input.block_count as usize, 0)?;
+            }
+            self.held_words = region.carve_filled(bound.held_words, 0)?;
+            self.row_home = region.carve_filled(bound.rows as usize, NO_HOME)?;
+            self.drained = region.carve(bound.drain_room())?;
+        }
         for stage in &mut self.stages[..bound.stages()] {
             *stage = region.carve(STAGE_BYTES)?;
         }
@@ -599,6 +657,8 @@ impl<Backend: Io> RewriteJob<Backend> {
         touched += mem::take(&mut self.kept_dead).peak_bytes() + mem::take(&mut self.staged).peak_bytes();
         touched += mem::take(&mut self.staged_columns).peak_bytes() + mem::take(&mut self.marks).peak_bytes();
         touched += mem::take(&mut self.placed).peak_bytes() + mem::take(&mut self.stripe).peak_bytes();
+        touched += mem::take(&mut self.held_words).peak_bytes() + mem::take(&mut self.row_home).peak_bytes();
+        touched += mem::take(&mut self.drained).peak_bytes();
         for stage in &mut self.stages {
             touched += mem::take(stage).peak_bytes();
         }
@@ -718,6 +778,9 @@ impl<Backend: Io> RewriteJob<Backend> {
             return false;
         }
         self.clear(target);
+        if bound.is_holding {
+            self.hold_inputs(volume);
+        }
         // the inputs copy in offset order when their lists fit, and a deciding pass says which rows go across and to which output
         let rows: u64 = self.inputs[..self.input_count].iter().map(|input| input.block_rows).sum();
         self.is_ordered = self.is_ordered_bound && rows as usize <= self.placed.len();
@@ -762,7 +825,9 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.is_unwalked = false;
         self.bars_fired = BarsFired::default();
         // its rows counted for nothing a walk can trust, so the output goes through the forward walk they owe
-        if let Some(row) = self.rebuild.and_then(|segment| rows.get(segment)) {
+        // no input is the walk's started target, whose rows the walk is counting
+        let walking = volume.walk_segment.load(Ordering::Acquire);
+        if let Some(row) = self.rebuild.and_then(|segment| rows.get(segment)).filter(|row| row.facts.segment.0 != walking) {
             self.is_unwalked = true;
             let target = self.gather(volume, &rows, &row, 1, |_row| false);
             // the row counts every block the segment had, and only the ones that read are in the table
@@ -777,10 +842,6 @@ impl<Backend: Io> RewriteJob<Backend> {
             volume.note_pick(PickOutcome::Overlap);
             return Some((target, false));
         }
-        if volume.has_walk_target.load(Ordering::Acquire) {
-            volume.note_pick(PickOutcome::WalkTarget);
-            return None;
-        }
         // a full pool refuses range deletes, so the segment holding the oldest cover back goes whatever the trigger says
         if let Some(row) = self.forced.take().and_then(|forced| rows.get(forced)).filter(|row| is_mergeable(volume, row)) {
             self.forced_pick = Some(row.facts.segment);
@@ -791,7 +852,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         let current = DeathMark(self.state.current_mark.load(Ordering::Relaxed));
         let gave_up = self.gave_up_list(volume);
         let is_ready = |row: &SummaryRow<'_>| {
-            row.facts.is_walked() && !gave_up.holds(row.facts.segment) && is_rewrite_ready(volume, row, 0, current) && is_rewrite_ready(volume, row, freed_in_place(volume, row), current)
+            row.facts.is_walked() && row.facts.segment.0 != walking && !gave_up.holds(row.facts.segment) && is_rewrite_ready(volume, row, 0, current) && is_rewrite_ready(volume, row, freed_in_place(volume, row), current)
         };
         // the most won back for the bytes read goes first, and a picked row moves to its bucket's end, so a merge that gave way
         // lets the next one up
@@ -838,11 +899,6 @@ impl<Backend: Io> RewriteJob<Backend> {
         let near = self.listed.iter().filter_map(|segment| rows.get(*segment)).filter(is_near);
         // unwalked segments go first, since they need nothing from the walk
         let is_unwalked = near.filter(|row| !row.facts.is_walked()).take(2).count() == 2;
-        if !is_unwalked && volume.has_walk_target.load(Ordering::Acquire) {
-            // the walk goes first and asks again when it ends, and a look left here would keep the planner from it
-            self.has_looks_left = false;
-            return None;
-        }
         let is_more = |row: &SummaryRow<'_>| is_near(row) && row.facts.is_walked() != is_unwalked;
         let target = gather_smallest(volume, (rows, &self.listed), room, is_more, &mut self.inputs, &mut self.numbers, &mut self.input_count);
         // one segment alone wins back no overlap, and the next look starts past it
@@ -894,6 +950,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             input.segment = facts.segment;
             input.block_count = facts.block_count;
             input.block_rows = rows_of(&row);
+            input.most_block_rows = facts.most_block_rows;
             input.data_end = facts.data_end.0;
             self.numbers[self.input_count] = facts.segment;
             self.input_count += 1;
@@ -1016,6 +1073,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             RewritePhase::Placing => self.place_rows(),
             RewritePhase::Copying => self.finish_rows(),
             RewritePhase::Moving => self.move_blocks(target),
+            RewritePhase::Draining => self.drain_step(),
             RewritePhase::Installing => self.install(),
         };
         // the row blocks a pass reads, so a merge's deciding and placing reads show beside its copying one
@@ -1282,6 +1340,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.output_last_key.set_from(&self.key)?;
         let block = self.writer.entries().len() as u32;
         self.give_slot(volume, output.number, column, block);
+        self.note_home(output.number, block);
         self.note_kept_dead(output.number, column, block, &kept, replacement)
     }
 
@@ -1326,6 +1385,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.grave_last_key.set_from(&self.key)?;
         let block = self.grave_writer.entries().len() as u32;
         self.give_slot(volume, output.number, column, block);
+        self.note_home(output.number, block);
         self.note_kept_dead(output.number, column, block, &kept, replacement)
     }
 
@@ -1857,7 +1917,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             self.totals = Some(totals);
             self.name_output(output, self.data_slot)?;
         }
-        self.phase = RewritePhase::Installing;
+        self.phase = if self.is_holding { RewritePhase::Draining } else { RewritePhase::Installing };
         Ok(())
     }
 
@@ -1972,6 +2032,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         volume.lanes[self.lane].is_rewriting.store(false, Ordering::Release);
         *hold(&volume.lanes[self.lane].merging) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
         *hold(&volume.lanes[self.lane].inputs) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
+        self.release_hold(volume);
         volume.segments_rewritten.fetch_add(1, Ordering::AcqRel);
         volume.early_bar_rewrites.fetch_add(self.bars_fired.early, Ordering::Relaxed);
         volume.plain_bar_rewrites.fetch_add(self.bars_fired.plain, Ordering::Relaxed);
@@ -2050,6 +2111,8 @@ impl<Backend: Io> RewriteJob<Backend> {
         for count in self.kept_dead.iter().filter(|count| count.rows > 0) {
             volume.table.drop_live(count.segment, count.block, count.rows, count.replacement);
         }
+        // the rows the walk held land with the outputs, before the release lets a waiting walk count again
+        self.land_drained(volume);
     }
 
     /// Add an output's summary row
@@ -2152,6 +2215,9 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.leave_outputs(volume, slots);
         self.target = None;
         volume.lanes[self.lane].output_floor.store(NO_SEAL, Ordering::Release);
+        // the inputs stay, so the rows the walk held in them count there
+        self.drain_to_inputs(volume);
+        self.release_hold(volume);
         volume.lanes[self.lane].is_rewriting.store(false, Ordering::Release);
         *hold(&volume.lanes[self.lane].merging) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
         *hold(&volume.lanes[self.lane].inputs) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
@@ -2292,6 +2358,7 @@ pub fn gather_smallest<Backend: Io>(
         inputs[*input_count].segment = facts.segment;
         inputs[*input_count].block_count = facts.block_count;
         inputs[*input_count].block_rows = rows_of(&row);
+        inputs[*input_count].most_block_rows = facts.most_block_rows;
         inputs[*input_count].data_end = facts.data_end.0;
         numbers[*input_count] = facts.segment;
         *input_count += 1;
@@ -2504,6 +2571,12 @@ pub struct RewriteBound {
     pub is_ordered: bool,
     /// The most blocks the grave output takes
     pub most_grave_blocks: BlockCount,
+    /// Whether the merge holds its inputs, so the walk's charges on them go to bits that its install lands on the outputs
+    pub is_holding: bool,
+    /// Blocks the inputs hold in all, each with the ordinal of its first row
+    pub blocks: u64,
+    /// Words the held bits take
+    pub held_words: usize,
 }
 
 impl RewriteBound {
@@ -2532,6 +2605,24 @@ impl RewriteBound {
         if self.is_ordered { self.rows as usize } else { 0 }
     }
 
+    /// Count the dead counts a drain can land, an entry a block of every output
+    pub fn drain_room(&self) -> usize {
+        if !self.is_holding {
+            return 0;
+        }
+        let blocks = blocks_for_rows(self.rows, self.block_bytes, self.columns) as usize;
+        blocks + MOST_MERGE_OUTPUTS + self.grave_blocks().0 as usize
+    }
+
+    /// Count the region bytes the held bits, the blocks' first ordinals, the rows' homes and the drain's counts take
+    pub fn holding_bytes(&self) -> usize {
+        if !self.is_holding {
+            return 0;
+        }
+        let firsts = self.blocks as usize * size_of::<u32>() + self.inputs * LIST_ALIGN_ROOM;
+        list_bytes::<u64>(self.held_words) + firsts + list_bytes::<u32>(self.rows as usize) + list_bytes::<DeadCount>(self.drain_room())
+    }
+
     /// Count the region bytes every list of the run takes, each with its alignment room
     pub fn region_bytes(&self) -> ByteCount {
         let writers = FooterWriter::region_bytes(self.output_blocks()) + FooterWriter::region_bytes(self.grave_blocks());
@@ -2546,7 +2637,7 @@ impl RewriteBound {
             + list_bytes::<u32>(rows)
             + list_bytes::<StripeRow>(self.ordered_input_rows())
             + self.stages() * list_bytes::<u8>(STAGE_BYTES);
-        ByteCount((REGION_HEAD_BYTES + writers + inputs + keys + buffers + staged + ordered) as u64)
+        ByteCount((REGION_HEAD_BYTES + writers + inputs + keys + buffers + staged + ordered + self.holding_bytes()) as u64)
     }
 }
 
@@ -2574,4 +2665,208 @@ pub fn first_ready<'rows>(rows: &'rows SummaryRows, is_ready: impl Fn(&SummaryRo
         let looked = rows.orders().share_list(list).take(BUCKET_LOOKS).filter_map(|segment| rows.get(segment));
         looked.filter(|row| is_ready(row)).max_by_key(reclaim_share)
     })
+}
+
+impl<Backend: Io> RewriteJob<Backend> {
+    /// Hold the inputs from here on: lay their bits out over the region's words and publish them on the lane, so a walk that
+    /// would charge an input sets a bit, which the drain lands on the outputs before the install
+    pub fn hold_inputs(&mut self, volume: &Volume<Backend>) {
+        let inputs = self.inputs[..self.input_count].iter().map(|input| (input.segment, input.block_count, input.most_block_rows));
+        let bits = HeldBits::open(inputs, mem::take(&mut self.held_words));
+        let _claim = hold(&volume.claim_lock);
+        *hold(&volume.lanes[self.lane].held) = bits;
+        volume.lanes[self.lane].is_holding.store(true, Ordering::Release);
+        volume.claims_changed.fetch_add(1, Ordering::AcqRel);
+        self.is_holding = true;
+        self.home_count = 0;
+        self.drain_input = 0;
+        self.drain_block = 0;
+    }
+
+    /// Note where the row being kept went: its output and its block there, for a held bit on it
+    pub fn note_home(&mut self, output: SegmentNumber, block: u32) {
+        if self.row_home.is_empty() {
+            return;
+        }
+        let known = self.home_outputs[..self.home_count].iter().position(|number| *number == output);
+        let index = match known {
+            Some(index) => index,
+            None if self.home_count < self.home_outputs.len() => {
+                self.home_outputs[self.home_count] = output;
+                self.home_count += 1;
+                self.home_count - 1
+            },
+            None => return,
+        };
+        if let Some(home) = self.row_home.get_mut(self.row_at as usize) {
+            *home = ((index as u32) << HOME_BLOCK_BITS) | block;
+        }
+    }
+
+    /// Land one held block on the outputs, closing the bits at the first step so no walk sets another, and go on to the
+    /// install once none is left
+    pub fn drain_step(&mut self) -> Result<()> {
+        let state = Arc::clone(&self.state);
+        let volume = &state.volumes[self.volume];
+        if !self.held.is_closed {
+            let _claim = hold(&volume.claim_lock);
+            let mut held = hold(&volume.lanes[self.lane].held);
+            self.held = mem::take(&mut *held);
+            self.held.is_closed = true;
+            // the lane keeps refusing, so a block that would set a bit waits for the release and counts again
+            held.is_closed = true;
+        }
+        self.unit = (UnitKind::HeldDrain, 0);
+        let Some((input, block)) = self.next_held_block() else {
+            self.phase = RewritePhase::Installing;
+            return Ok(());
+        };
+        let landed = self.land_held_block(volume, input, block, true)?;
+        self.unit.1 = landed;
+        self.drain_block = block + 1;
+        Ok(())
+    }
+
+    /// Find the next input block with a bit set, from where the drain stands
+    pub fn next_held_block(&mut self) -> Option<(usize, u32)> {
+        while self.drain_input < self.held.input_count {
+            let input = self.drain_input;
+            let block_count = self.held.inputs[input].block_count;
+            while self.drain_block < block_count {
+                let block = self.drain_block;
+                if self.held.block_bits(input, block).iter().any(|word| *word != 0) {
+                    return Some((input, block));
+                }
+                self.drain_block += 1;
+            }
+            self.drain_input += 1;
+            self.drain_block = 0;
+        }
+        None
+    }
+
+    /// Read one held block of an input and count each held row dead where it went: on the output block a home says, nothing
+    /// for a row the merge dropped, or on the input itself when the rewrite gives way. Return the rows counted
+    pub fn land_held_block(&mut self, volume: &Volume<Backend>, input: usize, block: u32, is_to_outputs: bool) -> Result<u64> {
+        let segment = self.held.inputs[input].segment;
+        let (Some(pin), Some(line)) = (volume.table.pin(segment), volume.table.walk_block(segment, block)) else {
+            return Ok(0);
+        };
+        let length = line.entry.block_length().0 as usize;
+        if length > self.buffer.len() {
+            return Err(Error::from(ErrorKind::InvalidData));
+        }
+        pin.file.read_exact_at(line.entry.block_at(), &mut self.buffer[..length])?;
+        volume.held_drain_blocks.fetch_add(1, Ordering::Relaxed);
+        volume.held_drain_bytes.fetch_add(length as u64, Ordering::Relaxed);
+        // a block that no longer reads lands nothing, and its rows count again at its segment's next walk
+        let Some(mut walk) = RowBlockWalk::open_checked(&self.buffer[..length], pin.head.place_base) else {
+            return Ok(0);
+        };
+        let first = self.inputs.get(input).and_then(|merge_input| Some(merge_input.base + merge_input.block_first(block)?));
+        let replacement = self.state.read_point(volume);
+        let bits = self.held.block_bits(input, block);
+        let mut landed = 0;
+        while let Some(row) = walk.next_row(&mut self.key) {
+            let index = walk.row_index();
+            if bits.get(index / WORD_BITS).is_none_or(|word| word >> (index % WORD_BITS) & 1 == 0) {
+                continue;
+            }
+            let (segment, block) = if is_to_outputs {
+                let home = first.and_then(|first| self.row_home.get((first + index as u64) as usize)).copied().unwrap_or(NO_HOME);
+                // the merge dropped the row, so nothing it went to holds it
+                if home == NO_HOME {
+                    continue;
+                }
+                (self.home_outputs[(home >> HOME_BLOCK_BITS) as usize], home & ((1 << HOME_BLOCK_BITS) - 1))
+            } else {
+                (segment, block)
+            };
+            if self.drained.len() == self.drained.capacity() {
+                coalesce(&mut self.drained);
+            }
+            add_count(&mut self.drained, segment, line.column, block, &row, Some(replacement)).map_err(|_full| Error::from(ErrorKind::OutOfMemory))?;
+            landed += 1;
+        }
+        Ok(landed)
+    }
+
+    /// Land the bits on the inputs themselves, for a rewrite that gives way before its install: the inputs stay, and a row
+    /// the walk found dead in one counts there
+    pub fn drain_to_inputs(&mut self, volume: &Volume<Backend>) {
+        if !self.is_holding {
+            return;
+        }
+        if !self.held.is_closed {
+            let _claim = hold(&volume.claim_lock);
+            let mut held = hold(&volume.lanes[self.lane].held);
+            self.held = mem::take(&mut *held);
+            self.held.is_closed = true;
+            held.is_closed = true;
+        }
+        self.drained.clear();
+        self.drain_input = 0;
+        self.drain_block = 0;
+        while let Some((input, block)) = self.next_held_block() {
+            // a block that fails to read leaves its rows to count again at its segment's next walk
+            let _landed = self.land_held_block(volume, input, block, false);
+            self.drain_block = block + 1;
+        }
+        self.land_drained(volume);
+    }
+
+    /// Land the drain's counts on the summary and the table
+    pub fn land_drained(&mut self, volume: &Volume<Backend>) {
+        if self.drained.is_empty() {
+            return;
+        }
+        coalesce(&mut self.drained);
+        let mut rows = hold(&volume.summary);
+        let mut first = 0;
+        while let Some(count) = self.drained.get(first) {
+            let length = self.drained[first..].partition_point(|other| other.segment == count.segment);
+            rows.apply_counts(count.segment, &self.drained[first..first + length], None);
+            first += length;
+        }
+        drop(rows);
+        for count in self.drained.iter().filter(|count| count.rows > 0) {
+            volume.table.drop_live(count.segment, count.block, count.rows, count.replacement);
+        }
+        self.drained.clear();
+    }
+
+    /// Stop holding the inputs, once the install has retired them or the rewrite has given way, and bring a walk that waited
+    /// on them back to count again
+    pub fn release_hold(&mut self, volume: &Volume<Backend>) {
+        if !self.is_holding {
+            return;
+        }
+        let _claim = hold(&volume.claim_lock);
+        volume.lanes[self.lane].is_holding.store(false, Ordering::Release);
+        *hold(&volume.lanes[self.lane].held) = HeldBits::default();
+        volume.claims_changed.fetch_add(1, Ordering::AcqRel);
+        self.held = HeldBits::default();
+        self.is_holding = false;
+    }
+}
+
+/// Sort counts by segment and block and fold the ones of one block together
+pub fn coalesce(counts: &mut FixedList<DeadCount>) {
+    counts.sort_unstable_by_key(|count| (count.segment, count.block));
+    let mut kept = 0;
+    for index in 0..counts.len() {
+        let count = counts[index];
+        if kept > 0 && counts[kept - 1].segment == count.segment && counts[kept - 1].block == count.block {
+            let into = &mut counts[kept - 1];
+            into.rows += count.rows;
+            into.graves += count.graves;
+            into.bytes = ByteCount(into.bytes.0 + count.bytes.0);
+            into.kept_bytes = ByteCount(into.kept_bytes.0 + count.kept_bytes.0);
+            into.replacement = into.replacement.max(count.replacement);
+        } else {
+            counts[kept] = count;
+            kept += 1;
+        }
+    }
+    counts.truncate(kept);
 }

@@ -18,7 +18,8 @@ use reel_api::maintenance_report::{JobKind, PickKind, UnitKind};
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, WritePlace};
 
-use crate::config::MAX_KEY_BYTES;
+use crate::config::{MAX_KEY_BYTES, MOST_VOLUME_SLOTS};
+use crate::engine::held_bits::HeldRow;
 use crate::engine::cover_apply::{ApplyStep, CoverApply};
 use crate::engine::engine_state::EngineState;
 use crate::engine::planner::UnitStep;
@@ -38,7 +39,7 @@ use crate::row_kind::RowKind;
 use crate::segment::footer_writer::MOST_BLOCK_ROWS;
 use crate::segment::row_block::{FooterRow, ROW_BLOCK_BYTES, RowBlockWalk};
 use crate::segment::segment_table::{SegmentPin, WalkBlock};
-use crate::segment::segment_tail::SegmentNumber;
+use crate::segment::segment_tail::{MOST_MERGE_SEGMENTS, SegmentNumber};
 use crate::segment::summary::DeadCount;
 
 /// How long a walk waits after a failed read before it tries the block again
@@ -60,8 +61,23 @@ pub const SLOT_ASSIGNED: u8 = 1;
 pub const SLOT_COUNTED: u8 = 2;
 /// A walk slot holds a block its worker couldn't count
 pub const SLOT_FAILED: u8 = 3;
+/// The most inputs the rewrites can hold at once: eight for each lane, a seat a walk slot and the planner's
+pub const MOST_HOLDING: usize = (MOST_VOLUME_SLOTS + 1) * MOST_MERGE_SEGMENTS;
+/// A walk slot holds counts whose held rows a closed rewrite couldn't take, and its block counts again after the release
+pub const SLOT_CLAIMED: u8 = 5;
 /// A worker has taken a walk slot's block and is counting it
 pub const SLOT_COUNTING: u8 = 4;
+
+/// What a counted block's landing came to
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Landing {
+    /// The counts landed and the walk moved past the block
+    Landed,
+    /// A rewrite began or ended holding its inputs after the block was counted, so it counts again
+    Stale,
+    /// A held row's rewrite has begun to land its bits, so the block waits for the release and counts again then
+    Waiting,
+}
 
 /// The segment a walk is on
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -91,6 +107,9 @@ pub struct BlockCounts {
     pub overflowed: FixedList<SegmentNumber>,
     pub read_bytes: ByteCount,
     pub rows: u64,
+    pub held: FixedList<HeldRow>,
+    pub holding: FixedList<(SegmentNumber, u8)>,
+    pub claims_seen: u64,
 }
 
 impl BlockCounts {
@@ -102,6 +121,9 @@ impl BlockCounts {
             overflowed: FixedList::on_heap(MOST_BLOCK_FREES),
             read_bytes: ByteCount(0),
             rows: 0,
+            held: FixedList::on_heap(MOST_BLOCK_ROWS),
+            holding: FixedList::on_heap(MOST_HOLDING),
+            claims_seen: 0,
         }
     }
 
@@ -113,17 +135,22 @@ impl BlockCounts {
             overflowed: region.carve(MOST_BLOCK_FREES)?,
             read_bytes: ByteCount(0),
             rows: 0,
+            held: region.carve(rows + 1)?,
+            holding: region.carve(MOST_HOLDING)?,
+            claims_seen: 0,
         })
     }
 
     /// Count the region bytes room for a block of up to this many rows takes
     pub fn region_bytes(rows: usize) -> usize {
-        list_bytes::<DeadCount>(rows + 1) + list_bytes::<FreeRecord>(MOST_BLOCK_FREES) + list_bytes::<SegmentNumber>(MOST_BLOCK_FREES)
+        let held = list_bytes::<HeldRow>(rows + 1) + list_bytes::<(SegmentNumber, u8)>(MOST_HOLDING);
+        list_bytes::<DeadCount>(rows + 1) + list_bytes::<FreeRecord>(MOST_BLOCK_FREES) + list_bytes::<SegmentNumber>(MOST_BLOCK_FREES) + held
     }
 
     /// Give the lists back, and return the most bytes they wrote
     pub fn release(&mut self) -> usize {
-        let peak = self.counts.peak_bytes() + self.frees.peak_bytes() + self.overflowed.peak_bytes();
+        let held = self.held.peak_bytes() + self.holding.peak_bytes();
+        let peak = self.counts.peak_bytes() + self.frees.peak_bytes() + self.overflowed.peak_bytes() + held;
         *self = Self::default();
         peak
     }
@@ -141,6 +168,26 @@ impl BlockCounts {
         self.overflowed.clear();
         self.read_bytes = ByteCount(0);
         self.rows = 0;
+        self.held.clear();
+    }
+
+    /// Note which inputs the rewrites hold now, and the claims' count they were read at, before a block is counted
+    pub fn note_claims<Backend: Io>(&mut self, volume: &Volume<Backend>) {
+        self.claims_seen = volume.claims_changed.load(Ordering::Acquire);
+        self.holding.clear();
+        for (lane, rewrite) in volume.lanes.iter().enumerate() {
+            if !rewrite.is_holding.load(Ordering::Acquire) {
+                continue;
+            }
+            for input in hold(&rewrite.inputs).iter().filter(|input| input.0 != 0) {
+                let _pushed = self.holding.push_if_room((*input, lane as u8));
+            }
+        }
+    }
+
+    /// Find the lane whose rewrite holds a segment
+    pub fn holder(&self, segment: SegmentNumber) -> Option<u8> {
+        self.holding.iter().find(|(input, _lane)| *input == segment).map(|(_input, lane)| *lane)
     }
 
     /// Count a row dead, and note a large record so its blocks can go
@@ -232,6 +279,8 @@ pub struct WalkJob<Backend: Io> {
     waiting_frees: FixedList<FreeRecord>,
     next_handed_out: u32,
     failed_slot: Option<usize>,
+    waiting_on: Option<u64>,
+    claim_since: Option<Nanoseconds>,
     pub apply: CoverApply<Backend>,
     region: Option<Region>,
     block_rows: usize,
@@ -271,6 +320,7 @@ impl<Backend: Io> BlockCounter<Backend> {
     /// Count a target's next block into a list, and return the position past it
     pub fn count(&mut self, volume: &Volume<Backend>, target: WalkTarget, counts: &mut BlockCounts) -> Result<u32> {
         counts.clear();
+        counts.note_claims(volume);
 
         // a damaged segment answers for nothing, so its rows count nothing and the walk moves past it
         let pin = volume.table.pin(target.segment).filter(|_pin| !target.is_damaged);
@@ -404,7 +454,11 @@ impl<Backend: Io> BlockCounter<Backend> {
                 },
                 Some(found) if !target.is_backward && !is_covered(found.row.place) => {
                     if let Some(index) = volume.table.block_at(found.segment, found.block_offset) {
-                        counts.count_dead(found.segment, block.column, index, &found.row, row.place)?;
+                        // a row of an input a rewrite holds goes to its bits, which its drain lands where the row went
+                        match counts.holder(found.segment) {
+                            Some(lane) => counts.held.push(HeldRow { segment: found.segment, lane, block: index, at: found.at })?,
+                            None => counts.count_dead(found.segment, block.column, index, &found.row, row.place)?,
+                        }
                         self.state.mark_slot_stale(volume, block.column, &self.key, found.segment, found.block_offset);
                     }
                 },
@@ -429,6 +483,8 @@ impl<Backend: Io> WalkJob<Backend> {
             waiting_frees: FixedList::on_heap(MOST_BLOCK_FREES),
             next_handed_out: 0,
             failed_slot: None,
+            waiting_on: None,
+            claim_since: None,
             region: None,
             block_rows: 0,
             region_need: ByteCount(0),
@@ -565,20 +621,45 @@ impl<Backend: Io> WalkJob<Backend> {
         let started = state.io.now();
         let outcome = self.counter.count(volume, target, &mut counts);
         state.note_unit(UnitKind::WalkBlock, counts.rows, started);
-        let landed = outcome.and_then(|next_block| self.land(volume, target, next_block, &mut counts));
+        let landing = outcome.and_then(|next_block| self.land(volume, target, next_block, &mut counts));
         self.counts = counts;
-        landed
+        match landing? {
+            Landing::Landed => self.end_claim_wait(volume, state.io.now()),
+            // the next step counts the block again
+            Landing::Stale => {},
+            Landing::Waiting => self.note_claim_wait(volume, started),
+        }
+        Ok(())
     }
 
-    /// Land one block's counts and the new position under one hold. A count for a segment that left since goes nowhere, since
-    /// a segment number is never used twice
-    pub fn land(
-        &mut self,
-        volume: &Volume<Backend>,
-        target: WalkTarget,
-        next_block: u32,
-        counts: &mut BlockCounts,
-    ) -> Result<()> {
+    /// Land one block's counts and the new position under the claim lock, so no rewrite begins or ends holding in between.
+    /// A block counted before a rewrite began or ended holding counts again, and one whose held rows a closed rewrite can't
+    /// take waits for its release. Every held row's bit is set or none is, so a block that waits marks nothing
+    pub fn land(&mut self, volume: &Volume<Backend>, target: WalkTarget, next_block: u32, counts: &mut BlockCounts) -> Result<Landing> {
+        {
+            let _claim = hold(&volume.claim_lock);
+            if counts.claims_seen != volume.claims_changed.load(Ordering::Acquire) {
+                return Ok(Landing::Stale);
+            }
+            for row in counts.held.iter() {
+                if hold(&volume.lanes[usize::from(row.lane)].held).reserve(row).is_err() {
+                    return Ok(Landing::Waiting);
+                }
+            }
+            for row in counts.held.iter() {
+                hold(&volume.lanes[usize::from(row.lane)].held).mark(row);
+            }
+            self.apply_block(volume, target, next_block, counts);
+            // a free on a segment a rewrite has claimed would cut a record its copy still reads
+            counts.frees.retain(|free| !volume.is_taken(free.segment));
+        }
+        self.after_landing(volume, target, next_block, counts)?;
+        Ok(Landing::Landed)
+    }
+
+    /// Apply one block's counts and the new position to the summary and the table. A count for a segment that left since goes
+    /// nowhere, since a segment number is never used twice
+    pub fn apply_block(&mut self, volume: &Volume<Backend>, target: WalkTarget, next_block: u32, counts: &mut BlockCounts) {
         self.state.note_moved(JobKind::DeadByteWalk, counts.read_bytes);
         counts.counts.sort_unstable_by_key(|count| count.segment);
         let mut rows = hold(&volume.summary);
@@ -591,6 +672,16 @@ impl<Backend: Io> WalkJob<Backend> {
         for count in counts.counts.iter().filter(|count| count.rows > 0) {
             volume.table.drop_live(count.segment, count.block, count.rows, count.replacement);
         }
+    }
+
+    /// Free what a landed block's large dead records held, and move the walk on past the block
+    pub fn after_landing(
+        &mut self,
+        volume: &Volume<Backend>,
+        target: WalkTarget,
+        next_block: u32,
+        counts: &mut BlockCounts,
+    ) -> Result<()> {
         for segment in counts.overflowed.iter().filter(|_segment| volume.can_free_blocks) {
             volume.note_held_frees(*segment);
         }
@@ -709,7 +800,7 @@ impl<Backend: Io> WalkJob<Backend> {
         self.hand_out(volume, target);
         for (index, slot) in volume.walk_slots.iter().enumerate() {
             let phase = slot.phase.load(Ordering::Acquire);
-            if phase != SLOT_COUNTED && phase != SLOT_FAILED {
+            if phase != SLOT_COUNTED && phase != SLOT_FAILED && phase != SLOT_CLAIMED {
                 continue;
             }
             let mut work = hold(&slot.work);
@@ -727,13 +818,39 @@ impl<Backend: Io> WalkJob<Backend> {
                 return self.wait_for_retry(now);
             }
 
+            // a block that waits on a rewrite's release counts again once the claims change
+            if phase == SLOT_CLAIMED {
+                drop(work);
+                if self.waiting_on == Some(volume.claims_changed.load(Ordering::Acquire)) {
+                    return UnitStep::Idle;
+                }
+                self.end_claim_wait(volume, now);
+                assign(&self.state.workers, slot);
+                return UnitStep::Worked;
+            }
+
             let next_block = work.next_block;
-            let landed = self.land(volume, target, next_block, &mut work.counts);
+            let landing = self.land(volume, target, next_block, &mut work.counts);
             drop(work);
-            slot.phase.store(SLOT_FREE, Ordering::Release);
-            return match landed {
-                Ok(()) => UnitStep::Worked,
-                Err(_) => self.wait_for_retry(now),
+            return match landing {
+                Ok(Landing::Landed) => {
+                    slot.phase.store(SLOT_FREE, Ordering::Release);
+                    self.end_claim_wait(volume, now);
+                    UnitStep::Worked
+                },
+                Ok(Landing::Stale) => {
+                    assign(&self.state.workers, slot);
+                    UnitStep::Worked
+                },
+                Ok(Landing::Waiting) => {
+                    slot.phase.store(SLOT_CLAIMED, Ordering::Release);
+                    self.note_claim_wait(volume, now);
+                    UnitStep::Idle
+                },
+                Err(_) => {
+                    slot.phase.store(SLOT_FREE, Ordering::Release);
+                    self.wait_for_retry(now)
+                },
             };
         }
         UnitStep::Idle
@@ -771,9 +888,10 @@ impl<Backend: Io> WalkJob<Backend> {
         if self.target.is_none() && volume.is_walk_held.load(Ordering::Acquire) {
             return UnitStep::Idle;
         }
+        // the walk once stood aside here while any rewrite ran. A rewrite's held bits take the walk's charges on its inputs now,
+        // and the count stays for the figure the hold gave
         if self.target.is_none() && volume.is_rewriting() {
             volume.walks_held.fetch_add(1, Ordering::Relaxed);
-            return UnitStep::Idle;
         }
         if self.target.is_none() && !self.pick_target() {
             return UnitStep::Idle;
@@ -787,7 +905,12 @@ impl<Backend: Io> WalkJob<Backend> {
         if !volume.walk_slots.is_empty() && !target.is_damaged {
             return self.step_slots(volume, target, now);
         }
+        // a block that waits on a rewrite's release counts again once the claims change
+        if self.is_waiting(volume) {
+            return UnitStep::Idle;
+        }
         match self.walk_block(target) {
+            Ok(()) if self.is_waiting(volume) => UnitStep::Idle,
             Ok(()) => UnitStep::Worked,
             Err(_) => self.wait_for_retry(now),
         }
@@ -950,4 +1073,31 @@ pub fn add_count(
 /// Read the most rows one of a segment's blocks holds, or the most any block can when the fact is missing
 pub fn block_rows_bound(facts: &SegmentFacts) -> usize {
     if facts.most_block_rows > 0 { facts.most_block_rows as usize } else { MOST_BLOCK_ROWS }
+}
+
+impl<Backend: Io> WalkJob<Backend> {
+    /// Note the walk waits on a rewrite's release, counting a wait once however many steps it takes
+    pub fn note_claim_wait(&mut self, volume: &Volume<Backend>, now: Nanoseconds) {
+        self.waiting_on = Some(volume.claims_changed.load(Ordering::Acquire));
+        if self.claim_since.is_none() {
+            self.claim_since = Some(now);
+            volume.walk_claim_waits.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// End a wait on a release, and add the time it held the walk
+    pub fn end_claim_wait(&mut self, volume: &Volume<Backend>, now: Nanoseconds) {
+        self.waiting_on = None;
+        let Some(since) = self.claim_since.take() else {
+            return;
+        };
+        let held = now.0.saturating_sub(since.0);
+        volume.walk_claim_held.fetch_add(held, Ordering::Relaxed);
+        volume.walk_claim_longest.fetch_max(held, Ordering::Relaxed);
+    }
+
+    /// Check the walk waits on a release that hasn't come
+    pub fn is_waiting(&self, volume: &Volume<Backend>) -> bool {
+        self.waiting_on == Some(volume.claims_changed.load(Ordering::Acquire))
+    }
 }

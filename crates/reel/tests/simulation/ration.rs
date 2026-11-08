@@ -45,6 +45,7 @@ fn column(id: ColumnId, name: &str, volume: u8) -> ColumnConfig {
         codec: Codec::None,
         volume: VolumeId(volume),
         complete_rows: None,
+        least_value: None,
     }
 }
 

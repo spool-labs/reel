@@ -53,6 +53,7 @@ fn main() {
             codec: Codec::None,
             volume: VolumeId(0),
             complete_rows: None,
+            least_value: None,
         }],
     };
     let store = ReelStore::open(PlainIo::new(), &config).expect("open");

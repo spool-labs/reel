@@ -214,6 +214,7 @@ fn config(policy: SyncPolicy, complete_rows: Option<RowCount>) -> StoreConfig {
         codec: Codec::None,
         volume: VolumeId(volume),
         complete_rows,
+        least_value: None,
     };
     StoreConfig {
         memory_budget: BUDGET,

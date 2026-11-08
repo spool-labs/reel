@@ -1012,6 +1012,7 @@ pub fn build_state<Backend: Io>(
             codec: column.codec,
             volume: column.volume,
             is_complete: column.complete_rows.is_some(),
+            least_value: column.least_value.map_or(0, |bytes| bytes.0),
         });
         let found = scan.sealed.len();
         let room = (segments_per_shard * TABLE_SHARDS).max(found * 2);
@@ -1204,6 +1205,7 @@ pub fn build_state<Backend: Io>(
         longest_turn: AtomicU64::new(0),
         index_waits: AtomicU64::new(0),
         longest_index_wait: AtomicU64::new(0),
+        values_under_least: (0..MAX_COLUMNS).map(|_column| AtomicU64::new(0)).collect(),
         open_time: AtomicU64::new(0),
         prefault_time: AtomicU64::new(0),
         record_readers: Pool::new(record_readers),

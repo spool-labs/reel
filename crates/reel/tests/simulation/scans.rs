@@ -56,6 +56,7 @@ fn open(io: &SimulatedIo) -> Store {
         codec: Codec::None,
         volume: VolumeId(0),
         complete_rows: None,
+        least_value: None,
     };
     let config = StoreConfig {
         memory_budget: BUDGET,
@@ -835,6 +836,7 @@ fn lz4_config() -> StoreConfig {
             codec: Codec::Lz4,
             volume: VolumeId(0),
             complete_rows: None,
+            least_value: None,
         }],
     }
 }

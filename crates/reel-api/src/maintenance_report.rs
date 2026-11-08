@@ -102,12 +102,22 @@ pub struct CompleteReading {
     pub rows_past_capacity: RowCount,
 }
 
+/// How a column that declares a least value stands: the values written under it since open, which land as any other and size
+/// nothing
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LeastValueReading {
+    pub column: ColumnId,
+    pub least_value: ByteCount,
+    pub values_under_least: u64,
+}
+
 /// Every job, the reclaim counts and the readings a node roll stops on, in buffers the caller reuses
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaintenanceReport {
     pub jobs: [JobReport; JOB_KINDS.len()],
     pub volumes: Vec<VolumeReading>,
     pub complete_columns: Vec<CompleteReading>,
+    pub least_value_columns: Vec<LeastValueReading>,
     pub graves_at_open: RowCount,
     pub deletes_since_open: RowCount,
     pub graves_dropped: RowCount,
@@ -146,6 +156,7 @@ impl MaintenanceReport {
     pub fn clear(&mut self) {
         self.volumes.clear();
         self.complete_columns.clear();
+        self.least_value_columns.clear();
     }
 
     /// Start a report with one idle entry per kind of job
@@ -154,6 +165,7 @@ impl MaintenanceReport {
             jobs: JOB_KINDS.map(JobReport::new),
             volumes: Vec::new(),
             complete_columns: Vec::new(),
+            least_value_columns: Vec::new(),
             graves_at_open: RowCount::default(),
             deletes_since_open: RowCount::default(),
             graves_dropped: RowCount::default(),

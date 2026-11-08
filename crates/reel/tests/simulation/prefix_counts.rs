@@ -45,6 +45,7 @@ fn open(io: &SimulatedIo) -> Store {
         codec,
         volume: VolumeId(0),
         complete_rows: None,
+        least_value: None,
     };
     let config = StoreConfig {
         memory_budget: BUDGET,

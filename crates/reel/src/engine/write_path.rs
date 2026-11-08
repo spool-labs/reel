@@ -13,6 +13,7 @@ use reel_api::units::{ByteCount, DeathMark, FileOffset, Nanoseconds, RootId, Row
 
 use crate::config::SyncPolicy;
 use crate::engine::claim::Claim;
+use crate::engine::column_info::ColumnInfo;
 use crate::engine::ration::RATION_SPINS;
 use crate::engine::engine_sizing::{OPEN_PER_ROOT, SEAL_ROWS_EIGHTHS};
 use crate::engine::engine_state::{EngineState, IndexWait, SlotData, SlotPin};
@@ -112,6 +113,7 @@ impl<Backend: Io> EngineState<Backend> {
         self.check_key(column, key)?;
         let volume = &self.volumes[info.volume.0 as usize];
         check_value_size(volume, value)?;
+        self.note_value(column, &info, value);
         check_writable(volume)?;
         self.draw_ration(volume, RowCount(1))?;
 
@@ -572,6 +574,13 @@ impl<Backend: Io> EngineState<Backend> {
                     self.wait_for_index(column, start, slot)?;
                 },
             }
+        }
+    }
+
+    /// Count a value under the least its column declares. It lands as any other, and only leaves its volume's row floor high
+    pub fn note_value(&self, column: ColumnId, info: &ColumnInfo, value: &[u8]) {
+        if (value.len() as u64) < info.least_value {
+            self.values_under_least[column.0 as usize].fetch_add(1, Ordering::Relaxed);
         }
     }
 

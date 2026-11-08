@@ -6,6 +6,11 @@ use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, RowCount, VolumeId};
 
 use crate::record::codec::Codec;
+use crate::record::record_head::SMALL_HEAD_BYTES;
+use crate::segment::footer_writer::SMALLEST_ROW_BYTES;
+
+/// The fewest bytes a row with its record takes when its column declares no value: the smallest record and stored row
+pub const FORMAT_ROW_FLOOR: u64 = (SMALL_HEAD_BYTES + SMALLEST_ROW_BYTES) as u64;
 
 /// The memory budget when the caller doesn't set one
 pub const DEFAULT_MEMORY_BUDGET: ByteCount = ByteCount(512 * 1024 * 1024);
@@ -59,6 +64,8 @@ pub struct ColumnConfig {
     pub volume: VolumeId,
     /// The rows a complete table holds, for a column that declares one. A get on it reads no footers
     pub complete_rows: Option<RowCount>,
+    /// The fewest value bytes a record of this column holds, when it declares them, which raises its volume's row floor
+    pub least_value: Option<ByteCount>,
 }
 
 /// One volume
@@ -136,5 +143,13 @@ impl StoreConfig {
     pub fn widest_key(&self, volume: usize) -> usize {
         let columns = self.columns.iter().filter(|column| column.volume.0 as usize == volume);
         columns.map(|column| column.key_shape.widest()).max().unwrap_or(0)
+    }
+
+    /// Read the fewest bytes a row of a volume takes with its record: the smallest record and stored row, past the least value
+    /// its columns declare. A column that declares none brings the floor down to the format's own
+    pub fn row_floor(&self, volume: usize) -> u64 {
+        let columns = self.columns.iter().filter(|column| column.volume.0 as usize == volume);
+        let least = columns.map(|column| column.least_value.map_or(0, |bytes| bytes.0)).min().unwrap_or(0);
+        FORMAT_ROW_FLOOR + least
     }
 }

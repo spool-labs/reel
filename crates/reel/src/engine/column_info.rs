@@ -13,6 +13,7 @@ pub struct ColumnInfo {
     pub codec: Codec,
     pub volume: VolumeId,
     pub is_complete: bool,
+    pub least_value: u64,
 }
 
 impl ColumnInfo {

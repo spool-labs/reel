@@ -4,7 +4,7 @@ use std::io::Error;
 use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::{CompleteReading, JOB_KINDS, JobKind, JobState, MOST_REPORTED_LANES, MaintenanceReport, VolumeReading};
+use reel_api::maintenance_report::{CompleteReading, JOB_KINDS, JobKind, JobState, LeastValueReading, MOST_REPORTED_LANES, MaintenanceReport, VolumeReading};
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, Nanoseconds, RootId, RowCount, SegmentCount, VolumeId};
 use reel_api::usage::{ColumnRootUsage, ColumnUsage, RootUsage, UsageReport, VolumeUsage};
@@ -164,6 +164,15 @@ impl<Backend: Io> EngineState<Backend> {
                 longest_seal_steps: volume.seal_steps.reading(),
                 key_order_copies: volume.key_order_copies.load(Ordering::Acquire),
             });
+        }
+        for (id, info) in self.columns.iter().enumerate() {
+            if let Some(info) = info.filter(|info| info.least_value > 0) {
+                report.least_value_columns.push(LeastValueReading {
+                    column: ColumnId(id as u8),
+                    least_value: ByteCount(info.least_value),
+                    values_under_least: self.values_under_least[id].load(Ordering::Acquire),
+                });
+            }
         }
         for (id, info) in self.columns.iter().enumerate() {
             if info.is_some_and(|info| info.is_complete) {

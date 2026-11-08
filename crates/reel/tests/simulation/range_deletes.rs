@@ -57,6 +57,7 @@ fn config_at(budget: ByteCount) -> StoreConfig {
         codec: Codec::None,
         volume: VolumeId(0),
         complete_rows: None,
+        least_value: None,
     };
     StoreConfig {
         memory_budget: budget,

@@ -29,7 +29,9 @@ use reel::segment::footer_writer::FooterWriter;
 use reel::segment::segment_table::{RetiredSegment, shard_of};
 use reel::segment::segment_tail::{BlockCount, MOST_MERGE_SEGMENTS, SegmentNumber, TailHead};
 use reel_api::column_id::ColumnId;
+use reel_api::maintenance_report::MaintenanceReport;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RootId, VolumeId, WritePlace};
+use reel_api::write_batch::WriteBatch;
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_file::SimulatedFile;
@@ -58,6 +60,7 @@ const UNWALKED_CRASH_POINTS: u64 = 40;
 const UNWALKED_CRASH_STRIDE: u64 = 3;
 const SEAT_KEYS: u64 = 400;
 const WORKER_BUDGET: ByteCount = ByteCount(96 * 1024 * 1024);
+const LEAST_VALUE: u64 = 100;
 const HAND_OUT_LINE: Duration = Duration::from_millis(1);
 const PARK_WAIT: Duration = Duration::from_secs(10);
 
@@ -80,6 +83,7 @@ fn config() -> StoreConfig {
             codec: Codec::None,
             volume: VolumeId(0),
             complete_rows: None,
+            least_value: None,
         }],
     }
 }
@@ -2476,5 +2480,34 @@ fn seat_lock_is_held_for_a_swap() {
         let value: &[u8] = if number < SEAT_KEYS * 3 / 4 { b"second" } else { b"first" };
         assert_eq!(read(&store, &key(number)), Some(value.to_vec()));
     }
+    store.close().expect("close");
+}
+
+// a value under the least its column declares lands as any other and counts in the column's reading, from a put, an owned
+// put and a batch row alike
+#[test]
+fn value_under_the_least_lands_and_counts() {
+    let io = SimulatedIo::new(Seed(84));
+    let mut config = config();
+    config.columns[0].least_value = Some(ByteCount(LEAST_VALUE));
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let short = vec![1; LEAST_VALUE as usize - 1];
+    let whole = vec![2; LEAST_VALUE as usize];
+    store.put(COLUMN, b"put", &short).expect("put");
+    store.put_owned(COLUMN, b"owned", short.clone()).expect("put");
+    let mut batch = WriteBatch::new();
+    batch.put(COLUMN, b"batch", &short);
+    batch.put(COLUMN, b"whole", &whole);
+    store.write_batch(&batch).expect("batch");
+
+    let mut report = MaintenanceReport::new();
+    store.maintenance_report(&mut report);
+    let reading = report.least_value_columns.iter().find(|reading| reading.column == COLUMN).expect("a reading");
+    assert_eq!(reading.least_value, ByteCount(LEAST_VALUE));
+    assert_eq!(reading.values_under_least, 3, "a value under the least went uncounted, or one at it counted");
+    for key in [&b"put"[..], b"owned", b"batch"] {
+        assert_eq!(read(&store, key), Some(short.clone()));
+    }
+    assert_eq!(read(&store, b"whole"), Some(whole));
     store.close().expect("close");
 }

@@ -98,6 +98,7 @@ fn config(budget: ByteCount) -> StoreConfig {
                 codec: Codec::None,
                 volume: VolumeId(0),
                 complete_rows: None,
+                least_value: None,
             },
             ColumnConfig {
                 id: LONG_COLUMN,
@@ -106,6 +107,7 @@ fn config(budget: ByteCount) -> StoreConfig {
                 codec: Codec::None,
                 volume: VolumeId(0),
                 complete_rows: None,
+                least_value: None,
             },
         ],
     }

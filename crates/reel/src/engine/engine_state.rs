@@ -95,6 +95,7 @@ pub struct EngineState<Backend: Io> {
     pub longest_turn: AtomicU64,
     pub index_waits: AtomicU64,
     pub longest_index_wait: AtomicU64,
+    pub values_under_least: Vec<AtomicU64>,
     pub open_time: AtomicU64,
     pub prefault_time: AtomicU64,
     pub record_readers: Pool<RecordReader>,

@@ -78,6 +78,7 @@ fn config() -> StoreConfig {
         codec,
         volume: VolumeId(volume),
         complete_rows: None,
+        least_value: None,
     };
     StoreConfig {
         memory_budget: BUDGET,

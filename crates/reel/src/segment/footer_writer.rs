@@ -22,8 +22,10 @@ use crate::segment::segment_tail::{
     PlaceRange, SECOND_TAIL_DISTANCE, SegmentNumber, TAIL_FIXED_BYTES, TailCursor, TailHead, write_trailer,
 };
 
+/// Bytes the smallest row a block stores takes
+pub const SMALLEST_ROW_BYTES: usize = 4;
 /// Most rows a block of the smallest rows can hold
-pub const MOST_BLOCK_ROWS: usize = ROW_BLOCK_BYTES / 4;
+pub const MOST_BLOCK_ROWS: usize = ROW_BLOCK_BYTES / SMALLEST_ROW_BYTES;
 
 /// What the writer knows about a column before its first row
 #[derive(Clone, Copy, Debug)]

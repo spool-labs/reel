@@ -50,6 +50,7 @@ fn config_on(threads: ThreadCounts, device: DeviceClass) -> StoreConfig {
             codec: Codec::None,
             volume: VolumeId(0),
             complete_rows: None,
+            least_value: None,
         }],
     }
 }

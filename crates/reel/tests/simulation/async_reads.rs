@@ -53,6 +53,7 @@ fn open(io: &SimulatedIo) -> Store2 {
             codec: Codec::None,
             volume: VolumeId(0),
             complete_rows: None,
+            least_value: None,
         }],
     };
     ReelStore::open(io.clone(), &config).expect("open")

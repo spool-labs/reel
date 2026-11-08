@@ -125,6 +125,7 @@ impl<Backend: Io> EngineState<Backend> {
             match (value, end) {
                 (Some(value), _no_end) => {
                     check_value_size(&self.volumes[info.volume.0 as usize], value)?;
+                    self.note_value(column, &info, value);
                 },
                 (None, Some(end)) => {
                     self.check_key(column, end)?;

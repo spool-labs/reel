@@ -19,7 +19,7 @@ use crate::engine::recovery::{
     scan_roots,
     pass_open_rows, walk_rows,
 };
-use crate::engine::reel_store::{build_state, open_error, read_superblock, store_sizing};
+use crate::engine::reel_store::{build_state, open_error, read_superblock, store_sizing, volume_disks};
 use crate::engine::volume::Volume;
 use crate::guard::hold;
 use crate::io::Io;
@@ -46,7 +46,8 @@ pub fn load_read_only<Backend: Io>(io: &Backend, config: &StoreConfig) -> Result
 /// Build a view from one listing
 pub fn try_load<Backend: Io>(io: &Backend, config: &StoreConfig) -> Result<Arc<EngineState<Backend>>, StoreError> {
     let superblock = read_superblock(io, config)?;
-    let sizing = store_sizing(config, false)?;
+    let disks = volume_disks(io, config).map_err(open_error("reading a disk's size"))?;
+    let sizing = store_sizing(config, false, &disks)?;
     let roots: Vec<_> = config.volumes.iter().enumerate().map(|(index, volume)| (index, volume.roots.clone())).collect();
     let listings = list_roots(io, &roots).map_err(open_error("listing a root"))?;
     let mode = OpenMode::ReadOnly;
@@ -59,7 +60,7 @@ pub fn try_load<Backend: Io>(io: &Backend, config: &StoreConfig) -> Result<Arc<E
         },
     };
     let locks = config.volumes.iter().map(|_volume| Vec::new()).collect();
-    let mut state = build_state(io.clone(), config, &sizing, superblock, locks, &scan, summaries);
+    let mut state = build_state(io.clone(), config, &sizing, &disks, superblock, locks, &scan, summaries);
     state.is_read_only = true;
     let state = Arc::new(state);
     let outcome = bring_up_read_only(&state, &mut scan);

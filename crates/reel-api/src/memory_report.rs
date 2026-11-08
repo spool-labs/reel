@@ -42,6 +42,12 @@ pub struct MemoryReport {
     pub arena_segments_left_out: SegmentCount,
     /// Columns of those segments
     pub arena_columns_left_out: usize,
+    /// The line the plan keeps for the segment entries of volumes with a known disk size, apart from the table's share
+    pub entry_line: ByteCount,
+    /// The size of the distinct filesystems under those volumes' roots
+    pub disk_bytes: ByteCount,
+    /// The disk bytes the entries cover, short of the disks when the line met its cap, and seals stop past it
+    pub disk_covered: ByteCount,
 }
 
 impl MemoryReport {

@@ -19,6 +19,7 @@ use crate::record::record_head::SMALL_HEAD_BYTES;
 use crate::segment::damage_list::{MOST_DAMAGED_SPANS, SPAN_KEY_BYTES};
 use crate::segment::range_covers::{COVER_RECORD_BYTES, COVER_SLOT_BYTES, MOST_RANGE_COVERS};
 use crate::segment::row_block::{BLOCK_TRAILER_BYTES, COMPLETE_BLOCK_BYTES, ROW_ROOM_NUMBERS};
+use crate::segment::segment_table::TABLE_SHARDS;
 use crate::segment::segment_tail::MOST_SEGMENT_BYTES;
 
 /// A segment's target size on a store with a full budget, and a smaller budget targets half of itself
@@ -41,10 +42,18 @@ pub const BLOCK_CACHE_DIVISOR: u64 = 8;
 pub const SUMMARY_DIVISOR: u64 = 16;
 /// The segment tables and column directories get one part in this many of what the fixed parts and the room leave
 pub const TABLE_DIVISOR: u64 = 16;
-/// Bytes the table plans for a segment before its columns
-pub const PLANNED_SEGMENT_BYTES: u64 = 512;
-/// Bytes the table and directories plan for a column of a segment
-pub const PLANNED_COLUMN_BYTES: u64 = 576;
+/// Bytes a segment's entry plans for before its columns: its table entry, slot and pin, its places in the table's and the
+/// summary's number maps at their worst rounding, and the 16 B the planner's covered list holds for it
+pub const PLANNED_SEGMENT_BYTES: u64 = 280;
+/// Bytes a column of a segment plans for: its tail in the table, and an entry in each list of both its directories
+pub const PLANNED_COLUMN_BYTES: u64 = 952;
+/// Entries a volume plans for each segment its disks hold at the segment size, since small records seal smaller
+pub const ENTRY_MARGIN: u64 = 2;
+/// Entries a table shard holds at the least, whatever the disks
+pub const LEAST_SHARD_ENTRIES: usize = 8;
+/// The entries past each table's floor take at most one part in this many of what the budget has past its least. Past that the
+/// entries cover less than the disk, and a seal stops once the segments pass them
+pub const ENTRY_LINE_DIVISOR: u64 = 4;
 /// Bytes the table plans for a line of a block index
 pub const PLANNED_LINE_BYTES: u64 = 32;
 /// The least a budget has to leave after the fixed parts
@@ -121,6 +130,8 @@ pub struct StoreShape {
     pub widest_keys: u64,
     pub threads: ThreadCounts,
     pub has_ring: bool,
+    pub disk_entry_bytes: ByteCount,
+    pub floor_entry_bytes: ByteCount,
 }
 
 /// What a budget buys
@@ -137,6 +148,7 @@ pub struct EngineSizing {
     pub walk_workers: usize,
     pub least_budget: ByteCount,
     pub room: ByteCount,
+    pub entry_line: ByteCount,
 }
 
 impl StoreShape {
@@ -203,9 +215,15 @@ impl StoreShape {
         ByteCount(ROUNDING_ROOM + self.foreground_jobs() * JOB_ROOM_BYTES)
     }
 
-    /// Read the smallest budget this store can run in
+    /// Read the smallest budget this store can run in, with the least entries its disks' tables hold
     pub fn least_budget(&self) -> ByteCount {
-        ByteCount(self.fixed_bytes().0 + self.room().0 + LEAST_SHARED_BYTES.0)
+        ByteCount(self.fixed_bytes().0 + self.room().0 + self.floor_entry_bytes.0 + LEAST_SHARED_BYTES.0)
+    }
+
+    /// Read the entries line: what the disks ask for, up to the floor and a quarter of what the budget has past its least
+    pub fn entry_line(&self) -> ByteCount {
+        let cap = self.budget.0.saturating_sub(self.least_budget().0) / ENTRY_LINE_DIVISOR;
+        ByteCount(self.disk_entry_bytes.0.min(self.floor_entry_bytes.0 + cap))
     }
 }
 
@@ -214,8 +232,8 @@ impl EngineSizing {
     pub fn for_store(shape: &StoreShape) -> Self {
         let open_slots = shape.open_slots();
         let budget = shape.budget;
-        // the room comes out before the shares
-        let shared = budget.0.saturating_sub(shape.fixed_bytes().0 + shape.room().0);
+        // the room and the entries come out before the shares
+        let shared = budget.0.saturating_sub(shape.fixed_bytes().0 + shape.room().0 + shape.entry_line().0);
         let index_share = shared / WRITE_INDEX_DIVISOR;
         let rows_total = index_share / PLANNED_ROW_BYTES;
         let rows_per_shard = (rows_total / SHARD_COUNT as u64).max(64);
@@ -225,13 +243,8 @@ impl EngineSizing {
         let pages = ((rows_per_shard / page_rows + 1) * 2).max(least_pages);
         let nodes = (rows_per_shard / (NODE_FANOUT as u64 / 2) + 1) * 2 + 64;
 
-        let segment_bytes = if budget >= FULL_BUDGET {
-            SEGMENT_TARGET
-        } else {
-            ByteCount(budget.0 / 2)
-        };
         Self {
-            segment_bytes: ByteCount(segment_bytes.0.min(MOST_SEGMENT_BYTES.0 / 2)),
+            segment_bytes: segment_bytes_for(budget),
             segment_rows: RowCount(rows_total * SEAL_ROWS_EIGHTHS / 8),
             shard: ShardSizing {
                 pages: PageCount(pages as u32),
@@ -247,8 +260,44 @@ impl EngineSizing {
             walk_workers: shape.walk_workers(),
             least_budget: shape.least_budget(),
             room: shape.room(),
+            entry_line: shape.entry_line(),
         }
     }
+}
+
+/// Read the entries a volume's table plans for: the segments its disks hold at the segment size times the margin, in whole
+/// shards, or nothing for a volume with a disk of no known size
+pub fn disk_entries(disk: Option<ByteCount>, segment_bytes: ByteCount) -> Option<usize> {
+    let segments = disk?.0.div_ceil(segment_bytes.0.max(1)) * ENTRY_MARGIN;
+    Some((segments as usize).div_ceil(TABLE_SHARDS).max(LEAST_SHARD_ENTRIES) * TABLE_SHARDS)
+}
+
+/// Read the segment size a volume's entries plan at: the byte target, or a full segment's rows at the volume's row floor when
+/// those come to less
+pub fn assumed_segment_bytes(segment_bytes: ByteCount, segment_rows: RowCount, row_floor: u64) -> ByteCount {
+    ByteCount(segment_bytes.0.min(segment_rows.0.saturating_mul(row_floor)).max(1))
+}
+
+/// Read the bytes an entry plans for on a volume with some columns
+pub fn entry_cost(columns: usize) -> u64 {
+    PLANNED_SEGMENT_BYTES + columns.max(1) as u64 * PLANNED_COLUMN_BYTES
+}
+
+/// Read the entries every table holds, whatever its disk
+pub const fn floor_entries() -> usize {
+    LEAST_SHARD_ENTRIES * TABLE_SHARDS
+}
+
+/// Scale a volume's entries past the floor by the room past the floor over what the disks ask past it, in whole shards
+pub fn capped_entries(entries: usize, room: u64, asked: u64) -> usize {
+    let past = entries.saturating_sub(floor_entries()) as u128;
+    let scaled = (past * u128::from(room) / u128::from(asked.max(1))) as usize;
+    (floor_entries() + scaled) / TABLE_SHARDS * TABLE_SHARDS
+}
+
+/// Read the disk bytes a volume's entries cover: the segments they plan for at the segment size, up to the disk's size
+pub fn entry_cover(entries: usize, segment_bytes: ByteCount, disk: ByteCount) -> ByteCount {
+    ByteCount((entries as u64 / ENTRY_MARGIN).saturating_mul(segment_bytes.0).min(disk.0))
 }
 
 /// Work out how many rows a segment can take and still fit the row blocks a complete slot can address, for a column's widest
@@ -287,4 +336,10 @@ pub fn rows_per_second(rows: RowCount, elapsed: u64) -> u64 {
         return 0;
     }
     (u128::from(rows.0) * u128::from(SECOND) / u128::from(elapsed)) as u64
+}
+
+/// Read the bytes a budget sets a segment at: the target once the budget reaches the default, and half the budget below it
+pub fn segment_bytes_for(budget: ByteCount) -> ByteCount {
+    let bytes = if budget >= FULL_BUDGET { SEGMENT_TARGET } else { ByteCount(budget.0 / 2) };
+    ByteCount(bytes.0.min(MOST_SEGMENT_BYTES.0 / 2))
 }

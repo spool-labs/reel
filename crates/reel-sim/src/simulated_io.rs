@@ -10,7 +10,7 @@ use std::time::Instant;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, ProcessId};
 
 use reel::guard::hold;
-use reel::io::Io;
+use reel::io::{DiskSize, Io};
 use reel::io::job::{Job, JobStep};
 use reel::io::lock_outcome::LockOutcome;
 use crate::count_pause::CountPause;
@@ -484,6 +484,13 @@ impl Io for SimulatedIo {
         let mut disk = hold(&self.disk);
         disk.enter()?;
         Ok(disk.free_space(path))
+    }
+
+    fn capacity(&self, path: &Path) -> Result<Option<DiskSize>> {
+        let _pause = CountPause::new();
+        let mut disk = hold(&self.disk);
+        disk.enter()?;
+        Ok(disk.disk_size(path))
     }
 
     fn lock(&self, path: &Path) -> Result<LockOutcome<SimulatedLock>> {

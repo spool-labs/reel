@@ -45,6 +45,8 @@ pub enum StoreError {
     DamagePoolFull { volume: VolumeId },
     #[error("volume {volume:?} is below its free space reserve")]
     VolumeFull { volume: VolumeId },
+    #[error("volume {volume:?} has every table entry in use, so its seal waits for a rewrite to free one")]
+    TableFull { volume: VolumeId },
     #[error("volume {volume:?} refuses writes after a failed sync")]
     VolumeFailed { volume: VolumeId },
     #[error("root {root:?} is held by process {holder:?}")]

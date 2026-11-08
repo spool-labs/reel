@@ -24,13 +24,15 @@ fn head() -> TailHead {
         index_sum: Checksum(8),
         ranges_sum: Checksum(9),
         column_count: 2,
-        input_count: 1,
         is_output: true,
         is_partial: false,
         is_unwalked: false,
-        inputs: [SegmentNumber(5); MOST_MERGE_SEGMENTS],
         marks: MarkRange { lowest: DeathMark(40), highest: DeathMark(70) },
     }
+}
+
+fn inputs() -> TailInputs {
+    TailInputs::of(&[SegmentNumber(5)])
 }
 
 fn column(id: u8) -> ColumnTail {
@@ -51,7 +53,7 @@ fn column(id: u8) -> ColumnTail {
 fn built() -> Vec<u8> {
     let mut bytes = vec![0; MAX_TAIL_BYTES];
     let mut cursor = TailCursor::new(&mut bytes);
-    head().write(&mut cursor);
+    head().write(&inputs(), &mut cursor);
     column(1).write(&mut cursor);
     column(2).write(&mut cursor);
     let body = TAIL_FIXED_BYTES + 2 * COLUMN_TAIL_BYTES;
@@ -69,7 +71,7 @@ fn tail_round() {
     let tail = find_tail(&file, RECORD_KEY).expect("whole tail");
     let mut input = TailReader::new(tail);
 
-    assert_eq!(TailHead::read(&mut input), Some(head()));
+    assert_eq!(TailHead::read(&mut input), Some((head(), inputs())));
     assert_eq!(ColumnTail::read(&mut input), Some(column(1)));
     assert_eq!(ColumnTail::read(&mut input), Some(column(2)));
 }

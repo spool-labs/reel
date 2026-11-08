@@ -8,8 +8,12 @@ use std::fs;
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use reel::engine::reel_store::{ReelStore, ring_fits};
+use reel::engine::engine_sizing::{ENTRY_LINE_DIVISOR, floor_entries};
+use reel::engine::reel_store::{ReelStore, ring_fits, volume_disks};
+use reel::segment::segment_table::TABLE_SHARDS;
 use reel::io::plain::PlainIo;
+use reel_api::maintenance_report::MaintenanceReport;
+use reel_api::memory_report::MemoryReport;
 use reel_api::store_error::StoreError;
 use reel_api::units::ByteCount;
 
@@ -102,6 +106,7 @@ fn main() {
             println!("the pools' time at open is missing or past the open's");
             failures += 1;
         }
+        failures += check_entry_line(&store, &report, budget);
         store.close().expect("close");
         drop(store);
         fs::remove_dir_all(&root).expect("remove");
@@ -110,6 +115,24 @@ fn main() {
     if failures > 0 {
         process::exit(1);
     }
+}
+
+// the roots sit on a real disk, so the plan's entries line comes from it, inside its cap, the tables hold every entry it pays for
+// to within a shard's rounding, and the cover is no larger than the disk
+fn check_entry_line(store: &ReelStore<PlainIo>, report: &MemoryReport, budget: ByteCount) -> u32 {
+    let mut volumes = MaintenanceReport::new();
+    store.maintenance_report(&mut volumes);
+    let held: u64 = volumes.volumes.iter().map(|volume| (volume.entry_room.0 + TABLE_SHARDS as u64) * volume.entry_bytes.0).sum();
+    let segment = volumes.volumes.iter().map(|volume| volume.cover_segment_bytes.0).max().unwrap_or(0);
+    println!("entries line {} B covers {} B of a {} B disk at {segment} B a segment", report.entry_line.0, report.disk_covered.0, report.disk_bytes.0);
+    let floor: u64 = volumes.volumes.iter().map(|volume| floor_entries() as u64 * volume.entry_bytes.0).sum();
+    let cap = floor + budget.0.saturating_sub(report.least_budget.0) / ENTRY_LINE_DIVISOR;
+    let is_short = report.disk_bytes.0 == 0 || held < report.entry_line.0 || report.entry_line.0 > cap;
+    if is_short || report.disk_covered > report.disk_bytes {
+        println!("the entries line is missing, past its cap, past the tables, or covers more than the disk");
+        return 1;
+    }
+    0
 }
 
 // the default budget opens with the ring, and the report gives the least budget as a figure
@@ -121,8 +144,9 @@ fn check_default_cell() -> u32 {
     match ReelStore::open(PlainIo::new(), &config) {
         Ok(store) => {
             let report = store.memory_report();
-            println!("the default at {DEFAULT_CELL_MIB} MiB: ring fits {}, least {:?}", ring_fits(&config), report.least_budget);
-            failures += u32::from(!ring_fits(&config) || report.least_budget.0 == 0 || report.least_budget > budget);
+            let disks = volume_disks(&PlainIo::new(), &config).expect("disks");
+            println!("the default at {DEFAULT_CELL_MIB} MiB: ring fits {}, least {:?}", ring_fits(&config, &disks), report.least_budget);
+            failures += u32::from(!ring_fits(&config, &disks) || report.least_budget.0 == 0 || report.least_budget > budget);
             store.close().expect("close");
         },
         Err(error) => {

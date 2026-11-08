@@ -240,6 +240,7 @@ impl<File: Clone> SegmentTable<File> {
             total += guard.blocks.capacity() * size_of::<BlockEntry>();
             total += guard.free_slots.capacity() * size_of::<u32>();
             total += guard.map.slots.capacity() * (size_of::<u32>() + size_of::<SegmentNumber>());
+            total += self.pins[shard].capacity() * size_of::<AtomicU32>();
         }
         ByteCount(total as u64)
     }
@@ -280,6 +281,11 @@ impl<File: Clone> SegmentTable<File> {
         });
         guard.map.insert(head.segment, slot);
         true
+    }
+
+    /// Read how many segments the table has room for
+    pub fn capacity(&self) -> usize {
+        TABLE_SHARDS * self.read_shard(0).segments.len()
     }
 
     /// Count the segments in the table

@@ -41,7 +41,7 @@ use crate::segment::damage_list::{DamagedRange, highest_of, spans_of};
 use crate::segment::range_covers::{Cover, RangeCovers, read_covers};
 use crate::segment::footer_reader::FooterReader;
 use crate::segment::segment_table::{TABLE_SHARDS, TableSizing, shard_of};
-use crate::segment::segment_tail::{ColumnTail, SegmentNumber, TailHead, columns_fit};
+use crate::segment::segment_tail::{ColumnTail, SegmentNumber, TailHead, TailInputs, columns_fit};
 use crate::segment::summary::{
     ColumnFacts, LostRows, MOST_ROW_COLUMN_BYTES, MOST_ROW_FIXED_BYTES, SUMMARY_KEY_BYTES, SegmentFacts, SpanFacts,
     SummaryPaths,
@@ -70,6 +70,7 @@ pub struct FoundSealed<File> {
     pub path: PathBuf,
     pub file: File,
     pub head: TailHead,
+    pub inputs: TailInputs,
     pub columns: Vec<ColumnTail>,
     pub entries: Vec<BlockEntry>,
     pub has_rows: bool,
@@ -119,6 +120,7 @@ pub enum SegmentRead {
     /// Its tail and index read
     Sealed {
         head: TailHead,
+        inputs: TailInputs,
         columns: Vec<ColumnTail>,
         entries: Vec<BlockEntry>,
     },
@@ -345,7 +347,7 @@ pub fn remove_or_hold<Backend: Io>(io: &Backend, root: &Path, volume: usize, num
 /// A grave output whose inputs are still here belongs to a merge that never finished, and it goes instead
 pub fn drop_inputs<Backend: Io>(io: &Backend, scan: &mut RootScan<Backend::File>) {
     let is_final = |found: &&FoundSealed<Backend::File>| !found.head.is_partial;
-    let inputs: Vec<SegmentNumber> = scan.sealed.iter().filter(is_final).flat_map(|found| found.head.inputs()).copied().collect();
+    let inputs: Vec<SegmentNumber> = scan.sealed.iter().filter(is_final).flat_map(|found| found.inputs.inputs()).copied().collect();
     for input in inputs {
         if let Some(at) = scan.sealed.iter().position(|found| found.head.segment == input) {
             let found = scan.sealed.remove(at);
@@ -364,8 +366,9 @@ pub fn drop_inputs<Backend: Io>(io: &Backend, scan: &mut RootScan<Backend::File>
     let mut index = 0;
     while index < scan.sealed.len() {
         let head = &scan.sealed[index].head;
+        let inputs = scan.sealed[index].inputs.inputs();
         let is_held = |number: &SegmentNumber| scan.sealed.iter().any(|found| found.head.segment == *number);
-        if !head.is_partial || !head.inputs().iter().any(is_held) {
+        if !head.is_partial || !inputs.iter().any(is_held) {
             index += 1;
             continue;
         }
@@ -416,11 +419,12 @@ pub fn sort_segment<Backend: Io>(
     let segment = if is_stale { SegmentRead::Open } else { segment };
 
     match segment {
-        SegmentRead::Sealed { head, columns, entries } => scan.sealed.push(FoundSealed {
+        SegmentRead::Sealed { head, inputs, columns, entries } => scan.sealed.push(FoundSealed {
             volume: listing.volume,
             path: listing.path.clone(),
             file,
             head,
+            inputs,
             columns,
             entries,
             has_rows: opened.is_some(),
@@ -485,7 +489,7 @@ pub fn read_segment<File: IoFile>(
     if let Some(head) = reader.read_tail(file, record_key, &mut columns)? {
         let mut entries = Vec::new();
         if reader.read_index(file, &head, &mut entries)? && columns_fit(&columns, entries.len()) {
-            return Ok(SegmentRead::Sealed { head, columns, entries });
+            return Ok(SegmentRead::Sealed { head, inputs: reader.tail_inputs, columns, entries });
         }
         // open decides what its ranges are once it has read the summary
         return Ok(SegmentRead::Damaged {

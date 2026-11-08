@@ -613,6 +613,7 @@ impl<Backend: Io> EngineState<Backend> {
         if volume.ration.lets_through(self.rows_held(), rows, || self.io.now()) {
             return Ok(());
         }
+        check_seal_room(volume)?;
 
         let started = self.io.now();
         self.index_waits.fetch_add(1, Ordering::Relaxed);
@@ -743,6 +744,7 @@ impl<Backend: Io> EngineState<Backend> {
         self.index_waits.fetch_add(1, Ordering::Relaxed);
         let _waiting = IndexWait::new(&self.index_waiters);
         let deadline = self.io.now().0.saturating_add(INDEX_WAIT.0);
+        let own = &self.volumes[self.column(column)?.volume.0 as usize];
         loop {
             for volume in &self.volumes {
                 self.seal_fullest(volume);
@@ -751,6 +753,7 @@ impl<Backend: Io> EngineState<Backend> {
                 self.longest_index_wait.fetch_max(self.io.now().0.saturating_sub(started.0), Ordering::Relaxed);
                 return Ok(());
             }
+            check_seal_room(own)?;
             if self.io.now().0 > deadline {
                 return Err(StoreError::Io {
                     action: "waiting for the write index",
@@ -786,6 +789,7 @@ impl<Backend: Io> EngineState<Backend> {
             }
             if pick.must_wait {
                 drop(claims);
+                check_seal_room(volume)?;
                 self.io.pause();
                 continue;
             }
@@ -1629,6 +1633,14 @@ pub fn check_value_size<Backend: Io>(volume: &Volume<Backend>, value: &[u8]) -> 
 pub fn check_writable<Backend: Io>(volume: &Volume<Backend>) -> Result<(), StoreError> {
     if volume.has_failed() {
         return Err(StoreError::VolumeFailed { volume: volume.id });
+    }
+    Ok(())
+}
+
+/// Refuse a wait that only a seal could end while the volume's seal stands stopped on a full table
+pub fn check_seal_room<Backend: Io>(volume: &Volume<Backend>) -> Result<(), StoreError> {
+    if volume.is_seal_stuck.load(Ordering::Acquire) {
+        return Err(StoreError::TableFull { volume: volume.id });
     }
     Ok(())
 }

@@ -21,7 +21,7 @@ pub struct DirectoryEntry {
     pub shared_sum: Checksum,
     pub lowest: KeyPrefix,
     pub highest: KeyPrefix,
-    pub reach: KeyPrefix,
+    pub reach: i32,
     pub segment: SegmentNumber,
     pub newest_place: WritePlace,
 }
@@ -94,7 +94,7 @@ impl Listing {
                 shared_sum: column.shared_sum,
                 lowest: column.lowest,
                 highest: column.highest,
-                reach: column.highest,
+                reach: 0,
                 segment,
                 newest_place,
             },
@@ -279,7 +279,7 @@ pub fn empty_list(capacity: usize) -> DirectoryList {
         shared_sum: Checksum(0),
         lowest: KeyPrefix::default(),
         highest: KeyPrefix::default(),
-        reach: KeyPrefix::default(),
+        reach: 0,
         segment: SegmentNumber(0),
         newest_place: WritePlace(0),
     };
@@ -308,10 +308,10 @@ pub fn search_group(group: &[DirectoryEntry], key: KeyPrefix, fill: &mut PageFil
         return;
     }
 
-    // each entry's reach covers its half of the list, as in a balanced tree over the sorted run
+    // each entry's reach points at the highest key in its half of the list, as in a balanced tree over the sorted run
     let middle = group.len() / 2;
     let entry = &group[middle];
-    if entry.reach < key {
+    if group[middle.saturating_add_signed(entry.reach as isize)].highest < key {
         return;
     }
 
@@ -398,20 +398,23 @@ pub fn refresh_groups(list: &mut [DirectoryEntry]) {
     }
 }
 
-/// Give each entry the highest key in its half of the run, and return the run's highest
-pub fn refresh_reach(run: &mut [DirectoryEntry]) -> KeyPrefix {
+/// Point each entry at the entry with the highest key in its half of the run, as an offset from itself, and return the
+/// run's highest entry
+pub fn refresh_reach(run: &mut [DirectoryEntry]) -> Option<usize> {
     if run.is_empty() {
-        return KeyPrefix::default();
+        return None;
     }
-
     let middle = run.len() / 2;
-    let (left, rest) = run.split_at_mut(middle);
-    let Some((entry, right)) = rest.split_first_mut() else {
-        return KeyPrefix::default();
-    };
-    let reach = entry.highest.max(refresh_reach(left)).max(refresh_reach(right));
-    entry.reach = reach;
-    reach
+    let left = refresh_reach(&mut run[..middle]);
+    let right = refresh_reach(&mut run[middle + 1..]).map(|index| index + middle + 1);
+    let mut best = middle;
+    for side in [left, right].into_iter().flatten() {
+        if run[side].highest > run[best].highest {
+            best = side;
+        }
+    }
+    run[middle].reach = (best as isize - middle as isize) as i32;
+    Some(best)
 }
 
 /// Read one copy of the list

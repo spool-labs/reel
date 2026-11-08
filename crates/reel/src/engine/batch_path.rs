@@ -14,7 +14,7 @@ use crate::engine::claim::Claim;
 use crate::engine::engine_sizing::GROUP_BYTES;
 use crate::engine::engine_state::{EngineState, IndexWait};
 use crate::engine::volume::Volume;
-use crate::engine::write_path::{ClaimRequest, INDEX_WAIT, check_value_size, check_writable, store_error};
+use crate::engine::write_path::{ClaimRequest, INDEX_WAIT, check_seal_room, check_value_size, check_writable, store_error};
 use crate::guard::hold;
 use crate::index::key_hash::hash_key;
 use crate::index::open_slots::OpenSlot;
@@ -278,10 +278,12 @@ impl<Backend: Io> EngineState<Backend> {
         self.index_waits.fetch_add(1, Ordering::Relaxed);
         let _waiting = IndexWait::new(&self.index_waiters);
         let deadline = started.0.saturating_add(INDEX_WAIT.0);
+        let own = &self.volumes[plan.volume.0 as usize];
         loop {
             for volume in &self.volumes {
                 self.seal_fullest(volume);
             }
+            check_seal_room(own)?;
             if self.io.now().0 > deadline {
                 return Err(StoreError::Io {
                     action: "waiting for the write index",

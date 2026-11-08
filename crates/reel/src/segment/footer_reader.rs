@@ -18,7 +18,7 @@ use crate::segment::footer_writer::fold_sum;
 use crate::segment::row_block::{FooterRow, ROW_BLOCK_BYTES, RowBlockWalk};
 use crate::segment::segment_table::BlockWindow;
 use crate::segment::segment_tail::{
-    ColumnTail, MAX_TAIL_BYTES, SECOND_TAIL_DISTANCE, SegmentNumber, TailHead, TailReader, find_tail,
+    ColumnTail, MAX_TAIL_BYTES, SECOND_TAIL_DISTANCE, SegmentNumber, TailHead, TailInputs, TailReader, find_tail,
 };
 
 /// Segments one page of a directory search holds
@@ -95,6 +95,7 @@ pub struct FooterReader {
     key: Vec<u8>,
     pub candidates: Vec<Candidate>,
     pub found_block: u32,
+    pub tail_inputs: TailInputs,
     /// Segments the last directory walk asked
     pub asked: u64,
 }
@@ -109,6 +110,7 @@ impl FooterReader {
             key: touched_capacity(ROW_BLOCK_BYTES, 0),
             candidates: touched_capacity(CANDIDATE_PAGE, Candidate::default()),
             found_block: 0,
+            tail_inputs: TailInputs::default(),
             asked: 0,
         }
     }
@@ -156,9 +158,10 @@ impl FooterReader {
             return Ok(None);
         };
         let mut input = TailReader::new(tail);
-        let Some(head) = TailHead::read(&mut input) else {
+        let Some((head, inputs)) = TailHead::read(&mut input) else {
             return Ok(None);
         };
+        self.tail_inputs = inputs;
 
         columns.clear();
         for _column in 0..head.column_count {
@@ -481,6 +484,7 @@ impl HollowItem for FooterReader {
             key: Vec::new(),
             candidates: Vec::new(),
             found_block: 0,
+            tail_inputs: TailInputs::default(),
             asked: 0,
         }
     }

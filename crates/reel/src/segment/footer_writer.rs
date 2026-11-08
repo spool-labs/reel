@@ -18,8 +18,8 @@ use crate::segment::row_block::{
 };
 use crate::segment::summary::{ColumnFacts, SUMMARY_KEY_BYTES, put_bound, put_lowest};
 use crate::segment::segment_tail::{
-    BlockCount, COLUMN_TAIL_BYTES, COPY_GAP_BYTES, ColumnTail, MAX_COLUMNS, MAX_TAIL_BYTES, MOST_MERGE_SEGMENTS, MOST_SEGMENT_BYTES,
-    PlaceRange, SECOND_TAIL_DISTANCE, SegmentNumber, TAIL_FIXED_BYTES, TailCursor, TailHead, write_trailer,
+    BlockCount, COLUMN_TAIL_BYTES, COPY_GAP_BYTES, ColumnTail, MAX_COLUMNS, MAX_TAIL_BYTES, MOST_SEGMENT_BYTES,
+    PlaceRange, SECOND_TAIL_DISTANCE, SegmentNumber, TAIL_FIXED_BYTES, TailCursor, TailHead, TailInputs, write_trailer,
 };
 
 /// Bytes the smallest row a block stores takes
@@ -353,8 +353,6 @@ impl FooterWriter {
         // the footer must be whole before a tail can say so, or a power cut could keep the tail alone
         file.sync()?;
 
-        let mut listed = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
-        listed[..inputs.len()].copy_from_slice(inputs);
         let head = TailHead {
             segment,
             data_end,
@@ -368,14 +366,12 @@ impl FooterWriter {
             index_sum,
             ranges_sum: checksum(ranges),
             column_count: self.columns.len() as u32,
-            input_count: inputs.len() as u32,
             is_output: self.is_output,
             is_partial: self.is_partial,
             is_unwalked: self.is_unwalked,
-            inputs: listed,
             marks: self.marks,
         };
-        let total = self.write_tail(&head, record_key);
+        let total = self.write_tail(&head, &TailInputs::of(inputs), record_key);
         let second_tail_at = self.position;
         let second_end = second_tail_at.0 + total as u64;
         let file_length = ByteCount(second_end + SECOND_TAIL_DISTANCE);
@@ -411,9 +407,9 @@ impl FooterWriter {
     }
 
     /// Lay out the tail and return its length
-    pub fn write_tail(&mut self, head: &TailHead, record_key: RecordKey) -> usize {
+    pub fn write_tail(&mut self, head: &TailHead, inputs: &TailInputs, record_key: RecordKey) -> usize {
         let mut cursor = TailCursor::new(&mut self.tail);
-        head.write(&mut cursor);
+        head.write(inputs, &mut cursor);
         for column in &self.columns {
             column.write(&mut cursor);
         }

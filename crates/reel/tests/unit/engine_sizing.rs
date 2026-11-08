@@ -1,12 +1,23 @@
+use std::path::PathBuf;
+
+use reel::config::{ColumnConfig, DeviceClass, KeyShape, NO_WORKERS, StoreConfig, SyncPolicy, ThreadCounts, VolumeConfig};
 use reel::engine::engine_sizing::*;
+use reel::engine::reel_store::{planned_table, store_sizing, volume_entries};
 use reel::engine::seal_job::MOST_SEGMENT_BLOCKS;
 use reel::index::open_slots::MAX_OPEN_SLOTS;
+use reel::io::plain_file::PlainFile;
+use reel::record::codec::Codec;
 use reel::row_kind::RowKind;
+use reel::segment::column_directory::ColumnDirectory;
 use reel::segment::row_block::{COMPLETE_BLOCK_BYTES, FooterRow, RowBlockBuilder};
-use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
+use reel::segment::segment_table::{NumberMap, SegmentTable, TABLE_SHARDS, TableSizing};
+use reel_api::column_id::ColumnId;
+use reel_api::units::{ByteCount, FileOffset, RowCount, VolumeId, WritePlace};
 
 const ROWS_PER_BLOCK: u64 = 1_400;
 const MOST_ROW_BYTES: u64 = 1_024;
+const BOX_DISK_BYTES: u64 = 241_566_183_424;
+const BOX_CHURN_SEGMENTS: usize = 421;
 
 // the default budget gets near-gigabyte segments, and a small one scales down
 #[test]
@@ -30,6 +41,8 @@ fn shape(budget: ByteCount, roots: usize) -> StoreShape {
         widest_keys: 64,
         threads: reel::config::NO_WORKERS,
         has_ring: false,
+        disk_entry_bytes: ByteCount(0),
+        floor_entry_bytes: ByteCount(0),
     }
 }
 
@@ -55,6 +68,8 @@ fn documented_rows() {
             widest_keys: 64,
             threads: reel::config::NO_WORKERS,
             has_ring: false,
+            disk_entry_bytes: ByteCount(0),
+            floor_entry_bytes: ByteCount(0),
         };
 
         assert_eq!(EngineSizing::for_store(&store).segment_rows, RowCount(rows), "{mib} MiB");
@@ -72,6 +87,8 @@ fn summary_holds_blocks() {
         widest_keys: 64,
         threads: reel::config::NO_WORKERS,
         has_ring: false,
+        disk_entry_bytes: ByteCount(0),
+        floor_entry_bytes: ByteCount(0),
     };
     let rows_room = EngineSizing::for_store(&store).summary_share.0 / 2;
     let blocks = 1_000_000_000 / ROWS_PER_BLOCK;
@@ -92,6 +109,8 @@ fn documented_reserve() {
             widest_keys: 64,
             threads: reel::config::NO_WORKERS,
             has_ring: false,
+            disk_entry_bytes: ByteCount(0),
+            floor_entry_bytes: ByteCount(0),
         };
 
         let segment = EngineSizing::for_store(&store).segment_bytes;
@@ -173,4 +192,85 @@ fn seal_point_from_rates() {
 fn rates() {
     assert_eq!(rows_per_second(RowCount(500), SECOND / 2), 1_000);
     assert_eq!(rows_per_second(RowCount(500), 0), 0);
+}
+
+// a planned entry covers what the table, both directories of each column, the summary's lookup and the covered list hold for a
+// segment
+#[test]
+fn planned_entries_cover_the_heap() {
+    for columns in [1, 2, 4] {
+        for per_shard in [8, 100, 1_700, 1_848] {
+            let segments = per_shard * TABLE_SHARDS;
+            let sizing = TableSizing { segments_per_shard: per_shard, columns_per_shard: per_shard * columns, blocks_per_shard: 0 };
+            let table: SegmentTable<PlainFile> = SegmentTable::new(&sizing);
+            let directories = 2 * columns as u64 * ColumnDirectory::new(segments).heap_bytes().0;
+            let lookup = NumberMap::new(segments).heap_bytes() as u64;
+            let covered = (2 * segments * size_of::<u64>()) as u64;
+            let held = table.heap_bytes().0 + directories + lookup + covered;
+
+            assert!(held <= segments as u64 * entry_cost(columns), "{columns} columns at {per_shard} a shard hold {held} B");
+        }
+    }
+}
+
+// a disk sets a volume's entries at twice the segments it holds in whole shards. The least budget rises by the tables' floor
+// alone, the line comes out of the shares, and a small budget caps the line at a quarter of what it has past its least
+#[test]
+fn disk_sets_the_entries() {
+    let hz02 = ByteCount(3_875_398_791 * 4_096);
+    let bare = shape(FULL_BUDGET, 1);
+    let asked = ByteCount(29_568 * entry_cost(2));
+    let floor = ByteCount(floor_entries() as u64 * entry_cost(2));
+    let disked = StoreShape { disk_entry_bytes: asked, floor_entry_bytes: floor, ..bare };
+    let small = StoreShape { budget: ByteCount(128 * 1024 * 1024), ..disked };
+    let small_cap = (small.budget.0 - small.least_budget().0) / ENTRY_LINE_DIVISOR;
+
+    assert_eq!(disk_entries(Some(hz02), SEGMENT_TARGET), Some(29_568));
+    assert_eq!(disk_entries(None, SEGMENT_TARGET), None);
+    assert_eq!(disk_entries(Some(ByteCount(1)), SEGMENT_TARGET), Some(floor_entries()));
+    assert_eq!(asked, ByteCount(64_576_512));
+    assert_eq!(disked.least_budget().0, bare.least_budget().0 + floor.0);
+    assert_eq!(disked.entry_line(), asked);
+    assert!(EngineSizing::for_store(&disked).table_share < EngineSizing::for_store(&bare).table_share);
+    assert_eq!(small.entry_line(), ByteCount(floor.0 + small_cap));
+    assert!(small.entry_line() < asked);
+}
+
+// a capped volume keeps its floor and its part of the room past it in whole shards, and its cover stops at the segments its
+// entries plan for or the disk, whichever is smaller
+#[test]
+fn capped_entries_and_cover() {
+    let segment = ByteCount(64 * 1024 * 1024);
+
+    assert_eq!(capped_entries(29_648, 1_000, 4_000), 7_504);
+    assert_eq!(capped_entries(200, 0, 4_000), floor_entries());
+    assert_eq!(entry_cover(7_504, segment, ByteCount(1 << 40)), ByteCount(3_752 * segment.0));
+    assert_eq!(entry_cover(7_504, segment, ByteCount(1 << 30)), ByteCount(1 << 30));
+}
+
+// the box's churn at 512 MiB on its 241 GB disk held 421 segments at its most, runs and row-limit seals far under the byte
+// target, so every shard has room for all of them and the churn can never fill one and stop a seal
+#[test]
+fn box_churn_fits_the_table() {
+    let column = |id: u8, name: &str, codec: Codec| ColumnConfig {
+        id: ColumnId(id),
+        name: name.to_string(),
+        key_shape: KeyShape::Variable { most: 64 },
+        codec,
+        volume: VolumeId(0),
+        complete_rows: None,
+        least_value: None,
+    };
+    let config = StoreConfig {
+        memory_budget: FULL_BUDGET,
+        threads: ThreadCounts { maintenance_workers: Some(2), ..NO_WORKERS },
+        volumes: vec![VolumeConfig { name: "smoke".to_string(), roots: vec![PathBuf::from("/box")], sync: SyncPolicy::Never, device: DeviceClass::default() }],
+        columns: vec![column(1, "meta", Codec::None), column(2, "bulk", Codec::Lz4)],
+    };
+    let disks = [Some(ByteCount(BOX_DISK_BYTES))];
+    let sizing = store_sizing(&config, true, &disks).expect("sizing");
+    let entries = volume_entries(&config, &disks, sizing.segment_rows, sizing.entry_line);
+    let table = planned_table(&config, entries[0], 0, sizing.table_share.0);
+
+    assert!(table.segments_per_shard >= BOX_CHURN_SEGMENTS, "{} entries a shard", table.segments_per_shard);
 }

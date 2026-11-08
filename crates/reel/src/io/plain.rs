@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, ProcessId};
 
-use crate::io::{Io, IoFile};
+use crate::io::{DiskSize, Io, IoFile};
 use crate::io::job::Job;
 use crate::io::lock_outcome::LockOutcome;
 use crate::io::plain_file::{PlainFile, reserve_space};
@@ -173,19 +173,14 @@ impl Io for PlainIo {
     }
 
     fn free_space(&self, path: &Path) -> Result<ByteCount> {
-        let directory = File::open(path)?;
-        let mut stats = MaybeUninit::<libc::statvfs>::zeroed();
-        // SAFETY: the descriptor is open and the pointer is valid for the call
-        let status = unsafe { libc::fstatvfs(directory.as_raw_fd(), stats.as_mut_ptr()) };
-        if status != 0 {
-            return Err(Error::last_os_error());
-        }
+        let stats = disk_stats(path)?;
+        Ok(ByteCount(widen(stats.f_bavail).saturating_mul(widen(stats.f_frsize))))
+    }
 
-        // SAFETY: fstatvfs filled the struct, and every field is a plain integer
-        let stats = unsafe { stats.assume_init() };
-        let blocks = widen(stats.f_bavail);
-        let block_size = widen(stats.f_frsize);
-        Ok(ByteCount(blocks.saturating_mul(block_size)))
+    fn capacity(&self, path: &Path) -> Result<Option<DiskSize>> {
+        let stats = disk_stats(path)?;
+        let bytes = ByteCount(widen(stats.f_blocks).saturating_mul(widen(stats.f_frsize)));
+        Ok(Some(DiskSize { filesystem: widen(stats.f_fsid), bytes }))
     }
 
     fn lock(&self, path: &Path) -> Result<LockOutcome<PlainLock>> {
@@ -277,6 +272,19 @@ pub fn parse_holder(buf: &[u8]) -> Result<ProcessId> {
 /// Widen a field whose width differs between platforms
 pub fn widen<Field: Into<u64>>(field: Field) -> u64 {
     field.into()
+}
+
+/// Read the filesystem stats of the disk under a directory
+pub fn disk_stats(path: &Path) -> Result<libc::statvfs> {
+    let directory = File::open(path)?;
+    let mut stats = MaybeUninit::<libc::statvfs>::zeroed();
+    // SAFETY: the descriptor is open and the pointer is valid for the call
+    let status = unsafe { libc::fstatvfs(directory.as_raw_fd(), stats.as_mut_ptr()) };
+    if status != 0 {
+        return Err(Error::last_os_error());
+    }
+    // SAFETY: fstatvfs filled the struct, and every field is a plain integer
+    Ok(unsafe { stats.assume_init() })
 }
 
 /// Say whether any disk under a path spins, following a stacked device down to its slaves

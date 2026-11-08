@@ -555,6 +555,9 @@ impl<Backend: Io> EngineState<Backend> {
             is_arena_full: self.is_arena_full.load(Ordering::Acquire),
             arena_segments_left_out,
             arena_columns_left_out,
+            entry_line: self.sizing.entry_line,
+            disk_bytes: ByteCount(self.volumes.iter().filter_map(|volume| volume.disk_bytes).map(|bytes| bytes.0).sum()),
+            disk_covered: ByteCount(self.volumes.iter().map(|volume| volume.disk_covered.0).sum()),
             ..MemoryReport::default()
         };
         for directory in self.directories.iter().flatten() {

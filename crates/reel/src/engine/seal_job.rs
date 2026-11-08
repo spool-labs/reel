@@ -212,7 +212,9 @@ impl<Backend: Io> SealJob<Backend> {
 
     /// Say the seal needs a reclaim's room, and bring the planner back, which would otherwise stand aside for this seal
     pub fn note_stuck(&self) {
-        self.volume().is_seal_stuck.store(true, Ordering::Release);
+        if !self.volume().is_seal_stuck.swap(true, Ordering::AcqRel) {
+            self.volume().seal_stops.fetch_add(1, Ordering::Relaxed);
+        }
         if let Some(task) = self.state.planner_task.get() {
             task.wake();
         }

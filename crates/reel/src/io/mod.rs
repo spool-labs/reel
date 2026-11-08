@@ -258,6 +258,15 @@ pub trait IoTask: Send + Sync {
     fn stop(&self) -> Result<()>;
 }
 
+/// The size of the disk under a path, and the filesystem it belongs to
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DiskSize {
+    /// The filesystem's id, the same for every path on it
+    pub filesystem: u64,
+    /// The bytes the filesystem holds in all, free or used
+    pub bytes: ByteCount,
+}
+
 /// Every way the engine touches the outside world
 pub trait Io: Clone + Send + Sync + 'static {
     /// An open file
@@ -304,6 +313,9 @@ pub trait Io: Clone + Send + Sync + 'static {
 
     /// Read how many bytes the disk under a directory can still take
     fn free_space(&self, path: &Path) -> Result<ByteCount>;
+
+    /// Read the size of the disk under a directory and its filesystem, or nothing when the disk has no set size
+    fn capacity(&self, path: &Path) -> Result<Option<DiskSize>>;
 
     /// Say whether any disk under a path spins, or nothing when this backend can't tell
     fn is_rotational(&self, path: &Path) -> Option<bool>;

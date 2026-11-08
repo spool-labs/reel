@@ -88,6 +88,72 @@ pub struct VolumeReading {
     pub longest_seal_steps: SealSteps,
     /// Record rewrites that copied in key order, reading records at random
     pub key_order_copies: u64,
+    /// Segments the table holds now
+    pub entries_used: SegmentCount,
+    /// Segments the table has room for, which the disk sets when its size is known
+    pub entry_room: SegmentCount,
+    /// The segment size the entries' cover assumes: the byte target, or a full segment's rows at the row floor when that is less
+    pub cover_segment_bytes: ByteCount,
+    /// The disk bytes the table's room holds at the mean size of the segments it holds now, the real headroom beside the cover
+    pub cover_at_mean: ByteCount,
+    /// Bytes each entry plans for, by the volume's columns
+    pub entry_bytes: ByteCount,
+    /// Times a seal stopped on a full table or directory, once for each stop until a seal lands again
+    pub seal_stops: u64,
+    /// Looks for rewrite work, by what each came to, in the order of `PickOutcome`
+    pub picks: [u64; PICK_OUTCOMES],
+    /// What finished rewrites took off the disk and wrote back
+    pub rewrite_bytes: RewriteBytes,
+    /// Walk blocks whose counts landed
+    pub walk_blocks: u64,
+}
+
+/// What a rewrite lane's look for work came to. The overlap misses count beside the look's own outcome
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PickOutcome {
+    /// The volume could start no rewrite: one runs on a spinning disk, outputs are stray, or the park is full
+    Refused,
+    /// A segment whose rows need a rebuild
+    Rebuild,
+    /// An overlap merge at a key past the bound
+    Overlap,
+    /// No key past the bound among the segments a merge can take
+    OverlapMiss,
+    /// A key past the bound with one segment there a merge can take
+    OverlapLone,
+    /// A walk target stands, so only an overlap merge could start
+    WalkTarget,
+    /// A segment a full cover pool forced
+    Forced,
+    /// A record rewrite of the segments that win back the most
+    Record,
+    /// Nothing was ready
+    Nothing,
+}
+
+/// Outcomes a look for rewrite work can come to
+pub const PICK_OUTCOMES: usize = 9;
+
+impl PickOutcome {
+    /// Read this outcome's place in a reading
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// What finished rewrites took off the disk and wrote back
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RewriteBytes {
+    /// File bytes of the inputs that left the disk
+    pub inputs_gone: ByteCount,
+    /// File bytes of the outputs
+    pub written: ByteCount,
+    /// Dead bytes the inputs that left held
+    pub dead_gone: ByteCount,
+    /// Dead bytes the outputs carry
+    pub dead_kept: ByteCount,
+    /// Rewrites that wrote at least the bytes their leaving inputs held
+    pub unreclaimed: u64,
 }
 
 /// Lanes a volume reading has room for. Workers past this show in the last one

@@ -86,12 +86,31 @@ pub struct TailHead {
     pub index_sum: Checksum,
     pub ranges_sum: Checksum,
     pub column_count: u32,
-    pub input_count: u32,
     pub is_output: bool,
     pub is_partial: bool,
     pub is_unwalked: bool,
-    pub inputs: [SegmentNumber; MOST_MERGE_SEGMENTS],
     pub marks: MarkRange,
+}
+
+/// The segments a merge output replaced, which its tail lists beside the head. Only open reads them, so the table keeps none
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TailInputs {
+    pub count: u32,
+    pub numbers: [SegmentNumber; MOST_MERGE_SEGMENTS],
+}
+
+impl TailInputs {
+    /// List some inputs
+    pub fn of(inputs: &[SegmentNumber]) -> Self {
+        let mut numbers = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
+        numbers[..inputs.len()].copy_from_slice(inputs);
+        Self { count: inputs.len() as u32, numbers }
+    }
+
+    /// Read the segments this one replaced
+    pub fn inputs(&self) -> &[SegmentNumber] {
+        self.numbers.get(..self.count as usize).unwrap_or_default()
+    }
 }
 
 /// Writes the fixed fields of a tail in order
@@ -164,8 +183,8 @@ impl<'bytes> TailReader<'bytes> {
 }
 
 impl TailHead {
-    /// Write the fixed fields
-    pub fn write(&self, out: &mut TailCursor) {
+    /// Write the fixed fields, with the inputs in their place among them
+    pub fn write(&self, inputs: &TailInputs, out: &mut TailCursor) {
         out.put(&self.segment.0.to_le_bytes());
         out.put(&self.data_end.0.to_le_bytes());
         out.put(&self.index_at.0.to_le_bytes());
@@ -182,21 +201,16 @@ impl TailHead {
         let bit = if self.is_output { OUTPUT_BIT } else { 0 };
         let partial_bit = if self.is_partial { PARTIAL_BIT } else { 0 };
         let unwalked_bit = if self.is_unwalked { UNWALKED_BIT } else { 0 };
-        out.put(&(self.input_count | bit | partial_bit | unwalked_bit).to_le_bytes());
-        for input in &self.inputs {
+        out.put(&(inputs.count | bit | partial_bit | unwalked_bit).to_le_bytes());
+        for input in &inputs.numbers {
             out.put(&input.0.to_le_bytes());
         }
         out.put(&self.marks.lowest.0.to_le_bytes());
         out.put(&self.marks.highest.0.to_le_bytes());
     }
 
-    /// Read the segments this one replaced
-    pub fn inputs(&self) -> &[SegmentNumber] {
-        self.inputs.get(..self.input_count as usize).unwrap_or_default()
-    }
-
-    /// Read the fixed fields back
-    pub fn read(input: &mut TailReader) -> Option<Self> {
+    /// Read the fixed fields back, and the inputs among them
+    pub fn read(input: &mut TailReader) -> Option<(Self, TailInputs)> {
         let mut head = Self {
             segment: SegmentNumber(input.word()?),
             data_end: FileOffset(input.word()?),
@@ -213,26 +227,25 @@ impl TailHead {
             index_sum: Checksum(input.word()?),
             ranges_sum: Checksum(input.word()?),
             column_count: input.half()?,
-            input_count: 0,
             is_output: false,
             is_partial: false,
             is_unwalked: false,
-            inputs: [SegmentNumber(0); MOST_MERGE_SEGMENTS],
             marks: MarkRange::NONE,
         };
+        let mut inputs = TailInputs::default();
         let listed = input.half()?;
-        head.input_count = listed & !(OUTPUT_BIT | PARTIAL_BIT | UNWALKED_BIT);
+        inputs.count = listed & !(OUTPUT_BIT | PARTIAL_BIT | UNWALKED_BIT);
         head.is_output = listed & OUTPUT_BIT != 0;
         head.is_partial = listed & PARTIAL_BIT != 0;
         head.is_unwalked = listed & UNWALKED_BIT != 0;
-        for segment in &mut head.inputs {
+        for segment in &mut inputs.numbers {
             *segment = SegmentNumber(input.word()?);
         }
         head.marks = MarkRange {
             lowest: DeathMark(input.word()?),
             highest: DeathMark(input.word()?),
         };
-        Some(head)
+        Some((head, inputs))
     }
 }
 

@@ -16,7 +16,7 @@ fn entry(number: u64, lowest: &[u8], highest: &[u8]) -> Listing {
             shared_sum: checksum(&lowest[..shared]),
             lowest: KeyPrefix::of_key(lowest, shared),
             highest: KeyPrefix::of_key(highest, shared),
-            reach: KeyPrefix::default(),
+            reach: 0,
             segment: SegmentNumber(number),
             newest_place: WritePlace(number),
         },

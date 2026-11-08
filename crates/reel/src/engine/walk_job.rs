@@ -471,6 +471,7 @@ impl<Backend: Io> WalkJob<Backend> {
             rows.note_forward(target.segment);
         }
         drop(rows);
+        volume.walk_blocks.fetch_add(1, Ordering::Relaxed);
         for count in counts.counts.iter().filter(|count| count.rows > 0) {
             volume.table.drop_live(count.segment, count.block, count.rows, count.replacement);
         }

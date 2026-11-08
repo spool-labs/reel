@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::JobKind;
+use reel_api::maintenance_report::{JobKind, PickOutcome};
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, DeathMark, FileOffset, RootId, RowCount, WritePlace};
 
@@ -24,7 +24,7 @@ use crate::engine::read_path::SealedRow;
 use crate::engine::recovery::save_cleared_spans;
 use crate::engine::open_segment::{data_path, output_path};
 use crate::engine::seal_job::MOST_SEGMENT_BLOCKS;
-use crate::engine::volume::{GRAVE_SLOT, GaveUp, MOST_MERGE_OUTPUTS, NO_SEAL, OutputSlots, RewriteOutput, Volume};
+use crate::engine::volume::{GRAVE_SLOT, GaveUp, MOST_MERGE_OUTPUTS, NO_SEAL, OutputSlots, RewriteOutput, RowBytes, Volume};
 use crate::engine::walk_job::add_count;
 use crate::guard::hold;
 use crate::lifetime::MarkRange;
@@ -456,14 +456,9 @@ impl<Backend: Io> RewriteJob<Backend> {
 
     /// Pick the inputs: a run of segments over the overlap bound first, since that comes ahead of the walk, then ready segments
     pub fn pick(&mut self, volume: &Volume<Backend>) -> Option<(MergeTarget, bool)> {
-        if !volume.can_start_rewrite() {
-            return None;
-        }
-        if volume.stray_outputs.load(Ordering::Acquire) > 0 {
-            return None;
-        }
         let room = volume.park_room().min(MOST_MERGE_SEGMENTS);
-        if room == 0 {
+        if !volume.can_start_rewrite() || volume.stray_outputs.load(Ordering::Acquire) > 0 || room == 0 {
+            volume.note_pick(PickOutcome::Refused);
             return None;
         }
         let rows = hold(&volume.summary);
@@ -475,20 +470,25 @@ impl<Backend: Io> RewriteJob<Backend> {
             let target = self.gather(volume, &rows, &row, 1, |_row| false);
             // the row counts every block the segment had, and only the ones that read are in the table
             self.inputs[0].block_count = self.rebuild_blocks;
+            volume.note_pick(PickOutcome::Rebuild);
             return Some((target, false));
         }
         // an overlap merge copies records, so one at a time on the planner keeps ingest at its line
         if self.lane == PLANNER_LANE
             && let Some(target) = self.pick_overlap(volume, &rows, room)
         {
+            volume.note_pick(PickOutcome::Overlap);
             return Some((target, false));
         }
         if volume.has_walk_target.load(Ordering::Acquire) {
+            volume.note_pick(PickOutcome::WalkTarget);
             return None;
         }
         // a full pool refuses range deletes, so the segment holding the oldest cover back goes whatever the trigger says
         if let Some(row) = self.forced.take().and_then(|forced| rows.get(forced)).filter(|row| is_mergeable(volume, row)) {
-            return Some((self.gather(volume, &rows, &row, 1, |_row| false), false));
+            let target = self.gather(volume, &rows, &row, 1, |_row| false);
+            volume.note_pick(PickOutcome::Forced);
+            return Some((target, false));
         }
         let current = DeathMark(self.state.current_mark.load(Ordering::Relaxed));
         let gave_up = self.gave_up_list(volume);
@@ -504,8 +504,10 @@ impl<Backend: Io> RewriteJob<Backend> {
             let is_more = |row: &SummaryRow<'_>| is_ready(row) && row.facts.segment > first.facts.segment && row.facts.marks.shares_lifetime(lifetime);
             let target = self.gather(volume, &rows, &first, room, is_more);
             self.note_bars(&rows, current);
+            volume.note_pick(PickOutcome::Record);
             return Some((target, is_grave_heavy));
         }
+        volume.note_pick(PickOutcome::Nothing);
         None
     }
 
@@ -522,7 +524,10 @@ impl<Backend: Io> RewriteJob<Backend> {
         let found = overlap_start(rows, &mut self.looked_up_to, can_merge, has_bound, &mut self.crowded_key);
         let looked_up_to = self.looked_up_to;
         self.has_looks_left = rows.rows().any(|row| row.facts.segment > looked_up_to);
-        let (crowded, column) = found?;
+        let Some((crowded, column)) = found else {
+            volume.note_pick(PickOutcome::OverlapMiss);
+            return None;
+        };
         let point = &self.crowded_key;
         let lifetime = crowded.facts.marks;
         let is_near = |row: &SummaryRow<'_>| can_merge(row) && covers_point(row, column, point) && row.facts.marks.shares_lifetime(lifetime);
@@ -538,6 +543,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         // one segment alone wins back no overlap, and the next look starts past it
         if self.input_count < 2 {
             self.looked_up_to = crowded.facts.segment;
+            volume.note_pick(PickOutcome::OverlapLone);
             return None;
         }
         self.is_unwalked = is_unwalked;
@@ -1419,6 +1425,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         for input in inputs {
             volume.covers.remove_segment(*input);
         }
+        let gone = rows_bytes(&hold(&volume.summary), inputs.iter().copied());
         for input in inputs {
             self.state.filter_arena.drop_segment(*input);
         }
@@ -1426,6 +1433,11 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.note_install();
         volume.lanes[self.lane].rewrites_done.fetch_add(1, Ordering::AcqRel);
         self.summarize(volume, inputs);
+        let staged = self.staged.iter().map(|staged| staged.facts.segment);
+        let last = self.totals.and(self.output.as_ref()).map(|output| output.number);
+        let graves = self.grave_totals.and(self.grave_output.as_ref()).map(|output| output.number);
+        let written = rows_bytes(&hold(&volume.summary), staged.chain(last).chain(graves));
+        volume.note_rewrite_bytes(gone, written);
         self.end_rebuild(volume);
         let saved = state.save_summary(volume);
 
@@ -1915,4 +1927,20 @@ pub fn bar_quarters(marks: MarkRange, current: DeathMark) -> u64 {
     } else {
         PLAIN_BAR_QUARTERS
     }
+}
+
+/// Add up the file bytes and the dead bytes of some segments' rows
+pub fn rows_bytes(rows: &SummaryRows, segments: impl Iterator<Item = SegmentNumber>) -> RowBytes {
+    let mut bytes = RowBytes::default();
+    for row in segments.filter_map(|segment| rows.get(segment)) {
+        bytes.file += row.facts.file_length.0;
+        let mut cursor = row.cursor();
+        for _column in 0..row.column_count {
+            let Some(facts) = cursor.column() else {
+                break;
+            };
+            bytes.dead += facts.dead_bytes.0;
+        }
+    }
+    bytes
 }

@@ -1,18 +1,23 @@
 //! What a store says about itself: sizes from the summaries, and jobs that read as running, idle or stalled
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::engine::engine_sizing::{ENTRY_LINE_DIVISOR, ENTRY_MARGIN, floor_entries};
 use reel::engine::job_tally::STALL_AFTER;
 use reel::engine::reel_store::ReelStore;
+use reel::io::Io;
 use reel::record::codec::Codec;
 use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::{JobKind, JobState, MaintenanceReport};
+use reel_api::maintenance_report::{JobKind, JobState, MaintenanceReport, PickOutcome};
+use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, Nanoseconds, RootId, RowCount, SegmentCount, VolumeId};
 use reel_api::usage::{ColumnUsage, UsageReport};
 use reel_sim::seeded_random::Seed;
-use reel_sim::simulated_io::SimulatedIo;
+use reel_sim::simulated_io::{PAUSE_TICK, SimulatedIo};
+
+use crate::seed_sets::seeds;
 
 const ROOT: &str = "/disk/reports";
 const COLUMN: ColumnId = ColumnId(1);
@@ -21,12 +26,24 @@ const TICK: Nanoseconds = Nanoseconds(1_000_000);
 const STEPS: u64 = 400_000;
 const KEYS: u64 = 100;
 const VALUE: &[u8] = &[7; 200];
+const SMALL_DISK: ByteCount = ByteCount(1024 * 1024 * 1024);
+const RUN_STEPS: u64 = 20_000;
+const LARGE_DISK: ByteCount = ByteCount(1 << 40);
+const COVER_BUDGET: ByteCount = ByteCount(128 * 1024 * 1024);
+const MOST_PAST_PUTS: u64 = 10_000_000;
+const BIG_DISK: ByteCount = ByteCount(8 << 30);
+const REAL_RECORD: &[u8] = &[5; 256 * 1024];
+const REAL_SEGMENTS: u64 = 4;
 
 type Store = ReelStore<SimulatedIo>;
 
 fn open(io: &SimulatedIo) -> Store {
+    open_at(io, BUDGET)
+}
+
+fn open_at(io: &SimulatedIo, budget: ByteCount) -> Store {
     let config = StoreConfig {
-        memory_budget: BUDGET,
+        memory_budget: budget,
         threads: reel::config::NO_WORKERS,
         volumes: vec![VolumeConfig {
             name: "reports".to_string(),
@@ -171,5 +188,161 @@ fn counts() {
     let mut reopened = MaintenanceReport::new();
     store.maintenance_report(&mut reopened);
     assert_eq!(reopened.deletes_since_open, RowCount(0));
+    store.close().expect("close");
+}
+
+// a disk of a known size sets the table's entries, the reports give them beside the disk, and a full table stops a seal and
+// counts the stop once, in every seed of a sweep
+#[test]
+fn full_table_stops_a_seal() {
+    for seed in seeds([5]) {
+        let io = SimulatedIo::new(Seed(seed));
+        io.add_disk(Path::new(ROOT), SMALL_DISK);
+        let store = open(&io);
+        store.state.volumes[0].is_compaction_held.store(true, Ordering::Release);
+        let memory = store.memory_report();
+        let mut report = MaintenanceReport::new();
+        store.maintenance_report(&mut report);
+        let room = report.volumes[0].entry_room;
+
+        assert_eq!(memory.disk_bytes, SMALL_DISK);
+        let segment = report.volumes[0].cover_segment_bytes;
+        assert!(segment < store.state.sizing.segment_bytes, "seed {seed}: the cover assumed the byte target for rows of no declared size");
+        assert_eq!(memory.disk_covered, ByteCount((room.0 / ENTRY_MARGIN * segment.0).min(SMALL_DISK.0)));
+        assert!(room.0 >= floor_entries() as u64);
+        let mut number = 0;
+        while report.volumes[0].seal_stops == 0 && number < room.0 * 2 {
+            store.put(COLUMN, format!("key-{number:05}").as_bytes(), VALUE).expect("put");
+            store.seal_now();
+            run(&io);
+            store.maintenance_report(&mut report);
+            number += 1;
+        }
+        assert_eq!(report.volumes[0].seal_stops, 1, "seed {seed}: the table never filled, or a stop counted twice");
+        assert!(report.volumes[0].entries_used < room, "seed {seed}: a shard filled before the table");
+        run(&io);
+        store.maintenance_report(&mut report);
+        assert_eq!(report.volumes[0].seal_stops, 1, "seed {seed}: a stuck seal counted its retries");
+        let mut value = Vec::new();
+        assert!(store.get(COLUMN, b"key-00000", &mut value).expect("get"), "seed {seed}: a sealed key went missing past the stop");
+        store.put(COLUMN, b"past-the-stop", VALUE).expect("put");
+        store.state.volumes[0].is_compaction_held.store(false, Ordering::Release);
+        store.close().expect("close");
+    }
+}
+
+// step the jobs for a while, past a seal that keeps trying
+fn run(io: &SimulatedIo) {
+    for _step in 0..RUN_STEPS {
+        if io.step_any().is_none() {
+            io.advance_clock(TICK);
+        }
+    }
+}
+
+// a disk past what the capped line covers still opens, with the entries line at its cap and the cover it reaches
+#[test]
+fn disk_past_the_cover() {
+    let io = SimulatedIo::new(Seed(6));
+    io.add_disk(Path::new(ROOT), LARGE_DISK);
+    let store = open_at(&io, COVER_BUDGET);
+    let memory = store.memory_report();
+    let mut report = MaintenanceReport::new();
+    store.maintenance_report(&mut report);
+    let room = report.volumes[0].entry_room;
+
+    assert_eq!(memory.disk_bytes, LARGE_DISK);
+    let floor = floor_entries() as u64 * report.volumes[0].entry_bytes.0;
+    assert!(memory.entry_line.0 <= floor + (COVER_BUDGET.0 - memory.least_budget.0) / ENTRY_LINE_DIVISOR, "the line passed its cap");
+    assert!(memory.entry_line.0 >= room.0 * report.volumes[0].entry_bytes.0, "the entries passed their line");
+    assert_eq!(memory.disk_covered, ByteCount(room.0 / ENTRY_MARGIN * report.volumes[0].cover_segment_bytes.0));
+    assert!(memory.disk_covered < LARGE_DISK, "the cover reached the whole disk");
+    store.put(COLUMN, b"key", VALUE).expect("put");
+    store.close().expect("close");
+}
+
+// a put past the open segments' room under a seal stop is refused at once, and close still works
+#[test]
+fn puts_under_a_seal_stop() {
+    let io = SimulatedIo::new(Seed(7));
+    io.add_disk(Path::new(ROOT), SMALL_DISK);
+    let store = open(&io);
+    store.state.volumes[0].is_compaction_held.store(true, Ordering::Release);
+    let mut report = MaintenanceReport::new();
+    store.maintenance_report(&mut report);
+    let room = report.volumes[0].entry_room.0;
+    let mut number = 0;
+    while report.volumes[0].seal_stops == 0 && number < room * 2 {
+        store.put(COLUMN, format!("key-{number:05}").as_bytes(), VALUE).expect("put");
+        store.seal_now();
+        run(&io);
+        store.maintenance_report(&mut report);
+        number += 1;
+    }
+    assert_eq!(report.volumes[0].seal_stops, 1, "the table never filled");
+
+    let mut puts = 0;
+    let (outcome, waited) = loop {
+        let before = io.now();
+        let outcome = store.put(COLUMN, format!("past-{puts:08}").as_bytes(), VALUE);
+        puts += 1;
+        if outcome.is_err() || puts == MOST_PAST_PUTS {
+            break (outcome, io.now().0 - before.0);
+        }
+    };
+    assert!(matches!(outcome, Err(StoreError::TableFull { volume: VolumeId(0) })), "{outcome:?} after {puts} puts");
+    assert!(waited < PAUSE_TICK.0, "the refused put paused for {waited} ns");
+    store.state.volumes[0].is_compaction_held.store(false, Ordering::Release);
+    store.close().expect("close");
+}
+
+// a record rewrite of a mostly dead segment takes more bytes off the disk than it writes and drops dead bytes, and the readings
+// say what the looks for work came to and how many walk blocks landed
+#[test]
+fn rewrite_bytes_and_picks() {
+    let io = SimulatedIo::new(Seed(8));
+    let store = open(&io);
+    put_keys(&store);
+    seal(&store, &io);
+    for number in 1..KEYS {
+        store.put(COLUMN, format!("key-{number:03}").as_bytes(), VALUE).expect("put");
+    }
+    seal(&store, &io);
+    let mut report = MaintenanceReport::new();
+    store.maintenance_report(&mut report);
+    let volume = &report.volumes[0];
+    let bytes = volume.rewrite_bytes;
+
+    assert!(volume.walk_blocks > 0, "no walk block landed");
+    assert!(volume.picks[PickOutcome::Record.index()] > 0, "no record rewrite picked: {:?}", volume.picks);
+    assert!(bytes.inputs_gone > bytes.written && bytes.dead_gone > bytes.dead_kept, "{bytes:?}");
+    assert_eq!(bytes.unreclaimed, 0, "{bytes:?}");
+    store.close().expect("close");
+}
+
+// an undeclared column on a big disk plans its cover at the row floor, far short of the disk, while its records seal full
+// segments, so the table's room holds the whole disk at their real size and no write meets TableFull
+#[test]
+fn undeclared_column_on_a_big_disk() {
+    let io = SimulatedIo::new(Seed(9));
+    io.add_disk(Path::new(ROOT), BIG_DISK);
+    let store = open(&io);
+    let per_segment = store.state.sizing.segment_bytes.0 / REAL_RECORD.len() as u64;
+    for segment in 0..REAL_SEGMENTS {
+        for number in 0..per_segment {
+            let outcome = store.put(COLUMN, format!("real-{segment:03}-{number:06}").as_bytes(), REAL_RECORD);
+            assert!(!matches!(outcome, Err(StoreError::TableFull { .. })), "segment {segment} met TableFull");
+            outcome.expect("put");
+        }
+        seal(&store, &io);
+    }
+    let memory = store.memory_report();
+    let mut report = MaintenanceReport::new();
+    store.maintenance_report(&mut report);
+    let volume = &report.volumes[0];
+
+    assert!(memory.disk_covered < BIG_DISK, "the cover at the row floor reached the disk");
+    assert!(volume.cover_at_mean >= BIG_DISK, "the room at the real segment size falls short of the disk");
+    assert_eq!(volume.seal_stops, 0);
     store.close().expect("close");
 }

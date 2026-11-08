@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use reel_api::maintenance_report::SealSteps;
+use reel_api::maintenance_report::{PICK_OUTCOMES, PickOutcome, SealSteps};
 use reel_api::units::{ByteCount, Nanoseconds, RowCount, VolumeId, WritePlace};
 
 use crate::config::SyncPolicy;
@@ -160,6 +160,13 @@ impl<File> Default for RewriteLane<File> {
     }
 }
 
+/// File bytes and dead bytes of some segments
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RowBytes {
+    pub file: u64,
+    pub dead: u64,
+}
+
 /// One volume of a store
 pub struct Volume<Backend: Io> {
     pub id: VolumeId,
@@ -185,6 +192,30 @@ pub struct Volume<Backend: Io> {
     pub is_compaction_held: AtomicBool,
     /// A seal found the table or a directory full, and only a reclaim can give it room
     pub is_seal_stuck: AtomicBool,
+    /// Times a seal stopped on a full table or directory, once for each stop until a seal lands again
+    pub seal_stops: AtomicU64,
+    /// The bytes the distinct filesystems under the roots hold, or nothing when a root's disk has no known size
+    pub disk_bytes: Option<ByteCount>,
+    /// The disk bytes the table's entries cover, which a disk past them leaves to the seal stop
+    pub disk_covered: ByteCount,
+    /// The segment size the cover assumes: the byte target, or a full segment's rows at the row floor when that is less
+    pub cover_segment_bytes: ByteCount,
+    /// Bytes each table entry plans for, by the volume's columns
+    pub entry_bytes: ByteCount,
+    /// Looks for rewrite work, by what each came to, in the order of `PickOutcome`
+    pub picks: [AtomicU64; PICK_OUTCOMES],
+    /// File bytes of the inputs finished rewrites took off the disk
+    pub rewrite_inputs_gone: AtomicU64,
+    /// File bytes of finished rewrites' outputs
+    pub rewrite_written: AtomicU64,
+    /// Dead bytes the inputs that left held
+    pub rewrite_dead_gone: AtomicU64,
+    /// Dead bytes the outputs carry
+    pub rewrite_dead_kept: AtomicU64,
+    /// Rewrites that wrote at least the bytes their leaving inputs held
+    pub rewrites_unreclaimed: AtomicU64,
+    /// Walk blocks whose counts landed
+    pub walk_blocks: AtomicU64,
     /// The segment a seal is working on, or `NO_SEAL`. Its rows can still answer through its open slot, so no walk starts on it
     pub sealing: AtomicU64,
     pub walk_slots: Vec<WalkSlot<Backend::Task>>,
@@ -301,6 +332,22 @@ impl<Backend: Io> Volume<Backend> {
     /// Check the park has room for this many segments
     pub fn can_park(&self, count: usize) -> bool {
         self.park_room() >= count
+    }
+
+    /// Count what a finished rewrite took off the disk and wrote back
+    pub fn note_rewrite_bytes(&self, gone: RowBytes, written: RowBytes) {
+        self.rewrite_inputs_gone.fetch_add(gone.file, Ordering::Relaxed);
+        self.rewrite_written.fetch_add(written.file, Ordering::Relaxed);
+        self.rewrite_dead_gone.fetch_add(gone.dead, Ordering::Relaxed);
+        self.rewrite_dead_kept.fetch_add(written.dead, Ordering::Relaxed);
+        if written.file >= gone.file {
+            self.rewrites_unreclaimed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Count what a look for rewrite work came to
+    pub fn note_pick(&self, outcome: PickOutcome) {
+        self.picks[outcome.index()].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Check a merge running beside the walk has taken a segment

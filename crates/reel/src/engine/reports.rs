@@ -1,10 +1,13 @@
 //! What a store says about itself: sizes from the summaries, and each job's state and counts, none of it a scan
 
+use std::array;
 use std::io::Error;
 use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::{CompleteReading, JOB_KINDS, JobKind, JobState, LeastValueReading, MOST_REPORTED_LANES, MaintenanceReport, VolumeReading};
+use reel_api::maintenance_report::{
+    CompleteReading, JOB_KINDS, JobKind, JobState, LeastValueReading, MOST_REPORTED_LANES, MaintenanceReport, RewriteBytes, VolumeReading,
+};
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, Nanoseconds, RootId, RowCount, SegmentCount, VolumeId};
 use reel_api::usage::{ColumnRootUsage, ColumnUsage, RootUsage, UsageReport, VolumeUsage};
@@ -148,10 +151,12 @@ impl<Backend: Io> EngineState<Backend> {
             strays += volume.stray_outputs.load(Ordering::Acquire);
             retries += volume.reclaim_retries.load(Ordering::Acquire);
             let rows = hold(&volume.summary);
+            let segment_count = rows.rows().count() as u64;
+            let used_bytes: u64 = rows.rows().map(|row| row.facts.file_length.0).sum();
             report.volumes.push(VolumeReading {
                 volume: VolumeId(index as u8),
-                segment_count: SegmentCount(rows.rows().count() as u64),
-                used_bytes: ByteCount(rows.rows().map(|row| row.facts.file_length.0).sum()),
+                segment_count: SegmentCount(segment_count),
+                used_bytes: ByteCount(used_bytes),
                 is_spinning: volume.is_spinning,
                 is_device_set: volume.is_device_set,
                 rewrites_by_lane: lane_counts(volume),
@@ -163,6 +168,21 @@ impl<Backend: Io> EngineState<Backend> {
                 plain_bar_rewrites: volume.plain_bar_rewrites.load(Ordering::Acquire),
                 longest_seal_steps: volume.seal_steps.reading(),
                 key_order_copies: volume.key_order_copies.load(Ordering::Acquire),
+                entries_used: SegmentCount(volume.table.segment_count()),
+                entry_room: SegmentCount(volume.table.capacity() as u64),
+                entry_bytes: volume.entry_bytes,
+                cover_segment_bytes: volume.cover_segment_bytes,
+                cover_at_mean: ByteCount((volume.table.capacity() as u64).saturating_mul(used_bytes / segment_count.max(1))),
+                seal_stops: volume.seal_stops.load(Ordering::Acquire),
+                picks: array::from_fn(|outcome| volume.picks[outcome].load(Ordering::Acquire)),
+                rewrite_bytes: RewriteBytes {
+                    inputs_gone: ByteCount(volume.rewrite_inputs_gone.load(Ordering::Acquire)),
+                    written: ByteCount(volume.rewrite_written.load(Ordering::Acquire)),
+                    dead_gone: ByteCount(volume.rewrite_dead_gone.load(Ordering::Acquire)),
+                    dead_kept: ByteCount(volume.rewrite_dead_kept.load(Ordering::Acquire)),
+                    unreclaimed: volume.rewrites_unreclaimed.load(Ordering::Acquire),
+                },
+                walk_blocks: volume.walk_blocks.load(Ordering::Acquire),
             });
         }
         for (id, info) in self.columns.iter().enumerate() {

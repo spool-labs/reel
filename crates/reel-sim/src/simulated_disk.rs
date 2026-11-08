@@ -7,6 +7,7 @@ use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use reel::io::DiskSize;
 use reel_api::units::{ByteCount, ProcessId};
 
 use crate::file_image::FileImage;
@@ -333,6 +334,14 @@ impl SimulatedDisk {
             None => UNBOUNDED_CAPACITY,
         };
         ByteCount(capacity.0.saturating_sub(self.used_space(root).0))
+    }
+
+    /// Read the size of the disk under a path, with the disk's place among the declared ones as its filesystem, or nothing for a
+    /// path on no declared disk
+    pub fn disk_size(&self, path: &Path) -> Option<DiskSize> {
+        let root = self.disk_of(path)?;
+        let filesystem = self.capacities.keys().position(|declared| *declared == root)? as u64;
+        Some(DiskSize { filesystem, bytes: *self.capacities.get(&root)? })
     }
 
     /// Read how much the disk under a path can still take

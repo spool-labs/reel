@@ -20,8 +20,9 @@ use crate::config::{ColumnConfig, DeviceClass, NO_WORKERS, StoreConfig, VolumeCo
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::engine_sizing::{
     complete_block_rows, complete_row_limit,
-    EngineSizing, FILTER_ARENA_EIGHTHS, FILTER_CACHE_QUARTERS, FILTER_SLOT_BYTES, GROUP_BYTES, LEAST_LZ4_BUDGET, PLANNED_COLUMN_BYTES, PLANNED_LINE_BYTES, SHARED_JOBS,
-    PLANNED_SEGMENT_BYTES, StoreShape, GATHER_BYTES, READ_BUFFERS, WRITE_BUFFERS,
+    EngineSizing, FILTER_ARENA_EIGHTHS, FILTER_CACHE_QUARTERS, FILTER_SLOT_BYTES, GROUP_BYTES, LEAST_LZ4_BUDGET, LEAST_SHARD_ENTRIES, PLANNED_LINE_BYTES,
+    SHARED_JOBS, StoreShape, GATHER_BYTES, READ_BUFFERS, WRITE_BUFFERS, assumed_segment_bytes, capped_entries, disk_entries, entry_cost, entry_cover, floor_entries,
+    segment_bytes_for,
 };
 use crate::engine::engine_state::{EngineState, PLACE_RUN, SEGMENT_NUMBER_BATCH, SlotFile};
 use crate::engine::open_segment::{RECORD_WINDOW_BYTES, RecordWindow, RowQueue, fits_a_segment_path};
@@ -98,8 +99,9 @@ impl<Backend: Io> ReelStore<Backend> {
         let locks = lock_roots(&io, config)?;
         let superblock = settle_superblock(&io, config)?;
 
-        let ring = if ring_fits(config) { io.open_ring().map_err(open_error("opening a ring"))? } else { None };
-        let sizing = store_sizing(config, ring.is_some())?;
+        let disks = volume_disks(&io, config).map_err(open_error("reading a disk's size"))?;
+        let ring = if ring_fits(config, &disks) { io.open_ring().map_err(open_error("opening a ring"))? } else { None };
+        let sizing = store_sizing(config, ring.is_some(), &disks)?;
 
         // every root is listed before any tail is read, and the table is sized from what they hold
         let mut roots = Vec::with_capacity(config.volumes.len());
@@ -119,7 +121,7 @@ impl<Backend: Io> ReelStore<Backend> {
 
         // the pools are built and touched here and as the jobs start, and open reports that time apart
         let touched_from = io.now();
-        let mut state = build_state(io, config, &sizing, superblock, locks, &scan, summaries);
+        let mut state = build_state(io, config, &sizing, &disks, superblock, locks, &scan, summaries);
         state.complete = complete_tables(config);
         state.complete_images = complete_images(config);
         state.attach_ring(ring);
@@ -683,10 +685,10 @@ pub fn bring_up<Backend: Io>(
     Ok(())
 }
 
-/// Describe a store to the sizing
-pub fn store_shape(config: &StoreConfig, has_ring: bool) -> StoreShape {
+/// Describe a store to the sizing, with each volume's disk size or nothing where it has none
+pub fn store_shape(config: &StoreConfig, has_ring: bool, disks: &[Option<ByteCount>]) -> StoreShape {
     let root_count = config.volumes.iter().map(|volume| volume.roots.len()).sum();
-    StoreShape {
+    let bare = StoreShape {
         budget: config.memory_budget,
         roots: root_count,
         volumes: config.volumes.len(),
@@ -694,18 +696,79 @@ pub fn store_shape(config: &StoreConfig, has_ring: bool) -> StoreShape {
         widest_keys: (0..config.volumes.len()).map(|volume| config.widest_key(volume) as u64).sum(),
         threads: config.threads,
         has_ring,
+        disk_entry_bytes: ByteCount(0),
+        floor_entry_bytes: entry_line(config, &disks.iter().map(|disk| disk.map(|_size| floor_entries())).collect::<Vec<_>>()),
+    };
+    // a segment's rows come from the shares, so the disks ask at the rows a plan with no line of theirs gives
+    let rows = EngineSizing::for_store(&bare.with_workers_settled()).segment_rows;
+    StoreShape { disk_entry_bytes: entry_line(config, &asked_entries(config, disks, rows)), ..bare }
+}
+
+/// Count the columns a volume holds
+pub fn columns_on(config: &StoreConfig, volume: usize) -> usize {
+    config.columns.iter().filter(|column| column.volume.0 as usize == volume).count()
+}
+
+/// Add up the bytes of the volumes' entries, at their columns' cost
+pub fn entry_line(config: &StoreConfig, entries: &[Option<usize>]) -> ByteCount {
+    let bytes = |(volume, count): (usize, &Option<usize>)| Some(count.as_ref().copied()? as u64 * entry_cost(columns_on(config, volume)));
+    ByteCount(entries.iter().enumerate().filter_map(bytes).sum())
+}
+
+/// Read the segment size a volume's entries plan at, from the rows a segment takes
+pub fn volume_segment_bytes(config: &StoreConfig, volume: usize, rows: RowCount) -> ByteCount {
+    assumed_segment_bytes(segment_bytes_for(config.memory_budget), rows, config.row_floor(volume))
+}
+
+/// Read the entries each volume's disk asks for at its segment size, or nothing for a volume with a disk of no known size
+pub fn asked_entries(config: &StoreConfig, disks: &[Option<ByteCount>], rows: RowCount) -> Vec<Option<usize>> {
+    disks.iter().enumerate().map(|(volume, disk)| disk_entries(*disk, volume_segment_bytes(config, volume, rows))).collect()
+}
+
+/// Plan each volume's entries inside the planned line: what its disk asks for, with every volume's entries past the floor scaled
+/// down together when the line is short of what they ask
+pub fn volume_entries(config: &StoreConfig, disks: &[Option<ByteCount>], rows: RowCount, line: ByteCount) -> Vec<Option<usize>> {
+    let entries = asked_entries(config, disks, rows);
+    let asked = entry_line(config, &entries).0;
+    if asked <= line.0 {
+        return entries;
     }
+    let floor = entry_line(config, &entries.iter().map(|count| count.map(|_count| floor_entries())).collect::<Vec<_>>()).0;
+    let room = line.0.saturating_sub(floor);
+    entries.iter().map(|count| count.map(|count| capped_entries(count, room, asked - floor))).collect()
+}
+
+/// Read each volume's disk size: the sizes of the distinct filesystems its roots sit on, or nothing when a root's disk has no
+/// known size
+pub fn volume_disks<Backend: Io>(io: &Backend, config: &StoreConfig) -> Result<Vec<Option<ByteCount>>, Error> {
+    let mut disks = Vec::with_capacity(config.volumes.len());
+    for volume in &config.volumes {
+        let mut filesystems = Vec::with_capacity(volume.roots.len());
+        let mut total = Some(0);
+        for root in &volume.roots {
+            match io.capacity(root)? {
+                Some(disk) if !filesystems.contains(&disk.filesystem) => {
+                    filesystems.push(disk.filesystem);
+                    total = total.map(|bytes: u64| bytes.saturating_add(disk.bytes.0));
+                },
+                Some(_counted) => {},
+                None => total = None,
+            }
+        }
+        disks.push(total.map(ByteCount));
+    }
+    Ok(disks)
 }
 
 /// Check a budget holds the ring beside the least a store runs on. A smaller one keeps async reads on the blocking pool
-pub fn ring_fits(config: &StoreConfig) -> bool {
-    let shape = StoreShape { threads: NO_WORKERS, ..store_shape(config, true) };
+pub fn ring_fits(config: &StoreConfig, disks: &[Option<ByteCount>]) -> bool {
+    let shape = StoreShape { threads: NO_WORKERS, ..store_shape(config, true, disks) };
     shape.least_budget() <= config.memory_budget
 }
 
 /// Share a budget out for a store, or say why it can't run on it
-pub fn store_sizing(config: &StoreConfig, has_ring: bool) -> Result<EngineSizing, StoreError> {
-    let shape = store_shape(config, has_ring);
+pub fn store_sizing(config: &StoreConfig, has_ring: bool, disks: &[Option<ByteCount>]) -> Result<EngineSizing, StoreError> {
+    let shape = store_shape(config, has_ring, disks);
     let shape = shape.with_workers_settled();
     let least_shape = StoreShape { threads: NO_WORKERS, ..shape };
     if config.threads.read_threads == 0 {
@@ -972,11 +1035,31 @@ pub fn row_room(columns: usize) -> usize {
     MOST_ROW_FIXED_BYTES + columns * MOST_ROW_COLUMN_BYTES
 }
 
+/// Plan a volume's table: the more of what half its part of the share buys and what its disk plans for, and its block-index
+/// lines from the rest of that part
+pub fn planned_table(config: &StoreConfig, entries: Option<usize>, volume: usize, volume_share: u64) -> TableSizing {
+    let columns = columns_on(config, volume).max(1);
+    let cost = entry_cost(columns);
+    // the disk only adds entries to what half the share buys: the line pays the disk's, the share pays any past them, and the
+    // block-index lines take the rest of the share
+    let from_disk = entries.unwrap_or(0);
+    let entries = ((volume_share / 2 / cost) as usize).max(from_disk);
+    let line_share = volume_share - (entries - from_disk) as u64 * cost;
+    let segments_per_shard = (entries / TABLE_SHARDS).max(LEAST_SHARD_ENTRIES);
+    TableSizing {
+        segments_per_shard,
+        columns_per_shard: segments_per_shard * columns,
+        blocks_per_shard: ((line_share / PLANNED_LINE_BYTES) as usize / TABLE_SHARDS).max(64),
+    }
+}
+
 /// Allocate and touch everything the engine will hold
+#[allow(clippy::too_many_arguments, reason = "open hands over everything it read")]
 pub fn build_state<Backend: Io>(
     io: Backend,
     config: &StoreConfig,
     sizing: &EngineSizing,
+    disks: &[Option<ByteCount>],
     superblock: Superblock,
     mut locks: Vec<Vec<Backend::Lock>>,
     scan: &RootScan<Backend::File>,
@@ -984,20 +1067,10 @@ pub fn build_state<Backend: Io>(
 ) -> EngineState<Backend> {
     let first_place = superblock.place_limit.0.saturating_sub(PLACE_RUN);
     let places = Arc::new(PlaceCount::new(WritePlace(first_place), superblock.place_limit));
-    // a volume's table and directories come out of its part of the share, by the columns it can hold
     let volume_share = sizing.table_share.0 / config.volumes.len().max(1) as u64;
-    let most_columns = (0..config.volumes.len())
-        .map(|volume| config.columns.iter().filter(|column| column.volume.0 as usize == volume).count())
-        .max()
-        .unwrap_or(1)
-        .max(1);
-    let segment_bytes = PLANNED_SEGMENT_BYTES + most_columns as u64 * PLANNED_COLUMN_BYTES;
-    let segments_per_shard = ((volume_share / 2 / segment_bytes) as usize / TABLE_SHARDS).max(8);
-    let table_sizing = TableSizing {
-        segments_per_shard,
-        columns_per_shard: segments_per_shard * most_columns,
-        blocks_per_shard: ((volume_share / 2 / PLANNED_LINE_BYTES) as usize / TABLE_SHARDS).max(64),
-    };
+    let entries = volume_entries(config, disks, sizing.segment_rows, sizing.entry_line);
+    let planned: Vec<TableSizing> =
+        (0..config.volumes.len()).map(|volume| planned_table(config, entries.get(volume).copied().flatten(), volume, volume_share)).collect();
 
     let mut columns: Vec<Option<ColumnInfo>> = vec![None; MAX_COLUMNS];
     let mut directories: Vec<Option<ColumnDirectory>> = Vec::with_capacity(MAX_COLUMNS);
@@ -1015,7 +1088,7 @@ pub fn build_state<Backend: Io>(
             least_value: column.least_value.map_or(0, |bytes| bytes.0),
         });
         let found = scan.sealed.len();
-        let room = (segments_per_shard * TABLE_SHARDS).max(found * 2);
+        let room = (planned[column.volume.0 as usize].segments_per_shard * TABLE_SHARDS).max(found * 2);
         directories[column.id.0 as usize] = Some(ColumnDirectory::new(room));
     }
 
@@ -1041,7 +1114,8 @@ pub fn build_state<Backend: Io>(
         let span_room = MOST_DAMAGED_SPANS * (MOST_ROW_SPAN_FIXED_BYTES + 2 * SPAN_KEY_BYTES);
         let summary_room = span_room + found_summary.max(planned_summary).max(scan.least_summary_room(index, columns_here) * 2);
         summary.rows.make_room(ByteCount(summary_room as u64));
-        let mut room = table_room(&table_sizing, &scan.least_sizing(index));
+        let mut room = table_room(&planned[index], &scan.least_sizing(index));
+        let cover_segment = volume_segment_bytes(config, index, sizing.segment_rows);
         room.blocks_per_shard += complete_shard_lines(config, index);
         // a row for each segment the table can hold, beside open segments and the spans of gone ones
         summary.rows.make_index(room.segments_per_shard * TABLE_SHARDS + open_slots + MOST_DAMAGED_SPANS);
@@ -1074,6 +1148,18 @@ pub fn build_state<Backend: Io>(
             has_kept_covers: AtomicBool::new(false),
             is_compaction_held: AtomicBool::new(false),
             is_seal_stuck: AtomicBool::new(false),
+            seal_stops: AtomicU64::new(0),
+            disk_bytes: disks.get(index).copied().flatten(),
+            disk_covered: disks.get(index).copied().flatten().map_or(ByteCount(0), |disk| entry_cover(room.segments_per_shard * TABLE_SHARDS, cover_segment, disk)),
+            cover_segment_bytes: cover_segment,
+            entry_bytes: ByteCount(entry_cost(columns_here)),
+            picks: Default::default(),
+            rewrite_inputs_gone: AtomicU64::new(0),
+            rewrite_written: AtomicU64::new(0),
+            rewrite_dead_gone: AtomicU64::new(0),
+            rewrite_dead_kept: AtomicU64::new(0),
+            rewrites_unreclaimed: AtomicU64::new(0),
+            walk_blocks: AtomicU64::new(0),
             sealing: AtomicU64::new(NO_SEAL),
             lanes: (0..=sizing.walk_workers).map(|_lane| RewriteLane::new()).collect(),
             gave_up: Mutex::new(GaveUp::new()),
@@ -1186,7 +1272,7 @@ pub fn build_state<Backend: Io>(
         index: WriteIndex::new(&sizing.shard),
         spot: SpotIndex::new(sizing.spot_share),
         filter_cache: BlockCache::new(ByteCount(filter_share.0 - arena_share.0), FILTER_SLOT_BYTES),
-        filter_arena: FilterArena::new(arena_share, segments_per_shard * TABLE_SHARDS * config.volumes.len()),
+        filter_arena: FilterArena::new(arena_share, planned.iter().map(|table| table.segments_per_shard * TABLE_SHARDS).sum()),
         row_cache: BlockCache::new(row_share, ROW_BLOCK_BYTES),
         complete_cache: is_complete.then(|| BlockCache::new(complete_share, COMPLETE_BLOCK_BYTES)),
         complete_line_bytes: ByteCount(complete_lines(config) * size_of::<BlockEntry>() as u64),

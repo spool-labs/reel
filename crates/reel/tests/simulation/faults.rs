@@ -20,10 +20,11 @@ use reel::segment::summary::SummaryPaths;
 use reel::superblock::Superblock;
 use reel_api::column_id::ColumnId;
 use reel_api::direction::Direction;
+use reel_api::maintenance_report::MaintenanceReport;
 use reel_api::scan::ScanStep;
 use reel_api::reads::Reads;
 use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, DeathMark, FileOffset, Nanoseconds, RowCount, VolumeId};
+use reel_api::units::{ByteCount, DeathMark, FileOffset, Nanoseconds, RowCount, SegmentCount, VolumeId};
 use reel_api::write_batch::WriteBatch;
 
 // the default walk runs on the planner, so seeds spread over 0 to 2 workers to keep the worker path under test
@@ -33,7 +34,7 @@ const TABLE_ROWS: RowCount = RowCount(100_000);
 const ROOTS: [&str; 3] = ["/disk/faults-meta", "/disk/faults-meta-two", "/disk/faults-bulk"];
 const COLUMNS: [ColumnId; 2] = [ColumnId(1), ColumnId(2)];
 const HIGHEST_KEY: &[u8] = b"zzz";
-const BUDGET: ByteCount = ByteCount(124 * 1024 * 1024);
+const BUDGET: ByteCount = ByteCount(128 * 1024 * 1024);
 // a test holds each seed with a traced bug: 0 `failed_open` and `failed_close`, 1 `rows_sync` and `tail_sync`, 37 and
 // 349 `covered_last` and `later_sync`, 125 `one_copy`, 681 `tail_then_cut`, 959 `flushed_unknown`, 1000 `open_covers`, 1002
 // `wrong_place`. Seeds 1 and 1000 are mapped from notes, with no replay. The rest are plain extra seeds
@@ -701,6 +702,9 @@ impl Run {
 
     // take what each key reads after a crash as the truth, once it's at or above what a sync covered
     fn reconcile(&mut self, store: &Store) {
+        let mut report = MaintenanceReport::new();
+        store.maintenance_report(&mut report);
+        assert_eq!(report.unlinks_refused, SegmentCount(0), "seed {}: the counts called a live row dead", self.seed);
         for ((column, key), versions) in &mut self.model {
             let found = match read(store, *column, key) {
                 Ok(found) => found,

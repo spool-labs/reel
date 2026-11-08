@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::JobKind;
+use reel_api::maintenance_report::{JobKind, UnitKind};
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, WritePlace};
 
@@ -83,6 +83,7 @@ pub struct BlockCounts {
     pub frees: Vec<FreeRecord>,
     pub overflowed: Vec<SegmentNumber>,
     pub read_bytes: ByteCount,
+    pub rows: u64,
 }
 
 impl BlockCounts {
@@ -93,6 +94,7 @@ impl BlockCounts {
             frees: touched_capacity(MOST_BLOCK_FREES, FreeRecord::default()),
             overflowed: touched_capacity(MOST_BLOCK_FREES, SegmentNumber(0)),
             read_bytes: ByteCount(0),
+            rows: 0,
         }
     }
 
@@ -108,6 +110,7 @@ impl BlockCounts {
         self.frees.clear();
         self.overflowed.clear();
         self.read_bytes = ByteCount(0);
+        self.rows = 0;
     }
 
     /// Count a row dead, and note a large record so its blocks can go
@@ -314,6 +317,7 @@ impl<Backend: Io> BlockCounter<Backend> {
         let mut last_place = WritePlace(u64::MAX);
 
         while let Some(row) = walk.next_row(&mut self.key) {
+            counts.rows += 1;
             debug_assert!(self.last_column != Some(block.column) || self.last_key != self.key || row.place < last_place);
             last_place = row.place;
             if row.kind == RowKind::RangeDelete {
@@ -448,7 +452,9 @@ impl<Backend: Io> WalkJob<Backend> {
         let state = Arc::clone(&self.state);
         let volume = &state.volumes[self.volume];
         let mut counts = mem::take(&mut self.counts);
+        let started = state.io.now();
         let outcome = self.counter.count(volume, target, &mut counts);
+        state.note_unit(UnitKind::WalkBlock, counts.rows, started);
         let landed = outcome.and_then(|next_block| self.land(volume, target, next_block, &mut counts));
         self.counts = counts;
         landed
@@ -517,7 +523,10 @@ impl<Backend: Io> WalkJob<Backend> {
         let Some(target) = self.target else {
             return UnitStep::Idle;
         };
-        match self.apply.step() {
+        let started = self.state.io.now();
+        let applied = self.apply.step();
+        self.state.note_unit(UnitKind::CoverApply, 1, started);
+        match applied {
             Ok(ApplyStep::Working) => UnitStep::Worked,
             Ok(ApplyStep::Done) => {
                 self.end_apply(volume, target.segment);
@@ -711,7 +720,9 @@ impl<Backend: Io> Job for WalkWorker<Backend> {
         // blocks reach a worker out of order, so each one finds the key before it
         self.counter.last_column = None;
         self.counter.is_next_key_unknown = false;
+        let started = state.io.now();
         let counted = self.counter.count(volume, *target, counts);
+        state.note_unit(UnitKind::WalkBlock, counts.rows, started);
         let phase = match counted {
             Ok(position) => {
                 *next_block = position;

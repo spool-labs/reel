@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::{JobKind, PickOutcome};
+use reel_api::maintenance_report::{JobKind, PickOutcome, UnitKind};
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, DeathMark, FileOffset, RootId, RowCount, WritePlace};
 
@@ -59,6 +59,8 @@ pub const SHARE_SCALE: u64 = 1_000_000;
 pub const MOST_KEPT_BLOCKS: usize = 1_024;
 /// Rows one step of a merge decides
 pub const MERGE_STEP_ROWS: usize = 4_096;
+/// Records one step of a stripe's copy takes, a few waves of eight ranged reads
+pub const COPY_STEP_RECORDS: usize = 64;
 /// The widest span of a segment one stripe of a record rewrite covers
 pub const MOST_STRIPE_BYTES: u64 = 256 * 1024 * 1024;
 /// Rows a stripe lists at once. A span with more narrows to the half with the lowest offsets
@@ -289,6 +291,8 @@ pub struct RewriteJob<Backend: Io> {
     stripe: Vec<StripeRow>,
     stripe_start: u64,
     stripe_end: u64,
+    stripe_copied: Option<usize>,
+    unit: (UnitKind, u64),
     row_ordinal: usize,
     is_ordered: bool,
     /// Tests of a merge's cut set this, since an offset-order copy runs to one output
@@ -371,6 +375,8 @@ impl<Backend: Io> RewriteJob<Backend> {
             stripe: touched_capacity(MOST_STRIPE_ROWS, StripeRow::default()),
             stripe_start: 0,
             stripe_end: 0,
+            stripe_copied: None,
+            unit: (UnitKind::MergeRows, 0),
             row_ordinal: 0,
             is_ordered: false,
             is_key_order_held: false,
@@ -692,6 +698,8 @@ impl<Backend: Io> RewriteJob<Backend> {
         let Some(target) = self.target else {
             return;
         };
+        let started = self.state.io.now();
+        self.unit = (UnitKind::MergeRows, 0);
         let outcome = match self.phase {
             RewritePhase::Deciding | RewritePhase::Copying if !self.is_drained && !self.is_cutting => self.merge_rows(),
             RewritePhase::Deciding => self.end_deciding(target),
@@ -700,6 +708,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             RewritePhase::Moving => self.move_blocks(target),
             RewritePhase::Installing => self.install(),
         };
+        self.state.note_unit(self.unit.0, self.unit.1, started);
         if outcome.is_err() {
             self.abandon();
         }
@@ -722,6 +731,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
 
         for _row in 0..MERGE_STEP_ROWS {
+            self.unit.1 += 1;
             let Some(index) = self.next_input() else {
                 self.is_drained = true;
                 return Ok(());
@@ -1126,18 +1136,25 @@ impl<Backend: Io> RewriteJob<Backend> {
         (self.is_ordered && self.is_marked(ordinal)).then(|| FileOffset(u64::from(self.placed[ordinal])))
     }
 
-    /// Walk a step of the input's rows, listing the marked ones in this stripe, and copy the stripe once the rows run out
+    /// Walk a step of the input's rows, listing the marked ones in this stripe, and copy the stripe a step at a time once the
+    /// rows run out
     pub fn place_rows(&mut self) -> Result<()> {
         let state = Arc::clone(&self.state);
         let volume = &state.volumes[self.volume];
         let Some(pin) = volume.table.pin(self.numbers[0]) else {
             return Err(Error::from(ErrorKind::NotFound));
         };
+        if self.stripe_copied.is_some() {
+            return self.copy_stripe(&pin.file);
+        }
         if self.inputs[0].row.is_none() && self.inputs[0].length == 0 {
             self.inputs[0].advance(volume, &pin)?;
         }
         for _row in 0..MERGE_STEP_ROWS {
+            self.unit.1 += 1;
             let Some(row) = self.inputs[0].row else {
+                self.stripe.sort_unstable_by_key(|listed| listed.offset);
+                self.stripe_copied = Some(0);
                 return self.copy_stripe(&pin.file);
             };
             let ordinal = self.row_ordinal;
@@ -1163,18 +1180,26 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.stripe.push(StripeRow { offset: row.offset, length: row.length, ordinal: ordinal as u32 });
     }
 
-    /// Copy a stripe's records in offset order, and go round for the next stripe or on to the footer once the records run out
+    /// Copy a step of a stripe's records in offset order, and once the stripe is across go round for the next one, or on to the
+    /// footer once the records run out
     pub fn copy_stripe(&mut self, from: &Backend::File) -> Result<()> {
         let Some(output) = self.output.clone() else {
             return Err(Error::from(ErrorKind::NotFound));
         };
-        self.stripe.sort_unstable_by_key(|listed| listed.offset);
-        for index in 0..self.stripe.len() {
+        let first = self.stripe_copied.unwrap_or(0);
+        let end = (first + COPY_STEP_RECORDS).min(self.stripe.len());
+        self.unit = (UnitKind::StripeCopy, (end - first) as u64);
+        for index in first..end {
             let listed = self.stripe[index];
             let row = FooterRow { place: WritePlace(0), offset: listed.offset, length: listed.length, kind: RowKind::Value };
             let at = self.copy_record(from, &output.file, &row)?;
             self.placed[listed.ordinal as usize] = at.0 as u32;
         }
+        if end < self.stripe.len() {
+            self.stripe_copied = Some(end);
+            return Ok(());
+        }
+        self.stripe_copied = None;
         self.stripe.clear();
         self.row_ordinal = 0;
         self.inputs[0].rewind();
@@ -1194,6 +1219,7 @@ impl<Backend: Io> RewriteJob<Backend> {
     /// End the copying. Several inputs becoming one wins back overlap whatever it dropped, and one input that dropped nothing
     /// has nothing to install
     pub fn finish_rows(&mut self) -> Result<()> {
+        self.unit = (UnitKind::Footer, self.writer.entries().len() as u64);
         let Some(output) = self.output.clone() else {
             return Err(Error::from(ErrorKind::NotFound));
         };
@@ -1219,10 +1245,12 @@ impl<Backend: Io> RewriteJob<Backend> {
         let from = target.blocks_at.0 + self.moved;
         let left = self.writer.position().0 - from;
         if distance == 0 || left == 0 || self.writer.columns().is_empty() {
+            self.unit = (UnitKind::Footer, self.writer.entries().len() as u64);
             return if self.is_cutting { self.cut_output(target, &output, distance) } else { self.finish_outputs(&output, distance) };
         }
 
         let part = left.min(self.buffer.len() as u64) as usize;
+        self.unit = (UnitKind::BlockMove, (part as u64).div_ceil(ROW_BLOCK_BYTES as u64));
         output.file.read_exact_at(FileOffset(from), &mut self.buffer[..part])?;
         output.file.write_at(FileOffset(from - distance), &[IoSlice::new(&self.buffer[..part])])?;
         self.moved += part as u64;
@@ -1366,6 +1394,8 @@ impl<Backend: Io> RewriteJob<Backend> {
     /// Swap the inputs for the outputs in every list, save that, and park the inputs. The count moves before the last look:
     /// a read or a cue that takes its point after it has every replacement under that point
     pub fn install(&mut self) -> Result<()> {
+        let outputs = self.staged.len() + usize::from(self.output.is_some()) + usize::from(self.grave_output.is_some());
+        self.unit = (UnitKind::Install, (self.input_count + outputs) as u64);
         self.install_with(|| {})
     }
 

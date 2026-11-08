@@ -13,9 +13,9 @@ use reel::engine::compact_job::{CompactJob, park};
 use reel::engine::cue::{Cue, CueTable};
 use reel::engine::open_segment::{OUTPUT_SUFFIX, data_path};
 use reel::engine::read_path::{RecordWant, WalkAsk};
-use reel::engine::planner::Planner;
+use reel::engine::planner::{Planner, unit_bound};
 use reel::engine::reel_store::ReelStore;
-use reel::engine::rewrite_job::{MERGE_BUFFER_BYTES, MOST_OVERLAP, MOST_PARK_WAITS, PLANNER_LANE, RewriteJob, RewritePhase, is_overlap_input, overlaps};
+use reel::engine::rewrite_job::{COPY_STEP_RECORDS, MERGE_BUFFER_BYTES, MOST_OVERLAP, MOST_PARK_WAITS, PLANNER_LANE, RewriteJob, RewritePhase, is_overlap_input, overlaps};
 use reel::engine::volume::{MOST_PARKED, NO_SEAL};
 use reel::engine::walk_job::{BlockCounter, WalkJob, WalkWorker};
 use reel::guard::hold;
@@ -29,7 +29,7 @@ use reel::segment::footer_writer::FooterWriter;
 use reel::segment::segment_table::{RetiredSegment, shard_of};
 use reel::segment::segment_tail::{BlockCount, MOST_MERGE_SEGMENTS, SegmentNumber, TailHead};
 use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::MaintenanceReport;
+use reel_api::maintenance_report::{MaintenanceReport, UnitKind};
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RootId, VolumeId, WritePlace};
 use reel_api::write_batch::WriteBatch;
 use reel_sim::seeded_random::Seed;
@@ -61,6 +61,7 @@ const UNWALKED_CRASH_STRIDE: u64 = 3;
 const SEAT_KEYS: u64 = 400;
 const WORKER_BUDGET: ByteCount = ByteCount(96 * 1024 * 1024);
 const LEAST_VALUE: u64 = 100;
+const STEPPED_COPY_KEYS: u64 = 8 * COPY_STEP_RECORDS as u64;
 const HAND_OUT_LINE: Duration = Duration::from_millis(1);
 const PARK_WAIT: Duration = Duration::from_secs(10);
 
@@ -2509,5 +2510,34 @@ fn value_under_the_least_lands_and_counts() {
         assert_eq!(read(&store, key), Some(short.clone()));
     }
     assert_eq!(read(&store, b"whole"), Some(whole));
+    store.close().expect("close");
+}
+
+// a record rewrite copies its stripe a step at a time, so no unit copies more records than its bound, however many the
+// stripe holds
+#[test]
+fn stripe_copies_in_steps() {
+    let io = SimulatedIo::new(Seed(88));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let key = |number: u64| format!("k-{number:05}").into_bytes();
+    for number in 0..STEPPED_COPY_KEYS {
+        store.put(COLUMN, &key(number), b"first").expect("put");
+    }
+    let older = seal(&store, &io);
+    for number in 0..STEPPED_COPY_KEYS * 3 / 4 {
+        store.put(COLUMN, &key(number), b"second").expect("put");
+    }
+    seal(&store, &io);
+    hold_compaction(&store, false);
+    store.state.ask_compaction();
+    settle(&io);
+    assert!(!store.state.volumes[0].table.holds(older), "the mostly dead segment never rewrote");
+    let mut report = MaintenanceReport::new();
+    store.maintenance_report(&mut report);
+    let copy = report.longest_units[UnitKind::StripeCopy.index()];
+    assert!(copy.work > 0, "no stripe copied");
+    assert!(copy.work <= unit_bound(UnitKind::StripeCopy).expect("a bound"), "a stripe copy took {} records", copy.work);
+    assert_eq!(read(&store, &key(STEPPED_COPY_KEYS - 1)), Some(b"first".to_vec()));
     store.close().expect("close");
 }

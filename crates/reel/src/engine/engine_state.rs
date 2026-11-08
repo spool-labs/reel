@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use reel_api::column_id::ColumnId;
+use reel_api::maintenance_report::UnitKind;
 use reel_api::memory_report::MemoryReport;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, SegmentCount, WritePlace};
@@ -14,7 +15,7 @@ use reel_api::units::{ByteCount, FileOffset, Nanoseconds, SegmentCount, WritePla
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::cue::{CueTable, JobCounts};
 use crate::engine::engine_sizing::EngineSizing;
-use crate::engine::job_tally::JobTallies;
+use crate::engine::job_tally::{JobTallies, UnitTallies};
 use crate::engine::open_segment::{RecordWindow, RowQueue};
 use crate::engine::compact_job::park;
 use crate::engine::open_segment::{data_path, output_path, rows_path};
@@ -111,6 +112,7 @@ pub struct EngineState<Backend: Io> {
     pub damaged_segments: AtomicU64,
     pub dropped_summary_rows: AtomicU64,
     pub tallies: JobTallies,
+    pub units: UnitTallies,
     pub opened_at: Nanoseconds,
     pub graves_at_open: AtomicU64,
     pub graves_dropped: AtomicU64,
@@ -119,6 +121,7 @@ pub struct EngineState<Backend: Io> {
     pub corruption_errors: AtomicU64,
     pub is_arena_full: AtomicBool,
     pub arena_fill: AtomicU64,
+    pub unlinks_refused: AtomicU64,
     pub memory_budget: ByteCount,
     pub seal_heap: AtomicU64,
     pub compaction_heap: AtomicU64,
@@ -245,13 +248,19 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// Write a volume's summary whole from a copy, so no lock is held over the writes, and one save runs at a time
     pub fn save_summary(&self, volume: &Volume<Backend>) -> Result<(), Error> {
+        volume.summary_saves.fetch_add(1, Ordering::Relaxed);
         volume.summary_buffer.with(|buffer| {
+            let started = self.io.now();
             buffer.clear();
             let rows = hold(&volume.summary);
             buffer.extend_from_slice(rows.bytes());
             let forward = rows.highest_forward;
             drop(rows);
-            write_summary(&self.io, &volume.summary_paths, self.read_point(volume), forward, buffer)
+            let bytes = buffer.len() as u64;
+            self.note_unit(UnitKind::SummaryCopy, bytes, started);
+            let saved = write_summary(&self.io, &volume.summary_paths, self.read_point(volume), forward, buffer);
+            self.note_unit(UnitKind::SummarySave, bytes, started);
+            saved
         })
     }
 

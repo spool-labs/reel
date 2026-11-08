@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
 use reel_api::maintenance_report::{
-    CompleteReading, JOB_KINDS, JobKind, JobState, LeastValueReading, MOST_REPORTED_LANES, MaintenanceReport, RewriteBytes, VolumeReading,
+    CompleteReading, JOB_KINDS, JobKind, JobState, LeastValueReading, MOST_REPORTED_LANES, MaintenanceReport, RewriteBytes, UnitKind, VolumeReading,
 };
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, Nanoseconds, RootId, RowCount, SegmentCount, VolumeId};
@@ -28,6 +28,12 @@ impl<Backend: Io> EngineState<Backend> {
     /// Count bytes a job moved
     pub fn note_moved(&self, kind: JobKind, bytes: ByteCount) {
         self.tallies[kind.index()].note_moved(bytes, self.io.now());
+    }
+
+    /// Note one maintenance unit's work and how long it ran from its start
+    pub fn note_unit(&self, kind: UnitKind, work: u64, started: Nanoseconds) {
+        let time = Nanoseconds(self.io.now().0.saturating_sub(started.0));
+        self.units[kind.index()].note(work, time);
     }
 
     /// Count a corruption error on its way to a caller
@@ -168,6 +174,7 @@ impl<Backend: Io> EngineState<Backend> {
                 plain_bar_rewrites: volume.plain_bar_rewrites.load(Ordering::Acquire),
                 longest_seal_steps: volume.seal_steps.reading(),
                 key_order_copies: volume.key_order_copies.load(Ordering::Acquire),
+                summary_saves: volume.summary_saves.load(Ordering::Acquire),
                 entries_used: SegmentCount(volume.table.segment_count()),
                 entry_room: SegmentCount(volume.table.capacity() as u64),
                 entry_bytes: volume.entry_bytes,
@@ -211,6 +218,9 @@ impl<Backend: Io> EngineState<Backend> {
         report.empties_left = SegmentCount(empties);
         report.stray_outputs = SegmentCount(strays);
         report.has_ring = self.ring.is_some();
+        for (reading, tally) in report.longest_units.iter_mut().zip(&self.units) {
+            *reading = tally.reading();
+        }
         let fill = self.arena_fill.load(Ordering::Relaxed);
         report.arena_fill = (fill > 0).then_some(Nanoseconds(fill));
         report.reclaim_retries = RowCount(retries);
@@ -220,6 +230,7 @@ impl<Backend: Io> EngineState<Backend> {
         report.graves_carried = RowCount(self.graves_carried.load(Ordering::Relaxed));
         report.rewrites_reclaiming_nothing = SegmentCount(self.empty_rewrites.load(Ordering::Relaxed));
         report.corruption_errors = RowCount(self.corruption_errors.load(Ordering::Relaxed));
+        report.unlinks_refused = SegmentCount(self.unlinks_refused.load(Ordering::Relaxed));
         report.damaged_segments = SegmentCount(self.damaged_segments.load(Ordering::Acquire));
         report.summary_rows_dropped = RowCount(self.dropped_summary_rows.load(Ordering::Acquire));
         report.refused_reads = RowCount(self.cues.refused_reads());

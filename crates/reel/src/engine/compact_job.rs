@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::JobKind;
+use reel_api::maintenance_report::{JobKind, UnitKind};
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, Nanoseconds, WritePlace};
 
@@ -53,6 +53,28 @@ pub struct HeldPass {
     pub is_whole: bool,
 }
 
+/// A pass that proves a candidate's rows dead before its unlink
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConfirmPass {
+    pub segment: SegmentNumber,
+    pub next_block: u32,
+}
+
+/// What one step of a confirmation found
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RowsProof {
+    /// Every row of the block is dead
+    Dead,
+    /// No block is left, so every row is dead
+    Finished,
+    /// A row stands live, so the counts are wrong
+    Live,
+    /// A block or a row couldn't be read, so nothing is proven
+    Unread,
+    /// The segment left during the pass
+    Gone,
+}
+
 /// What keeps a cover in the pool
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Blocker {
@@ -70,10 +92,10 @@ pub struct CompactJob<Backend: Io> {
     pub volume: usize,
     pub retry_at: Option<Nanoseconds>,
     pub rewrite: RewriteJob<Backend>,
-    /// One rewrite for each of the volume's workers
     pub seats: Arc<Vec<RewriteSeat<Backend>>>,
     handed_at: u64,
     held_pass: Option<HeldPass>,
+    confirm_pass: Option<ConfirmPass>,
     should_rewrite: bool,
     last_tried: SegmentNumber,
     settle_at: usize,
@@ -84,6 +106,7 @@ pub struct CompactJob<Backend: Io> {
     key: Vec<u8>,
     row_key: Vec<u8>,
     end: Vec<u8>,
+    unit: Option<(UnitKind, u64)>,
 }
 
 impl<Backend: Io> CompactJob<Backend> {
@@ -99,7 +122,9 @@ impl<Backend: Io> CompactJob<Backend> {
             seats: Arc::new(seats),
             handed_at: 0,
             should_rewrite: false,
+            unit: None,
             held_pass: None,
+            confirm_pass: None,
             state,
             volume,
             retry_at: None,
@@ -125,9 +150,23 @@ impl<Backend: Io> CompactJob<Backend> {
 
     /// Step once: try the next segment the counts call dead, or nothing when none is
     pub fn step_unit(&mut self, now: Nanoseconds) -> UnitStep {
-        match self.step_work(now) {
+        let started = self.state.io.now();
+        self.unit = None;
+        let step = match self.step_work(now) {
             UnitStep::Idle if self.has_parked() => UnitStep::RetryAt(Nanoseconds(now.0 + PARKED_RETRY.0)),
             step => step,
+        };
+        // a rewrite's step notes its own unit, the same on the planner and on a worker
+        if let Some((kind, work)) = self.unit.take() {
+            self.state.note_unit(kind, work, started);
+        }
+        step
+    }
+
+    /// Count work into the unit under way
+    pub fn add_work(&mut self, work: u64) {
+        if let Some(unit) = &mut self.unit {
+            unit.1 += work;
         }
     }
 
@@ -163,6 +202,7 @@ impl<Backend: Io> CompactJob<Backend> {
             }
         }
         if let Some(parked) = self.take_parked(volume) {
+            self.unit = Some((UnitKind::ParkedClear, 1));
             return match state.clear_parked(volume, parked) {
                 Ok(()) => UnitStep::Worked,
                 Err(parked) => {
@@ -173,13 +213,22 @@ impl<Backend: Io> CompactJob<Backend> {
         }
         // a live cue may still need what it kept, and its going brings the planner back
         if state.cues.is_empty() && volume.has_kept_covers.swap(false, Ordering::AcqRel) {
+            self.unit = Some((UnitKind::CoverSweep, 0));
             self.sweep_covers(volume);
             return UnitStep::Worked;
         }
         if state.cues.is_empty() && volume.has_held_frees.load(Ordering::Acquire) {
+            self.unit = Some((UnitKind::HeldFrees, 0));
             return match self.step_held_pass(volume) {
                 Ok(()) => UnitStep::Worked,
                 Err(_) => UnitStep::RetryAt(Nanoseconds(now.0 + WALK_RETRY.0)),
+            };
+        }
+        if self.confirm_pass.is_some() {
+            self.unit = Some((UnitKind::UnlinkCheck, 0));
+            return match self.step_confirm(volume) {
+                Ok(()) => UnitStep::Worked,
+                Err(_) => self.wait_for_retry(now),
             };
         }
         self.hand_out_on_change(volume);
@@ -187,6 +236,7 @@ impl<Backend: Io> CompactJob<Backend> {
             self.rewrite.step();
             return UnitStep::Worked;
         }
+        self.unit = Some((UnitKind::Pick, 1));
         if self.start_rebuild(volume) {
             return UnitStep::Worked;
         }
@@ -299,7 +349,9 @@ impl<Backend: Io> CompactJob<Backend> {
             return Err(Error::from(ErrorKind::InvalidData));
         };
         let mut is_whole = pass.is_whole;
+        let mut rows = 0;
         while let Some(row) = walk.next_row(&mut self.key) {
+            rows += 1;
             if row.kind != RowKind::Value || row.length < FREE_IN_PLACE_BYTES {
                 continue;
             }
@@ -324,6 +376,7 @@ impl<Backend: Io> CompactJob<Backend> {
             is_whole,
             ..pass
         });
+        self.add_work(rows);
         Ok(())
     }
 
@@ -546,14 +599,14 @@ impl<Backend: Io> CompactJob<Backend> {
             return None;
         }
         let rows = hold(&volume.summary);
-        let dead = rows.rows().filter(is_wholly_dead);
+        let dead = rows.rows().filter(is_wholly_dead).filter(|row| !volume.table.is_unproven(row.facts.segment));
         let after = dead.clone().filter(|row| row.facts.segment > self.last_tried).min_by_key(|row| row.facts.segment);
         let picked = after.or_else(|| dead.min_by_key(|row| row.facts.segment));
         picked.map(|row| row.facts.segment)
     }
 
-    /// Confirm a candidate from its block counts and unlink it. A cue that stands in the way brings the planner back as it
-    /// goes, and counts that haven't landed bring it back with the walk that lands them
+    /// Check a candidate's counts and start the pass that proves its rows dead. A cue that stands in the way brings the planner
+    /// back as it goes, and counts that haven't landed bring it back with the walk that lands them
     pub fn confirm(&mut self, volume: &Volume<Backend>, segment: SegmentNumber) -> Result<()> {
         self.last_tried = segment;
         let Some(highest_replacement) = volume.table.dead_replacement(segment) else {
@@ -562,58 +615,107 @@ impl<Backend: Io> CompactJob<Backend> {
         if self.state.cues.holds_back(self.volume, highest_replacement) {
             return Ok(());
         }
-        if cfg!(debug_assertions) {
-            self.check_rows(volume, segment)?;
+        if !volume.can_park(1) || self.state.read_point(volume) < highest_replacement {
+            return Ok(());
         }
+        // a cover decides a segment wholly inside it, and no count does
+        if is_under_applied_cover(volume, segment) {
+            volume.wants_compaction.store(true, Ordering::Release);
+            return self.unlink(volume, segment, highest_replacement);
+        }
+        self.confirm_pass = Some(ConfirmPass { segment, next_block: 0 });
+        Ok(())
+    }
+
+    /// Prove one more block of a candidate's rows dead, and unlink it once none is left. Counts alone never unlink a segment,
+    /// so a wrong count costs its space and keeps its rows
+    pub fn step_confirm(&mut self, volume: &Volume<Backend>) -> Result<()> {
+        let Some(pass) = self.confirm_pass else {
+            return Ok(());
+        };
+        let proof = self.prove_block(volume, pass)?;
+        if proof == RowsProof::Dead {
+            self.confirm_pass = Some(ConfirmPass { next_block: pass.next_block + 1, ..pass });
+            return Ok(());
+        }
+        self.confirm_pass = None;
         volume.wants_compaction.store(true, Ordering::Release);
+        match proof {
+            RowsProof::Finished => self.finish_confirm(volume, pass.segment),
+            RowsProof::Live => {
+                self.state.unlinks_refused.fetch_add(1, Ordering::Relaxed);
+                volume.table.flag_unproven(pass.segment);
+                Ok(())
+            },
+            RowsProof::Unread => {
+                volume.table.flag_unproven(pass.segment);
+                Ok(())
+            },
+            RowsProof::Dead | RowsProof::Gone => Ok(()),
+        }
+    }
+
+    /// Unlink a segment whose rows are all proven dead, if its counts still say so
+    pub fn finish_confirm(&self, volume: &Volume<Backend>, segment: SegmentNumber) -> Result<()> {
+        if volume.is_applying.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let Some(highest_replacement) = volume.table.dead_replacement(segment) else {
+            return Ok(());
+        };
+        if self.state.cues.holds_back(self.volume, highest_replacement) {
+            return Ok(());
+        }
         self.unlink(volume, segment, highest_replacement)
     }
 
-    /// Check every row of a segment the counts call dead has a newer version in some sealed segment, or sits in a damaged
-    /// range, where a rotted replacement can't show itself. Only a debug build comes here, so the seed sweep proves each
-    /// unlink row by row
-    pub fn check_rows(&mut self, volume: &Volume<Backend>, segment: SegmentNumber) -> Result<()> {
-        let Some(pin) = volume.table.pin(segment) else {
-            return Ok(());
+    /// Check every row of a block has a newer version in some sealed segment or lies under an applied cover, or sits in a
+    /// damaged range, where a rotted replacement can't show itself
+    pub fn prove_block(&mut self, volume: &Volume<Backend>, pass: ConfirmPass) -> Result<RowsProof> {
+        let Some(pin) = volume.table.pin(pass.segment) else {
+            return Ok(RowsProof::Gone);
         };
-        let mut index = 0;
-        while let Some(block) = volume.table.walk_block(segment, index) {
-            index += 1;
-            let length = block.entry.block_length().0 as usize;
-            if length > self.block.len() {
-                return Ok(());
+        let Some(block) = volume.table.walk_block(pass.segment, pass.next_block) else {
+            return Ok(RowsProof::Finished);
+        };
+        let length = block.entry.block_length().0 as usize;
+        if length > self.block.len() {
+            return Ok(RowsProof::Unread);
+        }
+        match pin.file.read_exact_at(block.entry.block_at(), &mut self.block[..length]) {
+            Ok(()) => {},
+            Err(error) if is_device_error(&error) => return Ok(RowsProof::Unread),
+            Err(error) => return Err(error),
+        }
+        let Some(mut walk) = RowBlockWalk::open(&self.block[..length], pin.head.place_base) else {
+            return Ok(RowsProof::Unread);
+        };
+        let mut rows = 0;
+        while let Some(row) = walk.next_row(&mut self.key) {
+            // a settled cover's row counts dead with nothing above it
+            rows += 1;
+            if row.kind == RowKind::RangeDelete {
+                continue;
             }
-            match pin.file.read_exact_at(block.entry.block_at(), &mut self.block[..length]) {
-                Ok(()) => {},
-                // a block no read can give back has nothing to check against
-                Err(error) if is_device_error(&error) => return Ok(()),
-                Err(error) => return Err(error),
-            }
-            let Some(mut walk) = RowBlockWalk::open(&self.block[..length], pin.head.place_base) else {
-                return Ok(());
+            let Ok(read) = self.state.key_read(block.column, &self.key, WritePlace(u64::MAX), false) else {
+                return Ok(RowsProof::Unread);
             };
-            while let Some(row) = walk.next_row(&mut self.key) {
-                // a settled cover's row counts dead with nothing above it
-                if row.kind == RowKind::RangeDelete {
-                    continue;
-                }
-                let Ok(read) = self.state.key_read(block.column, &self.key, WritePlace(u64::MAX), false) else {
-                    return Ok(());
-                };
-                match in_place(self.state.search_footers(&InPlace, volume, &read)) {
-                    Ok(newest) => {
-                        let is_replaced = newest.is_some_and(|found| found.row.place > row.place);
-                        let is_covered = volume.covers.newest_over(block.column, &self.key, WritePlace(u64::MAX)).is_some_and(|cover| cover > row.place);
-                        // damage only answers for a row it could be newer than
-                        let is_hidden = volume.damage.covering(block.column, &self.key).is_some_and(|highest| highest > row.place);
-                        debug_assert!(is_replaced || is_covered || is_hidden, "the counts call a live row dead");
-                    },
-                    Err(StoreError::Corruption { .. }) => return Ok(()),
-                    Err(_error) => return Err(Error::from(ErrorKind::Interrupted)),
-                }
+            match in_place(self.state.search_footers(&InPlace, volume, &read)) {
+                Ok(newest) => {
+                    let is_replaced = newest.is_some_and(|found| found.row.place > row.place);
+                    let is_covered = volume.covers.newest_applied(block.column, &self.key).is_some_and(|cover| cover > row.place);
+                    // damage only answers for a row it could be newer than
+                    let is_hidden = volume.damage.covering(block.column, &self.key).is_some_and(|highest| highest > row.place);
+                    if !is_replaced && !is_covered && !is_hidden {
+                        return Ok(RowsProof::Live);
+                    }
+                },
+                Err(StoreError::Corruption { .. }) => return Ok(RowsProof::Unread),
+                Err(_error) => return Err(Error::from(ErrorKind::Interrupted)),
             }
         }
-        Ok(())
+        self.add_work(rows);
+        Ok(RowsProof::Dead)
     }
 
     /// Take the segment out of every list and save that, once its replacements are published and no cue reads below them,
@@ -669,6 +771,24 @@ pub fn park<Backend: Io>(
         *slot = Some(ParkedSegment { retired, segment, is_saved });
         volume.segments_parked.fetch_add(1, Ordering::AcqRel);
     }
+}
+
+/// Check every column of a segment lies wholly inside an applied cover above its rows. A summary's range can only be wider
+/// than the truth
+pub fn is_under_applied_cover<Backend: Io>(volume: &Volume<Backend>, segment: SegmentNumber) -> bool {
+    let rows = hold(&volume.summary);
+    let Some(row) = rows.get(segment) else {
+        return false;
+    };
+    let covers = volume.covers.read();
+    let mut cursor = row.cursor();
+    (0..row.column_count).all(|_column| {
+        cursor.column().is_some_and(|facts| {
+            let place = row.facts.places.highest;
+            let cover = Cover { column: facts.column, start: facts.lowest, end: facts.bound, place, segment };
+            !facts.bound.is_empty() && covers.is_inside_newer(&cover, true)
+        })
+    })
 }
 
 /// Check a row's counts say nothing in its segment is live. Rows with damage or covers answer for more than their rows

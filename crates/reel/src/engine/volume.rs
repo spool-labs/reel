@@ -244,6 +244,8 @@ pub struct Volume<Backend: Io> {
     pub plain_bar_rewrites: AtomicU64,
     /// Record rewrites that copied in key order, reading records at random
     pub key_order_copies: AtomicU64,
+    /// Whole summary saves since open
+    pub summary_saves: AtomicU64,
     pub order: WriteOrder,
     pub rows_in_index: AtomicU64,
     pub seal_steps: SealStepTimes,

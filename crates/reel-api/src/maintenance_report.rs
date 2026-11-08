@@ -40,6 +40,81 @@ impl JobKind {
     }
 }
 
+/// Every kind of maintenance unit, in the order a report lists them
+pub const UNIT_KINDS: [UnitKind; 15] = [
+    UnitKind::WalkBlock,
+    UnitKind::MergeRows,
+    UnitKind::StripeCopy,
+    UnitKind::BlockMove,
+    UnitKind::Footer,
+    UnitKind::Install,
+    UnitKind::UnlinkCheck,
+    UnitKind::HeldFrees,
+    UnitKind::CoverApply,
+    UnitKind::CoverSweep,
+    UnitKind::FilterLoad,
+    UnitKind::ParkedClear,
+    UnitKind::Pick,
+    UnitKind::SummaryCopy,
+    UnitKind::SummarySave,
+];
+
+/// A kind of maintenance unit. A job runs as units, and each kind's work is counted in what its line says
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum UnitKind {
+    /// One row block of the dead-byte walk, in rows
+    WalkBlock,
+    /// A step of a merge's or rewrite's row decisions, in rows
+    MergeRows,
+    /// A step of a record rewrite's stripe copy, in records
+    StripeCopy,
+    /// A step moving a rewrite's row blocks down to its records' end, in row blocks
+    BlockMove,
+    /// Writing a rewrite's footer, in row blocks
+    Footer,
+    /// A rewrite's install, in segments listed and retired
+    Install,
+    /// A step of the check that every row of a segment is dead before it unlinks, in rows
+    UnlinkCheck,
+    /// A step freeing a flagged segment's large dead records, in rows
+    HeldFrees,
+    /// A step of a segment's range deletes, in steps
+    CoverApply,
+    /// Dropping the range deletes nothing needs any more, in covers
+    CoverSweep,
+    /// A step loading filters into the arena, in filter blocks
+    FilterLoad,
+    /// Giving back a file no read holds any more, in files
+    ParkedClear,
+    /// A look for the next job, in looks
+    Pick,
+    /// Copying the summary out under its lock for a save, in bytes
+    SummaryCopy,
+    /// Saving the whole summary, the copy and the write, in bytes
+    SummarySave,
+}
+
+impl UnitKind {
+    /// Read this kind's place in `UNIT_KINDS`
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// The largest unit of one kind since open, in work and in wall time, and the sums over every unit. The two largest can come
+/// from different units
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct UnitReading {
+    /// The most work one unit did
+    pub work: u64,
+    /// The longest one unit ran
+    pub time: Nanoseconds,
+    /// The work every unit did
+    pub work_sum: u64,
+    /// The time every unit ran
+    pub time_sum: Nanoseconds,
+}
+
 /// What a job is doing
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum JobState {
@@ -88,6 +163,8 @@ pub struct VolumeReading {
     pub longest_seal_steps: SealSteps,
     /// Record rewrites that copied in key order, reading records at random
     pub key_order_copies: u64,
+    /// Whole summary saves since open
+    pub summary_saves: u64,
     /// Segments the table holds now
     pub entries_used: SegmentCount,
     /// Segments the table has room for, which the disk sets when its size is known
@@ -201,8 +278,11 @@ pub struct MaintenanceReport {
     pub stray_outputs: SegmentCount,
     /// How long the filter arena took to fill after open, which is the store's restart window
     pub arena_fill: Option<Nanoseconds>,
+    /// Unlinks refused because a row the counts called dead stands live, which is always none
+    pub unlinks_refused: SegmentCount,
     /// Async reads complete through the ring, and through the blocking pool when this is false
     pub has_ring: bool,
+    pub longest_units: [UnitReading; UNIT_KINDS.len()],
 }
 
 impl JobReport {
@@ -248,7 +328,9 @@ impl MaintenanceReport {
             empties_left: SegmentCount::default(),
             stray_outputs: SegmentCount::default(),
             arena_fill: None,
+            unlinks_refused: SegmentCount::default(),
             has_ring: false,
+            longest_units: [UnitReading::default(); UNIT_KINDS.len()],
         }
     }
 }

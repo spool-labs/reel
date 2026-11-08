@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use reel::engine::planner::unit_bound;
 use reel::engine::reel_store::ReelStore;
 use reel::engine::rewrite_job::{SHARE_SCALE, reclaim_share};
 use reel::engine::walk_job::FREE_IN_PLACE_BYTES;
@@ -22,9 +23,10 @@ use reel::io::plain::PlainIo;
 use reel::segment::filter_arena::FilterArena;
 use reel::segment::segment_tail::SegmentNumber;
 use reel_api::direction::Direction;
+use reel_api::maintenance_report::{MaintenanceReport, UNIT_KINDS};
 use reel_api::scan::ScanStep;
 use reel_api::store_error::StoreError;
-use reel_api::units::ByteCount;
+use reel_api::units::{ByteCount, Nanoseconds};
 use reel_api::value_list::ValueList;
 use reel_api::write_batch::WriteBatch;
 
@@ -49,6 +51,8 @@ const SMALL_BYTES: usize = 100;
 const CHUNKED_BYTES: usize = 200_000;
 const BURST_RECORDS: usize = 8_000;
 const BURST_FREES: usize = BURST_RECORDS / 2;
+/// The longest any unit with a work bound may run on real files, a small multiple of the worst measured on the churn and insert arms
+const UNIT_TIME_LINE: Nanoseconds = Nanoseconds(100_000_000);
 const LONG_GET_BYTES: usize = 4 * 1024 * 1024;
 const ROUNDS: usize = 1_500;
 const FLUSH_ROUNDS: usize = 64;
@@ -714,6 +718,7 @@ fn main() {
     let freed = store.state.volumes[0].bytes_freed.load(Ordering::Acquire) - freed_before;
     let rewritten = store.state.volumes[0].segments_rewritten.load(Ordering::Acquire) - rewritten_before;
     let threads_after = thread_faults();
+    let unit_failures = check_units(&store);
 
     let allocations_before_close = ALLOCATIONS.load(Ordering::Acquire);
     IS_WINDOW.store(true, Ordering::Release);
@@ -741,7 +746,7 @@ fn main() {
     println!("{unlinked} unlinks in the window");
     println!("{freed} bytes freed in place in the window");
     println!("{rewritten} rewrites in the window");
-    failures += free_burst();
+    failures += free_burst() + unit_failures;
     if unlinked == 0 || freed == 0 || rewritten == 0 {
         failures += 1;
     }
@@ -758,4 +763,20 @@ fn touch_stack() {
         *byte = 1;
     }
     std::hint::black_box(&mut stretch);
+}
+
+// every unit with a work bound stays under it and under the time line, and the longest of each kind shows
+fn check_units(store: &Store) -> u64 {
+    let mut report = MaintenanceReport::new();
+    store.maintenance_report(&mut report);
+    let mut failures = 0;
+    for (kind, reading) in UNIT_KINDS.iter().zip(&report.longest_units) {
+        let bound = unit_bound(*kind);
+        println!("unit {kind:?}: {} work, {} us", reading.work, reading.time.0 / 1_000);
+        if bound.is_some_and(|bound| reading.work > bound) || (bound.is_some() && reading.time > UNIT_TIME_LINE) {
+            println!("unit {kind:?} is past its bound {bound:?} or the {} ms line", UNIT_TIME_LINE.0 / 1_000_000);
+            failures += 1;
+        }
+    }
+    failures
 }

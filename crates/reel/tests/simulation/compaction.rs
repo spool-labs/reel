@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
-use reel::engine::compact_job::{CompactJob, is_wholly_dead};
+use reel::engine::compact_job::{CompactJob, ConfirmPass, RowsProof, is_under_applied_cover, is_wholly_dead};
 use reel::engine::cue::MOST_CUES;
 use reel::engine::engine_sizing::COMPACT_JOB_BYTES;
 use reel::engine::open_segment::data_path;
@@ -21,7 +21,8 @@ use reel::segment::damage_list::DamagedRange;
 use reel::segment::segment_tail::SegmentNumber;
 use reel::segment::summary::{DeadCount, LostRows, SummaryPaths, SummaryRows, read_summary};
 use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, Nanoseconds, VolumeId, WritePlace};
+use reel_api::maintenance_report::MaintenanceReport;
+use reel_api::units::{ByteCount, Nanoseconds, SegmentCount, VolumeId, WritePlace};
 use reel_api::value_list::{ValueAnswer, ValueList};
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_disk::OperationCount;
@@ -365,9 +366,7 @@ fn unlink_looks_again() {
     store.close().expect("close");
 }
 
-// counts that call a live row dead break the summary's one promise, and a debug build's row check says so
-#[cfg(debug_assertions)]
-#[should_panic(expected = "the counts call a live row dead")]
+// counts that call a live row dead break the summary's one promise, and the rows refuse the unlink
 #[test]
 fn counts_alone() {
     let io = SimulatedIo::new(Seed(17));
@@ -402,9 +401,7 @@ fn counts_alone() {
     store.close().expect("close");
 }
 
-// the row check goes by place: an older version in a finished segment replaces nothing
-#[cfg(debug_assertions)]
-#[should_panic(expected = "the counts call a live row dead")]
+// the proof goes by place: an older version in a finished segment replaces nothing
 #[test]
 fn newest_stays() {
     let io = SimulatedIo::new(Seed(24));
@@ -937,9 +934,108 @@ fn replacement_survives_power_cut() {
     }
 }
 
-// damage older than a row says nothing about what replaced it, so counts that call that row dead still trip the check
-#[cfg(debug_assertions)]
-#[should_panic(expected = "the counts call a live row dead")]
+// a wrong count charges a block for a row it never lost
+fn charge_again(store: &Store, segment: SegmentNumber) {
+    let volume = &store.state.volumes[0];
+    let count = DeadCount { segment, column: COLUMN, block: 0, rows: 1, replacement: WritePlace(1), ..DeadCount::default() };
+    hold(&volume.summary).apply_counts(segment, &[count], None);
+    volume.table.drop_live(segment, 0, 1, WritePlace(1));
+}
+
+fn sealed_rows(store: &Store, io: &SimulatedIo, keys: &[&[u8]]) -> SegmentNumber {
+    for key in keys {
+        store.put(COLUMN, key, b"value").expect("put");
+    }
+    let number = hold(&store.state.volumes[0].claims).open[0].number;
+    store.seal_now();
+    settle(io);
+    number
+}
+
+fn read_key(store: &Store, key: &[u8]) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    store.get(COLUMN, key, &mut buf).expect("get").then_some(buf)
+}
+
+fn is_called_dead(store: &Store, segment: SegmentNumber) -> bool {
+    let rows = hold(&store.state.volumes[0].summary);
+    is_wholly_dead(&rows.get(segment).expect("a row")) && store.state.volumes[0].table.dead_replacement(segment).is_some()
+}
+
+fn refused_after_asking(store: &Store, io: &SimulatedIo) -> SegmentCount {
+    release_compaction(store);
+    store.state.ask_compaction();
+    settle(io);
+    hold_compaction(store);
+    let mut report = MaintenanceReport::new();
+    store.maintenance_report(&mut report);
+    report.unlinks_refused
+}
+
+// counts that call a live row dead unlink nothing: a double charge, then two doubles beside a miss
+#[test]
+fn unlink_refuses_a_live_row() {
+    let io = SimulatedIo::new(Seed(43));
+    let store = open(&io);
+    hold_compaction(&store);
+    let unlinked = store.state.volumes[0].segments_unlinked.load(Ordering::Acquire);
+
+    let doubled = sealed_rows(&store, &io, &[b"a-dead", b"a-live"]);
+    sealed_rows(&store, &io, &[b"a-dead"]);
+    charge_again(&store, doubled);
+    assert!(is_called_dead(&store, doubled));
+    assert_eq!(refused_after_asking(&store, &io), SegmentCount(1));
+    assert_eq!(read_key(&store, b"a-live"), Some(b"value".to_vec()));
+
+    // a block keeps one total, so three rows counted and one charge more read as two doubles beside a miss
+    let missed = sealed_rows(&store, &io, &[b"b-dead-0", b"b-dead-1", b"b-dead-2", b"b-live"]);
+    sealed_rows(&store, &io, &[b"b-dead-0", b"b-dead-1", b"b-dead-2"]);
+    charge_again(&store, missed);
+    assert!(is_called_dead(&store, missed));
+    assert_eq!(refused_after_asking(&store, &io), SegmentCount(2));
+    assert_eq!(read_key(&store, b"b-live"), Some(b"value".to_vec()));
+
+    assert_eq!(store.state.volumes[0].segments_unlinked.load(Ordering::Acquire), unlinked);
+    store.close().expect("close");
+}
+
+// rows the counts and the rows both call dead still go, and the report stays at none
+#[test]
+fn proven_rows_unlink() {
+    let io = SimulatedIo::new(Seed(44));
+    let store = open(&io);
+    hold_compaction(&store);
+    let older = sealed_rows(&store, &io, &[b"a", b"b"]);
+    sealed_rows(&store, &io, &[b"a", b"b"]);
+    assert!(is_called_dead(&store, older));
+
+    assert_eq!(refused_after_asking(&store, &io), SegmentCount(0));
+    assert!(!store.state.volumes[0].table.holds(older));
+    store.close().expect("close");
+}
+
+// an applied cover decides a segment wholly inside it, and one partly outside goes by its rows
+#[test]
+fn applied_cover_decides_its_unlink() {
+    let io = SimulatedIo::new(Seed(45));
+    let store = open(&io);
+    hold_compaction(&store);
+    let volume = &store.state.volumes[0];
+    let inside = sealed_rows(&store, &io, &[b"m-0", b"m-1"]);
+    let across = sealed_rows(&store, &io, &[b"m-2", b"z-0"]);
+    store.delete_range(COLUMN, b"m", b"n").expect("delete");
+    store.seal_now();
+    settle(&io);
+
+    assert!(is_under_applied_cover(volume, inside));
+    assert!(!is_under_applied_cover(volume, across));
+    assert_eq!(refused_after_asking(&store, &io), SegmentCount(0));
+    assert!(!volume.table.holds(inside));
+    assert_eq!(read_key(&store, b"z-0"), Some(b"value".to_vec()));
+    store.close().expect("close");
+}
+
+// damage older than a row says nothing about what replaced it, so counts that call that row dead get refused
 #[test]
 fn old_damage_hides_nothing() {
     let io = SimulatedIo::new(Seed(41));
@@ -955,7 +1051,8 @@ fn old_damage_hides_nothing() {
         end: None,
     });
 
-    job(&store).check_rows(volume, live).expect("check");
+    let pass = ConfirmPass { segment: live, next_block: 0 };
+    assert_eq!(job(&store).prove_block(volume, pass).expect("prove"), RowsProof::Live);
     store.close().expect("close");
 }
 

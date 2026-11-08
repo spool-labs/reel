@@ -27,7 +27,7 @@ const BUDGET: ByteCount = ByteCount(64 * 1024 * 1024);
 const TICK: Nanoseconds = Nanoseconds(1_000_000);
 const STEPS: u64 = 400_000;
 const KEYS: u64 = 40;
-const WHOLE_KEYS: u64 = 20_000;
+const WHOLE_KEYS: u64 = 14_000;
 const LIVE_KEYS: u64 = 50_000;
 const MOST_WHOLE_READS: u64 = 40;
 

@@ -8,7 +8,7 @@ use std::fs;
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use reel::engine::engine_sizing::{ENTRY_LINE_DIVISOR, floor_entries};
+use reel::engine::engine_sizing::{ENTRY_LINE_DIVISOR, SEAL_JOB_BYTES, WALK_JOB_BYTES, floor_entries};
 use reel::engine::reel_store::{ReelStore, ring_fits, volume_disks};
 use reel::segment::segment_table::TABLE_SHARDS;
 use reel::io::plain::PlainIo;
@@ -107,6 +107,7 @@ fn main() {
             failures += 1;
         }
         failures += check_entry_line(&store, &report, budget);
+        failures += check_job_plans(&report, config.volumes.len() as u64);
         store.close().expect("close");
         drop(store);
         fs::remove_dir_all(&root).expect("remove");
@@ -156,4 +157,16 @@ fn check_default_cell() -> u32 {
     }
     fs::remove_dir_all(&root).expect("remove");
     failures
+}
+
+// the seal jobs and the walks hold their buffers at or under the lines the budget plans for them
+fn check_job_plans(report: &MemoryReport, volumes: u64) -> u32 {
+    let workers = volumes * report.maintenance_workers as u64;
+    let footer_plan = volumes * (SEAL_JOB_BYTES + WALK_JOB_BYTES) + workers * WALK_JOB_BYTES;
+    println!("jobs: {:?} footer space against {footer_plan} B planned, {:?} compaction", report.footer_space, report.compaction);
+    if report.footer_space.0 > footer_plan {
+        println!("a seal or a walk holds more than its plan");
+        return 1;
+    }
+    0
 }

@@ -42,6 +42,7 @@ pub struct TableEntry<File> {
     pub is_walked: bool,
     pub highest_replacement: WritePlace,
     pub has_held_frees: bool,
+    pub is_unproven: bool,
 }
 
 /// A segment held open for a read, let go when dropped
@@ -278,6 +279,7 @@ impl<File: Clone> SegmentTable<File> {
             is_walked: false,
             highest_replacement: WritePlace(0),
             has_held_frees: false,
+            is_unproven: false,
         });
         guard.map.insert(head.segment, slot);
         true
@@ -343,6 +345,24 @@ impl<File: Clone> SegmentTable<File> {
         if let Some(entry) = guard.segments[slot as usize].as_mut() {
             entry.has_held_frees = is_held;
         }
+    }
+
+    /// Note a confirmation couldn't prove a segment's rows dead, so only a rewrite takes it until the next open
+    pub fn flag_unproven(&self, number: SegmentNumber) {
+        let mut guard = self.write_shard(shard_of(number));
+        let Some(slot) = guard.map.get(number) else {
+            return;
+        };
+        if let Some(entry) = guard.segments[slot as usize].as_mut() {
+            entry.is_unproven = true;
+        }
+    }
+
+    /// Check a confirmation left a segment unproven
+    pub fn is_unproven(&self, number: SegmentNumber) -> bool {
+        let guard = self.read_shard(shard_of(number));
+        let entry = guard.map.get(number).and_then(|slot| guard.segments[slot as usize].as_ref());
+        entry.is_some_and(|entry| entry.is_unproven)
     }
 
     /// Find a segment with large dead records no list could hold

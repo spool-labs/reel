@@ -67,9 +67,9 @@ pub const READ_BUFFER_BYTES: u64 = 512 * 1024;
 /// Bytes a record encoder is planned at, with no share of the compress pool
 pub const ENCODER_BYTES: u64 = 256 * 1024;
 /// Bytes a seal job's own buffers are planned at
-pub const SEAL_JOB_BYTES: u64 = 3 * 1024 * 1024;
+pub const SEAL_JOB_BYTES: u64 = 13 * 256 * 1024;
 /// Bytes a dead-byte walk's own buffers are planned at
-pub const WALK_JOB_BYTES: u64 = 5 * 256 * 1024;
+pub const WALK_JOB_BYTES: u64 = 9 * 256 * 1024;
 /// Bytes a compaction job's own buffers are planned at
 pub const COMPACT_JOB_BYTES: u64 = 11 * 512 * 1024;
 /// Bytes a job's stack is planned at
@@ -79,8 +79,8 @@ pub const SHARED_JOBS: u64 = 3;
 /// Bytes a row of the write index really takes, node, page and table share included, with a long batch's length of it
 pub const PLANNED_ROW_BYTES: u64 = 227;
 /// A volume seals at this share of what the index holds, in eighths, to keep room for writers in flight. With one
-/// lz4 column and 64 B keys that gives these rows a segment: 21,742 at 128 MiB, 114,128 at 192 MiB, 576,055 at 512 MiB and
-/// 5,749,646 at 4 GiB. A segment seals at its byte target or at this limit, whichever comes first, so small
+/// lz4 column and 64 B keys that gives these rows a segment: 19,938 at 128 MiB, 112,323 at 192 MiB, 574,251 at 512 MiB and
+/// 5,747,841 at 4 GiB. A segment seals at its byte target or at this limit, whichever comes first, so small
 /// records seal smaller and reach their size through merges, whose outputs the write index doesn't bound
 /// A volume holds its open segment and one spare at full size even when its sealed data is small: the reserve is twice the
 /// segment size, 128 MiB at a 128 MiB budget, 192 MiB at 192 MiB, and 2 GiB from the default 512 MiB up. The space gate adds

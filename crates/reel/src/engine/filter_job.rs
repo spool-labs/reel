@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
+use reel_api::maintenance_report::UnitKind;
 use reel_api::units::FileOffset;
 
 use crate::engine::engine_state::EngineState;
@@ -32,6 +33,7 @@ pub struct FilterLoader<Backend: Io> {
     segment: Option<SegmentNumber>,
     runs: Vec<BlockRun>,
     looked_at: u64,
+    loaded: u64,
 }
 
 impl<Backend: Io> FilterLoader<Backend> {
@@ -43,6 +45,7 @@ impl<Backend: Io> FilterLoader<Backend> {
             segment: None,
             runs: touched_capacity(MAX_COLUMNS, BlockRun::default()),
             looked_at: u64::MAX,
+            loaded: 0,
         }
     }
 
@@ -62,7 +65,10 @@ impl<Backend: Io> FilterLoader<Backend> {
         let Some(segment) = self.segment else {
             return false;
         };
-        if !self.load_some(volume, segment) {
+        let started = state.io.now();
+        let loaded = self.load_some(volume, segment);
+        state.note_unit(UnitKind::FilterLoad, self.loaded, started);
+        if !loaded {
             state.filter_arena.drop_segment(segment);
             // an empty extent says the arena tried, so the look moves on and the block cache answers for this segment
             if !state.filter_arena.begin(segment, 0, 0) {
@@ -144,6 +150,7 @@ impl<Backend: Io> FilterLoader<Backend> {
         let Some(pin) = volume.table.pin(segment) else {
             return false;
         };
+        self.loaded = 0;
         let mut left = FILTER_STEP_BLOCKS;
         let mut buffer = self.state.footer_readers.lease();
         for index in 0..self.runs.len() {
@@ -163,6 +170,7 @@ impl<Backend: Io> FilterLoader<Backend> {
                 };
                 self.state.filter_arena.add(segment, start.0 as u32, bits);
                 self.runs[index].next += 1;
+                self.loaded += 1;
                 left -= 1;
             }
         }

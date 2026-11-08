@@ -12,6 +12,7 @@ use reel_api::maintenance_report::UnitKind;
 use reel_api::units::Nanoseconds;
 
 use crate::engine::compact_job::CompactJob;
+use crate::engine::complete_path::REFILL_STEP_BLOCKS;
 use crate::engine::engine_state::EngineState;
 use crate::engine::filter_job::{FILTER_STEP_BLOCKS, FilterLoader};
 use crate::engine::open_segment::{OpenSegment, SegmentPhase};
@@ -161,6 +162,7 @@ pub fn unit_bound(kind: UnitKind) -> Option<u64> {
         UnitKind::Install => Some((MOST_MERGE_SEGMENTS + MOST_MERGE_OUTPUTS + 1) as u64),
         UnitKind::CoverSweep => Some(MOST_RANGE_COVERS as u64),
         UnitKind::FilterLoad => Some(FILTER_STEP_BLOCKS as u64),
+        UnitKind::SlotRefill => Some(REFILL_STEP_BLOCKS as u64),
         UnitKind::CoverApply | UnitKind::ParkedClear | UnitKind::Pick => Some(1),
         UnitKind::SummaryCopy | UnitKind::SummarySave | UnitKind::Start => None,
     }

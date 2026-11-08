@@ -41,7 +41,7 @@ impl JobKind {
 }
 
 /// Every kind of maintenance unit, in the order a report lists them
-pub const UNIT_KINDS: [UnitKind; 17] = [
+pub const UNIT_KINDS: [UnitKind; 18] = [
     UnitKind::WalkBlock,
     UnitKind::MergeRows,
     UnitKind::StripeCopy,
@@ -59,6 +59,7 @@ pub const UNIT_KINDS: [UnitKind; 17] = [
     UnitKind::SummarySave,
     UnitKind::Start,
     UnitKind::HeldDrain,
+    UnitKind::SlotRefill,
 ];
 
 /// A kind of maintenance unit. A job runs as units, and each kind's work is counted in what its line says
@@ -98,6 +99,8 @@ pub enum UnitKind {
     Start,
     /// Landing one held block of a rewrite's inputs on its outputs before the install, in rows
     HeldDrain,
+    /// Giving rows past a complete table's mark their slots once it has room again, in row blocks
+    SlotRefill,
 }
 
 impl UnitKind {

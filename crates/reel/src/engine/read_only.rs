@@ -49,16 +49,11 @@ pub fn try_load<Backend: Io>(io: &Backend, config: &StoreConfig) -> Result<Arc<E
     let disks = volume_disks(io, config).map_err(open_error("reading a disk's size"))?;
     let sizing = store_sizing(config, false, &disks)?;
     let roots: Vec<_> = config.volumes.iter().enumerate().map(|(index, volume)| (index, volume.roots.clone())).collect();
+    // the summary goes first: a cover settles only once its rows' files are gone, so a later listing can't find rows it hid
+    let summaries = read_summaries(io, &roots).map_err(open_error("reading a summary"))?;
     let listings = list_roots(io, &roots).map_err(open_error("listing a root"))?;
     let mode = OpenMode::ReadOnly;
     let mut scan = scan_roots(io, superblock.record_key, &listings, mode).map_err(open_error("reading a tail"))?;
-    let summaries = match read_summaries(io, &roots) {
-        Ok(summaries) => summaries,
-        Err(error) => {
-            scan.close_files(io);
-            return Err(open_error("reading a summary")(error));
-        },
-    };
     let locks = config.volumes.iter().map(|_volume| Vec::new()).collect();
     let mut state = build_state(io.clone(), config, &sizing, &disks, superblock, locks, &scan, summaries);
     state.is_read_only = true;

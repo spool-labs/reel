@@ -21,11 +21,13 @@ use reel::index::key_hash::hash_key;
 use reel::record::codec::Codec;
 use reel::segment::segment_tail::SegmentNumber;
 use reel_api::column_id::ColumnId;
+use reel_api::direction::Direction;
 use reel_api::maintenance_report::MaintenanceReport;
+use reel_api::scan::ScanStep;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RowCount, VolumeId};
 use reel_sim::file_image::BitMask;
-use reel_sim::seeded_random::Seed;
+use reel_sim::seeded_random::{Seed, SeededRandom};
 use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_io::SimulatedIo;
 
@@ -35,6 +37,11 @@ const COLUMN: ColumnId = ColumnId(1);
 const BUDGET: ByteCount = ByteCount(64 * 1024 * 1024);
 const TICK: Nanoseconds = Nanoseconds(1_000_000);
 const STEPS: u64 = 400_000;
+const INTERLEAVE_SEEDS: u64 = 4;
+const INTERLEAVE_KEYS: u64 = 600;
+const INTERLEAVE_ROUNDS: u64 = 6;
+const INTERLEAVE_STEPS: u64 = 40;
+const INTERLEAVE_WORKERS: usize = 4;
 const KEYS: u64 = 2_000;
 const CAPACITY: RowCount = RowCount(100_000);
 const SMALL_CAPACITY: RowCount = RowCount(200);
@@ -193,9 +200,9 @@ fn sealed_numbers(store: &Store) -> Vec<SegmentNumber> {
     numbers
 }
 
-// the walk marks an overwritten row's slot stale and charges its segment once, and a get then reads one block for the key
+// the walk frees an overwritten row's slot and charges its segment once, so the key holds one slot and a get reads one block
 #[test]
-fn walk_marks_and_charges() {
+fn walk_frees_and_charges() {
     let io = SimulatedIo::new(Seed(3));
     let store = open(&io, CAPACITY);
     for number in 0..KEYS {
@@ -208,9 +215,8 @@ fn walk_marks_and_charges() {
     seal(&store, &io);
 
     let slots = slots_of(&store, b"key");
-    assert_eq!(slots.len(), 2);
-    assert_eq!(slots.iter().filter(|slot| slot.is_stale()).count(), 1);
-    assert!(slots.iter().any(|slot| slot.is_stale() && slot.segment_number() == first));
+    assert_eq!(slots.len(), 1);
+    assert!(slots.iter().all(|slot| slot.segment_number() != first), "the superseded row kept its slot");
     assert_eq!(dead_rows(&store, first), 1);
 
     store.state.complete_cache.as_ref().expect("a cache").clear();
@@ -320,7 +326,8 @@ fn fill_store(store: &Store, io: &SimulatedIo) -> Filled {
     (model, deleted)
 }
 
-// an open from the saved image and an open after a crash hold the same rows, slot for slot
+// an open from the saved image holds the same rows slot for slot, and an open after a crash holds them all, with slots of
+// superseded rows its walks already counted until their segments go
 #[test]
 fn image_equals_rebuild() {
     let io = SimulatedIo::new(Seed(8));
@@ -339,7 +346,8 @@ fn image_equals_rebuild() {
     drop(store);
 
     let store = open(&io, CAPACITY);
-    assert_eq!(row_slots(&store), before);
+    let rebuilt = row_slots(&store);
+    assert!(before.iter().all(|slot| rebuilt.contains(slot)), "a rebuild lost a slot the image held");
     check(&store, &model, &deleted);
     store.close().expect("close");
 }
@@ -454,9 +462,9 @@ fn tag_collision() {
     store.close().expect("close");
 }
 
-// a cue still reads the value a walk marked stale
+// a cue still reads the value whose slot a walk freed, through the footers
 #[test]
-fn cue_reads_a_stale_slot() {
+fn cue_reads_a_freed_slot() {
     let io = SimulatedIo::new(Seed(13));
     let store = open(&io, CAPACITY);
     for number in 0..KEYS {
@@ -467,7 +475,7 @@ fn cue_reads_a_stale_slot() {
     let cue = store.cue().expect("cue");
     store.put(COLUMN, b"key", b"second").expect("put");
     seal(&store, &io);
-    assert!(slots_of(&store, b"key").iter().any(CompleteSlot::is_stale));
+    assert_eq!(slots_of(&store, b"key").len(), 1);
 
     let mut value = Vec::new();
     assert!(cue.get(COLUMN, b"key", &mut value).expect("get"));
@@ -655,9 +663,9 @@ fn unread_block_reads_as_damage() {
     store.close().expect("close");
 }
 
-// a cue reads a version whose stale slot a fold took, through the footers
+// a cue reads a version whose slot many overwrites since have freed, through the footers
 #[test]
-fn cue_reads_past_a_fold() {
+fn cue_reads_past_overwrites() {
     let io = SimulatedIo::new(Seed(18));
     let store = open(&io, CAPACITY);
     for number in 0..KEPT_PER_ROUND {
@@ -673,7 +681,7 @@ fn cue_reads_past_a_fold() {
         }
         seal(&store, &io);
     }
-    assert!(slots_of(&store, b"hot").iter().any(CompleteSlot::is_sticky));
+    assert_eq!(slots_of(&store, b"hot").len(), 1);
 
     let mut value = Vec::new();
     assert!(cue.get(COLUMN, b"hot", &mut value).expect("get"));
@@ -682,9 +690,9 @@ fn cue_reads_past_a_fold() {
     store.close().expect("close");
 }
 
-// a get that took its point before an overwrite still reads what stood then, though the walk marked that row stale since
+// a get that took its point before an overwrite still reads what stood then, though the walk freed that row's slot since
 #[test]
-fn read_behind_a_stale_mark() {
+fn read_behind_a_freed_slot() {
     let io = SimulatedIo::new(Seed(19));
     let store = open(&io, CAPACITY);
     for number in 0..KEPT_PER_ROUND {
@@ -695,7 +703,7 @@ fn read_behind_a_stale_mark() {
     let latest = store.state.latest_read(COLUMN, b"key").expect("read");
     store.put(COLUMN, b"key", b"second").expect("put");
     seal(&store, &io);
-    assert!(slots_of(&store, b"key").iter().any(CompleteSlot::is_stale));
+    assert_eq!(slots_of(&store, b"key").len(), 1);
 
     let mut value = Vec::new();
     let answer = crate::latest::answer(&store, &latest, RecordWant::Whole, &mut value).expect("no job crossed it");
@@ -757,9 +765,9 @@ fn hot_key_leaves_no_mark_with_a_held_walk() {
     store.close().expect("close");
 }
 
-// a hot key's walk charges through the footers once its slots have gone, so the rows it replaced still count dead
+// a hot key holds one slot however often it is written, and every row it replaced counts dead
 #[test]
-fn hot_key_charges_through_the_footers() {
+fn hot_key_charges_every_version() {
     let io = SimulatedIo::new(Seed(22));
     let store = open(&io, CAPACITY);
     for round in 0..MOST_TAG_SLOTS as u64 * 2 {
@@ -769,7 +777,7 @@ fn hot_key_charges_through_the_footers() {
         }
         seal(&store, &io);
     }
-    assert!(slots_of(&store, b"hot").iter().any(CompleteSlot::is_sticky));
+    assert_eq!(slots_of(&store, b"hot").len(), 1);
     let dead: u64 = sealed_numbers(&store).into_iter().map(|segment| dead_rows(&store, segment)).sum();
     assert_eq!(dead, MOST_TAG_SLOTS as u64 * 2 - 1);
     store.close().expect("close");
@@ -831,4 +839,101 @@ fn cool(store: &Store, io: &SimulatedIo) {
     let until = store.state.volumes.iter().map(|volume| volume.hot_until().0).max().unwrap_or(0);
     io.advance_clock(Nanoseconds(until.saturating_sub(io.clock_reading().0)));
     settle(io);
+}
+
+// a table that ran out of room clears its mark once the walk frees the slots of overwritten rows, with no open between, and every
+// key reads its newest value through the table again
+#[test]
+fn mark_clears_once_room_returns() {
+    let io = SimulatedIo::new(Seed(31));
+    let store = open(&io, RowCount(2 * KEYS));
+    let volume = &store.state.volumes[0];
+    let table = store.state.complete_table(COLUMN).expect("a table");
+    volume.is_walk_held.store(true, Ordering::Release);
+    for round in 0..3 {
+        for number in 0..KEYS {
+            store.put(COLUMN, &key(number), format!("round-{round}").as_bytes()).expect("put");
+        }
+        seal(&store, &io);
+    }
+    assert!(table.mark().is_some(), "three versions of every key fit a table sized for two");
+
+    volume.is_walk_held.store(false, Ordering::Release);
+    store.state.ask_compaction();
+    for _step in 0..KEYS {
+        if table.mark().is_none() {
+            break;
+        }
+        io.advance_clock(Nanoseconds(1_000_000));
+        settle(&io);
+    }
+    assert_eq!(table.mark(), None, "the mark stood with room back");
+    assert_eq!(table.past_capacity(), RowCount(0));
+    assert_eq!(table.used_slots(), RowCount(KEYS), "a refill gave superseded rows their slots back");
+    for number in 0..KEYS {
+        assert_eq!(read(&store, &key(number)), Some(b"round-2".to_vec()));
+    }
+    store.close().expect("close");
+}
+
+// scans stepped between job steps see every kept key once and nothing a range delete or a grave hides, while seals, walks, merges
+// and cover settles run under them
+#[test]
+fn scans_between_job_steps() {
+    for seed in 0..INTERLEAVE_SEEDS {
+        let io = SimulatedIo::new(Seed(seed));
+        let mut config = config(CAPACITY);
+        config.threads.maintenance_workers = Some(INTERLEAVE_WORKERS);
+        config.memory_budget = ByteCount(256 * 1024 * 1024);
+        let store = ReelStore::open(io.clone(), &config).expect("open");
+        let mut random = SeededRandom::new(Seed(seed));
+        let kept = |number: u64| format!("kept-{number:04}").into_bytes();
+        let spanned = |number: u64| format!("span-{number:04}").into_bytes();
+        let gone = |number: u64| format!("gone-{number:04}").into_bytes();
+        for number in 0..INTERLEAVE_KEYS {
+            store.put(COLUMN, &kept(number), b"first").expect("put");
+            store.put(COLUMN, &spanned(number), b"gone").expect("put");
+            store.put(COLUMN, &gone(number), b"gone").expect("put");
+        }
+        seal(&store, &io);
+        for number in 0..INTERLEAVE_KEYS {
+            store.delete(COLUMN, &gone(number)).expect("delete");
+        }
+        store.delete_range(COLUMN, &spanned(0), &spanned(INTERLEAVE_KEYS)).expect("delete");
+        store.flush().expect("flush");
+        let cue = store.cue().expect("cue");
+        for round in 0..INTERLEAVE_ROUNDS {
+            for number in 0..INTERLEAVE_KEYS {
+                store.put(COLUMN, &kept(number), format!("round-{round}").as_bytes()).expect("put");
+            }
+            store.seal_now();
+            let mut scan = if round % 2 == 0 {
+                store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan")
+            } else {
+                cue.iter_from(COLUMN, b"", Direction::Ascending).expect("scan")
+            };
+            let (mut name, mut value) = (Vec::new(), Vec::new());
+            let mut next = 0;
+            loop {
+                for _step in 0..random.below(INTERLEAVE_STEPS) {
+                    if io.step_any().is_none() {
+                        io.advance_clock(TICK);
+                    }
+                }
+                match scan.next_row(&mut name, &mut value).expect("step") {
+                    ScanStep::End => break,
+                    ScanStep::Corrupt => panic!("seed {seed}: {name:?} came corrupt"),
+                    ScanStep::Found => {},
+                }
+                assert_eq!(name, kept(next), "seed {seed} round {round}");
+                next += 1;
+            }
+            assert_eq!(next, INTERLEAVE_KEYS, "seed {seed} round {round}");
+        }
+        drop(cue);
+        let volume = &store.state.volumes[0];
+        assert!(volume.segments_rewritten.load(Ordering::Acquire) + volume.segments_unlinked.load(Ordering::Acquire) > 0, "seed {seed}: no job ran under the scans");
+        settle(&io);
+        store.close().expect("close");
+    }
 }

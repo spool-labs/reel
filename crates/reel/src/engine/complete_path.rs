@@ -5,22 +5,45 @@ use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
-use reel_api::units::WritePlace;
+use reel_api::units::{RowCount, WritePlace};
 
 use crate::engine::engine_state::EngineState;
 use crate::engine::read_path::{KeyRead, SealedRow, WalkAsk, corruption};
 use crate::engine::recovery::{whole_columns, widen_row};
 use crate::engine::volume::Volume;
+use crate::fixed_list::{FixedList, ListOut};
 use crate::guard::hold;
 use crate::index::complete_table::{CompleteSlot, CompleteTable, TagMatches};
 use crate::index::key_hash::hash_key;
 use crate::io::{DeviceReads, InPlace, Io, in_place};
 use crate::io::device_error::is_device_error;
+use crate::pool::Pool;
 use crate::row_kind::RowKind;
 use crate::segment::block_cache::BlockKey;
 use crate::segment::footer_reader::{FooterAnswer, FooterCaches, FooterQuery, FooterReader};
 use crate::segment::row_block::RowBlockWalk;
 use crate::segment::segment_tail::SegmentNumber;
+
+/// Row blocks a refill step gives slots, so a unit stays near a walk block's work
+pub const REFILL_STEP_BLOCKS: u32 = 16;
+
+/// A span of one segment's row blocks
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockSpan {
+    pub segment: SegmentNumber,
+    pub first: u32,
+    pub end: u32,
+}
+
+/// A refill of a complete table past its mark, a few row blocks a step
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Refill {
+    pub column: ColumnId,
+    pub mark: SegmentNumber,
+    pub missed: RowCount,
+    pub segment: Option<SegmentNumber>,
+    pub block: u32,
+}
 
 impl<Backend: Io> EngineState<Backend> {
     /// Read the heap the small block cache holds
@@ -57,11 +80,11 @@ impl<Backend: Io> EngineState<Backend> {
     ) -> Result<Option<SealedRow>, StoreError> {
         let mut matches = TagMatches::new();
         table.find(read.hash, &mut matches);
-        // a stale mark speaks for reads at or above the row that caused it, and a read behind the newest sealed row may
-        // need what it hides. The check comes after the slots, so a mark this read saw has its sealed row counted
+        // a superseded row's slot goes, so a read behind the newest sealed row, which may need one, asks the footers. The check
+        // comes after the slots, so a slot this read saw go has its sealed row counted
         let is_behind = volume.may_hide_under_sealed(read.read_point);
         // a sticky slot says the footers answer for this tag
-        if matches.slots().iter().any(CompleteSlot::is_sticky) {
+        if is_behind || matches.slots().iter().any(CompleteSlot::is_sticky) {
             return self.search_footers(device, volume, read).await;
         }
         // a miss asks no footer, so it takes no reader
@@ -71,7 +94,7 @@ impl<Backend: Io> EngineState<Backend> {
         let mut reader = self.footer_reader_for(device);
         let mut best = None;
         for slot in matches.slots() {
-            if !slot.is_stale() || is_behind {
+            if !slot.is_stale() {
                 self.ask_slot(device, volume, read, slot, &mut reader, &mut best).await?;
             }
         }
@@ -161,10 +184,10 @@ impl<Backend: Io> EngineState<Backend> {
         })
     }
 
-    /// Mark a charged row's slot stale, so a get reads one block for its key
-    pub fn mark_slot_stale(&self, volume: &Volume<Backend>, column: ColumnId, key: &[u8], segment: SegmentNumber, block_offset: u32) {
+    /// Free a charged row's slot, so a get reads one block for its key and the table holds a slot a key
+    pub fn free_superseded_slot(&self, volume: &Volume<Backend>, column: ColumnId, key: &[u8], segment: SegmentNumber, block_offset: u32) {
         if let (Some(table), Some(block)) = (self.complete_table(column), volume.table.block_at(segment, block_offset)) {
-            table.mark_stale(hash_key(column, key), segment, block as u16);
+            table.free_superseded(hash_key(column, key), segment, block as u16);
         }
     }
 
@@ -215,14 +238,97 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// Give one segment's rows of a column their slots, and say whether every block read clean
     pub fn fill_from_segment(&self, volume: &Volume<Backend>, column: ColumnId, number: SegmentNumber) -> IoResult<bool> {
-        let (Some(table), Some(pin), Some((first, count))) =
-            (self.complete_table(column), volume.table.pin(number), volume.table.column_blocks(number, column))
-        else {
+        let Some((first, count)) = volume.table.column_blocks(number, column) else {
             return Ok(true);
         };
-        let mut key = Vec::new();
-        self.footer_readers.with(|reader| {
-            for index in first..first + count {
+        let blocks = BlockSpan { segment: number, first, end: first + count };
+        self.fill_blocks(volume, column, blocks, &self.footer_readers, &mut Vec::new(), None)
+    }
+
+    /// Find a complete column of a volume whose table has a mark and room again, holding fewer slots than a pass that failed
+    /// left, and start a refill from the mark
+    pub fn start_refill(&self, index: usize, below: u64) -> Option<Refill> {
+        for (id, table) in self.complete.iter().enumerate() {
+            let (Some(table), Some(info)) = (table, self.columns[id]) else {
+                continue;
+            };
+            let is_due = info.volume.0 as usize == index && table.has_room() && table.used_slots().0 < below;
+            let Some(mark) = table.mark().filter(|_mark| is_due) else {
+                continue;
+            };
+            // newest first, so a key's newest row past the mark takes its slot ahead of the rows it superseded
+            let segment = hold(&self.volumes[index].summary).orders().after(SegmentNumber(mark.0.saturating_sub(1))).last().copied();
+            return Some(Refill { column: ColumnId(id as u8), mark, missed: table.past_capacity(), segment, block: 0 });
+        }
+        None
+    }
+
+    /// Give a few row blocks past a refill's mark their slots, and clear the mark once no segment past it is left. Say whether the
+    /// refill goes on. A block that can't be read ends it with the mark standing, since its rows have no slot
+    pub fn refill_step(&self, index: usize, refill: &mut Refill, (key, check): (&mut FixedList<u8>, &mut FooterReader)) -> IoResult<bool> {
+        let volume = &self.volumes[index];
+        let Some(table) = self.complete_table(refill.column) else {
+            return Ok(false);
+        };
+        let Some(segment) = refill.segment else {
+            table.clear_mark(refill.mark, refill.missed);
+            return Ok(false);
+        };
+        let mark = refill.mark;
+        let next = |segment: SegmentNumber| hold(&volume.summary).orders().below(segment).last().copied().filter(|below| *below >= mark);
+        let Some((first, count)) = volume.table.column_blocks(segment, refill.column) else {
+            refill.segment = next(segment);
+            refill.block = 0;
+            return Ok(true);
+        };
+        let from = first + refill.block;
+        let end = (from + REFILL_STEP_BLOCKS).min(first + count);
+        let blocks = BlockSpan { segment, first: from, end };
+        if !self.fill_blocks(volume, refill.column, blocks, &self.job_footer_readers, key, Some(check))? {
+            return Ok(false);
+        }
+        if end == first + count {
+            refill.segment = next(segment);
+            refill.block = 0;
+        } else {
+            refill.block = end - first;
+        }
+        Ok(true)
+    }
+
+    /// Check a key holds a slotted row at or above a place, reading its slots' blocks so a tag collision never counts
+    pub fn is_slotted_at(&self, volume: &Volume<Backend>, (table, column): (&CompleteTable, ColumnId), (key, place): (&[u8], WritePlace), reader: &mut FooterReader) -> bool {
+        let Ok(read) = self.key_read(column, key, WritePlace(u64::MAX), false) else {
+            return false;
+        };
+        let mut matches = TagMatches::new();
+        table.find(read.hash, &mut matches);
+        let mut best = None;
+        for slot in matches.slots() {
+            // a block that can't be read says nothing, and the row takes a slot of its own
+            if !slot.is_stale() && !slot.is_sticky() && in_place(self.ask_slot(&InPlace, volume, &read, slot, reader, &mut best)).is_err() {
+                return false;
+            }
+        }
+        best.is_some_and(|found| found.row.place >= place)
+    }
+
+    /// Give a span of a segment's row blocks of a column their slots, and say whether every block read clean
+    pub fn fill_blocks(
+        &self,
+        volume: &Volume<Backend>,
+        column: ColumnId,
+        blocks: BlockSpan,
+        readers: &Pool<FooterReader>,
+        key: &mut impl ListOut<u8>,
+        mut newer: Option<&mut FooterReader>,
+    ) -> IoResult<bool> {
+        let number = blocks.segment;
+        let (Some(table), Some(pin)) = (self.complete_table(column), volume.table.pin(number)) else {
+            return Ok(true);
+        };
+        readers.with(|reader| {
+            for index in blocks.first..blocks.end {
                 let Some((entry, _replacement)) = volume.table.block_line(number, index) else {
                     return Ok(false);
                 };
@@ -237,12 +343,18 @@ impl<Backend: Io> EngineState<Backend> {
                     return Ok(false);
                 };
                 let mut last = None;
-                while let Some(row) = walk.next_row(&mut key) {
+                while let Some(row) = walk.next_row(key) {
                     if row.kind != RowKind::RangeDelete {
-                        let hash = hash_key(column, &key);
+                        let hash = hash_key(column, &key[..]);
                         if last != Some(hash) {
-                            table.insert(hash, number, index as u16, |_segment| false);
                             last = Some(hash);
+                            // a refill gives no slot to a row a slotted row stands at or above, so a superseded row stays out
+                            if let Some(check) = newer.as_deref_mut()
+                                && self.is_slotted_at(volume, (table, column), (&key[..], row.place), check)
+                            {
+                                continue;
+                            }
+                            table.insert(hash, number, index as u16, |segment| self.is_slot_gone(volume, segment));
                         }
                     }
                 }

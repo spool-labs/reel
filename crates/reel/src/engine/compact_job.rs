@@ -17,6 +17,7 @@ use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, Nanoseconds, WritePlace};
 
 use crate::config::MAX_KEY_BYTES;
+use crate::engine::complete_path::{REFILL_STEP_BLOCKS, Refill};
 use crate::engine::cover_apply::is_in_range;
 use crate::engine::engine_state::EngineState;
 use crate::engine::planner::UnitStep;
@@ -30,6 +31,7 @@ use crate::io::{InPlace, Io, IoFile, in_place};
 use crate::fixed_list::FixedList;
 use crate::row_kind::RowKind;
 use crate::segment::block_entry::KeyBound;
+use crate::segment::footer_reader::FooterReader;
 use crate::segment::range_covers::{Cover, MOST_RANGE_COVERS};
 use crate::segment::row_block::{ROW_BLOCK_BYTES, RowBlockWalk};
 use crate::segment::segment_table::RetiredSegment;
@@ -98,8 +100,11 @@ pub struct CompactJob<Backend: Io> {
     held_pass: Option<HeldPass>,
     confirm_pass: Option<ConfirmPass>,
     should_rewrite: bool,
-    /// An ask came while writes were arriving, and record rewrites take it up once they stop
     is_ask_held: bool,
+    refill: Option<Refill>,
+    refill_key: FixedList<u8>,
+    refill_below: u64,
+    refill_reader: FooterReader,
     last_tried: SegmentNumber,
     settle_at: usize,
     settled_rows: FixedList<DeadCount>,
@@ -141,6 +146,10 @@ impl<Backend: Io> CompactJob<Backend> {
             key: FixedList::on_heap(MAX_KEY_BYTES as usize),
             row_key: FixedList::on_heap(MAX_KEY_BYTES as usize),
             end: FixedList::on_heap(MAX_KEY_BYTES as usize + 1),
+            refill: None,
+            refill_key: FixedList::on_heap(MAX_KEY_BYTES as usize),
+            refill_below: u64::MAX,
+            refill_reader: FooterReader::new(),
         }
     }
 
@@ -214,6 +223,9 @@ impl<Backend: Io> CompactJob<Backend> {
                     self.wait_for_retry(now)
                 },
             };
+        }
+        if self.step_refill() {
+            return UnitStep::Worked;
         }
         // a live cue may still need what it kept, and its going brings the planner back
         if state.cues.is_empty() && volume.has_kept_covers.swap(false, Ordering::AcqRel) {
@@ -293,6 +305,27 @@ impl<Backend: Io> CompactJob<Backend> {
             return UnitStep::RetryAt(volume.hot_until());
         }
         UnitStep::Idle
+    }
+
+    /// Give a few row blocks past a complete table's mark their slots once it has room again, and say whether a step ran
+    pub fn step_refill(&mut self) -> bool {
+        let state = Arc::clone(&self.state);
+        if self.refill.is_none() {
+            self.refill = state.start_refill(self.volume, self.refill_below);
+        }
+        let Some(mut refill) = self.refill else {
+            return false;
+        };
+        self.unit = Some((UnitKind::SlotRefill, u64::from(REFILL_STEP_BLOCKS)));
+        // a failed read ends the refill with the mark standing, and a later step starts it over
+        let goes_on = state.refill_step(self.volume, &mut refill, (&mut self.refill_key, &mut self.refill_reader)).unwrap_or(false);
+        self.refill = goes_on.then_some(refill);
+        // a pass that left the mark standing waits for the walk to free more slots before it runs again
+        if !goes_on {
+            let table = state.complete_table(refill.column);
+            self.refill_below = table.filter(|table| table.mark().is_some()).map_or(u64::MAX, |table| table.used_slots().0);
+        }
+        true
     }
 
     /// Look for work for idle workers once something has changed that could give one a pick

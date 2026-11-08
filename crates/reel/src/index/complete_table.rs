@@ -281,6 +281,39 @@ impl CompleteShard {
         cleared
     }
 
+    /// Free one slot of a tag's homes or run that points at a block, and say whether one went
+    pub fn free_slot(&mut self, homes: &Homes, segment: u32, block: u16) -> bool {
+        let is_row = |slot: &CompleteSlot| slot.key_tag() == homes.tag && !slot.is_sticky() && slot.segment == segment && slot.block == block;
+        let mut buckets = [Some(homes.first), Some(homes.second)];
+        if homes.first == homes.second {
+            buckets[1] = None;
+        }
+        for bucket in buckets.into_iter().flatten() {
+            for slot in &mut self.slots[bucket * BUCKET_SLOTS..(bucket + 1) * BUCKET_SLOTS] {
+                if slot.is_used() && is_row(slot) {
+                    *slot = CompleteSlot::empty();
+                    return true;
+                }
+            }
+        }
+        if self.overflow_used == 0 {
+            return false;
+        }
+        let mut at = self.overflow_start(homes.tag);
+        for _step in 0..self.run_reach() {
+            let slot = self.overflow[at];
+            if !slot.is_used() {
+                return false;
+            }
+            if is_row(&slot) {
+                self.clear_overflow(at);
+                return true;
+            }
+            at = (at + 1) % self.overflow.len();
+        }
+        false
+    }
+
     /// Take a tag's slots out of its run of the overflow area, its sticky slot apart, and say how many went
     pub fn fold_overflow(&mut self, tag: u16) -> u64 {
         let mut folded = 0;
@@ -442,6 +475,25 @@ impl CompleteTable {
         }
     }
 
+    /// Check the table sits under its load line, so rows past its mark can have their slots again
+    pub fn has_room(&self) -> bool {
+        self.used.load(Ordering::Acquire) * 10 < self.slot_count() as u64 * LOAD_TENTHS
+    }
+
+    /// Clear a mark a refill from it made good, and say whether it went. A row that found no room since the refill began keeps
+    /// it, since that row has no slot
+    pub fn clear_mark(&self, mark: SegmentNumber, missed: RowCount) -> bool {
+        if self.mark.compare_exchange(mark.0, NO_MARK, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return false;
+        }
+        if self.past_capacity.load(Ordering::Acquire) != missed.0 {
+            self.mark.fetch_min(mark.0, Ordering::AcqRel);
+            return false;
+        }
+        self.past_capacity.fetch_sub(missed.0, Ordering::AcqRel);
+        true
+    }
+
     /// Count every slot the table has room for
     pub fn slot_count(&self) -> usize {
         let (slots, overflow) = self.shard_sizes();
@@ -505,29 +557,17 @@ impl CompleteTable {
         shard.visit_tag(&homes, |slot| matches.push(*slot));
     }
 
-    /// Mark one row's slot superseded. A get skips it, and it stays until its segment goes, so a grave can see an older row stands.
-    /// Two keys of a tag in one block hold a slot each, so this marks one
-    pub fn mark_stale(&self, hash: KeyHash, segment: SegmentNumber, block: u16) {
+    /// Free a superseded row's slot, so the table holds a slot a key whatever its overwrites. Two keys of a tag in one block hold
+    /// a slot each, so this frees one
+    pub fn free_superseded(&self, hash: KeyHash, segment: SegmentNumber, block: u16) {
+        let Ok(segment) = u32::try_from(segment.0) else {
+            return;
+        };
         let mut shard = self.write_shard(shard_of(hash));
         let homes = shard.homes(hash);
-        let mut is_marked = false;
-        let mut mark = |slot: &mut CompleteSlot| {
-            if !is_marked && !slot.is_stale() && u64::from(slot.segment) == segment.0 && slot.block == block {
-                slot.tag |= STALE_BIT;
-                is_marked = true;
-            }
-        };
-        shard.change_homes(&homes, &mut mark);
-        shard.change_overflow(homes.tag, mark);
-    }
-
-    /// Check a key's tag has a slot past the ones it is asked to leave out. A tag another key shares can only keep a grave longer
-    pub fn has_other_slot(&self, hash: KeyHash, is_own: impl Fn(u32) -> bool, is_gone: impl Fn(u32) -> bool) -> bool {
-        let shard = self.read_shard(shard_of(hash));
-        let homes = shard.homes(hash);
-        let mut has_other = false;
-        shard.visit_tag(&homes, |slot| has_other |= slot.is_sticky() || (!is_own(slot.segment) && !is_gone(slot.segment)));
-        has_other
+        if shard.free_slot(&homes, segment, block) {
+            self.used.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 
     /// Give a tag whose list is full one sticky slot in place of the rest, or say its run has no room for one. Its readers go by the

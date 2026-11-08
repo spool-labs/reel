@@ -41,7 +41,6 @@ use crate::segment::damage_list::DamagedRange;
 use crate::segment::block_entry::KeyBound;
 use crate::segment::column_directory::{ColumnDirectory, Listing};
 use crate::segment::footer_writer::{ColumnStart, FooterTotals, FooterWriter};
-use crate::index::complete_table::CompleteTable;
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::segment::row_block::{BLOCK_TRAILER_BYTES, FooterRow, ROW_BLOCK_BYTES, ROW_ROOM_NUMBERS, RowBlockWalk};
 use crate::segment::segment_table::SegmentPin;
@@ -1366,25 +1365,12 @@ impl<Backend: Io> RewriteJob<Backend> {
         {
             return Ok(false);
         }
-        if let Some(table) = state.complete_table(column) {
-            return Ok(!self.has_older_slot(volume, table, column, row));
-        }
+        // a complete column frees a superseded row's slot, so its footers answer for older rows as any column's do
         match state.has_older_row(volume, column, &self.key, row.place, &self.numbers[..self.input_count]) {
             Ok(has_older) => Ok(!has_older),
             Err(StoreError::Corruption { .. }) => Ok(false),
             Err(_error) => Err(Error::from(ErrorKind::Interrupted)),
         }
-    }
-
-    /// Check a complete column still holds an older row of a grave's key: an open row, or any slot of its tag outside this merge,
-    /// live or stale. A slot of another key can only keep the grave longer, and past the mark a row can stand with no slot at all
-    pub fn has_older_slot(&self, volume: &Volume<Backend>, table: &CompleteTable, column: ColumnId, row: &FooterRow) -> bool {
-        let state = &self.state;
-        let point = WritePlace(row.place.0.saturating_sub(1));
-        let is_own = |segment: u32| self.numbers[..self.input_count].contains(&SegmentNumber(u64::from(segment)));
-        table.mark().is_some()
-            || state.index.lookup(column, &self.key, point, volume.view()).row.is_some()
-            || table.has_other_slot(hash_key(column, &self.key), is_own, |segment| state.is_slot_gone(volume, segment))
     }
 
     /// Carry a row into the data output, and note it dead when a cue is all that keeps it, since no walk will count it again

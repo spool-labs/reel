@@ -81,7 +81,7 @@ fn check_walk(mut scan: StoreScan<PlainIo>, direction: Direction, round: Option<
                 kept(next)
             },
         };
-        assert_eq!(key, expected);
+        assert_eq!(key, expected, "{direction:?} walk at a cue {}", round.is_some());
         assert!(value.starts_with(&key), "{key:?} read {value:?}");
         if let Some(round) = round {
             assert_eq!(value, value_of(&key, round));

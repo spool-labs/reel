@@ -93,6 +93,7 @@ pub fn open_error(action: &'static str) -> impl Fn(Error) -> StoreError {
 impl<Backend: Io> ReelStore<Backend> {
     /// Open a store: lock every root, read every tail, recover every open segment, start the jobs
     pub fn open(io: Backend, config: &StoreConfig) -> Result<Self, StoreError> {
+        let opened_from = io.now();
         check_config(config)?;
         let locks = lock_roots(&io, config)?;
         let superblock = settle_superblock(&io, config)?;
@@ -116,10 +117,13 @@ impl<Backend: Io> ReelStore<Backend> {
             },
         };
 
+        // the pools are built and touched here and as the jobs start, and open reports that time apart
+        let touched_from = io.now();
         let mut state = build_state(io, config, &sizing, superblock, locks, &scan, summaries);
         state.complete = complete_tables(config);
         state.complete_images = complete_images(config);
         state.attach_ring(ring);
+        state.prefault_time.store(state.io.now().0.saturating_sub(touched_from.0), Ordering::Release);
         let state = Arc::new(state);
         if let Err(error) = bring_up(&state, &mut scan) {
             // a caller can retry, so a failed open leaves no handle behind
@@ -130,6 +134,7 @@ impl<Backend: Io> ReelStore<Backend> {
             }
             return Err(error);
         }
+        state.open_time.store(state.io.now().0.saturating_sub(opened_from.0), Ordering::Release);
 
         Ok(Self {
             state,
@@ -608,6 +613,7 @@ pub fn bring_up<Backend: Io>(
         state.mark_full_segments(&mut claims, volume);
     }
 
+    let jobs_from = state.io.now();
     let row_job = RowJob {
         state: Arc::clone(state),
     };
@@ -672,6 +678,7 @@ pub fn bring_up<Backend: Io>(
         let _set = state.ring_task.set(task);
     }
     state.job_count.store(SHARED_JOBS + state.read_tasks.len() as u64 + state.volumes.len() as u64 + workers, Ordering::Release);
+    state.prefault_time.fetch_add(state.io.now().0.saturating_sub(jobs_from.0), Ordering::AcqRel);
     state.note_graves_at_open();
     Ok(())
 }
@@ -1196,6 +1203,8 @@ pub fn build_state<Backend: Io>(
         longest_turn: AtomicU64::new(0),
         index_waits: AtomicU64::new(0),
         longest_index_wait: AtomicU64::new(0),
+        open_time: AtomicU64::new(0),
+        prefault_time: AtomicU64::new(0),
         record_readers: Pool::new(record_readers),
         footer_readers: Pool::new(footer_readers),
         scan_heap,

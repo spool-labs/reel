@@ -95,6 +95,11 @@ fn main() {
             println!("budget {} MiB fails", budget.0 / MIB);
             failures += 1;
         }
+        println!("open {} us, of which the pools {} us", report.open_time.0 / 1_000, report.prefault_time.0 / 1_000);
+        if report.prefault_time.0 == 0 || report.prefault_time > report.open_time {
+            println!("the pools' time at open is missing or past the open's");
+            failures += 1;
+        }
         store.close().expect("close");
         drop(store);
         fs::remove_dir_all(&root).expect("remove");

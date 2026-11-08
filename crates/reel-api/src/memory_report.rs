@@ -1,6 +1,6 @@
 //! Heap held by each structure, with no profiler attached
 
-use crate::units::{ByteCount, SegmentCount};
+use crate::units::{ByteCount, Nanoseconds, SegmentCount};
 
 /// Every named part of the engine's heap
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -28,6 +28,10 @@ pub struct MemoryReport {
     pub open_slots: usize,
     /// Workers each volume runs beside its planner, which the budget may have set below the default
     pub maintenance_workers: usize,
+    /// How long the last open took, from the root locks to every job running
+    pub open_time: Nanoseconds,
+    /// The part of that open spent building and touching the pools, the jobs' included
+    pub prefault_time: Nanoseconds,
     /// The filter arena holds every filter it can, and gets search the footers' own filters until it does
     pub is_arena_full: bool,
     /// Segments with filters the arena lacks, which a full arena left out for want of room

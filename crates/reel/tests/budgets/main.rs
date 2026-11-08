@@ -9,7 +9,7 @@ use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use reel::engine::engine_sizing::{ENTRY_LINE_DIVISOR, SEAL_JOB_BYTES, WALK_JOB_BYTES, floor_entries};
-use reel::engine::reel_store::{ReelStore, ring_fits, volume_disks};
+use reel::engine::reel_store::{ReelStore, ring_fits, store_shape, volume_disks};
 use reel::segment::segment_table::TABLE_SHARDS;
 use reel::io::plain::PlainIo;
 use reel_api::maintenance_report::MaintenanceReport;
@@ -29,6 +29,8 @@ const WORKER_COUNTS: [usize; 3] = [0, 1, 4];
 const REPORT_SLACK_DIVISOR: u64 = 10;
 /// The budget a store opens with when its caller gives none
 const DEFAULT_CELL_MIB: u64 = 512;
+/// The thinnest budget the harness opens, where the ring may not fit
+const LEAST_CELL_MIB: u64 = 128;
 
 static LIVE_BYTES: AtomicU64 = AtomicU64::new(0);
 
@@ -112,6 +114,7 @@ fn main() {
         drop(store);
         fs::remove_dir_all(&root).expect("remove");
     }
+    failures += check_least_cell();
     failures += check_default_cell();
     if failures > 0 {
         process::exit(1);
@@ -169,4 +172,30 @@ fn check_job_plans(report: &MemoryReport, volumes: u64) -> u32 {
         return 1;
     }
     0
+}
+
+// the least cell opens on the default and takes the ring exactly when it fits, with the least budget beside the ring and without
+fn check_least_cell() -> u32 {
+    let root = scratch_root();
+    let budget = ByteCount(LEAST_CELL_MIB * MIB);
+    let config = config(&root, budget);
+    let disks = volume_disks(&PlainIo::new(), &config).expect("disks");
+    let (ring, no_ring) = (store_shape(&config, true, &disks).least_budget(), store_shape(&config, false, &disks).least_budget());
+    println!("least budget at {LEAST_CELL_MIB} MiB: {ring:?} with the ring, {no_ring:?} without");
+    let mut failures = 0;
+    match ReelStore::open(PlainIo::new(), &config) {
+        Ok(store) => {
+            let mut report = MaintenanceReport::new();
+            store.maintenance_report(&mut report);
+            println!("the default at {LEAST_CELL_MIB} MiB has_ring {}", report.has_ring);
+            failures += u32::from(report.has_ring != ring_fits(&config, &disks));
+            store.close().expect("close");
+        },
+        Err(error) => {
+            println!("the default refused: {error}");
+            failures += 1;
+        },
+    }
+    fs::remove_dir_all(&root).expect("remove");
+    failures
 }

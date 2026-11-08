@@ -427,7 +427,7 @@ pub struct RewriteJob<Backend: Io> {
     listed: FixedList<SegmentNumber>,
     crowd: FixedList<SegmentNumber>,
     pub has_looks_left: bool,
-    picked_as: Option<PickOutcome>,
+    pub picked_as: Option<PickOutcome>,
     /// The overlap look's current pass began at the oldest segment, with no merge started since
     is_whole_pass: bool,
     /// When the job began, for the merge time hot ingest is judged by
@@ -1057,13 +1057,17 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
     }
 
-    /// Read where a merge cuts its output. An overlap merge's inputs span the same keys, so it writes one output over all of them,
-    /// and the next merge takes it whole with no pieces of other merges to meet; a record rewrite cuts into narrow ranges
+    /// Read where a merge cuts its output. An overlap merge's inputs span the same keys, so it writes outputs a segment long, and the
+    /// next merge takes each whole; a record rewrite cuts into narrow ranges. No output's records reach the row blocks, which start
+    /// at `blocks_at`
     pub fn merge_cut(&self, target: MergeTarget) -> u64 {
-        if self.picked_as == Some(PickOutcome::Overlap) {
-            return target.data.0.max(self.cut_floor);
-        }
-        (target.data.0 / MOST_MERGE_OUTPUTS as u64).max(self.cut_floor)
+        let segment_bytes = self.state.volumes[self.volume].segment_bytes.0;
+        let cut = if self.picked_as == Some(PickOutcome::Overlap) {
+            target.data.0.min(segment_bytes).max(self.cut_floor)
+        } else {
+            (target.data.0 / MOST_MERGE_OUTPUTS as u64).max(self.cut_floor)
+        };
+        cut.min(target.blocks_at.0)
     }
 
     /// Create the data output and start every input over. It reserves the inputs' whole length, so a merge holds that much

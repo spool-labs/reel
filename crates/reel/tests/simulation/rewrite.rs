@@ -15,7 +15,8 @@ use reel::engine::open_segment::{OUTPUT_SUFFIX, data_path};
 use reel::engine::read_path::{RecordWant, WalkAsk};
 use reel::engine::planner::{Planner, unit_bound};
 use reel::engine::reel_store::ReelStore;
-use reel::engine::rewrite_job::{MERGE_BUFFER_BYTES, MOST_OVERLAP, MOST_PARK_WAITS, PLANNER_LANE, RewriteJob, RewritePhase, is_overlap_input, overlaps};
+use reel::engine::rewrite_job::{MERGE_BUFFER_BYTES, MergeTarget, MOST_OVERLAP, MOST_PARK_WAITS, PLANNER_LANE, RewriteJob, RewritePhase, is_overlap_input, overlaps};
+use reel::lifetime::MarkRange;
 use reel::engine::volume::{MOST_PARKED, NO_SEAL, Volume};
 use reel::engine::walk_job::{BlockCounter, WalkJob, WalkWorker};
 use reel::guard::hold;
@@ -3052,5 +3053,24 @@ fn idle_seal_reads_quiet() {
     settle(&io);
     assert!(volume.seal_interval.load(Ordering::Relaxed) > 0, "the seal measured no fill time");
     assert!(!volume.is_ingesting(io.clock_reading()), "a seal after ten quiet minutes read as writes arriving");
+    store.close().expect("close");
+}
+
+// an overlap merge over records several segments long cuts its outputs a segment long, short of where its row blocks start, so no
+// record runs into a block
+#[test]
+fn overlap_cut_stays_under_the_row_blocks() {
+    let io = SimulatedIo::new(Seed(88));
+    let store = open(&io);
+    let state = &store.state;
+    let segment = state.volumes[0].segment_bytes.0;
+    let mut job = RewriteJob::new(Arc::clone(state), 0, PLANNER_LANE);
+    job.picked_as = Some(PickOutcome::Overlap);
+    for inputs in [1, 2, 3, MOST_MERGE_SEGMENTS as u64] {
+        let data = inputs * segment;
+        let target = MergeTarget { blocks_at: FileOffset(data.min(2 * segment)), data: ByteCount(data), length: ByteCount(data + segment), marks: MarkRange::NONE };
+        let cut = job.merge_cut(target);
+        assert!(cut <= segment && cut <= target.blocks_at.0, "{inputs} inputs cut at {cut} B, a segment is {segment} B");
+    }
     store.close().expect("close");
 }

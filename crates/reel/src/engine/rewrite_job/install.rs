@@ -29,14 +29,24 @@ use crate::segment::summary::{ColumnFacts, SegmentFacts, SummaryRow, SummaryRows
 use crate::engine::rewrite_job::{BAR_QUARTERS, EARLY_BAR_QUARTERS, MOST_PARK_WAITS, MergeTarget, RewriteJob, RewritePhase, StagedColumn, StagedOutput, rows_bytes};
 
 impl<Backend: Io> RewriteJob<Backend> {
-    /// End the copying. Several inputs becoming one wins back overlap whatever it dropped, and one input that dropped nothing
-    /// has nothing to install
+    /// Check a merge that dropped nothing would leave its inputs' overlap as it was. One input wins back nothing unless it was
+    /// cut. Several overlap afterwards as one chain of data outputs, which follow each other in key order, and a grave output
+    /// beside them: a data and a grave output going back in as two inputs would come out as the same two again
+    pub fn is_futile(&self) -> bool {
+        if self.input_count == 1 {
+            return !self.is_cutting && self.staged.is_empty();
+        }
+        1 + usize::from(self.grave_output.is_some()) >= self.input_count
+    }
+
+    /// End the copying. Several inputs becoming fewer wins back overlap whatever it dropped, and a merge that dropped nothing
+    /// and leaves as much overlap has nothing to install
     pub fn finish_rows(&mut self) -> Result<()> {
         self.unit = (UnitKind::Footer, self.writer.entries().len() as u64);
         let Some(output) = self.output.clone() else {
             return Err(Error::from(ErrorKind::NotFound));
         };
-        if self.dropped_rows == 0 && self.input_count == 1 && !self.is_cutting && self.staged.is_empty() && self.rebuild.is_none() {
+        if self.dropped_rows == 0 && self.rebuild.is_none() && self.is_futile() {
             self.note_gave_up();
             return Err(Error::from(ErrorKind::Interrupted));
         }

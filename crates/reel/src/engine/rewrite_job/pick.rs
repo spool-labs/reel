@@ -215,9 +215,12 @@ impl<Backend: Io> RewriteJob<Backend> {
     pub fn pick_overlap(&mut self, volume: &Volume<Backend>, rows: &SummaryRows, room: usize) -> Option<MergeTarget> {
         let sealing = volume.sealing.load(Ordering::Acquire);
         let walking = volume.walk_segment.load(Ordering::Acquire);
+        // a merge that found nothing to win leaves its inputs out until something changes, or it would run again for nothing
+        let gave_up = self.gave_up_list(volume);
         let can_merge = |row: &SummaryRow<'_>| {
             let segment = row.facts.segment.0;
-            is_overlap_input(row) && segment != sealing && segment != walking && !volume.is_taken(row.facts.segment)
+            let is_free = segment != sealing && segment != walking && !volume.is_taken(row.facts.segment) && !gave_up.holds(row.facts.segment);
+            is_overlap_input(row) && is_free
         };
         let state = Arc::clone(&self.state);
         // a column with a complete table has no overlap bound

@@ -22,7 +22,7 @@ use crate::index::seal_walk::SealWalk;
 use crate::index::spot_index::SpotLocation;
 use crate::io::job::{Job, JobStep};
 use crate::io::{InPlace, Io, IoTask, in_place};
-use crate::io::device_error::is_device_error;
+use crate::io::device_error::{is_device_error, is_sync_failure};
 use crate::record::codec::Codec;
 use crate::record::record_check::RecordIdentity;
 use crate::record::record_reader::{RecordLocation, RecordRead};
@@ -613,7 +613,8 @@ impl<Backend: Io> SealJob<Backend> {
             self.phase,
             SealPhase::Installing | SealPhase::Summarizing | SealPhase::DiscardingRows
         );
-        let is_retryable = error.kind() == ErrorKind::StorageFull || is_past_footer;
+        // a failed sync may have dropped record pages a rewritten footer would never cover, so only a write error retries
+        let is_retryable = !is_sync_failure(error) && (error.kind() == ErrorKind::StorageFull || is_past_footer);
         if !is_retryable {
             self.volume().fail();
             return JobStep::Idle;

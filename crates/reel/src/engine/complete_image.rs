@@ -16,8 +16,7 @@ use crate::index::complete_table::{COMPLETE_SHARDS, CompleteTable, SLOT_BYTES};
 use crate::io::{Io, IoFile};
 use crate::little_endian::read_word;
 use crate::pool::touched_zeroes;
-use crate::record::record_check::{Checksum, checksum};
-use crate::segment::footer_writer::fold_sum;
+use crate::record::record_check::RunningSum;
 use crate::segment::segment_tail::SegmentNumber;
 
 /// The first bytes of an image
@@ -42,7 +41,7 @@ pub struct ImageWriter<'file, File> {
     chunk: &'file mut [u8],
     used: usize,
     at: u64,
-    sum: Checksum,
+    sum: RunningSum,
     outcome: Result<()>,
 }
 
@@ -71,7 +70,7 @@ impl<File: IoFile> ImageWriter<'_, File> {
     pub fn flush(&mut self) {
         if self.used > 0 && self.outcome.is_ok() {
             let bytes = &self.chunk[..self.used];
-            self.sum = fold_sum(self.sum, checksum(bytes));
+            self.sum.add(bytes);
             self.outcome = self.file.write_at(FileOffset(self.at), &[IoSlice::new(bytes)]);
             self.at += self.used as u64;
         }
@@ -82,7 +81,7 @@ impl<File: IoFile> ImageWriter<'_, File> {
     pub fn finish(mut self) -> Result<()> {
         self.flush();
         self.outcome?;
-        self.file.write_at(FileOffset(self.at), &[IoSlice::new(&self.sum.0.to_le_bytes())])?;
+        self.file.write_at(FileOffset(self.at), &[IoSlice::new(&self.sum.sum().0.to_le_bytes())])?;
         self.file.sync()
     }
 }
@@ -111,7 +110,7 @@ impl<Backend: Io> EngineState<Backend> {
             chunk: &mut files.chunk,
             used: 0,
             at: 0,
-            sum: Checksum(0),
+            sum: RunningSum::new(),
             outcome: Ok(()),
         };
         let (slots, overflow) = table.shard_sizes();
@@ -167,16 +166,16 @@ pub fn read_image<File: IoFile>(file: &File, column: ColumnId, table: &CompleteT
         return Err(bad());
     };
     let mut chunk = vec![0; IMAGE_CHUNK_BYTES];
-    let (mut at, mut sum) = (0, Checksum(0));
+    let (mut at, mut sum) = (0, RunningSum::new());
     while at < body {
         let part = (body - at).min(IMAGE_CHUNK_BYTES as u64) as usize;
         file.read_exact_at(FileOffset(at), &mut chunk[..part]).map_err(|_error| bad())?;
-        sum = fold_sum(sum, checksum(&chunk[..part]));
+        sum.add(&chunk[..part]);
         at += part as u64;
     }
     let mut stored = [0; size_of::<u64>()];
     file.read_exact_at(FileOffset(body), &mut stored).map_err(|_error| bad())?;
-    if u64::from_le_bytes(stored) != sum.0 {
+    if u64::from_le_bytes(stored) != sum.sum().0 {
         return Err(bad());
     }
 
@@ -190,7 +189,9 @@ pub fn read_image<File: IoFile>(file: &File, column: ColumnId, table: &CompleteT
     let (used, count) = (word(4)?, word(5)? as usize);
 
     let mut at = IMAGE_HEAD_BYTES as u64;
-    let mut listed = vec![0; count * size_of::<u64>()];
+    // the count comes off the disk, so the list it sizes has to fit the file it was read from
+    let listed_bytes = count.checked_mul(size_of::<u64>()).filter(|bytes| IMAGE_HEAD_BYTES as u64 + *bytes as u64 <= length).ok_or_else(bad)?;
+    let mut listed = vec![0; listed_bytes];
     file.read_exact_at(FileOffset(at), &mut listed).map_err(|_error| bad())?;
     at += listed.len() as u64;
     for shard in 0..COMPLETE_SHARDS {

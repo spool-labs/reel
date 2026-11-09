@@ -1,6 +1,6 @@
 //! Writes a sealed segment's footer: row blocks with their filters, the block index and the tail
 
-use std::io::{Error, IoSlice, Result};
+use std::io::{Error, ErrorKind, IoSlice, Result};
 
 use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
@@ -10,8 +10,9 @@ use crate::fixed_list::{FixedList, ListFull};
 use crate::region::{Region, list_bytes};
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::io::IoFile;
+use crate::io::device_error::sync_failed;
 use crate::lifetime::MarkRange;
-use crate::record::record_check::{Checksum, RecordKey, checksum};
+use crate::record::record_check::{Checksum, RecordKey, RunningSum, checksum};
 use crate::row_kind::RowKind;
 use crate::segment::block_entry::{BLOCK_ENTRY_BYTES, BlockEntry, KeyPrefix, SharedHead};
 use crate::segment::block_filter::{FILTER_SUM_BYTES, add_key, filter_bytes, seal_filter};
@@ -435,7 +436,7 @@ impl FooterWriter {
         self.write_index(file)?;
 
         // the footer must be whole before a tail can say so, or a power cut could keep the tail alone
-        file.sync()?;
+        file.sync().map_err(sync_failed)?;
 
         let head = TailHead {
             segment,
@@ -463,9 +464,9 @@ impl FooterWriter {
         file.write_at(second_tail_at, &[IoSlice::new(&self.tail[..total])])?;
         file.write_at(first_tail_at, &[IoSlice::new(&self.tail[..total])])?;
         // a power cut can keep a cut alone, so an earlier seal's tail could end the file and hide every row after it
-        file.sync()?;
+        file.sync().map_err(sync_failed)?;
         file.truncate(file_length)?;
-        file.sync()?;
+        file.sync().map_err(sync_failed)?;
         Ok(FooterTotals {
             head,
             file_length,
@@ -477,18 +478,22 @@ impl FooterWriter {
 
     /// Write the block index a buffer at a time, and return its checksum
     pub fn write_index<File: IoFile>(&mut self, file: &File) -> Result<Checksum> {
-        let mut sum = Checksum(0);
+        let mut sum = RunningSum::new();
         let lines_per_write = self.index.len() / BLOCK_ENTRY_BYTES;
-        for lines in self.entries.chunks(lines_per_write) {
+        // a writer with no carved buffer has nothing to chunk by, and a footer it wrote would lose its index
+        if lines_per_write == 0 && !self.entries.is_empty() {
+            return Err(Error::from(ErrorKind::InvalidInput));
+        }
+        for lines in self.entries.chunks(lines_per_write.max(1)) {
             for (line, entry) in lines.iter().enumerate() {
                 entry.write(&mut self.index[line * BLOCK_ENTRY_BYTES..]);
             }
             let length = lines.len() * BLOCK_ENTRY_BYTES;
-            sum = fold_sum(sum, checksum(&self.index[..length]));
+            sum.add(&self.index[..length]);
             file.write_at(self.position, &[IoSlice::new(&self.index[..length])])?;
             self.position = FileOffset(self.position.0 + length as u64);
         }
-        Ok(sum)
+        Ok(sum.sum())
     }
 
     /// Lay out the tail and return its length
@@ -504,10 +509,6 @@ impl FooterWriter {
 }
 
 /// Fold one buffer's checksum into a running one
-pub fn fold_sum(running: Checksum, next: Checksum) -> Checksum {
-    Checksum(running.0.rotate_left(1) ^ next.0)
-}
-
 /// Count the bytes two keys share at the front
 pub fn shared_prefix(left: &[u8], right: &[u8]) -> usize {
     let mut shared = 0;

@@ -14,6 +14,7 @@ mod engine_sizing;
 mod lifetime;
 mod lz4_block;
 mod open_segment;
+mod plain_io;
 mod pool;
 mod ration;
 mod range_covers;

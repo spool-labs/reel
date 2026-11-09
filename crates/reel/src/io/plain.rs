@@ -1,13 +1,13 @@
 //! The plain-syscall backend, used on every platform
 
 use std::collections::hash_map::RandomState;
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{self, DirBuilder, File, OpenOptions, TryLockError};
 use std::hash::{BuildHasher, Hasher};
 use std::hint::black_box;
 use std::io::{Error, ErrorKind, Result};
 use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::{Arc, Barrier, Mutex};
@@ -33,6 +33,10 @@ use crate::pool::TOUCH_BYTE;
 /// Width of the process id in a lock file, padded with spaces
 pub const HOLDER_WIDTH: usize = 10;
 /// The file open writes in a root to learn whether its filesystem gives blocks back
+/// The mode a store's files take, which only the store's own user reads
+pub const FILE_MODE: u32 = 0o600;
+/// The mode a store's roots take
+pub const DIRECTORY_MODE: u32 = 0o700;
 pub const FREE_PROBE_NAME: &str = "free-probe";
 /// Bytes of that file, two blocks of any filesystem reel runs on
 pub const FREE_PROBE_BYTES: usize = 8 * 1024;
@@ -102,7 +106,7 @@ impl Io for PlainIo {
 
     fn create_file(&self, path: &Path, reserved: ByteCount) -> Result<PlainFile> {
         let mut options = OpenOptions::new();
-        options.read(true).write(true).create_new(true);
+        options.read(true).write(true).create_new(true).mode(FILE_MODE).custom_flags(libc::O_NOFOLLOW);
         let file = options.open(path)?;
         if reserved.0 == 0 {
             return Ok(PlainFile::new(file));
@@ -128,7 +132,7 @@ impl Io for PlainIo {
 
     fn can_free_blocks(&self, root: &Path) -> bool {
         let path = root.join(FREE_PROBE_NAME);
-        let probe = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path);
+        let probe = OpenOptions::new().read(true).write(true).create(true).truncate(true).mode(FILE_MODE).custom_flags(libc::O_NOFOLLOW).open(&path);
         let Ok(probe) = probe else {
             return false;
         };
@@ -154,7 +158,7 @@ impl Io for PlainIo {
     }
 
     fn create_directory(&self, path: &Path) -> Result<()> {
-        fs::create_dir_all(path)
+        DirBuilder::new().recursive(true).mode(DIRECTORY_MODE).create(path)
     }
 
     fn sync_directory(&self, path: &Path) -> Result<()> {
@@ -194,7 +198,7 @@ impl Io for PlainIo {
 
     fn lock(&self, path: &Path) -> Result<LockOutcome<PlainLock>> {
         let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
+        options.read(true).write(true).create(true).truncate(false).mode(FILE_MODE).custom_flags(libc::O_NOFOLLOW);
         let file = options.open(path)?;
 
         match file.try_lock() {

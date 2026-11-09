@@ -206,6 +206,8 @@ impl<Item> Pool<Item> {
                     return;
                 }
             }
+            // a slot frees once another put or take lets go of its lock, which takes nanoseconds
+            std::hint::spin_loop();
         }
     }
 

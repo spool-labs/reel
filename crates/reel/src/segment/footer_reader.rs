@@ -9,13 +9,12 @@ use crate::pool::{HollowItem, touched_capacity, touched_zeroes};
 use crate::index::key_hash::KeyHash;
 use crate::io::{DeviceReads, InPlace, IoFile, ReadOn, in_place};
 use crate::io::device_error::{read_or_damaged, read_or_damaged_on};
-use crate::record::record_check::{Checksum, RecordKey, checksum};
+use crate::record::record_check::{RecordKey, RunningSum};
 use crate::segment::column_directory::Candidate;
 use crate::segment::block_cache::{BlockCache, BlockKey};
 use crate::segment::block_entry::{BLOCK_ENTRY_BYTES, BlockEntry, KeyPrefix};
 use crate::segment::filter_arena::FilterArena;
 use crate::segment::block_filter::{may_contain, open_filter};
-use crate::segment::footer_writer::fold_sum;
 use crate::segment::row_block::{FooterRow, ROW_BLOCK_BYTES, RowBlockWalk};
 use crate::segment::segment_table::BlockWindow;
 use crate::segment::segment_tail::{
@@ -219,7 +218,7 @@ impl FooterReader {
         entries.clear();
         let mut at = start;
         let mut remaining = head.block_count.0 as usize;
-        let mut sum = Checksum(0);
+        let mut sum = RunningSum::new();
         let lines_per_read = self.block.len() / BLOCK_ENTRY_BYTES;
         // the blocks run in order from the records' end, each with its filter before the next header
         let mut after = head.data_end.0;
@@ -229,7 +228,7 @@ impl FooterReader {
             if !read_or_damaged(file, at, &mut self.block[..length])? {
                 return Ok(false);
             }
-            sum = fold_sum(sum, checksum(&self.block[..length]));
+            sum.add(&self.block[..length]);
             for line in 0..lines {
                 let Some(entry) = BlockEntry::read(&self.block[line * BLOCK_ENTRY_BYTES..]) else {
                     return Ok(false);
@@ -243,7 +242,7 @@ impl FooterReader {
             at = FileOffset(at.0 + length as u64);
             remaining -= lines;
         }
-        Ok(sum == head.index_sum && after <= start.0)
+        Ok(sum.sum() == head.index_sum && after <= start.0)
     }
 
     /// Find a key's newest row at a read point, through its filter and one row block

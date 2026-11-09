@@ -37,3 +37,26 @@ pub async fn read_or_damaged_on<File>(device: &impl DeviceReads<File>, file: &Fi
         Err(error) => Err(error),
     }
 }
+
+/// A sync that failed, which a retry can't trust: Linux can drop the dirty pages a failed sync held, and the next sync of the
+/// file then reports them written
+#[derive(Debug)]
+pub struct SyncFailed(pub Error);
+
+impl std::fmt::Display for SyncFailed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "a sync failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for SyncFailed {}
+
+/// Mark a failed sync so no retry takes it for a passing write error, keeping its kind
+pub fn sync_failed(error: Error) -> Error {
+    Error::new(error.kind(), SyncFailed(error))
+}
+
+/// Check an error came from a failed sync
+pub fn is_sync_failure(error: &Error) -> bool {
+    error.get_ref().is_some_and(|inner| inner.is::<SyncFailed>())
+}

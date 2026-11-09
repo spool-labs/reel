@@ -1,6 +1,6 @@
 //! One per root: the store's identity, its layout, the segment counter and the write order's limit
 
-use std::io::{ErrorKind, IoSlice, Result};
+use std::io::{Error, ErrorKind, IoSlice, Result};
 use std::path::{Path, PathBuf};
 
 use reel_api::column_id::ColumnId;
@@ -221,10 +221,10 @@ impl Superblock {
         let column_count = fields.word()?;
         let mut columns = Vec::new();
         for _column in 0..column_count {
-            let id = ColumnId(fields.word()? as u8);
+            let id = ColumnId(u8::try_from(fields.word()?).ok()?);
             let name = fields.text()?;
-            let shape = fields.word()? as u8;
-            let width = fields.word()? as u16;
+            let shape = u8::try_from(fields.word()?).ok()?;
+            let width = u16::try_from(fields.word()?).ok()?;
             let key_shape = match shape {
                 FIXED_SHAPE => KeyShape::Fixed { width },
                 VARIABLE_SHAPE => KeyShape::Variable { most: width },
@@ -310,9 +310,15 @@ impl Superblock {
     }
 }
 
+/// The most bytes a superblock copy can take, far past any store's, so a stray file can't size an allocation
+pub const MOST_SUPERBLOCK_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Read a file from end to end
 pub fn read_whole<File: IoFile>(file: &File) -> Result<Vec<u8>> {
     let length = file.length()?;
+    if length.0 > MOST_SUPERBLOCK_BYTES {
+        return Err(Error::from(ErrorKind::InvalidData));
+    }
     let mut bytes = vec![0; length.0 as usize];
     file.read_exact_at(FileOffset(0), &mut bytes)?;
     Ok(bytes)

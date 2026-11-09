@@ -45,3 +45,22 @@ fn check_fields() {
     assert_ne!(base, record_check(&identity(b"key"), OTHER_FORM, payload));
     assert_ne!(base, record_check(&identity(b"key"), FORM, checksum(b"other")));
 }
+
+// a running sum is the whole's checksum however the pieces were cut, and moving a piece changes it
+#[test]
+fn running_sum_cuts() {
+    let bytes: Vec<u8> = (0..20_000u32).map(|index| (index * 7 % 251) as u8).collect();
+    let whole = checksum(&bytes);
+    for cut in [1, 64, 4_096, 7_000] {
+        let mut sum = RunningSum::new();
+        for piece in bytes.chunks(cut) {
+            sum.add(piece);
+        }
+        assert_eq!(sum.sum(), whole, "cut {cut}");
+    }
+    let mut moved = RunningSum::new();
+    moved.add(&bytes[64..128]);
+    moved.add(&bytes[..64]);
+    moved.add(&bytes[128..]);
+    assert_ne!(moved.sum(), whole);
+}

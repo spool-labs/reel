@@ -282,9 +282,8 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// Send the window waiting to go with the slot's turn held, and give the turn back
     pub fn send_kept_in_turn(&self, index: usize) -> Result<(), Error> {
-        let outcome = self.send_kept_window(index);
-        hold(&self.queues[index]).is_writing = false;
-        outcome
+        let _turn = WritingTurn { state: self, index };
+        self.send_kept_window(index)
     }
 
     /// Move a slot to the next range of its segment in the other window, under the locks and with no I/O
@@ -1250,7 +1249,9 @@ impl<Backend: Io> EngineState<Backend> {
             let covers = sync.started;
             drop(sync);
 
+            let running = SyncRun { volume };
             let outcome = self.run_sync(volume);
+            drop(running);
             let mut sync = hold(&volume.sync);
             sync.is_running = false;
             match outcome {
@@ -1357,13 +1358,11 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// Send a slot's rows with its turn held, and give the turn back
     pub fn send_in_turn(&self, slot: OpenSlot, rows: &Backend::File, data: Option<&Backend::File>) -> Result<(), Error> {
-        let index = slot.0 as usize;
-
+        let _turn = WritingTurn { state: self, index: slot.0 as usize };
         let mut outcome = self.send_group(slot, rows, data);
         if outcome.is_ok() && self.has_left_over_rows(slot) {
             outcome = self.send_group(slot, rows, data);
         }
-        hold(&self.queues[index]).is_writing = false;
         outcome
     }
 
@@ -1679,4 +1678,37 @@ pub fn check_seal_room<Backend: Io>(volume: &Volume<Backend>) -> Result<(), Stor
 pub fn reserve_target<Backend: Io>(segment: &OpenSegment<Backend::File>, volume: &Volume<Backend>, end: u64) -> u64 {
     let limit = volume.segment_bytes.0.max(end);
     (segment.reserved_end.0 + RESERVE_STEP_BYTES).max(end).min(limit)
+}
+
+/// A slot's writing turn, given back however the send ends. A panic inside it fails every volume, since the slot's queue can
+/// stand half changed and the next writer would carry on from there
+pub struct WritingTurn<'state, Backend: Io> {
+    pub state: &'state EngineState<Backend>,
+    pub index: usize,
+}
+
+impl<Backend: Io> Drop for WritingTurn<'_, Backend> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            for volume in &self.state.volumes {
+                volume.fail();
+            }
+        }
+        hold(&self.state.queues[self.index]).is_writing = false;
+    }
+}
+
+/// A volume's sync under way. A panic inside it fails the volume and lets the next sync start, so the writers waiting on this
+/// one hear the failure
+pub struct SyncRun<'volume, Backend: Io> {
+    pub volume: &'volume Volume<Backend>,
+}
+
+impl<Backend: Io> Drop for SyncRun<'_, Backend> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.volume.fail();
+            hold(&self.volume.sync).is_running = false;
+        }
+    }
 }

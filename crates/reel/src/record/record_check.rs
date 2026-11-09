@@ -2,7 +2,7 @@
 
 use reel_api::column_id::ColumnId;
 use reel_api::units::WritePlace;
-use xxhash_rust::xxh3::{xxh3_64, xxh3_64_with_seed};
+use xxhash_rust::xxh3::{Xxh3, xxh3_64, xxh3_64_with_seed};
 
 use crate::record::record_head::RecordForm;
 use crate::row_kind::RowKind;
@@ -35,6 +35,40 @@ pub struct RecordIdentity<'key> {
 /// Sum stored bytes
 pub fn checksum(bytes: &[u8]) -> Checksum {
     Checksum(xxh3_64(bytes))
+}
+
+/// A checksum over bytes that come a piece at a time. It equals the checksum of the whole however the pieces were cut, so a
+/// reader with another buffer size checks what a writer wrote, and moving a piece changes it
+#[derive(Clone)]
+pub struct RunningSum(Xxh3);
+
+impl RunningSum {
+    /// Start over no bytes
+    pub fn new() -> Self {
+        Self(Xxh3::new())
+    }
+
+    /// Take the next piece
+    pub fn add(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    /// Read the checksum of every piece so far
+    pub fn sum(&self) -> Checksum {
+        Checksum(self.0.digest())
+    }
+}
+
+impl Default for RunningSum {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for RunningSum {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "RunningSum({:?})", self.sum())
+    }
 }
 
 /// Fold a place into a check, so a record checks only for the one write that made it

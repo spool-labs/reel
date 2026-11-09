@@ -3,6 +3,7 @@
 use std::hint;
 use std::io::{Error, ErrorKind};
 use std::sync::atomic::Ordering;
+use std::sync::MutexGuard;
 
 use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
@@ -24,6 +25,7 @@ use crate::lifetime::{MOST_LIFETIME_GROUPS, MarkRange, ceiling_of, reach_of};
 use crate::io::{Io, IoFile, IoTask};
 use crate::rows::row_group::{RowEntry, row_size};
 use crate::segment::range_covers::MOST_RANGE_COVERS;
+use crate::write_order::Ticket;
 
 use crate::engine::write_path::{ClaimRequest, INDEX_WAIT, LandOutcome, RowRoom, SPARE_REQUEST, SegmentPick, WRITES_PER_OPEN, check_seal_room, check_writable, reserve_target, store_error};
 
@@ -244,26 +246,7 @@ impl<Backend: Io> EngineState<Backend> {
             }
 
             if let Some(index) = pick.best {
-                // the reserve job keeps a step held ahead, and a claim past what it holds takes the room itself
-                let segment = &mut claims.open[index];
-                let end = segment.write_end.0 + request.bytes.0;
-                if end > segment.reserved_end.0 {
-                    let target = reserve_target(segment, volume, end);
-                    if let Err(source) = segment.data.reserve_to(ByteCount(target)) {
-                        // a full disk seals the segment, so no claim tries it again
-                        self.seal_at(&mut claims, volume, index);
-                        return Err(store_error(volume, "reserving a segment's room", source));
-                    }
-                    segment.reserved_end = FileOffset(target);
-                    segment.is_reserve_asked = false;
-                }
-                let is_short = segment.reserved_end.0 < volume.segment_bytes.0 && segment.reserved_end.0.saturating_sub(end) < RESERVE_STEP_BYTES / 2;
-                if !segment.is_reserve_asked && is_short {
-                    segment.is_reserve_asked = true;
-                    if let Some(task) = self.reserve_task.get() {
-                        task.wake();
-                    }
-                }
+                self.hold_claim_room(&mut claims, volume, index, request)?;
 
                 let Some(ticket) = volume.order.try_claim(request.rows) else {
                     // the ring frees when claims end, and ending one needs this lock, and so does a raise
@@ -275,47 +258,7 @@ impl<Backend: Io> EngineState<Backend> {
                     continue;
                 };
 
-                let segment = &mut claims.open[index];
-                if request.is_alone {
-                    segment.phase = SegmentPhase::Alone;
-                }
-                // the seal measures the ingest period from the first row, one clock read a segment
-                if segment.first_row_at.is_none() {
-                    segment.first_row_at = Some(self.io.now());
-                }
-                let offset = segment.write_end;
-                segment.write_end = FileOffset(offset.0 + request.bytes.0);
-                segment.row_count = RowCount(segment.row_count.0 + request.rows.0);
-                volume.rows_in_index.fetch_add(request.rows.0, Ordering::Relaxed);
-                segment.in_flight += 1;
-                segment.cover_rows += request.covers;
-                segment.has_deletes |= request.has_deletes;
-                segment.lowest_place = segment.lowest_place.min(ticket.first);
-                segment.highest_place = segment.highest_place.max(ticket.last);
-                if let Some(mark) = request.mark {
-                    segment.marks.add(mark);
-                }
-                let number = segment.number;
-                let data = segment.data.clone();
-                let slot = segment.slot;
-                self.slot_files[slot.0 as usize].pins.fetch_add(1, Ordering::AcqRel);
-                self.mark_full_segments(&mut claims, volume);
-                drop(claims);
-                // a group goes out with the marks so far, and this comes before the row lands
-                if let Some(mark) = request.mark {
-                    hold(&self.queues[slot.0 as usize]).marks.add(mark);
-                }
-                return Ok(Claim {
-                    state: self,
-                    volume,
-                    slot,
-                    segment: number,
-                    data,
-                    offset,
-                    ticket,
-                    is_landed: false,
-                    is_alone: request.is_alone,
-                });
+                return Ok(self.take_claim(claims, volume, index, request, ticket));
             }
 
             if claims.is_creating {
@@ -343,6 +286,82 @@ impl<Backend: Io> EngineState<Backend> {
                 },
                 Err(error) => return Err(error),
             }
+        }
+    }
+
+    /// Hold disk room for a claim in a segment: the reserve job keeps a step held ahead, and a claim past what it holds takes
+    /// the room itself. A full disk seals the segment, so no claim tries it again
+    pub fn hold_claim_room(&self, claims: &mut ClaimState<Backend::File>, volume: &Volume<Backend>, index: usize, request: &ClaimRequest) -> Result<(), StoreError> {
+        let segment = &mut claims.open[index];
+        let end = segment.write_end.0 + request.bytes.0;
+        if end > segment.reserved_end.0 {
+            let target = reserve_target(segment, volume, end);
+            if let Err(source) = segment.data.reserve_to(ByteCount(target)) {
+                self.seal_at(claims, volume, index);
+                return Err(store_error(volume, "reserving a segment's room", source));
+            }
+            segment.reserved_end = FileOffset(target);
+            segment.is_reserve_asked = false;
+        }
+        let is_short = segment.reserved_end.0 < volume.segment_bytes.0 && segment.reserved_end.0.saturating_sub(end) < RESERVE_STEP_BYTES / 2;
+        if !segment.is_reserve_asked && is_short {
+            segment.is_reserve_asked = true;
+            if let Some(task) = self.reserve_task.get() {
+                task.wake();
+            }
+        }
+        Ok(())
+    }
+
+    /// Take a claim in a segment that has the room and a ticket of places, pin its slot's files, and let the claims go
+    pub fn take_claim<'state>(
+        &'state self,
+        mut claims: MutexGuard<'state, ClaimState<Backend::File>>,
+        volume: &'state Volume<Backend>,
+        index: usize,
+        request: &ClaimRequest,
+        ticket: Ticket,
+    ) -> Claim<'state, Backend> {
+        let segment = &mut claims.open[index];
+        if request.is_alone {
+            segment.phase = SegmentPhase::Alone;
+        }
+        // the seal measures the ingest period from the first row, one clock read a segment
+        if segment.first_row_at.is_none() {
+            segment.first_row_at = Some(self.io.now());
+        }
+        let offset = segment.write_end;
+        segment.write_end = FileOffset(offset.0 + request.bytes.0);
+        segment.row_count = RowCount(segment.row_count.0 + request.rows.0);
+        volume.rows_in_index.fetch_add(request.rows.0, Ordering::Relaxed);
+        segment.in_flight += 1;
+        segment.cover_rows += request.covers;
+        segment.has_deletes |= request.has_deletes;
+        segment.lowest_place = segment.lowest_place.min(ticket.first);
+        segment.highest_place = segment.highest_place.max(ticket.last);
+        if let Some(mark) = request.mark {
+            segment.marks.add(mark);
+        }
+        let number = segment.number;
+        let data = segment.data.clone();
+        let slot = segment.slot;
+        self.slot_files[slot.0 as usize].pins.fetch_add(1, Ordering::AcqRel);
+        self.mark_full_segments(&mut claims, volume);
+        drop(claims);
+        // a group goes out with the marks so far, and this comes before the row lands
+        if let Some(mark) = request.mark {
+            hold(&self.queues[slot.0 as usize]).marks.add(mark);
+        }
+        Claim {
+            state: self,
+            volume,
+            slot,
+            segment: number,
+            data,
+            offset,
+            ticket,
+            is_landed: false,
+            is_alone: request.is_alone,
         }
     }
 

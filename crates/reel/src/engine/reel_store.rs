@@ -127,7 +127,7 @@ impl<Backend: Io> ReelStore<Backend> {
 
         // the pools are built and touched here and as the jobs start, and open reports that time apart
         let touched_from = io.now();
-        let mut state = build_state(io, config, &sizing, &disks, superblock, locks, &scan, summaries);
+        let mut state = build_state(OpenInputs { io, config, sizing: &sizing, disks: &disks, superblock, locks, scan: &scan, summaries });
         state.complete = complete_tables(config);
         state.complete_images = complete_images(config);
         state.attach_ring(ring);
@@ -613,6 +613,11 @@ pub fn bring_up<Backend: Io>(
         state.mark_full_segments(&mut claims, volume);
     }
 
+    start_jobs(state)
+}
+
+/// Start the row job, the walk workers, the planner, the reserve job, the readers and the ring's reaper
+pub fn start_jobs<Backend: Io>(state: &Arc<EngineState<Backend>>) -> Result<(), StoreError> {
     let jobs_from = state.io.now();
     let row_job = RowJob {
         state: Arc::clone(state),
@@ -1054,18 +1059,21 @@ pub fn planned_table(config: &StoreConfig, entries: Option<usize>, volume: usize
     }
 }
 
+/// What open read before it builds the engine's state
+pub struct OpenInputs<'open, Backend: Io> {
+    pub io: Backend,
+    pub config: &'open StoreConfig,
+    pub sizing: &'open EngineSizing,
+    pub disks: &'open [Option<ByteCount>],
+    pub superblock: Superblock,
+    pub locks: Vec<Vec<Backend::Lock>>,
+    pub scan: &'open RootScan<Backend::File>,
+    pub summaries: Vec<SummaryFound>,
+}
+
 /// Allocate and touch everything the engine will hold
-#[allow(clippy::too_many_arguments, reason = "open hands over everything it read")]
-pub fn build_state<Backend: Io>(
-    io: Backend,
-    config: &StoreConfig,
-    sizing: &EngineSizing,
-    disks: &[Option<ByteCount>],
-    superblock: Superblock,
-    mut locks: Vec<Vec<Backend::Lock>>,
-    scan: &RootScan<Backend::File>,
-    summaries: Vec<SummaryFound>,
-) -> EngineState<Backend> {
+pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<Backend> {
+    let OpenInputs { io, config, sizing, disks, superblock, mut locks, scan, summaries } = inputs;
     let first_place = superblock.place_limit.0.saturating_sub(PLACE_RUN);
     let places = Arc::new(PlaceCount::new(WritePlace(first_place), superblock.place_limit));
     let volume_share = sizing.table_share.0 / config.volumes.len().max(1) as u64;
@@ -1100,138 +1108,12 @@ pub fn build_state<Backend: Io>(
     let mut volumes = Vec::with_capacity(config.volumes.len());
     let all_row_room = config.volumes.len() * MOST_ROW_FIXED_BYTES + config.columns.len() * MOST_ROW_COLUMN_BYTES;
     let mut summaries = summaries.into_iter();
-    for (index, volume) in config.volumes.iter().enumerate() {
-        let mut paths = Vec::with_capacity(volume.roots.len());
-        for root in &volume.roots {
-            paths.push(SuperblockPaths::new(root));
-        }
-        let held = mem::take(&mut locks[index]);
-        let Some(mut summary) = summaries.next() else {
+    let context = VolumeContext { io: &io, config, sizing, disks, scan, places: &places, planned: &planned, open_slots, all_row_room };
+    for (index, held) in locks.iter_mut().map(mem::take).enumerate() {
+        let Some(summary) = summaries.next() else {
             continue;
         };
-        let found_summary = summary.rows.bytes().len() * 2;
-        let columns_here = config.columns.iter().filter(|column| column.volume.0 as usize == index).count();
-        // the share splits by each volume's row size, so every volume plans the same number of rows
-        // the share pays for the rows and the buffer they save through
-        let planned_summary = sizing.summary_share.0 as usize / 2 * row_room(columns_here) / all_row_room;
-        // open never drops a row, so a segment's damage keeps its rank through every open
-        let span_room = MOST_DAMAGED_SPANS * (MOST_ROW_SPAN_FIXED_BYTES + 2 * SPAN_KEY_BYTES);
-        let summary_room = span_room + found_summary.max(planned_summary).max(scan.least_summary_room(index, columns_here) * 2);
-        summary.rows.make_room(ByteCount(summary_room as u64));
-        let mut room = table_room(&planned[index], &scan.least_sizing(index));
-        let cover_segment = volume_segment_bytes(config, index, sizing.segment_rows);
-        room.blocks_per_shard += complete_shard_lines(config, index);
-        // a row for each segment the table can hold, beside open segments and the spans of gone ones
-        summary.rows.make_index(room.segments_per_shard * TABLE_SHARDS + open_slots + MOST_DAMAGED_SPANS);
-        volumes.push(Volume {
-            id: VolumeId(index as u8),
-            name: volume.name.clone(),
-            roots: volume.roots.clone(),
-            superblock_paths: paths,
-            policy: volume.sync,
-            locks: Mutex::new(held),
-            claims: Mutex::new(ClaimState {
-                open: touched_room(open_slots),
-                is_creating: false,
-                prepared: None,
-                wants_prepared: false,
-                bytes_since_sync: ByteCount(0),
-                next_root: 0,
-            }),
-            table: SegmentTable::new(&room),
-            view: AtomicU64::new(0),
-            handovers: AtomicU64::new(0),
-            highest_sealed: AtomicU64::new(0),
-            sync: Mutex::new(SyncState::default()),
-            is_failed: AtomicBool::new(false),
-            segment_bytes: sizing.segment_bytes,
-            segment_rows: volume_rows(config, index, sizing.segment_rows),
-            walk_retries: AtomicU64::new(0),
-            walks_waiting: AtomicU64::new(0),
-            wants_compaction: AtomicBool::new(true),
-            has_kept_covers: AtomicBool::new(false),
-            #[cfg(feature = "test-hooks")]
-            holds: TestHolds::default(),
-            is_seal_stuck: AtomicBool::new(false),
-            seal_stops: AtomicU64::new(0),
-            disk_bytes: disks.get(index).copied().flatten(),
-            disk_covered: disks.get(index).copied().flatten().map_or(ByteCount(0), |disk| entry_cover(room.segments_per_shard * TABLE_SHARDS, cover_segment, disk)),
-            cover_segment_bytes: cover_segment,
-            entry_bytes: ByteCount(entry_cost(columns_here)),
-            picks: Default::default(),
-            rewrite_inputs_gone: AtomicU64::new(0),
-            rewrite_written: AtomicU64::new(0),
-            rewrite_written_by_share: Default::default(),
-            rewrites_by_share: Default::default(),
-            unlinked_bytes: AtomicU64::new(0),
-            rewrite_dead_gone: AtomicU64::new(0),
-            rewrite_dead_kept: AtomicU64::new(0),
-            rewrites_unreclaimed: AtomicU64::new(0),
-            walk_blocks: AtomicU64::new(0),
-            sealing: AtomicU64::new(NO_SEAL),
-            lanes: (0..=sizing.walk_slots).map(|_lane| RewriteLane::new()).collect(),
-            gave_up: Mutex::new(GaveUp::new()),
-            early_bar_rewrites: AtomicU64::new(0),
-            plain_bar_rewrites: AtomicU64::new(0),
-            key_order_copies: AtomicU64::new(0),
-            offset_order_copies: AtomicU64::new(0),
-            span_reads: AtomicU64::new(0),
-            span_records: AtomicU64::new(0),
-            span_gap_bytes: AtomicU64::new(0),
-            lone_copies: AtomicU64::new(0),
-            keyed_copies: AtomicU64::new(0),
-            footer_reads: Default::default(),
-            span_runs: Default::default(),
-            summary_saves: AtomicU64::new(0),
-            order: WriteOrder::new(Arc::clone(&places)),
-            rows_in_index: AtomicU64::new(0),
-            seal_steps: SealStepTimes::default(),
-            ration: Ration::default(),
-            marked_seals: AtomicU64::new(0),
-            marked_seal_bytes: AtomicU64::new(0),
-            marks_dropped: AtomicU64::new(0),
-            is_spinning: is_spinning(&io, volume),
-            is_device_set: volume.device != DeviceClass::Detect,
-            seal_point: AtomicU64::new(volume_rows(config, index, sizing.segment_rows).0),
-            seal_rate: AtomicU64::new(0),
-            ingest_rate: AtomicU64::new(0),
-            seal_started_at: AtomicU64::new(0),
-            seal_interval: AtomicU64::new(0),
-            merge_interval: AtomicU64::new(0),
-            is_over_bound: AtomicBool::new(true),
-            walk_slots: (0..sizing.walk_slots).map(|_slot| WalkSlot::new()).collect(),
-            can_free_blocks: volume.roots.iter().all(|root| io.can_free_blocks(root)),
-            bytes_freed: AtomicU64::new(0),
-            has_held_frees: AtomicBool::new(false),
-            seals_done: AtomicU64::new(0),
-            segments_unlinked: AtomicU64::new(0),
-            segments_parked: AtomicU64::new(0),
-            empties_left: AtomicU64::new(0),
-            parked: Mutex::new([const { None }; MOST_PARKED]),
-            segments_rewritten: AtomicU64::new(0),
-            stray_outputs: AtomicU64::new(0),
-            reclaim_retries: AtomicU64::new(0),
-            has_walk_target: AtomicBool::new(false),
-            walk_segment: AtomicU64::new(NO_SEAL),
-            is_applying: AtomicBool::new(false),
-            claim_lock: Mutex::new(()),
-            claims_changed: AtomicU64::new(0),
-            walks_held: AtomicU64::new(0),
-            walk_claim_waits: AtomicU64::new(0),
-            walk_claim_held: AtomicU64::new(0),
-            walk_claim_longest: AtomicU64::new(0),
-            held_drain_blocks: AtomicU64::new(0),
-            held_drain_bytes: AtomicU64::new(0),
-            reserve: ByteCount(sizing.segment_bytes.0 * 2),
-            summary: Mutex::new(summary.rows),
-            summary_paths: summary.paths,
-            lost_rows: Mutex::new(summary.lost),
-            summary_buffer: Pool::new(vec![touched_buffer(summary_room)]),
-            damage: DamageList::new(),
-            covers: RangeCovers::new(config.widest_key(index)),
-            damaged: Mutex::new(touched_room(MOST_DAMAGED_SPANS)),
-            is_clearing: AtomicBool::new(false),
-        });
+        volumes.push(build_volume(&context, index, held, summary));
     }
 
     let mut queues = Vec::with_capacity(open_slots);
@@ -1372,6 +1254,152 @@ pub fn build_state<Backend: Io>(
         index_waiters: AtomicU64::new(0),
         cues: CueTable::new(config.volumes.len()),
         is_stopping: AtomicBool::new(false),
+    }
+}
+
+/// What every volume's state is built from, which open read once for the whole store
+pub struct VolumeContext<'open, Backend: Io> {
+    pub io: &'open Backend,
+    pub config: &'open StoreConfig,
+    pub sizing: &'open EngineSizing,
+    pub disks: &'open [Option<ByteCount>],
+    pub scan: &'open RootScan<Backend::File>,
+    pub places: &'open Arc<PlaceCount>,
+    pub planned: &'open [TableSizing],
+    pub open_slots: usize,
+    pub all_row_room: usize,
+}
+
+/// Build one volume's state: its summary's room, its table, and every count it keeps
+pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: usize, held: Vec<Backend::Lock>, mut summary: SummaryFound) -> Volume<Backend> {
+    let VolumeContext { io, config, sizing, disks, scan, places, planned, open_slots, all_row_room } = *context;
+    let volume = &config.volumes[index];
+    let mut paths = Vec::with_capacity(volume.roots.len());
+    for root in &volume.roots {
+        paths.push(SuperblockPaths::new(root));
+    }
+    let found_summary = summary.rows.bytes().len() * 2;
+    let columns_here = config.columns.iter().filter(|column| column.volume.0 as usize == index).count();
+    // the share splits by each volume's row size, so every volume plans the same number of rows
+    // the share pays for the rows and the buffer they save through
+    let planned_summary = sizing.summary_share.0 as usize / 2 * row_room(columns_here) / all_row_room;
+    // open never drops a row, so a segment's damage keeps its rank through every open
+    let span_room = MOST_DAMAGED_SPANS * (MOST_ROW_SPAN_FIXED_BYTES + 2 * SPAN_KEY_BYTES);
+    let summary_room = span_room + found_summary.max(planned_summary).max(scan.least_summary_room(index, columns_here) * 2);
+    summary.rows.make_room(ByteCount(summary_room as u64));
+    let mut room = table_room(&planned[index], &scan.least_sizing(index));
+    let cover_segment = volume_segment_bytes(config, index, sizing.segment_rows);
+    room.blocks_per_shard += complete_shard_lines(config, index);
+    // a row for each segment the table can hold, beside open segments and the spans of gone ones
+    summary.rows.make_index(room.segments_per_shard * TABLE_SHARDS + open_slots + MOST_DAMAGED_SPANS);
+    Volume {
+        id: VolumeId(index as u8),
+        name: volume.name.clone(),
+        roots: volume.roots.clone(),
+        superblock_paths: paths,
+        policy: volume.sync,
+        locks: Mutex::new(held),
+        claims: Mutex::new(ClaimState {
+            open: touched_room(open_slots),
+            is_creating: false,
+            prepared: None,
+            wants_prepared: false,
+            bytes_since_sync: ByteCount(0),
+            next_root: 0,
+        }),
+        table: SegmentTable::new(&room),
+        view: AtomicU64::new(0),
+        handovers: AtomicU64::new(0),
+        highest_sealed: AtomicU64::new(0),
+        sync: Mutex::new(SyncState::default()),
+        is_failed: AtomicBool::new(false),
+        segment_bytes: sizing.segment_bytes,
+        segment_rows: volume_rows(config, index, sizing.segment_rows),
+        walk_retries: AtomicU64::new(0),
+        walks_waiting: AtomicU64::new(0),
+        wants_compaction: AtomicBool::new(true),
+        has_kept_covers: AtomicBool::new(false),
+        #[cfg(feature = "test-hooks")]
+        holds: TestHolds::default(),
+        is_seal_stuck: AtomicBool::new(false),
+        seal_stops: AtomicU64::new(0),
+        disk_bytes: disks.get(index).copied().flatten(),
+        disk_covered: disks.get(index).copied().flatten().map_or(ByteCount(0), |disk| entry_cover(room.segments_per_shard * TABLE_SHARDS, cover_segment, disk)),
+        cover_segment_bytes: cover_segment,
+        entry_bytes: ByteCount(entry_cost(columns_here)),
+        picks: Default::default(),
+        rewrite_inputs_gone: AtomicU64::new(0),
+        rewrite_written: AtomicU64::new(0),
+        rewrite_written_by_share: Default::default(),
+        rewrites_by_share: Default::default(),
+        unlinked_bytes: AtomicU64::new(0),
+        rewrite_dead_gone: AtomicU64::new(0),
+        rewrite_dead_kept: AtomicU64::new(0),
+        rewrites_unreclaimed: AtomicU64::new(0),
+        walk_blocks: AtomicU64::new(0),
+        sealing: AtomicU64::new(NO_SEAL),
+        lanes: (0..=sizing.walk_slots).map(|_lane| RewriteLane::new()).collect(),
+        gave_up: Mutex::new(GaveUp::new()),
+        early_bar_rewrites: AtomicU64::new(0),
+        plain_bar_rewrites: AtomicU64::new(0),
+        key_order_copies: AtomicU64::new(0),
+        offset_order_copies: AtomicU64::new(0),
+        span_reads: AtomicU64::new(0),
+        span_records: AtomicU64::new(0),
+        span_gap_bytes: AtomicU64::new(0),
+        lone_copies: AtomicU64::new(0),
+        keyed_copies: AtomicU64::new(0),
+        footer_reads: Default::default(),
+        span_runs: Default::default(),
+        summary_saves: AtomicU64::new(0),
+        order: WriteOrder::new(Arc::clone(places)),
+        rows_in_index: AtomicU64::new(0),
+        seal_steps: SealStepTimes::default(),
+        ration: Ration::default(),
+        marked_seals: AtomicU64::new(0),
+        marked_seal_bytes: AtomicU64::new(0),
+        marks_dropped: AtomicU64::new(0),
+        is_spinning: is_spinning(io, volume),
+        is_device_set: volume.device != DeviceClass::Detect,
+        seal_point: AtomicU64::new(volume_rows(config, index, sizing.segment_rows).0),
+        seal_rate: AtomicU64::new(0),
+        ingest_rate: AtomicU64::new(0),
+        seal_started_at: AtomicU64::new(0),
+        seal_interval: AtomicU64::new(0),
+        merge_interval: AtomicU64::new(0),
+        is_over_bound: AtomicBool::new(true),
+        walk_slots: (0..sizing.walk_slots).map(|_slot| WalkSlot::new()).collect(),
+        can_free_blocks: volume.roots.iter().all(|root| io.can_free_blocks(root)),
+        bytes_freed: AtomicU64::new(0),
+        has_held_frees: AtomicBool::new(false),
+        seals_done: AtomicU64::new(0),
+        segments_unlinked: AtomicU64::new(0),
+        segments_parked: AtomicU64::new(0),
+        empties_left: AtomicU64::new(0),
+        parked: Mutex::new([const { None }; MOST_PARKED]),
+        segments_rewritten: AtomicU64::new(0),
+        stray_outputs: AtomicU64::new(0),
+        reclaim_retries: AtomicU64::new(0),
+        has_walk_target: AtomicBool::new(false),
+        walk_segment: AtomicU64::new(NO_SEAL),
+        is_applying: AtomicBool::new(false),
+        claim_lock: Mutex::new(()),
+        claims_changed: AtomicU64::new(0),
+        walks_held: AtomicU64::new(0),
+        walk_claim_waits: AtomicU64::new(0),
+        walk_claim_held: AtomicU64::new(0),
+        walk_claim_longest: AtomicU64::new(0),
+        held_drain_blocks: AtomicU64::new(0),
+        held_drain_bytes: AtomicU64::new(0),
+        reserve: ByteCount(sizing.segment_bytes.0 * 2),
+        summary: Mutex::new(summary.rows),
+        summary_paths: summary.paths,
+        lost_rows: Mutex::new(summary.lost),
+        summary_buffer: Pool::new(vec![touched_buffer(summary_room)]),
+        damage: DamageList::new(),
+        covers: RangeCovers::new(config.widest_key(index)),
+        damaged: Mutex::new(touched_room(MOST_DAMAGED_SPANS)),
+        is_clearing: AtomicBool::new(false),
     }
 }
 

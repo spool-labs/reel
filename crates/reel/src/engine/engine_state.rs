@@ -189,7 +189,7 @@ impl<File: Clone> SlotFile<File> {
     pub fn file(&self) -> Option<File> {
         let guard = match self.data.read() {
             Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
+            Err(poisoned) => crate::guard::recover(poisoned),
         };
         guard.as_ref().map(|held| held.file.clone())
     }
@@ -198,7 +198,7 @@ impl<File: Clone> SlotFile<File> {
     pub fn pin(&self, segment: SegmentNumber) -> Option<SlotPin<'_, File>> {
         let guard = match self.data.read() {
             Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
+            Err(poisoned) => crate::guard::recover(poisoned),
         };
         let held = guard.as_ref()?;
         if held.segment != segment {
@@ -213,7 +213,7 @@ impl<File: Clone> SlotFile<File> {
     pub fn set(&self, file: Option<SlotData<File>>) {
         let mut guard = match self.data.write() {
             Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
+            Err(poisoned) => crate::guard::recover(poisoned),
         };
         *guard = file;
     }

@@ -473,7 +473,7 @@ impl CompleteTable {
     pub fn read_shard(&self, index: usize) -> RwLockReadGuard<'_, CompleteShard> {
         match self.shards[index].read() {
             Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
+            Err(poisoned) => crate::guard::recover(poisoned),
         }
     }
 
@@ -481,7 +481,7 @@ impl CompleteTable {
     pub fn write_shard(&self, index: usize) -> RwLockWriteGuard<'_, CompleteShard> {
         match self.shards[index].write() {
             Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
+            Err(poisoned) => crate::guard::recover(poisoned),
         }
     }
 

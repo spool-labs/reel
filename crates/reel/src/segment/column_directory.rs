@@ -454,7 +454,7 @@ pub fn refresh_reach(run: &mut [DirectoryEntry]) -> Option<usize> {
 pub fn read_list(list: &RwLock<DirectoryList>) -> RwLockReadGuard<'_, DirectoryList> {
     match list.read() {
         Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+        Err(poisoned) => crate::guard::recover(poisoned),
     }
 }
 
@@ -462,6 +462,6 @@ pub fn read_list(list: &RwLock<DirectoryList>) -> RwLockReadGuard<'_, DirectoryL
 pub fn write_list(list: &RwLock<DirectoryList>) -> RwLockWriteGuard<'_, DirectoryList> {
     match list.write() {
         Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+        Err(poisoned) => crate::guard::recover(poisoned),
     }
 }

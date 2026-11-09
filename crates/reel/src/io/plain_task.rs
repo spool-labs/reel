@@ -50,7 +50,7 @@ impl TaskSignal {
         let flags = hold(&self.flags);
         let mut flags = match self.changed.wait_while(flags, |flags| flags.is_quiet()) {
             Ok(flags) => flags,
-            Err(poisoned) => poisoned.into_inner(),
+            Err(poisoned) => crate::guard::recover(poisoned),
         };
         flags.is_woken = false;
     }
@@ -60,7 +60,7 @@ impl TaskSignal {
         let flags = hold(&self.flags);
         let mut flags = match self.changed.wait_timeout_while(flags, limit, |flags| flags.is_quiet()) {
             Ok(outcome) => outcome.0,
-            Err(poisoned) => poisoned.into_inner().0,
+            Err(poisoned) => crate::guard::recover(poisoned).0,
         };
         flags.is_woken = false;
     }

@@ -226,7 +226,7 @@ impl<File: Clone> SegmentTable<File> {
     pub fn read_shard(&self, shard: usize) -> RwLockReadGuard<'_, TableShard<File>> {
         match self.shards[shard].read() {
             Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
+            Err(poisoned) => crate::guard::recover(poisoned),
         }
     }
 
@@ -234,7 +234,7 @@ impl<File: Clone> SegmentTable<File> {
     pub fn write_shard(&self, shard: usize) -> RwLockWriteGuard<'_, TableShard<File>> {
         match self.shards[shard].write() {
             Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
+            Err(poisoned) => crate::guard::recover(poisoned),
         }
     }
 

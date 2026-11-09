@@ -356,7 +356,7 @@ pub fn widen_for(slots: &mut Vec<DamageSlot>, range: &DamagedRange) -> bool {
 pub fn read_slots(slots: &RwLock<Vec<DamageSlot>>) -> RwLockReadGuard<'_, Vec<DamageSlot>> {
     match slots.read() {
         Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+        Err(poisoned) => crate::guard::recover(poisoned),
     }
 }
 
@@ -364,6 +364,6 @@ pub fn read_slots(slots: &RwLock<Vec<DamageSlot>>) -> RwLockReadGuard<'_, Vec<Da
 pub fn write_slots(slots: &RwLock<Vec<DamageSlot>>) -> RwLockWriteGuard<'_, Vec<DamageSlot>> {
     match slots.write() {
         Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+        Err(poisoned) => crate::guard::recover(poisoned),
     }
 }

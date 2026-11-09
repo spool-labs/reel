@@ -202,7 +202,7 @@ impl WriteOrder {
         while self.mark().0 < ticket.last.0 {
             ring = match self.moved.wait(ring) {
                 Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
+                Err(poisoned) => crate::guard::recover(poisoned),
             };
         }
         ring.waiters -= 1;

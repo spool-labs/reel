@@ -368,7 +368,7 @@ impl RangeCovers {
     pub fn read(&self) -> RwLockReadGuard<'_, CoverPool> {
         match self.pool.read() {
             Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
+            Err(poisoned) => crate::guard::recover(poisoned),
         }
     }
 
@@ -376,7 +376,7 @@ impl RangeCovers {
     pub fn write(&self) -> RwLockWriteGuard<'_, CoverPool> {
         match self.pool.write() {
             Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
+            Err(poisoned) => crate::guard::recover(poisoned),
         }
     }
 

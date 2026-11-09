@@ -269,7 +269,7 @@ impl<Item> Pool<Item> {
     pub fn sleep<'pool>(&'pool self, line: MutexGuard<'pool, PoolLine>) -> MutexGuard<'pool, PoolLine> {
         match self.freed.wait(line) {
             Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
+            Err(poisoned) => crate::guard::recover(poisoned),
         }
     }
 

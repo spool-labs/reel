@@ -426,9 +426,10 @@ impl<Backend: Io> Volume<Backend> {
         self.highest_sealed.load(Ordering::Acquire) > 0
     }
 
-    /// Check the volume still takes writes
+    /// Check the volume still takes writes. A lock found poisoned anywhere fails every volume, since the state behind it may be
+    /// half written
     pub fn has_failed(&self) -> bool {
-        self.is_failed.load(Ordering::Acquire)
+        self.is_failed.load(Ordering::Acquire) || crate::guard::is_poisoned()
     }
 
     /// Note that a sync failed, so the volume refuses writes until the store is reopened

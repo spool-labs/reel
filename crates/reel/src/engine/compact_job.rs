@@ -852,7 +852,8 @@ impl<Backend: Io> CompactJob<Backend> {
     /// crash before it goes leaves a segment with no row, which open walks backward and finds dead again
     pub fn unlink(&self, volume: &Volume<Backend>, segment: SegmentNumber, highest_replacement: WritePlace) -> Result<()> {
         let state = &self.state;
-        if !volume.can_park(1) || state.read_point(volume) < highest_replacement {
+        // a rewrite that claimed it may keep a row the cover hides, and its output would bring that row back
+        if volume.is_taken(segment) || !volume.can_park(1) || state.read_point(volume) < highest_replacement {
             return Ok(());
         }
         state.cues.note_reclaim();

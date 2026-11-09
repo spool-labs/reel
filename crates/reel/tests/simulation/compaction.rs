@@ -1041,6 +1041,30 @@ fn applied_cover_decides_its_unlink() {
     store.close().expect("close");
 }
 
+// a segment a rewrite claimed stays while the rewrite runs, since its output could keep a row the cover hides
+#[test]
+fn claimed_segment_waits_for_its_rewrite() {
+    let io = SimulatedIo::new(Seed(46));
+    let store = open(&io);
+    hold_compaction(&store);
+    let volume = &store.state.volumes[0];
+    let inside = sealed_rows(&store, &io, &[b"m-0", b"m-1"]);
+    store.delete_range(COLUMN, b"m", b"n").expect("delete");
+    store.seal_now();
+    settle(&io);
+    assert!(is_under_applied_cover(volume, inside));
+
+    let lane = volume.lanes.len() - 1;
+    hold(&volume.lanes[lane].inputs)[0] = inside;
+    refused_after_asking(&store, &io);
+    assert!(volume.table.holds(inside));
+
+    hold(&volume.lanes[lane].inputs)[0] = SegmentNumber(0);
+    refused_after_asking(&store, &io);
+    assert!(!volume.table.holds(inside));
+    store.close().expect("close");
+}
+
 // damage older than a row says nothing about what replaced it, so counts that call that row dead get refused
 #[test]
 fn old_damage_hides_nothing() {

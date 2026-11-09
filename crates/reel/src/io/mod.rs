@@ -263,6 +263,9 @@ pub trait IoTask: Send + Sync {
     /// Check the job has ended, so nothing it owed will come
     fn has_ended(&self) -> bool;
 
+    /// Tell the job to stop after its current step, and don't wait for it
+    fn ask_stop(&self);
+
     /// Stop the job after its current step and wait for it
     fn stop(&self) -> Result<()>;
 }

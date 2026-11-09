@@ -96,10 +96,13 @@ impl IoTask for PlainTask {
         self.signal.changed.notify_all();
     }
 
-    fn stop(&self) -> Result<()> {
+    fn ask_stop(&self) {
         hold(&self.signal.flags).is_stopping = true;
         self.signal.changed.notify_all();
+    }
 
+    fn stop(&self) -> Result<()> {
+        self.ask_stop();
         let mut slot = hold(&self.thread);
         // a job stopping itself ends after this step, and can't wait for its own thread
         if let Some(thread) = slot.as_ref()

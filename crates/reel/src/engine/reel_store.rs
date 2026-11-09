@@ -461,6 +461,16 @@ impl<Backend: Io> EngineState<Backend> {
     /// Stop every job
     pub fn stop_jobs(&self) -> Result<(), Error> {
         self.is_stopping.store(true, Ordering::Release);
+        // the jobs with long steps all stop at once, so the joins below wait for the slowest step and not the sum
+        self.workers.ask_stop();
+        if let Some(task) = self.planner_task.get() {
+            task.ask_stop();
+        }
+        for cell in &self.seal_tasks {
+            if let Some(task) = cell.get() {
+                task.ask_stop();
+            }
+        }
         if let Some(task) = self.row_task.get() {
             task.stop()?;
         }

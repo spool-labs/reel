@@ -92,6 +92,15 @@ impl<Task: IoTask> Workers<Task> {
         self.cells.iter().filter(|cell| cell.is_active.load(Ordering::Acquire)).count() as u64
     }
 
+    /// Tell every worker that started to stop after its current step, so a stop that follows waits for the slowest step
+    pub fn ask_stop(&self) {
+        for cell in &self.cells {
+            if let Some(task) = cell.task.get() {
+                task.ask_stop();
+            }
+        }
+    }
+
     /// Stop every worker that started, each after its current step
     pub fn stop(&self) -> Result<()> {
         for cell in &self.cells {

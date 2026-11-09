@@ -75,6 +75,11 @@ impl IoTask for SimulatedTask {
         }
     }
 
+    // a simulated job steps only when the scheduler runs it, so asking stops it as a stop does
+    fn ask_stop(&self) {
+        let _stopped = self.stop();
+    }
+
     fn stop(&self) -> Result<()> {
         let mut slots = hold(&self.slots);
         if let Some(slot) = slots.get_mut(self.index.0)

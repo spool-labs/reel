@@ -33,6 +33,7 @@ use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_io::SimulatedIo;
 use xxhash_rust::xxh3::xxh3_64_with_seed;
+use reel_sim::wait::wait_until;
 
 const ROOT: &str = "/disk/batch-meta";
 const SECOND_ROOT: &str = "/disk/batch-bulk";
@@ -237,9 +238,7 @@ fn seen_whole() {
     thread::scope(|scope| {
         let writer = scope.spawn(|| store.write_batch(&batch_of(b"value")));
         let last = key_of(BATCH_KEYS - 1);
-        while store.state.index.lookup(PLAIN, &last, WritePlace(u64::MAX), volume.view()).row.is_none() {
-            thread::yield_now();
-        }
+        wait_until(|| store.state.index.lookup(PLAIN, &last, WritePlace(u64::MAX), volume.view()).row.is_some(), "the batch's last key never landed");
 
         assert_whole(&store, None);
 
@@ -650,9 +649,7 @@ fn rows_go_first() {
 
     thread::scope(|scope| {
         let writer = scope.spawn(|| store.write_batch(&long_batch(None)));
-        while !writer.is_finished() && !hold(&volume.claims).open.iter().any(|open| open.phase == SegmentPhase::Alone) {
-            thread::yield_now();
-        }
+        wait_until(|| writer.is_finished() || hold(&volume.claims).open.iter().any(|open| open.phase == SegmentPhase::Alone), "no segment went alone");
         let row = WriteRow {
             place,
             offset: earlier.offset,
@@ -700,9 +697,7 @@ fn turn_spares_puts() {
     thread::scope(|scope| {
         let writer = scope.spawn(|| store.put(PLAIN, b"beside", b"value"));
         // the row is in the index once the put has landed it, and the rule counts from there
-        while store.state.index.lookup(PLAIN, b"beside", WritePlace(u64::MAX), volume.view()).row.is_none() {
-            thread::yield_now();
-        }
+        wait_until(|| store.state.index.lookup(PLAIN, b"beside", WritePlace(u64::MAX), volume.view()).row.is_some(), "the write beside never landed");
         let start = io.clock_reading();
         while !groups(&io).iter().flatten().any(|row| row.1 == b"beside") {
             assert!(io.clock_reading().0 - start.0 <= GROUP_DEADLINE.0, "the put's group waited behind the turn");
@@ -944,9 +939,7 @@ fn long_seal_beside() {
 
     thread::scope(|scope| {
         let writer = scope.spawn(|| store.write_batch(&long_batch(Some(b"value"))));
-        while !writer.is_finished() && !hold(&volume.claims).open.iter().any(|open| open.phase == SegmentPhase::Alone) {
-            thread::yield_now();
-        }
+        wait_until(|| writer.is_finished() || hold(&volume.claims).open.iter().any(|open| open.phase == SegmentPhase::Alone), "no segment went alone");
         store.seal_now();
         drop(earlier);
         writer.join().expect("join").expect("batch");

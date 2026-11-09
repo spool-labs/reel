@@ -330,16 +330,20 @@ fn marked_segment_dead(dead_keys: u64, current: DeathMark) -> (Store, SimulatedI
     (store, io)
 }
 
-// a marked segment 60% dead waits while its highest mark stands
+// a marked segment 60% dead waits while its highest mark stands, and one 80% dead goes before its mark passes, so early deaths
+// don't wait for the unlink
 #[test]
-fn early_bar_waits() {
-    let (store, _io) = marked_segment_dead(KEYS * 6 / 10, DeathMark(0));
-    let reading = reading(&store);
-    assert_eq!((reading.early_bar_rewrites, reading.plain_bar_rewrites), (0, 0));
-    store.close().expect("close");
+fn early_bar() {
+    // (tenths dead, early and plain bar rewrites)
+    for (tenths, rewrites) in [(6, (0, 0)), (8, (1, 0))] {
+        let (store, _io) = marked_segment_dead(KEYS * tenths / 10, DeathMark(0));
+        let reading = reading(&store);
+        assert_eq!((reading.early_bar_rewrites, reading.plain_bar_rewrites), rewrites, "{tenths} tenths dead");
+        store.close().expect("close");
+    }
 }
 
-// the same segment goes at the plain bar once the current mark has passed its highest
+// the 60% dead segment goes at the plain bar once the current mark has passed its highest
 #[test]
 fn plain_bar_after_the_mark() {
     let (store, io) = marked_segment_dead(KEYS * 6 / 10, DeathMark(0));
@@ -347,15 +351,6 @@ fn plain_bar_after_the_mark() {
     settle(&io);
     let reading = reading(&store);
     assert_eq!((reading.early_bar_rewrites, reading.plain_bar_rewrites), (0, 1));
-    store.close().expect("close");
-}
-
-// a marked segment 80% dead goes before its mark passes, so early deaths don't wait for the unlink
-#[test]
-fn early_bar_fires() {
-    let (store, _io) = marked_segment_dead(KEYS * 8 / 10, DeathMark(0));
-    let reading = reading(&store);
-    assert_eq!((reading.early_bar_rewrites, reading.plain_bar_rewrites), (1, 0));
     store.close().expect("close");
 }
 

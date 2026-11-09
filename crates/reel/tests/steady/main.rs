@@ -33,6 +33,7 @@ use reel_api::write_batch::WriteBatch;
 mod store_config;
 
 use store_config::{BULK, META, PLAIN, config, scratch_root};
+use reel_sim::wait::wait_until;
 
 const BUDGET: ByteCount = ByteCount(192 * 1024 * 1024);
 const WORKERS_VARIABLE: &str = "REEL_STEADY_WORKERS";
@@ -538,9 +539,7 @@ fn damage(root: &Path, inputs: &Inputs) {
     store.seal_now();
     wait_for_seal(&store, before);
     // the table has the segment before its rows file goes, and a tail with rows beside it reads as open
-    while has_rows_file(root) {
-        thread::sleep(SEAL_WAIT);
-    }
+    wait_until(|| !has_rows_file(root), "the rows file never went");
     store.close().expect("close");
     drop(store);
 
@@ -696,9 +695,7 @@ fn main() {
     }
 
     // the walk runs behind the seals, and its first run is a path like any other
-    while (0..store.state.volumes.len()).any(|volume| store.state.pending_walks(volume) > 0) {
-        thread::sleep(SEAL_WAIT);
-    }
+    wait_until(|| (0..store.state.volumes.len()).all(|volume| store.state.pending_walks(volume) == 0), "the walks never finished");
 
     let unlinked_before = store.state.volumes[0].segments_unlinked.load(Ordering::Acquire);
     let freed_before = store.state.volumes[0].bytes_freed.load(Ordering::Acquire);

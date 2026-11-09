@@ -8,6 +8,7 @@ use reel::io::job::{Job, JobStep};
 use reel::io::plain::PlainIo;
 use reel::io::plain_task::PlainTask;
 use reel::io::{Io, IoTask};
+use reel_sim::wait::wait_until;
 
 const WORKERS: usize = 4;
 const SLOTS: usize = 4;
@@ -64,9 +65,7 @@ fn hand_out_racing_sleep_wakes_a_worker() {
     }
     for round in 0..ROUNDS {
         let slot = &slots[round % SLOTS];
-        while slot.load(Ordering::Acquire) != FREE {
-            thread::yield_now();
-        }
+        wait_until(|| slot.load(Ordering::Acquire) == FREE, "a slot never came back");
         slot.store(ASSIGNED, Ordering::SeqCst);
         workers.wake_one();
         let handed = Instant::now();

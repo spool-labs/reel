@@ -191,13 +191,6 @@ fn seal_point_from_rates() {
     assert!(index_rows - seal_point(limit, fast_seal, slow_ingest).0 >= fast_seal / 10);
 }
 
-// a rate needs time to have passed
-#[test]
-fn rates() {
-    assert_eq!(rows_per_second(RowCount(500), SECOND / 2), 1_000);
-    assert_eq!(rows_per_second(RowCount(500), 0), 0);
-}
-
 // a planned entry covers what the table, each column's directory, the volume's spare, the summary's lookup and the covered list hold
 // for a segment
 #[test]

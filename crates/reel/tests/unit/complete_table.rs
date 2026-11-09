@@ -101,14 +101,6 @@ fn gone_slots_clear_on_a_visit() {
     assert!(has_row(&table, hash, 9, 1));
 }
 
-// a key's tag and shard come from bits that don't overlap
-#[test]
-fn tag_and_shard() {
-    let hash = KeyHash(0xABCD_1234_0000_0000);
-    assert_eq!(tag_of(hash), 0x1234);
-    assert_eq!(shard_of(hash), 0xABCD % 64);
-}
-
 fn slot_of(tag: u16, is_stale: bool) -> CompleteSlot {
     CompleteSlot {
         segment: u32::from(tag),

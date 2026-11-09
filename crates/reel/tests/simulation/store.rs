@@ -27,6 +27,7 @@ use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, Nanoseconds, RootId, RowCount, VolumeId};
 use reel_api::value_list::{ValueAnswer, ValueList};
 use reel_api::write_batch::WriteBatch;
+use reel_sim::wait::wait_until;
 
 const ROOT: &str = "/disk/meta";
 const COLUMN: ColumnId = ColumnId(1);
@@ -997,9 +998,7 @@ fn window_pauses() {
 
     thread::scope(|scope| {
         let waiter = scope.spawn(|| store.state.wait_for_kept_window(slot));
-        while io.now() == start {
-            thread::yield_now();
-        }
+        wait_until(|| io.now() != start, "the clock never moved");
         assert!(!waiter.is_finished());
         hold(&store.state.queues[index]).is_writing = false;
         waiter.join().expect("join").expect("send");

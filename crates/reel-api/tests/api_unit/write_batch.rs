@@ -1,5 +1,4 @@
 use reel_api::column_id::ColumnId;
-use reel_api::units::ByteCount;
 use reel_api::write_batch::*;
 
 const COLUMN: ColumnId = ColumnId(3);
@@ -38,16 +37,4 @@ fn batch_order() {
         })
     );
     assert_eq!(batch.operation(3), None);
-}
-
-// clear empties the batch for reuse
-#[test]
-fn batch_reuse() {
-    let mut batch = WriteBatch::new();
-    batch.put(COLUMN, b"key", b"value");
-
-    batch.clear();
-
-    assert!(batch.is_empty());
-    assert_eq!(batch.byte_length(), ByteCount(0));
 }

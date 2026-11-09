@@ -25,6 +25,7 @@ use reel_sim::file_image::BitMask;
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_io::SimulatedIo;
+use reel_sim::wait::wait_until;
 
 const ROOT: &str = "/disk/ranges";
 const COLUMN: ColumnId = ColumnId(1);
@@ -243,46 +244,23 @@ fn crash_points() {
     }
 }
 
-// a cover inside a newer one is dropped, and what it hid stays hidden
+// a cover inside a newer one is dropped, one that only overlaps a newer one stays, and an older cover wider than a newer one
+// inside it still answers for keys past it. Each way, every key the covers took reads gone
 #[test]
-fn inside_newer() {
-    let io = SimulatedIo::new(Seed(6));
-    let store = open(&io);
-    fill(&store);
-    store.delete_range(COLUMN, &key_of(12), &key_of(15)).expect("delete");
-    store.delete_range(COLUMN, &key_of(10), &key_of(20)).expect("delete");
+fn cover_pairs() {
+    // (seed, older cover, newer cover, covers left)
+    let cases = [(6, (12, 15), (10, 20), 1), (7, (10, 15), (13, 20), 2), (8, (10, 20), (12, 14), 2)];
+    for (seed, older, newer, left) in cases {
+        let io = SimulatedIo::new(Seed(seed));
+        let store = open(&io);
+        fill(&store);
+        store.delete_range(COLUMN, &key_of(older.0), &key_of(older.1)).expect("delete");
+        store.delete_range(COLUMN, &key_of(newer.0), &key_of(newer.1)).expect("delete");
 
-    assert_eq!(store.state.volumes[0].covers.len(), 1);
-    assert_deleted(&store);
-    store.close().expect("close");
-}
-
-// a cover that only overlaps a newer one stays, and each hides its own keys
-#[test]
-fn overlapping() {
-    let io = SimulatedIo::new(Seed(7));
-    let store = open(&io);
-    fill(&store);
-    store.delete_range(COLUMN, &key_of(10), &key_of(15)).expect("delete");
-    store.delete_range(COLUMN, &key_of(13), &key_of(20)).expect("delete");
-
-    assert_eq!(store.state.volumes[0].covers.len(), 2);
-    assert_deleted(&store);
-    store.close().expect("close");
-}
-
-// an older cover wider than a newer one inside it still answers for keys past the newer one
-#[test]
-fn wider_older() {
-    let io = SimulatedIo::new(Seed(8));
-    let store = open(&io);
-    fill(&store);
-    store.delete_range(COLUMN, &key_of(10), &key_of(20)).expect("delete");
-    store.delete_range(COLUMN, &key_of(12), &key_of(14)).expect("delete");
-
-    assert_eq!(store.state.volumes[0].covers.len(), 2);
-    assert_deleted(&store);
-    store.close().expect("close");
+        assert_eq!(store.state.volumes[0].covers.len(), left, "older {older:?} newer {newer:?}");
+        assert_deleted(&store);
+        store.close().expect("close");
+    }
 }
 
 // a full pool refuses with nothing written, and a get still answers right
@@ -410,9 +388,7 @@ fn older_outlives_newer() {
     let (older_slot, older_segment) = (claim.slot, claim.segment);
     thread::scope(|scope| {
         let writer = scope.spawn(|| store.delete_range(COLUMN, &key_of(5), &key_of(30)));
-        while store.state.index.lookup(COLUMN, &key_of(5), WritePlace(u64::MAX), volume.view()).row.is_none_or(|row| row.segment == older_segment) {
-            thread::yield_now();
-        }
+        wait_until(|| store.state.index.lookup(COLUMN, &key_of(5), WritePlace(u64::MAX), volume.view()).row.is_some_and(|row| row.segment != older_segment), "key 5 never moved out of the older segment");
         drop(claim);
         writer.join().expect("join").expect("delete");
     });

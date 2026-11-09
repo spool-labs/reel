@@ -6,6 +6,7 @@ mod block_entry;
 mod block_filter;
 mod chunk_table;
 mod column_directory;
+mod cue;
 mod complete_table;
 mod damage_list;
 mod device_error;

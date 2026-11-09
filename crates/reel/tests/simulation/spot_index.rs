@@ -1,7 +1,7 @@
 //! The spot cache keeps its budget, keeps hot keys, and never gets a key wrong for long
 
 use reel::index::key_hash::{KeyHash, hash_key};
-use reel::index::spot_index::{SpotIndex, SpotLocation, SpotSlot};
+use reel::index::spot_index::{SpotIndex, SpotLocation};
 use reel::segment::segment_tail::SegmentNumber;
 use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, FileOffset, WritePlace};
@@ -10,7 +10,6 @@ const COLUMN: ColumnId = ColumnId(1);
 const SHARE: ByteCount = ByteCount(1024 * 1024);
 const KEYS: u64 = 200_000;
 const HOT_KEYS: u64 = 1_000;
-const MOST_SLOT_BYTES: usize = 28;
 
 fn hash_of(number: u64) -> KeyHash {
     hash_key(COLUMN, &number.to_le_bytes())
@@ -23,12 +22,6 @@ fn location(number: u64) -> SpotLocation {
         length: ByteCount(number % 4_096),
         place: WritePlace(number),
     }
-}
-
-// a slot stays within the size a key may cost
-#[test]
-fn slot_size() {
-    assert!(size_of::<SpotSlot>() < MOST_SLOT_BYTES);
 }
 
 // a key reads back where it was put, a new location replaces it, and a removed key is gone

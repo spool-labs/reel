@@ -21,6 +21,7 @@ use reel::guard::hold;
 use reel_sim::simulated_task::{JobCount, JobIndex};
 use reel::io::{Io, IoFile, IoTask};
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds};
+use reel_sim::wait::wait_until;
 
 const RESERVED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const NEAR_ROT: u64 = 200;
@@ -237,9 +238,7 @@ fn plain_jobs() {
     };
 
     let task = io.spawn_job("counting", job).expect("spawn");
-    while count.load(Ordering::Relaxed) < JOB_LIMIT {
-        thread::sleep(Duration::from_millis(1));
-    }
+    wait_until(|| count.load(Ordering::Relaxed) >= JOB_LIMIT, "the job never ran its steps");
     task.stop().expect("stop");
 }
 
@@ -258,9 +257,7 @@ fn plain_idle() {
     assert_eq!(steps.load(Ordering::Relaxed), 1);
 
     task.wake();
-    while steps.load(Ordering::Relaxed) < 2 {
-        thread::sleep(Duration::from_millis(1));
-    }
+    wait_until(|| steps.load(Ordering::Relaxed) >= 2, "a woken job never stepped twice");
     task.stop().expect("stop");
 }
 
@@ -275,9 +272,7 @@ fn plain_deadline() {
     };
 
     let task = io.spawn_job("deadline", job).expect("spawn");
-    while steps.load(Ordering::Relaxed) < 2 {
-        thread::sleep(Duration::from_millis(1));
-    }
+    wait_until(|| steps.load(Ordering::Relaxed) >= 2, "a woken job never stepped twice");
     task.stop().expect("stop");
 }
 
@@ -596,9 +591,7 @@ fn self_stop() {
 
     let plain = PlainIo::new();
     let steps = check_self_stop(&plain);
-    while steps.load(Ordering::Relaxed) == 0 {
-        thread::sleep(Duration::from_millis(1));
-    }
+    wait_until(|| steps.load(Ordering::Relaxed) > 0, "the job never stepped");
 
     let mut is_settled = false;
     let mut reached = steps.load(Ordering::Relaxed);

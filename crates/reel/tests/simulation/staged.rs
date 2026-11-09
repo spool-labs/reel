@@ -35,6 +35,7 @@ use reel::superblock::Superblock;
 use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RowCount, VolumeId, WritePlace};
+use reel_sim::wait::wait_until;
 
 const ROOT: &str = "/disk/staged";
 const COLUMN: ColumnId = ColumnId(1);
@@ -1163,9 +1164,7 @@ fn covers_out_of_order() {
 
     thread::scope(|scope| {
         let newer = scope.spawn(|| store.delete_range(COLUMN, b"a", b"zz"));
-        while volume.covers.is_empty() {
-            thread::yield_now();
-        }
+        wait_until(|| !volume.covers.is_empty(), "no cover landed");
 
         assert_eq!(state.land_row(COLUMN, b"a", &older_row).expect("land"), LandOutcome::Landed);
         volume.covers.add_held(&Cover {

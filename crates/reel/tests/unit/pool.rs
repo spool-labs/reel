@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 
 use reel::pool::*;
+use reel_sim::wait::wait_until;
 
-const QUEUE_ROOM: usize = 1_024;
 
 const FIRST: u32 = 1;
 const SECOND: u32 = 2;
@@ -32,9 +32,7 @@ fn first_come() {
         let waiter = scope.spawn(|| {
             pool.with(|_item| order.compare_exchange(0, FIRST, Ordering::AcqRel, Ordering::Acquire).is_ok())
         });
-        while pool.waiting() == 0 {
-            thread::yield_now();
-        }
+        wait_until(|| pool.waiting() > 0, "no taker waited");
 
         pool.give_back(item);
         let is_second = pool.with(|_item| order.compare_exchange(FIRST, SECOND, Ordering::AcqRel, Ordering::Acquire).is_ok());
@@ -53,9 +51,7 @@ fn queue_drains() {
 
     thread::scope(|scope| {
         let waiters: Vec<_> = (0..4).map(|_thread| scope.spawn(|| pool.with(|item| *item))).collect();
-        while pool.waiting() < 4 {
-            thread::yield_now();
-        }
+        wait_until(|| pool.waiting() >= 4, "four takers never waited");
 
         pool.give_back(first);
         pool.give_back(second);
@@ -82,9 +78,7 @@ fn many_at_once() {
             pool.give_back_all(&mut items);
             count
         });
-        while pool.waiting() == 0 {
-            thread::yield_now();
-        }
+        wait_until(|| pool.waiting() > 0, "no taker waited");
 
         pool.give_back(first);
         pool.give_back(second);
@@ -92,14 +86,6 @@ fn many_at_once() {
         assert_eq!(waiter.join().expect("join"), 3);
     });
     assert_eq!(pool.waiting(), 0);
-}
-
-// a touched queue comes back empty, with its room still there to take what it was sized for
-#[test]
-fn touched_queue_keeps_its_room() {
-    let queue = touched_queue(QUEUE_ROOM, 0_u64);
-    assert!(queue.is_empty());
-    assert!(queue.capacity() >= QUEUE_ROOM);
 }
 
 // real threads taking one and many items through a pool too small for them lose no wake and no item

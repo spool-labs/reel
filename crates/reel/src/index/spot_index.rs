@@ -38,6 +38,9 @@ pub struct SpotSlot {
     pub place: u64,
 }
 
+// a slot stays under the 28 bytes a cached key may cost
+const _: () = assert!(size_of::<SpotSlot>() < 28);
+
 /// A shard's slots, fixed at open
 #[derive(Debug)]
 pub struct SpotShard {

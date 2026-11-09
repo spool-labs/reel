@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::compact_job::{CompactJob, park};
-use reel::engine::cue::{Cue, CueTable};
+use reel::engine::cue::Cue;
 use reel::engine::open_segment::{OUTPUT_SUFFIX, data_path};
 use reel::engine::read_path::{RecordWant, WalkAsk};
 use reel::engine::planner::Planner;
@@ -471,17 +471,6 @@ fn search_sees_new_list() {
     walked.expect("walk");
     assert_eq!(reader.asked, 2);
     store.close().expect("close");
-}
-
-// a cue counts inside a row's window from the row's place up to, and not including, its replacement's
-#[test]
-fn cue_window() {
-    let table = CueTable::new(1);
-    let slot = table.take(0, WritePlace(10)).expect("a slot");
-    assert!(table.has_cue_between(0, WritePlace(10), WritePlace(11)));
-    assert!(!table.has_cue_between(0, WritePlace(11), WritePlace(20)));
-    assert!(!table.has_cue_between(0, WritePlace(5), WritePlace(10)));
-    table.release(slot);
 }
 
 // a get that took its point before a rewrite dropped its version starts over

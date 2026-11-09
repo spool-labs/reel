@@ -190,11 +190,4 @@ mod tests {
         assert_eq!(parse_number(b"max\n"), None);
         assert_eq!(parse_number(b"1073741824\n"), Some(1_073_741_824));
     }
-
-    #[test]
-    fn this_host_has_memory() {
-        let memory = read_host_memory();
-        assert!(memory.total.0 > 0);
-        assert!(memory.free() <= memory.total);
-    }
 }

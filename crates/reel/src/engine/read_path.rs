@@ -21,6 +21,7 @@ use crate::index::write_row::WriteRow;
 use crate::io::{DeviceReads, InPlace, Io, ReadOn, in_place};
 use crate::pool::PoolLease;
 use crate::io::device_error::is_device_error;
+use crate::io::ring::RingWait;
 use crate::record::record_check::RecordIdentity;
 use crate::record::record_reader::{RecordLocation, RecordRead, RecordReader};
 use crate::row_kind::RowKind;
@@ -176,7 +177,11 @@ impl<Backend: Io> EngineState<Backend> {
         want: RecordWant,
         buf: &mut Vec<u8>,
     ) -> Result<bool, StoreError> {
-        in_place(self.get_latest_on(&InPlace, column, key, want, buf))
+        // a store with a ring reads what the kernel doesn't hold through it, on this thread with no wake
+        match &self.ring {
+            Some(ring) => in_place(self.get_latest_on(&RingWait(ring), column, key, want, buf)),
+            None => in_place(self.get_latest_on(&InPlace, column, key, want, buf)),
+        }
     }
 
     /// Answer a get through a device's read path, starting over when a job crosses it
@@ -250,7 +255,10 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// Answer every key at one read point, so a batch from one write_batch is seen whole or not at all
     pub fn get_many_now(&self, column: ColumnId, keys: &[&[u8]], values: &mut ValueList) -> Result<(), StoreError> {
-        in_place(self.get_many_on(&InPlace, column, keys, values))
+        match &self.ring {
+            Some(ring) => in_place(self.get_many_on(&RingWait(ring), column, keys, values)),
+            None => in_place(self.get_many_on(&InPlace, column, keys, values)),
+        }
     }
 
     /// Answer every key at one read point through a device's read path

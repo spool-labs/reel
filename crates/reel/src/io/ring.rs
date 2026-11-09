@@ -487,3 +487,108 @@ impl<File: IoFile, Driver: RingDriver<File>> DeviceReads<File> for OnRing<'_, Dr
         self.1
     }
 }
+
+/// Reads that wait for a ring on the calling thread, for a blocking get. What the kernel holds answers with no submit, and a read
+/// it doesn't hold goes to the ring, and the caller spins on its slot until the reaper lands it, with no wake between them
+#[derive(Debug)]
+pub struct RingWait<'ring, Driver>(pub &'ring ReadRing<Driver>);
+
+impl<Driver> ReadRing<Driver> {
+    /// Take a free slot, yielding until one frees
+    pub fn claim_now(&self) -> Result<RingLease<'_, Driver>> {
+        loop {
+            if let Some(lease) = self.try_claim()? {
+                return Ok(lease);
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    /// Read up to a slot's bytes on this thread, and say how many came
+    pub fn read_once_now<File>(&self, file: &File, offset: FileOffset, out: &mut [u8]) -> Result<usize>
+    where
+        Driver: RingDriver<File>,
+    {
+        let lease = self.claim_now()?;
+        lease.start(file, offset, out.len())?;
+        let length = lease.wait_now()?;
+        self.driver.copy_out(lease.slot, &mut out[..length]);
+        Ok(length)
+    }
+
+    /// Fill a buffer on this thread: what the kernel holds first, then a slot at a time through the ring
+    pub fn read_into_now<File>(&self, file: &File, offset: FileOffset, buf: &mut [u8]) -> Result<()>
+    where
+        Driver: RingDriver<File>,
+        File: IoFile,
+    {
+        let mut done = 0;
+        while done < buf.len() {
+            match file.try_read_at(FileOffset(offset.0 + done as u64), &mut buf[done..]) {
+                Ok(Some(ByteCount(count))) if count > 0 => done += count as usize,
+                Ok(Some(_) | None) | Err(_) => break,
+            }
+        }
+        while done < buf.len() {
+            let end = (done + RING_SLOT_BYTES).min(buf.len());
+            let read = self.read_once_now(file, FileOffset(offset.0 + done as u64), &mut buf[done..end])?;
+            if read == 0 {
+                return Err(Error::from(ErrorKind::UnexpectedEof));
+            }
+            done += read;
+        }
+        Ok(())
+    }
+
+    /// Fill parts on this thread, in one read when the kernel holds them or a slot holds them all
+    pub fn read_parts_now<File>(&self, file: &File, offset: FileOffset, parts: &mut [IoSliceMut<'_>]) -> Result<()>
+    where
+        Driver: RingDriver<File>,
+        File: IoFile,
+    {
+        let total: usize = parts.iter().map(|part| part.len()).sum();
+        if matches!(file.try_read_parts_at(offset, parts), Ok(Some(ByteCount(count))) if count == total as u64) {
+            return Ok(());
+        }
+        if total <= RING_SLOT_BYTES {
+            let lease = self.claim_now()?;
+            lease.start(file, offset, total)?;
+            if lease.wait_now()? == total {
+                self.driver.copy_parts(lease.slot, parts);
+                return Ok(());
+            }
+        }
+        // a part too big for a slot, or a short read, goes part by part
+        let mut at = offset.0;
+        for part in parts {
+            self.read_into_now(file, FileOffset(at), part)?;
+            at += part.len() as u64;
+        }
+        Ok(())
+    }
+}
+
+impl<Driver> RingLease<'_, Driver> {
+    /// Spin on the slot until its read lands, and take its answer
+    pub fn wait_now(&self) -> Result<usize> {
+        loop {
+            {
+                let mut held = hold(&self.ring.slots[self.slot]);
+                if held.phase == RingPhase::Done {
+                    return std::mem::replace(&mut held.answer, Ok(0));
+                }
+            }
+            std::hint::spin_loop();
+        }
+    }
+}
+
+impl<File: IoFile, Driver: RingDriver<File>> DeviceReads<File> for RingWait<'_, Driver> {
+    fn read_exact(&self, file: &File, offset: FileOffset, buf: &mut [u8]) -> impl Future<Output = Result<()>> + Send {
+        std::future::ready(self.0.read_into_now(file, offset, buf))
+    }
+
+    fn read_parts(&self, file: &File, offset: FileOffset, parts: &mut [IoSliceMut<'_>]) -> impl Future<Output = Result<()>> + Send {
+        std::future::ready(self.0.read_parts_now(file, offset, parts))
+    }
+}

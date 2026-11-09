@@ -6,6 +6,7 @@
 use std::cell::UnsafeCell;
 use std::io::{Error, ErrorKind, IoSliceMut, Result};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use io_uring::{IoUring, opcode, types};
 use reel_api::units::{ByteCount, FileOffset};
@@ -21,6 +22,11 @@ pub const RING_ENTRIES: u32 = 2 * RING_SLOTS as u32;
 pub const POKE: u64 = u64::MAX;
 /// The registered buffer every read lands in
 pub const BUFFER_INDEX: u16 = 0;
+/// How long the kernel's submit thread stays awake with nothing to submit before it sleeps, in milliseconds. While reads flow
+/// it stays up, and a start costs no syscall
+pub const SUBMIT_IDLE_MS: u32 = 1_000;
+/// How long a reaper looks at the completions in memory before it waits in the kernel, past a cold read's time on a slow disk
+pub const REAP_SPIN: Duration = Duration::from_micros(400);
 
 /// The slots' bytes, which the kernel writes behind the compiler's back
 #[derive(Debug)]
@@ -40,7 +46,11 @@ pub struct UringDriver {
 impl UringDriver {
     /// Set up the ring and register its buffers, or say why this kernel can't
     pub fn open() -> Result<Self> {
-        let ring = IoUring::new(RING_ENTRIES)?;
+        // a kernel thread takes submissions while it's awake, and a kernel that refuses one gets a ring with no thread
+        let ring = match IoUring::builder().setup_sqpoll(SUBMIT_IDLE_MS).build(RING_ENTRIES) {
+            Ok(ring) => ring,
+            Err(_refused) => IoUring::new(RING_ENTRIES)?,
+        };
         let cells: Vec<UnsafeCell<u8>> = (0..RING_SLOTS * RING_SLOT_BYTES).map(|_byte| UnsafeCell::new(TOUCH_BYTE)).collect();
         let bytes = RingBytes(cells.into_boxed_slice());
         let vector = libc::iovec {
@@ -85,7 +95,15 @@ impl RingDriver<PlainFile> for UringDriver {
     }
 
     fn reap(&self, done: &mut dyn FnMut(usize, Result<usize>)) -> Result<bool> {
-        match self.ring.submitter().submit_and_wait(1) {
+        // completions land in shared memory, so a look there costs no syscall, and a wait in the kernel costs a wake
+        let spun = Instant::now();
+        // only the one reaper reads this queue
+        while unsafe { self.ring.completion_shared() }.is_empty() && spun.elapsed() < REAP_SPIN {
+            std::hint::spin_loop();
+        }
+        let is_waiting = unsafe { self.ring.completion_shared() }.is_empty();
+        let waited = if is_waiting { self.ring.submitter().submit_and_wait(1) } else { Ok(0) };
+        match waited {
             Ok(_submitted) => {},
             Err(error) if error.raw_os_error() == Some(libc::EINTR) => return Ok(true),
             Err(error) => return Err(error),

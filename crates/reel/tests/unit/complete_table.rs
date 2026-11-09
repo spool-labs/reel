@@ -160,7 +160,7 @@ fn fold_covers_a_key_with_other_homes() {
     let hot = KeyHash(0x0000_1234_0000_0000);
     let other = KeyHash(0x0000_1234_4000_0000);
     {
-        let mut shard = table.write_shard(shard_of(other));
+        let mut shard = table.shards.write(shard_of(other));
         let (hot_homes, other_homes) = (shard.homes(hot), shard.homes(other));
         assert!(![hot_homes.first, hot_homes.second].contains(&other_homes.first));
         assert!(![hot_homes.first, hot_homes.second].contains(&other_homes.second));

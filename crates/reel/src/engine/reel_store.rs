@@ -540,7 +540,7 @@ impl<Backend: Io> EngineState<Backend> {
         }
 
         for shard in 0..TABLE_SHARDS {
-            let mut guard = volume.table.write_shard(shard);
+            let mut guard = volume.table.shards.write(shard);
             for slot in guard.segments.iter_mut() {
                 if let Some(entry) = slot.take() {
                     self.io.close_file(entry.file);

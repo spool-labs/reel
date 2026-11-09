@@ -128,5 +128,5 @@ fn retired_keeps_slot() {
     drop(pin);
 
     table.free_retired(&retired);
-    assert_eq!(table.read_shard(retired.shard).free_slots.len(), 3);
+    assert_eq!(table.shards.read(retired.shard).free_slots.len(), 3);
 }

@@ -1,11 +1,12 @@
 //! One store-wide cache of checked filter and row blocks, cold blocks out first
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::RwLock;
 
 use reel_api::units::ByteCount;
 
 use crate::pool::touched_filled;
+use crate::guard::Shards;
 use crate::segment::segment_tail::SegmentNumber;
 
 /// Shards of a cache
@@ -38,7 +39,7 @@ pub struct CacheShard {
 /// A cache of blocks up to a fixed size
 #[derive(Debug)]
 pub struct BlockCache {
-    shards: Vec<RwLock<CacheShard>>,
+    pub shards: Shards<CacheShard>,
     touched: Vec<Vec<AtomicU64>>,
     slot_bytes: usize,
     buckets: usize,
@@ -66,7 +67,7 @@ impl BlockCache {
             touched.push(bits);
         }
         Self {
-            shards,
+            shards: Shards(shards),
             touched,
             slot_bytes,
             buckets,
@@ -78,26 +79,10 @@ impl BlockCache {
         self.slot_bytes
     }
 
-    /// Read a shard
-    pub fn read_shard(&self, index: usize) -> RwLockReadGuard<'_, CacheShard> {
-        match self.shards[index].read() {
-            Ok(guard) => guard,
-            Err(poisoned) => crate::guard::recover(poisoned),
-        }
-    }
-
-    /// Change a shard
-    pub fn write_shard(&self, index: usize) -> RwLockWriteGuard<'_, CacheShard> {
-        match self.shards[index].write() {
-            Ok(guard) => guard,
-            Err(poisoned) => crate::guard::recover(poisoned),
-        }
-    }
-
     /// Empty the cache
     pub fn clear(&self) {
         for index in 0..self.shards.len() {
-            let mut guard = self.write_shard(index);
+            let mut guard = self.shards.write(index);
             guard.keys.fill(NO_BLOCK);
         }
     }
@@ -106,7 +91,7 @@ impl BlockCache {
     pub fn heap_bytes(&self) -> ByteCount {
         let mut total = 0;
         for shard in 0..CACHE_SHARDS {
-            let guard = self.read_shard(shard);
+            let guard = self.shards.read(shard);
             total += guard.bytes.capacity() + guard.keys.capacity() * size_of::<BlockKey>();
             total += guard.lengths.capacity() * size_of::<u32>();
             total += self.touched[shard].capacity() * size_of::<AtomicU64>();
@@ -125,7 +110,7 @@ impl BlockCache {
     /// Run a function over a cached block, with no lock held past it
     pub fn with<Answer>(&self, key: BlockKey, visit: impl FnOnce(&[u8]) -> Answer) -> Option<Answer> {
         let (shard, first) = self.place_of(key);
-        let guard = self.read_shard(shard);
+        let guard = self.shards.read(shard);
         for slot in first..first + CACHE_WAYS {
             if guard.keys[slot] == key {
                 self.touched[shard][slot].store(1, Ordering::Relaxed);
@@ -144,7 +129,7 @@ impl BlockCache {
         }
 
         let (shard, first) = self.place_of(key);
-        let mut guard = self.write_shard(shard);
+        let mut guard = self.shards.write(shard);
         let slot = self.pick_slot(shard, &guard, first, key);
         guard.keys[slot] = key;
         guard.lengths[slot] = block.len() as u32;

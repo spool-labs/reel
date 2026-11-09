@@ -701,11 +701,11 @@ fn hold_whole() {
     let key = key_of(1);
     let mut needs = [ShardNeed::default(); SHARD_COUNT];
     needs[0].add(key.len());
-    while needs[SHARD_COUNT - 1].pages() <= index.read_shard(SHARD_COUNT - 1).slab.total_pages() {
+    while needs[SHARD_COUNT - 1].pages() <= index.shards.read(SHARD_COUNT - 1).slab.total_pages() {
         needs[SHARD_COUNT - 1].add(key.len());
     }
 
     assert!(!index.hold_room(&needs));
 
-    assert_eq!(index.read_shard(0).held, ShardHold::default());
+    assert_eq!(index.shards.read(0).held, ShardHold::default());
 }

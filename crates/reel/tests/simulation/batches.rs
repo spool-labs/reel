@@ -753,7 +753,7 @@ fn path_boundary() {
 fn shard_limit() {
     let io = SimulatedIo::new(Seed(21));
     let store = open(&io);
-    let limit = store.state.index.read_shard(0).node_row_limit();
+    let limit = store.state.index.shards.read(0).node_row_limit();
     let mut batch = WriteBatch::new();
     let mut number = 0;
     while (batch.len() as u64) <= limit {

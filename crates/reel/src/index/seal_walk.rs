@@ -87,7 +87,7 @@ impl SealWalk {
         self.slot = slot;
         for shard in 0..SHARD_COUNT {
             self.runs[shard].next = {
-                let guard = index.read_shard(shard);
+                let guard = index.shards.read(shard);
                 guard.trees[slot.0 as usize].first_position(&guard.nodes)
             };
             self.load(index, shard);
@@ -106,7 +106,7 @@ impl SealWalk {
             return;
         }
 
-        let guard = index.read_shard(shard);
+        let guard = index.shards.read(shard);
         // the addresses sit side by side in the leaves, and with them in hand no slab read waits on the one before
         let mut entries = [NO_ENTRY; WALK_RUN_ROWS];
         while run.count < WALK_RUN_ROWS

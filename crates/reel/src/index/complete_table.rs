@@ -5,11 +5,12 @@
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::RwLock;
 
 use reel_api::units::{ByteCount, RowCount};
 
 use crate::index::key_hash::KeyHash;
+use crate::guard::Shards;
 use crate::pool::touched_filled;
 use crate::segment::segment_tail::SegmentNumber;
 
@@ -83,7 +84,7 @@ pub struct CompleteShard {
 /// A complete column's table
 #[derive(Debug)]
 pub struct CompleteTable {
-    shards: Vec<RwLock<CompleteShard>>,
+    pub shards: Shards<CompleteShard>,
     mark: AtomicU64,
     used: AtomicU64,
     past_capacity: AtomicU64,
@@ -461,7 +462,7 @@ impl CompleteTable {
         let slots = (rows.0 * 10 / LOAD_TENTHS) as usize;
         let per_shard = slots.div_ceil(COMPLETE_SHARDS);
         Self {
-            shards: (0..COMPLETE_SHARDS).map(|_shard| RwLock::new(CompleteShard::new(per_shard))).collect(),
+            shards: Shards((0..COMPLETE_SHARDS).map(|_shard| RwLock::new(CompleteShard::new(per_shard))).collect()),
             mark: AtomicU64::new(NO_MARK),
             used: AtomicU64::new(0),
             past_capacity: AtomicU64::new(0),
@@ -469,27 +470,11 @@ impl CompleteTable {
         }
     }
 
-    /// Read a shard
-    pub fn read_shard(&self, index: usize) -> RwLockReadGuard<'_, CompleteShard> {
-        match self.shards[index].read() {
-            Ok(guard) => guard,
-            Err(poisoned) => crate::guard::recover(poisoned),
-        }
-    }
-
-    /// Change a shard
-    pub fn write_shard(&self, index: usize) -> RwLockWriteGuard<'_, CompleteShard> {
-        match self.shards[index].write() {
-            Ok(guard) => guard,
-            Err(poisoned) => crate::guard::recover(poisoned),
-        }
-    }
-
     /// Read the heap the table holds
     pub fn heap_bytes(&self) -> ByteCount {
         let slots: usize = (0..COMPLETE_SHARDS)
             .map(|index| {
-                let shard = self.read_shard(index);
+                let shard = self.shards.read(index);
                 shard.slots.capacity() + shard.overflow.capacity()
             })
             .sum();
@@ -541,25 +526,25 @@ impl CompleteTable {
 
     /// Read how many slots and overflow slots each shard has
     pub fn shard_sizes(&self) -> (usize, usize) {
-        let shard = self.read_shard(0);
+        let shard = self.shards.read(0);
         (shard.slots.len(), shard.overflow.len())
     }
 
     /// Call on a shard's slots, then its overflow area, used or not
     pub fn visit_slots(&self, shard: usize, mut visit: impl FnMut(&CompleteSlot)) {
-        let guard = self.read_shard(shard);
+        let guard = self.shards.read(shard);
         guard.slots.iter().chain(guard.overflow.iter()).for_each(&mut visit);
     }
 
     /// Read the length of a part of a shard: its slots, then its overflow area
     pub fn part_length(&self, shard: usize, part: usize) -> usize {
-        let guard = self.read_shard(shard);
+        let guard = self.shards.read(shard);
         if part == 0 { guard.slots.len() } else { guard.overflow.len() }
     }
 
     /// Fill a part of a shard from an image's bytes, starting at a slot
     pub fn fill_part(&self, shard: usize, part: usize, from: usize, bytes: &[u8]) {
-        let mut guard = self.write_shard(shard);
+        let mut guard = self.shards.write(shard);
         let shard = &mut *guard;
         let slots = if part == 0 { &mut shard.slots } else { &mut shard.overflow };
         for (slot, stored) in slots[from..].iter_mut().zip(bytes.chunks_exact(SLOT_BYTES)) {
@@ -572,7 +557,7 @@ impl CompleteTable {
     /// Finish a fill from an image: count the overflow slots and take the image's count of used slots
     pub fn finish_fill(&self, used: u64) {
         for index in 0..COMPLETE_SHARDS {
-            let mut shard = self.write_shard(index);
+            let mut shard = self.shards.write(index);
             shard.overflow_used = shard.overflow.iter().filter(|slot| slot.is_used()).count();
         }
         self.used.store(used, Ordering::Release);
@@ -581,7 +566,7 @@ impl CompleteTable {
     /// Empty the table
     pub fn clear(&self) {
         for index in 0..COMPLETE_SHARDS {
-            let mut shard = self.write_shard(index);
+            let mut shard = self.shards.write(index);
             shard.slots.fill(CompleteSlot::empty());
             shard.overflow.fill(CompleteSlot::empty());
             shard.overflow_used = 0;
@@ -602,7 +587,7 @@ impl CompleteTable {
 
     /// Clear gone slots from one step's buckets of a shard, the overflow area with the last step, and say whether the shard is done
     pub fn sweep_step(&self, shard: usize, from: usize, is_gone: &impl Fn(u32) -> bool) -> bool {
-        let mut guard = self.write_shard(shard);
+        let mut guard = self.shards.write(shard);
         let end = (from + SWEEP_STEP_BUCKETS).min(guard.buckets);
         let mut cleared = guard.sweep_buckets(from..end, is_gone);
         let is_done = end == guard.buckets;
@@ -626,7 +611,7 @@ impl CompleteTable {
 
     /// Fill a list with the slots a key's tag matches
     pub fn find(&self, hash: KeyHash, matches: &mut TagMatches) {
-        let shard = self.read_shard(shard_of(hash));
+        let shard = self.shards.read(shard_of(hash));
         let homes = shard.homes(hash);
         shard.visit_tag(&homes, |slot| matches.push(*slot));
     }
@@ -637,7 +622,7 @@ impl CompleteTable {
         let Ok(segment) = u32::try_from(segment.0) else {
             return;
         };
-        let mut shard = self.write_shard(shard_of(hash));
+        let mut shard = self.shards.write(shard_of(hash));
         let homes = shard.homes(hash);
         if shard.free_slot(&homes, segment, block) {
             self.used.fetch_sub(1, Ordering::AcqRel);
@@ -687,7 +672,7 @@ impl CompleteTable {
 
     /// Find a slot a place: a home, then a home by moving another slot on, then the overflow area
     pub fn place(&self, hash: KeyHash, segment: u32, block: u16, is_gone: &impl Fn(u32) -> bool) -> bool {
-        let mut shard = self.write_shard(shard_of(hash));
+        let mut shard = self.shards.write(shard_of(hash));
         let homes = shard.homes(hash);
         let cleared = shard.clear_gone(homes.tag, is_gone);
         self.used.fetch_sub(cleared, Ordering::AcqRel);

@@ -1,13 +1,14 @@
 //! Every sealed segment's handle, tail and block index, sharded so no read takes a global lock
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::RwLock;
 
 use reel_api::column_id::ColumnId;
 use reel_api::direction::Direction;
 use reel_api::units::{ByteCount, RootId, WritePlace};
 
 use crate::pool::touched_capacity;
+use crate::guard::Shards;
 use crate::segment::block_entry::{BlockEntry, KeyPrefix};
 use crate::segment::footer_reader::first_candidate;
 use crate::segment::segment_tail::{ColumnTail, SegmentNumber, TailHead};
@@ -100,7 +101,7 @@ pub struct TableShard<File> {
 /// The table of a volume
 #[derive(Debug)]
 pub struct SegmentTable<File> {
-    shards: Vec<RwLock<TableShard<File>>>,
+    pub shards: Shards<TableShard<File>>,
     pins: Vec<Vec<AtomicU32>>,
 }
 
@@ -219,30 +220,14 @@ impl<File: Clone> SegmentTable<File> {
             }));
             pins.push(shard_pins);
         }
-        Self { shards, pins }
-    }
-
-    /// Read a shard
-    pub fn read_shard(&self, shard: usize) -> RwLockReadGuard<'_, TableShard<File>> {
-        match self.shards[shard].read() {
-            Ok(guard) => guard,
-            Err(poisoned) => crate::guard::recover(poisoned),
-        }
-    }
-
-    /// Change a shard
-    pub fn write_shard(&self, shard: usize) -> RwLockWriteGuard<'_, TableShard<File>> {
-        match self.shards[shard].write() {
-            Ok(guard) => guard,
-            Err(poisoned) => crate::guard::recover(poisoned),
-        }
+        Self { shards: Shards(shards), pins }
     }
 
     /// Read the heap every shard holds
     pub fn heap_bytes(&self) -> ByteCount {
         let mut total = 0;
         for shard in 0..TABLE_SHARDS {
-            let guard = self.read_shard(shard);
+            let guard = self.shards.read(shard);
             total += guard.segments.capacity() * size_of::<Option<TableEntry<File>>>();
             total += guard.columns.capacity() * size_of::<ColumnTail>();
             total += guard.blocks.capacity() * size_of::<BlockEntry>();
@@ -255,7 +240,7 @@ impl<File: Clone> SegmentTable<File> {
 
     /// Install a sealed segment, or return false when its shard has no room
     pub fn install(&self, file: File, root: RootId, head: &TailHead, columns: &[ColumnTail], blocks: &[BlockEntry]) -> bool {
-        let mut guard = self.write_shard(shard_of(head.segment));
+        let mut guard = self.shards.write(shard_of(head.segment));
         if !guard.has_room(columns, blocks) {
             guard.compact();
         }
@@ -294,13 +279,13 @@ impl<File: Clone> SegmentTable<File> {
 
     /// Read how many segments the table has room for
     pub fn capacity(&self) -> usize {
-        TABLE_SHARDS * self.read_shard(0).segments.len()
+        TABLE_SHARDS * self.shards.read(0).segments.len()
     }
 
     /// Check the fullest shard has used more than half of its segment slots, its column pool or its block pool
     pub fn is_past_half(&self) -> bool {
         (0..TABLE_SHARDS).any(|shard| {
-            let shard = self.read_shard(shard);
+            let shard = self.shards.read(shard);
             let used = shard.segments.len() - shard.free_slots.len();
             2 * used > shard.segments.len() || 2 * shard.columns.len() > shard.columns.capacity() || 2 * shard.blocks.len() > shard.blocks.capacity()
         })
@@ -310,20 +295,20 @@ impl<File: Clone> SegmentTable<File> {
     pub fn segment_count(&self) -> u64 {
         let mut count = 0;
         for shard in 0..TABLE_SHARDS {
-            count += self.read_shard(shard).segments.iter().flatten().count() as u64;
+            count += self.shards.read(shard).segments.iter().flatten().count() as u64;
         }
         count
     }
 
     /// Check the table has a segment
     pub fn holds(&self, number: SegmentNumber) -> bool {
-        self.read_shard(shard_of(number)).map.get(number).is_some()
+        self.shards.read(shard_of(number)).map.get(number).is_some()
     }
 
     /// Hold a segment open for a read, or return nothing when it has left the table
     pub fn pin(&self, number: SegmentNumber) -> Option<SegmentPin<'_, File>> {
         let shard = shard_of(number);
-        let guard = self.read_shard(shard);
+        let guard = self.shards.read(shard);
         let slot = guard.map.get(number)?;
         let entry = guard.segments[slot as usize].as_ref()?;
         let pin = &self.pins[shard][slot as usize];
@@ -338,7 +323,7 @@ impl<File: Clone> SegmentTable<File> {
 
     /// Take a block's dead rows off its live count, and keep the highest place that replaced any of the segment's rows
     pub fn drop_live(&self, number: SegmentNumber, block: u32, rows: u32, replacement: WritePlace) {
-        let mut guard = self.write_shard(shard_of(number));
+        let mut guard = self.shards.write(shard_of(number));
         let Some(slot) = guard.map.get(number) else {
             return;
         };
@@ -354,7 +339,7 @@ impl<File: Clone> SegmentTable<File> {
 
     /// Set or clear a segment's flag for large dead records no list could hold
     pub fn flag_held_frees(&self, number: SegmentNumber, is_held: bool) {
-        let mut guard = self.write_shard(shard_of(number));
+        let mut guard = self.shards.write(shard_of(number));
         let Some(slot) = guard.map.get(number) else {
             return;
         };
@@ -365,7 +350,7 @@ impl<File: Clone> SegmentTable<File> {
 
     /// Note a confirmation couldn't prove a segment's rows dead, so only a rewrite takes it until the next open
     pub fn flag_unproven(&self, number: SegmentNumber) {
-        let mut guard = self.write_shard(shard_of(number));
+        let mut guard = self.shards.write(shard_of(number));
         let Some(slot) = guard.map.get(number) else {
             return;
         };
@@ -376,7 +361,7 @@ impl<File: Clone> SegmentTable<File> {
 
     /// Check a confirmation left a segment unproven
     pub fn is_unproven(&self, number: SegmentNumber) -> bool {
-        let guard = self.read_shard(shard_of(number));
+        let guard = self.shards.read(shard_of(number));
         let entry = guard.map.get(number).and_then(|slot| guard.segments[slot as usize].as_ref());
         entry.is_some_and(|entry| entry.is_unproven)
     }
@@ -384,14 +369,14 @@ impl<File: Clone> SegmentTable<File> {
     /// Find a segment with large dead records no list could hold
     pub fn next_held_frees(&self) -> Option<SegmentNumber> {
         (0..TABLE_SHARDS).find_map(|shard| {
-            let guard = self.read_shard(shard);
+            let guard = self.shards.read(shard);
             guard.segments.iter().flatten().find(|entry| entry.has_held_frees).map(|entry| entry.number)
         })
     }
 
     /// Find which of a segment's blocks starts at an offset in its file
     pub fn block_at(&self, number: SegmentNumber, offset: u32) -> Option<u32> {
-        let guard = self.read_shard(shard_of(number));
+        let guard = self.shards.read(shard_of(number));
         let slot = guard.map.get(number)?;
         let entry = guard.segments[slot as usize].as_ref()?;
         let first = entry.blocks.start as usize;
@@ -403,7 +388,7 @@ impl<File: Clone> SegmentTable<File> {
     /// Read the highest place that replaced a segment's rows, or nothing while a block still has a live row. The place lives
     /// here alone, and it starts at zero after an open, where no cue can read below what was already written
     pub fn dead_replacement(&self, number: SegmentNumber) -> Option<WritePlace> {
-        let guard = self.read_shard(shard_of(number));
+        let guard = self.shards.read(shard_of(number));
         let slot = guard.map.get(number)?;
         let entry = guard.segments[slot as usize].as_ref()?;
         let first = entry.blocks.start as usize;
@@ -413,7 +398,7 @@ impl<File: Clone> SegmentTable<File> {
 
     /// Add up a segment's live rows, block by block
     pub fn live_rows(&self, number: SegmentNumber) -> Option<u64> {
-        let guard = self.read_shard(shard_of(number));
+        let guard = self.shards.read(shard_of(number));
         let slot = guard.map.get(number)?;
         let entry = guard.segments[slot as usize].as_ref()?;
         let first = entry.blocks.start as usize;
@@ -423,7 +408,7 @@ impl<File: Clone> SegmentTable<File> {
 
     /// Note a segment's walk has finished, so other walks may count against it
     pub fn mark_walked(&self, number: SegmentNumber) {
-        let mut guard = self.write_shard(shard_of(number));
+        let mut guard = self.shards.write(shard_of(number));
         let Some(slot) = guard.map.get(number) else {
             return;
         };
@@ -434,7 +419,7 @@ impl<File: Clone> SegmentTable<File> {
 
     /// Copy out one of a segment's block lines, counted over all its columns, and the column it belongs to
     pub fn walk_block(&self, number: SegmentNumber, index: u32) -> Option<WalkBlock> {
-        let guard = self.read_shard(shard_of(number));
+        let guard = self.shards.read(shard_of(number));
         let slot = guard.map.get(number)?;
         let entry = guard.segments[slot as usize].as_ref()?;
         let line = guard.blocks.get(entry.blocks.start as usize + index as usize)?;
@@ -450,7 +435,7 @@ impl<File: Clone> SegmentTable<File> {
     /// Take a segment out so no new read can pin it
     pub fn retire(&self, number: SegmentNumber) -> Option<RetiredSegment<File>> {
         let shard = shard_of(number);
-        let mut guard = self.write_shard(shard);
+        let mut guard = self.shards.write(shard);
         let slot = guard.map.get(number)?;
         let entry = guard.segments[slot as usize].take()?;
         guard.map.remove(number);
@@ -468,12 +453,12 @@ impl<File: Clone> SegmentTable<File> {
 
     /// Give a retired segment's slot back, once no read holds it
     pub fn free_retired(&self, retired: &RetiredSegment<File>) {
-        self.write_shard(retired.shard).free_slots.push(retired.slot);
+        self.shards.write(retired.shard).free_slots.push(retired.slot);
     }
 
     /// Read where a column's blocks start in a segment and how many there are
     pub fn column_blocks(&self, number: SegmentNumber, column: ColumnId) -> Option<(u32, u32)> {
-        let guard = self.read_shard(shard_of(number));
+        let guard = self.shards.read(shard_of(number));
         let slot = guard.map.get(number)?;
         let entry = guard.segments[slot as usize].as_ref()?;
         let tail = guard.column_of(entry, column)?;
@@ -482,7 +467,7 @@ impl<File: Clone> SegmentTable<File> {
 
     /// Find the block a key's rows can start in and the end of its column's blocks, in the segment's own block numbers
     pub fn blocks_from(&self, number: SegmentNumber, column: ColumnId, key: &[u8]) -> Option<(u32, u32)> {
-        let guard = self.read_shard(shard_of(number));
+        let guard = self.shards.read(shard_of(number));
         let slot = guard.map.get(number)?;
         let entry = guard.segments[slot as usize].as_ref()?;
         let column_tail = guard.column_of(entry, column)?;
@@ -496,7 +481,7 @@ impl<File: Clone> SegmentTable<File> {
     /// Add up each root's segments, as a caller measures them, into one number a root
     pub fn for_each_segment(&self, mut visit: impl FnMut(SegmentNumber, RootId, &File)) {
         for shard in 0..self.shards.len() {
-            let guard = self.read_shard(shard);
+            let guard = self.shards.read(shard);
             for entry in guard.segments.iter().flatten() {
                 visit(entry.number, entry.root, &entry.file);
             }
@@ -505,14 +490,14 @@ impl<File: Clone> SegmentTable<File> {
 
     /// Read which root holds a segment
     pub fn root_of(&self, number: SegmentNumber) -> Option<RootId> {
-        let guard = self.read_shard(shard_of(number));
+        let guard = self.shards.read(shard_of(number));
         let slot = guard.map.get(number)?;
         guard.segments[slot as usize].as_ref().map(|entry| entry.root)
     }
 
     /// Copy out a segment's tail for a column
     pub fn column_tail(&self, number: SegmentNumber, column: ColumnId) -> Option<ColumnTail> {
-        let guard = self.read_shard(shard_of(number));
+        let guard = self.shards.read(shard_of(number));
         let slot = guard.map.get(number)?;
         let entry = guard.segments[slot as usize].as_ref()?;
         guard.column_of(entry, column).copied()
@@ -520,7 +505,7 @@ impl<File: Clone> SegmentTable<File> {
 
     /// Copy out one block line, and the highest place that replaced any of the segment's rows
     pub fn block_line(&self, number: SegmentNumber, index: u32) -> Option<(BlockEntry, WritePlace)> {
-        let guard = self.read_shard(shard_of(number));
+        let guard = self.shards.read(shard_of(number));
         let slot = guard.map.get(number)?;
         let entry = guard.segments[slot as usize].as_ref()?;
         if index >= entry.blocks.length {
@@ -533,7 +518,7 @@ impl<File: Clone> SegmentTable<File> {
     /// Find the block a walk enters a column at, for a key known to start with the bytes the column shares. Going up that is
     /// the block its rows can start in, and going down the last block that starts at or before it
     pub fn entry_block(&self, number: SegmentNumber, tail: &ColumnTail, key: &[u8], direction: Direction) -> Option<u32> {
-        let guard = self.read_shard(shard_of(number));
+        let guard = self.shards.read(shard_of(number));
         let slot = guard.map.get(number)?;
         let entry = guard.segments[slot as usize].as_ref()?;
         let first = entry.blocks.start as usize + tail.first_block as usize;
@@ -548,7 +533,7 @@ impl<File: Clone> SegmentTable<File> {
 
     /// Copy out the block lines that can hold a key, from a block onward
     pub fn block_window(&self, number: SegmentNumber, column: ColumnId, key: &[u8], skip: usize) -> Option<BlockWindow> {
-        let guard = self.read_shard(shard_of(number));
+        let guard = self.shards.read(shard_of(number));
         let slot = guard.map.get(number)?;
         let entry = guard.segments[slot as usize].as_ref()?;
         let column_tail = guard.column_of(entry, column)?;

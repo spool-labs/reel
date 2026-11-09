@@ -2921,7 +2921,7 @@ fn hot_ingest_merges_once_room_runs_short() {
 // check one more segment would take the table's fullest shard past half
 fn is_near_half(volume: &Volume<SimulatedIo>) -> bool {
     (0..TABLE_SHARDS).any(|shard| {
-        let shard = volume.table.read_shard(shard);
+        let shard = volume.table.shards.read(shard);
         2 * (shard.segments.len() - shard.free_slots.len() + 1) > shard.segments.len()
     })
 }

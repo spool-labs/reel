@@ -64,7 +64,6 @@ pub struct CacheShard {
 #[derive(Debug)]
 pub struct RecordCache {
     shards: Vec<Mutex<CacheShard>>,
-    shard_bytes: usize,
 }
 
 /// Mix a record's place into a hash
@@ -86,11 +85,15 @@ impl CacheEntry {
 }
 
 impl CacheShard {
-    /// Allocate and touch a shard with an arena of some bytes
+    /// Allocate and touch a shard whose arena and index together take some bytes
     pub fn new(bytes: usize) -> Self {
-        let slots = (bytes / BYTES_PER_INDEX_SLOT).next_power_of_two().max(16);
+        // the index and its counts come out of the shard's bytes, one slot planned for each stretch of arena
+        let slot_cost = size_of::<CacheEntry>() + 1;
+        let planned = bytes / (BYTES_PER_INDEX_SLOT + slot_cost);
+        let slots = if planned < 16 { 16 } else { 1 << planned.ilog2() };
+        let arena = bytes.saturating_sub(slots * slot_cost).max(LEAST_SHARD_BYTES) / 8 * 8;
         Self {
-            arena: touched_filled(bytes, 0),
+            arena: touched_filled(arena, 0),
             head: 0,
             tail: 0,
             slots: touched_filled(slots, CacheEntry::empty()),
@@ -273,13 +276,13 @@ impl CacheShard {
 impl RecordCache {
     /// Allocate and touch a cache of some bytes across every shard
     pub fn new(bytes: ByteCount) -> Self {
-        let shard_bytes = (bytes.0 as usize / CACHE_SHARDS).max(LEAST_SHARD_BYTES).next_multiple_of(8);
+        let shard_bytes = (bytes.0 as usize / CACHE_SHARDS).max(2 * LEAST_SHARD_BYTES);
         let shards: Vec<_> = (0..CACHE_SHARDS).map(|_shard| Mutex::new(CacheShard::new(shard_bytes))).collect();
         // a lock can build its state on first use, so each takes it here, at open
         for shard in &shards {
             drop(hold(shard));
         }
-        Self { shards, shard_bytes }
+        Self { shards }
     }
 
     /// Pick a record's shard
@@ -305,11 +308,11 @@ impl RecordCache {
 
     /// Read the heap the cache holds
     pub fn heap_bytes(&self) -> ByteCount {
-        let slots = self.shards.first().map_or(0, |shard| {
+        let shard = self.shards.first().map_or(0, |shard| {
             let shard = hold(shard);
-            shard.slots.len() * size_of::<CacheEntry>() + shard.seen.len()
+            shard.arena.len() + shard.slots.len() * size_of::<CacheEntry>() + shard.seen.len()
         });
-        ByteCount(((self.shard_bytes + slots) * CACHE_SHARDS) as u64)
+        ByteCount((shard * CACHE_SHARDS) as u64)
     }
 
     /// Count the values the cache holds

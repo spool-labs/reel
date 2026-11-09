@@ -1286,9 +1286,7 @@ pub fn build_state<Backend: Io>(
     let block_share = ByteCount(sizing.cache_share.0 - filter_share.0);
     // complete columns read small blocks, and a slot sized for a full block would hold a sixteenth of what it could
     let complete_share = ByteCount(if is_complete { block_share.0 / 2 } else { 0 });
-    // a hot key's place is in the spot index and its value in the record cache, so the row blocks give half their share to values
-    let record_share = ByteCount((block_share.0 - complete_share.0) / 2);
-    let row_share = ByteCount(block_share.0 - complete_share.0 - record_share.0);
+    let row_share = ByteCount(block_share.0 - complete_share.0);
     let reserved = superblock.next_segment.0;
     let first_number = reserved.saturating_sub(SEGMENT_NUMBER_BATCH);
 
@@ -1306,7 +1304,7 @@ pub fn build_state<Backend: Io>(
         filter_cache: BlockCache::new(ByteCount(filter_share.0 - arena_share.0), FILTER_SLOT_BYTES),
         filter_arena: FilterArena::new(arena_share, planned.iter().map(|table| table.segments_per_shard * TABLE_SHARDS).sum()),
         row_cache: BlockCache::new(row_share, ROW_BLOCK_BYTES),
-        record_cache: RecordCache::new(record_share),
+        record_cache: RecordCache::new(sizing.record_share),
         complete_cache: is_complete.then(|| BlockCache::new(complete_share, COMPLETE_BLOCK_BYTES)),
         complete_line_bytes: ByteCount(complete_lines(config) * size_of::<BlockEntry>() as u64),
         queues,

@@ -33,18 +33,22 @@ pub const FULL_BUDGET: ByteCount = ByteCount(512 * 1024 * 1024);
 pub const OPEN_PER_ROOT: usize = 4;
 /// Open slots each open segment can need: its own, and one while it seals
 pub const SLOTS_PER_OPEN: usize = 2;
-/// The write index gets one part in this many of what the fixed parts and the room leave
-pub const WRITE_INDEX_DIVISOR: u64 = 2;
-/// The spot cache gets one part in this many of what the fixed parts and the room leave
-pub const SPOT_DIVISOR: u64 = 8;
-/// The block cache gets one part in this many of what the fixed parts and the room leave
-pub const BLOCK_CACHE_DIVISOR: u64 = 8;
-/// The summaries get one part in this many of what the fixed parts and the room leave, rows and the save buffer together. A row costs
-/// about 100 B a column and four bytes a row block, about 0.003 B a key at 1,400 rows a block, so 1B keys take 2.8 MB of
-/// it. A row that doesn't fit is dropped: its segment is never walked or counted against, which only understates
-pub const SUMMARY_DIVISOR: u64 = 16;
-/// The segment tables and column directories get one part in this many of what the fixed parts and the room leave
-pub const TABLE_DIVISOR: u64 = 16;
+/// The write index's sixteenths of what the fixed parts and the room leave
+pub const WRITE_INDEX_SIXTEENTHS: u64 = 6;
+/// The spot cache's sixteenths of what the fixed parts and the room leave
+pub const SPOT_SIXTEENTHS: u64 = 2;
+/// The block caches' sixteenths of what the fixed parts and the room leave
+pub const BLOCK_CACHE_SIXTEENTHS: u64 = 2;
+/// The record cache's sixteenths of what the fixed parts and the room leave, so a hot get reads no file
+pub const RECORD_CACHE_SIXTEENTHS: u64 = 2;
+/// The summaries' sixteenths of what the fixed parts and the room leave, rows and the save buffer together. A row costs about
+/// 100 B a column and four bytes a row block, about 0.003 B a key at 1,400 rows a block, so 1B keys take 2.8 MB of it. A row that
+/// doesn't fit is dropped: its segment is never walked or counted against, which only understates
+pub const SUMMARY_SIXTEENTHS: u64 = 1;
+/// The segment tables' and column directories' sixteenths of what the fixed parts and the room leave
+pub const TABLE_SIXTEENTHS: u64 = 1;
+/// Sixteenths every share takes together
+pub const SHARED_SIXTEENTHS: u64 = WRITE_INDEX_SIXTEENTHS + SPOT_SIXTEENTHS + BLOCK_CACHE_SIXTEENTHS + RECORD_CACHE_SIXTEENTHS + SUMMARY_SIXTEENTHS + TABLE_SIXTEENTHS;
 /// Bytes a segment's entry plans for before its columns: its table entry, slot and pin, its places in the table's and the
 /// summary's number maps at their worst rounding, the 16 B the planner's covered list holds for it, and its place in the
 /// summary's orders
@@ -155,6 +159,7 @@ pub struct EngineSizing {
     pub shard: ShardSizing,
     pub spot_share: ByteCount,
     pub cache_share: ByteCount,
+    pub record_share: ByteCount,
     pub summary_share: ByteCount,
     pub table_share: ByteCount,
     pub lz4_stored_limit: ByteCount,
@@ -253,7 +258,7 @@ impl EngineSizing {
         let budget = shape.budget;
         // the room and the entries come out before the shares
         let shared = budget.0.saturating_sub(shape.fixed_bytes().0 + shape.room().0 + shape.entry_line().0);
-        let index_share = share_of(shared, WRITE_INDEX_DIVISOR);
+        let index_share = share_of(shared, WRITE_INDEX_SIXTEENTHS);
         let rows_total = index_share / PLANNED_ROW_BYTES;
         let rows_per_shard = (rows_total / SHARD_COUNT as u64).max(64);
 
@@ -271,10 +276,11 @@ impl EngineSizing {
                 table_slots: (rows_per_shard as usize * 2).next_power_of_two(),
                 open_slots,
             },
-            spot_share: ByteCount(share_of(shared, SPOT_DIVISOR)),
-            cache_share: ByteCount(share_of(shared, BLOCK_CACHE_DIVISOR)),
-            summary_share: ByteCount(share_of(shared, SUMMARY_DIVISOR)),
-            table_share: ByteCount(share_of(shared, TABLE_DIVISOR)),
+            spot_share: ByteCount(share_of(shared, SPOT_SIXTEENTHS)),
+            cache_share: ByteCount(share_of(shared, BLOCK_CACHE_SIXTEENTHS)),
+            record_share: ByteCount(share_of(shared, RECORD_CACHE_SIXTEENTHS)),
+            summary_share: ByteCount(share_of(shared, SUMMARY_SIXTEENTHS)),
+            table_share: ByteCount(share_of(shared, TABLE_SIXTEENTHS)),
             lz4_stored_limit: LZ4_STORED_LIMIT,
             workers: shape.workers(),
             walk_slots: shape.walk_slots(),
@@ -285,10 +291,9 @@ impl EngineSizing {
     }
 }
 
-/// Read one share of what the fixed parts, the room and the entries leave. The divisors' parts add to seven eighths, so each
-/// scales by eight sevenths and the shares together take the whole
-pub const fn share_of(shared: u64, divisor: u64) -> u64 {
-    shared * 8 / (7 * divisor)
+/// Read one share of what the fixed parts, the room and the entries leave, scaled so the shares together take the whole
+pub const fn share_of(shared: u64, sixteenths: u64) -> u64 {
+    shared / SHARED_SIXTEENTHS * sixteenths
 }
 
 /// Read the entries a volume's table plans for: the segments its disks hold at the segment size times the margin, in whole

@@ -17,6 +17,7 @@ use reel::engine::walk_job::WalkJob;
 use reel::guard::hold;
 use reel::index::complete_table::{COMPLETE_SHARDS, CompleteSlot, MOST_TAG_SLOTS, TagMatches, shard_of, tag_of};
 use reel::io::{Io, IoFile};
+use reel::engine::volume::NO_SEAL;
 use reel::index::key_hash::hash_key;
 use reel::record::codec::Codec;
 use reel::segment::segment_tail::SegmentNumber;
@@ -974,5 +975,37 @@ fn churn_settles_to_a_slot_a_key() {
     let store = ReelStore::open(io.clone(), &config).expect("open");
     let reopened = store.state.complete_table(COLUMN).expect("a table").used_slots().0;
     assert!(reopened <= KEYS, "{reopened} slots after a reopen for {live} live keys of {KEYS}");
+    store.close().expect("close");
+}
+
+// a refill waits while a seal at or past the mark or a merge output is in flight, since their rows that found no slot aren't
+// listed yet and a refill would clear the mark over them
+#[test]
+fn refill_waits_for_segments_in_flight() {
+    let io = SimulatedIo::new(Seed(32));
+    let store = open(&io, RowCount(2 * KEYS));
+    let volume = &store.state.volumes[0];
+    let table = store.state.complete_table(COLUMN).expect("a table");
+    volume.holds.walk.store(true, Ordering::Release);
+    volume.holds.compaction.store(true, Ordering::Release);
+    for round in 0..3 {
+        for number in 0..KEYS {
+            store.put(COLUMN, &key(number), format!("round-{round}").as_bytes()).expect("put");
+        }
+        seal(&store, &io);
+    }
+    let mark = table.mark().expect("three versions of every key fit a table sized for two");
+    // an empty table has room, so only what's in flight holds the refill back
+    table.clear();
+
+    volume.sealing.store(mark.0, Ordering::Release);
+    assert!(store.state.start_refill(0, u64::MAX).is_none(), "a refill started beside a seal at the mark");
+    volume.sealing.store(NO_SEAL, Ordering::Release);
+    volume.lanes[0].output_floor.store(mark.0 + 1, Ordering::Release);
+    assert!(store.state.start_refill(0, u64::MAX).is_none(), "a refill started beside a merge output");
+    volume.lanes[0].output_floor.store(NO_SEAL, Ordering::Release);
+    assert!(store.state.start_refill(0, u64::MAX).is_some(), "a refill waited with nothing in flight");
+    volume.holds.compaction.store(false, Ordering::Release);
+    volume.holds.walk.store(false, Ordering::Release);
     store.close().expect("close");
 }

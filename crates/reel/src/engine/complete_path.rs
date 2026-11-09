@@ -10,7 +10,7 @@ use reel_api::units::{RowCount, WritePlace};
 use crate::engine::engine_state::EngineState;
 use crate::engine::read_path::{KeyRead, SealedRow, WalkAsk, corruption};
 use crate::engine::recovery::{whole_columns, widen_row};
-use crate::engine::volume::Volume;
+use crate::engine::volume::{NO_SEAL, Volume};
 use crate::fixed_list::{FixedList, ListOut};
 use crate::guard::hold;
 use crate::index::complete_table::{CompleteSlot, CompleteTable, TagMatches};
@@ -256,6 +256,13 @@ impl<Backend: Io> EngineState<Backend> {
             let Some(mark) = table.mark().filter(|_mark| is_due) else {
                 continue;
             };
+            // a seal or a merge output can hold rows past the mark that found no slot before the summary lists it, so a refill now
+            // would pass it and clear the mark over them
+            let volume = &self.volumes[index];
+            let sealing = volume.sealing.load(Ordering::Acquire);
+            if (sealing != NO_SEAL && sealing >= mark.0) || volume.output_floor() != NO_SEAL {
+                continue;
+            }
             // newest first, so a key's newest row past the mark takes its slot ahead of the rows it superseded
             let segment = hold(&self.volumes[index].summary).orders().after(SegmentNumber(mark.0.saturating_sub(1))).last().copied();
             return Some(Refill { column: ColumnId(id as u8), mark, missed: table.past_capacity(), segment, block: 0 });

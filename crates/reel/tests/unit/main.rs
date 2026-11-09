@@ -17,6 +17,7 @@ mod open_segment;
 mod pool;
 mod ration;
 mod range_covers;
+mod record_cache;
 mod record_check;
 mod record_head;
 mod record_reader;

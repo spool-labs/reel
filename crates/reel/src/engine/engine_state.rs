@@ -41,6 +41,7 @@ use crate::record::record_reader::RecordReader;
 use crate::rows::row_group::RowGroupBuffer;
 use crate::engine::complete_image::ImageFiles;
 use crate::index::complete_table::CompleteTable;
+use crate::index::record_cache::RecordCache;
 use crate::segment::block_cache::BlockCache;
 use crate::segment::filter_arena::FilterArena;
 use crate::segment::row_block::ROW_BLOCK_BYTES;
@@ -86,6 +87,7 @@ pub struct EngineState<Backend: Io> {
     pub filter_cache: BlockCache,
     pub filter_arena: FilterArena,
     pub row_cache: BlockCache,
+    pub record_cache: RecordCache,
     pub queues: Vec<Mutex<RowQueue>>,
     pub spare_groups: Vec<Mutex<Option<RowGroupBuffer>>>,
     pub windows: Vec<[RecordWindow; 2]>,
@@ -605,6 +607,7 @@ impl<Backend: Io> EngineState<Backend> {
             budget: self.memory_budget,
             write_index: self.index.heap_bytes(),
             spot_cache: self.spot.heap_bytes(),
+            record_cache: self.record_cache.heap_bytes(),
             complete_tables: ByteCount(self.complete.iter().flatten().map(|table| table.heap_bytes().0).sum()),
             block_cache: ByteCount(self.filter_arena.heap_bytes().0 + self.filter_cache.heap_bytes().0 + self.row_cache.heap_bytes().0 + self.complete_cache_bytes()),
             footer_space: ByteCount(self.seal_heap.load(Ordering::Acquire) + self.walk_heap.load(Ordering::Acquire)),

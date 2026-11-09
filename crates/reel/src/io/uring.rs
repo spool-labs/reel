@@ -23,10 +23,11 @@ pub const POKE: u64 = u64::MAX;
 /// The registered buffer every read lands in
 pub const BUFFER_INDEX: u16 = 0;
 /// How long the kernel's submit thread stays awake with nothing to submit before it sleeps, in milliseconds. While reads flow
-/// it stays up, and a start costs no syscall
-pub const SUBMIT_IDLE_MS: u32 = 1_000;
-/// How long a reaper looks at the completions in memory before it waits in the kernel, past a cold read's time on a slow disk
-pub const REAP_SPIN: Duration = Duration::from_micros(400);
+/// it stays up and a start costs no syscall, and at 10 ms it costs 0.4% of a core once they stop (33% at 1 s)
+pub const SUBMIT_IDLE_MS: u32 = 10;
+/// How long a reaper looks at the completions in memory before it waits in the kernel. On the ccx33 150 us took a cold read from
+/// 141 us to 120, and 400 us bought nothing more
+pub const REAP_SPIN: Duration = Duration::from_micros(150);
 
 /// The slots' bytes, which the kernel writes behind the compiler's back
 #[derive(Debug)]

@@ -6,6 +6,7 @@ pub mod key_hash;
 pub mod key_table;
 pub mod node_pool;
 pub mod open_slots;
+pub mod record_cache;
 pub mod seal_walk;
 pub mod seek_target;
 pub mod shard_cursor;

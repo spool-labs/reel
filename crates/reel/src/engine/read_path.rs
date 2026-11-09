@@ -533,9 +533,22 @@ impl<Backend: Io> EngineState<Backend> {
             offset: spot.offset,
             length: spot.length,
         };
+        // the cache holds each value with its key, so a slot another key's hash led to answers nothing there
+        let is_cached = match want {
+            RecordWant::Whole => self.record_cache.get(spot.segment, location.offset, read.key, buf),
+            RecordWant::Window(window) => self.record_cache.get_window(spot.segment, location.offset, read.key, window.offset, window.length, buf),
+        };
+        if is_cached {
+            return Ok(Some(true));
+        }
         // a slot holds no key, so a failed check here means another key or a moved record: a miss
         match self.read_record(ReadOn::new(device, &pin.file), location, spot.place, read, want, buf).await? {
-            RecordRead::Valid => Ok(Some(true)),
+            RecordRead::Valid => {
+                if want == RecordWant::Whole {
+                    self.record_cache.offer(spot.segment, location.offset, read.key, buf);
+                }
+                Ok(Some(true))
+            },
             RecordRead::Failed => Ok(None),
         }
     }
@@ -620,8 +633,21 @@ impl<Backend: Io> EngineState<Backend> {
             offset: sealed.row.offset,
             length: sealed.row.length,
         };
+        // a sealed record never changes where it sits, so the cache answers for its place while the segment is pinned
+        let is_cached = match want {
+            RecordWant::Whole => self.record_cache.get(sealed.segment, location.offset, read.key, buf),
+            RecordWant::Window(window) => self.record_cache.get_window(sealed.segment, location.offset, read.key, window.offset, window.length, buf),
+        };
+        if is_cached {
+            return Ok(true);
+        }
         match self.read_record(ReadOn::new(device, &pin.file), location, sealed.row.place, read, want, buf).await? {
-            RecordRead::Valid => Ok(true),
+            RecordRead::Valid => {
+                if want == RecordWant::Whole {
+                    self.record_cache.offer(sealed.segment, location.offset, read.key, buf);
+                }
+                Ok(true)
+            },
             RecordRead::Failed => Err(corruption(read)),
         }
     }

@@ -10,6 +10,7 @@ pub struct MemoryReport {
     pub spot_cache: ByteCount,
     pub complete_tables: ByteCount,
     pub block_cache: ByteCount,
+    pub record_cache: ByteCount,
     pub block_indexes: ByteCount,
     pub segment_table: ByteCount,
     pub summary: ByteCount,
@@ -58,6 +59,7 @@ impl MemoryReport {
                 + self.spot_cache.0
                 + self.complete_tables.0
                 + self.block_cache.0
+                + self.record_cache.0
                 + self.block_indexes.0
                 + self.segment_table.0
                 + self.summary.0

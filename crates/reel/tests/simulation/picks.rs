@@ -144,8 +144,9 @@ fn time(label: &str, mut pick: impl FnMut() -> bool) {
         times.push(started.elapsed());
     }
     times.sort();
-    // a debug build runs some ten times slower, and only the release run holds the line
-    assert!(cfg!(debug_assertions) || times[LOOKS - 1] < HOLD_LINE, "{label} held the summary {:?}", times[LOOKS - 1]);
+    // a debug build runs some ten times slower, and only the release run holds the line. The median holds it, since one look
+    // a parallel test preempts says nothing about the pick
+    assert!(cfg!(debug_assertions) || times[LOOKS / 2] < HOLD_LINE, "{label} held the summary {:?} at the median", times[LOOKS / 2]);
     println!(
         "pick {label}: least {:?} median {:?} most {:?}, found {found} of {LOOKS}",
         times[0],

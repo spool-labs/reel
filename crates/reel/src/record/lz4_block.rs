@@ -8,6 +8,8 @@ use crate::pool::touched_capacity;
 
 /// The library's default speed setting
 pub const ACCELERATION: c_int = 1;
+/// The longest input the library takes, LZ4_MAX_INPUT_SIZE in lz4.h. A longer length would also wrap the C int it passes as
+pub const MOST_INPUT_BYTES: usize = 0x7E00_0000;
 
 unsafe extern "C" {
     fn LZ4_sizeofState() -> c_int;
@@ -41,7 +43,7 @@ impl Lz4State {
     /// Compress one chunk, or return nothing when it doesn't shrink
     pub fn compress(&mut self, input: &[u8], output: &mut [u8]) -> Option<usize> {
         let capacity = input.len().min(output.len()).saturating_sub(1);
-        if capacity == 0 {
+        if capacity == 0 || input.len() > MOST_INPUT_BYTES {
             return None;
         }
 
@@ -71,6 +73,12 @@ impl Default for Lz4State {
 
 /// Decompress one chunk and return its length, or nothing when the block is malformed
 pub fn decompress(input: &[u8], output: &mut [u8]) -> Option<usize> {
+    if input.len() > MOST_INPUT_BYTES {
+        return None;
+    }
+    // no block decompresses past the most input, and a longer output length would wrap its C int
+    let reach = output.len().min(c_int::MAX as usize);
+    let output = &mut output[..reach];
     // SAFETY: both spans stay valid for their stated lengths, and the call never writes past output
     let length = unsafe {
         LZ4_decompress_safe(

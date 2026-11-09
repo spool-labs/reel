@@ -255,11 +255,6 @@ impl<Backend: Io> ReelStore<Backend> {
         self.state.set_current_mark(mark);
     }
 
-    /// Count a volume's pending range deletes
-    pub fn pending_range_deletes(&self, volume: VolumeId) -> usize {
-        self.state.volumes[volume.0 as usize].covers.len()
-    }
-
     /// Count the waits for room in the write index, and read the longest
     pub fn index_waits(&self) -> (u64, Nanoseconds) {
         let waits = self.state.index_waits.load(Ordering::Relaxed);

@@ -38,25 +38,30 @@ struct LiveBytes;
 #[global_allocator]
 static COUNTER: LiveBytes = LiveBytes;
 
+// SAFETY: every method only counts and then hands its call to the system allocator as it came
 unsafe impl GlobalAlloc for LiveBytes {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         LIVE_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        // SAFETY: the caller's layout and pointer go to the system allocator unchanged, under this call's own contract
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         LIVE_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        // SAFETY: the caller's layout and pointer go to the system allocator unchanged, under this call's own contract
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
         LIVE_BYTES.fetch_sub(layout.size() as u64, Ordering::Relaxed);
+        // SAFETY: the caller's layout and pointer go to the system allocator unchanged, under this call's own contract
         unsafe { System.dealloc(pointer, layout) }
     }
 
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
         LIVE_BYTES.fetch_add(size as u64, Ordering::Relaxed);
         LIVE_BYTES.fetch_sub(layout.size() as u64, Ordering::Relaxed);
+        // SAFETY: the caller's layout and pointer go to the system allocator unchanged, under this call's own contract
         unsafe { System.realloc(pointer, layout, size) }
     }
 }

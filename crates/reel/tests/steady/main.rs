@@ -178,6 +178,7 @@ fn unwritten_pages() -> usize {
     0
 }
 
+// SAFETY: every method only counts and then hands its call to the system allocator as it came
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // the trace's own allocations count for nothing
@@ -185,6 +186,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
             ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         }
         LIVE_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        // SAFETY: the caller's layout goes to the system allocator unchanged, under this call's own contract
         let block = unsafe { System.alloc(layout) };
         note_block(block, layout.size());
         block
@@ -196,6 +198,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
             ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         }
         LIVE_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        // SAFETY: the caller's layout goes to the system allocator unchanged, under this call's own contract
         let block = unsafe { System.alloc_zeroed(layout) };
         note_block(block, layout.size());
         block
@@ -207,6 +210,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
         }
         LIVE_BYTES.fetch_sub(layout.size() as u64, Ordering::Relaxed);
         forget_block(pointer, layout.size());
+        // SAFETY: the caller's layout and pointer go to the system allocator unchanged, under this call's own contract
         unsafe { System.dealloc(pointer, layout) }
     }
 
@@ -217,6 +221,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
         }
         LIVE_BYTES.fetch_add(size as u64, Ordering::Relaxed);
         LIVE_BYTES.fetch_sub(layout.size() as u64, Ordering::Relaxed);
+        // SAFETY: the caller's layout and pointer go to the system allocator unchanged, under this call's own contract
         unsafe { System.realloc(pointer, layout, size) }
     }
 }
@@ -620,6 +625,7 @@ fn check_arena_race() {
 // nothing has touched still faults, which is the fault this test looks for
 #[cfg(target_os = "linux")]
 fn lock_touched_pages() {
+    // SAFETY: mlockall takes flags and no memory of ours
     let locked = unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE | libc::MCL_ONFAULT) };
     println!("touched pages {}", if locked == 0 { "locked" } else { "unlocked" });
     assert_eq!(locked, 0, "steady needs its pages locked: raise the memlock limit");

@@ -33,8 +33,9 @@ pub const REAP_SPIN: Duration = Duration::from_micros(150);
 #[derive(Debug)]
 pub struct RingBytes(Box<[UnsafeCell<u8>]>);
 
-// a slot belongs to one side at a time: the kernel from submit to completion, the reader after it
+// SAFETY: a slot belongs to one side at a time: the kernel from submit to completion, the reader after it
 unsafe impl Sync for RingBytes {}
+// SAFETY: as for Sync, the kernel and the reader take turns on a slot, so moving the bytes between threads races nothing
 unsafe impl Send for RingBytes {}
 
 /// A ring with its registered buffers
@@ -58,7 +59,7 @@ impl UringDriver {
             iov_base: bytes.0.as_ptr().cast_mut().cast(),
             iov_len: RING_SLOTS * RING_SLOT_BYTES,
         };
-        // the buffer lives in this driver as long as the ring does
+        // SAFETY: the buffer lives in this driver as long as the ring does
         unsafe { ring.submitter().register_buffers(&[vector]) }?;
         Ok(Self {
             ring,
@@ -75,7 +76,7 @@ impl UringDriver {
     /// Put one entry on the queue and tell the kernel
     fn submit(&self, entry: &io_uring::squeue::Entry) -> Result<()> {
         let _submitting = hold(&self.submitting);
-        // the mutex keeps this the queue's one writer, and an entry's buffer outlives its read
+        // SAFETY: the mutex keeps this the queue's one writer, and an entry's buffer outlives its read
         let pushed = unsafe {
             let mut queue = self.ring.submission_shared();
             queue.push(entry)
@@ -104,10 +105,11 @@ impl RingDriver<PlainFile> for UringDriver {
     fn reap(&self, done: &mut dyn FnMut(usize, Result<usize>)) -> Result<bool> {
         // completions land in shared memory, so a look there costs no syscall, and a wait in the kernel costs a wake
         let spun = Instant::now();
-        // only the one reaper reads this queue
+        // SAFETY: only the one reaper reads this queue
         while unsafe { self.ring.completion_shared() }.is_empty() && spun.elapsed() < REAP_SPIN {
             std::hint::spin_loop();
         }
+        // SAFETY: only the one reaper reads this queue
         let is_waiting = unsafe { self.ring.completion_shared() }.is_empty();
         let waited = if is_waiting { self.ring.submitter().submit_and_wait(1) } else { Ok(0) };
         match waited {
@@ -115,7 +117,7 @@ impl RingDriver<PlainFile> for UringDriver {
             Err(error) if error.raw_os_error() == Some(libc::EINTR) => return Ok(true),
             Err(error) => return Err(error),
         }
-        // only the one reaper reads this queue
+        // SAFETY: only the one reaper reads this queue
         let completions = unsafe { self.ring.completion_shared() };
         for completion in completions {
             if completion.user_data() == POKE {
@@ -130,7 +132,7 @@ impl RingDriver<PlainFile> for UringDriver {
 
     fn copy_out(&self, slot: usize, out: &mut [u8]) {
         assert!(out.len() <= RING_SLOT_BYTES, "a copy past its slot");
-        // the completion ended the kernel's turn, and the slot stays held until this copy is done
+        // SAFETY: the completion ended the kernel's turn, and the slot stays held until this copy is done
         let bytes = unsafe { std::slice::from_raw_parts(self.slot_start(slot).cast_const(), out.len()) };
         out.copy_from_slice(bytes);
     }
@@ -140,7 +142,7 @@ impl RingDriver<PlainFile> for UringDriver {
         let mut at = 0;
         for part in parts {
             let length = part.len();
-            // as in copy_out, inside the slot since the parts' lengths fit it
+            // SAFETY: as in copy_out, inside the slot since the parts' lengths fit it
             let bytes = unsafe { std::slice::from_raw_parts(self.slot_start(slot).add(at).cast_const(), length) };
             part.copy_from_slice(bytes);
             at += length;

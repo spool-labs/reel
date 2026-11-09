@@ -222,6 +222,14 @@ impl Io for PlainIo {
     }
 
     fn random_word(&self) -> u64 {
+        // the record key keeps one store's records from checking under another's, so it comes from the kernel's random source
+        let mut bytes = [0u8; size_of::<u64>()];
+        // SAFETY: the buffer is valid for its length, which is under the 256 bytes getentropy takes
+        let status = unsafe { libc::getentropy(bytes.as_mut_ptr().cast::<libc::c_void>(), bytes.len()) };
+        if status == 0 {
+            return u64::from_le_bytes(bytes);
+        }
+        // a kernel with no random source still needs a store id, and the per-thread SipHash keys are the best left
         RandomState::new().build_hasher().finish()
     }
 

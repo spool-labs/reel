@@ -168,7 +168,8 @@ impl<Item> Pool<Item> {
     pub fn with<Answer>(&self, work: impl FnOnce(&mut Item) -> Answer) -> Answer {
         let mut item = self.take();
 
-        // a panic in the work must still hand the item back, or the pool would shrink for good
+        // a panic in the work must still hand the item back, or the pool would shrink for good and, once every item went, every
+        // caller would wait forever. Pooled items are scratch each use writes before it reads, so a half-changed one is safe
         let outcome = panic::catch_unwind(AssertUnwindSafe(|| work(&mut item)));
         self.give_back(item);
 

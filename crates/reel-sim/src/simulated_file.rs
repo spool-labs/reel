@@ -278,4 +278,24 @@ impl IoFile for SimulatedFile {
             None => Err(Error::from(ErrorKind::NotFound)),
         }
     }
+
+    fn reserve_to(&self, end: ByteCount) -> Result<()> {
+        let _pause = CountPause::new();
+        let mut disk = hold(&self.disk);
+        self.check(&mut disk, true)?;
+        let length = match disk.inodes.get(&self.inode) {
+            Some(image) => ByteCount(image.visible.len() as u64),
+            None => return Err(Error::from(ErrorKind::NotFound)),
+        };
+        if end <= length {
+            return Ok(());
+        }
+        if !disk.has_room(self.inode, ByteCount(end.0 - length.0)) {
+            return Err(Error::from(ErrorKind::StorageFull));
+        }
+        if let Some(image) = disk.inodes.get_mut(&self.inode) {
+            image.reserve(end);
+        }
+        Ok(())
+    }
 }

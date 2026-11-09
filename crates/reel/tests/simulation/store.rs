@@ -9,7 +9,7 @@ use std::thread;
 
 use crate::seed_sets::seeds;
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
-use reel::engine::open_segment::{RECORD_WINDOW_BYTES, SegmentPhase, rows_path};
+use reel::engine::open_segment::{RECORD_WINDOW_BYTES, RESERVE_STEP_BYTES, SegmentPhase, rows_path};
 use reel::engine::engine_sizing::OPEN_PER_ROOT;
 use reel::engine::reserve_job::RESERVE_PERIOD;
 use reel::engine::write_path::{ClaimRequest, SPARE_REQUEST, WRITES_PER_OPEN, WindowSwitch};
@@ -31,6 +31,9 @@ use reel_api::write_batch::WriteBatch;
 const ROOT: &str = "/disk/meta";
 const COLUMN: ColumnId = ColumnId(1);
 const BUDGET: ByteCount = ByteCount(61 * 1024 * 1024);
+const ROOM_BUDGET: ByteCount = ByteCount(400 * 1024 * 1024);
+const ROOM_VALUE: usize = 1024 * 1024;
+const ROOM_VALUES: u64 = 100;
 const KEY_SPACE: u64 = 400;
 const OPERATIONS: u64 = 3_000;
 const SEED_COUNT: u64 = 8;
@@ -1193,5 +1196,40 @@ fn many_batch_whole() {
             assert_eq!(values.answer(1), values.answer(2));
         }
     });
+    store.close().expect("close");
+}
+
+// an open segment holds a step of disk at create and gains the next step as its writes pass it, so a store never holds a whole
+// segment of disk ahead of what it wrote, and a spare holds a step alone
+#[test]
+fn room_grows_a_step_at_a_time() {
+    let io = SimulatedIo::new(Seed(61));
+    let mut config = config(SyncPolicy::Never);
+    config.memory_budget = ROOM_BUDGET;
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let volume = &store.state.volumes[0];
+    assert!(volume.segment_bytes.0 > 2 * RESERVE_STEP_BYTES, "a segment of {} B takes no step", volume.segment_bytes.0);
+    let value = vec![7; ROOM_VALUE];
+    let held = || {
+        let claims = hold(&volume.claims);
+        let segment = claims.open.iter().find(|segment| segment.phase == SegmentPhase::Taking).expect("an open segment");
+        let spare = claims.prepared.as_ref().map(|spare| spare.data.length().expect("length").0);
+        (segment.data.length().expect("length").0, segment.write_end.0, spare)
+    };
+
+    store.put(COLUMN, b"first", &value).expect("put");
+    let (length, _written, _spare) = held();
+    assert_eq!(length, RESERVE_STEP_BYTES);
+
+    for number in 0..ROOM_VALUES {
+        store.put(COLUMN, format!("key-{number:04}").as_bytes(), &value).expect("put");
+    }
+    settle(&io);
+    let (length, written, spare) = held();
+    assert!(written > RESERVE_STEP_BYTES, "the writes stayed inside the first step");
+    // the job takes the next step once the writes come within half a step of the room's end
+    assert!(length >= written && length < written + RESERVE_STEP_BYTES * 3 / 2, "{length} B held for {written} B written");
+    assert!(length < volume.segment_bytes.0, "a whole segment held");
+    assert!(spare.is_none_or(|spare| spare <= RESERVE_STEP_BYTES), "a spare holds {spare:?} B");
     store.close().expect("close");
 }

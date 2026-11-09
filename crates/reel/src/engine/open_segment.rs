@@ -48,6 +48,8 @@ pub struct OpenSegment<File> {
     pub rows: File,
     pub phase: SegmentPhase,
     pub write_end: FileOffset,
+    pub reserved_end: FileOffset,
+    pub is_reserve_asked: bool,
     pub row_count: RowCount,
     pub in_flight: u32,
     pub cover_rows: usize,
@@ -61,6 +63,10 @@ pub struct OpenSegment<File> {
     pub first_row_at: Option<Nanoseconds>,
     pub delete_seen: Option<Nanoseconds>,
 }
+
+/// Bytes an open segment holds on its disk ahead of its writes. It holds this much at create and gains it again a step at a
+/// time, so a store holds no whole segment of disk it hasn't written
+pub const RESERVE_STEP_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Bytes of the file range a slot's small records fill before they reach the kernel in one write call
 pub const RECORD_WINDOW_BYTES: usize = 64 * 1024;

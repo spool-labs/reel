@@ -18,7 +18,7 @@ use crate::engine::ration::RATION_SPINS;
 use crate::engine::engine_sizing::{OPEN_PER_ROOT, SEAL_ROWS_EIGHTHS};
 use crate::engine::engine_state::{EngineState, IndexWait, SlotData, SlotPin};
 use crate::engine::open_segment::{
-    MOST_WINDOW_RECORD_BYTES, OpenSegment, RECORD_WINDOW_BYTES, RecordWindow, RowQueue, SegmentPhase, data_path,
+    MOST_WINDOW_RECORD_BYTES, OpenSegment, RECORD_WINDOW_BYTES, RESERVE_STEP_BYTES, RecordWindow, RowQueue, SegmentPhase, data_path,
     rows_path,
 };
 use crate::engine::volume::{ClaimState, Volume};
@@ -812,6 +812,27 @@ impl<Backend: Io> EngineState<Backend> {
             }
 
             if let Some(index) = pick.best {
+                // the reserve job keeps a step held ahead, and a claim past what it holds takes the room itself
+                let segment = &mut claims.open[index];
+                let end = segment.write_end.0 + request.bytes.0;
+                if end > segment.reserved_end.0 {
+                    let target = reserve_target(segment, volume, end);
+                    if let Err(source) = segment.data.reserve_to(ByteCount(target)) {
+                        // a full disk seals the segment, so no claim tries it again
+                        self.seal_at(&mut claims, volume, index);
+                        return Err(store_error(volume, "reserving a segment's room", source));
+                    }
+                    segment.reserved_end = FileOffset(target);
+                    segment.is_reserve_asked = false;
+                }
+                let is_short = segment.reserved_end.0 < volume.segment_bytes.0 && segment.reserved_end.0.saturating_sub(end) < RESERVE_STEP_BYTES / 2;
+                if !segment.is_reserve_asked && is_short {
+                    segment.is_reserve_asked = true;
+                    if let Some(task) = self.reserve_task.get() {
+                        task.wake();
+                    }
+                }
+
                 let Some(ticket) = volume.order.try_claim(request.rows) else {
                     // the ring frees when claims end, and ending one needs this lock, and so does a raise
                     drop(claims);
@@ -941,8 +962,8 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Make the segments writers asked for, with the preallocation and directory sync no put should wait on. A full
-    /// disk leaves none ready, and the writer that needs one hears it when it creates its own. A spare holds a whole
-    /// segment's bytes of disk until a claim takes it or close removes it
+    /// disk leaves none ready, and the writer that needs one hears it when it creates its own. A spare holds a step of
+    /// disk until a claim takes it or close removes it
     pub fn prepare_segments(&self) {
         for volume in &self.volumes {
             let root = {
@@ -1116,7 +1137,7 @@ impl<Backend: Io> EngineState<Backend> {
         let path = &volume.roots[root.0 as usize];
         let number = self.next_segment_number()?;
         let reserved = if request.has_records {
-            ByteCount(volume.segment_bytes.0.max(request.bytes.0))
+            ByteCount(RESERVE_STEP_BYTES.max(request.bytes.0).min(volume.segment_bytes.0.max(request.bytes.0)))
         } else {
             ByteCount(0)
         };
@@ -1161,6 +1182,8 @@ impl<Backend: Io> EngineState<Backend> {
             rows,
             phase: SegmentPhase::Taking,
             write_end: FileOffset(0),
+            reserved_end: FileOffset(reserved.0),
+            is_reserve_asked: false,
             row_count: RowCount(0),
             in_flight: 0,
             cover_rows: 0,
@@ -1648,4 +1671,11 @@ pub fn check_seal_room<Backend: Io>(volume: &Volume<Backend>) -> Result<(), Stor
         return Err(StoreError::TableFull { volume: volume.id });
     }
     Ok(())
+}
+
+/// Work out the end a segment's room grows to for a claim that ends at `end`: a step past what it holds, up to the segment's
+/// bytes or the claim's end, whichever is further
+pub fn reserve_target<Backend: Io>(segment: &OpenSegment<Backend::File>, volume: &Volume<Backend>, end: u64) -> u64 {
+    let limit = volume.segment_bytes.0.max(end);
+    (segment.reserved_end.0 + RESERVE_STEP_BYTES).max(end).min(limit)
 }

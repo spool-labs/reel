@@ -162,6 +162,48 @@ impl IoFile for PlainFile {
         }
         Ok(())
     }
+
+    fn reserve_to(&self, end: ByteCount) -> Result<()> {
+        reserve_descriptor_to(self.descriptor, end)
+    }
+}
+
+/// Hold a file's space through an end, growing it there
+#[cfg(target_os = "linux")]
+pub fn reserve_descriptor_to(descriptor: RawFd, end: ByteCount) -> Result<()> {
+    // SAFETY: the descriptor is open, and no pointer crosses the call
+    let status = unsafe { libc::fallocate(descriptor, 0, 0, end.0 as libc::off_t) };
+    if status != 0 {
+        return Err(Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Hold a file's space through an end, growing it there
+#[cfg(not(target_os = "linux"))]
+pub fn reserve_descriptor_to(descriptor: RawFd, end: ByteCount) -> Result<()> {
+    let length = descriptor_stats(descriptor)?.st_size as u64;
+    if end.0 <= length {
+        return Ok(());
+    }
+    let mut store = libc::fstore_t {
+        fst_flags: libc::F_ALLOCATEALL,
+        fst_posmode: libc::F_PEOFPOSMODE,
+        fst_offset: 0,
+        fst_length: (end.0 - length) as libc::off_t,
+        fst_bytesalloc: 0,
+    };
+    // SAFETY: the descriptor is open, and the store outlives the call
+    let status = unsafe { libc::fcntl(descriptor, libc::F_PREALLOCATE, &raw mut store) };
+    if status != 0 {
+        return Err(Error::last_os_error());
+    }
+    // SAFETY: the descriptor is open, and no pointer crosses the call
+    let status = unsafe { libc::ftruncate(descriptor, end.0 as libc::off_t) };
+    if status != 0 {
+        return Err(Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Give a range's blocks back to the disk

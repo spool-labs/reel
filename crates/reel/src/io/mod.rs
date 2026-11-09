@@ -68,6 +68,10 @@ pub trait IoFile: Clone + Send + Sync {
 
     /// Cut the file back to a length
     fn truncate(&self, length: ByteCount) -> Result<()>;
+
+    /// Hold the disk's space through an end, so a write before it never meets a full disk. A file already that long is left as
+    /// it is
+    fn reserve_to(&self, end: ByteCount) -> Result<()>;
 }
 
 /// A device and what its reads go to, which travel down a read path together

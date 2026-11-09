@@ -1,11 +1,12 @@
-//! The job that keeps the limit of the write order, the segment counter and the next segment ahead of what writers need, and
-//! starts open segments' bytes for the device so a seal's sync finds little left to send
+//! The job that keeps the limit of the write order, the segment counter, the next segment and open segments' disk room ahead of
+//! what writers need, and starts open segments' bytes for the device so a seal's sync finds little left to send
 
 use std::sync::Arc;
 
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds};
 
 use crate::engine::engine_state::EngineState;
+use crate::engine::write_path::reserve_target;
 use crate::engine::volume::Volume;
 use crate::guard::hold;
 use crate::io::job::{Job, JobStep};
@@ -32,6 +33,13 @@ pub struct WritebackRange<File> {
     pub segment: SegmentNumber,
     pub from: u64,
     pub to: u64,
+}
+
+/// Room to hold ahead of an open segment's writes, with the file it lies in
+pub struct RoomAhead<File> {
+    pub file: File,
+    pub segment: SegmentNumber,
+    pub end: u64,
 }
 
 /// The job that saves the next reservation, so no writer waits on a root's sync
@@ -65,6 +73,37 @@ impl<Backend: Io> ReserveJob<Backend> {
         })
     }
 
+    /// Find an open segment whose writers asked for more room, and clone its handle so the call runs with no lock held
+    pub fn next_room(&self, volume: &Volume<Backend>) -> Option<RoomAhead<Backend::File>> {
+        let claims = hold(&volume.claims);
+        claims.open.iter().find(|segment| segment.is_reserve_asked).map(|segment| RoomAhead {
+            file: segment.data.clone(),
+            segment: segment.number,
+            end: reserve_target(segment, volume, segment.write_end.0),
+        })
+    }
+
+    /// Hold the next step of room for every open segment that asked. A full disk stops here, and the claim that runs past the
+    /// room hears it
+    pub fn hold_room(&mut self) {
+        let state = Arc::clone(&self.state);
+        for volume in &state.volumes {
+            while let Some(room) = self.next_room(volume) {
+                let is_held = room.file.reserve_to(ByteCount(room.end)).is_ok();
+                let mut claims = hold(&volume.claims);
+                if let Some(segment) = claims.open.iter_mut().find(|segment| segment.number == room.segment) {
+                    segment.is_reserve_asked = false;
+                    if is_held {
+                        segment.reserved_end = FileOffset(segment.reserved_end.0.max(room.end));
+                    }
+                }
+                if !is_held {
+                    break;
+                }
+            }
+        }
+    }
+
     /// Start every open segment's new bytes. The call is a hint: a failure leaves them to the seal's sync
     pub fn start_writeback(&mut self) {
         let state = Arc::clone(&self.state);
@@ -79,6 +118,7 @@ impl<Backend: Io> ReserveJob<Backend> {
 
 impl<Backend: Io> Job for ReserveJob<Backend> {
     fn step(&mut self) -> JobStep {
+        self.hold_room();
         self.start_writeback();
         self.state.prepare_segments();
         if self.state.needs_reservation() {

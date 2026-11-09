@@ -32,25 +32,12 @@ fn mark_order() {
     let second = order.try_claim(ONE).expect("room");
     let third = order.try_claim(ONE).expect("room");
 
-    order.finish(&second, TicketState::Landed);
-    order.finish(&third, TicketState::Landed);
+    order.finish(&second);
+    order.finish(&third);
     assert_eq!(order.mark(), WritePlace(0));
 
-    order.finish(&first, TicketState::Landed);
+    order.finish(&first);
     assert_eq!(order.mark(), third.last);
-}
-
-// an aborted claim lets the mark pass it
-#[test]
-fn mark_abort() {
-    let order = order_after(WritePlace(0));
-    let first = order.try_claim(ONE).expect("room");
-    let second = order.try_claim(ONE).expect("room");
-
-    order.finish(&first, TicketState::Aborted);
-    assert_eq!(order.mark(), first.last);
-    order.finish(&second, TicketState::Landed);
-    assert_eq!(order.mark(), second.last);
 }
 
 // a batch moves the mark in one step, so it's seen whole or not at all
@@ -60,7 +47,7 @@ fn mark_batch() {
     let batch = order.try_claim(RowCount(5)).expect("room");
 
     assert_eq!(order.mark(), WritePlace(0));
-    order.finish(&batch, TicketState::Landed);
+    order.finish(&batch);
     assert_eq!(order.mark(), WritePlace(5));
 }
 
@@ -74,7 +61,7 @@ fn ring_full() {
     }
 
     assert_eq!(order.try_claim(ONE), None);
-    order.finish(&first, TicketState::Landed);
+    order.finish(&first);
     assert!(order.try_claim(ONE).is_some());
 }
 
@@ -84,7 +71,7 @@ fn ring_reuse() {
     let order = order_after(WritePlace(0));
     for _claim in 0..MOST_IN_FLIGHT * 3 {
         let ticket = order.try_claim(ONE).expect("room");
-        order.finish(&ticket, TicketState::Landed);
+        order.finish(&ticket);
     }
 
     assert_eq!(order.mark(), WritePlace(MOST_IN_FLIGHT as u64 * 3));
@@ -114,12 +101,12 @@ fn marks_stand_apart() {
     let quick = meta.try_claim(ONE).expect("room");
     assert_eq!((slow.first, quick.first), (WritePlace(1), WritePlace(2)));
 
-    meta.finish(&quick, TicketState::Landed);
+    meta.finish(&quick);
     assert_eq!(meta.mark(), quick.last);
     assert_eq!(bulk.mark(), WritePlace(0));
     meta.wait_visible(&quick);
 
-    bulk.finish(&slow, TicketState::Landed);
+    bulk.finish(&slow);
     assert_eq!(bulk.mark(), slow.last);
 }
 

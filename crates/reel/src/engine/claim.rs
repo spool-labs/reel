@@ -11,7 +11,7 @@ use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
 use crate::io::Io;
 use crate::segment::segment_tail::SegmentNumber;
-use crate::write_order::{Ticket, TicketState};
+use crate::write_order::Ticket;
 
 /// A byte range and a run of places, claimed together
 pub struct Claim<'state, Backend: Io> {
@@ -42,7 +42,7 @@ impl<Backend: Io> Claim<'_, Backend> {
 
     /// End the claim with its rows in the index, leaving the wait for the mark to the caller
     pub fn finish(mut self) {
-        self.volume.order.finish(&self.ticket, TicketState::Landed);
+        self.volume.order.finish(&self.ticket);
         self.is_landed = true;
         self.release();
     }
@@ -70,7 +70,7 @@ impl<Backend: Io> Drop for Claim<'_, Backend> {
     fn drop(&mut self) {
         if !self.is_landed {
             // a failed writer must not hold the mark, or every later write would wait for it
-            self.volume.order.finish(&self.ticket, TicketState::Aborted);
+            self.volume.order.finish(&self.ticket);
             self.release();
         }
     }

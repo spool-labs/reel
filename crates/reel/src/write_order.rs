@@ -14,17 +14,6 @@ pub const MARK_SPINS: u32 = 256;
 /// Writers that can be in flight at once on a volume
 pub const MOST_IN_FLIGHT: usize = 1_024;
 
-/// How one claim ended
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TicketState {
-    /// Its writer is still working, and the mark waits for it
-    InFlight,
-    /// Its rows are in the index
-    Landed,
-    /// Its writer failed, so the mark passes it with nothing to show
-    Aborted,
-}
-
 /// One claim of places, in write order
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Ticket {
@@ -36,7 +25,7 @@ pub struct Ticket {
 /// The claims still ahead of the mark, oldest first
 #[derive(Debug)]
 pub struct TicketRing {
-    states: Vec<TicketState>,
+    is_in_flight: Vec<bool>,
     ends: Vec<WritePlace>,
     head: usize,
     tail: usize,
@@ -125,7 +114,7 @@ impl WriteOrder {
         Self {
             places,
             ring: Mutex::new(TicketRing {
-                states: vec![TicketState::Landed; MOST_IN_FLIGHT],
+                is_in_flight: vec![false; MOST_IN_FLIGHT],
                 ends: vec![WritePlace(0); MOST_IN_FLIGHT],
                 head: 0,
                 tail: 0,
@@ -157,21 +146,21 @@ impl WriteOrder {
         // the count moves under this lock, so this volume's claims stand in the ring in place order
         let (first, last) = self.places.take(rows)?;
         let slot = ring.tail % MOST_IN_FLIGHT;
-        ring.states[slot] = TicketState::InFlight;
+        ring.is_in_flight[slot] = true;
         ring.ends[slot] = last;
         ring.tail += 1;
         Some(Ticket { first, last, slot })
     }
 
-    /// End a claim, and move the mark past every finished claim in order
-    pub fn finish(&self, ticket: &Ticket, state: TicketState) {
+    /// End a claim, landed or failed, and move the mark past every finished claim in order
+    pub fn finish(&self, ticket: &Ticket) {
         let mut ring = hold(&self.ring);
-        ring.states[ticket.slot] = state;
+        ring.is_in_flight[ticket.slot] = false;
 
         let mut highest = None;
         while !ring.is_empty() {
             let head = ring.head % MOST_IN_FLIGHT;
-            if ring.states[head] == TicketState::InFlight {
+            if ring.is_in_flight[head] {
                 break;
             }
             highest = Some(ring.ends[head]);

@@ -5,7 +5,7 @@ edition.workspace = true
 publish = false
 
 [dependencies]
-reel.workspace = true
+reel = { workspace = true, features = ["test-hooks"] }
 libc.workspace = true
 reel-api.workspace = true
 

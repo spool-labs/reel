@@ -516,6 +516,8 @@ impl<Backend: Io> RewriteJob<Backend> {
             }
         }
         self.staged.clear();
+        // the outputs an offset-order pass made ahead went with the lane's slots above, and a later pass makes its own
+        self.slot_outputs = Default::default();
         self.output = None;
         self.grave_output = None;
         self.leave_outputs(volume, slots);

@@ -27,7 +27,7 @@ use crate::segment::row_block::FooterRow;
 use crate::segment::segment_table::SegmentPin;
 use crate::segment::segment_tail::{MOST_MERGE_SEGMENTS, SegmentNumber};
 
-use crate::engine::rewrite_job::{MERGE_STEP_ROWS, MergeTarget, RewriteJob, RewritePhase};
+use crate::engine::rewrite_job::{MERGE_STEP_ROWS, MERGE_STEP_TIME, MergeTarget, RewriteJob, RewritePhase};
 
 impl<Backend: Io> RewriteJob<Backend> {
     /// Read where a merge cuts its output. An overlap merge's inputs span the same keys, so it writes outputs a segment long, and the
@@ -174,7 +174,12 @@ impl<Backend: Io> RewriteJob<Backend> {
             }
         }
 
+        let deadline = state.io.now().0.saturating_add(MERGE_STEP_TIME.0);
         for _row in 0..MERGE_STEP_ROWS {
+            // a step past its time or a store going ends here, and the next step takes the row in hand
+            if self.unit.1 > 0 && (state.io.now().0 >= deadline || state.is_stopping.load(Ordering::Acquire)) {
+                return Ok(());
+            }
             self.unit.1 += 1;
             let Some(index) = self.next_input() else {
                 self.is_drained = true;
@@ -573,12 +578,16 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
         let state = Arc::clone(&self.state);
         let volume = &state.volumes[self.volume];
+        // every output the deciding pass cut takes its records before the copying pass reaches it. One is made a step, since
+        // setting a large file's room aside can take seconds, and a close waits for the step
+        if self.is_ordered
+            && let Some(slot) = (1..=self.cuts).find(|slot| self.slot_outputs[*slot].is_none())
+        {
+            self.slot_outputs[slot] = Some(self.create_output(volume, ByteCount(self.cut_bytes), slot)?);
+            return Ok(());
+        }
         self.open_output(volume, target)?;
         if self.is_ordered {
-            // every output the deciding pass cut takes its records before the copying pass reaches it
-            for slot in 1..=self.cuts {
-                self.slot_outputs[slot] = Some(self.create_output(volume, ByteCount(self.cut_bytes), slot)?);
-            }
             self.outputs_end = [0; MOST_MERGE_OUTPUTS];
             self.placing_input = 0;
             self.stripe.clear();

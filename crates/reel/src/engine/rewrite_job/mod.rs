@@ -68,6 +68,9 @@ pub const NO_HOME: u32 = u32::MAX;
 pub const HOME_BLOCK_BITS: u32 = 28;
 /// Rows one step of a merge decides
 pub const MERGE_STEP_ROWS: usize = 4_096;
+/// The longest a step of a merge decides rows for. A row can ask every overlapping segment's footers, so rows alone can run a
+/// step past a minute, and a close waits for the step
+pub const MERGE_STEP_TIME: Nanoseconds = Nanoseconds(20_000_000);
 /// Bytes a stripe copy step takes across before it stops, a buffer's worth, past which only the run in hand finishes
 pub const COPY_STEP_BYTES: u64 = MERGE_BUFFER_BYTES as u64;
 /// Bytes each output's stage holds before it goes out in one write

@@ -3104,3 +3104,30 @@ fn floor_skips_older_segments() {
     assert_eq!((found.segment, reader.asked), (newest.segment, 1));
     store.close().expect("close");
 }
+
+// an offset-order merge makes the outputs its deciding pass cut one a step, so no step waits on more than one file's room
+#[test]
+fn cut_outputs_come_one_a_step() {
+    let io = SimulatedIo::new(Seed(92));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    set_of_inputs(&store, &io);
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    job.rewrite.cut_floor = 0;
+    assert!(start_merge(&mut job));
+    assert_eq!(store.state.volumes[0].offset_order_copies.load(Ordering::Acquire), 1, "the inputs' lists fit, so the copy goes in offset order");
+
+    let lane = &store.state.volumes[0].lanes[PLANNER_LANE];
+    let made = || hold(&lane.partial_outputs).iter().filter(|output| output.is_some()).count();
+    let mut counts = vec![made()];
+    while job.rewrite.phase == RewritePhase::Deciding {
+        job.rewrite.step();
+        counts.push(made());
+    }
+    assert!(counts.windows(2).all(|pair| pair[1] <= pair[0] + 1), "a step made more than one output: {counts:?}");
+    assert!(counts.last().is_some_and(|last| *last >= 2), "the pass cut no output: {counts:?}");
+
+    run_to_end(&mut job);
+    check_set(&store);
+    store.close().expect("close");
+}

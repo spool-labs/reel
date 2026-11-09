@@ -4,10 +4,11 @@ use std::io::{Error, ErrorKind, IoSlice, Result};
 use std::path::{Path, PathBuf};
 
 use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, FileOffset, WritePlace};
+use reel_api::units::{FileOffset, WritePlace};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::config::{ColumnConfig, KeyShape};
+use crate::io::replace::replace_whole;
 use crate::io::device_error::is_device_error;
 use crate::io::{Io, IoFile};
 use crate::little_endian::ByteReader;
@@ -278,19 +279,7 @@ impl Superblock {
 
     /// Replace one copy through the new file
     pub fn write_copy<Backend: Io>(io: &Backend, paths: &SuperblockPaths, target: &Path, bytes: &[u8]) -> Result<()> {
-        match io.remove_file(&paths.new) {
-            Ok(()) => {},
-            Err(error) if error.kind() == ErrorKind::NotFound => {},
-            Err(error) => return Err(error),
-        }
-
-        let file = io.create_file(&paths.new, ByteCount(0))?;
-        let written = file.write_at(FileOffset(0), &[IoSlice::new(bytes)]);
-        let synced = written.and_then(|()| file.sync());
-        io.close_file(file);
-        synced?;
-        io.rename_file(&paths.new, target)?;
-        io.sync_directory(&paths.root)
+        replace_whole(io, &paths.root, &paths.new, target, &[IoSlice::new(bytes)])
     }
 }
 

@@ -13,6 +13,7 @@ use crate::engine::engine_state::EngineState;
 use crate::engine::volume::Volume;
 use crate::guard::hold;
 use crate::index::complete_table::{COMPLETE_SHARDS, CompleteTable, SLOT_BYTES};
+use crate::io::replace::move_into_place;
 use crate::io::{Io, IoFile};
 use crate::little_endian::read_word;
 use crate::pool::touched_zeroes;
@@ -124,8 +125,7 @@ impl<Backend: Io> EngineState<Backend> {
         let written = writer.finish();
         self.io.close_file(file);
         written?;
-        self.io.rename_file(&files.new_path, &files.path)?;
-        self.io.sync_directory(&volume.roots[0])
+        move_into_place(&self.io, &volume.roots[0], &files.new_path, &files.path)
     }
 
     /// Read a column's saved image into its table and remove it, and return the segments it covers, sorted. Anything wrong with

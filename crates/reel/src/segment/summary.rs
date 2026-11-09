@@ -9,6 +9,7 @@ use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, DeathMark, FileOffset, RowCount, WritePlace};
 
 use crate::fixed_list::{ListFull, ListOut};
+use crate::io::replace::replace_whole;
 use crate::io::device_error::{SECTOR_BYTES, read_or_damaged};
 use crate::io::{Io, IoFile};
 use crate::lifetime::MarkRange;
@@ -1044,19 +1045,8 @@ pub fn write_copy<Backend: Io>(
     ends: &CopyEnds,
     rows: &[u8],
 ) -> Result<()> {
-    match io.remove_file(&paths.new) {
-        Ok(()) => {},
-        Err(error) if error.kind() == ErrorKind::NotFound => {},
-        Err(error) => return Err(error),
-    }
-
-    let file = io.create_file(&paths.new, ByteCount(0))?;
-    let written = file.write_at(FileOffset(0), &[IoSlice::new(&ends.header), IoSlice::new(rows), IoSlice::new(&ends.trailer)]);
-    let synced = written.and_then(|()| file.sync());
-    io.close_file(file);
-    synced?;
-    io.rename_file(&paths.new, target)?;
-    io.sync_directory(&paths.root)
+    let parts = [IoSlice::new(&ends.header), IoSlice::new(rows), IoSlice::new(&ends.trailer)];
+    replace_whole(io, &paths.root, &paths.new, target, &parts)
 }
 
 /// Read a summary into rows, each from whichever copy passes its check, and return the newer mark. A copy with

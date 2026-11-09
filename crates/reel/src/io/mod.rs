@@ -7,6 +7,7 @@ pub mod lock_outcome;
 pub mod plain;
 pub mod plain_file;
 pub mod plain_task;
+pub mod replace;
 pub mod ring;
 #[cfg(target_os = "linux")]
 pub mod uring;

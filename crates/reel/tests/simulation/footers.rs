@@ -463,7 +463,7 @@ fn row_past_an_empty_block_is_refused() {
     assert!(writer.push_row(&file, &long, &row).is_err(), "a row past an empty block went nowhere");
 }
 
-// the totals carry the most rows any one block took, and the written index says the same of each block
+// the totals hold the most rows any one block took, and the written index says the same of each block
 #[test]
 fn most_block_rows_in_totals() {
     let written = write_rows(&[(FIRST_COLUMN, ordered_rows())]);

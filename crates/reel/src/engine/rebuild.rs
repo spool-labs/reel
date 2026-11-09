@@ -5,7 +5,6 @@
 //! The segment never joins a directory, so no read goes to it. Its output does, and the spans go when that's listed.
 
 use std::io::Result;
-use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
 use reel_api::units::{FileOffset, RowCount, WritePlace};
@@ -49,7 +48,7 @@ pub struct BlockFinds {
 impl<Backend: Io> CompactJob<Backend> {
     /// Start on the next damaged segment that has row blocks to rebuild from, and say whether one began
     pub fn start_rebuild(&mut self, volume: &Volume<Backend>) -> bool {
-        if volume.damage.is_empty() || volume.is_rebuild_held.load(Ordering::Acquire) {
+        if volume.damage.is_empty() || volume.is_rebuild_held() {
             return false;
         }
         // a segment with a good tail lost its rows some other way, so its blocks can't say what the span hides

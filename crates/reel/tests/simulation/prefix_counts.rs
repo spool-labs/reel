@@ -79,7 +79,7 @@ fn seal(store: &Store, io: &SimulatedIo) {
 }
 
 fn hold_compaction(store: &Store, is_held: bool) {
-    store.state.volumes[0].is_compaction_held.store(is_held, Ordering::Release);
+    store.state.volumes[0].holds.compaction.store(is_held, Ordering::Release);
     store.state.ask_compaction();
 }
 
@@ -132,7 +132,7 @@ fn walks_pending() {
     let io = SimulatedIo::new(Seed(2));
     let store = open(&io);
     hold_compaction(&store, true);
-    store.state.volumes[0].is_walk_held.store(true, Ordering::Release);
+    store.state.volumes[0].holds.walk.store(true, Ordering::Release);
     put_all(&store);
     seal(&store, &io);
     put_all(&store);
@@ -185,7 +185,7 @@ fn own_versions_unwalked() {
     let io = SimulatedIo::new(Seed(11));
     let store = open(&io);
     hold_compaction(&store, true);
-    store.state.volumes[0].is_walk_held.store(true, Ordering::Release);
+    store.state.volumes[0].holds.walk.store(true, Ordering::Release);
     put_all(&store);
     put_all(&store);
     seal(&store, &io);
@@ -201,7 +201,7 @@ fn overlap_inside_a_block_steps() {
     hold_compaction(&store, true);
     put_all(&store);
     seal(&store, &io);
-    store.state.volumes[0].is_walk_held.store(true, Ordering::Release);
+    store.state.volumes[0].holds.walk.store(true, Ordering::Release);
     store.put(COLUMN, &key(KEYS / 2), b"w").expect("put");
     seal(&store, &io);
     assert_eq!(store.count_prefix(COLUMN, b"key-").expect("count"), RowCount(KEYS));

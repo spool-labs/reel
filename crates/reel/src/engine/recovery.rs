@@ -694,11 +694,6 @@ impl<Backend: Io> EngineState<Backend> {
         Ok(true)
     }
 
-    /// Walk a rows file's whole groups for where they end and what a sync last covered
-    pub fn scan_rows(&self, rows: &Backend::File) -> Result<RowsScan> {
-        scan_rows_of(rows, self.record_key)
-    }
-
     /// Put each group's rows in the index, checking the records of groups no sync covered, and
     /// return where the kept rows end, or nothing when the index ran out of room
     pub fn replay_rows(

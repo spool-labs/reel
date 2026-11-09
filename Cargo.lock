@@ -82,6 +82,7 @@ dependencies = [
  "io-uring",
  "libc",
  "lz4-sys",
+ "reel",
  "reel-api",
  "reel-sim",
  "xxhash-rust",

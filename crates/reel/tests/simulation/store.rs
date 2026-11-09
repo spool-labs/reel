@@ -1145,7 +1145,7 @@ fn many_answers() {
 fn many_old_point() {
     let io = SimulatedIo::new(Seed(119));
     let store = open(&io);
-    store.state.volumes[0].is_compaction_held.store(true, Ordering::Release);
+    store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
     store.put(COLUMN, b"key", b"older").expect("put");
     store.seal_now();
     settle(&io);

@@ -388,11 +388,6 @@ pub fn share_bucket(share: u64) -> usize {
     (share.min(SHARE_SCALE) * SHARE_BUCKETS as u64 / (SHARE_SCALE + 1)) as usize
 }
 
-/// Read the least share a bucket holds
-pub fn bucket_floor(bucket: usize) -> u64 {
-    (bucket as u64 * (SHARE_SCALE + 1)).div_ceil(SHARE_BUCKETS as u64)
-}
-
 /// Read what a rewrite of a segment wins back, as a share of its record and footer bytes
 pub fn reclaim_share(row: &SummaryRow<'_>) -> u64 {
     let (mut rows, mut dead_rows, mut bytes, mut dead_bytes) = (0, 0, 0, 0);

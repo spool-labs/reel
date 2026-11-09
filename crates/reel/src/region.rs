@@ -69,11 +69,6 @@ impl Region {
         ByteCount(unsafe { self.head.as_ref() }.mapped as u64)
     }
 
-    /// Read the bytes carved so far, head included
-    pub fn carved_bytes(&self) -> ByteCount {
-        ByteCount(self.carved as u64)
-    }
-
     /// Carve an empty list with room for this many items
     pub fn carve<Item: Copy>(&mut self, capacity: usize) -> std::result::Result<FixedList<Item>, ListFull> {
         let start = self.carved.next_multiple_of(align_of::<Item>());

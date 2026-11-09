@@ -216,7 +216,7 @@ fn build(seed: u64) -> Built {
     let io = SimulatedIo::new(Seed(seed));
     let store = open(&io);
     // reclaim would take the dead rows these segments are built to hold
-    store.state.volumes[0].is_compaction_held.store(true, Ordering::Release);
+    store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
     let mut model = Model::new();
     for column in COLUMNS {
         for number in numbers_of(OLDEST) {
@@ -1402,7 +1402,7 @@ fn rebuild_never_reads_older() {
         let io = SimulatedIo::new(Seed(44));
         let store = ReelStore::open(io.clone(), &sized_config(REBUILD_BUDGET)).expect("open");
         hold_rebuilds(&store);
-        store.state.volumes[0].is_compaction_held.store(true, Ordering::Release);
+        store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
         let mut model = Model::new();
         for stage in [OLDEST, MIDDLE] {
             for column in COLUMNS {
@@ -1494,7 +1494,7 @@ fn stale_tail_over_rot() {
 
 fn hold_rebuilds(store: &Store) {
     for volume in &store.state.volumes {
-        volume.is_rebuild_held.store(true, Ordering::Release);
+        volume.holds.rebuild.store(true, Ordering::Release);
     }
 }
 

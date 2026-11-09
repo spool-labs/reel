@@ -134,7 +134,7 @@ fn stall_shows() {
     store.maintenance_report(&mut report);
     assert_eq!(job(&report, JobKind::DeadByteWalk), JobState::Idle);
 
-    volume.is_walk_held.store(true, Ordering::Release);
+    volume.holds.walk.store(true, Ordering::Release);
     put_keys(&store);
     seal(&store, &io);
     store.maintenance_report(&mut report);
@@ -143,7 +143,7 @@ fn stall_shows() {
     store.maintenance_report(&mut report);
     assert_eq!(job(&report, JobKind::DeadByteWalk), JobState::Stalled);
 
-    volume.is_walk_held.store(false, Ordering::Release);
+    volume.holds.walk.store(false, Ordering::Release);
     store.state.ask_compaction();
     settle(&io);
     store.maintenance_report(&mut report);
@@ -199,7 +199,7 @@ fn full_table_stops_a_seal() {
         let io = SimulatedIo::new(Seed(seed));
         io.add_disk(Path::new(ROOT), SMALL_DISK);
         let store = open(&io);
-        store.state.volumes[0].is_compaction_held.store(true, Ordering::Release);
+        store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
         let memory = store.memory_report();
         let mut report = MaintenanceReport::new();
         store.maintenance_report(&mut report);
@@ -226,7 +226,7 @@ fn full_table_stops_a_seal() {
         let mut value = Vec::new();
         assert!(store.get(COLUMN, b"key-00000", &mut value).expect("get"), "seed {seed}: a sealed key went missing past the stop");
         store.put(COLUMN, b"past-the-stop", VALUE).expect("put");
-        store.state.volumes[0].is_compaction_held.store(false, Ordering::Release);
+        store.state.volumes[0].holds.compaction.store(false, Ordering::Release);
         store.close().expect("close");
     }
 }
@@ -267,7 +267,7 @@ fn puts_under_a_seal_stop() {
     let io = SimulatedIo::new(Seed(7));
     io.add_disk(Path::new(ROOT), SMALL_DISK);
     let store = open(&io);
-    store.state.volumes[0].is_compaction_held.store(true, Ordering::Release);
+    store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
     let mut report = MaintenanceReport::new();
     store.maintenance_report(&mut report);
     let room = report.volumes[0].entry_room.0;
@@ -292,7 +292,7 @@ fn puts_under_a_seal_stop() {
     };
     assert!(matches!(outcome, Err(StoreError::TableFull { volume: VolumeId(0) })), "{outcome:?} after {puts} puts");
     assert!(waited < PAUSE_TICK.0, "the refused put paused for {waited} ns");
-    store.state.volumes[0].is_compaction_held.store(false, Ordering::Release);
+    store.state.volumes[0].holds.compaction.store(false, Ordering::Release);
     store.close().expect("close");
 }
 

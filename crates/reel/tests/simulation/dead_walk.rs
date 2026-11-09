@@ -93,7 +93,7 @@ fn open_large(io: &SimulatedIo) -> Store {
 // these tests read the counts of segments compaction would take away
 fn held(store: Store) -> Store {
     for volume in &store.state.volumes {
-        volume.is_compaction_held.store(true, Ordering::Release);
+        volume.holds.compaction.store(true, Ordering::Release);
     }
     store
 }

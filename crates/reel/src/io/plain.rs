@@ -369,11 +369,11 @@ pub fn block_spins(block: &Path, depth: usize) -> Option<bool> {
 #[cfg(target_os = "linux")]
 pub fn lower_priority() -> WorkerPriority {
     let param = libc::sched_param { sched_priority: 0 };
-    // SAFETY: zero names the calling thread, and the parameter lives for the call
+    // SAFETY: zero means the calling thread, and the parameter lives for the call
     unsafe { libc::sched_setscheduler(0, libc::SCHED_BATCH, &param) };
     // SAFETY: gettid reads the calling thread's id
     let thread = unsafe { libc::gettid() };
-    // SAFETY: on Linux a thread id names that thread alone for these calls
+    // SAFETY: on Linux a thread id points at that thread alone for these calls
     unsafe { libc::setpriority(libc::PRIO_PROCESS, thread as libc::id_t, MAINTENANCE_NICE) };
     // SAFETY: as above, and each call reads a number
     let (policy, nice) = unsafe { (libc::sched_getscheduler(0), libc::getpriority(libc::PRIO_PROCESS, thread as libc::id_t)) };

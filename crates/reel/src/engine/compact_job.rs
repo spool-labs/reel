@@ -207,7 +207,7 @@ impl<Backend: Io> CompactJob<Backend> {
     /// volume does no work, and its files stay for the next open
     pub fn has_parked(&self) -> bool {
         let volume = &self.state.volumes[self.volume];
-        let is_stepping = !volume.has_failed() && !volume.is_compaction_held.load(Ordering::Acquire);
+        let is_stepping = !volume.has_failed() && !volume.is_compaction_held();
         is_stepping && volume.segments_parked.load(Ordering::Acquire) > 0
     }
 
@@ -221,7 +221,7 @@ impl<Backend: Io> CompactJob<Backend> {
     pub fn step_work(&mut self, now: Nanoseconds) -> UnitStep {
         let state = Arc::clone(&self.state);
         let volume = &state.volumes[self.volume];
-        if volume.has_failed() || volume.is_compaction_held.load(Ordering::Acquire) {
+        if volume.has_failed() || volume.is_compaction_held() {
             return UnitStep::Idle;
         }
         if let Some(at) = self.retry_at.filter(|at| at.0 > now.0) {
@@ -306,7 +306,7 @@ impl<Backend: Io> CompactJob<Backend> {
         let is_deferring = volume.is_hot(now) && !is_short;
         let is_holding_records = volume.is_ingesting(now) && !is_short;
         let is_owed = !is_deferring && volume.is_over_bound.load(Ordering::Acquire);
-        let is_quiet_with_dead = !is_holding_records && !volume.is_reclaim_held.load(Ordering::Acquire) && is_reclaim_due(&hold(&volume.summary));
+        let is_quiet_with_dead = !is_holding_records && !volume.is_reclaim_held() && is_reclaim_due(&hold(&volume.summary));
         let mut should_rewrite = mem::take(&mut self.should_rewrite) || is_quiet_with_dead || is_owed;
         // an ask that arriving writes held back comes due once they stop
         if is_holding_records {

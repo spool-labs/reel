@@ -56,7 +56,7 @@ fn open(io: &SimulatedIo) -> Store {
     let store = ReelStore::open(io.clone(), &config).expect("open");
     // these segments keep the few dead rows they were built with
     for volume in &store.state.volumes {
-        volume.is_reclaim_held.store(true, Ordering::Release);
+        volume.holds.reclaim.store(true, Ordering::Release);
     }
     store
 }
@@ -386,7 +386,7 @@ fn freed_outlasts_a_reopen() {
     let store = open(&io);
     let volume = &store.state.volumes[0];
     // the quiet volume's line would rewrite the older segment, and this looks at its row as the reopen left it
-    volume.is_compaction_held.store(true, Ordering::Release);
+    volume.holds.compaction.store(true, Ordering::Release);
     settle(&io);
     let rows = hold(&volume.summary);
     let row = rows.rows().find(|row| row.facts.segment == older).expect("a row");

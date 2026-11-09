@@ -886,7 +886,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             return None;
         }
         let current = DeathMark(self.state.current_mark.load(Ordering::Relaxed));
-        let plain = plain_bar(is_ingesting || volume.is_reclaim_held.load(Ordering::Acquire), &rows);
+        let plain = plain_bar(is_ingesting || volume.is_reclaim_held(), &rows);
         let gave_up = self.gave_up_list(volume);
         let is_ready_at = |row: &SummaryRow<'_>, plain: u64| {
             let bar = (current, plain);
@@ -1845,11 +1845,6 @@ impl<Backend: Io> RewriteJob<Backend> {
         Ok(())
     }
 
-    /// Read where the input's records end
-    pub fn inputs_data_end(&self) -> u64 {
-        self.target.map_or(0, |target| target.data.0)
-    }
-
     /// End the copying. Several inputs becoming one wins back overlap whatever it dropped, and one input that dropped nothing
     /// has nothing to install
     pub fn finish_rows(&mut self) -> Result<()> {
@@ -2728,7 +2723,7 @@ pub struct RewriteBound {
     pub rows: u64,
     /// Rows the largest input holds, every row the placing pass lists at once
     pub most_input_rows: u64,
-    /// Columns the inputs hold in all, the most an output can carry
+    /// Columns the inputs hold in all, the most an output can hold
     pub columns: usize,
     /// The smallest block any of those columns writes
     pub block_bytes: usize,

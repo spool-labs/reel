@@ -8,7 +8,7 @@ use reel_api::maintenance_report::{PICK_OUTCOMES, PickOutcome, SHARE_KINDS, SPAN
 use reel_api::units::{ByteCount, Nanoseconds, RowCount, VolumeId, WritePlace};
 
 use crate::config::SyncPolicy;
-use crate::engine::open_segment::{OpenSegment, SegmentPhase};
+use crate::engine::open_segment::OpenSegment;
 use crate::engine::ration::Ration;
 use crate::engine::held_bits::HeldBits;
 use crate::engine::walk_job::WalkSlot;
@@ -183,6 +183,20 @@ pub struct RowBytes {
     pub dead: u64,
 }
 
+/// What a test holds off. A build without the test hooks has none of these, and every check reads false
+#[cfg(feature = "test-hooks")]
+#[derive(Debug, Default)]
+pub struct TestHolds {
+    /// Compaction stops stepping
+    pub compaction: AtomicBool,
+    /// The walk takes no new target, so segments stay unwalked
+    pub walk: AtomicBool,
+    /// Rebuilds wait, to see what damage does before one runs
+    pub rebuild: AtomicBool,
+    /// Quiet-time reclaim waits, so a segment keeps the few dead rows it was built with
+    pub reclaim: AtomicBool,
+}
+
 /// One volume of a store
 pub struct Volume<Backend: Io> {
     pub id: VolumeId,
@@ -204,8 +218,9 @@ pub struct Volume<Backend: Io> {
     pub walks_waiting: AtomicU64,
     pub wants_compaction: AtomicBool,
     pub has_kept_covers: AtomicBool,
-    /// Holds compaction off. Only tests set this today
-    pub is_compaction_held: AtomicBool,
+    /// What tests hold off, in a build with the test hooks
+    #[cfg(feature = "test-hooks")]
+    pub holds: TestHolds,
     /// A seal found the table or a directory full, and only a reclaim can give it room
     pub is_seal_stuck: AtomicBool,
     /// Times a seal stopped on a full table or directory, once for each stop until a seal lands again
@@ -313,12 +328,6 @@ pub struct Volume<Backend: Io> {
     pub is_over_bound: AtomicBool,
     /// The segment the walk has as its target, or `NO_SEAL`
     pub walk_segment: AtomicU64,
-    /// A test holds the walk here to leave segments unwalked
-    pub is_walk_held: AtomicBool,
-    /// A test holds rebuilds off, to see what damage does before one runs
-    pub is_rebuild_held: AtomicBool,
-    /// A test holds quiet-time reclaim off, so a segment keeps the few dead rows it was built with
-    pub is_reclaim_held: AtomicBool,
     /// A walk is counting what its covers hide, and a row that left now would make an older one look live
     pub is_applying: AtomicBool,
     /// Orders a walk's landing against a rewrite that begins or ends holding its inputs
@@ -349,6 +358,54 @@ pub struct Volume<Backend: Io> {
 }
 
 impl<Backend: Io> Volume<Backend> {
+    /// Check a test holds compaction off
+    #[cfg(feature = "test-hooks")]
+    pub fn is_compaction_held(&self) -> bool {
+        self.holds.compaction.load(Ordering::Acquire)
+    }
+
+    /// Check a test holds compaction off, which a build without the hooks never does
+    #[cfg(not(feature = "test-hooks"))]
+    pub const fn is_compaction_held(&self) -> bool {
+        false
+    }
+
+    /// Check a test holds the walk off
+    #[cfg(feature = "test-hooks")]
+    pub fn is_walk_held(&self) -> bool {
+        self.holds.walk.load(Ordering::Acquire)
+    }
+
+    /// Check a test holds the walk off, which a build without the hooks never does
+    #[cfg(not(feature = "test-hooks"))]
+    pub const fn is_walk_held(&self) -> bool {
+        false
+    }
+
+    /// Check a test holds rebuilds off
+    #[cfg(feature = "test-hooks")]
+    pub fn is_rebuild_held(&self) -> bool {
+        self.holds.rebuild.load(Ordering::Acquire)
+    }
+
+    /// Check a test holds rebuilds off, which a build without the hooks never does
+    #[cfg(not(feature = "test-hooks"))]
+    pub const fn is_rebuild_held(&self) -> bool {
+        false
+    }
+
+    /// Check a test holds quiet-time reclaim off
+    #[cfg(feature = "test-hooks")]
+    pub fn is_reclaim_held(&self) -> bool {
+        self.holds.reclaim.load(Ordering::Acquire)
+    }
+
+    /// Check a test holds quiet-time reclaim off, which a build without the hooks never does
+    #[cfg(not(feature = "test-hooks"))]
+    pub const fn is_reclaim_held(&self) -> bool {
+        false
+    }
+
     /// Read the set of open segments a reader counts, in one load
     pub fn view(&self) -> OpenSlots {
         OpenSlots(self.view.load(Ordering::Acquire))
@@ -489,17 +546,6 @@ impl<Backend: Io> Volume<Backend> {
         self.handovers.load(Ordering::Acquire)
     }
 
-    /// Count the open segments that take claims
-    pub fn taking_count(&self) -> usize {
-        let claims = hold(&self.claims);
-        let mut count = 0;
-        for segment in &claims.open {
-            if segment.phase == SegmentPhase::Taking {
-                count += 1;
-            }
-        }
-        count
-    }
 }
 
 /// The longest each step of a seal has run, for the report

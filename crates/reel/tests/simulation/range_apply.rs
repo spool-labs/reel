@@ -56,7 +56,7 @@ fn open(io: &SimulatedIo) -> Store {
     let store = ReelStore::open(io.clone(), &config).expect("open");
     // these segments keep the few dead rows they were built with
     for volume in &store.state.volumes {
-        volume.is_reclaim_held.store(true, Ordering::Release);
+        volume.holds.reclaim.store(true, Ordering::Release);
     }
     store
 }
@@ -86,7 +86,7 @@ fn read(store: &Store, key: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn hold_compaction(store: &Store, is_held: bool) {
-    store.state.volumes[0].is_compaction_held.store(is_held, Ordering::Release);
+    store.state.volumes[0].holds.compaction.store(is_held, Ordering::Release);
     store.state.ask_compaction();
 }
 
@@ -156,7 +156,7 @@ fn walk_counts_a_later_segment() {
     let store = open(&io);
     hold_compaction(&store, true);
     let volume = &store.state.volumes[0];
-    volume.is_walk_held.store(true, Ordering::Release);
+    volume.holds.walk.store(true, Ordering::Release);
     put_keys(&store, "a", b"value");
     put_keys(&store, "m", b"value");
     let older = seal(&store, &io);
@@ -309,14 +309,14 @@ fn dropped_cover_waits_for_the_newer() {
     let store = open(&io);
     hold_compaction(&store, true);
     let volume = &store.state.volumes[0];
-    volume.is_walk_held.store(true, Ordering::Release);
+    volume.holds.walk.store(true, Ordering::Release);
     store.delete_range(COLUMN, b"m", b"n").expect("delete");
     store.put(COLUMN, b"a", b"value").expect("put");
     let older = seal(&store, &io);
     store.delete_range(COLUMN, b"l", b"o").expect("delete");
     settle(&io);
     assert_eq!(pending(&store), 1);
-    volume.is_walk_held.store(false, Ordering::Release);
+    volume.holds.walk.store(false, Ordering::Release);
     store.state.ask_compaction();
     settle(&io);
 
@@ -462,7 +462,7 @@ fn unlink_waits_for_the_apply() {
     store.delete_range(COLUMN, b"m", b"n").expect("delete");
     store.put(COLUMN, b"zz", b"value").expect("put");
     let cover_segment = hold(&volume.claims).open[0].number;
-    volume.is_walk_held.store(true, Ordering::Release);
+    volume.holds.walk.store(true, Ordering::Release);
     store.seal_now();
     settle(&io);
 
@@ -512,7 +512,7 @@ fn counting_cover_stays() {
     store.delete_range(COLUMN, b"m", b"n").expect("delete");
     store.put(COLUMN, b"zz", b"value").expect("put");
     let cover_segment = hold(&volume.claims).open[0].number;
-    volume.is_walk_held.store(true, Ordering::Release);
+    volume.holds.walk.store(true, Ordering::Release);
     store.seal_now();
     settle(&io);
 

@@ -885,7 +885,7 @@ impl<Backend: Io> WalkJob<Backend> {
         if self.apply.segment.is_some() {
             return self.step_apply(volume, now);
         }
-        if self.target.is_none() && volume.is_walk_held.load(Ordering::Acquire) {
+        if self.target.is_none() && volume.is_walk_held() {
             return UnitStep::Idle;
         }
         // the walk once stood aside here while any rewrite ran. A rewrite's held bits take the walk's charges on its inputs now,

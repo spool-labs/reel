@@ -14,6 +14,8 @@ io-uring = "0.7"
 
 [dev-dependencies]
 libc.workspace = true
+# the tests reach the hooks whatever the command line says
+reel = { path = ".", features = ["test-hooks"] }
 reel-sim.workspace = true
 
 [lints]

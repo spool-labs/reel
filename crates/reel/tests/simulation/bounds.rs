@@ -100,15 +100,15 @@ fn most_inputs_of_widest_keys() {
     let io = SimulatedIo::new(Seed(91));
     let store = ReelStore::open(io.clone(), &config()).expect("open");
     let volume = &store.state.volumes[0];
-    volume.is_compaction_held.store(true, Ordering::Release);
-    volume.is_walk_held.store(true, Ordering::Release);
+    volume.holds.compaction.store(true, Ordering::Release);
+    volume.holds.walk.store(true, Ordering::Release);
     for number in 0..PILE {
         for key in 0..WIDE_KEYS {
             store.put(COLUMN, &wide_key(b'k', key), &number.to_le_bytes()).expect("put");
         }
         seal(&store, &io);
     }
-    volume.is_compaction_held.store(false, Ordering::Release);
+    volume.holds.compaction.store(false, Ordering::Release);
 
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
     assert!(job.rewrite.start(), "no merge started");
@@ -118,7 +118,7 @@ fn most_inputs_of_widest_keys() {
     }
     assert!(store.state.volumes[0].segments_rewritten.load(Ordering::Acquire) > 0);
     drop(job);
-    volume.is_walk_held.store(false, Ordering::Release);
+    volume.holds.walk.store(false, Ordering::Release);
     store.state.ask_compaction();
     settle(&io);
     let mut buf = Vec::new();
@@ -162,8 +162,8 @@ fn widest_records() {
     let io = SimulatedIo::new(Seed(93));
     let store = ReelStore::open(io.clone(), &config()).expect("open");
     let volume = &store.state.volumes[0];
-    volume.is_compaction_held.store(true, Ordering::Release);
-    volume.is_walk_held.store(true, Ordering::Release);
+    volume.holds.compaction.store(true, Ordering::Release);
+    volume.holds.walk.store(true, Ordering::Release);
     let value = vec![7; WIDE_VALUE_BYTES];
     for number in 0..PILE {
         store.put(COLUMN, &wide_key(b'a', number), &value).expect("put");
@@ -171,7 +171,7 @@ fn widest_records() {
         store.put(COLUMN, &wide_key(b'z', number), &value).expect("put");
         seal(&store, &io);
     }
-    volume.is_compaction_held.store(false, Ordering::Release);
+    volume.holds.compaction.store(false, Ordering::Release);
 
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
     assert!(job.rewrite.start(), "no merge started");
@@ -180,7 +180,7 @@ fn widest_records() {
     }
     assert!(volume.segments_rewritten.load(Ordering::Acquire) > 0);
     drop(job);
-    volume.is_walk_held.store(false, Ordering::Release);
+    volume.holds.walk.store(false, Ordering::Release);
     store.state.ask_compaction();
     settle(&io);
     let mut buf = Vec::new();

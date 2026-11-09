@@ -51,6 +51,8 @@ use crate::engine::planner::Planner;
 use crate::engine::walk_job::{BlockCounter, WalkJob, WalkSlot, WalkWorker};
 use crate::engine::workers::Workers;
 use crate::engine::volume::{SealStepTimes, ClaimState, GaveUp, MOST_MERGE_OUTPUTS, MOST_PARKED, NO_SEAL, RewriteLane, SyncState, Volume};
+#[cfg(feature = "test-hooks")]
+use crate::engine::volume::TestHolds;
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
 use crate::engine::complete_image::ImageFiles;
@@ -1151,7 +1153,8 @@ pub fn build_state<Backend: Io>(
             walks_waiting: AtomicU64::new(0),
             wants_compaction: AtomicBool::new(true),
             has_kept_covers: AtomicBool::new(false),
-            is_compaction_held: AtomicBool::new(false),
+            #[cfg(feature = "test-hooks")]
+            holds: TestHolds::default(),
             is_seal_stuck: AtomicBool::new(false),
             seal_stops: AtomicU64::new(0),
             disk_bytes: disks.get(index).copied().flatten(),
@@ -1213,9 +1216,6 @@ pub fn build_state<Backend: Io>(
             reclaim_retries: AtomicU64::new(0),
             has_walk_target: AtomicBool::new(false),
             walk_segment: AtomicU64::new(NO_SEAL),
-            is_walk_held: AtomicBool::new(false),
-            is_reclaim_held: AtomicBool::new(false),
-            is_rebuild_held: AtomicBool::new(false),
             is_applying: AtomicBool::new(false),
             claim_lock: Mutex::new(()),
             claims_changed: AtomicU64::new(0),

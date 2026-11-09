@@ -67,7 +67,7 @@ fn open(io: &SimulatedIo) -> Store2 {
     let store = ReelStore::open(io.clone(), &config).expect("open");
     // these segments keep the few dead rows they were built with
     for volume in &store.state.volumes {
-        volume.is_reclaim_held.store(true, Ordering::Release);
+        volume.holds.reclaim.store(true, Ordering::Release);
     }
     store
 }
@@ -295,7 +295,7 @@ fn write_older(store: &Store2, io: &SimulatedIo) -> SegmentNumber {
 }
 
 fn release_compaction(store: &Store2, io: &SimulatedIo) {
-    store.state.volumes[1].is_compaction_held.store(false, Ordering::Release);
+    store.state.volumes[1].holds.compaction.store(false, Ordering::Release);
     store.state.ask_compaction();
     settle(io);
 }
@@ -346,7 +346,7 @@ fn second_point_keeps_a_row() {
     let io = SimulatedIo::new(Seed(11));
     let store = open(&io);
     let meta = &store.state.volumes[1];
-    meta.is_compaction_held.store(true, Ordering::Release);
+    meta.holds.compaction.store(true, Ordering::Release);
     let older = write_older(&store, &io);
     for key in [&b"b"[..], b"c", b"d"] {
         store.put(META, key, b"second").expect("put");
@@ -371,7 +371,7 @@ fn first_point_keeps_no_row() {
     let io = SimulatedIo::new(Seed(12));
     let store = open(&io);
     let meta = &store.state.volumes[1];
-    meta.is_compaction_held.store(true, Ordering::Release);
+    meta.holds.compaction.store(true, Ordering::Release);
     let older = write_older(&store, &io);
     let cue = cue_past_rows(&store, &[b"a", b"b", b"c", b"d"], b"second");
     seal_meta(&store, &io);

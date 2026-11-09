@@ -64,7 +64,7 @@ fn open(io: &SimulatedIo) -> Store {
     let store = ReelStore::open(io.clone(), &config).expect("open");
     // these segments keep the few dead rows they were built with
     for volume in &store.state.volumes {
-        volume.is_reclaim_held.store(true, Ordering::Release);
+        volume.holds.reclaim.store(true, Ordering::Release);
     }
     store
 }
@@ -205,7 +205,7 @@ fn unlink_crashes() {
 }
 
 fn hold_compaction(store: &Store) {
-    store.state.volumes[0].is_compaction_held.store(true, Ordering::Release);
+    store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
 }
 
 fn job(store: &Store) -> CompactJob<SimulatedIo> {
@@ -713,7 +713,7 @@ fn parked_crash() {
 }
 
 fn release_compaction(store: &Store) {
-    store.state.volumes[0].is_compaction_held.store(false, Ordering::Release);
+    store.state.volumes[0].holds.compaction.store(false, Ordering::Release);
 }
 
 // step for a while without asking the jobs to go quiet, since a parked file keeps its job coming back

@@ -188,7 +188,7 @@ fn no_allocations() {
     let store = ReelStore::open(io.clone(), &config()).expect("open");
     // the loop reads a span as damaged on every round, so no rebuild may clear it
     for volume in &store.state.volumes {
-        volume.is_rebuild_held.store(true, Ordering::Release);
+        volume.holds.rebuild.store(true, Ordering::Release);
     }
     let keys: Vec<Vec<u8>> = (0..KEYS).map(|number| format!("key-{number:06}").into_bytes()).collect();
     let small = vec![7; 100];

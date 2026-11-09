@@ -86,7 +86,7 @@ fn config(capacity: RowCount) -> StoreConfig {
 fn open(io: &SimulatedIo, capacity: RowCount) -> Store {
     let store = ReelStore::open(io.clone(), &config(capacity)).expect("open");
     // these segments keep the few dead rows they were built with
-    store.state.volumes[0].is_reclaim_held.store(true, Ordering::Release);
+    store.state.volumes[0].holds.reclaim.store(true, Ordering::Release);
     store
 }
 
@@ -604,7 +604,7 @@ fn rewrite_beside_a_newer_original() {
     let store = open(&io, CAPACITY);
     let volume = &store.state.volumes[0];
     io.hold_jobs("reel-planner", true);
-    volume.is_compaction_held.store(true, Ordering::Release);
+    volume.holds.compaction.store(true, Ordering::Release);
     store.put(COLUMN, b"key", b"older").expect("put");
     for number in 0..KEYS {
         store.put(COLUMN, &key(number), b"value").expect("put");
@@ -634,7 +634,7 @@ fn rewrite_beside_a_newer_original() {
     let slots = slots_of(&store, b"key");
     assert!(slots.iter().any(|slot| slot.segment_number() > newest), "{slots:?}");
     assert_eq!(read(&store, b"key"), Some(b"newest".to_vec()));
-    volume.is_compaction_held.store(false, Ordering::Release);
+    volume.holds.compaction.store(false, Ordering::Release);
     io.hold_jobs("reel-planner", false);
     store.close().expect("close");
 }
@@ -795,7 +795,7 @@ fn output_slots_outlast_a_rewrite_in_flight() {
     let io = SimulatedIo::new(Seed(23));
     let store = open(&io, RowCount(OUTPUT_ROOM));
     let volume = &store.state.volumes[0];
-    volume.is_compaction_held.store(true, Ordering::Release);
+    volume.holds.compaction.store(true, Ordering::Release);
     for number in 0..OUTPUT_KEYS {
         store.put(COLUMN, &key(number), b"first").expect("put");
     }
@@ -835,7 +835,7 @@ fn output_slots_outlast_a_rewrite_in_flight() {
         let expected: &[u8] = if number % 3 == 2 { b"first" } else { b"second" };
         assert_eq!(read(&store, &key(number)).as_deref(), Some(expected), "key {number}");
     }
-    volume.is_compaction_held.store(false, Ordering::Release);
+    volume.holds.compaction.store(false, Ordering::Release);
     store.close().expect("close");
 }
 
@@ -854,7 +854,7 @@ fn mark_clears_once_room_returns() {
     let store = open(&io, RowCount(2 * KEYS));
     let volume = &store.state.volumes[0];
     let table = store.state.complete_table(COLUMN).expect("a table");
-    volume.is_walk_held.store(true, Ordering::Release);
+    volume.holds.walk.store(true, Ordering::Release);
     for round in 0..3 {
         for number in 0..KEYS {
             store.put(COLUMN, &key(number), format!("round-{round}").as_bytes()).expect("put");
@@ -863,7 +863,7 @@ fn mark_clears_once_room_returns() {
     }
     assert!(table.mark().is_some(), "three versions of every key fit a table sized for two");
 
-    volume.is_walk_held.store(false, Ordering::Release);
+    volume.holds.walk.store(false, Ordering::Release);
     store.state.ask_compaction();
     for _step in 0..KEYS {
         if table.mark().is_none() {

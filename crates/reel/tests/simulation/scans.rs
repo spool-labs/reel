@@ -90,7 +90,7 @@ fn seal(store: &Store, io: &SimulatedIo) {
 }
 
 fn hold_compaction(store: &Store, is_held: bool) {
-    store.state.volumes[0].is_compaction_held.store(is_held, Ordering::Release);
+    store.state.volumes[0].holds.compaction.store(is_held, Ordering::Release);
     store.state.ask_compaction();
 }
 

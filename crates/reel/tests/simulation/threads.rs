@@ -169,7 +169,7 @@ fn most_rewrites_at_once(device: DeviceClass) -> usize {
     let threads = ThreadCounts { maintenance_workers: Some(3), ..ThreadCounts::default() };
     let store: Store = ReelStore::open(io.clone(), &config_on(threads, device)).expect("open");
     let volume = &store.state.volumes[0];
-    volume.is_compaction_held.store(true, Ordering::Release);
+    volume.holds.compaction.store(true, Ordering::Release);
     for round in 0..DEAD_SEGMENTS {
         for number in 0..KEYS {
             store.put(COLUMN, format!("key-{round}-{number:04}").as_bytes(), b"first").expect("put");
@@ -187,7 +187,7 @@ fn most_rewrites_at_once(device: DeviceClass) -> usize {
     settle(&io);
     cool(&store, &io);
 
-    volume.is_compaction_held.store(false, Ordering::Release);
+    volume.holds.compaction.store(false, Ordering::Release);
     store.state.ask_compaction();
     let mut most = 0;
     for _step in 0..STEPS {

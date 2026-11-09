@@ -127,7 +127,7 @@ fn read(store: &Store, key: &[u8]) -> Option<Vec<u8>> {
 
 // the segment keeps the few dead rows it was built with
 fn hold_reclaim(store: &Store) {
-    store.state.volumes[0].is_reclaim_held.store(true, Ordering::Release);
+    store.state.volumes[0].holds.reclaim.store(true, Ordering::Release);
 }
 
 fn has_file(io: &SimulatedIo, number: SegmentNumber) -> bool {
@@ -162,7 +162,7 @@ fn start_merge(job: &mut CompactJob<SimulatedIo>) -> bool {
 }
 
 fn hold_compaction(store: &Store, is_held: bool) {
-    store.state.volumes[0].is_compaction_held.store(is_held, Ordering::Release);
+    store.state.volumes[0].holds.compaction.store(is_held, Ordering::Release);
 }
 
 // write every key, seal, then write all but the last again: the first segment is mostly dead with one live row
@@ -1352,7 +1352,7 @@ fn fill_park(store: &Store, stand_in: &SegmentNumber, count: usize) {
 }
 
 fn hold_walk(store: &Store, is_held: bool) {
-    store.state.volumes[0].is_walk_held.store(is_held, Ordering::Release);
+    store.state.volumes[0].holds.walk.store(is_held, Ordering::Release);
     store.state.ask_compaction();
 }
 

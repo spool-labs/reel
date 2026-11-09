@@ -255,8 +255,16 @@ impl IoFile for SimulatedFile {
 
     fn free_range(&self, offset: FileOffset, length: ByteCount) -> Result<()> {
         let _pause = CountPause::new();
-        let zeros = vec![0; length.0 as usize];
-        self.write_at(offset, &[IoSlice::new(&zeros)])?;
+        // a punched hole keeps the file's size, so zeros go only where the file reaches
+        let reach = {
+            let disk = hold(&self.disk);
+            disk.inodes.get(&self.inode).map_or(0, |image| image.visible.len() as u64)
+        };
+        let end = (offset.0 + length.0).min(reach);
+        if end > offset.0 {
+            let zeros = vec![0; (end - offset.0) as usize];
+            self.write_at(offset, &[IoSlice::new(&zeros)])?;
+        }
         let mut disk = hold(&self.disk);
         let newly = match disk.inodes.get_mut(&self.inode) {
             Some(image) => image.note_freed(offset, length),

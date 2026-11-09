@@ -1612,6 +1612,8 @@ impl<Backend: Io> RewriteJob<Backend> {
             self.outputs_end = [0; MOST_MERGE_OUTPUTS];
             self.placing_input = 0;
             self.stripe.clear();
+            // a pass given up partway through a copy leaves its place in the stripe, which would skip a whole input here
+            self.stripe_copied = None;
             self.phase = RewritePhase::Placing;
         }
         Ok(())

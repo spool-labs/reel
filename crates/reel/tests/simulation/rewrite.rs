@@ -3075,3 +3075,32 @@ fn overlap_cut_stays_under_the_row_blocks() {
     }
     store.close().expect("close");
 }
+
+// a walk with a floor asks only the segments with a row above it, and the newest of those still answers
+#[test]
+fn floor_skips_older_segments() {
+    let io = SimulatedIo::new(Seed(91));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    for round in 0..4 {
+        store.put(COLUMN, b"key", format!("value-{round}").as_bytes()).expect("put");
+        seal(&store, &io);
+    }
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    let directory = state.directories[COLUMN.0 as usize].as_ref().expect("a directory");
+    let newest = state.newest_walked(volume, COLUMN, b"key", &[], None).expect("walk").expect("a row");
+    let second = state.newest_walked(volume, COLUMN, b"key", &[newest.segment], None).expect("walk").expect("a row");
+
+    let mut reader = FooterReader::new();
+    let read = state.key_read_now(COLUMN, b"key").expect("read");
+    let ask = WalkAsk { skipped: &[newest.segment], is_finished_only: true, above: Some(second.row.place), ..WalkAsk::EVERY };
+    let found = in_place(state.walk_candidates(&InPlace, volume, directory, &read, &mut reader, ask)).expect("walk");
+    assert_eq!(found, None, "nothing outside lies above the second newest row");
+    assert_eq!(reader.asked, 0, "every segment left has nothing above the floor");
+
+    let ask = WalkAsk { skipped: &[], ..ask };
+    let found = in_place(state.walk_candidates(&InPlace, volume, directory, &read, &mut reader, ask)).expect("walk").expect("a row");
+    assert_eq!((found.segment, reader.asked), (newest.segment, 1));
+    store.close().expect("close");
+}

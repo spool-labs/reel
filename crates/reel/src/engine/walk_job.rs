@@ -445,7 +445,7 @@ impl<Backend: Io> BlockCounter<Backend> {
 
             self.last_key.set_from(&self.key)?;
             self.last_column = Some(block.column);
-            let found = self.state.newest_walked(volume, block.column, &self.key, &[target.segment]);
+            let found = self.state.newest_walked(volume, block.column, &self.key, &[target.segment], None);
             let newest = match found {
                 Ok(newest) => newest,
                 // a version a damaged block hides counts nothing, which only understates

@@ -89,6 +89,8 @@ pub struct WalkAsk<'list> {
     pub first: SegmentNumber,
     pub skipped: &'list [SegmentNumber],
     pub is_finished_only: bool,
+    /// Only a row above this place matters to the caller, so the walk stops at the first segment with nothing above it
+    pub above: Option<WritePlace>,
 }
 
 impl WalkAsk<'_> {
@@ -97,6 +99,7 @@ impl WalkAsk<'_> {
         first: SegmentNumber(0),
         skipped: &[],
         is_finished_only: false,
+        above: None,
     };
 }
 
@@ -716,18 +719,20 @@ impl<Backend: Io> EngineState<Backend> {
         Ok(newest_of(found.row, sealed).place().is_some())
     }
 
-    /// Find a key's newest row among the segments whose walks have finished, leaving out one segment and range rows
+    /// Find a key's newest row among the segments whose walks have finished, leaving out some segments and range rows. With a
+    /// place given, only a row above it is looked for
     pub fn newest_walked(
         &self,
         volume: &Volume<Backend>,
         column: ColumnId,
         key: &[u8],
         skipped: &[SegmentNumber],
+        above: Option<WritePlace>,
     ) -> Result<Option<SealedRow>, StoreError> {
         let read = self.key_read(column, key, WritePlace(u64::MAX), false)?;
         match self.complete_table(column) {
-            Some(table) => self.newest_walked_complete(volume, &read, table, skipped),
-            None => self.newest_walked_footers(volume, &read, skipped),
+            Some(table) => self.newest_walked_complete(volume, &read, table, skipped, above),
+            None => self.newest_walked_footers(volume, &read, skipped, above),
         }
     }
 
@@ -737,12 +742,13 @@ impl<Backend: Io> EngineState<Backend> {
         volume: &Volume<Backend>,
         read: &KeyRead<'_>,
         skipped: &[SegmentNumber],
+        above: Option<WritePlace>,
     ) -> Result<Option<SealedRow>, StoreError> {
         let Some(directory) = &self.directories[read.column.0 as usize] else {
             return Ok(None);
         };
         let mut reader = self.job_footer_readers.lease();
-        in_place(self.walk_candidates(&InPlace, volume, directory, read, &mut reader, WalkAsk { skipped, is_finished_only: true, ..WalkAsk::EVERY }))
+        in_place(self.walk_candidates(&InPlace, volume, directory, read, &mut reader, WalkAsk { skipped, is_finished_only: true, above, ..WalkAsk::EVERY }))
     }
 
     /// Ask a finished segment for a key's newest row that isn't a range delete, and keep it when it's the newest so far.
@@ -843,7 +849,8 @@ impl<Backend: Io> EngineState<Backend> {
 
             for index in first..reader.candidates.len() {
                 let candidate = reader.candidates[index];
-                if best.is_some_and(|row| row.row.place >= candidate.newest_place) {
+                // newest first, so past a segment with nothing above the floor no later one has anything either
+                if best.is_some_and(|row| row.row.place >= candidate.newest_place) || ask.above.is_some_and(|above| candidate.newest_place <= above) {
                     break;
                 }
                 if let Some(mark) = device.try_mark().filter(|_mark| skip == 0) {

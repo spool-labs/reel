@@ -162,11 +162,12 @@ impl<Backend: Io> EngineState<Backend> {
         read: &KeyRead<'_>,
         table: &CompleteTable,
         skipped: &[SegmentNumber],
+        above: Option<WritePlace>,
     ) -> Result<Option<SealedRow>, StoreError> {
         let mut matches = TagMatches::new();
         table.find(read.hash, &mut matches);
         if matches.slots().iter().any(CompleteSlot::is_sticky) {
-            return self.newest_walked_footers(volume, read, skipped);
+            return self.newest_walked_footers(volume, read, skipped, above);
         }
         self.job_footer_readers.with(|reader| {
             let mut best = None;
@@ -178,7 +179,7 @@ impl<Backend: Io> EngineState<Backend> {
             let (Some(mark), Some(directory)) = (table.mark(), &self.directories[read.column.0 as usize]) else {
                 return Ok(best);
             };
-            let ask = WalkAsk { first: mark, skipped, is_finished_only: true };
+            let ask = WalkAsk { first: mark, skipped, is_finished_only: true, above };
             let marked = in_place(self.walk_candidates(&InPlace, volume, directory, read, reader, ask))?;
             Ok(newest_sealed(best, marked))
         })

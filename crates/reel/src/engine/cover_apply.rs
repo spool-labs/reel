@@ -264,7 +264,7 @@ impl<Backend: Io> CoverApply<Backend> {
         column: ColumnId,
     ) -> std::result::Result<Option<SealedRow>, StoreError> {
         let state = &self.state;
-        let walked = state.newest_walked(volume, column, &self.key, &[])?;
+        let walked = state.newest_walked(volume, column, &self.key, &[], None)?;
         let Some(segment) = self.segment else {
             return Ok(walked);
         };

@@ -483,7 +483,7 @@ impl<Backend: Io> CompactJob<Backend> {
             if row.kind != RowKind::Value || row.length < FREE_IN_PLACE_BYTES {
                 continue;
             }
-            let newest = match self.state.newest_walked(volume, block.column, &self.key, &[pass.segment]) {
+            let newest = match self.state.newest_walked(volume, block.column, &self.key, &[pass.segment], None) {
                 Ok(newest) => newest,
                 Err(StoreError::Corruption { .. }) => None,
                 Err(_error) => return Err(Error::from(ErrorKind::Interrupted)),

@@ -317,7 +317,8 @@ impl<Backend: Io> RewriteJob<Backend> {
         Ok(own.max(self.newest_place).max(self.cover_place).filter(|place| *place > row.place))
     }
 
-    /// Find a key's newest row in a finished segment outside the merge
+    /// Find a key's newest row in a finished segment outside the merge, above its top row here. One below that replaces nothing
+    /// the top row doesn't, so the segments with nothing above it go unasked
     pub fn newest_outside(
         &self,
         volume: &Volume<Backend>,
@@ -326,7 +327,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         if self.is_unwalked {
             return Ok(None);
         }
-        self.state.newest_walked(volume, column, &self.key, &self.numbers[..self.input_count])
+        self.state.newest_walked(volume, column, &self.key, &self.numbers[..self.input_count], Some(self.top_place))
     }
 
     /// Check a replaced row can go: no live cue sits at or above it and below its newest replacement

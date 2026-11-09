@@ -1,0 +1,59 @@
+[package]
+name = "reel-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+reel = { path = "../crates/reel", features = ["test-hooks"] }
+reel-api = { path = "../crates/reel-api" }
+
+# its own workspace, so the fuzz build's sanitizer flags stay out of the store's
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "row_group_head"
+path = "fuzz_targets/row_group_head.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "row_block"
+path = "fuzz_targets/row_block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_entry"
+path = "fuzz_targets/block_entry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "segment_tail"
+path = "fuzz_targets/segment_tail.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "record"
+path = "fuzz_targets/record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "superblock"
+path = "fuzz_targets/superblock.rs"
+test = false
+doc = false
+bench = false

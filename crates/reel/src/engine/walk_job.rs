@@ -640,9 +640,13 @@ impl<Backend: Io> WalkJob<Backend> {
         self.counts = counts;
         match landing? {
             Landing::Landed => self.end_claim_wait(volume, state.io.now()),
-            // the next step counts the block again
-            Landing::Stale => {},
-            Landing::Waiting => self.note_claim_wait(volume, started),
+            // the next step counts the block again, and the key it remembers is this block's last, which would make the block's
+            // first row look like an older version of it
+            Landing::Stale => self.counter.last_column = None,
+            Landing::Waiting => {
+                self.counter.last_column = None;
+                self.note_claim_wait(volume, started);
+            },
         }
         Ok(())
     }

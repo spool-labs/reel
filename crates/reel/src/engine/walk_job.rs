@@ -22,7 +22,6 @@ use crate::config::{MAX_KEY_BYTES, MOST_VOLUME_SLOTS};
 use crate::engine::held_bits::HeldRow;
 use crate::engine::cover_apply::{ApplyStep, CoverApply};
 use crate::engine::engine_state::EngineState;
-use crate::engine::planner::UnitStep;
 use crate::engine::rewrite_job::{RewriteJob, RewriteSeat};
 use crate::engine::workers::Workers;
 use crate::engine::volume::{NO_SEAL, Volume};
@@ -742,19 +741,19 @@ impl<Backend: Io> WalkJob<Backend> {
     }
 
     /// Take one step of a target's covers, and end the target with the last
-    pub fn step_apply(&mut self, volume: &Volume<Backend>, now: Nanoseconds) -> UnitStep {
+    pub fn step_apply(&mut self, volume: &Volume<Backend>, now: Nanoseconds) -> JobStep {
         let Some(target) = self.target else {
-            return UnitStep::Idle;
+            return JobStep::Idle;
         };
         let started = self.state.io.now();
         let applied = self.apply.step();
         self.state.note_unit(UnitKind::CoverApply, 1, started);
         match applied {
-            Ok(ApplyStep::Working) => UnitStep::Worked,
+            Ok(ApplyStep::Working) => JobStep::Worked,
             Ok(ApplyStep::Done) => {
                 self.end_apply(volume, target.segment);
                 match self.finish_target(volume, target.segment) {
-                    Ok(()) => UnitStep::Worked,
+                    Ok(()) => JobStep::Worked,
                     Err(_) => self.wait_for_retry(now),
                 }
             },
@@ -818,7 +817,7 @@ impl<Backend: Io> WalkJob<Backend> {
     }
 
     /// Land the next block once its worker has counted it, in block order, and let go of what an ended target left behind
-    pub fn step_slots(&mut self, volume: &Volume<Backend>, target: WalkTarget, now: Nanoseconds) -> UnitStep {
+    pub fn step_slots(&mut self, volume: &Volume<Backend>, target: WalkTarget, now: Nanoseconds) -> JobStep {
         self.hand_out(volume, target);
         for (index, slot) in volume.walk_slots.iter().enumerate() {
             let phase = slot.phase.load(Ordering::Acquire);
@@ -844,11 +843,11 @@ impl<Backend: Io> WalkJob<Backend> {
             if phase == SLOT_CLAIMED {
                 drop(work);
                 if self.waiting_on == Some(volume.claims_changed.load(Ordering::Acquire)) {
-                    return UnitStep::Idle;
+                    return JobStep::Idle;
                 }
                 self.end_claim_wait(volume, now);
                 assign(&self.state.workers, slot);
-                return UnitStep::Worked;
+                return JobStep::Worked;
             }
 
             let next_block = work.next_block;
@@ -858,16 +857,16 @@ impl<Backend: Io> WalkJob<Backend> {
                 Ok(Landing::Landed) => {
                     slot.phase.store(SLOT_FREE, Ordering::Release);
                     self.end_claim_wait(volume, now);
-                    UnitStep::Worked
+                    JobStep::Worked
                 },
                 Ok(Landing::Stale) => {
                     assign(&self.state.workers, slot);
-                    UnitStep::Worked
+                    JobStep::Worked
                 },
                 Ok(Landing::Waiting) => {
                     slot.phase.store(SLOT_CLAIMED, Ordering::Release);
                     self.note_claim_wait(volume, now);
-                    UnitStep::Idle
+                    JobStep::Idle
                 },
                 Err(_) => {
                     slot.phase.store(SLOT_FREE, Ordering::Release);
@@ -875,25 +874,25 @@ impl<Backend: Io> WalkJob<Backend> {
                 },
             };
         }
-        UnitStep::Idle
+        JobStep::Idle
     }
 
     /// Come back after the retry wait
-    pub fn wait_for_retry(&mut self, now: Nanoseconds) -> UnitStep {
+    pub fn wait_for_retry(&mut self, now: Nanoseconds) -> JobStep {
         let at = Nanoseconds(now.0 + WALK_RETRY.0);
         self.retry_at = Some(at);
-        UnitStep::RetryAt(at)
+        JobStep::IdleUntil { deadline: at }
     }
 
     /// Step this volume's walk once: one row block, or nothing when no segment waits or a failed read's wait isn't over
-    pub fn step_unit(&mut self, now: Nanoseconds) -> UnitStep {
+    pub fn step_unit(&mut self, now: Nanoseconds) -> JobStep {
         let state = Arc::clone(&self.state);
         let volume = &state.volumes[self.volume];
         if volume.has_failed() {
-            return UnitStep::Idle;
+            return JobStep::Idle;
         }
         if let Some(at) = self.retry_at.filter(|at| at.0 > now.0) {
-            return UnitStep::RetryAt(at);
+            return JobStep::IdleUntil { deadline: at };
         }
         self.retry_at = None;
         self.free_waiting(volume);
@@ -908,7 +907,7 @@ impl<Backend: Io> WalkJob<Backend> {
             return self.step_apply(volume, now);
         }
         if self.target.is_none() && volume.is_walk_held() {
-            return UnitStep::Idle;
+            return JobStep::Idle;
         }
         // the walk once stood aside here while any rewrite ran. A rewrite's held bits take the walk's charges on its inputs now,
         // and the count stays for the figure the hold gave
@@ -916,10 +915,10 @@ impl<Backend: Io> WalkJob<Backend> {
             volume.walks_held.fetch_add(1, Ordering::Relaxed);
         }
         if self.target.is_none() && !self.pick_target() {
-            return UnitStep::Idle;
+            return JobStep::Idle;
         }
         let Some(target) = self.target else {
-            return UnitStep::Idle;
+            return JobStep::Idle;
         };
         if !self.ensure_region(volume) {
             return self.wait_for_retry(now);
@@ -929,11 +928,11 @@ impl<Backend: Io> WalkJob<Backend> {
         }
         // a block that waits on a rewrite's release counts again once the claims change
         if self.is_waiting(volume) {
-            return UnitStep::Idle;
+            return JobStep::Idle;
         }
         match self.walk_block(target) {
-            Ok(()) if self.is_waiting(volume) => UnitStep::Idle,
-            Ok(()) => UnitStep::Worked,
+            Ok(()) if self.is_waiting(volume) => JobStep::Idle,
+            Ok(()) => JobStep::Worked,
             Err(_) => self.wait_for_retry(now),
         }
     }

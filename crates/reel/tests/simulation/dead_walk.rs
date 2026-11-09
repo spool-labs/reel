@@ -10,7 +10,7 @@ use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig
 use reel::engine::compact_job::CompactJob;
 use reel::engine::engine_state::IndexWait;
 use reel::engine::open_segment::SegmentPhase;
-use reel::engine::planner::{Planner, WALK_LAG_SEGMENTS, UnitStep};
+use reel::engine::planner::{Planner, WALK_LAG_SEGMENTS};
 use reel::engine::reel_store::ReelStore;
 use reel::engine::held_bits::HeldBits;
 use reel::fixed_list::FixedList;
@@ -728,7 +728,7 @@ fn blocks_land_in_order() {
     drop(work);
     slot.phase.store(SLOT_COUNTED, Ordering::Release);
 
-    assert_eq!(job.step_unit(Nanoseconds(0)), UnitStep::Idle);
+    assert_eq!(job.step_unit(Nanoseconds(0)), JobStep::Idle);
     assert_eq!(job.target, Some(target));
     assert_eq!(slot.phase.load(Ordering::Acquire), SLOT_COUNTED);
     drop(job);
@@ -751,7 +751,7 @@ fn stale_slot_comes_free() {
     };
     slot.phase.store(SLOT_COUNTED, Ordering::Release);
 
-    assert_eq!(job.step_unit(Nanoseconds(0)), UnitStep::Idle);
+    assert_eq!(job.step_unit(Nanoseconds(0)), JobStep::Idle);
     assert_eq!(job.target, Some(target));
     assert_ne!(slot.phase.load(Ordering::Acquire), SLOT_COUNTED);
     drop(job);
@@ -915,10 +915,10 @@ fn recounted_block_lands_once() {
     }
     assert_eq!(merge.rewrite.input_numbers(), [older]);
     let blocks = volume.walk_blocks.load(Ordering::Relaxed);
-    assert_eq!(job.step_unit(io.clock_reading()), UnitStep::Worked);
+    assert_eq!(job.step_unit(io.clock_reading()), JobStep::Worked);
     assert_eq!(volume.walk_blocks.load(Ordering::Relaxed), blocks, "a block counted before the hold landed");
     count_slots(&io);
-    assert_eq!(job.step_unit(io.clock_reading()), UnitStep::Worked);
+    assert_eq!(job.step_unit(io.clock_reading()), JobStep::Worked);
     assert_eq!(volume.walk_blocks.load(Ordering::Relaxed), blocks + 1);
     assert_eq!(hold(&volume.lanes[0].held).marked, 1);
 
@@ -951,16 +951,16 @@ fn waiting_block_marks_no_lane() {
     let mut job = WalkJob::new(state.clone(), 0);
     job.step_unit(io.clock_reading());
     count_slots(&io);
-    assert_eq!(job.step_unit(io.clock_reading()), UnitStep::Idle);
+    assert_eq!(job.step_unit(io.clock_reading()), JobStep::Idle);
     assert_eq!(hold(&volume.lanes[1].held).marked, 0, "a waiting block marked a lane");
     assert_eq!(volume.walk_blocks.load(Ordering::Relaxed), blocks, "a waiting block landed its counts");
     assert_eq!(volume.walk_claim_waits.load(Ordering::Relaxed), 1);
-    assert_eq!(job.step_unit(io.clock_reading()), UnitStep::Idle, "a wait counted again before the release");
+    assert_eq!(job.step_unit(io.clock_reading()), JobStep::Idle, "a wait counted again before the release");
 
     release_lane(&store, 2);
-    assert_eq!(job.step_unit(io.clock_reading()), UnitStep::Worked);
+    assert_eq!(job.step_unit(io.clock_reading()), JobStep::Worked);
     count_slots(&io);
-    assert_eq!(job.step_unit(io.clock_reading()), UnitStep::Worked);
+    assert_eq!(job.step_unit(io.clock_reading()), JobStep::Worked);
     assert_eq!(volume.walk_blocks.load(Ordering::Relaxed), blocks + 1);
     assert_eq!(hold(&volume.lanes[1].held).marked, 1);
     assert_eq!(dead_rows_of(&store, older), older_dead + 1);
@@ -1004,7 +1004,7 @@ fn claim_waits_for_a_landing_block() {
         thread::sleep(BEGIN_WAIT);
         assert!(!volume.lanes[0].is_holding.load(Ordering::Acquire), "a rewrite began holding inside a landing");
         drop(summary);
-        assert_eq!(landing.join().expect("landing"), UnitStep::Worked);
+        assert_eq!(landing.join().expect("landing"), JobStep::Worked);
         assert!(begin.join().expect("begin"));
     });
     assert_eq!(volume.walk_blocks.load(Ordering::Relaxed), blocks + 1);
@@ -1041,7 +1041,7 @@ fn free_on_a_claimed_segment_is_dropped() {
     let freed = volume.bytes_freed.load(Ordering::Acquire);
 
     let mut job = WalkJob::new(state.clone(), 0);
-    assert_eq!(job.step_unit(io.clock_reading()), UnitStep::Worked);
+    assert_eq!(job.step_unit(io.clock_reading()), JobStep::Worked);
     assert_eq!(dead_rows_of(&store, older), 1);
     assert_eq!(volume.bytes_freed.load(Ordering::Acquire), freed, "a free cut a record a rewrite claimed");
     hold(&volume.lanes[0].inputs)[0] = SegmentNumber(0);

@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::compact_job::CompactJob;
 use reel::engine::open_segment::data_path;
-use reel::engine::planner::UnitStep;
+use reel::io::job::JobStep;
 use reel::engine::complete_image::IMAGE_HEAD_BYTES;
 use reel::engine::read_path::RecordWant;
 use reel::engine::reel_store::ReelStore;
@@ -591,7 +591,7 @@ fn grave_outlives_its_older_row() {
 fn walk_all(store: &Store, now: Nanoseconds) {
     let mut walk = WalkJob::new(Arc::clone(&store.state), 0);
     for _step in 0..STEPS {
-        if walk.step_unit(now) == UnitStep::Idle {
+        if walk.step_unit(now) == JobStep::Idle {
             return;
         }
     }

@@ -28,17 +28,6 @@ pub const WRITER_YIELD: Nanoseconds = Nanoseconds(200_000);
 /// the seals still falls behind while ingest lasts
 pub const WALK_LAG_SEGMENTS: u64 = 8;
 
-/// What one step of a unit found
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum UnitStep {
-    /// It did a bounded piece of work
-    Worked,
-    /// It has nothing to do
-    Idle,
-    /// It failed, and can try again at this clock reading
-    RetryAt(Nanoseconds),
-}
-
 /// Every volume's units and whose turn it is
 pub struct Planner<Backend: Io> {
     pub state: Arc<EngineState<Backend>>,
@@ -71,14 +60,14 @@ impl<Backend: Io> Planner<Backend> {
     }
 
     /// Note what a unit's step found, and say whether it worked
-    pub fn note_step(&mut self, index: usize, step: UnitStep, soonest: &mut Option<Nanoseconds>) -> bool {
+    pub fn note_step(&mut self, index: usize, step: JobStep, soonest: &mut Option<Nanoseconds>) -> bool {
         match step {
-            UnitStep::Worked => {
+            JobStep::Worked => {
                 self.last = index;
                 return true;
             },
-            UnitStep::Idle => {},
-            UnitStep::RetryAt(at) => *soonest = Some(soonest.map_or(at, |other| Nanoseconds(other.0.min(at.0)))),
+            JobStep::Idle | JobStep::Finished => {},
+            JobStep::IdleUntil { deadline: at } => *soonest = Some(soonest.map_or(at, |other| Nanoseconds(other.0.min(at.0)))),
         }
         false
     }

@@ -21,13 +21,12 @@ use crate::config::MAX_KEY_BYTES;
 use crate::engine::complete_path::{REFILL_STEP_BLOCKS, Refill};
 use crate::engine::cover_apply::is_in_range;
 use crate::engine::engine_state::EngineState;
-use crate::engine::planner::UnitStep;
 use crate::engine::rewrite_job::{PLANNER_LANE, RewriteJob, RewriteSeat, is_reclaim_due};
 use crate::engine::rebuild::MOST_REBUILD_TRIES;
 use crate::engine::volume::{ParkedSegment, Volume};
 use crate::engine::walk_job::{FREE_IN_PLACE_BYTES, FreeRecord, WALK_RETRY};
 use crate::guard::hold;
-use crate::io::device_error::is_device_error;
+use crate::io::device_error::is_device_error; use crate::io::job::JobStep;
 use crate::io::{InPlace, Io, IoFile, in_place};
 use crate::fixed_list::FixedList;
 use crate::index::complete_table::{COMPLETE_SHARDS, CompleteTable, SWEEP_STEP_BUCKETS};
@@ -182,11 +181,11 @@ impl<Backend: Io> CompactJob<Backend> {
     }
 
     /// Step once: try the next segment the counts call dead, or nothing when none is
-    pub fn step_unit(&mut self, now: Nanoseconds) -> UnitStep {
+    pub fn step_unit(&mut self, now: Nanoseconds) -> JobStep {
         let started = self.state.io.now();
         self.unit = None;
         let step = match self.step_work(now) {
-            UnitStep::Idle if self.has_parked() => UnitStep::RetryAt(Nanoseconds(now.0 + PARKED_RETRY.0)),
+            JobStep::Idle if self.has_parked() => JobStep::IdleUntil { deadline: Nanoseconds(now.0 + PARKED_RETRY.0) },
             step => step,
         };
         // a rewrite's step notes its own unit, the same on the planner and on a worker
@@ -218,14 +217,14 @@ impl<Backend: Io> CompactJob<Backend> {
     }
 
     /// Step once: a parked file no read holds any more, then the candidate work
-    pub fn step_work(&mut self, now: Nanoseconds) -> UnitStep {
+    pub fn step_work(&mut self, now: Nanoseconds) -> JobStep {
         let state = Arc::clone(&self.state);
         let volume = &state.volumes[self.volume];
         if volume.has_failed() || volume.is_compaction_held() {
-            return UnitStep::Idle;
+            return JobStep::Idle;
         }
         if let Some(at) = self.retry_at.filter(|at| at.0 > now.0) {
-            return UnitStep::RetryAt(at);
+            return JobStep::IdleUntil { deadline: at };
         }
         self.retry_at = None;
         if volume.stray_outputs.load(Ordering::Acquire) > 0 {
@@ -237,7 +236,7 @@ impl<Backend: Io> CompactJob<Backend> {
         if let Some(parked) = self.take_parked(volume) {
             self.unit = Some((UnitKind::ParkedClear, 1));
             return match state.clear_parked(volume, parked) {
-                Ok(()) => UnitStep::Worked,
+                Ok(()) => JobStep::Worked,
                 Err(parked) => {
                     park_again(volume, parked);
                     self.wait_for_retry(now)
@@ -245,39 +244,39 @@ impl<Backend: Io> CompactJob<Backend> {
             };
         }
         if self.step_refill() {
-            return UnitStep::Worked;
+            return JobStep::Worked;
         }
         if self.step_sweep() {
-            return UnitStep::Worked;
+            return JobStep::Worked;
         }
         // a live cue may still need what it kept, and its going brings the planner back
         if state.cues.is_empty() && volume.has_kept_covers.swap(false, Ordering::AcqRel) {
             self.unit = Some((UnitKind::CoverSweep, 0));
             self.sweep_covers(volume);
-            return UnitStep::Worked;
+            return JobStep::Worked;
         }
         if state.cues.is_empty() && volume.has_held_frees.load(Ordering::Acquire) {
             self.unit = Some((UnitKind::HeldFrees, 0));
             return match self.step_held_pass(volume) {
-                Ok(()) => UnitStep::Worked,
-                Err(_) => UnitStep::RetryAt(Nanoseconds(now.0 + WALK_RETRY.0)),
+                Ok(()) => JobStep::Worked,
+                Err(_) => JobStep::IdleUntil { deadline: Nanoseconds(now.0 + WALK_RETRY.0) },
             };
         }
         if self.confirm_pass.is_some() {
             self.unit = Some((UnitKind::UnlinkCheck, 0));
             return match self.step_confirm(volume) {
-                Ok(()) => UnitStep::Worked,
+                Ok(()) => JobStep::Worked,
                 Err(_) => self.wait_for_retry(now),
             };
         }
         self.hand_out_on_change(volume);
         if self.rewrite.is_running() {
             self.rewrite.step();
-            return UnitStep::Worked;
+            return JobStep::Worked;
         }
         self.unit = Some((UnitKind::Pick, 1));
         if self.start_rebuild(volume) {
-            return UnitStep::Worked;
+            return JobStep::Worked;
         }
         let is_asked = volume.wants_compaction.swap(false, Ordering::AcqRel);
         if is_asked {
@@ -286,7 +285,7 @@ impl<Backend: Io> CompactJob<Backend> {
             self.force_oldest(volume);
             // a settled cover asks again, and only a worked step brings the planner back to hear it
             if has_settled {
-                return UnitStep::Worked;
+                return JobStep::Worked;
             }
         }
         // an ask outlives the unlink steps below, as it outlived them before
@@ -298,7 +297,7 @@ impl<Backend: Io> CompactJob<Backend> {
                 return self.wait_for_retry(now);
             }
             if self.confirm_pass.is_some() {
-                return UnitStep::Worked;
+                return JobStep::Worked;
             }
         }
         // a quiet volume with dead bytes fills its idle time with reclaiming them, and one past the bound merges back first
@@ -316,18 +315,18 @@ impl<Backend: Io> CompactJob<Backend> {
         }
         // workers run every rewrite, so the planner stays free to pick and walk. A merge of 1 GiB segments would hold it for minutes
         if should_rewrite && (self.hand_out() || (self.seats.is_empty() && self.rewrite.start())) {
-            return UnitStep::Worked;
+            return JobStep::Worked;
         }
         // a look takes a few segments at a time, and the rest still count. Hot ingest looks at none
         self.should_rewrite = should_rewrite && !is_deferring && self.rewrite.has_looks_left;
         if self.should_rewrite {
-            return UnitStep::Worked;
+            return JobStep::Worked;
         }
         // what hot ingest or arriving writes put off starts once the window closes
         if is_deferring || is_holding_records {
-            return UnitStep::RetryAt(volume.hot_until());
+            return JobStep::IdleUntil { deadline: volume.hot_until() };
         }
-        UnitStep::Idle
+        JobStep::Idle
     }
 
     /// Clear one step's buckets of slots that point at gone segments, once enough may, and say whether a step ran
@@ -435,10 +434,10 @@ impl<Backend: Io> CompactJob<Backend> {
     }
 
     /// Come back after the retry wait
-    pub fn wait_for_retry(&mut self, now: Nanoseconds) -> UnitStep {
+    pub fn wait_for_retry(&mut self, now: Nanoseconds) -> JobStep {
         let at = Nanoseconds(now.0 + WALK_RETRY.0);
         self.retry_at = Some(at);
-        UnitStep::RetryAt(at)
+        JobStep::IdleUntil { deadline: at }
     }
 
     /// Take a parked segment no read holds any more

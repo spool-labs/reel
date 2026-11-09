@@ -10,7 +10,7 @@ use reel::segment::summary_orders::is_wholly_dead;
 use reel::engine::cue::MOST_CUES;
 use reel::engine::engine_sizing::COMPACT_JOB_BYTES;
 use reel::engine::open_segment::data_path;
-use reel::engine::planner::UnitStep;
+use reel::io::job::JobStep;
 use reel::engine::read_path::RecordWant;
 use reel::engine::reel_store::ReelStore;
 use reel::engine::walk_job::WALK_RETRY;
@@ -744,11 +744,11 @@ fn failed_save_keeps_file() {
     let mut job = job(&store);
     release_compaction(&store);
     io.fail_writes(OperationCount(1));
-    assert!(matches!(job.step_unit(Nanoseconds(0)), UnitStep::RetryAt(_)));
+    assert!(matches!(job.step_unit(Nanoseconds(0)), JobStep::IdleUntil { .. }));
     assert!(has_file(&io, older));
     assert_eq!(volume.segments_parked.load(Ordering::Acquire), 1);
 
-    assert_eq!(job.step_unit(AFTER_THE_RETRY), UnitStep::Worked);
+    assert_eq!(job.step_unit(AFTER_THE_RETRY), JobStep::Worked);
     assert!(!has_file(&io, older));
     assert_eq!(volume.segments_parked.load(Ordering::Acquire), 0);
     drop(job);
@@ -1183,10 +1183,10 @@ fn parked_until_durable() {
     job.unlink(volume, older, state.read_point(&state.volumes[0])).expect("unlink");
     release_compaction(&store);
     io.fail_directory_syncs(OperationCount(1));
-    assert!(matches!(job.step_unit(Nanoseconds(0)), UnitStep::RetryAt(_)));
+    assert!(matches!(job.step_unit(Nanoseconds(0)), JobStep::IdleUntil { .. }));
     assert_eq!(volume.segments_parked.load(Ordering::Acquire), 1);
 
-    assert_eq!(job.step_unit(AFTER_THE_RETRY), UnitStep::Worked);
+    assert_eq!(job.step_unit(AFTER_THE_RETRY), JobStep::Worked);
     assert_eq!(volume.segments_parked.load(Ordering::Acquire), 0);
     io.power_cut();
     drop(job);

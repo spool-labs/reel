@@ -10,6 +10,7 @@ use crate::index::key_hash::KeyHash;
 use crate::io::{DeviceReads, InPlace, IoFile, ReadOn, in_place};
 use crate::io::device_error::{read_or_damaged, read_or_damaged_on};
 use crate::record::record_check::{RecordKey, RunningSum};
+use crate::little_endian::ByteReader;
 use crate::segment::column_directory::Candidate;
 use crate::segment::block_cache::{BlockCache, BlockKey};
 use crate::segment::block_entry::{BLOCK_ENTRY_BYTES, BlockEntry, KeyPrefix};
@@ -18,7 +19,7 @@ use crate::segment::block_filter::{may_contain, open_filter};
 use crate::segment::row_block::{FooterRow, ROW_BLOCK_BYTES, RowBlockWalk};
 use crate::segment::segment_table::BlockWindow;
 use crate::segment::segment_tail::{
-    ColumnTail, MAX_TAIL_BYTES, SECOND_TAIL_DISTANCE, SegmentNumber, TailHead, TailInputs, TailReader, find_tail,
+    ColumnTail, MAX_TAIL_BYTES, SECOND_TAIL_DISTANCE, SegmentNumber, TailHead, TailInputs, find_tail,
 };
 
 /// Segments one page of a directory search holds
@@ -183,7 +184,7 @@ impl FooterReader {
         let Some(tail) = find_tail(&self.tail[..read], record_key) else {
             return Ok(None);
         };
-        let mut input = TailReader::new(tail);
+        let mut input = ByteReader::new(tail);
         let Some((head, inputs)) = TailHead::read(&mut input) else {
             return Ok(None);
         };

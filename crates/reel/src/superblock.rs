@@ -10,6 +10,7 @@ use xxhash_rust::xxh3::xxh3_64;
 use crate::config::{ColumnConfig, KeyShape};
 use crate::io::device_error::is_device_error;
 use crate::io::{Io, IoFile};
+use crate::little_endian::ByteReader;
 use crate::record::record_check::RecordKey;
 use crate::segment::segment_tail::SegmentNumber;
 
@@ -91,12 +92,6 @@ pub struct FieldWriter<'bytes> {
     bytes: &'bytes mut Vec<u8>,
 }
 
-/// Reads a superblock's fields from its bytes
-#[derive(Debug)]
-pub struct FieldReader<'bytes> {
-    bytes: &'bytes [u8],
-}
-
 impl SuperblockPaths {
     /// Build a root's paths
     pub fn new(root: &Path) -> Self {
@@ -122,22 +117,11 @@ impl FieldWriter<'_> {
     }
 }
 
-impl<'bytes> FieldReader<'bytes> {
-    /// Take a word
-    pub fn word(&mut self) -> Option<u64> {
-        let (word, rest) = self.bytes.split_at_checked(size_of::<u64>())?;
-        self.bytes = rest;
-        let mut array = [0; size_of::<u64>()];
-        array.copy_from_slice(word);
-        Some(u64::from_le_bytes(array))
-    }
-
-    /// Take text
+impl ByteReader<'_> {
+    /// Take a superblock's text: its length, then its bytes
     pub fn text(&mut self) -> Option<String> {
-        let length = self.word()? as usize;
-        let (text, rest) = self.bytes.split_at_checked(length)?;
-        self.bytes = rest;
-        String::from_utf8(text.to_vec()).ok()
+        let length = usize::try_from(self.word()?).ok()?;
+        String::from_utf8(self.take(length)?.to_vec()).ok()
     }
 }
 
@@ -191,12 +175,12 @@ impl Superblock {
     /// Read a superblock from its stored bytes, or nothing when they fail their check
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let sum_at = bytes.len().checked_sub(size_of::<u64>())?;
-        let mut tail = FieldReader { bytes: &bytes[sum_at..] };
+        let mut tail = ByteReader::new(&bytes[sum_at..]);
         if xxh3_64(&bytes[..sum_at]) != tail.word()? {
             return None;
         }
 
-        let mut fields = FieldReader { bytes: &bytes[..sum_at] };
+        let mut fields = ByteReader::new(&bytes[..sum_at]);
         if fields.word()? != u64::from(SUPERBLOCK_MAGIC) {
             return None;
         }

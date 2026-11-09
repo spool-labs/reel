@@ -7,6 +7,7 @@ use reel_api::units::{ByteCount, DeathMark, FileOffset, RowCount, WritePlace};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::lifetime::MarkRange;
+use crate::little_endian::ByteReader;
 use crate::record::record_check::{Checksum, RecordKey};
 use crate::segment::block_entry::{KEY_BOUND_BYTES, KEY_PREFIX_BYTES, KeyBound, KeyPrefix, SHARED_HEAD_BYTES, SharedHead};
 
@@ -120,13 +121,6 @@ pub struct TailCursor<'bytes> {
     used: usize,
 }
 
-/// Reads the fixed fields of a tail in order
-#[derive(Clone, Copy, Debug)]
-pub struct TailReader<'bytes> {
-    bytes: &'bytes [u8],
-    used: usize,
-}
-
 impl<'bytes> TailCursor<'bytes> {
     /// Start at the front of a buffer
     pub fn new(bytes: &'bytes mut [u8]) -> Self {
@@ -140,33 +134,7 @@ impl<'bytes> TailCursor<'bytes> {
     }
 }
 
-impl<'bytes> TailReader<'bytes> {
-    /// Start at the front of some bytes
-    pub fn new(bytes: &'bytes [u8]) -> Self {
-        Self { bytes, used: 0 }
-    }
-
-    /// Take raw bytes
-    pub fn take(&mut self, length: usize) -> Option<&'bytes [u8]> {
-        let field = self.bytes.get(self.used..self.used + length)?;
-        self.used += length;
-        Some(field)
-    }
-
-    /// Take a word
-    pub fn word(&mut self) -> Option<u64> {
-        let mut word = [0; size_of::<u64>()];
-        word.copy_from_slice(self.take(size_of::<u64>())?);
-        Some(u64::from_le_bytes(word))
-    }
-
-    /// Take a half word
-    pub fn half(&mut self) -> Option<u32> {
-        let mut half = [0; size_of::<u32>()];
-        half.copy_from_slice(self.take(size_of::<u32>())?);
-        Some(u32::from_le_bytes(half))
-    }
-
+impl ByteReader<'_> {
     /// Take a shared prefix's first bytes
     pub fn shared_head(&mut self) -> Option<SharedHead> {
         let mut head = [0; SHARED_HEAD_BYTES];
@@ -210,7 +178,7 @@ impl TailHead {
     }
 
     /// Read the fixed fields back, and the inputs among them
-    pub fn read(input: &mut TailReader) -> Option<(Self, TailInputs)> {
+    pub fn read(input: &mut ByteReader) -> Option<(Self, TailInputs)> {
         let mut head = Self {
             segment: SegmentNumber(input.word()?),
             data_end: FileOffset(input.word()?),
@@ -299,7 +267,7 @@ impl ColumnTail {
     }
 
     /// Read one column's fields back
-    pub fn read(input: &mut TailReader) -> Option<Self> {
+    pub fn read(input: &mut ByteReader) -> Option<Self> {
         let leading = input.take(size_of::<u32>())?;
         let tail = Self {
             column: ColumnId(leading[0]),
@@ -335,7 +303,7 @@ pub fn write_trailer(tail: &mut [u8], body_length: usize, record_key: RecordKey)
 /// Find a whole tail at the end of some bytes, or nothing when the segment isn't sealed
 pub fn find_tail(end: &[u8], record_key: RecordKey) -> Option<&[u8]> {
     let trailer_at = end.len().checked_sub(TRAILER_BYTES)?;
-    let mut input = TailReader::new(&end[trailer_at..]);
+    let mut input = ByteReader::new(&end[trailer_at..]);
     let total = input.half()? as usize;
     if input.half()? != TAIL_MAGIC {
         return None;

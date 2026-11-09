@@ -12,7 +12,7 @@ use crate::fixed_list::{ListFull, ListOut};
 use crate::io::device_error::{SECTOR_BYTES, read_or_damaged};
 use crate::io::{Io, IoFile};
 use crate::lifetime::MarkRange;
-use crate::little_endian::read_half;
+use crate::little_endian::{ByteReader, read_half};
 use crate::record::record_check::{Checksum, checksum};
 use crate::segment::segment_table::NumberMap;
 use crate::segment::segment_tail::{PlaceRange, SegmentNumber};
@@ -164,44 +164,8 @@ pub struct SummaryRow<'bytes> {
     pub body: &'bytes [u8],
 }
 
-/// A walk over the fields of a row
-#[derive(Clone, Copy, Debug)]
-pub struct RowCursor<'bytes> {
-    bytes: &'bytes [u8],
-}
 
-impl<'bytes> RowCursor<'bytes> {
-    /// Take some bytes
-    pub fn take(&mut self, length: usize) -> Option<&'bytes [u8]> {
-        let (field, rest) = self.bytes.split_at_checked(length)?;
-        self.bytes = rest;
-        Some(field)
-    }
-
-    /// Take a word
-    pub fn word(&mut self) -> Option<u64> {
-        let mut word = [0; size_of::<u64>()];
-        word.copy_from_slice(self.take(size_of::<u64>())?);
-        Some(u64::from_le_bytes(word))
-    }
-
-    /// Take a four-byte number
-    pub fn half(&mut self) -> Option<u32> {
-        let bytes = self.take(size_of::<u32>())?;
-        Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-    }
-
-    /// Take a short
-    pub fn short(&mut self) -> Option<u16> {
-        let bytes = self.take(size_of::<u16>())?;
-        Some(u16::from_le_bytes([bytes[0], bytes[1]]))
-    }
-
-    /// Take one byte
-    pub fn byte(&mut self) -> Option<u8> {
-        Some(self.take(1)?[0])
-    }
-
+impl<'bytes> ByteReader<'bytes> {
     /// Read the next column
     pub fn column(&mut self) -> Option<ColumnFacts<'bytes>> {
         let column = ColumnId(self.byte()?);
@@ -250,8 +214,8 @@ impl<'bytes> SummaryRow<'bytes> {
     }
 
     /// Walk the row's columns, then its spans
-    pub fn cursor(&self) -> RowCursor<'bytes> {
-        RowCursor { bytes: self.body }
+    pub fn cursor(&self) -> ByteReader<'bytes> {
+        ByteReader::new(self.body)
     }
 }
 
@@ -529,7 +493,7 @@ impl SummaryRows {
                 for _column in 0..row.column_count {
                     cursor.column()?;
                 }
-                let spans_length = cursor.bytes.len();
+                let spans_length = cursor.rest().len();
                 return Some((at, length, at + length - ROW_SUM_BYTES - spans_length));
             }
             at += length;
@@ -927,7 +891,7 @@ pub fn read_row(bytes: &[u8]) -> Option<(usize, Option<SummaryRow<'_>>)> {
 
 /// Read a row's fixed fields
 pub fn parse_row(body: &[u8]) -> Option<SummaryRow<'_>> {
-    let mut cursor = RowCursor { bytes: body };
+    let mut cursor = ByteReader::new(body);
     let segment = SegmentNumber(cursor.word()?);
     let file_length = ByteCount(cursor.word()?);
     let data_end = FileOffset(cursor.word()?);
@@ -975,7 +939,7 @@ pub fn parse_row(body: &[u8]) -> Option<SummaryRow<'_>> {
         block_dead,
         column_count,
         span_count,
-        body: cursor.bytes,
+        body: cursor.rest(),
     })
 }
 
@@ -1169,7 +1133,7 @@ pub fn read_copy<Backend: Io>(io: &Backend, path: &Path) -> Result<Option<Summar
 
 /// Read one end of a copy, or nothing when it fails its check
 pub fn read_end(end: &[u8], magic: u64) -> Option<CopyEnd> {
-    let mut cursor = RowCursor { bytes: end };
+    let mut cursor = ByteReader::new(end);
     let is_ours = cursor.word() == Some(magic);
     let (mark, rows_length) = (cursor.word()?, cursor.word()?);
     let (forward, sum) = (cursor.word()?, cursor.word()?);

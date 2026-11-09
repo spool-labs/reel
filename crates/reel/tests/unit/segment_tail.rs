@@ -1,6 +1,7 @@
 use reel::lifetime::MarkRange;
 use reel::record::record_check::{Checksum, RecordKey};
 use reel::segment::block_entry::{KeyBound, KeyPrefix, SHARED_HEAD_BYTES, SharedHead};
+use reel::little_endian::ByteReader;
 use reel::segment::segment_tail::*;
 use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, DeathMark, FileOffset, RowCount, WritePlace};
@@ -69,7 +70,7 @@ fn tail_round() {
     file.extend_from_slice(&built());
 
     let tail = find_tail(&file, RECORD_KEY).expect("whole tail");
-    let mut input = TailReader::new(tail);
+    let mut input = ByteReader::new(tail);
 
     assert_eq!(TailHead::read(&mut input), Some((head(), inputs())));
     assert_eq!(ColumnTail::read(&mut input), Some(column(1)));

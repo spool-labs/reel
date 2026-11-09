@@ -3,10 +3,11 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use reel::segment::segment_tail::{ColumnTail, TailHead, TailReader};
+use reel::little_endian::ByteReader;
+use reel::segment::segment_tail::{ColumnTail, TailHead};
 
 fuzz_target!(|bytes: &[u8]| {
-    let mut reader = TailReader::new(bytes);
+    let mut reader = ByteReader::new(bytes);
     let Some((head, _inputs)) = TailHead::read(&mut reader) else {
         return;
     };

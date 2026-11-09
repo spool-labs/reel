@@ -14,7 +14,7 @@ use std::task::{Context, Poll, Waker};
 use reel_api::units::{ByteCount, FileOffset};
 
 use crate::guard::hold;
-use crate::io::{DeviceReads, IoFile, WalkMark};
+use crate::io::{DeviceReads, IoFile, WalkMark}; use crate::lease::{Ended, LeaseCell};
 use crate::pool::touched_queue;
 
 /// Reads a ring holds in flight at once
@@ -82,28 +82,8 @@ impl<File> RingDriver<File> for NoRing {
     }
 }
 
-/// What a slot is doing
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RingPhase {
-    /// Nobody holds it
-    Free,
-    /// A read holds it and hasn't started
-    Held,
-    /// The device has it
-    Reading,
-    /// The read is over and its answer waits for the caller
-    Done,
-    /// The caller went away, and the completion frees it
-    Dropped,
-}
-
-/// One slot's state
-#[derive(Debug)]
-pub struct RingSlot {
-    phase: RingPhase,
-    answer: Result<usize>,
-    waker: Option<Waker>,
-}
+/// One slot's read: the device has it while it's busy, and its answer is the bytes it read
+pub type RingSlot = LeaseCell<Result<usize>>;
 
 /// Callers waiting for one kind of room, oldest first. A wake goes to one caller, so one that leaves takes itself out of line
 /// or hands on a wake it got and didn't use
@@ -250,7 +230,7 @@ impl<Driver> OnRing<'_, Driver> {
 impl<Driver> ReadRing<Driver> {
     /// Build a ring on a driver, with every slot allocated
     pub fn new(driver: Driver) -> Self {
-        let slot = || RingSlot { phase: RingPhase::Free, answer: Ok(0), waker: None };
+        let slot = RingSlot::new;
         Self {
             driver,
             slots: (0..RING_SLOTS).map(|_slot| Mutex::new(slot())).collect(),
@@ -313,17 +293,12 @@ impl<Driver> ReadRing<Driver> {
         let Some(slot) = hold(&self.free).pop() else {
             return Ok(None);
         };
-        hold(&self.slots[slot]).phase = RingPhase::Held;
         Ok(Some(RingLease { ring: self, slot }))
     }
 
     /// Give a slot back and wake the next in line
     pub fn release(&self, slot: usize) {
-        {
-            let mut held = hold(&self.slots[slot]);
-            held.phase = RingPhase::Free;
-            held.waker = None;
-        }
+        hold(&self.slots[slot]).reset();
         hold(&self.free).push(slot);
         self.slot_line.wake_next();
     }
@@ -331,18 +306,11 @@ impl<Driver> ReadRing<Driver> {
     /// Take a completion from the driver and wake its caller, or free the slot when the caller went away
     pub fn finish(&self, slot: usize, answer: Result<usize>) {
         self.in_flight.fetch_sub(1, Ordering::AcqRel);
-        let mut held = hold(&self.slots[slot]);
-        if held.phase == RingPhase::Dropped {
-            drop(held);
-            self.release(slot);
-            return;
-        }
-        held.answer = answer;
-        held.phase = RingPhase::Done;
-        let waker = held.waker.take();
-        drop(held);
-        if let Some(waker) = waker {
-            waker.wake();
+        let ended = hold(&self.slots[slot]).end(answer);
+        match ended {
+            Ended::Wake(Some(waker)) => waker.wake(),
+            Ended::Wake(None) => {},
+            Ended::Release => self.release(slot),
         }
     }
 }
@@ -429,9 +397,9 @@ impl<Driver> RingLease<'_, Driver> {
         Driver: RingDriver<File>,
     {
         self.ring.in_flight.fetch_add(1, Ordering::AcqRel);
-        hold(&self.ring.slots[self.slot]).phase = RingPhase::Reading;
+        hold(&self.ring.slots[self.slot]).start();
         if let Err(error) = self.ring.driver.start(self.slot, file, offset, length) {
-            hold(&self.ring.slots[self.slot]).phase = RingPhase::Held;
+            hold(&self.ring.slots[self.slot]).unstart();
             self.ring.in_flight.fetch_sub(1, Ordering::AcqRel);
             return Err(error);
         }
@@ -443,28 +411,16 @@ impl<Driver> RingLease<'_, Driver> {
     where
         Driver: Sync,
     {
-        poll_fn(|context| {
-            let mut held = hold(&self.ring.slots[self.slot]);
-            if held.phase != RingPhase::Done {
-                if !held.waker.as_ref().is_some_and(|waker| waker.will_wake(context.waker())) {
-                    held.waker = Some(context.waker().clone());
-                }
-                return Poll::Pending;
-            }
-            Poll::Ready(std::mem::replace(&mut held.answer, Ok(0)))
-        })
+        poll_fn(|context| hold(&self.ring.slots[self.slot]).poll_answer(context))
     }
 }
 
 impl<Driver> Drop for RingLease<'_, Driver> {
     fn drop(&mut self) {
-        let mut held = hold(&self.ring.slots[self.slot]);
-        if held.phase == RingPhase::Reading {
-            held.phase = RingPhase::Dropped;
-            return;
+        let is_free = hold(&self.ring.slots[self.slot]).leave();
+        if is_free {
+            self.ring.release(self.slot);
         }
-        drop(held);
-        self.ring.release(self.slot);
     }
 }
 
@@ -616,11 +572,11 @@ impl<Driver> RingLease<'_, Driver> {
         let answer = loop {
             {
                 let mut held = hold(&self.ring.slots[self.slot]);
-                if held.phase == RingPhase::Done {
-                    break std::mem::replace(&mut held.answer, Ok(0));
+                if let Some(answer) = held.take_answer() {
+                    break answer;
                 }
                 if spun.elapsed() >= spin {
-                    held.waker = Some(THREAD_WAKER.with(Waker::clone));
+                    THREAD_WAKER.with(|waker| held.wait_with(waker));
                     drop(held);
                     // a parked reader gives its seat to the next
                     if is_seated {

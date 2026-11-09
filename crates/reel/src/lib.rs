@@ -22,6 +22,7 @@ inner_modules!(
     guard,
     index,
     io,
+    lease,
     lifetime,
     little_endian,
     record,

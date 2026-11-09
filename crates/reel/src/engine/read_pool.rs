@@ -8,7 +8,7 @@ use std::future::poll_fn;
 use std::mem;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll, Waker, ready};
 
 use reel_api::column_id::ColumnId;
 use reel_api::scan::ScanStep;
@@ -24,6 +24,7 @@ use crate::guard::hold;
 use crate::io::job::{Job, JobStep};
 use crate::io::ring::{OnRing, ReadRing};
 use crate::io::{DeviceReads, InPlace, Io, IoTask, OnlyWarm, WalkMark, in_place, poll_once};
+use crate::lease::{Ended, LeaseCell, LeasePhase};
 use crate::pool::{touched_capacity, touched_queue};
 
 /// Async reads in flight at once
@@ -36,23 +37,6 @@ pub const SLOT_KEYS: usize = 1_024;
 pub const SCAN_BLOCK_KEYS: usize = 256;
 /// Callers that wait in line for a slot, and any past that look again when the runtime polls them
 pub const MOST_WAITERS: usize = 1_024;
-
-/// What a slot is doing
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SlotPhase {
-    /// Nobody holds it
-    Free,
-    /// A caller is filling it
-    Held,
-    /// It waits for a worker
-    Queued,
-    /// A worker is reading
-    Running,
-    /// The read is over and its answer waits for the caller
-    Done,
-    /// The caller went away, and the worker frees it
-    Dropped,
-}
 
 /// One read, with the caller's buffers
 #[derive(Debug, Default)]
@@ -82,12 +66,10 @@ pub enum ReadWork {
 /// One read in flight
 #[derive(Debug)]
 pub struct ReadSlot {
-    phase: SlotPhase,
+    lease: LeaseCell<Result<bool, StoreError>>,
     work: ReadWork,
     keys: Vec<u8>,
     key_ends: Vec<usize>,
-    answer: Result<bool, StoreError>,
-    waker: Option<Waker>,
 }
 
 /// The slots and the line of work
@@ -118,22 +100,18 @@ impl ReadSlot {
     /// Allocate a slot's buffers
     pub fn new() -> Self {
         Self {
-            phase: SlotPhase::Free,
+            lease: LeaseCell::new(),
             work: ReadWork::Empty,
             keys: touched_capacity(SLOT_KEY_BYTES, 0),
             key_ends: touched_capacity(SLOT_KEYS, 0),
-            answer: Ok(false),
-            waker: None,
         }
     }
 
     /// Start empty for the next caller
     pub fn reset(&mut self) {
-        self.phase = SlotPhase::Free;
+        self.lease.reset();
         self.keys.clear();
         self.key_ends.clear();
-        self.answer = Ok(false);
-        self.waker = None;
     }
 }
 
@@ -195,7 +173,6 @@ impl ReadPool {
     /// Take a free slot
     pub fn try_claim(&self) -> Option<SlotLease<'_>> {
         let index = hold(&self.free).pop()?;
-        hold(&self.slots[index]).phase = SlotPhase::Held;
         Some(SlotLease { pool: self, index })
     }
 
@@ -220,15 +197,16 @@ impl ReadPool {
         loop {
             let index = hold(&self.queue).pop_front()?;
             let mut slot = hold(&self.slots[index]);
-            if slot.phase == SlotPhase::Dropped {
-                drop(slot);
-                self.release(index);
-                continue;
+            match slot.lease.phase() {
+                LeasePhase::Dropped => {
+                    drop(slot);
+                    self.release(index);
+                    continue;
+                },
+                // a refused read is over, and nothing queues a running one
+                LeasePhase::Idle | LeasePhase::Done => continue,
+                LeasePhase::Busy => {},
             }
-            if slot.phase != SlotPhase::Queued {
-                continue;
-            }
-            slot.phase = SlotPhase::Running;
             let (work, keys, ends) = (mem::take(&mut slot.work), mem::take(&mut slot.keys), mem::take(&mut slot.key_ends));
             return Some((index, work, keys, ends));
         }
@@ -240,36 +218,25 @@ impl ReadPool {
         slot.keys = keys;
         slot.key_ends = ends;
         slot.work = work;
-        if slot.phase == SlotPhase::Dropped {
-            drop(slot);
-            self.release(index);
-            return;
-        }
-        slot.answer = answer;
-        slot.phase = SlotPhase::Done;
-        let waker = slot.waker.take();
+        let ended = slot.lease.end(answer);
         drop(slot);
-        if let Some(waker) = waker {
-            waker.wake();
-        }
+        self.after_end(index, ended);
     }
 
     /// End every queued read, for a store that's going
     pub fn refuse_queued(&self) {
         while let Some(index) = hold(&self.queue).pop_front() {
-            let mut slot = hold(&self.slots[index]);
-            if slot.phase == SlotPhase::Dropped {
-                drop(slot);
-                self.release(index);
-                continue;
-            }
-            slot.answer = Err(StoreError::Closed);
-            slot.phase = SlotPhase::Done;
-            let waker = slot.waker.take();
-            drop(slot);
-            if let Some(waker) = waker {
-                waker.wake();
-            }
+            let ended = hold(&self.slots[index]).lease.end(Err(StoreError::Closed));
+            self.after_end(index, ended);
+        }
+    }
+
+    /// Wake the caller of a read that ended, or free its slot when the caller went away
+    pub fn after_end(&self, index: usize, ended: Ended) {
+        match ended {
+            Ended::Wake(Some(waker)) => waker.wake(),
+            Ended::Wake(None) => {},
+            Ended::Release => self.release(index),
         }
     }
 }
@@ -309,7 +276,7 @@ impl SlotLease<'_> {
 
     /// Put the slot in line, and say which worker to wake
     pub fn submit(&self) -> usize {
-        hold(&self.pool.slots[self.index]).phase = SlotPhase::Queued;
+        hold(&self.pool.slots[self.index]).lease.start();
         hold(&self.pool.queue).push_back(self.index);
         self.pool.next_worker.fetch_add(1, Ordering::Relaxed) % self.pool.workers
     }
@@ -318,13 +285,7 @@ impl SlotLease<'_> {
     pub async fn finished(&self) -> (ReadWork, Result<bool, StoreError>) {
         poll_fn(|context| {
             let mut slot = hold(&self.pool.slots[self.index]);
-            if slot.phase != SlotPhase::Done {
-                if !slot.waker.as_ref().is_some_and(|waker| waker.will_wake(context.waker())) {
-                    slot.waker = Some(context.waker().clone());
-                }
-                return Poll::Pending;
-            }
-            let answer = mem::replace(&mut slot.answer, Ok(false));
+            let answer = ready!(slot.lease.poll_answer(context));
             Poll::Ready((mem::take(&mut slot.work), answer))
         })
         .await
@@ -333,13 +294,10 @@ impl SlotLease<'_> {
 
 impl Drop for SlotLease<'_> {
     fn drop(&mut self) {
-        let mut slot = hold(&self.pool.slots[self.index]);
-        if matches!(slot.phase, SlotPhase::Queued | SlotPhase::Running) {
-            slot.phase = SlotPhase::Dropped;
-            return;
+        let is_free = hold(&self.pool.slots[self.index]).lease.leave();
+        if is_free {
+            self.pool.release(self.index);
         }
-        drop(slot);
-        self.pool.release(self.index);
     }
 }
 

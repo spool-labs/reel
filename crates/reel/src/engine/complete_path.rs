@@ -14,7 +14,7 @@ use crate::engine::volume::{NO_SEAL, Volume};
 use crate::fixed_list::{FixedList, ListOut};
 use crate::guard::hold;
 use crate::index::complete_table::{CompleteSlot, CompleteTable, TagMatches};
-use crate::index::key_hash::hash_key;
+use crate::index::key_hash::{KeyHash, hash_key};
 use crate::io::{DeviceReads, InPlace, Io, in_place};
 use crate::io::device_error::is_device_error;
 use crate::pool::Pool;
@@ -185,9 +185,9 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Free a charged row's slot, so a get reads one block for its key and the table holds a slot a key
-    pub fn free_superseded_slot(&self, volume: &Volume<Backend>, column: ColumnId, key: &[u8], segment: SegmentNumber, block_offset: u32) {
+    pub fn free_superseded_slot(&self, volume: &Volume<Backend>, column: ColumnId, hash: KeyHash, segment: SegmentNumber, block_offset: u32) {
         if let (Some(table), Some(block)) = (self.complete_table(column), volume.table.block_at(segment, block_offset)) {
-            table.free_superseded(hash_key(column, key), segment, block as u16);
+            table.free_superseded(hash, segment, block as u16);
         }
     }
 

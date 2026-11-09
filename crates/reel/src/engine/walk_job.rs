@@ -27,6 +27,7 @@ use crate::engine::rewrite_job::{RewriteJob, RewriteSeat};
 use crate::engine::workers::Workers;
 use crate::engine::volume::{NO_SEAL, Volume};
 use crate::guard::hold;
+use crate::index::key_hash::{KeyHash, hash_key};
 use crate::io::device_error::is_device_error;
 use crate::io::job::{Job, JobStep};
 use crate::io::{Io, IoFile, IoTask};
@@ -99,6 +100,15 @@ pub struct FreeRecord {
     pub replacement: WritePlace,
 }
 
+/// A complete slot a charged row leaves, freed once the block's counts land
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SlotFree {
+    pub column: ColumnId,
+    pub hash: KeyHash,
+    pub segment: SegmentNumber,
+    pub block_offset: u32,
+}
+
 /// What counting one block found
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct BlockCounts {
@@ -110,6 +120,8 @@ pub struct BlockCounts {
     pub held: FixedList<HeldRow>,
     pub holding: FixedList<(SegmentNumber, u8)>,
     pub claims_seen: u64,
+    /// A count can be thrown away and taken again, and a slot it freed early would hide the version the next count must charge
+    pub slot_frees: FixedList<SlotFree>,
 }
 
 impl BlockCounts {
@@ -124,6 +136,7 @@ impl BlockCounts {
             held: FixedList::on_heap(MOST_BLOCK_ROWS),
             holding: FixedList::on_heap(MOST_HOLDING),
             claims_seen: 0,
+            slot_frees: FixedList::on_heap(MOST_BLOCK_ROWS),
         }
     }
 
@@ -138,18 +151,19 @@ impl BlockCounts {
             held: region.carve(rows + 1)?,
             holding: region.carve(MOST_HOLDING)?,
             claims_seen: 0,
+            slot_frees: region.carve(rows + 1)?,
         })
     }
 
     /// Count the region bytes room for a block of up to this many rows takes
     pub fn region_bytes(rows: usize) -> usize {
-        let held = list_bytes::<HeldRow>(rows + 1) + list_bytes::<(SegmentNumber, u8)>(MOST_HOLDING);
+        let held = list_bytes::<HeldRow>(rows + 1) + list_bytes::<(SegmentNumber, u8)>(MOST_HOLDING) + list_bytes::<SlotFree>(rows + 1);
         list_bytes::<DeadCount>(rows + 1) + list_bytes::<FreeRecord>(MOST_BLOCK_FREES) + list_bytes::<SegmentNumber>(MOST_BLOCK_FREES) + held
     }
 
     /// Give the lists back, and return the most bytes they wrote
     pub fn release(&mut self) -> usize {
-        let held = self.held.peak_bytes() + self.holding.peak_bytes();
+        let held = self.held.peak_bytes() + self.holding.peak_bytes() + self.slot_frees.peak_bytes();
         let peak = self.counts.peak_bytes() + self.frees.peak_bytes() + self.overflowed.peak_bytes() + held;
         *self = Self::default();
         peak
@@ -157,7 +171,7 @@ impl BlockCounts {
 
     /// Read the heap they hold
     pub fn heap_bytes(&self) -> ByteCount {
-        let counts = self.counts.capacity() * size_of::<DeadCount>();
+        let counts = self.counts.capacity() * size_of::<DeadCount>() + self.slot_frees.capacity() * size_of::<SlotFree>();
         ByteCount((counts + self.frees.capacity() * size_of::<FreeRecord>()) as u64)
     }
 
@@ -169,6 +183,7 @@ impl BlockCounts {
         self.read_bytes = ByteCount(0);
         self.rows = 0;
         self.held.clear();
+        self.slot_frees.clear();
     }
 
     /// Note which inputs the rewrites hold now, and the claims' count they were read at, before a block is counted
@@ -444,7 +459,7 @@ impl<Backend: Io> BlockCounter<Backend> {
             match newest {
                 Some(found) if found.row.place > row.place => {
                     let replacement = found.row.place;
-                    self.state.free_superseded_slot(volume, block.column, &self.key, target.segment, block.entry.block_offset);
+                    counts.slot_frees.push(SlotFree { column: block.column, hash: hash_key(block.column, &self.key), segment: target.segment, block_offset: block.entry.block_offset })?;
                     counts.count_dead(target.segment, block.column, target.next_block, &row, replacement)?;
                 },
                 // a row under an applied cover is dead by it, and so is any older one a row here would find
@@ -459,7 +474,7 @@ impl<Backend: Io> BlockCounter<Backend> {
                             Some(lane) => counts.held.push(HeldRow { segment: found.segment, lane, block: index, at: found.at })?,
                             None => counts.count_dead(found.segment, block.column, index, &found.row, row.place)?,
                         }
-                        self.state.free_superseded_slot(volume, block.column, &self.key, found.segment, found.block_offset);
+                        counts.slot_frees.push(SlotFree { column: block.column, hash: hash_key(block.column, &self.key), segment: found.segment, block_offset: found.block_offset })?;
                     }
                 },
                 Some(_) | None => {},
@@ -671,6 +686,9 @@ impl<Backend: Io> WalkJob<Backend> {
         volume.walk_blocks.fetch_add(1, Ordering::Relaxed);
         for count in counts.counts.iter().filter(|count| count.rows > 0) {
             volume.table.drop_live(count.segment, count.block, count.rows, count.replacement);
+        }
+        for free in counts.slot_frees.iter() {
+            self.state.free_superseded_slot(volume, free.column, free.hash, free.segment, free.block_offset);
         }
     }
 

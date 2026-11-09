@@ -6,11 +6,12 @@ use std::sync::Arc;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds};
 
 use crate::engine::engine_state::EngineState;
+use crate::engine::open_segment::SegmentPhase;
 use crate::engine::write_path::reserve_target;
 use crate::engine::volume::Volume;
 use crate::guard::hold;
 use crate::io::job::{Job, JobStep};
-use crate::io::{Io, IoFile};
+use crate::io::{Io, IoFile, IoTask};
 use crate::pool::touched_filled;
 use crate::segment::segment_tail::SegmentNumber;
 
@@ -73,10 +74,13 @@ impl<Backend: Io> ReserveJob<Backend> {
         })
     }
 
-    /// Find an open segment whose writers asked for more room, and clone its handle so the call runs with no lock held
+    /// Find an open segment whose writers asked for more room and that no seal has taken, mark it held so its seal waits, and
+    /// clone its handle so the call runs with no lock held
     pub fn next_room(&self, volume: &Volume<Backend>) -> Option<RoomAhead<Backend::File>> {
-        let claims = hold(&volume.claims);
-        claims.open.iter().find(|segment| segment.is_reserve_asked).map(|segment| RoomAhead {
+        let mut claims = hold(&volume.claims);
+        let segment = claims.open.iter_mut().find(|segment| segment.is_reserve_asked && segment.phase != SegmentPhase::Sealing)?;
+        segment.is_room_holding = true;
+        Some(RoomAhead {
             file: segment.data.clone(),
             segment: segment.number,
             end: reserve_target(segment, volume, segment.write_end.0),
@@ -93,6 +97,13 @@ impl<Backend: Io> ReserveJob<Backend> {
                 let mut claims = hold(&volume.claims);
                 if let Some(segment) = claims.open.iter_mut().find(|segment| segment.number == room.segment) {
                     segment.is_reserve_asked = false;
+                    segment.is_room_holding = false;
+                    // a seal that came while the room grew waited for it
+                    if segment.phase == SegmentPhase::Sealing
+                        && let Some(task) = state.seal_tasks[volume.id.0 as usize].get()
+                    {
+                        task.wake();
+                    }
                     if is_held {
                         segment.reserved_end = FileOffset(segment.reserved_end.0.max(room.end));
                     }

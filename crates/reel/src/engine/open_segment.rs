@@ -50,6 +50,8 @@ pub struct OpenSegment<File> {
     pub write_end: FileOffset,
     pub reserved_end: FileOffset,
     pub is_reserve_asked: bool,
+    /// The reserve job is growing this segment's room with no lock held, so its seal waits: a cut file grown again would bury its tails
+    pub is_room_holding: bool,
     pub row_count: RowCount,
     pub in_flight: u32,
     pub cover_rows: usize,

@@ -1233,3 +1233,44 @@ fn room_grows_a_step_at_a_time() {
     assert!(spare.is_none_or(|spare| spare <= RESERVE_STEP_BYTES), "a spare holds {spare:?} B");
     store.close().expect("close");
 }
+
+// room a segment asked for before its seal never grows the sealed file, where it once buried the tails and the next open lost the
+// segment as damaged
+#[test]
+fn room_skips_a_sealing_segment() {
+    let io = SimulatedIo::new(Seed(62));
+    let mut config = config(SyncPolicy::Never);
+    config.memory_budget = ROOM_BUDGET;
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let value = vec![7; ROOM_VALUE];
+    io.hold_jobs("reel-reserve", true);
+    for number in 0..ROOM_VALUES {
+        store.put(COLUMN, format!("key-{number:04}").as_bytes(), &value).expect("put");
+    }
+    store.seal_now();
+    // step until the seal has cut the file to its tails while the segment still sits among the open ones, then hold the seal
+    // there and let the room job look
+    let is_cut = || {
+        let claims = hold(&store.state.volumes[0].claims);
+        claims.open.iter().any(|segment| segment.is_reserve_asked && segment.data.length().expect("length").0 < segment.reserved_end.0)
+    };
+    while !is_cut() {
+        assert!(io.step_any().is_some(), "the seal ended before it cut the file");
+    }
+    io.hold_jobs("reel-seal", true);
+    io.hold_jobs("reel-reserve", false);
+    io.wake_jobs("reel-reserve");
+    settle(&io);
+    io.hold_jobs("reel-seal", false);
+    io.wake_jobs("reel-seal");
+    settle(&io);
+    store.close().expect("close");
+    drop(store);
+
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    assert_eq!(store.damaged_segments(), 0);
+    for number in 0..ROOM_VALUES {
+        assert_eq!(read(&store, format!("key-{number:04}").as_bytes()), Some(value.clone()), "key {number}");
+    }
+    store.close().expect("close");
+}

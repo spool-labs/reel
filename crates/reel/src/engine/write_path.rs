@@ -1184,6 +1184,7 @@ impl<Backend: Io> EngineState<Backend> {
             write_end: FileOffset(0),
             reserved_end: FileOffset(reserved.0),
             is_reserve_asked: false,
+            is_room_holding: false,
             row_count: RowCount(0),
             in_flight: 0,
             cover_rows: 0,

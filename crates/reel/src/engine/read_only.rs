@@ -165,6 +165,7 @@ impl<Backend: Io> EngineState<Backend> {
             write_end: recovered.write_end,
             reserved_end: recovered.write_end,
             is_reserve_asked: false,
+            is_room_holding: false,
             row_count: recovered.row_count,
             cover_rows: recovered.cover_rows,
             in_flight: 0,

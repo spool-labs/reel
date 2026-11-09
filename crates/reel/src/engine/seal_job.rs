@@ -144,7 +144,7 @@ impl<Backend: Io> SealJob<Backend> {
         let volume = &self.state.volumes[self.volume];
         let claims = hold(&volume.claims);
         for segment in &claims.open {
-            if segment.phase == SegmentPhase::Sealing {
+            if segment.phase == SegmentPhase::Sealing && !segment.is_room_holding {
                 volume.sealing.store(segment.number.0, Ordering::Release);
                 let now = self.state.io.now();
                 if self.seal_started.0 > 0 {

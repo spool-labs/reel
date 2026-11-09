@@ -139,9 +139,10 @@ impl<Backend: Io> RewriteJob<Backend> {
         let is_short = volume.is_short_of_room();
         let is_deferring = volume.is_hot(now) && !is_short;
         let is_ingesting = volume.is_ingesting(now);
-        // an overlap merge copies records, so one at a time on the planner keeps ingest at its line while writes arrive, and once
-        // they stop every idle worker takes one over segments no other merge holds
-        if (self.lane == PLANNER_LANE || !is_ingesting)
+        // an overlap merge copies records, so one at a time on the first worker keeps ingest at its line while writes arrive, and
+        // once they stop every idle worker takes one over segments no other merge holds. The planner runs one only with no workers
+        let ingest_lane = if volume.walk_slots.is_empty() { PLANNER_LANE } else { PLANNER_LANE + 1 };
+        if (self.lane == ingest_lane || !is_ingesting)
             && !is_deferring
             && let Some(target) = self.pick_overlap(volume, &rows, room)
         {

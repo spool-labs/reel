@@ -2419,9 +2419,9 @@ impl DeviceReads<SimulatedFile> for ChangesList<'_> {
     }
 }
 
-// an overlap merge copies records, so while writes arrive it starts on the planner's lane and a worker leaves it there
+// an overlap merge copies records, so while writes arrive the first worker runs it and the planner leaves it to that worker
 #[test]
-fn workers_leave_overlap() {
+fn first_worker_takes_overlap() {
     let io = SimulatedIo::new(Seed(74));
     let mut config = config();
     config.memory_budget = ByteCount(256 * 1024 * 1024);
@@ -2437,11 +2437,11 @@ fn workers_leave_overlap() {
     volume.seal_started_at.store(io.clock_reading().0, Ordering::Relaxed);
 
     let state = &store.state;
-    let mut worker = RewriteJob::new(Arc::clone(state), 0, PLANNER_LANE + 1);
-    assert!((0..OVER_THE_BOUND).all(|_look| worker.pick(&state.volumes[0]).is_none()));
     let mut planner = RewriteJob::new(Arc::clone(state), 0, PLANNER_LANE);
-    assert!((0..OVER_THE_BOUND).any(|_look| planner.pick(&state.volumes[0]).is_some()));
-    planner.abandon();
+    assert!((0..OVER_THE_BOUND).all(|_look| planner.pick(&state.volumes[0]).is_none()));
+    let mut worker = RewriteJob::new(Arc::clone(state), 0, PLANNER_LANE + 1);
+    assert!((0..OVER_THE_BOUND).any(|_look| worker.pick(&state.volumes[0]).is_some()));
+    worker.abandon();
     drop(planner);
     drop(worker);
     store.close().expect("close");
@@ -2859,6 +2859,7 @@ fn records_wait_behind_overlap() {
     hold_compaction(&store, false);
     for _step in 0..PLANNER_STEPS {
         job.step_unit(io.clock_reading());
+        step_seats(&job);
         if records() > 0 {
             break;
         }
@@ -2878,6 +2879,15 @@ fn records_wait_behind_overlap() {
     }
     io.hold_jobs("reel-planner", false);
     store.close().expect("close");
+}
+
+// step each seat's rewrite once, as a worker would
+fn step_seats(job: &CompactJob<SimulatedIo>) {
+    for seat in job.seats.iter() {
+        if let Some(rewrite) = hold(&seat.job).as_mut().filter(|rewrite| rewrite.is_running()) {
+            rewrite.step();
+        }
+    }
 }
 
 // hot ingest puts merges off while the table has room, and once its fullest shard passes half they run under the ingest, so no

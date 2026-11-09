@@ -314,8 +314,8 @@ impl<Backend: Io> CompactJob<Backend> {
         } else {
             should_rewrite |= mem::take(&mut self.is_ask_held);
         }
-        // workers go first, so the planner stays free to pick and walk
-        if should_rewrite && (self.hand_out() || self.rewrite.start()) {
+        // workers run every rewrite, so the planner stays free to pick and walk. A merge of 1 GiB segments would hold it for minutes
+        if should_rewrite && (self.hand_out() || (self.seats.is_empty() && self.rewrite.start())) {
             return UnitStep::Worked;
         }
         // a look takes a few segments at a time, and the rest still count. Hot ingest looks at none

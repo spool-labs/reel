@@ -268,6 +268,7 @@ impl RecordEncoder {
     }
 
     /// Count the runs of the record laid out last
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn run_count(&self) -> usize {
         self.runs.len()
     }

@@ -1072,6 +1072,7 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Mark one open segment to seal
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn seal_slot(&self, volume: &Volume<Backend>, slot: OpenSlot) {
         let mut claims = hold(&volume.claims);
         for segment in &mut claims.open {

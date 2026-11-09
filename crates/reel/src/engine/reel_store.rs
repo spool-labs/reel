@@ -407,6 +407,7 @@ impl<Backend: Io> ReelStore<Backend> {
     }
 
     /// Mark each volume's fullest taking segment to seal, as an idle volume does on its own
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn seal_now(&self) {
         for volume in &self.state.volumes {
             self.state.seal_fullest(volume);

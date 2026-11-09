@@ -217,6 +217,7 @@ impl MergeInput {
     }
 
     /// Read the heap the buffers hold
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn heap_bytes(&self) -> usize {
         self.block.capacity() + self.key.capacity()
     }
@@ -248,6 +249,7 @@ impl MergeInput {
     }
 
     /// Check a row list this long has room for every row of the input
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn row_room(&self, rows: usize) -> bool {
         self.block_rows <= rows as u64
     }
@@ -567,6 +569,7 @@ impl<Backend: Io> RewriteJob<Backend> {
     }
 
     /// Read the bytes the run's region maps, nothing between runs
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn region_bytes(&self) -> ByteCount {
         self.region.as_ref().map_or(ByteCount(0), Region::mapped_bytes)
     }
@@ -736,11 +739,13 @@ impl<Backend: Io> RewriteJob<Backend> {
     }
 
     /// Count the outputs that wait for this merge's last one
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn staged_count(&self) -> usize {
         self.staged.len()
     }
 
     /// Read the newest segment a look for an overlap has passed
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn looked_up_to(&self) -> SegmentNumber {
         self.looked_up_to
     }
@@ -775,6 +780,7 @@ impl<Backend: Io> RewriteJob<Backend> {
     }
 
     /// Check a claimed pick waits for its first step to map its region
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn is_claimed(&self) -> bool {
         self.claimed.is_some()
     }
@@ -828,6 +834,7 @@ impl<Backend: Io> RewriteJob<Backend> {
     }
 
     /// Pick the inputs: a run of segments over the overlap bound first, since that comes ahead of the walk, then ready segments
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn pick(&mut self, volume: &Volume<Backend>) -> Option<(MergeTarget, bool)> {
         self.pick_within(volume, MOST_MERGE_SEGMENTS)
     }
@@ -2563,6 +2570,7 @@ pub fn covers_point(row: &SummaryRow<'_>, column: ColumnId, point: &[u8]) -> boo
 
 /// Check two segments share a column and their ranges meet. A summary keeps only a key's first bytes, so a range here can only
 /// be wider than the truth
+#[cfg(any(test, feature = "test-hooks"))]
 pub fn overlaps(left: &SummaryRow<'_>, right: &SummaryRow<'_>) -> bool {
     let (mut left_columns, mut right_columns) = (left.cursor(), right.cursor());
     let (mut left_left, mut right_left) = (left.column_count, right.column_count);
@@ -2684,6 +2692,7 @@ impl<Backend: Io> RewriteSeat<Backend> {
     }
 
     /// Check the seat's rewrite is running, which it is while a worker holds it
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn is_busy(&self) -> bool {
         hold(&self.job).as_ref().is_none_or(RewriteJob::is_running)
     }

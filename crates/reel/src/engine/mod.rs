@@ -37,4 +37,6 @@ pub mod store_traits;
 pub mod volume;
 pub mod walk_job;
 pub mod workers;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod unit_bounds;
 pub mod write_path;

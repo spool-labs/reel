@@ -41,11 +41,13 @@ pub const FREE_PROBE_NAME: &str = "free-probe";
 /// Bytes of that file, two blocks of any filesystem reel runs on
 pub const FREE_PROBE_BYTES: usize = 8 * 1024;
 /// Layers of stacked devices a look at a disk goes down through
+#[cfg(target_os = "linux")]
 pub const MOST_STACK_DEPTH: usize = 8;
+/// The nice value a maintenance worker runs at, the lowest normal one
+#[cfg(target_os = "linux")]
+pub const MAINTENANCE_NICE: i32 = 19;
 /// The stack of a job thread, which holds a seal's and a merge's deepest calls with room to spare
 pub const JOB_STACK_BYTES: ByteCount = ByteCount(1024 * 1024);
-/// The nice value a maintenance worker runs at, the lowest normal one
-pub const MAINTENANCE_NICE: i32 = 19;
 /// What a job's touch leaves alone: the guard page, the thread's own data that glibc keeps in the stack, and the frames
 /// above the touch, about 15 KiB in a debug build. A kernel with 64 KiB pages takes 64 KiB for the guard alone
 pub const STACK_SLACK_BYTES: usize = 128 * 1024;

@@ -215,6 +215,7 @@ impl ColumnDirectory {
 
     /// Publish a list of every listing at once, sorted here, or return false when they don't fit. A listing at a time copies the
     /// whole list for each one, and one sort fills a directory of any size
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn publish_all(&self, listings: &[Listing]) -> bool {
         let mut target = hold(&self.spare);
         if listings.len() > target.entries.capacity() {

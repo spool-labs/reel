@@ -188,6 +188,7 @@ impl FilterArena {
     }
 
     /// Copy a block's bits out, for a check that wants them whole
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn copy_filter(&self, segment: SegmentNumber, offset: u32) -> Option<Vec<u8>> {
         self.in_window(segment, |extent| {
             let (start, end) = self.block_bits(extent, offset)?;

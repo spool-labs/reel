@@ -20,6 +20,7 @@ pub const MOST_RANGE_COVERS: usize = 4_096;
 pub const COVER_BLOCK: usize = 64;
 /// Covers a search looks at beside the ones that hold its key, however they nest. A search visits every cover that
 /// holds its key, so the worst case is a full pool nested over one key: 4,096 steps, 17.7 us on a macOS laptop
+#[cfg(any(test, feature = "test-hooks"))]
 pub const MOST_SEARCH_STEPS: usize = 200;
 /// Bytes a cover takes in a footer beside its keys: column, two key lengths and its place
 pub const COVER_RECORD_BYTES: usize = 1 + 2 + 2 + size_of::<u64>();
@@ -562,6 +563,7 @@ impl RangeCovers {
     }
 
     /// Count the covers a search for a key looks at
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn search_steps(&self, column: ColumnId, key: &[u8]) -> usize {
         let mut steps = 0;
         let _newest = self.read().newest_over(column, key, WritePlace(u64::MAX), &mut steps);

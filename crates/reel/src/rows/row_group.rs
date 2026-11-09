@@ -198,6 +198,7 @@ impl RowGroupBuffer {
 
 impl<'bytes> ParsedGroup<'bytes> {
     /// Walk the group's rows
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn walk(&self) -> RowWalk<'bytes> {
         RowWalk { rows: self.rows }
     }

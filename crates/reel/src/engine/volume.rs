@@ -422,6 +422,7 @@ impl<Backend: Io> Volume<Backend> {
     }
 
     /// Check any sealed segment has reached the table
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn table_holds_any(&self) -> bool {
         self.highest_sealed.load(Ordering::Acquire) > 0
     }

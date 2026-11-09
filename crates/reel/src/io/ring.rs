@@ -51,9 +51,11 @@ pub trait RingDriver<File>: Send + Sync + 'static {
 }
 
 /// The driver of a backend with no ring, which never exists
+#[cfg(not(target_os = "linux"))]
 #[derive(Clone, Copy, Debug)]
 pub enum NoRing {}
 
+#[cfg(not(target_os = "linux"))]
 impl<File> RingDriver<File> for NoRing {
     fn start(&self, _slot: usize, _file: &File, _offset: FileOffset, _length: usize) -> Result<()> {
         match *self {}

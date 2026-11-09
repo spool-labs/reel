@@ -593,6 +593,7 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// List the files with a segment's name that neither the lists nor a hold account for, which is always none at a quiet
     /// moment. A test asks this after every open and before every close
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn unlisted_segments(&self, volume: &Volume<Backend>) -> Result<Vec<SegmentNumber>> {
         let claims = hold(&volume.claims);
         let parked = hold(&volume.parked);

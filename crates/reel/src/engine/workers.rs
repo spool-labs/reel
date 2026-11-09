@@ -82,6 +82,7 @@ impl<Task: IoTask> Workers<Task> {
     }
 
     /// Check a worker is marked idle
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn is_idle(&self, index: usize) -> bool {
         self.idle[index / MASK_BITS].load(Ordering::SeqCst) >> (index % MASK_BITS) & 1 == 1
     }

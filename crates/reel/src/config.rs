@@ -12,8 +12,6 @@ use crate::segment::footer_writer::SMALLEST_ROW_BYTES;
 /// The fewest bytes a row with its record takes when its column declares no value: the smallest record and stored row
 pub const FORMAT_ROW_FLOOR: u64 = (SMALL_HEAD_BYTES + SMALLEST_ROW_BYTES) as u64;
 
-/// The memory budget when the caller doesn't set one
-pub const DEFAULT_MEMORY_BUDGET: ByteCount = ByteCount(512 * 1024 * 1024);
 /// The most walk slots and rewrite seats a volume has, which the 64-bit mask of slots carved from a walk target holds
 pub const MOST_VOLUME_SLOTS: usize = 64;
 /// The most maintenance workers a store runs, past any host's online CPUs

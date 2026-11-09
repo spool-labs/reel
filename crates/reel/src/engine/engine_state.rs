@@ -23,6 +23,7 @@ use crate::engine::compact_job::park;
 use crate::engine::open_segment::{data_path, output_path, rows_path};
 use crate::engine::read_pool::ReadPool;
 use crate::engine::walk_job::{FREE_BLOCK_BYTES, FreeRecord};
+#[cfg(any(test, feature = "test-hooks"))]
 use crate::segment::summary_orders::WalkList;
 use crate::engine::workers::Workers;
 use crate::engine::volume::{ParkedSegment, RewriteOutput, Volume};
@@ -358,6 +359,7 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Count a volume's segments waiting for the dead-byte walk
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn pending_walks(&self, volume: usize) -> usize {
         let rows = hold(&self.volumes[volume].summary);
         rows.orders().walk_count(WalkList::Unwalked) + rows.orders().walk_count(WalkList::Backward)
@@ -369,6 +371,7 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Check a volume's summary lookup still holds every row
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn is_summary_lookup_whole(&self, volume: usize) -> bool {
         hold(&self.volumes[volume].summary).is_lookup_whole()
     }

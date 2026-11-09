@@ -7,7 +7,8 @@ use std::collections::VecDeque;
 use std::future::{Future, poll_fn};
 use std::io::{Error, ErrorKind, IoSliceMut, Result};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use std::task::{Context, Poll, Waker};
 
 use reel_api::units::{ByteCount, FileOffset};
@@ -217,6 +218,7 @@ pub struct ReadRing<Driver> {
     slot_line: WaitLine,
     in_flight: AtomicUsize,
     is_closed: AtomicBool,
+    spinners: AtomicUsize,
 }
 
 /// A slot a read holds
@@ -256,6 +258,7 @@ impl<Driver> ReadRing<Driver> {
             slot_line: WaitLine::new(),
             in_flight: AtomicUsize::new(0),
             is_closed: AtomicBool::new(false),
+            spinners: AtomicUsize::new(0),
         }
     }
 
@@ -488,8 +491,37 @@ impl<File: IoFile, Driver: RingDriver<File>> DeviceReads<File> for OnRing<'_, Dr
     }
 }
 
+/// How long a blocking read with a spin seat spins on its slot before it parks. On the ccx33 a cold 4 KiB read lands in 110 to
+/// 140 us, and 120 to 1000 us all ran the same, while 60 us parked before the read landed and lost 10%
+pub const SEATED_SPIN: Duration = Duration::from_micros(250);
+/// How long a blocking read with no spin seat spins before it parks. On the ccx33 at 8 readers 0 and 10 us ran the same, 30 us
+/// lost 4% and 100 us lost 8%
+pub const WAIT_SPIN: Duration = Duration::from_micros(10);
+/// Readers that may spin at once. On the ccx33 a spinning reader took a cold get from 170 us to 142 and gained 10 to 20% at 1 to 4
+/// readers, and at 8 readers 2 seats ran 52 to 55k gets/s against 51 to 53k parked, 4 seats 50k and 6 seats 42k. Beside two busy
+/// threads 6 seats fell to 26k with a 3.3 ms p99, while 2 seats ran 46k
+pub const SPIN_SEATS: usize = 2;
+
+/// Unparks the thread it was made on
+pub struct Unpark(std::thread::Thread);
+
+impl std::task::Wake for Unpark {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+thread_local! {
+    /// This thread's waker for a parked blocking read, made once so a read allocates nothing
+    static THREAD_WAKER: Waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+}
+
 /// Reads that wait for a ring on the calling thread, for a blocking get. What the kernel holds answers with no submit, and a read
-/// it doesn't hold goes to the ring, and the caller spins on its slot until the reaper lands it, with no wake between them
+/// it doesn't hold goes to the ring, and the caller waits on its slot until the reaper lands it
 #[derive(Debug)]
 pub struct RingWait<'ring, Driver>(pub &'ring ReadRing<Driver>);
 
@@ -569,17 +601,40 @@ impl<Driver> ReadRing<Driver> {
 }
 
 impl<Driver> RingLease<'_, Driver> {
-    /// Spin on the slot until its read lands, and take its answer
+    /// Wait on this thread for the slot's read to land, and take its answer. A reader spins while a core is free for it, then parks
+    /// until the reaper's completion wakes it, so a full box keeps its cores for the submit thread and the reaper
     pub fn wait_now(&self) -> Result<usize> {
-        loop {
+        let spinners = &self.ring.spinners;
+        let mut is_seated = spinners.fetch_add(1, Ordering::Relaxed) < SPIN_SEATS;
+        if !is_seated {
+            spinners.fetch_sub(1, Ordering::Relaxed);
+        }
+        let spin = if is_seated { SEATED_SPIN } else { WAIT_SPIN };
+        let spun = Instant::now();
+        let answer = loop {
             {
                 let mut held = hold(&self.ring.slots[self.slot]);
                 if held.phase == RingPhase::Done {
-                    return std::mem::replace(&mut held.answer, Ok(0));
+                    break std::mem::replace(&mut held.answer, Ok(0));
+                }
+                if spun.elapsed() >= spin {
+                    held.waker = Some(THREAD_WAKER.with(Waker::clone));
+                    drop(held);
+                    // a parked reader gives its seat to the next
+                    if is_seated {
+                        spinners.fetch_sub(1, Ordering::Relaxed);
+                        is_seated = false;
+                    }
+                    std::thread::park();
+                    continue;
                 }
             }
             std::hint::spin_loop();
+        };
+        if is_seated {
+            spinners.fetch_sub(1, Ordering::Relaxed);
         }
+        answer
     }
 }
 

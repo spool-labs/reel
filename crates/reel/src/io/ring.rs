@@ -347,7 +347,7 @@ impl<Driver> ReadRing<Driver> {
 
 impl<Driver> ReadRing<Driver> {
     /// Read up to a slot's bytes, and say how many came
-    pub async fn read_once<File>(&self, file: &File, offset: FileOffset, out: &mut [u8]) -> Result<usize>
+    async fn read_once<File>(&self, file: &File, offset: FileOffset, out: &mut [u8]) -> Result<usize>
     where
         Driver: RingDriver<File>,
         File: Sync,
@@ -537,7 +537,7 @@ impl<Driver> ReadRing<Driver> {
     }
 
     /// Read up to a slot's bytes on this thread, and say how many came
-    pub fn read_once_now<File>(&self, file: &File, offset: FileOffset, out: &mut [u8]) -> Result<usize>
+    fn read_once_now<File>(&self, file: &File, offset: FileOffset, out: &mut [u8]) -> Result<usize>
     where
         Driver: RingDriver<File>,
     {

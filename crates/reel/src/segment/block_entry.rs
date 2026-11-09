@@ -113,6 +113,14 @@ impl BlockEntry {
         })
     }
 
+    /// Check the entry can describe a block: its header past `after`, then the block, no longer than `most_length`, then its
+    /// filter. A sum only shows the writer wrote these bytes, and a writer bug's offsets would underflow the reads below
+    pub fn is_shaped(&self, after: u64, most_length: usize) -> bool {
+        let header = u64::from(self.block_offset).checked_sub(BLOCK_HEADER_BYTES as u64);
+        let length = self.filter_offset.checked_sub(self.block_offset);
+        header.is_some_and(|header| header >= after) && length.is_some_and(|length| length > 0 && length as usize <= most_length)
+    }
+
     /// Find where the block's header starts, which is where the filter before it ends
     pub fn header_at(&self) -> FileOffset {
         FileOffset(u64::from(self.block_offset) - BLOCK_HEADER_BYTES as u64)

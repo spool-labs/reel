@@ -26,3 +26,25 @@ fn prefix_order() {
     assert!(KeyPrefix::of_key(b"ab", 0) < KeyPrefix::of_key(b"b", 0));
     assert_eq!(KeyPrefix::of_key(b"ab", 5), KeyPrefix::default());
 }
+
+// an entry whose offsets would underflow or run past the buffer is refused before any read uses them
+#[test]
+fn shape_refusals() {
+    let entry = |block_offset: u32, filter_offset: u32| BlockEntry {
+        first_key: KeyPrefix::default(),
+        block_offset,
+        filter_offset,
+        live_rows: 1,
+    };
+    let header = reel::segment::row_block::BLOCK_HEADER_BYTES as u32;
+    assert!(entry(1_000, 2_000).is_shaped(0, 4_096));
+    // the header would start before the offset 0
+    assert!(!entry(header - 1, 2_000).is_shaped(0, 4_096));
+    // the header starts inside what came before
+    assert!(!entry(1_000, 2_000).is_shaped(u64::from(1_000 - header + 1), 4_096));
+    // the filter starts before the block, or where it does
+    assert!(!entry(2_000, 1_000).is_shaped(0, 4_096));
+    assert!(!entry(2_000, 2_000).is_shaped(0, 4_096));
+    // the block is longer than any read buffer holds
+    assert!(!entry(1_000, 6_000).is_shaped(0, 4_096));
+}

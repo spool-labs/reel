@@ -81,13 +81,19 @@ impl UringDriver {
             queue.push(entry)
         };
         pushed.map_err(|_full| Error::from(ErrorKind::WouldBlock))?;
-        self.ring.submitter().submit()?;
+        // a pushed entry is the kernel's whatever this says: the submit thread or the reaper's next wait sends it, so the slot stays in
+        // flight and a failed submit only waits for that
+        let _sent = self.ring.submitter().submit();
         Ok(())
     }
 }
 
 impl RingDriver<PlainFile> for UringDriver {
     fn start(&self, slot: usize, file: &PlainFile, offset: FileOffset, length: usize) -> Result<()> {
+        // the kernel writes up to the length into the slot, so a longer one would run into the next
+        if length > RING_SLOT_BYTES {
+            return Err(Error::from(ErrorKind::InvalidInput));
+        }
         let entry = opcode::ReadFixed::new(types::Fd(file.descriptor()), self.slot_start(slot), length as u32, BUFFER_INDEX)
             .offset(offset.0)
             .build()
@@ -123,12 +129,14 @@ impl RingDriver<PlainFile> for UringDriver {
     }
 
     fn copy_out(&self, slot: usize, out: &mut [u8]) {
+        assert!(out.len() <= RING_SLOT_BYTES, "a copy past its slot");
         // the completion ended the kernel's turn, and the slot stays held until this copy is done
         let bytes = unsafe { std::slice::from_raw_parts(self.slot_start(slot).cast_const(), out.len()) };
         out.copy_from_slice(bytes);
     }
 
     fn copy_parts(&self, slot: usize, parts: &mut [IoSliceMut<'_>]) {
+        assert!(parts.iter().map(|part| part.len()).sum::<usize>() <= RING_SLOT_BYTES, "a copy past its slot");
         let mut at = 0;
         for part in parts {
             let length = part.len();

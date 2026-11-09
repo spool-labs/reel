@@ -221,6 +221,8 @@ impl FooterReader {
         let mut remaining = head.block_count.0 as usize;
         let mut sum = Checksum(0);
         let lines_per_read = self.block.len() / BLOCK_ENTRY_BYTES;
+        // the blocks run in order from the records' end, each with its filter before the next header
+        let mut after = head.data_end.0;
         while remaining > 0 {
             let lines = remaining.min(lines_per_read);
             let length = lines * BLOCK_ENTRY_BYTES;
@@ -232,12 +234,16 @@ impl FooterReader {
                 let Some(entry) = BlockEntry::read(&self.block[line * BLOCK_ENTRY_BYTES..]) else {
                     return Ok(false);
                 };
+                if !entry.is_shaped(after, self.block.len()) {
+                    return Ok(false);
+                }
+                after = u64::from(entry.filter_offset);
                 entries.push(entry);
             }
             at = FileOffset(at.0 + length as u64);
             remaining -= lines;
         }
-        Ok(sum == head.index_sum)
+        Ok(sum == head.index_sum && after <= start.0)
     }
 
     /// Find a key's newest row at a read point, through its filter and one row block
@@ -290,6 +296,9 @@ impl FooterReader {
         };
 
         let length = first.block_length().0 as usize;
+        if length > self.block.len() {
+            return Ok(false);
+        }
         if !read_or_damaged(file, first.block_at(), &mut self.block[..length])? {
             return Ok(false);
         }
@@ -302,6 +311,9 @@ impl FooterReader {
         }
 
         let length = last.block_length().0 as usize;
+        if length > self.block.len() {
+            return Ok(false);
+        }
         if !read_or_damaged(file, last.block_at(), &mut self.block[..length])? {
             return Ok(false);
         }

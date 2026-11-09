@@ -386,7 +386,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             Some(offset) => offset,
             None => {
                 volume.keyed_copies.fetch_add(1, Ordering::Relaxed);
-                self.copy_record(&pin.file, &output.file, row)?
+                self.copy_record(&pin.file, &output.file, row).map_err(|error| self.note_lost(pin.head.segment, error))?
             },
         };
         let kept = FooterRow { offset, ..*row };

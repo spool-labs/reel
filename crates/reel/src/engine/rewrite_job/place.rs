@@ -27,7 +27,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             return Err(Error::from(ErrorKind::NotFound));
         };
         if self.stripe_copied.is_some() {
-            return self.copy_stripe(&pin.file);
+            return self.copy_stripe(&pin.file).map_err(|error| self.note_unreadable(input, error));
         }
         if self.inputs[input].row.is_none() && self.inputs[input].length == 0 {
             self.inputs[input].advance(volume, &pin).map_err(|error| self.note_unreadable(input, error))?;
@@ -38,7 +38,7 @@ impl<Backend: Io> RewriteJob<Backend> {
                 // the input's kept records go in offset order, whichever output each one belongs to
                 self.stripe.sort_unstable_by_key(|listed| listed.offset);
                 self.stripe_copied = Some(0);
-                return self.copy_stripe(&pin.file);
+                return self.copy_stripe(&pin.file).map_err(|error| self.note_unreadable(input, error));
             };
             let at = (self.inputs[input].base + self.inputs[input].ordinal()) as usize;
             if self.is_marked(at) {

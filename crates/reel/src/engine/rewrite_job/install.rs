@@ -487,8 +487,14 @@ impl<Backend: Io> RewriteJob<Backend> {
 
     /// Note the input a read failed on when the device lost its bytes or a row block fails its check, and pass the error on
     pub fn note_unreadable(&mut self, input: usize, error: Error) -> Error {
+        self.note_lost(self.numbers[input], error)
+    }
+
+    /// Note a segment a read failed on when the device lost its bytes or they fail their check, and pass the error on. A
+    /// record lost in an input fails every merge it joins as surely as a lost row block does
+    pub fn note_lost(&mut self, segment: SegmentNumber, error: Error) -> Error {
         if is_device_error(&error) || error.kind() == ErrorKind::InvalidData {
-            self.unreadable = Some(self.numbers[input]);
+            self.unreadable = Some(segment);
         }
         error
     }

@@ -535,6 +535,14 @@ fn merge_meets_bad_sector() {
     assert_merge_damages(&built);
 }
 
+// and for a record whose bytes the device lost, which a merge reads when it copies the record across
+#[test]
+fn merge_meets_lost_record() {
+    let built = build(14);
+    built.io.bad_sector(&built.files[MIDDLE], FileOffset(8)).expect("bad sector");
+    assert_merge_damages(&built);
+}
+
 fn assert_merge_damages(built: &Built) {
     let store = open(&built.io);
     hold_rebuilds(&store);

@@ -155,3 +155,15 @@ fn long_key_writes_nothing() {
     assert_eq!(key, key_of(1));
     assert_eq!(walk.next_row(&mut key), None);
 }
+
+// a row whose place or length overflows reads as no row, where it once overflowed the add. The fuzzer found these bytes
+#[test]
+fn overflowing_row() {
+    let block = [
+        0x41, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0xd2, 0x20, 0x00, 0x3a, 0x01, 0xd2, 0x20, 0x5a, 0x5a,
+        0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x00, 0x3a, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x41,
+    ];
+    let mut key: Vec<u8> = Vec::with_capacity(64);
+    let mut walk = RowBlockWalk::open_checked(&block, WritePlace(1 << 32)).expect("a walk");
+    while walk.next_row(&mut key).is_some() {}
+}

@@ -331,21 +331,23 @@ impl<'block> RowBlockWalk<'block> {
         let kind = RowKind::from_byte((first & KIND_MASK) as u8)?;
         let (suffix_length, suffix_bytes) = read_varint(bytes.get(shared_bytes..)?)?;
         let suffix_at = shared_bytes + suffix_bytes;
-        let suffix = bytes.get(suffix_at..suffix_at + suffix_length as usize)?;
+        // a length or place that overflows is no row, however its block's sum came out
+        let place_at = suffix_at.checked_add(usize::try_from(suffix_length).ok()?)?;
+        let suffix = bytes.get(suffix_at..place_at)?;
         key.truncate(shared as usize);
         key.extend_from_slice(suffix).ok()?;
 
-        let place_at = suffix_at + suffix_length as usize;
         let (place, place_bytes) = read_varint(bytes.get(place_at..)?)?;
         let offset_at = place_at + place_bytes;
         let (offset, offset_bytes) = read_varint(bytes.get(offset_at..)?)?;
         let length_at = offset_at + offset_bytes;
         let (length, length_bytes) = read_varint(bytes.get(length_at..)?)?;
+        let place = self.place_base.0.checked_add(place)?;
 
         self.position += length_at + length_bytes;
         self.next_index += 1;
         Some(FooterRow {
-            place: WritePlace(self.place_base.0 + place),
+            place: WritePlace(place),
             offset: FileOffset(offset),
             length: ByteCount(length),
             kind,

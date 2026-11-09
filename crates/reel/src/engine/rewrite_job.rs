@@ -31,6 +31,7 @@ use crate::engine::volume::{GRAVE_SLOT, GaveUp, MOST_MERGE_OUTPUTS, NO_SEAL, Out
 use crate::engine::walk_job::add_count;
 use crate::guard::hold;
 use crate::lifetime::MarkRange;
+use crate::io::device_error::is_device_error;
 use crate::io::{Io, IoFile};
 use crate::fixed_list::{FixedList, ListFull};
 use crate::region::{LIST_ALIGN_ROOM, REGION_HEAD_BYTES, Region, list_bytes};
@@ -372,6 +373,8 @@ pub struct RewriteJob<Backend: Io> {
     admitted: Option<(Admit, RewriteBound)>,
     /// A claimed pick waiting for its first step: its target, and whether it decides its graves first
     claimed: Option<(MergeTarget, bool)>,
+    /// An input with a row block the device lost or that fails its check, which the give-up damages so no pick takes it again
+    unreadable: Option<SegmentNumber>,
     /// The need the region in hand was admitted with, which goes back at the job's end
     region_need: ByteCount,
     /// The forced segment a pick took, which goes back when admission turns the pick away
@@ -505,6 +508,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             forced: None,
             admitted: None,
             claimed: None,
+            unreadable: None,
             region_need: ByteCount(0),
             forced_pick: None,
             region: None,
@@ -1177,6 +1181,10 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.state.volumes[self.volume].footer_reads[pass].fetch_add(read, Ordering::Relaxed);
         self.state.note_unit(self.unit.0, self.unit.1, started);
         if outcome.is_err() {
+            // a lost or rotten block fails every merge it joins, so its segment is damage the way a get would find it
+            if let Some(segment) = self.unreadable.take() {
+                self.state.damage_unread(self.volume, segment);
+            }
             self.abandon();
         }
     }
@@ -1193,7 +1201,7 @@ impl<Backend: Io> RewriteJob<Backend> {
                 return Err(Error::from(ErrorKind::NotFound));
             };
             if self.inputs[index].row.is_none() && self.inputs[index].length == 0 {
-                self.inputs[index].advance(volume, pin)?;
+                self.inputs[index].advance(volume, pin).map_err(|error| self.note_unreadable(index, error))?;
             }
         }
 
@@ -1223,7 +1231,7 @@ impl<Backend: Io> RewriteJob<Backend> {
                 self.last_column = None;
                 return Ok(());
             }
-            self.inputs[index].advance(volume, pin)?;
+            self.inputs[index].advance(volume, pin).map_err(|error| self.note_unreadable(index, error))?;
         }
         Ok(())
     }
@@ -1656,7 +1664,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             return self.copy_stripe(&pin.file);
         }
         if self.inputs[input].row.is_none() && self.inputs[input].length == 0 {
-            self.inputs[input].advance(volume, &pin)?;
+            self.inputs[input].advance(volume, &pin).map_err(|error| self.note_unreadable(input, error))?;
         }
         for _row in 0..MERGE_STEP_ROWS {
             self.unit.1 += 1;
@@ -1674,7 +1682,7 @@ impl<Backend: Io> RewriteJob<Backend> {
                 };
                 self.stripe.push(StripeRow { offset, length, ordinal: at as u32 })?;
             }
-            self.inputs[input].advance(volume, &pin)?;
+            self.inputs[input].advance(volume, &pin).map_err(|error| self.note_unreadable(input, error))?;
         }
         Ok(())
     }
@@ -2289,6 +2297,14 @@ impl<Backend: Io> RewriteJob<Backend> {
         for number in &self.numbers[..self.input_count] {
             gave_up.add(*number);
         }
+    }
+
+    /// Note the input a read failed on when the device lost its bytes or a row block fails its check, and pass the error on
+    pub fn note_unreadable(&mut self, input: usize, error: Error) -> Error {
+        if is_device_error(&error) || error.kind() == ErrorKind::InvalidData {
+            self.unreadable = Some(self.numbers[input]);
+        }
+        error
     }
 
     /// Give the merge up: the inputs stay, and the outputs go whatever name they have reached

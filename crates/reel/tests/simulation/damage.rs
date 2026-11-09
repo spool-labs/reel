@@ -517,6 +517,39 @@ fn one_block() {
     store.close().expect("close");
 }
 
+// a merge that meets a rotten row block damages its segment and goes quiet, where it once picked the same inputs forever
+#[test]
+fn merge_meets_rot() {
+    let built = build(12);
+    let at = built.heads[MIDDLE].data_end.0 + BLOCK_HEADER_BYTES as u64 + 5;
+    built.io.rot(&built.files[MIDDLE], FileOffset(at), FLIP).expect("rot");
+    assert_merge_damages(&built);
+}
+
+// the same for a block the device can't read at all
+#[test]
+fn merge_meets_bad_sector() {
+    let built = build(13);
+    let at = built.heads[MIDDLE].data_end.0 + BLOCK_HEADER_BYTES as u64 + 5;
+    built.io.bad_sector(&built.files[MIDDLE], FileOffset(at)).expect("bad sector");
+    assert_merge_damages(&built);
+}
+
+fn assert_merge_damages(built: &Built) {
+    let store = open(&built.io);
+    hold_rebuilds(&store);
+    settle(&built.io);
+    assert_eq!(store.damaged_segments(), 1);
+    for ((column, key), entry) in &built.model {
+        match read(&store, *column, key) {
+            Ok(value) => assert_eq!(value, entry.value, "key {key:?}"),
+            Err(StoreError::Corruption { .. }) => {},
+            Err(error) => panic!("key {key:?} failed: {error}"),
+        }
+    }
+    store.close().expect("close");
+}
+
 // a put or delete inside a range lands above it and serves, also after another open
 #[test]
 fn write_above() {

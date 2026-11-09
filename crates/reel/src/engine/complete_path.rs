@@ -220,8 +220,8 @@ impl<Backend: Io> EngineState<Backend> {
         Ok(())
     }
 
-    /// Damage a segment with a row block open couldn't read. The block's keys have no slot, so they would otherwise read as absent.
-    /// The segment stays in the table and its row keeps its facts
+    /// Damage a segment with a row block open or a merge couldn't read. The block's keys have no slot, so they would otherwise read
+    /// as absent. The segment stays in the table and its row keeps its facts
     pub fn damage_unread(&self, index: usize, number: SegmentNumber) {
         let volume = &self.volumes[index];
         let counter = self.places.last_given();
@@ -231,6 +231,7 @@ impl<Backend: Io> EngineState<Backend> {
         let mut damaged = hold(&volume.damaged);
         if !damaged.contains(&number) {
             damaged.push(number);
+            self.damaged_segments.fetch_add(1, Ordering::AcqRel);
         }
         drop(damaged);
         widen_row(self, index, &mut hold(&volume.summary), number, counter);

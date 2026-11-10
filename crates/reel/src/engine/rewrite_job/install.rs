@@ -322,6 +322,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.target = None;
         volume.lanes[self.lane].output_floor.store(NO_SEAL, Ordering::Release);
         volume.lanes[self.lane].is_rewriting.store(false, Ordering::Release);
+        self.release_promise(volume);
         *hold(&volume.lanes[self.lane].merging) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
         *hold(&volume.lanes[self.lane].inputs) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
         self.release_hold(volume);
@@ -527,6 +528,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.drain_to_inputs(volume);
         self.release_hold(volume);
         volume.lanes[self.lane].is_rewriting.store(false, Ordering::Release);
+        self.release_promise(volume);
         *hold(&volume.lanes[self.lane].merging) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
         *hold(&volume.lanes[self.lane].inputs) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
         self.release_region();
@@ -577,5 +579,13 @@ pub fn list_output<'tail, Backend: Io>(
         {
             volume.fail();
         }
+    }
+}
+
+impl<Backend: Io> RewriteJob<Backend> {
+    /// Give back the output room this merge claimed
+    pub fn release_promise(&mut self, volume: &Volume<Backend>) {
+        volume.outputs_promised.fetch_sub(self.promised.0, Ordering::AcqRel);
+        self.promised = ByteCount(0);
     }
 }

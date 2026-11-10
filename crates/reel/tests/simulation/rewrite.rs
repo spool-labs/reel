@@ -3147,3 +3147,29 @@ fn silence_ends_ingest() {
     assert!(!volume.is_ingesting(Nanoseconds(now + IDLE_SEAL_AFTER.0)), "an hour's fill held the window past the silence");
     store.close().expect("close");
 }
+
+// a merge starts only with disk room for its output beside the writers' reserve and a segment
+#[test]
+fn merge_waits_for_disk_room() {
+    let io = SimulatedIo::new(Seed(94));
+    let root = PathBuf::from(ROOT);
+    io.add_disk(&root, ByteCount(1 << 40));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    pile_up(&store, &io, OVER_THE_BOUND);
+    let volume = &store.state.volumes[0];
+    let used = (1 << 40) - io.free_space(&root).expect("free").0;
+    io.add_disk(&root, ByteCount(used + volume.reserve.0 + volume.segment_bytes.0));
+
+    let refused = || volume.picks[PickOutcome::Refused.index()].load(Ordering::Acquire);
+    let before = refused();
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(!start_merge(&mut job), "a merge started with no room for its output");
+    assert!(refused() > before);
+
+    io.add_disk(&root, ByteCount(1 << 40));
+    assert!(start_merge(&mut job));
+    run_to_end(&mut job);
+    check_pile(&store, OVER_THE_BOUND);
+    store.close().expect("close");
+}

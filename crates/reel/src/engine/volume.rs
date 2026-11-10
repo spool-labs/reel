@@ -322,6 +322,8 @@ pub struct Volume<Backend: Io> {
     pub bytes_since_sync: AtomicU64,
     /// When the row job last saw a write land on the volume
     pub last_write_at: AtomicU64,
+    /// Bytes of outputs the running merges claimed room for
+    pub outputs_promised: AtomicU64,
     /// Seals that ended a segment writes had gone quiet on
     pub idle_seals: AtomicU64,
     /// Nanoseconds from the last sealed segment's first row to its seal start, the time the writes took to fill it, or 0 before a

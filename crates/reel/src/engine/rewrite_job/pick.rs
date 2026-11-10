@@ -11,6 +11,7 @@ use reel_api::maintenance_report::{
 };
 use reel_api::units::{ByteCount, DeathMark, FileOffset};
 
+use crate::engine::engine_state::EngineState;
 use crate::engine::seal_job::MOST_SEGMENT_BLOCKS;
 use crate::engine::volume::{MOST_MERGE_OUTPUTS, Volume};
 use crate::guard::hold;
@@ -42,6 +43,18 @@ impl<Backend: Io> RewriteJob<Backend> {
         let Some((target, is_grave_heavy)) = self.pick_admitted(volume) else {
             return false;
         };
+        // an output takes its disk before its inputs give theirs back, so a merge starts only with room beside the writers'
+        if !has_disk_room(&state, volume, target.length) {
+            if let Some((admit, _bound)) = self.admitted.take() {
+                state.give_back(admit.role, admit.need, ByteCount(0));
+            }
+            self.unpick(volume);
+            self.has_looks_left = false;
+            volume.note_pick(PickOutcome::Refused);
+            return false;
+        }
+        self.promised = target.length;
+        volume.outputs_promised.fetch_add(target.length.0, Ordering::AcqRel);
         self.clear(target);
         volume.lanes[self.lane].is_rewriting.store(!self.is_unwalked, Ordering::Release);
         let mut inputs = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
@@ -666,4 +679,10 @@ pub fn is_reclaim_due(rows: &SummaryRows) -> bool {
 /// list keep it out for good
 pub fn can_ever_merge(row: &SummaryRow<'_>) -> bool {
     !row.facts.is_damaged && !row.facts.has_covers && row.facts.block_count > 0
+}
+
+/// Check every root has room for a merge's output beside the writers' reserve and a segment, and the outputs other merges claimed
+pub fn has_disk_room<Backend: Io>(state: &EngineState<Backend>, volume: &Volume<Backend>, output: ByteCount) -> bool {
+    let need = volume.reserve.0 + volume.segment_bytes.0 + volume.outputs_promised.load(Ordering::Acquire) + output.0;
+    volume.roots.iter().all(|root| state.io.free_space(root).is_ok_and(|free| free.0 >= need))
 }

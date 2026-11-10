@@ -1427,7 +1427,7 @@ fn walk_after_merges_counts_once() {
     store.close().expect("close");
 }
 
-// a merge takes walked inputs or unwalked ones and never both, and an unwalked one leaves the walk free
+// a merge takes walked inputs or unwalked ones and never both, and the walked ones go first
 #[test]
 fn no_mix_of_walked() {
     let io = SimulatedIo::new(Seed(52));
@@ -1440,11 +1440,10 @@ fn no_mix_of_walked() {
     let volume = &store.state.volumes[0];
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
     assert!(start_merge(&mut job));
-    assert!(job.rewrite.is_unwalked_merge());
-    assert!(!volume.is_rewriting());
+    assert!(!job.rewrite.is_unwalked_merge());
     let rows = hold(&volume.summary);
     for input in job.rewrite.input_numbers() {
-        assert!(!rows.get(*input).expect("a row").facts.is_walked());
+        assert!(rows.get(*input).expect("a row").facts.is_walked());
     }
     drop(rows);
     job.rewrite.abandon();
@@ -2809,10 +2808,10 @@ fn cool(store: &Store, io: &SimulatedIo) {
 }
 
 
-// an overlap merge takes the widest ranges over its point first, so segments that span every key merge ahead of narrow ones,
-// small as those are
+// an overlap merge takes the deadest segments over its point first, so segments of overwritten rows merge ahead of wide ones
+// that hold live rows
 #[test]
-fn overlap_takes_the_widest_first() {
+fn overlap_takes_the_deadest_first() {
     let io = SimulatedIo::new(Seed(82));
     let store = open(&io);
     // the merge mechanics under test, not the size of the records, decide what merges
@@ -2834,7 +2833,7 @@ fn overlap_takes_the_widest_first() {
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
     assert!(start_merge(&mut job));
     let inputs = job.rewrite.input_numbers().to_vec();
-    assert!(inputs.len() > 1 && inputs.iter().all(|input| wide.contains(input)), "a narrow segment went ahead of a wide one: {inputs:?}");
+    assert!(inputs.len() > 1 && inputs.iter().all(|input| !wide.contains(input)), "a live segment went ahead of a dead one: {inputs:?}");
     run_to_end(&mut job);
     store.close().expect("close");
 }

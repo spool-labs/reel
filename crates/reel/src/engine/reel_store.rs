@@ -52,7 +52,7 @@ use crate::engine::filter_job::FilterLoader;
 use crate::engine::planner::Planner;
 use crate::engine::walk_job::{BlockCounter, WalkJob, WalkSlot, WalkWorker};
 use crate::engine::workers::Workers;
-use crate::engine::volume::{SealStepTimes, ClaimState, GaveUp, MOST_MERGE_OUTPUTS, MOST_PARKED, NO_SEAL, RewriteLane, SyncState, Volume};
+use crate::engine::volume::{SealStepTimes, ClaimState, GaveUp, MOST_MERGE_OUTPUTS, MOST_PARKED, NO_CALL, NO_SEAL, RewriteLane, SyncState, Volume};
 #[cfg(feature = "test-hooks")]
 use crate::engine::volume::TestHolds;
 use crate::guard::hold;
@@ -227,10 +227,14 @@ impl<Backend: Io> ReelStore<Backend> {
         Ok(())
     }
 
+    /// Count a read, which tells maintenance callers are still busy, and check the store is open
+    pub fn check_read(&self) -> Result<(), StoreError> {
+        self.state.caller_ops.note();
+        self.check_open()
+    }
+
     /// Refuse a call after close
     pub fn check_open(&self) -> Result<(), StoreError> {
-        // every caller operation comes through here, and its count tells maintenance callers are still busy
-        self.state.caller_ops.note();
         if self.is_closed.load(Ordering::Acquire) {
             return Err(StoreError::Closed);
         }
@@ -295,13 +299,13 @@ impl<Backend: Io> ReelStore<Backend> {
 
     /// Fill a buffer with the newest value, and say whether the key has one
     pub fn get(&self, column: ColumnId, key: &[u8], buf: &mut Vec<u8>) -> Result<bool, StoreError> {
-        self.check_open()?;
+        self.check_read()?;
         self.state.counted(self.state.get_latest(column, key, RecordWant::Whole, buf))
     }
 
     /// Answer every key at one point in the write order, with a bad record as that key's answer
     pub fn get_many(&self, column: ColumnId, keys: &[&[u8]], values: &mut ValueList) -> Result<(), StoreError> {
-        self.check_open()?;
+        self.check_read()?;
         let answer = self.state.get_many_now(column, keys, values);
         self.state.corruption_errors.fetch_add(values.corrupt_count(), Ordering::Relaxed);
         answer
@@ -315,20 +319,20 @@ impl<Backend: Io> ReelStore<Backend> {
         window: ValueWindow,
         buf: &mut Vec<u8>,
     ) -> Result<bool, StoreError> {
-        self.check_open()?;
+        self.check_read()?;
         let want = RecordWant::Window(window);
         self.state.counted(self.state.get_latest(column, key, want, buf))
     }
 
     /// Take a read view at this point in the write order, which copies no data and never blocks a writer
     pub fn cue(&self) -> Result<Cue<Backend>, StoreError> {
-        self.check_open()?;
+        self.check_read()?;
         Cue::new(Arc::clone(&self.state))
     }
 
     /// Walk rows and keys from a key, which comes first when it has a row
     pub fn iter_from(&self, column: ColumnId, start: &[u8], direction: Direction) -> Result<StoreScan<Backend>, StoreError> {
-        self.check_open()?;
+        self.check_read()?;
         StoreScan::new(Arc::clone(&self.state), &from_key(column, start, direction))
     }
 
@@ -346,7 +350,7 @@ impl<Backend: Io> ReelStore<Backend> {
 
     /// Walk rows and keys under a prefix
     pub fn iter_prefix(&self, column: ColumnId, prefix: &[u8]) -> Result<StoreScan<Backend>, StoreError> {
-        self.check_open()?;
+        self.check_read()?;
         StoreScan::new(Arc::clone(&self.state), &under_prefix(column, prefix))
     }
 
@@ -362,7 +366,7 @@ impl<Backend: Io> ReelStore<Backend> {
 
     /// Check whether the key has a value, without reading the value
     pub fn contains(&self, column: ColumnId, key: &[u8]) -> Result<bool, StoreError> {
-        self.check_open()?;
+        self.check_read()?;
         self.state.counted(self.state.contains_now(column, key))
     }
 
@@ -1395,7 +1399,8 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         park_refusals: AtomicU64::new(0),
         most_in_flight: AtomicU64::new(0),
         callers_seen: AtomicU64::new(0),
-        last_call_at: AtomicU64::new(0),
+        last_call_at: AtomicU64::new(NO_CALL),
+        callers_looked_at: AtomicU64::new(0),
         capped_picks: AtomicU64::new(0),
         outputs_promised: AtomicU64::new(0),
         is_room_short: AtomicBool::new(false),

@@ -165,6 +165,11 @@ fn workers_run_rewrites() {
 
 // the most rewrites seen running at once while the jobs drain a volume of half-dead segments
 fn most_rewrites_at_once(device: DeviceClass) -> usize {
+    most_rewrites(device, false)
+}
+
+// the most rewrites that ran at once, with a get on every step when asked, so callers read as busy
+fn most_rewrites(device: DeviceClass, is_reading: bool) -> usize {
     let io = SimulatedIo::new(Seed(6));
     let threads = ThreadCounts { maintenance_workers: Some(3), ..ThreadCounts::default() };
     let store: Store = ReelStore::open(io.clone(), &config_on(threads, device)).expect("open");
@@ -193,6 +198,10 @@ fn most_rewrites_at_once(device: DeviceClass) -> usize {
     for _step in 0..STEPS {
         let running = volume.lanes.iter().filter(|lane| hold(&lane.inputs)[0] != SegmentNumber(0)).count();
         most = most.max(running);
+        if is_reading {
+            let mut buf = Vec::new();
+            let _found = store.get(COLUMN, b"key-0-0000", &mut buf).expect("get");
+        }
         if io.step_any().is_none() {
             io.advance_clock(TICK);
             if io.step_any().is_none() {
@@ -348,4 +357,10 @@ fn cool(store: &Store, io: &SimulatedIo) {
     let until = store.state.volumes.iter().map(|volume| volume.hot_until().0).max().unwrap_or(0);
     io.advance_clock(Nanoseconds(until.saturating_sub(io.clock_reading().0)));
     settle(io);
+}
+
+// callers reading keep merges in flight at the cap, so gets keep their cores, where a quiet volume runs several
+#[test]
+fn reads_hold_merges_at_the_cap() {
+    assert_eq!(most_rewrites(DeviceClass::Solid, true), 1);
 }

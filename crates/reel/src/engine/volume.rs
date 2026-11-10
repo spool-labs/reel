@@ -32,8 +32,11 @@ pub const NO_SEAL: u64 = u64::MAX;
 /// Room for segments out of every list whose files wait for their reads to finish, for each rewrite lane, so every lane can park a
 /// merge's inputs at once
 pub const MOST_PARKED: usize = 8;
-/// Merges that run at once while callers are busy, so gets keep their cores; once callers go quiet every worker may merge
-pub const MERGE_CAP_ACTIVE: usize = 2;
+/// Workers for each merge that may run while callers are busy, so gets keep their cores; once callers go quiet every worker may
+/// merge. A starting value, tuned at the end
+pub const MERGE_CAP_WORKERS: usize = 4;
+/// The call time of a volume no caller has read from yet
+pub const NO_CALL: u64 = u64::MAX;
 
 /// A segment out of every list, whose file goes once no read holds it
 #[derive(Clone, Debug)]
@@ -368,6 +371,7 @@ pub struct Volume<Backend: Io> {
     /// The caller operations a pick last saw, and when the count last moved
     pub callers_seen: AtomicU64,
     pub last_call_at: AtomicU64,
+    pub callers_looked_at: AtomicU64,
     /// Picks put off because callers were busy and the merges in flight had reached the cap
     pub capped_picks: AtomicU64,
     /// One bit for each row the walk charged, for segments born since open
@@ -578,34 +582,42 @@ impl<Backend: Io> Volume<Backend> {
         fill < merge && self.is_ingesting(now)
     }
 
-    /// Check writes are still arriving: the last seal started less than two fill times ago. Record rewrites, which spend writes
     /// Note the caller operations so far, and when the count last moved
     pub fn note_callers(&self, total: u64, now: Nanoseconds) {
-        if self.callers_seen.swap(total, Ordering::Relaxed) != total {
+        let looked_at = self.callers_looked_at.swap(now.0, Ordering::Relaxed);
+        // a count that moved since a look older than the quiet spell can't say when, so it marks nothing recent
+        if self.callers_seen.swap(total, Ordering::Relaxed) != total && now.0.saturating_sub(looked_at) < IDLE_SEAL_AFTER.0 {
             self.last_call_at.store(now.0, Ordering::Relaxed);
         }
     }
 
     /// Check callers wrote within the hot window or called within the quiet spell that ends it
     pub fn is_caller_active(&self, now: Nanoseconds) -> bool {
-        self.is_ingesting(now) || now.0.saturating_sub(self.last_call_at.load(Ordering::Relaxed)) < IDLE_SEAL_AFTER.0
+        let last = self.last_call_at.load(Ordering::Relaxed);
+        self.is_ingesting(now) || (last != NO_CALL && now.0.saturating_sub(last) < IDLE_SEAL_AFTER.0)
+    }
+
+    /// Read the cap a volume starts with: a quarter of its workers, at least one
+    pub fn default_merge_cap(&self) -> usize {
+        (self.lanes.len().saturating_sub(1) / MERGE_CAP_WORKERS).max(1)
     }
 
     /// Read the most merges that run while callers are busy
     #[cfg(feature = "test-hooks")]
     pub fn merge_cap(&self) -> usize {
         match self.holds.merge_cap.load(Ordering::Acquire) {
-            0 => MERGE_CAP_ACTIVE,
+            0 => self.default_merge_cap(),
             cap => cap,
         }
     }
 
     /// Read the most merges that run while callers are busy
     #[cfg(not(feature = "test-hooks"))]
-    pub const fn merge_cap(&self) -> usize {
-        MERGE_CAP_ACTIVE
+    pub fn merge_cap(&self) -> usize {
+        self.default_merge_cap()
     }
 
+    /// Check writes are still arriving: the last seal started less than two fill times ago. Record rewrites, which spend writes
     /// only to win space back, wait while it holds, and a volume with no seal yet or whose writes stopped is past it
     pub fn is_ingesting(&self, now: Nanoseconds) -> bool {
         now.0 < self.hot_until().0

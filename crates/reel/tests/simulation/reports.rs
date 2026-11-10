@@ -391,3 +391,35 @@ fn arena_takes_room_for_rows_on_disk() {
 
 const ARENA_ROWS: u64 = 1_000_000;
 const PAGE_SLACK: u64 = 64 * 1024;
+
+// a seal stuck on one full shard comes free once compaction runs, with every segment live and none overlapping another
+#[test]
+fn stuck_shard_comes_free() {
+    let io = SimulatedIo::new(Seed(5));
+    io.add_disk(Path::new(ROOT), SMALL_DISK);
+    let store = open(&io);
+    store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
+    let mut report = MaintenanceReport::new();
+    store.maintenance_report(&mut report);
+    let room = report.volumes[0].entry_room;
+    let mut number = 0;
+    while report.volumes[0].seal_stops == 0 && number < room.0 * 2 {
+        store.put(COLUMN, format!("key-{number:05}").as_bytes(), VALUE).expect("put");
+        store.seal_now();
+        run(&io);
+        store.maintenance_report(&mut report);
+        number += 1;
+    }
+    assert!(store.state.volumes[0].is_seal_stuck.load(Ordering::Acquire));
+    store.state.volumes[0].holds.compaction.store(false, Ordering::Release);
+    store.state.ask_compaction();
+    run(&io);
+    run(&io);
+    assert!(!store.state.volumes[0].is_seal_stuck.load(Ordering::Acquire), "the seal stayed stuck on a full shard");
+    store.put(COLUMN, b"past-the-stop", VALUE).expect("put");
+    let mut value = Vec::new();
+    for key in 0..number {
+        assert!(store.get(COLUMN, format!("key-{key:05}").as_bytes(), &mut value).expect("get"), "key {key}");
+    }
+    store.close().expect("close");
+}

@@ -31,6 +31,7 @@ use crate::segment::column_directory::Listing;
 use crate::segment::footer_writer::{ColumnStart, FooterTotals, FooterWriter};
 use crate::segment::range_covers::{Cover, put_cover};
 use crate::segment::row_block::FooterRow;
+use crate::segment::segment_table::{NO_SHARD, shard_of};
 use crate::segment::segment_tail::{BlockCount, SegmentNumber};
 use crate::segment::damage_list::{highest_of, spans_of};
 use crate::segment::summary::SegmentFacts;
@@ -497,6 +498,7 @@ impl<Backend: Io> SealJob<Backend> {
                 self.writer.entries(),
             );
             if !installed {
+                volume.stuck_shard.store(shard_of(target.number), Ordering::Release);
                 self.note_stuck();
                 // the rows file stays until the table has room, so a retry loses nothing
                 return Err(Error::other("segment table is full"));
@@ -526,6 +528,7 @@ impl<Backend: Io> SealJob<Backend> {
         }
 
         volume.is_seal_stuck.store(false, Ordering::Release);
+        volume.stuck_shard.store(NO_SHARD, Ordering::Release);
         self.phase = SealPhase::Summarizing;
         Ok(())
     }

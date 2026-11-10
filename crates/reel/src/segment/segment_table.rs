@@ -746,6 +746,9 @@ pub fn filter_end<File>(entry: &TableEntry<File>, column: &ColumnTail, blocks: &
 }
 
 /// Pick a segment's shard
+/// A shard no segment has, for a seal that waits on none
+pub const NO_SHARD: usize = usize::MAX;
+
 pub fn shard_of(number: SegmentNumber) -> usize {
     (number.0.wrapping_mul(NUMBER_MIX) >> SHARD_SHIFT) as usize
 }

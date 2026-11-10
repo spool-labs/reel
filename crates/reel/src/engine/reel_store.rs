@@ -75,6 +75,7 @@ use crate::rows::row_group::RowGroupBuffer;
 use crate::index::record_cache::RecordCache;
 use crate::segment::block_cache::{BlockCache, CACHE_SHARDS, CACHE_WAYS};
 use crate::segment::filter_arena::FilterArena;
+use crate::segment::segment_table::NO_SHARD;
 use crate::segment::column_directory::{ColumnDirectory, DirectoryList, empty_list};
 use crate::segment::damage_list::{DamageList, MOST_DAMAGED_SPANS, SPAN_KEY_BYTES};
 use crate::segment::range_covers::RangeCovers;
@@ -1365,6 +1366,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         #[cfg(feature = "test-hooks")]
         holds: TestHolds::default(),
         is_seal_stuck: AtomicBool::new(false),
+        stuck_shard: AtomicUsize::new(NO_SHARD),
         seal_stops: AtomicU64::new(0),
         disk_bytes: disks.get(index).copied().flatten(),
         disk_covered: disks.get(index).copied().flatten().map_or(ByteCount(0), |disk| entry_cover(room.segments_per_shard * TABLE_SHARDS, cover_segment, disk)),

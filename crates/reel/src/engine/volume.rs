@@ -249,6 +249,8 @@ pub struct Volume<Backend: Io> {
     pub holds: TestHolds,
     /// A seal found the table or a directory full, and only a reclaim can give it room
     pub is_seal_stuck: AtomicBool,
+    /// The table shard a stuck seal waits on for a slot, or NO_SHARD. A rewrite takes its outputs outside it
+    pub stuck_shard: AtomicUsize,
     /// Times a seal stopped on a full table or directory, once for each stop until a seal lands again
     pub seal_stops: AtomicU64,
     /// The bytes the distinct filesystems under the roots hold, or nothing when a root's disk has no known size

@@ -24,18 +24,25 @@ use crate::fixed_list::ListFull;
 use crate::segment::column_directory::Listing;
 use crate::segment::footer_writer::{FooterTotals, FooterWriter};
 use crate::segment::row_block::ROW_BLOCK_BYTES;
+use crate::segment::segment_table::shard_of;
 use crate::segment::segment_tail::{ColumnTail, MOST_MERGE_SEGMENTS, SegmentNumber};
 use crate::segment::summary::{ColumnFacts, SegmentFacts, SummaryRow, SummaryRows};
 
 use crate::engine::rewrite_job::{BAR_QUARTERS, EARLY_BAR_QUARTERS, MOST_PARK_WAIT, MergeTarget, OUTGROW_STEP_BYTES, RewriteJob, RewritePhase, StagedColumn, StagedOutput, rows_bytes}; use crate::engine::rewrite_job::pick::has_disk_room;
 
 impl<Backend: Io> RewriteJob<Backend> {
+    /// Check a lone input sits in the table shard a stuck seal waits on, so moving it to an output elsewhere frees the slot
+    pub fn is_leaving_stuck_shard(&self) -> bool {
+        self.input_count == 1 && shard_of(self.numbers[0]) == self.state.volumes[self.volume].stuck_shard.load(Ordering::Acquire)
+    }
+
     /// Check a merge that dropped nothing would leave its inputs' overlap as it was. One input wins back nothing unless it was
-    /// cut. Several overlap afterwards as one chain of data outputs, which follow each other in key order, and a grave output
-    /// beside them: a data and a grave output going back in as two inputs would come out as the same two again
+    /// cut or it leaves a stuck seal's shard. Several overlap afterwards as one chain of data outputs, which follow each other in
+    /// key order, and a grave output beside them: a data and a grave output going back in as two inputs would come out as the
+    /// same two again
     pub fn is_futile(&self) -> bool {
         if self.input_count == 1 {
-            return !self.is_cutting && self.staged.is_empty();
+            return !self.is_cutting && self.staged.is_empty() && !self.is_leaving_stuck_shard();
         }
         1 + usize::from(self.grave_output.is_some()) >= self.input_count
     }

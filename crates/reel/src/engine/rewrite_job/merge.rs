@@ -25,10 +25,10 @@ use crate::row_kind::RowKind;
 use crate::segment::footer_writer::ColumnStart;
 use crate::index::key_hash::hash_key;
 use crate::segment::row_block::FooterRow;
-use crate::segment::segment_table::SegmentPin;
+use crate::segment::segment_table::{SegmentPin, shard_of};
 use crate::segment::segment_tail::{MOST_MERGE_SEGMENTS, SegmentNumber};
 
-use crate::engine::rewrite_job::{MERGE_STEP_ROWS, MERGE_STEP_TIME, MergeTarget, RewriteJob, RewritePhase};
+use crate::engine::rewrite_job::{MERGE_STEP_ROWS, MERGE_STEP_TIME, MOST_NUMBER_TRIES, MergeTarget, RewriteJob, RewritePhase};
 
 impl<Backend: Io> RewriteJob<Backend> {
     /// Read where a merge cuts its output. An overlap merge's inputs span the same keys, so it writes outputs a segment long, and the
@@ -60,7 +60,16 @@ impl<Backend: Io> RewriteJob<Backend> {
 
     /// Create an output file under a new number, listed for a close to clear away
     pub fn create_output(&self, volume: &Volume<Backend>, length: ByteCount, slot: usize) -> Result<RewriteOutput<Backend::File>> {
-        let Ok(number) = self.state.next_segment_number() else {
+        // an output that lands outside a stuck seal's shard frees the slot its input held there
+        let stuck = volume.stuck_shard.load(Ordering::Acquire);
+        let mut number = self.state.next_segment_number();
+        for _try in 0..MOST_NUMBER_TRIES {
+            match &number {
+                Ok(taken) if shard_of(*taken) == stuck => number = self.state.next_segment_number(),
+                _other => break,
+            }
+        }
+        let Ok(number) = number else {
             return Err(Error::from(ErrorKind::StorageFull));
         };
         let root = number.0 as usize % volume.roots.len();
@@ -678,8 +687,8 @@ impl<Backend: Io> RewriteJob<Backend> {
 
     /// End the deciding: copy from the first row if one would drop, and leave the segments alone if none would
     pub fn end_deciding(&mut self, target: MergeTarget) -> Result<()> {
-        // several inputs becoming one win back overlap whatever they drop
-        if self.dropped_rows == 0 && self.input_count == 1 {
+        // several inputs becoming one win back overlap whatever they drop, and a lone input moves out of a stuck seal's shard
+        if self.dropped_rows == 0 && self.input_count == 1 && !self.is_leaving_stuck_shard() {
             self.note_gave_up();
             return Err(Error::from(ErrorKind::Interrupted));
         }

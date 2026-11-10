@@ -21,7 +21,7 @@ use crate::config::MAX_KEY_BYTES;
 use crate::engine::complete_path::{REFILL_STEP_BLOCKS, Refill};
 use crate::engine::cover_apply::is_in_range;
 use crate::engine::engine_state::EngineState;
-use crate::engine::rewrite_job::{PLANNER_LANE, RewriteJob, RewriteSeat, is_reclaim_due};
+use crate::engine::rewrite_job::{PLANNER_LANE, RewriteJob, RewriteSeat, is_mergeable, is_reclaim_due};
 use crate::engine::rebuild::MOST_REBUILD_TRIES;
 use crate::engine::volume::{ParkedSegment, Volume};
 use crate::engine::walk_job::{FREE_IN_PLACE_BYTES, FreeRecord, WALK_RETRY};
@@ -36,7 +36,7 @@ use crate::segment::block_entry::KeyBound;
 use crate::segment::footer_reader::FooterReader;
 use crate::segment::range_covers::{Cover, MOST_RANGE_COVERS};
 use crate::segment::row_block::{ROW_BLOCK_BYTES, RowBlockWalk};
-use crate::segment::segment_table::RetiredSegment;
+use crate::segment::segment_table::{NO_SHARD, RetiredSegment, shard_of};
 use crate::segment::segment_tail::{MOST_MERGE_SEGMENTS, SegmentNumber};
 use crate::segment::summary::{DeadCount, SummaryRow};
 use crate::segment::summary_orders::WalkList;
@@ -293,6 +293,7 @@ impl<Backend: Io> CompactJob<Backend> {
                 return JobStep::Worked;
             }
         }
+        self.force_stuck_shard(volume);
         // an ask outlives the unlink steps below, as it outlived them before
         self.should_rewrite |= is_asked;
         // a whole unlink wins back the most for the least, so each step tries one ahead of the rewrites, after the covers settle.
@@ -720,6 +721,23 @@ impl<Backend: Io> CompactJob<Backend> {
             }
         }
         false
+    }
+
+    /// While a seal waits on a full table shard, send that shard's smallest segment to a rewrite, whatever the trigger says. Its
+    /// output lands outside the shard, so each such rewrite frees a slot there, and nothing else would with every segment live
+    pub fn force_stuck_shard(&mut self, volume: &Volume<Backend>) {
+        let stuck = volume.stuck_shard.load(Ordering::Acquire);
+        if stuck == NO_SHARD || self.rewrite.is_running() || self.rewrite.forced.is_some() {
+            return;
+        }
+        let rows = self.state.hold_for_pick(self.volume, PickKind::Cover);
+        let in_shard = rows.rows().filter(|row| shard_of(row.facts.segment) == stuck && is_mergeable(volume, row));
+        let smallest = in_shard.min_by_key(|row| row.facts.file_length).map(|row| row.facts.segment);
+        drop(rows);
+        if let Some(segment) = smallest {
+            self.rewrite.forced = Some(segment);
+            self.should_rewrite = true;
+        }
     }
 
     /// Past half of the pool, send the oldest cover's first sealed row to a rewrite, whatever the trigger says

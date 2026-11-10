@@ -48,7 +48,7 @@ pub use pick::is_reclaim_due;
 #[cfg(any(test, feature = "test-hooks"))]
 pub use install::freed_in_place;
 #[cfg(any(test, feature = "test-hooks"))]
-pub use pick::{CROWD_ANSWERS, CrowdAnswer, CrowdAnswers, CrowdStamp, column_range, covers_point, has_settled_covers, is_crowded, is_overlap_input, overlap_bound, overlaps};
+pub use pick::{CROWD_ANSWERS, CrowdAnswer, CrowdAnswers, CrowdStamp, column_range, covers_point, has_settled_covers, is_crowded, is_mergeable, is_overlap_input, overlap_bound, overlaps};
 
 /// A bar counts in quarters of a segment's bytes
 pub const BAR_QUARTERS: u64 = 4;
@@ -110,6 +110,8 @@ pub const GATHER_LOOKS: usize = 64;
 pub const OVERLAP_LISTED: usize = 4 * (MOST_OVERLAP + 1);
 /// Most listings a count of the segments over one key pages through
 pub const CROWD_PAGES: usize = 4;
+/// Numbers an output skips looking for one outside a stuck seal's shard, which one in 16 lands in
+pub const MOST_NUMBER_TRIES: usize = 64;
 
 /// A column of a finished output that isn't the last of its set, kept for its list entry and its summary row
 #[derive(Clone, Copy, Debug, Default)]

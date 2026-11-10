@@ -44,7 +44,11 @@ impl<Backend: Io> RewriteJob<Backend> {
             return false;
         };
         // an output takes its disk before its inputs give theirs back, so a merge starts only with room beside the writers'
-        if !has_disk_room(&state, volume, target.length) {
+        // a merge that gives back more than it writes may use the writers' reserve, or a full disk could never free itself
+        let summary = hold(&volume.summary);
+        let inputs: u64 = self.numbers[..self.input_count].iter().filter_map(|number| summary.get(*number)).map(|row| row.facts.file_length.0).sum();
+        drop(summary);
+        if !has_disk_room(&state, volume, target.length, target.length.0 < inputs) {
             if let Some((admit, _bound)) = self.admitted.take() {
                 state.give_back(admit.role, admit.need, ByteCount(0));
             }
@@ -681,8 +685,9 @@ pub fn can_ever_merge(row: &SummaryRow<'_>) -> bool {
     !row.facts.is_damaged && !row.facts.has_covers && row.facts.block_count > 0
 }
 
-/// Check every root has room for a merge's output beside the writers' reserve and a segment, and the outputs other merges claimed
-pub fn has_disk_room<Backend: Io>(state: &EngineState<Backend>, volume: &Volume<Backend>, output: ByteCount) -> bool {
-    let need = volume.reserve.0 + volume.segment_bytes.0 + volume.outputs_promised.load(Ordering::Acquire) + output.0;
+/// Check every root has room for a merge's output and the outputs other merges claimed, and beside the writers' reserve unless the merge frees space
+pub fn has_disk_room<Backend: Io>(state: &EngineState<Backend>, volume: &Volume<Backend>, output: ByteCount, is_freeing: bool) -> bool {
+    let kept = if is_freeing { 0 } else { volume.reserve.0 + volume.segment_bytes.0 };
+    let need = kept + volume.outputs_promised.load(Ordering::Acquire) + output.0;
     volume.roots.iter().all(|root| state.io.free_space(root).is_ok_and(|free| free.0 >= need))
 }

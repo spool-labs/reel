@@ -22,6 +22,7 @@ use reel::segment::damage_list::DamagedRange;
 use reel::segment::segment_tail::SegmentNumber;
 use reel::segment::summary::{DeadCount, LostRows, SummaryPaths, SummaryRows, read_summary};
 use reel_api::column_id::ColumnId;
+use reel_api::store_error::StoreError;
 use reel_api::maintenance_report::MaintenanceReport;
 use reel_api::units::{ByteCount, Nanoseconds, SegmentCount, VolumeId, WritePlace};
 use reel_api::value_list::{ValueAnswer, ValueList};
@@ -1193,4 +1194,34 @@ fn parked_until_durable() {
     drop(store);
     drop(state);
     assert!(!has_file(&io, older));
+}
+
+// a disk filled with overwritten rows frees itself once writes stop, and takes puts again
+#[test]
+fn full_disk_frees_itself() {
+    let io = SimulatedIo::new(Seed(48));
+    let root = PathBuf::from(ROOT);
+    io.add_disk(&root, ByteCount(1 << 40));
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    volume.holds.reclaim.store(false, Ordering::Release);
+    io.add_disk(&root, ByteCount(8 * volume.segment_bytes.0));
+    let value = vec![5; 4096];
+    let mut is_full = false;
+    'fill: for _round in 0..1_000 {
+        for number in 0..1_000 {
+            match store.put(COLUMN, format!("key-{number:04}").as_bytes(), &value) {
+                Ok(()) => {},
+                Err(StoreError::VolumeFull { .. }) => {
+                    is_full = true;
+                    break 'fill;
+                },
+                Err(error) => panic!("put failed: {error}"),
+            }
+        }
+    }
+    assert!(is_full, "the disk never filled");
+    settle(&io);
+    store.put(COLUMN, b"after", &value).expect("a put once the dead rows went");
+    store.close().expect("close");
 }

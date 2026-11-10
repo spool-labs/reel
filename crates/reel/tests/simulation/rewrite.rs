@@ -3367,3 +3367,36 @@ fn footers_by_kind_match_the_total() {
     assert_eq!(footers.iter().map(|bytes| bytes.0).sum::<u64>(), report.written[WriteSource::MergeFooters.index()].0);
     store.close().expect("close");
 }
+
+// a count from before a reopen may rest on a segment that walks again, so while any segment is unwalked a pick promises its
+// inputs' whole length, and the merge never writes past it
+#[test]
+fn reopened_counts_promise_whole_inputs() {
+    let io = SimulatedIo::new(Seed(99));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let (_older, _newer) = half_dead(&store, &io);
+    settle(&io);
+    store.close().expect("close");
+
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    hold_compaction(&store, true);
+    volume.holds.walk.store(true, Ordering::Release);
+    store.put(COLUMN, b"z", b"after the reopen").expect("put");
+    seal(&store, &io);
+    hold_compaction(&store, true);
+    // writes stop, so record rewrites may run
+    io.advance_clock(Nanoseconds(IDLE_SEAL_AFTER.0 * 4));
+    assert!(hold(&volume.summary).rows().any(|row| !row.facts.is_walked()), "no segment is unwalked");
+
+    hold_compaction(&store, false);
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(start_merge(&mut job), "no merge started");
+    let whole: u64 = job.rewrite.input_numbers().iter().filter_map(|number| hold(&volume.summary).get(*number).map(|row| row.facts.file_length.0)).sum();
+    assert_eq!(volume.outputs_promised.load(Ordering::Acquire), whole, "the pick trusted a count from before the reopen");
+    run_to_end(&mut job);
+    assert_eq!(volume.promises_outgrown.load(Ordering::Acquire), 0);
+    volume.holds.walk.store(false, Ordering::Release);
+    store.close().expect("close");
+}

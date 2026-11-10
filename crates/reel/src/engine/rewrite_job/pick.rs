@@ -719,10 +719,15 @@ impl<Backend: Io> RewriteJob<Backend> {
     /// the writers' reserve, or a full disk could never free itself
     pub fn disk_room_for(&self, volume: &Volume<Backend>, length: ByteCount) -> Option<ByteCount> {
         let summary = hold(&volume.summary);
+        // every segment below this place has finished its walk, so a replacement under it is one the merge's ask can find
+        let walked_below = summary.rows().filter(|row| !row.facts.is_walked()).map(|row| row.facts.places.lowest).min();
         let (mut inputs, mut output, mut lowest) = (0, 0, WritePlace(u64::MAX));
         for row in self.numbers[..self.input_count].iter().filter_map(|number| summary.get(*number)) {
             inputs += row.facts.file_length.0;
-            output += output_estimate(&row);
+            output += match is_count_trusted(volume, row.facts.segment, walked_below) {
+                true => output_estimate(&row),
+                false => row.facts.file_length.0,
+            };
             lowest = lowest.min(row.facts.places.lowest);
         }
         drop(summary);
@@ -736,6 +741,15 @@ impl<Backend: Io> RewriteJob<Backend> {
         let output = ByteCount(output.min(length.0));
         has_disk_room(&self.state, volume, output, output.0 < inputs).then_some(output)
     }
+}
+
+/// Check a segment's dead counts stand for rows a merge drops: with no segment unwalked, or with every replacement charged since
+/// open below the unwalked ones. A count from before a reopen may rest on a segment that walks again, which keeps its rows
+pub fn is_count_trusted<Backend: Io>(volume: &Volume<Backend>, segment: SegmentNumber, walked_below: Option<WritePlace>) -> bool {
+    let Some(unwalked) = walked_below else {
+        return true;
+    };
+    volume.table.highest_replacement(segment).is_some_and(|place| place.0 > 0 && place < unwalked)
 }
 
 /// Add up a segment's record bytes and rows over every column, since a merge copies the whole segment

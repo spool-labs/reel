@@ -7,6 +7,7 @@ use xxhash_rust::xxh3::xxh3_64_with_seed;
 use crate::lifetime::MarkRange;
 use crate::pool::touched_zeroes;
 use crate::little_endian::{read_half, read_word};
+use crate::segment::varint::{MAX_VARINT_BYTES, VALUE_BITS, read_varint, write_varint};
 use crate::record::record_check::RecordKey;
 use crate::row_kind::RowKind;
 
@@ -26,18 +27,14 @@ pub const GROUP_HEADER_BYTES: usize = 36;
 pub const GROUP_SUM_BYTES: usize = size_of::<u64>();
 /// Bytes a group adds around its rows
 pub const GROUP_OVERHEAD_BYTES: usize = GROUP_HEADER_BYTES + GROUP_SUM_BYTES;
-/// Where a row's kind sits
+/// Where a row's kind sits, after its column. The key's length, the place, the offset and the length follow as varints
 pub const ROW_KIND_AT: usize = 1;
-/// Where a row's key length sits
-pub const ROW_KEY_LENGTH_AT: usize = 2;
-/// Where a row's place sits
-pub const ROW_PLACE_AT: usize = 4;
-/// Where a row's offset sits
-pub const ROW_OFFSET_AT: usize = 12;
-/// Where a row's length sits
-pub const ROW_LENGTH_AT: usize = 20;
-/// Bytes of a row before its key
-pub const ROW_HEADER_BYTES: usize = 28;
+/// Bytes a row's column and kind take
+pub const ROW_FIXED_BYTES: usize = 2;
+/// Most bytes a row takes before its key: a key length of 16 bits, then a place, an offset and a length of 64
+pub const ROW_HEADER_BYTES: usize = ROW_FIXED_BYTES + KEY_LENGTH_VARINT_BYTES + 3 * MAX_VARINT_BYTES;
+/// Most bytes a key length of 16 bits takes as a varint
+pub const KEY_LENGTH_VARINT_BYTES: usize = 3;
 
 /// One row, with its key borrowed
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,21 +107,19 @@ impl RowGroupBuffer {
 
     /// Add a row, or return false when it doesn't fit
     pub fn push(&mut self, row: &RowEntry) -> bool {
-        let size = row_size(row.key.len());
+        let size = encoded_size(row);
         if !self.has_room(size) {
             return false;
         }
-
         let bytes = &mut self.bytes[self.used..self.used + size];
         bytes[0] = row.column.0;
         bytes[ROW_KIND_AT] = row.kind.as_byte();
-        let key_length = row.key.len() as u16;
-        bytes[ROW_KEY_LENGTH_AT..ROW_PLACE_AT].copy_from_slice(&key_length.to_le_bytes());
-        bytes[ROW_PLACE_AT..ROW_OFFSET_AT].copy_from_slice(&row.place.0.to_le_bytes());
-        bytes[ROW_OFFSET_AT..ROW_LENGTH_AT].copy_from_slice(&row.offset.0.to_le_bytes());
-        bytes[ROW_LENGTH_AT..ROW_HEADER_BYTES].copy_from_slice(&row.length.0.to_le_bytes());
-        bytes[ROW_HEADER_BYTES..].copy_from_slice(row.key);
-
+        let mut at = ROW_FIXED_BYTES;
+        for number in [row.key.len() as u64, row.place.0, row.offset.0, row.length.0] {
+            // the size was worked out from these numbers, so each fits
+            at += write_varint(&mut bytes[at..], number).unwrap_or(0);
+        }
+        bytes[at..].copy_from_slice(row.key);
         self.used += size;
         self.row_count += 1;
         true
@@ -220,26 +215,44 @@ impl<'bytes> Iterator for RowWalk<'bytes> {
     type Item = RowEntry<'bytes>;
 
     fn next(&mut self) -> Option<RowEntry<'bytes>> {
-        let header = self.rows.get(..ROW_HEADER_BYTES)?;
-        let key_length = u16::from_le_bytes([header[ROW_KEY_LENGTH_AT], header[ROW_KEY_LENGTH_AT + 1]]) as usize;
-        let key = self.rows.get(ROW_HEADER_BYTES..ROW_HEADER_BYTES + key_length)?;
-
+        let fixed = self.rows.get(..ROW_FIXED_BYTES)?;
+        let (column, kind) = (ColumnId(fixed[0]), RowKind::from_byte(fixed[ROW_KIND_AT])?);
+        let mut at = ROW_FIXED_BYTES;
+        let mut numbers = [0; 4];
+        for number in &mut numbers {
+            let (value, used) = read_varint(self.rows.get(at..)?)?;
+            *number = value;
+            at += used;
+        }
+        let [key_length, place, offset, length] = numbers;
+        let key = self.rows.get(at..at + key_length as usize)?;
         let row = RowEntry {
-            column: ColumnId(header[0]),
+            column,
             key,
-            place: WritePlace(read_word(header, ROW_PLACE_AT)?),
-            offset: FileOffset(read_word(header, ROW_OFFSET_AT)?),
-            length: ByteCount(read_word(header, ROW_LENGTH_AT)?),
-            kind: RowKind::from_byte(header[ROW_KIND_AT])?,
+            place: WritePlace(place),
+            offset: FileOffset(offset),
+            length: ByteCount(length),
+            kind,
         };
-        self.rows = &self.rows[ROW_HEADER_BYTES + key_length..];
+        self.rows = &self.rows[at + key_length as usize..];
         Some(row)
     }
 }
 
-/// Size a row with its key
+/// Size a row with its key as its numbers can take at most, which a claim holds room for
 pub fn row_size(key_length: usize) -> usize {
     ROW_HEADER_BYTES + key_length
+}
+
+/// Size a row as it's written
+pub fn encoded_size(row: &RowEntry) -> usize {
+    let numbers = [row.key.len() as u64, row.place.0, row.offset.0, row.length.0];
+    ROW_FIXED_BYTES + numbers.iter().map(|number| varint_size(*number)).sum::<usize>() + row.key.len()
+}
+
+/// Count the bytes a number takes as a varint
+pub fn varint_size(number: u64) -> usize {
+    (u64::BITS - number.max(1).leading_zeros()).div_ceil(VALUE_BITS) as usize
 }
 
 /// Read a group's header, or nothing when these bytes can't open a group

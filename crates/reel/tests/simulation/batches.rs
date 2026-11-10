@@ -384,20 +384,25 @@ fn seals_make_room() {
     store.close().expect("close");
 }
 
+// a key long enough that the long batch's rows run past two buffers
+fn long_key(number: u64) -> Vec<u8> {
+    format!("long-batch-key-{number:06}-padding").into_bytes()
+}
+
 // a batch of graves with rows past two buffers, so its group goes out in three pieces
 fn long_batch(value: Option<&[u8]>) -> WriteBatch {
     let mut batch = WriteBatch::new();
     for number in 0..LONG_ROWS {
         match value {
-            Some(value) => batch.put(PLAIN, &key_of(number), value),
-            None => batch.delete(PLAIN, &key_of(number)),
+            Some(value) => batch.put(PLAIN, &long_key(number), value),
+            None => batch.delete(PLAIN, &long_key(number)),
         }
     }
     batch
 }
 
 fn long_values(store: &Store) -> Vec<Option<Vec<u8>>> {
-    (0..LONG_ROWS).map(|number| read(store, PLAIN, &key_of(number)).expect("get")).collect()
+    (0..LONG_ROWS).map(|number| read(store, PLAIN, &long_key(number)).expect("get")).collect()
 }
 
 fn assert_all(found: &[Option<Vec<u8>>], value: Option<&[u8]>) {
@@ -418,7 +423,7 @@ fn long_group() {
     assert_all(&long_values(&store), Some(b"value"));
     store.flush().expect("flush");
     let rows: Vec<Vec<(WritePlace, Vec<u8>)>> =
-        groups(&io).into_iter().filter(|group| group.iter().any(|row| row.1 == key_of(0))).collect();
+        groups(&io).into_iter().filter(|group| group.iter().any(|row| row.1 == long_key(0))).collect();
     assert_eq!(rows.len(), 1);
     let places: Vec<u64> = rows[0].iter().map(|row| row.0.0).collect();
     let expected: Vec<u64> = (1..=LONG_ROWS).map(|step| mark.0 + step).collect();
@@ -474,7 +479,7 @@ fn long_failure() {
         io.fail_writes_after(OperationCount(writes_before_failure));
         let written = store.write_batch(&long_batch(None));
 
-        assert!(matches!(written, Err(StoreError::Io { action: "writing rows", .. })), "{writes_before_failure} writes");
+        assert!(matches!(written, Err(StoreError::Io { action: "writing rows", .. })), "{writes_before_failure} writes: {written:?}");
         assert_all(&long_values(&store), Some(b"older"));
         assert!(matches!(store.put(PLAIN, b"after", b"value"), Err(StoreError::VolumeFailed { .. })));
         io.kill();
@@ -667,7 +672,7 @@ fn rows_go_first() {
 
     let rows = groups(&io);
     let beside = rows.iter().position(|group| group.iter().any(|row| row.1 == b"beside")).expect("a group");
-    let long = rows.iter().position(|group| group.iter().any(|row| row.1 == key_of(0))).expect("a group");
+    let long = rows.iter().position(|group| group.iter().any(|row| row.1 == long_key(0))).expect("a group");
     assert!(beside < long);
     store.close().expect("close");
 }
@@ -769,10 +774,10 @@ fn long_twice() {
     let io = SimulatedIo::new(Seed(22));
     let store = open(&io);
     let mut batch = long_batch(Some(b"first"));
-    batch.put(PLAIN, &key_of(0), b"second");
-    batch.delete(PLAIN, &key_of(1));
-    batch.delete(PLAIN, &key_of(LONG_ROWS - 1));
-    batch.put(PLAIN, &key_of(LONG_ROWS - 1), b"second");
+    batch.put(PLAIN, &long_key(0), b"second");
+    batch.delete(PLAIN, &long_key(1));
+    batch.delete(PLAIN, &long_key(LONG_ROWS - 1));
+    batch.put(PLAIN, &long_key(LONG_ROWS - 1), b"second");
 
     store.write_batch(&batch).expect("batch");
 
@@ -786,10 +791,10 @@ fn long_twice() {
 }
 
 fn assert_twice(store: &Store) {
-    assert_eq!(read(store, PLAIN, &key_of(0)).expect("get"), Some(b"second".to_vec()));
-    assert_eq!(read(store, PLAIN, &key_of(1)).expect("get"), None);
-    assert_eq!(read(store, PLAIN, &key_of(2)).expect("get"), Some(b"first".to_vec()));
-    assert_eq!(read(store, PLAIN, &key_of(LONG_ROWS - 1)).expect("get"), Some(b"second".to_vec()));
+    assert_eq!(read(store, PLAIN, &long_key(0)).expect("get"), Some(b"second".to_vec()));
+    assert_eq!(read(store, PLAIN, &long_key(1)).expect("get"), None);
+    assert_eq!(read(store, PLAIN, &long_key(2)).expect("get"), Some(b"first".to_vec()));
+    assert_eq!(read(store, PLAIN, &long_key(LONG_ROWS - 1)).expect("get"), Some(b"second".to_vec()));
 }
 
 // a crash that keeps the rows and takes one record drops the long group whole
@@ -801,7 +806,7 @@ fn long_lost_record() {
     store.flush().expect("flush");
 
     store.write_batch(&long_batch(Some(b"newer"))).expect("batch");
-    let (data, lost) = last_record(&io, &key_of(LONG_ROWS - 1));
+    let (data, lost) = last_record(&io, &long_key(LONG_ROWS - 1));
     io.kill();
     drop(store);
     io.rot(&data, lost, BitMask(1)).expect("rot");

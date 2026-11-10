@@ -29,7 +29,7 @@ use crate::record::record_encoder::{PlainRecord, RecordEncoder};
 use crate::record::record_head::plain_length;
 use crate::row_kind::RowKind;
 use crate::record::record_check::RecordKey;
-use crate::rows::row_group::{GROUP_OVERHEAD_BYTES, GroupHead, RowEntry, RowGroupBuffer, row_size};
+use crate::rows::row_group::{GROUP_OVERHEAD_BYTES, GroupHead, RowEntry, RowGroupBuffer, encoded_size, row_size};
 use crate::segment::range_covers::Cover;
 use crate::segment::segment_tail::SegmentNumber;
 
@@ -447,7 +447,8 @@ impl<Backend: Io> EngineState<Backend> {
             });
         };
 
-        let total = ByteCount((plan.row_bytes + GROUP_OVERHEAD_BYTES) as u64);
+        // the plan held room for the most each row could take, and the group is written at the size its rows take
+        let total = ByteCount((written_bytes(rows_of_batch.clone()) + GROUP_OVERHEAD_BYTES) as u64);
         self.check_rows_room(claim.volume, slot, total)?;
 
         // no other writer's rows wait behind the turn: new claims go elsewhere, and these go out first
@@ -534,7 +535,7 @@ impl<Backend: Io> EngineState<Backend> {
             let guard = hold(queue);
             (guard.rows_end, guard.synced_through, guard.marks)
         };
-        let total = ByteCount((plan.row_bytes + GROUP_OVERHEAD_BYTES) as u64);
+        let total = ByteCount((written_bytes(batch_rows.clone()) + GROUP_OVERHEAD_BYTES) as u64);
         let group = LongGroup::new(rows, rows_end, self.record_key);
 
         stage.clear();
@@ -741,4 +742,9 @@ impl BatchCursor {
 /// Read the mark a batch lands under. A grave carries no mark and a batch never splits, so one that holds a delete has none
 pub fn batch_mark(batch: &WriteBatch, plan: &BatchPlan) -> Option<DeathMark> {
     batch.mark().filter(|_mark| plan.deletes == 0 && plan.covers == 0)
+}
+
+/// Add up the bytes a batch's rows take as they're written
+pub fn written_bytes<'batch>(rows: impl Iterator<Item = RowEntry<'batch>>) -> usize {
+    rows.map(|row| encoded_size(&row)).sum()
 }

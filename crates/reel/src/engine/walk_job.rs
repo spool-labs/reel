@@ -31,6 +31,7 @@ use crate::io::device_error::is_device_error;
 use crate::io::job::{Job, JobStep};
 use crate::io::{Io, IoFile, IoTask};
 use crate::engine::admission::JobRole;
+use crate::segment::key_cursor::KeyCursor;
 use crate::segment::summary_orders::WalkList;
 use crate::segment::summary::SegmentFacts;
 use crate::fixed_list::{FixedList, ListFull, full};
@@ -280,6 +281,7 @@ pub struct BlockCounter<Backend: Io> {
     last_key: FixedList<u8>,
     pub last_column: Option<ColumnId>,
     is_next_key_unknown: bool,
+    pub cursor: KeyCursor<Backend::File>,
 }
 
 /// The walk of one volume's sealed segments
@@ -323,12 +325,13 @@ impl<Backend: Io> BlockCounter<Backend> {
             last_key: FixedList::on_heap(MAX_KEY_BYTES as usize),
             last_column: None,
             is_next_key_unknown: false,
+            cursor: KeyCursor::new(),
         }
     }
 
     /// Read the heap the buffers hold
     pub fn heap_bytes(&self) -> ByteCount {
-        ByteCount((self.block.capacity() + self.key.capacity() + self.last_key.capacity()) as u64)
+        ByteCount((self.block.capacity() + self.key.capacity() + self.last_key.capacity()) as u64 + self.cursor.heap_bytes().0)
     }
 
     /// Count a target's next block into a list, and return the position past it
@@ -345,7 +348,13 @@ impl<Backend: Io> BlockCounter<Backend> {
         if self.last_column.is_none() && target.next_block > 0 {
             self.load_last_key(volume, &pin, target, block.column)?;
         }
-        match self.count_block(volume, &pin, &block, target, counts) {
+        let counted = self.count_block(volume, &pin, &block, target, counts);
+        self.cursor.release(&volume.table);
+        let taken = mem::take(&mut self.cursor.counts);
+        for (total, count) in self.state.cursor_lookups.iter().zip([taken.held, taken.refills, taken.answered, taken.to_table]) {
+            total.fetch_add(count, Ordering::Relaxed);
+        }
+        match counted {
             Err(error) if is_device_error(&error) => counts.clear(),
             outcome => outcome?,
         }
@@ -445,7 +454,7 @@ impl<Backend: Io> BlockCounter<Backend> {
 
             self.last_key.set_from(&self.key)?;
             self.last_column = Some(block.column);
-            let found = self.state.newest_walked(volume, block.column, &self.key, &[target.segment], None);
+            let found = self.state.newest_walked_held(volume, block.column, &self.key, &[target.segment], &mut self.cursor);
             let newest = match found {
                 Ok(newest) => newest,
                 // a version a damaged block hides counts nothing, which only understates

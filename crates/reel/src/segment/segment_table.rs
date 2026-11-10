@@ -1,6 +1,6 @@
 //! Every sealed segment's handle, tail and block index, sharded so no read takes a global lock
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::RwLock;
 
 use reel_api::column_id::ColumnId;
@@ -103,6 +103,8 @@ pub struct TableShard<File> {
 pub struct SegmentTable<File> {
     pub shards: Shards<TableShard<File>>,
     pins: Vec<Vec<AtomicU32>>,
+    /// Each slot's walked flag, which a cursor holding the slot reads with no lock
+    walked: Vec<Vec<AtomicBool>>,
 }
 
 /// How much of each pool one shard gets
@@ -202,14 +204,17 @@ impl<File: Clone> SegmentTable<File> {
     pub fn new(sizing: &TableSizing) -> Self {
         let mut shards = Vec::with_capacity(TABLE_SHARDS);
         let mut pins = Vec::with_capacity(TABLE_SHARDS);
+        let mut walked = Vec::with_capacity(TABLE_SHARDS);
         for _shard in 0..TABLE_SHARDS {
             let mut segments = Vec::with_capacity(sizing.segments_per_shard);
             let mut free_slots = Vec::with_capacity(sizing.segments_per_shard);
             let mut shard_pins = Vec::with_capacity(sizing.segments_per_shard);
+            let mut shard_walked = Vec::with_capacity(sizing.segments_per_shard);
             for slot in 0..sizing.segments_per_shard {
                 segments.push(None);
                 free_slots.push(slot as u32);
                 shard_pins.push(AtomicU32::new(0));
+                shard_walked.push(AtomicBool::new(false));
             }
             shards.push(RwLock::new(TableShard {
                 segments,
@@ -219,8 +224,9 @@ impl<File: Clone> SegmentTable<File> {
                 blocks: touched_capacity(sizing.blocks_per_shard, BlockEntry::default()),
             }));
             pins.push(shard_pins);
+            walked.push(shard_walked);
         }
-        Self { shards: Shards(shards), pins }
+        Self { shards: Shards(shards), pins, walked }
     }
 
     /// Read the heap every shard holds
@@ -233,7 +239,7 @@ impl<File: Clone> SegmentTable<File> {
             total += guard.blocks.capacity() * size_of::<BlockEntry>();
             total += guard.free_slots.capacity() * size_of::<u32>();
             total += guard.map.slots.capacity() * (size_of::<u32>() + size_of::<SegmentNumber>());
-            total += self.pins[shard].capacity() * size_of::<AtomicU32>();
+            total += self.pins[shard].capacity() * size_of::<AtomicU32>() + self.walked[shard].capacity() * size_of::<AtomicBool>();
         }
         ByteCount(total as u64)
     }
@@ -273,6 +279,7 @@ impl<File: Clone> SegmentTable<File> {
             has_held_frees: false,
             is_unproven: false,
         });
+        self.walked[shard_of(head.segment)][slot as usize].store(false, Ordering::Release);
         guard.map.insert(head.segment, slot);
         true
     }
@@ -414,6 +421,7 @@ impl<File: Clone> SegmentTable<File> {
         };
         if let Some(entry) = guard.segments[slot as usize].as_mut() {
             entry.is_walked = true;
+            self.walked[shard_of(number)][slot as usize].store(true, Ordering::Release);
         }
     }
 
@@ -674,4 +682,122 @@ pub fn shard_of(number: SegmentNumber) -> usize {
 /// Pick a number's first place in a map
 pub fn home_of(number: SegmentNumber, mask: usize) -> usize {
     (number.0.wrapping_mul(NUMBER_MIX) >> 32) as usize & mask
+}
+
+/// What a cursor learned of a segment under one take of its shard's lock
+#[derive(Debug)]
+pub enum RunCopy<File> {
+    /// The segment left the table
+    Gone,
+    /// Its file and a run of the column's block lines from the first that can hold a key
+    Run(HeldRun<File>),
+}
+
+/// A segment's file and a run of one column's block lines, which a cursor keeps pinned until it lets go
+#[derive(Clone, Debug)]
+pub struct HeldRun<File> {
+    pub file: File,
+    pub place_base: WritePlace,
+    pub shard: usize,
+    pub slot: u32,
+    pub column: Option<ColumnTail>,
+    pub low: KeyPrefix,
+    pub count: usize,
+    pub reaches_end: bool,
+    pub end_filter: u64,
+    /// The segment's walk had finished when the cursor last looked
+    pub is_walked: bool,
+    /// A prefix more lines share than a run holds, which goes to the table with no copy
+    pub crowded: Option<KeyPrefix>,
+}
+
+impl<File: Clone> SegmentTable<File> {
+    /// Copy a column's block lines into a run from the first that can hold a key, and pin the segment when asked, walked or not
+    pub fn copy_run(&self, number: SegmentNumber, column: ColumnId, key: &[u8], run: &mut [BlockEntry], is_pinning: bool) -> RunCopy<File> {
+        let shard = shard_of(number);
+        let guard = self.shards.read(shard);
+        let Some(slot) = guard.map.get(number) else {
+            return RunCopy::Gone;
+        };
+        let Some(entry) = guard.segments[slot as usize].as_ref() else {
+            return RunCopy::Gone;
+        };
+        if is_pinning {
+            self.pins[shard][slot as usize].fetch_add(1, Ordering::AcqRel);
+        }
+        let mut held = HeldRun {
+            file: entry.file.clone(),
+            place_base: entry.head.place_base,
+            shard,
+            slot,
+            column: None,
+            low: KeyPrefix::default(),
+            count: 0,
+            reaches_end: true,
+            end_filter: 0,
+            is_walked: entry.is_walked,
+            crowded: None,
+        };
+        let Some(tail) = guard.column_of(entry, column) else {
+            return RunCopy::Run(held);
+        };
+        let first = entry.blocks.start as usize + tail.first_block as usize;
+        let Some(lines) = guard.blocks.get(first..first + tail.block_count.0 as usize) else {
+            return RunCopy::Run(held);
+        };
+        let low = KeyPrefix::of_key(key, tail.shared_length as usize);
+        let start = first_candidate(lines, low);
+        let count = lines.len().saturating_sub(start).min(run.len());
+        run[..count].copy_from_slice(&lines[start..start + count]);
+        held.column = Some(*tail);
+        held.low = low;
+        held.count = count;
+        held.reaches_end = start + count >= lines.len();
+        held.end_filter = filter_end(entry, tail, &guard.blocks);
+        RunCopy::Run(held)
+    }
+
+    /// Check a held run's segment has finished its walk since the cursor last looked, with no lock
+    pub fn is_walked_now(&self, held: &HeldRun<File>) -> bool {
+        self.walked[held.shard][held.slot as usize].load(Ordering::Acquire)
+    }
+
+    /// Let go of the pin a cursor took on a run's segment
+    pub fn release_run(&self, held: &HeldRun<File>) {
+        self.pins[held.shard][held.slot as usize].fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Find a key's window of blocks in a copied run, as `window_of` would in the whole column, or nothing when the run can't
+/// say: the key sits below the run's first key, or past its last line with more lines beyond
+pub fn window_in_run(held: &HeldRun<impl Sized>, run: &[BlockEntry], key: &[u8]) -> Option<Option<BlockWindow>> {
+    let Some(tail) = held.column else {
+        return Some(None);
+    };
+    let prefix = KeyPrefix::of_key(key, tail.shared_length as usize);
+    let lines = &run[..held.count];
+    if prefix < held.low || (!held.reaches_end && lines.last().is_none_or(|last| last.first_key <= prefix)) {
+        return None;
+    }
+    let start = first_candidate(lines, prefix);
+    let mut window = BlockWindow {
+        column: tail,
+        entries: [BlockEntry::default(); WINDOW_BLOCKS],
+        count: 0,
+        filter_end_of_last: 0,
+        has_more: false,
+    };
+    for (index, line) in lines.iter().enumerate().skip(start) {
+        if line.first_key > prefix {
+            break;
+        }
+        if window.count == WINDOW_BLOCKS {
+            window.has_more = true;
+            break;
+        }
+        window.entries[window.count] = *line;
+        window.count += 1;
+        window.filter_end_of_last = lines.get(index + 1).map_or(held.end_filter, |next| next.header_at().0);
+    }
+    Some(Some(window))
 }

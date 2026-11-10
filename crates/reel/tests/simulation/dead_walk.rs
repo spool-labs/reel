@@ -4,6 +4,7 @@ use std::iter;
 use std::thread;
 use std::time::{Duration, Instant};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
@@ -24,7 +25,7 @@ use reel::segment::segment_tail::SegmentNumber;
 use reel::segment::summary::{LostRows, SummaryPaths, SummaryRows, copy_ends, read_summary, write_copy};
 use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, Nanoseconds, RowCount, VolumeId, WritePlace};
-use reel_sim::seeded_random::Seed;
+use reel_sim::seeded_random::{Seed, SeededRandom};
 use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_io::SimulatedIo;
 
@@ -1049,3 +1050,81 @@ fn free_on_a_claimed_segment_is_dropped() {
     io.hold_jobs(WALK_JOB, false);
     store.close().expect("close");
 }
+
+const CURSOR_SEEDS: u64 = 6;
+const CURSOR_SEGMENTS_WRITTEN: u64 = 40;
+const CURSOR_PUTS: u64 = 3_000;
+const CURSOR_KEYS: u64 = 40_000;
+const CURSOR_KEY_BYTES: usize = 200;
+
+// overwrites spread over many segments, half of them under keys whose first 16 bytes past the shared ones match, walked with
+// the cursor and through the table alone: every segment ends with the same counts. In the second pair the walk starts once
+// every segment is sealed, and merges claim and retire segments between its blocks
+#[test]
+fn cursor_counts_as_the_table_does() {
+    for seed in 0..CURSOR_SEEDS {
+        let (table, _none) = cursor_arm(seed, true, false);
+        let (cursor, lookups) = cursor_arm(seed, false, false);
+        assert_eq!(cursor, table, "seed {seed}: the cursor counted differently");
+        assert!(table.iter().any(|(_segment, _rows, dead)| *dead > 0), "seed {seed}: nothing counted dead");
+        assert!(lookups[0] > 0 && lookups[2] > 0, "seed {seed}: the cursor answered nothing: {lookups:?}");
+        let (merged_table, _none) = cursor_arm(seed, true, true);
+        let (merged_cursor, _lookups) = cursor_arm(seed, false, true);
+        assert_eq!(merged_cursor, merged_table, "seed {seed}: the cursor counted differently under merges");
+        assert!(merged_table.len() < table.len(), "seed {seed}: nothing merged");
+    }
+}
+
+fn cursor_arm(seed: u64, is_cursor_off: bool, is_merging: bool) -> (Vec<(u64, u64, u64)>, [u64; 4]) {
+    let io = SimulatedIo::new(Seed(seed));
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    volume.holds.no_cursor.store(is_cursor_off, Ordering::Release);
+    volume.holds.small_bound.store(true, Ordering::Release);
+    volume.holds.walk.store(is_merging, Ordering::Release);
+    let mut random = SeededRandom::new(Seed(seed));
+    for _segment in 0..CURSOR_SEGMENTS_WRITTEN {
+        for _put in 0..CURSOR_PUTS {
+            let number = random.below(CURSOR_KEYS);
+            let key = match number % 2 {
+                0 => format!("k{number:05}"),
+                _odd => format!("shared-stem-0123456789-{number:05}"),
+            };
+            let mut key = key.into_bytes();
+            key.resize(CURSOR_KEY_BYTES, (number % 251) as u8);
+            store.put(COLUMN, &key, &random.below(u64::MAX).to_le_bytes()).expect("put");
+        }
+        store.seal_now();
+        settle(&io);
+    }
+    if is_merging {
+        volume.holds.walk.store(false, Ordering::Release);
+        let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+        for step in 0..CURSOR_MERGE_STEPS {
+            if io.step_any().is_none() {
+                io.advance_clock(TICK);
+            }
+            if step % CURSOR_MERGE_EVERY == 0 {
+                if job.rewrite.is_running() {
+                    job.rewrite.step();
+                } else {
+                    job.rewrite.start();
+                }
+            }
+        }
+        while job.rewrite.is_running() {
+            job.rewrite.step();
+        }
+    }
+    settle(&io);
+    let counts = hold(&volume.summary).rows().map(|row| {
+        let column = row.cursor().column().expect("a column");
+        (row.facts.segment.0, column.row_count.0, column.dead_rows.0)
+    }).collect();
+    let lookups = store.state.cursor_lookups.each_ref().map(|count| count.load(Ordering::Acquire));
+    store.close().expect("close");
+    (counts, lookups)
+}
+
+const CURSOR_MERGE_STEPS: u64 = 4_000;
+const CURSOR_MERGE_EVERY: u64 = 3;

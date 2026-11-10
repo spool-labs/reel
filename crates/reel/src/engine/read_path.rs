@@ -28,6 +28,7 @@ use crate::row_kind::RowKind;
 use crate::segment::column_directory::ColumnDirectory;
 use crate::segment::footer_reader::{FooterAnswer, FooterCaches, FooterQuery, FooterReader, RowAt, WindowRead};
 use crate::segment::row_block::FooterRow;
+use crate::segment::key_cursor::{CursorAnswer, KeyCursor};
 use crate::segment::segment_table::{BlockWindow, SegmentPin, WINDOW_BLOCKS};
 use crate::segment::segment_tail::SegmentNumber;
 
@@ -751,6 +752,102 @@ impl<Backend: Io> EngineState<Backend> {
         in_place(self.walk_candidates(&InPlace, volume, directory, read, &mut reader, WalkAsk { skipped, is_finished_only: true, above, ..WalkAsk::EVERY }))
     }
 
+    /// Find a key's newest row among finished segments, as `newest_walked` does with no floor, through a cursor that holds
+    /// each segment it meets until the caller lets go. Keys come in order within a column
+    pub fn newest_walked_held(
+        &self,
+        volume: &Volume<Backend>,
+        column: ColumnId,
+        key: &[u8],
+        skipped: &[SegmentNumber],
+        cursor: &mut KeyCursor<Backend::File>,
+    ) -> Result<Option<SealedRow>, StoreError> {
+        if self.complete_table(column).is_some() || volume.is_cursor_held_off() {
+            return self.newest_walked(volume, column, key, skipped, None);
+        }
+        let read = self.key_read(column, key, WritePlace(u64::MAX), false)?;
+        let Some(directory) = &self.directories[column.0 as usize] else {
+            return Ok(None);
+        };
+        let mut reader = self.job_footer_readers.lease();
+        reader.asked = 0;
+        let mut best: Option<SealedRow> = None;
+        let mut skip = 0;
+        let mut generation = None;
+        loop {
+            let page = directory.candidates(read.key, skip, &mut reader.candidates);
+            // a list that changed between pages could hide a segment, and asking twice is harmless
+            if generation.is_some_and(|seen| seen != page.generation) {
+                skip = 0;
+                generation = None;
+                continue;
+            }
+            generation = Some(page.generation);
+            reader.candidates.sort_unstable_by_key(|candidate| Reverse(candidate.newest_place));
+            for index in 0..reader.candidates.len() {
+                let candidate = reader.candidates[index];
+                if best.is_some_and(|row| row.row.place >= candidate.newest_place) {
+                    break;
+                }
+                if skipped.contains(&candidate.segment) {
+                    continue;
+                }
+                reader.asked += 1;
+                if self.is_stopping.load(Ordering::Acquire) {
+                    return Err(StoreError::Io {
+                        action: "walking",
+                        source: Error::from(ErrorKind::Interrupted),
+                    });
+                }
+                self.ask_held(volume, &read, candidate.segment, cursor, &mut reader, &mut best)?;
+            }
+            skip += reader.candidates.len();
+            // a segment that left under this walk took rows with it, and the list that took it out has their new home
+            if !page.is_cut && directory.generation() == page.generation {
+                return Ok(best);
+            }
+            if !page.is_cut {
+                skip = 0;
+                generation = None;
+            }
+        }
+    }
+
+    /// Ask one walked segment through the cursor, or through the table when the cursor can't place the key
+    pub fn ask_held(
+        &self,
+        volume: &Volume<Backend>,
+        read: &KeyRead<'_>,
+        segment: SegmentNumber,
+        cursor: &mut KeyCursor<Backend::File>,
+        reader: &mut FooterReader,
+        best: &mut Option<SealedRow>,
+    ) -> Result<(), StoreError> {
+        let (file, place_base, window) = match cursor.window(&volume.table, segment, read.column, read.key) {
+            CursorAnswer::Skip => return Ok(()),
+            CursorAnswer::Table => return in_place(self.ask_walked(&InPlace, volume, read, segment, reader, best)),
+            CursorAnswer::Window { file, place_base, window } => (file, place_base, window),
+        };
+        let Some(window) = window else {
+            return Ok(());
+        };
+        let mut point = *read;
+        let mut first = Some(window);
+        while let Some(found) = in_place(self.search_file(&InPlace, volume, &point, segment, (file, place_base), reader, first.take()))? {
+            if found.kind != RowKind::RangeDelete {
+                if best.is_none_or(|current| current.row.place < found.place) {
+                    *best = Some(SealedRow { segment, row: found, block_offset: reader.found_block, at: reader.found_at });
+                }
+                return Ok(());
+            }
+            let Some(below) = found.place.0.checked_sub(1) else {
+                return Ok(());
+            };
+            point.read_point = WritePlace(below);
+        }
+        Ok(())
+    }
+
     /// Ask a finished segment for a key's newest row that isn't a range delete, and keep it when it's the newest so far.
     /// A stop ends the walk here, so it waits for one read and never for a key's whole set of probes
     pub async fn ask_walked(
@@ -940,6 +1037,20 @@ impl<Backend: Io> EngineState<Backend> {
         segment: SegmentNumber,
         pin: &SegmentPin<'_, Backend::File>,
         reader: &mut FooterReader,
+        first: Option<BlockWindow>,
+    ) -> Result<Option<FooterRow>, StoreError> {
+        self.search_file(device, volume, read, segment, (&pin.file, pin.head.place_base), reader, first).await
+    }
+
+    /// Search a segment's file window by window, while the caller holds it
+    pub async fn search_file(
+        &self,
+        device: &impl DeviceReads<Backend::File>,
+        volume: &Volume<Backend>,
+        read: &KeyRead<'_>,
+        segment: SegmentNumber,
+        (file, place_base): (&Backend::File, WritePlace),
+        reader: &mut FooterReader,
         mut first: Option<BlockWindow>,
     ) -> Result<Option<FooterRow>, StoreError> {
         let caches = FooterCaches {
@@ -961,9 +1072,9 @@ impl<Backend: Io> EngineState<Backend> {
             let window_read = WindowRead {
                 segment,
                 window: &window,
-                place_base: pin.head.place_base,
+                place_base,
             };
-            let looked_up = reader.lookup_window(device, &pin.file, &window_read, &caches, &query).await;
+            let looked_up = reader.lookup_window(device, file, &window_read, &caches, &query).await;
             let answer = match looked_up {
                 Ok(answer) => answer,
                 Err(source) if is_device_error(&source) => FooterAnswer::Damaged,

@@ -505,6 +505,8 @@ pub struct MaintenanceReport {
     pub pauses: [u64; PAUSE_CAUSES.len()],
     /// The longest a writer took to reserve room ahead of its claims
     pub longest_room_step: Nanoseconds,
+    /// Walk lookups through the cursor: segments it pinned, runs it copied again, rows it answered, rows it sent to the table
+    pub cursor_lookups: [u64; 4],
     pub volumes: Vec<VolumeReading>,
     pub complete_columns: Vec<CompleteReading>,
     pub least_value_columns: Vec<LeastValueReading>,
@@ -583,6 +585,7 @@ impl MaintenanceReport {
             written: [ByteCount(0); WRITE_SOURCES.len()],
             pauses: [0; PAUSE_CAUSES.len()],
             longest_room_step: Nanoseconds(0),
+            cursor_lookups: [0; 4],
             volumes: Vec::new(),
             complete_columns: Vec::new(),
             least_value_columns: Vec::new(),

@@ -127,6 +127,8 @@ pub struct EngineState<Backend: Io> {
     pub pauses: [AtomicU64; PAUSE_CAUSES.len()],
     /// The longest room step, in nanoseconds
     pub longest_room_step: AtomicU64,
+    /// Walk lookups through the cursor, in the report's order
+    pub cursor_lookups: [AtomicU64; 4],
     pub units: UnitTallies,
     pub opened_at: Nanoseconds,
     pub graves_at_open: AtomicU64,

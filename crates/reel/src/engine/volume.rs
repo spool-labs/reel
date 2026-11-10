@@ -199,6 +199,8 @@ pub struct TestHolds {
     pub small_bound: AtomicBool,
     /// A merge promises a quarter of its estimate, as counts that charged dead rows twice would
     pub low_estimate: AtomicBool,
+    /// Walks look keys up through the table alone, to compare against the cursor
+    pub no_cursor: AtomicBool,
 }
 
 /// One volume of a store
@@ -436,6 +438,18 @@ impl<Backend: Io> Volume<Backend> {
     pub const fn is_bound_pinned(&self) -> bool {
         false
     }
+    /// Check a test has walks look keys up through the table alone
+    #[cfg(feature = "test-hooks")]
+    pub fn is_cursor_held_off(&self) -> bool {
+        self.holds.no_cursor.load(Ordering::Acquire)
+    }
+
+    /// Check a test has walks skip the cursor, which a build without the hooks never does
+    #[cfg(not(feature = "test-hooks"))]
+    pub const fn is_cursor_held_off(&self) -> bool {
+        false
+    }
+
     /// Check a test cuts merge promises to a quarter of the estimate
     #[cfg(feature = "test-hooks")]
     pub fn is_estimate_low(&self) -> bool {

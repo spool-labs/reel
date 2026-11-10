@@ -404,7 +404,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.bit_rows += 1;
         // one row in so many asks as well: a set bit with no newer row anywhere is wrong, a clear bit the ask finds replaced is
         // a row the walk didn't charge
-        if cfg!(feature = "test-hooks") || self.bit_rows % BIT_SAMPLE_EVERY == 0 {
+        if volume.asks_every_bit() || self.bit_rows % BIT_SAMPLE_EVERY == 0 {
             decided[DECIDED_ASKED].fetch_add(1, Ordering::Relaxed);
             let inputs = &self.numbers[..self.input_count];
             if is_set && !state.has_newer_sealed(volume, column, &self.key, row.place, inputs).unwrap_or(true) {

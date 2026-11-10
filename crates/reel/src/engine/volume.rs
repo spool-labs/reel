@@ -204,6 +204,8 @@ pub struct TestHolds {
     pub no_cursor: AtomicBool,
     /// Merges ask every row, to compare against the dead bits
     pub no_bits: AtomicBool,
+    /// Merges ask one bit decision in so many, as a release build does, so a bench measures the bits and not the check
+    pub sample_bits: AtomicBool,
 }
 
 /// One volume of a store
@@ -452,6 +454,18 @@ impl<Backend: Io> Volume<Backend> {
     /// Check a test has walks and merges skip the cursor, which a build without the hooks never does
     #[cfg(not(feature = "test-hooks"))]
     pub const fn is_cursor_held_off(&self) -> bool {
+        false
+    }
+
+    /// Check every bit decision is asked as well, which a test build does unless a bench samples like a release one
+    #[cfg(feature = "test-hooks")]
+    pub fn asks_every_bit(&self) -> bool {
+        !self.holds.sample_bits.load(Ordering::Acquire)
+    }
+
+    /// Check every bit decision is asked as well, which a build without the hooks never does
+    #[cfg(not(feature = "test-hooks"))]
+    pub const fn asks_every_bit(&self) -> bool {
         false
     }
 

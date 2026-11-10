@@ -1376,6 +1376,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         seal_rate: AtomicU64::new(0),
         ingest_rate: AtomicU64::new(0),
         seal_started_at: AtomicU64::new(0),
+        is_sync_due: AtomicBool::new(false),
         bytes_since_sync: AtomicU64::new(0),
         idle_seals: AtomicU64::new(0),
         outputs_promised: AtomicU64::new(0),

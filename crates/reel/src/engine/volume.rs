@@ -321,6 +321,8 @@ pub struct Volume<Backend: Io> {
     pub ingest_rate: AtomicU64,
     /// When the last sealed segment last took a write, in the clock's nanoseconds, or 0 before a seal
     pub seal_started_at: AtomicU64,
+    /// A writer crossed the cadence limit and the row job owes the volume a sync
+    pub is_sync_due: AtomicBool,
     /// Bytes written since the last byte-cadence sync
     pub bytes_since_sync: AtomicU64,
     /// When the row job last saw a write land on the volume

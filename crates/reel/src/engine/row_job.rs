@@ -109,6 +109,14 @@ impl<Backend: Io> RowJob<Backend> {
 
 impl<Backend: Io> Job for RowJob<Backend> {
     fn step(&mut self) -> JobStep {
+        // a sync a writer handed over runs here, and covers every write returned before it starts
+        for volume in &self.state.volumes {
+            if volume.is_sync_due.swap(false, Ordering::AcqRel) {
+                volume.bytes_since_sync.store(0, Ordering::Release);
+                let _synced = self.state.sync_volume(volume);
+                return JobStep::Worked;
+            }
+        }
         if self.send_all() {
             // bytes just sent are what the device can start on, ahead of the seal
             if let Some(task) = self.state.reserve_task.get() {

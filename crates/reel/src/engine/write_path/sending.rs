@@ -15,7 +15,7 @@ use crate::engine::open_segment::{
 use crate::engine::volume::Volume;
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
-use crate::io::{Io, IoFile};
+use crate::io::{Io, IoFile, IoTask};
 
 
 impl<Backend: Io> EngineState<Backend> {
@@ -25,10 +25,17 @@ impl<Backend: Io> EngineState<Backend> {
         match volume.policy {
             SyncPolicy::EveryWrite => self.sync_volume(volume),
             SyncPolicy::EveryBytes(limit) => {
-                let before = volume.bytes_since_sync.fetch_add(length.0, Ordering::AcqRel);
-                // the writer that crosses the limit takes the count back to nothing and syncs
-                if before + length.0 >= limit.0 && volume.bytes_since_sync.swap(0, Ordering::AcqRel) >= limit.0 {
+                let total = volume.bytes_since_sync.fetch_add(length.0, Ordering::AcqRel) + length.0;
+                // past twice the limit a writer syncs itself, so unsynced bytes stay bounded when the row job falls behind
+                if total >= 2 * limit.0 && volume.bytes_since_sync.swap(0, Ordering::AcqRel) >= 2 * limit.0 {
                     return self.sync_volume(volume);
+                }
+                // the writer that crosses the limit hands the sync to the row job and goes on
+                if total >= limit.0 && total - length.0 < limit.0 {
+                    volume.is_sync_due.store(true, Ordering::Release);
+                    if let Some(task) = self.row_task.get() {
+                        task.wake();
+                    }
                 }
                 Ok(())
             },

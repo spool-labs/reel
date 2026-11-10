@@ -1,6 +1,7 @@
 //! An open segment's bytes start for the device during ingest, so a seal's sync finds little left to send
 
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::thread;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
@@ -110,20 +111,6 @@ fn starts_a_range_once() {
     store.close().expect("close");
 }
 
-// a byte-cadence volume syncs once each time its writes pass the limit
-#[test]
-fn cadence_syncs_at_the_limit() {
-    let io = SimulatedIo::new(Seed(5));
-    let store = open_with(&io, SyncPolicy::EveryBytes(ByteCount(10 * VALUE_BYTES)));
-    let volume = &store.state.volumes[0];
-    let synced = || hold(&volume.sync).completed;
-    let start = synced();
-    fill(&store, 9 * VALUE_BYTES);
-    assert_eq!(synced(), start);
-    fill(&store, 2 * VALUE_BYTES);
-    assert_eq!(synced(), start + 1);
-    store.close().expect("close");
-}
 
 // a writer that runs past its segment's room takes more with the claims lock let go, so other writers go on
 #[test]
@@ -147,5 +134,27 @@ fn room_step_frees_the_claims() {
     });
     let mut value = Vec::new();
     assert!(store.get(COLUMN, b"past-the-room", &mut value).expect("get"));
+    store.close().expect("close");
+}
+
+// a writer that crosses the cadence limit hands the sync to the row job, and one at twice the limit syncs itself
+#[test]
+fn cadence_syncs_at_the_limit() {
+    let io = SimulatedIo::new(Seed(5));
+    let store = open_with(&io, SyncPolicy::EveryBytes(ByteCount(10 * VALUE_BYTES)));
+    let volume = &store.state.volumes[0];
+    let synced = || hold(&volume.sync).completed;
+    let start = synced();
+    fill(&store, 9 * VALUE_BYTES);
+    assert_eq!(synced(), start);
+    fill(&store, 2 * VALUE_BYTES);
+    assert_eq!(synced(), start, "the writer synced at the limit");
+    assert!(volume.is_sync_due.load(Ordering::Acquire));
+    two_periods(&io);
+    assert_eq!(synced(), start + 1, "the row job never ran the sync");
+
+    // with the row job not stepping, the writer that reaches twice the limit syncs itself
+    fill(&store, 21 * VALUE_BYTES);
+    assert!(synced() >= start + 2);
     store.close().expect("close");
 }

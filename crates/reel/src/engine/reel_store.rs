@@ -17,7 +17,7 @@ use reel_api::usage::{ColumnUsage, UsageReport};
 use reel_api::write_batch::WriteBatch;
 
 use crate::config::{ColumnConfig, DeviceClass, StoreConfig, VolumeConfig};
-use crate::engine::dead_bits::DeadBits;
+use crate::engine::dead_bits::{CHUNK_WORDS, DEAD_BITS_NAME, DeadBits, NEW_DEAD_BITS_NAME, SAVE_HEADS_PAGE};
 use crate::engine::caller_activity::CallerCounts;
 use crate::engine::admission::Admission;
 use reel_api::maintenance_report::WorkerPriority;
@@ -52,7 +52,7 @@ use crate::engine::filter_job::FilterLoader;
 use crate::engine::planner::Planner;
 use crate::engine::walk_job::{BlockCounter, WalkJob, WalkSlot, WalkWorker};
 use crate::engine::workers::Workers;
-use crate::engine::volume::{SealStepTimes, ClaimState, GaveUp, MOST_MERGE_OUTPUTS, MOST_PARKED, NO_CALL, NO_SEAL, RewriteLane, SyncState, Volume};
+use crate::engine::volume::{SealStepTimes, ClaimState, GaveUp, MOST_MERGE_OUTPUTS, MOST_PARKED, NO_CALL, NO_SEAL, RewriteLane, SyncState, Volume, BitsSave};
 #[cfg(feature = "test-hooks")]
 use crate::engine::volume::TestHolds;
 use crate::guard::hold;
@@ -614,6 +614,10 @@ pub fn bring_up<Backend: Io>(
         volume.walks_waiting.store(waiting, Ordering::Release);
     }
     recover_segments(state, scan).map_err(open_error("recovering a segment"))?;
+    for volume in &state.volumes {
+        // bits that fail to load leave their rows to ask, which costs a merge time and nothing else
+        let _loaded = state.load_dead_bits(volume);
+    }
     state.fill_complete_tables().map_err(open_error("filling a complete table"))?;
     let damaged: usize = state.volumes.iter().map(|volume| hold(&volume.damaged).len()).sum();
     state.damaged_segments.store(damaged as u64, Ordering::Release);
@@ -1439,6 +1443,10 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         held_drain_bytes: AtomicU64::new(0),
         reserve: ByteCount(sizing.segment_bytes.0 * 2),
         summary: Mutex::new(summary.rows),
+        bits_path: summary.paths.root.join(DEAD_BITS_NAME),
+        new_bits_path: summary.paths.root.join(NEW_DEAD_BITS_NAME),
+        bits_save: Mutex::new(BitsSave { heads: Vec::with_capacity(SAVE_HEADS_PAGE), chunk: Vec::with_capacity(CHUNK_WORDS * size_of::<u64>()) }),
+        bits_saved_at: AtomicU64::new(0),
         summary_paths: summary.paths,
         lost_rows: Mutex::new(summary.lost),
         summary_buffer: Pool::new(vec![touched_buffer(summary_room)]),

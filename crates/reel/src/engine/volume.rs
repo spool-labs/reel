@@ -8,7 +8,7 @@ use reel_api::maintenance_report::{PICK_OUTCOMES, PickOutcome, SHARE_KINDS, SPAN
 use reel_api::units::{ByteCount, Nanoseconds, RowCount, VolumeId, WritePlace};
 
 use crate::config::SyncPolicy;
-use crate::engine::dead_bits::DeadBits;
+use crate::engine::dead_bits::{DeadBits, SavedHead};
 use crate::engine::open_segment::OpenSegment;
 use crate::engine::ration::Ration;
 use crate::engine::held_bits::HeldBits;
@@ -408,6 +408,12 @@ pub struct Volume<Backend: Io> {
     pub held_drain_bytes: AtomicU64,
     pub summary: Mutex<SummaryRows>,
     pub summary_paths: SummaryPaths,
+    /// The dead bits file and the name a save writes first, in the summary's root
+    pub bits_path: PathBuf,
+    pub new_bits_path: PathBuf,
+    /// What a save of the bits copies through, and when the last one ran
+    pub bits_save: Mutex<BitsSave>,
+    pub bits_saved_at: AtomicU64,
     pub lost_rows: Mutex<LostRows>,
     pub summary_buffer: Pool<Vec<u8>>,
     pub damage: DamageList,
@@ -616,6 +622,12 @@ impl<Backend: Io> Volume<Backend> {
         (self.lanes.len().saturating_sub(1) / MERGE_CAP_WORKERS).max(1)
     }
 
+
+    /// Read the heap a save of the dead bits copies through
+    pub fn bits_save_bytes(&self) -> u64 {
+        let save = hold(&self.bits_save);
+        (save.heads.capacity() * size_of::<SavedHead>() + save.chunk.capacity()) as u64
+    }
     /// Read the most merges that run while callers are busy
     #[cfg(feature = "test-hooks")]
     pub fn merge_cap(&self) -> usize {
@@ -748,4 +760,11 @@ impl SealStepTimes {
             clean_step: read(&self.clean_step),
         }
     }
+}
+
+/// What a save of the dead bits copies through: the heads of the extents it saves and one chunk of words
+#[derive(Debug, Default)]
+pub struct BitsSave {
+    pub heads: Vec<SavedHead>,
+    pub chunk: Vec<u8>,
 }

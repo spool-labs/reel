@@ -388,9 +388,12 @@ impl<Backend: Io> RewriteJob<Backend> {
         // a walk that charges a row of a held input sets the lane's bit, and leaves the table's replacement as it was
         let is_held = !is_dead && hold(&volume.lanes[self.lane].held).is_set(segment, block, index);
         let is_set = is_dead || is_held;
+        // every replacement sits in a sealed segment, so the highest sealed place bounds one the table can't, after a reopen
+        // reset its replacement or when a lane's held bit left it as it was
+        let sealed = Some(WritePlace(volume.highest_sealed.load(Ordering::Acquire)));
         let bound = match is_held {
-            true => Some(WritePlace(volume.highest_sealed.load(Ordering::Acquire))),
-            false => volume.table.highest_replacement(segment),
+            true => sealed,
+            false => volume.table.highest_replacement(segment).filter(|place| *place > row.place).or(sealed),
         };
         let answer = match is_set {
             true => match bound.filter(|place| *place > row.place) {

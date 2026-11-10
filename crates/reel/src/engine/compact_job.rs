@@ -334,6 +334,10 @@ impl<Backend: Io> CompactJob<Backend> {
         if is_deferring || is_holding_records {
             return JobStep::IdleUntil { deadline: volume.hot_until() };
         }
+        // a planner with nothing to do saves the bits that changed, so a stop after a quiet spell keeps them all
+        if volume.bits_saved_at.load(Ordering::Acquire) != 0 && volume.dead_bits.is_changed.swap(false, Ordering::AcqRel) {
+            let _saved = self.state.save_dead_bits(volume);
+        }
         JobStep::Idle
     }
 

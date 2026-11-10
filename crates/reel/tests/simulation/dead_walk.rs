@@ -1256,3 +1256,92 @@ fn missed_charge_spoils_and_asks() {
     assert_eq!(hold(&volume.summary).orders().present(), [newer, third], "the merge kept a dead row");
     store.close().expect("close");
 }
+
+// saved bits come back at the next open, and a merge there decides by them with no ask
+#[test]
+fn bits_survive_a_reopen() {
+    let io = SimulatedIo::new(Seed(67));
+    let store = open_workers(&io);
+    let (older, newer, third) = three_segments(&store, &io, &[b"d"]);
+    io.hold_jobs(WALK_JOB, false);
+    io.hold_jobs("reel-walk", false);
+    settle(&io);
+    assert!(store.state.volumes[0].dead_bits.exact(older).is_some());
+    // a quiet planner saves them, and this one is held
+    store.state.save_dead_bits(&store.state.volumes[0]).expect("save");
+    store.close().expect("close");
+
+    let store = open_workers(&io);
+    let volume = &store.state.volumes[0];
+    assert!(volume.dead_bits.exact(older).is_some(), "the bits didn't come back");
+    check_dead_bits(volume);
+    let mut merge = CompactJob::new(store.state.clone(), 0);
+    while !merge.rewrite.start() {
+        assert!(merge.rewrite.has_looks_left, "no rewrite started");
+    }
+    assert_eq!(merge.rewrite.input_numbers(), [older]);
+    while merge.rewrite.is_running() {
+        merge.rewrite.step();
+    }
+    let decided = volume.dead_bits.decided.each_ref().map(|count| count.load(Ordering::Acquire));
+    assert!(decided[DECIDED_SET] > 0 && decided[DECIDED_WRONG] == 0, "{decided:?}");
+    assert_eq!(hold(&volume.summary).orders().present(), [newer, third]);
+    store.close().expect("close");
+}
+
+// a crash after a bits save, with counts that moved since, brings back only the segments whose bits still match their
+// counts, and every key reads its newest version
+#[test]
+fn stale_bits_stay_missing_after_a_crash() {
+    for is_power_cut in [false, true] {
+        let io = SimulatedIo::new(Seed(68));
+        let store = open_workers(&io);
+        let state = &store.state;
+        let _segments = three_segments(&store, &io, &[b"d"]);
+        io.hold_jobs(WALK_JOB, false);
+        io.hold_jobs("reel-walk", false);
+        settle(&io);
+        state.save_dead_bits(&state.volumes[0]).expect("save");
+        // a later write charges the older segment again, its count lands and saves, and the bits file stays as it was
+        store.put(COLUMN, b"a", b"fourth").expect("put");
+        store.flush().expect("flush");
+        store.seal_now();
+        settle(&io);
+        state.save_summary(&state.volumes[0]).expect("save");
+        if is_power_cut {
+            io.power_cut();
+        } else {
+            io.kill();
+        }
+        drop(store);
+
+        let store = open_workers(&io);
+        let volume = &store.state.volumes[0];
+        check_dead_bits(volume);
+        for (key, value) in [(b"a", &b"fourth"[..]), (b"b", b"second"), (b"c", b"second"), (b"d", b"third")] {
+            let mut buf = Vec::new();
+            assert!(store.get(COLUMN, key, &mut buf).expect("get"), "power cut {is_power_cut}");
+            assert_eq!(buf, value, "power cut {is_power_cut}");
+        }
+        store.close().expect("close");
+    }
+}
+
+// damage open finds spoils every bit it loaded, since a bit can't say whether the row that set it was among what was lost
+#[test]
+fn damage_at_open_spoils_saved_bits() {
+    let io = SimulatedIo::new(Seed(69));
+    let store = open_workers(&io);
+    let (older, newer, _third) = three_segments(&store, &io, &[b"d"]);
+    io.hold_jobs(WALK_JOB, false);
+    io.hold_jobs("reel-walk", false);
+    settle(&io);
+    store.state.damage_unread(0, newer);
+    store.close().expect("close");
+
+    let store = open_workers(&io);
+    let volume = &store.state.volumes[0];
+    assert!(!hold(&volume.damaged).is_empty(), "open found no damage");
+    assert!(volume.dead_bits.exact(older).is_none(), "a bit loaded beside damage stayed exact");
+    store.close().expect("close");
+}

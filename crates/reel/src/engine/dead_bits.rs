@@ -3,11 +3,12 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use reel_api::units::ByteCount;
+use reel_api::units::{ByteCount, Nanoseconds};
 
 use crate::fixed_list::FixedList;
+use crate::record::record_check::checksum;
 use crate::guard::hold;
 use crate::row_kind::RowKind;
 use crate::segment::footer_reader::RowAt;
@@ -75,6 +76,8 @@ pub struct DeadBits {
     pub inexact: [AtomicU64; 6],
     /// Spoils so far, so a merge that read an extent reads it again after one
     pub spoils: AtomicU64,
+    /// Bits or extents changed since the last save, so an idle planner saves them
+    pub is_changed: AtomicBool,
     /// Merge rows by what their bit gave: set and dropped, clear and kept, asked as well, a set bit the ask found no newer row
     /// for, a clear bit the ask found one for
     pub decided: [AtomicU64; 5],
@@ -98,6 +101,7 @@ impl DeadBits {
             books: Mutex::new(BitsBooks { extents: HashMap::with_capacity(most_segments), free }),
             inexact: Default::default(),
             spoils: AtomicU64::new(0),
+            is_changed: AtomicBool::new(false),
             decided: Default::default(),
         }
     }
@@ -136,6 +140,7 @@ impl DeadBits {
             word.store(0, Ordering::Relaxed);
         }
         books.extents.insert(segment, BitsExtent { span, block_count, block_words, is_exact: true });
+        self.is_changed.store(true, Ordering::Release);
         true
     }
 
@@ -161,6 +166,7 @@ impl DeadBits {
     /// Set the bits of a block's charged rows as their counts land, and take a row whose bit was set already back out of its
     /// block's count, so a row counts once. A charge with no place, or past the extent, leaves its segment's bits inexact
     pub fn land(&self, rows: &[DeadRow], counts: &mut FixedList<DeadCount>) {
+        self.is_changed.store(true, Ordering::Release);
         let mut books = hold(&self.books);
         for row in rows {
             let Some(extent) = books.extents.get_mut(&row.segment) else {
@@ -201,6 +207,7 @@ impl DeadBits {
             extent.is_exact = false;
             self.inexact[cause].fetch_add(1, Ordering::Relaxed);
             self.spoils.fetch_add(1, Ordering::AcqRel);
+            self.is_changed.store(true, Ordering::Release);
         }
     }
 
@@ -270,5 +277,131 @@ pub fn give_span(free: &mut Vec<WordSpan>, span: WordSpan) {
     if at > 0 && free[at - 1].start + free[at - 1].length == free[at].start {
         free[at - 1].length += free[at].length;
         free.remove(at);
+    }
+}
+
+
+/// The bits file in a volume's first root, and the name a save writes before it replaces it
+pub const DEAD_BITS_NAME: &str = "dead-bits";
+pub const NEW_DEAD_BITS_NAME: &str = "dead-bits.new";
+/// Words a save copies under one take of the books and writes with one checksum
+pub const CHUNK_WORDS: usize = 8 * 1024;
+/// Extent heads a save lists at a time
+pub const SAVE_HEADS_PAGE: usize = 4096;
+/// How long a volume goes between saves of its dead bits, beside a summary save. A starting value, tuned at the end
+pub const DEAD_BITS_SAVE_PERIOD: Nanoseconds = Nanoseconds(60_000_000_000);
+/// Bytes of an extent's head in the file: segment, blocks, words a block
+pub const SAVED_HEAD_BYTES: usize = 8 + 4 + 4;
+
+/// One extent's head, as a save writes it
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SavedHead {
+    pub segment: SegmentNumber,
+    pub block_count: u32,
+    pub block_words: u32,
+}
+
+impl SavedHead {
+    /// Write the head
+    pub fn bytes(&self) -> [u8; SAVED_HEAD_BYTES] {
+        let mut out = [0; SAVED_HEAD_BYTES];
+        out[..8].copy_from_slice(&self.segment.0.to_le_bytes());
+        out[8..12].copy_from_slice(&self.block_count.to_le_bytes());
+        out[12..].copy_from_slice(&self.block_words.to_le_bytes());
+        out
+    }
+
+    /// Read a head
+    pub fn of(bytes: &[u8]) -> Option<Self> {
+        Some(Self {
+            segment: SegmentNumber(u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?)),
+            block_count: u32::from_le_bytes(bytes.get(8..12)?.try_into().ok()?),
+            block_words: u32::from_le_bytes(bytes.get(12..16)?.try_into().ok()?),
+        })
+    }
+
+    /// Count an extent's words
+    pub fn words(&self) -> usize {
+        self.block_count as usize * self.block_words as usize
+    }
+}
+
+/// Check a chunk: its segment and place in the extent, then its words, so a chunk of another segment never passes
+pub fn chunk_sum(segment: SegmentNumber, index: usize, words: &[u8]) -> u64 {
+    let mut head = [0; 16];
+    head[..8].copy_from_slice(&segment.0.to_le_bytes());
+    head[8..].copy_from_slice(&(index as u64).to_le_bytes());
+    checksum(&head).0 ^ checksum(words).0.rotate_left(17)
+}
+
+impl DeadBits {
+    /// List a page of the exact extents' heads past the first so many, for a save to copy one at a time
+    pub fn saved_heads(&self, out: &mut Vec<SavedHead>, skip: usize) {
+        out.clear();
+        let books = hold(&self.books);
+        for (segment, extent) in books.extents.iter().filter(|(_segment, extent)| extent.is_exact).skip(skip) {
+            if out.len() == out.capacity() {
+                break;
+            }
+            out.push(SavedHead { segment: *segment, block_count: extent.block_count, block_words: extent.block_words });
+        }
+    }
+
+    /// Copy one chunk of an extent's words while it stays the extent the head names, or nothing once it changed
+    pub fn copy_chunk(&self, head: &SavedHead, index: usize, out: &mut Vec<u8>) -> bool {
+        out.clear();
+        let books = hold(&self.books);
+        let Some(extent) = books.extents.get(&head.segment).filter(|extent| {
+            extent.is_exact && extent.block_count == head.block_count && extent.block_words == head.block_words
+        }) else {
+            return false;
+        };
+        let first = index * CHUNK_WORDS;
+        let last = (first + CHUNK_WORDS).min(head.words());
+        for word in &self.words[extent.span.start as usize + first..extent.span.start as usize + last] {
+            out.extend_from_slice(&word.load(Ordering::Acquire).to_le_bytes());
+        }
+        true
+    }
+
+    /// Load the extents a saved file holds, each only when every chunk's checksum passes and every block's set bits match the
+    /// dead count the summary gives it, so bits a crash left behind or ahead of the counts stay missing and their rows ask
+    pub fn restore(&self, bytes: &[u8], matches: impl Fn(SegmentNumber, u32, u32) -> bool) -> u64 {
+        let mut loaded = 0;
+        let mut at = 0;
+        while let Some(head) = bytes.get(at..at + SAVED_HEAD_BYTES).and_then(SavedHead::of) {
+            at += SAVED_HEAD_BYTES;
+            let chunks = head.words().div_ceil(CHUNK_WORDS);
+            let mut is_whole = self.begin_words(head.segment, head.block_count, head.block_words);
+            let extent = hold(&self.books).extents.get(&head.segment).copied();
+            for index in 0..chunks {
+                let length = (head.words() - index * CHUNK_WORDS).min(CHUNK_WORDS) * size_of::<u64>();
+                let (Some(words), Some(sum)) = (bytes.get(at..at + length), bytes.get(at + length..at + length + 8)) else {
+                    return loaded;
+                };
+                at += length + 8;
+                is_whole &= sum == chunk_sum(head.segment, index, words).to_le_bytes();
+                let Some(extent) = extent.filter(|_extent| is_whole) else {
+                    continue;
+                };
+                for (offset, chunk) in words.chunks_exact(size_of::<u64>()).enumerate() {
+                    let word = u64::from_le_bytes(chunk.try_into().unwrap_or_default());
+                    self.words[extent.span.start as usize + index * CHUNK_WORDS + offset].store(word, Ordering::Release);
+                }
+            }
+            let is_matched = is_whole
+                && (0..head.block_count).all(|block| self.block_set(head.segment, block).is_some_and(|set| matches(head.segment, block, set)));
+            if is_matched {
+                loaded += 1;
+            } else {
+                self.end(head.segment);
+            }
+        }
+        loaded
+    }
+
+    /// Give a segment a clear extent laid out with so many words a block
+    pub fn begin_words(&self, segment: SegmentNumber, block_count: u32, block_words: u32) -> bool {
+        self.begin(segment, block_count, block_words.saturating_mul(WORD_BITS))
     }
 }

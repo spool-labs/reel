@@ -1,6 +1,6 @@
 //! Everything a store shares between its threads
 
-use std::io::{Error, ErrorKind};
+use std::io::{Error, ErrorKind, IoSlice};
 use std::path::Path;
 use std::mem;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -13,6 +13,9 @@ use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, SegmentCount, WritePlace};
 
 use crate::engine::caller_activity::CallerCounts;
+use crate::engine::dead_bits::{CHUNK_WORDS, DEAD_BITS_SAVE_PERIOD, chunk_sum};
+use crate::engine::volume::BitsSave;
+use crate::io::replace::move_into_place;
 use crate::engine::rewrite_job::rows_of;
 use crate::engine::admission::{Admission, Admit, Decision, JobRole, reserve_for, room_for};
 use reel_api::maintenance_report::WorkerPriority;
@@ -51,7 +54,7 @@ use crate::segment::row_block::ROW_BLOCK_BYTES;
 use crate::segment::column_directory::ColumnDirectory;
 use crate::segment::footer_reader::FooterReader;
 use crate::segment::segment_tail::{MAX_COLUMNS, SegmentNumber};
-use crate::segment::summary::write_summary;
+use crate::segment::summary::{read_readable, write_summary};
 use crate::superblock::Superblock;
 use crate::write_order::PlaceCount;
 
@@ -292,6 +295,8 @@ impl<Backend: Io> EngineState<Backend> {
             let saved = write_summary(&self.io, &volume.summary_paths, self.read_point(volume), forward, buffer);
             self.note_unit(UnitKind::SummarySave, bytes, started);
             self.note_written(WriteSource::Summaries, ByteCount(bytes));
+            // the bits are a saving of work, so a save of them that fails leaves the summary saved and its rows ask
+            let _bits = self.save_dead_bits_if_due(volume);
             saved
         })
     }
@@ -644,7 +649,7 @@ impl<Backend: Io> EngineState<Backend> {
             write_index: self.index.heap_bytes(),
             spot_cache: self.spot.heap_bytes(),
             record_cache: self.record_cache.heap_bytes(),
-            dead_bits: ByteCount(self.volumes.iter().map(|volume| volume.dead_bits.heap_bytes().0).sum()),
+            dead_bits: ByteCount(self.volumes.iter().map(|volume| volume.dead_bits.heap_bytes().0 + volume.bits_save_bytes()).sum()),
             complete_tables: ByteCount(self.complete.iter().flatten().map(|table| table.heap_bytes().0).sum()),
             block_cache: ByteCount(self.filter_arena.heap_bytes().0 + self.filter_cache.heap_bytes().0 + self.row_cache.heap_bytes().0 + self.complete_cache_bytes()),
             footer_space: ByteCount(self.seal_heap.load(Ordering::Acquire) + self.walk_heap.load(Ordering::Acquire)),
@@ -750,5 +755,94 @@ impl<Backend: Io> EngineState<Backend> {
         for volume in &self.volumes {
             volume.order.resume_past(place);
         }
+    }
+}
+
+impl<Backend: Io> EngineState<Backend> {
+    /// Save a volume's exact dead bits beside its summary, a chunk at a time under its own checksum, through a fresh file moved
+    /// into place, so a crash leaves the old file or the new one
+    pub fn save_dead_bits(&self, volume: &Volume<Backend>) -> Result<(), Error> {
+        let mut save = hold(&volume.bits_save);
+        let BitsSave { heads, chunk } = &mut *save;
+        match self.io.remove_file(&volume.new_bits_path) {
+            Ok(()) => {},
+            Err(error) if error.kind() == ErrorKind::NotFound => {},
+            Err(error) => return Err(error),
+        }
+        let file = self.io.create_file(&volume.new_bits_path, ByteCount(0))?;
+        let mut at = 0;
+        let mut written = Ok(());
+        // a page of heads at a time, and an extent that comes or goes between pages is left out or saved twice, which a load
+        // takes as a missing bit or the same bits again
+        let mut skip = 0;
+        loop {
+            volume.dead_bits.saved_heads(heads, skip);
+            skip += heads.len();
+            for head in heads.iter() {
+                let head_bytes = head.bytes();
+                written = written.and_then(|()| file.write_at(FileOffset(at), &[IoSlice::new(&head_bytes)]));
+                at += head_bytes.len() as u64;
+                for index in 0..head.words().div_ceil(CHUNK_WORDS) {
+                    // an extent that changed under the save writes the rest of its chunks with sums that fail, so open drops it
+                    let sum = match volume.dead_bits.copy_chunk(head, index, chunk) {
+                        true => chunk_sum(head.segment, index, chunk),
+                        false => {
+                            let length = (head.words() - index * CHUNK_WORDS).min(CHUNK_WORDS) * size_of::<u64>();
+                            chunk.clear();
+                            chunk.resize(length, 0);
+                            !chunk_sum(head.segment, index, chunk)
+                        },
+                    };
+                    let sum_bytes = sum.to_le_bytes();
+                    written = written.and_then(|()| file.write_at(FileOffset(at), &[IoSlice::new(chunk), IoSlice::new(&sum_bytes)]));
+                    at += (chunk.len() + sum_bytes.len()) as u64;
+                }
+        }
+        if heads.len() < heads.capacity() {
+            break;
+        }
+        }
+        let synced = written.and_then(|()| file.sync());
+        self.io.close_file(file);
+        synced?;
+        self.note_written(WriteSource::Summaries, ByteCount(at));
+        volume.bits_saved_at.store(self.io.now().0.max(1), Ordering::Release);
+        move_into_place(&self.io, &volume.summary_paths.root, &volume.new_bits_path, &volume.bits_path)
+    }
+
+    /// Save the bits once a period has passed since the last save, beside the summary that just went out
+    pub fn save_dead_bits_if_due(&self, volume: &Volume<Backend>) -> Result<(), Error> {
+        // none before open loaded what the last run saved, or an early save would write over it
+        let saved_at = volume.bits_saved_at.load(Ordering::Acquire);
+        if saved_at == 0 || self.io.now().0.saturating_sub(saved_at) < DEAD_BITS_SAVE_PERIOD.0 {
+            return Ok(());
+        }
+        self.save_dead_bits(volume)
+    }
+
+    /// Load a volume's saved dead bits at open, each segment only where every block's set bits match its count in the summary
+    /// open read, and none at all when open found damage
+    pub fn load_dead_bits(&self, volume: &Volume<Backend>) -> Result<u64, Error> {
+        volume.bits_saved_at.store(self.io.now().0.max(1), Ordering::Release);
+        let file = match self.io.open_read_only(&volume.bits_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error),
+        };
+        let bytes = read_readable(&file);
+        self.io.close_file(file);
+        let bytes = bytes?;
+        let rows = hold(&volume.summary);
+        let loaded = volume.dead_bits.restore(&bytes, |segment, block, set| {
+            rows.get(segment).is_some_and(|row| {
+                let at = block as usize * size_of::<u32>();
+                row.block_dead.get(at..at + size_of::<u32>()).is_some_and(|dead| u32::from_le_bytes(dead.try_into().unwrap_or_default()) == set)
+            })
+        });
+        drop(rows);
+        if !hold(&volume.damaged).is_empty() || !volume.damage.is_empty() {
+            volume.dead_bits.spoil_all();
+        }
+        Ok(loaded)
     }
 }

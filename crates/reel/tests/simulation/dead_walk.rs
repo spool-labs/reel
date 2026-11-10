@@ -13,6 +13,9 @@ use reel::engine::engine_state::IndexWait;
 use reel::engine::open_segment::SegmentPhase;
 use reel::engine::planner::{Planner, WALK_LAG_SEGMENTS};
 use reel::engine::reel_store::ReelStore;
+use reel::engine::engine_sizing::CURSOR_BYTES;
+use reel::segment::key_cursor::KeyCursor;
+use reel_sim::simulated_file::SimulatedFile;
 use reel::engine::held_bits::HeldBits;
 use reel::fixed_list::FixedList;
 use reel::engine::walk_job::{SLOT_COUNTED, WalkJob, WalkTarget, FREE_IN_PLACE_BYTES};
@@ -1128,3 +1131,10 @@ fn cursor_arm(seed: u64, is_cursor_off: bool, is_merging: bool) -> (Vec<(u64, u6
 
 const CURSOR_MERGE_STEPS: u64 = 4_000;
 const CURSOR_MERGE_EVERY: u64 = 3;
+
+// a cursor holds no more than the line the budget plans for it
+#[test]
+fn cursor_fits_its_plan() {
+    let cursor: KeyCursor<SimulatedFile> = KeyCursor::new();
+    assert!(cursor.heap_bytes().0 <= CURSOR_BYTES, "{:?} past {CURSOR_BYTES}", cursor.heap_bytes());
+}

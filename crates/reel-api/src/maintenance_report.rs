@@ -505,7 +505,7 @@ pub struct MaintenanceReport {
     pub pauses: [u64; PAUSE_CAUSES.len()],
     /// The longest a writer took to reserve room ahead of its claims
     pub longest_room_step: Nanoseconds,
-    /// Walk lookups through the cursor: segments it pinned, runs it copied again, rows it answered, rows it sent to the table
+    /// Walk and merge lookups through the cursor: segments it pinned, runs it copied again, rows it answered, rows it sent to the table
     pub cursor_lookups: [u64; 4],
     pub volumes: Vec<VolumeReading>,
     pub complete_columns: Vec<CompleteReading>,

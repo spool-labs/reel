@@ -350,10 +350,7 @@ impl<Backend: Io> BlockCounter<Backend> {
         }
         let counted = self.count_block(volume, &pin, &block, target, counts);
         self.cursor.release(&volume.table);
-        let taken = mem::take(&mut self.cursor.counts);
-        for (total, count) in self.state.cursor_lookups.iter().zip([taken.held, taken.refills, taken.answered, taken.to_table]) {
-            total.fetch_add(count, Ordering::Relaxed);
-        }
+        self.state.note_cursor(mem::take(&mut self.cursor.counts));
         match counted {
             Err(error) if is_device_error(&error) => counts.clear(),
             outcome => outcome?,
@@ -454,7 +451,7 @@ impl<Backend: Io> BlockCounter<Backend> {
 
             self.last_key.set_from(&self.key)?;
             self.last_column = Some(block.column);
-            let found = self.state.newest_walked_held(volume, block.column, &self.key, &[target.segment], &mut self.cursor);
+            let found = self.state.newest_walked_held(volume, block.column, &self.key, &[target.segment], None, &mut self.cursor);
             let newest = match found {
                 Ok(newest) => newest,
                 // a version a damaged block hides counts nothing, which only understates

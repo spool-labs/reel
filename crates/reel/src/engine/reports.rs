@@ -22,6 +22,7 @@ use crate::index::complete_table::CompleteTable;
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
 use crate::io::{Io, IoFile};
+use crate::segment::key_cursor::CursorCounts;
 use crate::segment::segment_tail::SegmentNumber;
 use crate::segment::summary::{ColumnFacts, SummaryRows};
 
@@ -29,6 +30,13 @@ impl<Backend: Io> EngineState<Backend> {
     /// Count bytes written, by where they came from
     pub fn note_written(&self, source: WriteSource, bytes: ByteCount) {
         self.written[source.index()].fetch_add(bytes.0, Ordering::Relaxed);
+    }
+
+    /// Add what a cursor did to the report's totals
+    pub fn note_cursor(&self, counts: CursorCounts) {
+        for (total, count) in self.cursor_lookups.iter().zip([counts.held, counts.refills, counts.answered, counts.to_table]) {
+            total.fetch_add(count, Ordering::Relaxed);
+        }
     }
 
     /// Count a writer's pause by its cause, and take it

@@ -83,11 +83,13 @@ pub const ENCODER_BYTES: u64 = 256 * 1024;
 pub const SEAL_JOB_BYTES: u64 = 13 * 256 * 1024;
 /// Bytes a dead-byte walk's own buffers are planned at
 pub const WALK_JOB_BYTES: u64 = 9 * 256 * 1024;
-/// Bytes a volume's compaction job holds from open: its block, keys and settled rows, and the planner lane's pick key. A
+/// Bytes a volume's compaction job holds from open: its block, keys and settled rows, the planner lane's pick key and cursor. A
 /// rewrite's lists come from the region it maps at its start, outside the budget
-pub const COMPACT_JOB_BYTES: u64 = 128 * 1024;
-/// Bytes a worker's rewrite lane holds from open: its pick key and its inputs' places
-pub const LANE_JOB_BYTES: u64 = 4 * 1024;
+pub const COMPACT_JOB_BYTES: u64 = 128 * 1024 + CURSOR_BYTES;
+/// Bytes a worker's rewrite lane holds from open: its pick key, its inputs' places and its cursor
+pub const LANE_JOB_BYTES: u64 = 4 * 1024 + CURSOR_BYTES;
+/// Bytes a key cursor holds, in every walk counter and rewrite lane
+pub const CURSOR_BYTES: u64 = 256 * 1024;
 /// Bytes a job's stack is planned at
 pub const JOB_STACK_PLAN_BYTES: u64 = 1024 * 1024;
 /// Jobs a store runs beside one seal job a volume: row write-out, reservations and the planner

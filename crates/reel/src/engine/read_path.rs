@@ -752,7 +752,7 @@ impl<Backend: Io> EngineState<Backend> {
         in_place(self.walk_candidates(&InPlace, volume, directory, read, &mut reader, WalkAsk { skipped, is_finished_only: true, above, ..WalkAsk::EVERY }))
     }
 
-    /// Find a key's newest row among finished segments, as `newest_walked` does with no floor, through a cursor that holds
+    /// Find a key's newest row among finished segments, as `newest_walked` does, through a cursor that holds
     /// each segment it meets until the caller lets go. Keys come in order within a column
     pub fn newest_walked_held(
         &self,
@@ -760,10 +760,11 @@ impl<Backend: Io> EngineState<Backend> {
         column: ColumnId,
         key: &[u8],
         skipped: &[SegmentNumber],
+        above: Option<WritePlace>,
         cursor: &mut KeyCursor<Backend::File>,
     ) -> Result<Option<SealedRow>, StoreError> {
         if self.complete_table(column).is_some() || volume.is_cursor_held_off() {
-            return self.newest_walked(volume, column, key, skipped, None);
+            return self.newest_walked(volume, column, key, skipped, above);
         }
         let read = self.key_read(column, key, WritePlace(u64::MAX), false)?;
         let Some(directory) = &self.directories[column.0 as usize] else {
@@ -786,7 +787,7 @@ impl<Backend: Io> EngineState<Backend> {
             reader.candidates.sort_unstable_by_key(|candidate| Reverse(candidate.newest_place));
             for index in 0..reader.candidates.len() {
                 let candidate = reader.candidates[index];
-                if best.is_some_and(|row| row.row.place >= candidate.newest_place) {
+                if best.is_some_and(|row| row.row.place >= candidate.newest_place) || above.is_some_and(|above| candidate.newest_place <= above) {
                     break;
                 }
                 if skipped.contains(&candidate.segment) {

@@ -141,6 +141,9 @@ impl<Backend: Io> RewriteJob<Backend> {
             RewritePhase::Installing => self.install(),
         };
         // a merge that wrote past its promise takes more room before it goes on, or gives way
+        // a step holds the segments outside the merge for its rows alone, so an unlink or close waits one step at most
+        self.cursor.release(&self.state.volumes[self.volume].table);
+        self.state.note_cursor(mem::take(&mut self.cursor.counts));
         let outcome = outcome.and_then(|()| if self.outgrows_promise() { Err(Error::from(ErrorKind::StorageFull)) } else { Ok(()) });
         // the row blocks a pass reads, so a merge's deciding and placing reads show beside its copying one
         let pass = match phase {
@@ -338,14 +341,14 @@ impl<Backend: Io> RewriteJob<Backend> {
     /// Find a key's newest row in a finished segment outside the merge, above its top row here. One below that replaces nothing
     /// the top row doesn't, so the segments with nothing above it go unasked
     pub fn newest_outside(
-        &self,
+        &mut self,
         volume: &Volume<Backend>,
         column: ColumnId,
     ) -> std::result::Result<Option<SealedRow>, StoreError> {
         if self.is_unwalked {
             return Ok(None);
         }
-        self.state.newest_walked(volume, column, &self.key, &self.numbers[..self.input_count], Some(self.top_place))
+        self.state.newest_walked_held(volume, column, &self.key, &self.numbers[..self.input_count], Some(self.top_place), &mut self.cursor)
     }
 
     /// Check a replaced row can go: no live cue sits at or above it and below its newest replacement

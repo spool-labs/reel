@@ -28,6 +28,7 @@ use crate::fixed_list::{FixedList, ListFull};
 use crate::region::{LIST_ALIGN_ROOM, REGION_HEAD_BYTES, Region, list_bytes};
 use crate::engine::held_bits::HeldBits;
 use crate::engine::admission::{Admit, JobRole, PICK_HALVINGS};
+use crate::segment::key_cursor::KeyCursor;
 use crate::segment::damage_list::DamagedRange;
 use crate::segment::footer_writer::{FooterTotals, FooterWriter};
 use crate::index::key_hash::KeyHash;
@@ -393,6 +394,8 @@ pub struct RewriteJob<Backend: Io> {
     forced_pick: Option<SegmentNumber>,
     /// The mapping this run's lists are carved from, held from an admitted start to the install or the abandon
     region: Option<Region>,
+    /// Holds the segments outside the merge that a step asks for newer rows
+    pub cursor: KeyCursor<Backend::File>,
     /// Tests set this low to fill the grave output
     pub most_grave_blocks: BlockCount,
     pub last_slot: Option<(KeyHash, SegmentNumber, u32)>,
@@ -524,6 +527,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             region_need: ByteCount(0),
             forced_pick: None,
             region: None,
+            cursor: KeyCursor::new(),
             most_grave_blocks: MOST_GRAVE_BLOCKS,
             last_slot: None,
             stale_given: (None, 0),
@@ -577,7 +581,7 @@ impl<Backend: Io> RewriteJob<Backend> {
     pub fn heap_bytes(&self) -> ByteCount {
         let inputs = self.inputs.capacity() * size_of::<MergeInput>();
         let lists = self.listed.held_bytes() + self.crowd.held_bytes();
-        ByteCount((self.crowded_key.held_bytes() + lists + inputs) as u64)
+        ByteCount((self.crowded_key.held_bytes() + lists + inputs) as u64 + self.cursor.heap_bytes().0)
     }
 
     /// Read the bytes the run's region maps, nothing between runs

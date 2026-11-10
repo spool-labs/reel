@@ -29,7 +29,8 @@ use crate::write_order::WriteOrder;
 /// A volume's `sealing` number between seals
 pub const NO_SEAL: u64 = u64::MAX;
 
-/// A volume's room for segments out of every list whose files wait for their reads to finish
+/// Room for segments out of every list whose files wait for their reads to finish, for each rewrite lane, so every lane can park a
+/// merge's inputs at once
 pub const MOST_PARKED: usize = 8;
 
 /// A segment out of every list, whose file goes once no read holds it
@@ -280,7 +281,7 @@ pub struct Volume<Backend: Io> {
     pub segments_parked: AtomicU64,
     /// Empty files a failed remove left with the park full, which the next open removes
     pub empties_left: AtomicU64,
-    pub parked: Mutex<[Option<ParkedSegment<Backend::File>>; MOST_PARKED]>,
+    pub parked: Mutex<Vec<Option<ParkedSegment<Backend::File>>>>,
     pub segments_rewritten: AtomicU64,
     /// A rewrite has made its first row decision and not installed. Rows it decided on must stay as they were, so no walk
     /// starts a target
@@ -356,6 +357,10 @@ pub struct Volume<Backend: Io> {
     pub outputs_promised: AtomicU64,
     /// Seals that ended a segment writes had gone quiet on
     pub idle_seals: AtomicU64,
+    /// Picks refused because the park had no room for their inputs
+    pub park_refusals: AtomicU64,
+    /// The most merges that ran at once
+    pub most_in_flight: AtomicU64,
     /// One bit for each row the walk charged, for segments born since open
     pub dead_bits: DeadBits,
     /// Nanoseconds from the last sealed segment's first row to its seal start, the time the writes took to fill it, or 0 before a
@@ -584,7 +589,7 @@ impl<Backend: Io> Volume<Backend> {
     /// ingest
     pub fn is_short_of_room(&self) -> bool {
         let parked = hold(&self.parked).iter().filter(|slot| slot.is_some()).count();
-        2 * parked > MOST_PARKED || self.table.is_past_half()
+        2 * parked > MOST_PARKED * self.lanes.len() || self.table.is_past_half()
     }
 
     /// Check the park has room for this many segments

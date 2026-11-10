@@ -16,7 +16,7 @@ use crate::engine::open_segment::{ROWS_SUFFIX, OpenSegment, SegmentPhase, rows_p
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::engine::open_segment::{DATA_SUFFIX, parse_segment};
 use crate::engine::seal_job::SealJob;
-use crate::engine::volume::{MOST_PARKED, Volume};
+use crate::engine::volume::Volume;
 use crate::engine::write_path::{ClaimRequest, LandOutcome};
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
@@ -78,8 +78,8 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// Check a file is the one kind a full park may leave behind: with no record and no rows it can bring nothing back, and the
     /// next open removes it. Both have to hold, so nothing else passes
-    pub fn is_empty_past_the_park(&self, path: &Path, parked: usize) -> Result<bool> {
-        if parked < MOST_PARKED {
+    pub fn is_empty_past_the_park(&self, path: &Path, is_park_full: bool) -> Result<bool> {
+        if !is_park_full {
             return Ok(false);
         }
         let file = self.io.open_read_only(path)?;
@@ -120,7 +120,7 @@ impl<Backend: Io> EngineState<Backend> {
                     || parked.iter().flatten().any(|parked| parked.segment == number)
                     || volume.lanes.iter().any(|lane| hold(&lane.partial_outputs).iter().flatten().any(|output| output.number == number))
                     || damaged.contains(&number);
-                if !is_held && !self.is_empty_past_the_park(&path, parked.iter().flatten().count())? {
+                if !is_held && !self.is_empty_past_the_park(&path, parked.iter().all(Option::is_some))? {
                     unlisted.push(number);
                 }
             }

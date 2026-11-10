@@ -758,6 +758,8 @@ impl<Backend: Io> RewriteJob<Backend> {
                 volume.outputs_promised.fetch_add(output.0, Ordering::AcqRel);
                 self.parks_held = self.input_count;
                 volume.parks_promised.fetch_add(self.input_count, Ordering::AcqRel);
+                let in_flight = volume.lanes.iter().filter(|lane| lane.is_rewriting.load(Ordering::Acquire)).count() as u64 + 1;
+                volume.most_in_flight.fetch_max(in_flight, Ordering::Relaxed);
                 volume.is_room_refused.store(false, Ordering::Release);
                 self.forced_pick = None;
                 return Some(picked);

@@ -28,7 +28,8 @@ pub fn unit_bound(kind: UnitKind) -> Option<u64> {
         UnitKind::FilterLoad => Some(FILTER_STEP_BLOCKS as u64),
         UnitKind::SlotRefill => Some(REFILL_STEP_BLOCKS as u64),
         UnitKind::SlotSweep => Some(SWEEP_STEP_BUCKETS as u64),
-        UnitKind::CoverApply | UnitKind::ParkedClear | UnitKind::Pick => Some(1),
+        UnitKind::ParkedClear => Some(MOST_MERGE_SEGMENTS as u64),
+        UnitKind::CoverApply | UnitKind::Pick => Some(1),
         UnitKind::SummaryCopy | UnitKind::SummarySave | UnitKind::Start => None,
     }
 }

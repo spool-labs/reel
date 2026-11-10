@@ -1257,7 +1257,7 @@ fn overlap_needs_two() {
     assert!(!job.rewrite.start());
     assert!(job.rewrite.looked_up_to() > first_tried);
 
-    *hold(&volume.parked) = [const { None }; MOST_PARKED];
+    hold(&volume.parked).iter_mut().for_each(|slot| *slot = None);
     assert!(start_merge(&mut job));
     assert!(job.rewrite.input_numbers().len() > 1);
     io.kill();
@@ -3228,7 +3228,8 @@ fn claims_share_the_park() {
     hold_compaction(&store, true);
     pile_up(&store, &io, 2 * OVER_THE_BOUND);
     let stand_in = stand_in_parked(&store);
-    fill_park(&store, &stand_in, MOST_PARKED - MOST_MERGE_SEGMENTS);
+    let park = hold(&store.state.volumes[0].parked).len();
+    fill_park(&store, &stand_in, park - MOST_MERGE_SEGMENTS);
 
     let start = |job: &mut RewriteJob<SimulatedIo>| loop {
         if job.start() {

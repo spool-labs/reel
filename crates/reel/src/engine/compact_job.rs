@@ -37,7 +37,7 @@ use crate::segment::footer_reader::FooterReader;
 use crate::segment::range_covers::{Cover, MOST_RANGE_COVERS};
 use crate::segment::row_block::{ROW_BLOCK_BYTES, RowBlockWalk};
 use crate::segment::segment_table::RetiredSegment;
-use crate::segment::segment_tail::SegmentNumber;
+use crate::segment::segment_tail::{MOST_MERGE_SEGMENTS, SegmentNumber};
 use crate::segment::summary::{DeadCount, SummaryRow};
 use crate::segment::summary_orders::WalkList;
 
@@ -234,15 +234,19 @@ impl<Backend: Io> CompactJob<Backend> {
                 return self.wait_for_retry(now);
             }
         }
-        if let Some(parked) = self.take_parked(volume) {
-            self.unit = Some((UnitKind::ParkedClear, 1));
-            return match state.clear_parked(volume, parked) {
-                Ok(()) => JobStep::Worked,
-                Err(parked) => {
-                    park_again(volume, parked);
-                    self.wait_for_retry(now)
-                },
-            };
+        // every lane parks a merge's inputs, so a step clears a merge's worth that are ready or the park becomes the queue
+        let mut cleared = 0;
+        while cleared < MOST_MERGE_SEGMENTS as u64 && let Some(parked) = self.take_parked(volume) {
+            if let Err(parked) = state.clear_parked(volume, parked) {
+                park_again(volume, parked);
+                self.unit = Some((UnitKind::ParkedClear, cleared));
+                return self.wait_for_retry(now);
+            }
+            cleared += 1;
+        }
+        if cleared > 0 {
+            self.unit = Some((UnitKind::ParkedClear, cleared));
+            return JobStep::Worked;
         }
         if self.step_refill() {
             return JobStep::Worked;

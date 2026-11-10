@@ -117,6 +117,7 @@ impl<Backend: Io> RewriteJob<Backend> {
     pub fn pick_within(&mut self, volume: &Volume<Backend>, most: usize) -> Option<(MergeTarget, bool)> {
         let room = volume.park_room().min(most);
         if !volume.can_start_rewrite() || volume.stray_outputs.load(Ordering::Acquire) > 0 || room == 0 {
+            volume.park_refusals.fetch_add(u64::from(room == 0), Ordering::Relaxed);
             volume.note_pick(PickOutcome::Refused);
             return None;
         }

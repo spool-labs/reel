@@ -18,7 +18,7 @@ use crate::engine::open_segment::{data_path, output_path};
 use crate::engine::volume::{GRAVE_SLOT, GaveUp, MOST_MERGE_OUTPUTS, NO_SEAL, OutputSlots, RewriteOutput, Volume};
 use crate::guard::hold;
 use crate::io::device_error::is_device_error;
-use crate::io::{Io, IoFile};
+use crate::io::{Io, IoFile, IoTask};
 use crate::fixed_list::ListFull;
 use crate::segment::column_directory::Listing;
 use crate::segment::footer_writer::{FooterTotals, FooterWriter};
@@ -26,7 +26,7 @@ use crate::segment::row_block::ROW_BLOCK_BYTES;
 use crate::segment::segment_tail::{ColumnTail, MOST_MERGE_SEGMENTS, SegmentNumber};
 use crate::segment::summary::{ColumnFacts, SegmentFacts, SummaryRow, SummaryRows};
 
-use crate::engine::rewrite_job::{BAR_QUARTERS, EARLY_BAR_QUARTERS, MOST_PARK_WAITS, MergeTarget, OUTGROW_STEP_BYTES, RewriteJob, RewritePhase, StagedColumn, StagedOutput, rows_bytes}; use crate::engine::rewrite_job::pick::has_disk_room;
+use crate::engine::rewrite_job::{BAR_QUARTERS, EARLY_BAR_QUARTERS, MOST_PARK_WAIT, MergeTarget, OUTGROW_STEP_BYTES, RewriteJob, RewritePhase, StagedColumn, StagedOutput, rows_bytes}; use crate::engine::rewrite_job::pick::has_disk_room;
 
 impl<Backend: Io> RewriteJob<Backend> {
     /// Check a merge that dropped nothing would leave its inputs' overlap as it was. One input wins back nothing unless it was
@@ -237,12 +237,18 @@ impl<Backend: Io> RewriteJob<Backend> {
         let volume = &state.volumes[self.volume];
         // a full park clears as reads finish, and this step comes round again until the wait runs out
         if !volume.can_park(self.input_count) {
-            self.park_waits += 1;
-            if self.park_waits > MOST_PARK_WAITS {
+            let now = state.io.now();
+            let since = *self.park_wait_since.get_or_insert(now);
+            // the planner clears the park once reads let go of what it holds, so it gets the turn this wait is for
+            if let Some(task) = state.planner_task.get() {
+                task.wake();
+            }
+            if now.0.saturating_sub(since.0) > MOST_PARK_WAIT.0 {
                 return Err(Error::from(ErrorKind::Interrupted));
             }
             return Ok(());
         }
+        self.park_wait_since = None;
         if state.read_point(volume) < self.highest_replacement {
             return Err(Error::from(ErrorKind::Interrupted));
         }

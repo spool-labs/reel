@@ -324,6 +324,10 @@ pub struct Volume<Backend: Io> {
     pub bytes_since_sync: AtomicU64,
     /// When the row job last saw a write land on the volume
     pub last_write_at: AtomicU64,
+    /// Bytes merges wrote and gave up, by the phase they stopped in
+    pub given_up_by_phase: [AtomicU64; 6],
+    /// Bytes merges wrote and gave up, by why: interrupted, out of room, an input gone, bad data, anything else
+    pub given_up_by_kind: [AtomicU64; 5],
     /// Merges that wrote past their promise and took more room
     pub promises_outgrown: AtomicU64,
     /// A merge was refused for disk room, so the planner looks again on a timer, since no write may come to wake it

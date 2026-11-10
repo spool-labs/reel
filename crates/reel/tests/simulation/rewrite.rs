@@ -17,7 +17,7 @@ use reel::engine::planner::Planner;
 use reel::engine::unit_bounds::unit_bound;
 use reel::engine::reel_store::ReelStore;
 use reel::engine::row_job::IDLE_SEAL_AFTER;
-use reel::engine::rewrite_job::{MERGE_BUFFER_BYTES, MergeTarget, MOST_OVERLAP, MOST_PARK_WAITS, PLANNER_LANE, RewriteJob, RewritePhase, is_overlap_input, overlaps};
+use reel::engine::rewrite_job::{MERGE_BUFFER_BYTES, MergeTarget, MOST_OVERLAP, MOST_PARK_WAIT, PLANNER_LANE, RewriteJob, RewritePhase, is_overlap_input, overlaps};
 use reel::lifetime::MarkRange;
 use reel::engine::volume::{MOST_PARKED, NO_SEAL, Volume};
 use reel::engine::walk_job::{BlockCounter, WalkJob, WalkWorker};
@@ -1263,7 +1263,8 @@ fn overlap_needs_two() {
     io.kill();
 }
 
-// a park that stays full ends the wait, and the merge gives way with the inputs where they were
+// a park that stays full ends the wait once its time runs out, however many steps it took, and the merge gives way with the
+// inputs where they were
 #[test]
 fn park_wait_ends() {
     let io = SimulatedIo::new(Seed(35));
@@ -1281,10 +1282,11 @@ fn park_wait_ends() {
     let stand_in = stand_in_parked(&store);
     fill_park(&store, &stand_in, MOST_PARKED);
 
-    for _round in 0..MOST_PARK_WAITS {
+    for _round in 0..10_000 {
         job.rewrite.step();
     }
-    assert!(job.rewrite.is_running());
+    assert!(job.rewrite.is_running(), "steps alone ended the wait");
+    io.advance_clock(Nanoseconds(MOST_PARK_WAIT.0 + 1));
     job.rewrite.step();
     assert!(!job.rewrite.is_running());
     assert!(inputs.iter().all(|input| volume.table.holds(*input)));

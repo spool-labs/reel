@@ -84,8 +84,8 @@ pub const STAGED_COLUMN_KEY_BYTES: usize = 2 * SUMMARY_KEY_BYTES + 2;
 pub const RUN_KEYS: usize = 8;
 /// Most row blocks the output for kept graves can have, past which the merge gives way
 pub const MOST_GRAVE_BLOCKS: BlockCount = BlockCount(2_048);
-/// Rounds an install waits for room to park its inputs, past which the merge gives way
-pub const MOST_PARK_WAITS: u32 = 4_096;
+/// How long an install waits for room to park its inputs, past which the merge gives way
+pub const MOST_PARK_WAIT: Nanoseconds = Nanoseconds(10_000_000_000);
 /// Most segments of a column that overlap one key before a merge is due, for records up to the base size
 pub const MOST_OVERLAP: usize = 32;
 /// Records this size or smaller keep the bound at MOST_OVERLAP, and larger ones raise it in step, so large values seldom merge
@@ -365,7 +365,7 @@ pub struct RewriteJob<Backend: Io> {
     dropped_rows: u64,
     dropped_graves: u64,
     kept_dead: FixedList<DeadCount>,
-    park_waits: u32,
+    park_wait_since: Option<Nanoseconds>,
     pub cut_floor: u64,
     cut_bytes: u64,
     data_slot: usize,
@@ -502,7 +502,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             dropped_rows: 0,
             dropped_graves: 0,
             kept_dead: FixedList::empty(),
-            park_waits: 0,
+            park_wait_since: None,
             cut_floor,
             cut_bytes: 0,
             data_slot: 0,

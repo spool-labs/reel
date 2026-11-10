@@ -99,7 +99,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.highest_replacement = WritePlace(0);
         self.dropped_rows = 0;
         self.dropped_graves = 0;
-        self.park_waits = 0;
+        self.park_wait_since = None;
         self.data_slot = 0;
         self.is_cutting = false;
         self.output_rows = 0;
@@ -156,6 +156,17 @@ impl<Backend: Io> RewriteJob<Backend> {
             if let Some(segment) = self.unreadable.take() {
                 self.state.damage_unread(self.volume, segment);
             }
+            let given_up = self.staged.iter().map(|staged| staged.facts.file_length.0).sum::<u64>() + self.records_end.0 + self.used as u64;
+            let kind = match outcome.as_ref().map_err(Error::kind) {
+                Err(ErrorKind::Interrupted) => 0,
+                Err(ErrorKind::StorageFull) => 1,
+                Err(ErrorKind::NotFound) => 2,
+                Err(ErrorKind::InvalidData) => 3,
+                _other => 4,
+            };
+            let volume = &self.state.volumes[self.volume];
+            volume.given_up_by_phase[phase as usize].fetch_add(given_up, Ordering::Relaxed);
+            volume.given_up_by_kind[kind].fetch_add(given_up, Ordering::Relaxed);
             self.abandon();
         }
     }

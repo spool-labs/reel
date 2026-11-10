@@ -15,6 +15,7 @@ use reel::engine::read_path::RecordWant;
 use reel::engine::reel_store::ReelStore;
 use reel::engine::walk_job::WALK_RETRY;
 use reel::engine::volume::MOST_PARKED;
+use reel::engine::reserve_job::RESERVE_PERIOD;
 use reel::guard::hold;
 use reel::io::{InPlace, Io, in_place};
 use reel::record::codec::Codec;
@@ -1196,7 +1197,7 @@ fn parked_until_durable() {
     assert!(!has_file(&io, older));
 }
 
-// a disk filled with overwritten rows frees itself once writes stop, and takes puts again
+// a disk filled with overwritten rows frees itself once writes stop, through merges since every segment keeps a live row
 #[test]
 fn full_disk_frees_itself() {
     let io = SimulatedIo::new(Seed(48));
@@ -1208,9 +1209,10 @@ fn full_disk_frees_itself() {
     io.add_disk(&root, ByteCount(8 * volume.segment_bytes.0));
     let value = vec![5; 4096];
     let mut is_full = false;
-    'fill: for _round in 0..1_000 {
+    'fill: for round in 0..1_000 {
         for number in 0..1_000 {
-            match store.put(COLUMN, format!("key-{number:04}").as_bytes(), &value) {
+            let key = if number % 100 == 0 { format!("keep-{round:04}-{number:04}") } else { format!("key-{number:04}") };
+            match store.put(COLUMN, key.as_bytes(), &value) {
                 Ok(()) => {},
                 Err(StoreError::VolumeFull { .. }) => {
                     is_full = true;
@@ -1221,7 +1223,12 @@ fn full_disk_frees_itself() {
         }
     }
     assert!(is_full, "the disk never filled");
-    settle(&io);
+    // writes have stopped, so the hot window closes after its quiet spell
+    for _round in 0..10 {
+        io.advance_clock(Nanoseconds(volume.hot_until().0.saturating_sub(io.clock_reading().0).max(RESERVE_PERIOD.0) + 1));
+        settle(&io);
+    }
+    assert!(volume.segments_rewritten.load(Ordering::Acquire) > 0, "no merge freed the room");
     store.put(COLUMN, b"after", &value).expect("a put once the dead rows went");
     store.close().expect("close");
 }

@@ -3148,7 +3148,8 @@ fn silence_ends_ingest() {
     store.close().expect("close");
 }
 
-// a merge starts only with disk room for its output beside the writers' reserve and a segment
+
+// an overlap merge waits for disk room for its output beside the writers' reserve, and starts once the room is there
 #[test]
 fn merge_waits_for_disk_room() {
     let io = SimulatedIo::new(Seed(94));
@@ -3159,16 +3160,20 @@ fn merge_waits_for_disk_room() {
     pile_up(&store, &io, OVER_THE_BOUND);
     let volume = &store.state.volumes[0];
     let used = (1 << 40) - io.free_space(&root).expect("free").0;
-    io.add_disk(&root, ByteCount(used + volume.reserve.0 + volume.segment_bytes.0));
+    io.add_disk(&root, ByteCount(used + volume.reserve.0 + volume.segment_bytes.0 - 1));
 
-    let refused = || volume.picks[PickOutcome::Refused.index()].load(Ordering::Acquire);
-    let before = refused();
+    let overlaps = || volume.picks[PickOutcome::Overlap.index()].load(Ordering::Acquire);
+    let before = overlaps();
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
-    assert!(!start_merge(&mut job), "a merge started with no room for its output");
-    assert!(refused() > before);
+    // a merge that frees space may still start, and it runs to its end first
+    if start_merge(&mut job) {
+        run_to_end(&mut job);
+    }
+    assert_eq!(overlaps(), before, "an overlap merge started with no room for its output");
 
     io.add_disk(&root, ByteCount(1 << 40));
     assert!(start_merge(&mut job));
+    assert!(overlaps() > before);
     run_to_end(&mut job);
     check_pile(&store, OVER_THE_BOUND);
     store.close().expect("close");

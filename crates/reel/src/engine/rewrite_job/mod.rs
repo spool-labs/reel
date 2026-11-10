@@ -697,6 +697,18 @@ impl<Backend: Io> RewriteJob<Backend> {
         let mut most = MOST_MERGE_SEGMENTS;
         for _halving in 0..=PICK_HALVINGS {
             let picked = self.pick_within(volume, most)?;
+            let Some(output) = self.disk_room_for(volume, picked.0.length) else {
+                self.unpick(volume);
+                volume.is_room_short.store(true, Ordering::Release);
+                volume.note_pick(PickOutcome::Refused);
+                // fewer inputs write a smaller output, so a short disk tries a smaller merge before it gives up
+                if self.input_count < 2 {
+                    self.has_looks_left = false;
+                    return None;
+                }
+                most = self.input_count / 2;
+                continue;
+            };
             let mut bound = self.bound(volume);
             // offset order first, and the same pick in key order when its lists don't fit, which the floor alone admits
             let mut admit = None;
@@ -710,6 +722,9 @@ impl<Backend: Io> RewriteJob<Backend> {
             if let Some(admit) = admit {
                 // the job maps and carves on its own thread, at its first step
                 self.admitted = Some((admit, bound));
+                self.promised = output;
+                volume.outputs_promised.fetch_add(output.0, Ordering::AcqRel);
+                volume.is_room_short.store(false, Ordering::Release);
                 self.forced_pick = None;
                 return Some(picked);
             }

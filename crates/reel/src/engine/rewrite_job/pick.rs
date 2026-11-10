@@ -44,21 +44,6 @@ impl<Backend: Io> RewriteJob<Backend> {
             return false;
         };
         // an output takes its disk before its inputs give theirs back, so a merge starts only with room beside the writers'
-        // a merge that gives back more than it writes may use the writers' reserve, or a full disk could never free itself
-        let summary = hold(&volume.summary);
-        let inputs: u64 = self.numbers[..self.input_count].iter().filter_map(|number| summary.get(*number)).map(|row| row.facts.file_length.0).sum();
-        drop(summary);
-        if !has_disk_room(&state, volume, target.length, target.length.0 < inputs) {
-            if let Some((admit, _bound)) = self.admitted.take() {
-                state.give_back(admit.role, admit.need, ByteCount(0));
-            }
-            self.unpick(volume);
-            self.has_looks_left = false;
-            volume.note_pick(PickOutcome::Refused);
-            return false;
-        }
-        self.promised = target.length;
-        volume.outputs_promised.fetch_add(target.length.0, Ordering::AcqRel);
         self.clear(target);
         volume.lanes[self.lane].is_rewriting.store(!self.is_unwalked, Ordering::Release);
         let mut inputs = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
@@ -137,6 +122,9 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
         let state = Arc::clone(&self.state);
         let kind = if self.lane == PLANNER_LANE { PickKind::Overlap } else { PickKind::Rewrite };
+        // a disk short of room frees space first, so overlap merges, which write what they read, wait for it
+        let is_room_short = !has_disk_room(&state, volume, ByteCount(0), false);
+        volume.is_room_short.store(is_room_short, Ordering::Release);
         let mut rows = state.hold_for_pick(self.volume, kind);
         self.is_unwalked = false;
         self.bars_fired = BarsFired::default();
@@ -161,6 +149,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         let ingest_lane = if volume.walk_slots.is_empty() { PLANNER_LANE } else { PLANNER_LANE + 1 };
         if (self.lane == ingest_lane || !is_ingesting)
             && !is_deferring
+            && !is_room_short
             && let Some(target) = self.pick_overlap(volume, &rows, room)
         {
             self.picked_as = Some(PickOutcome::Overlap);
@@ -182,7 +171,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             return None;
         }
         // a volume merges back to the bound before it reclaims, so record rewrites wait while an overlap merge runs or can start
-        if volume.is_over_bound.load(Ordering::Acquire) {
+        if volume.is_over_bound.load(Ordering::Acquire) && !is_room_short {
             volume.note_pick(PickOutcome::Behind);
             return None;
         }
@@ -690,4 +679,33 @@ pub fn has_disk_room<Backend: Io>(state: &EngineState<Backend>, volume: &Volume<
     let kept = if is_freeing { 0 } else { volume.reserve.0 + volume.segment_bytes.0 };
     let need = kept + volume.outputs_promised.load(Ordering::Acquire) + output.0;
     volume.roots.iter().all(|root| state.io.free_space(root).is_ok_and(|free| free.0 >= need))
+}
+
+/// Estimate what a merge writes for a segment: its live bytes and its live rows' footer share
+pub fn output_estimate(row: &SummaryRow<'_>) -> u64 {
+    let mut estimate = 0;
+    let mut cursor = row.cursor();
+    for _column in 0..row.column_count {
+        let Some(column) = cursor.column() else {
+            return row.facts.file_length.0;
+        };
+        estimate += column.live_bytes.0 + column.row_count.0.saturating_sub(column.dead_rows.0) * ROW_FOOTER_BYTES;
+    }
+    estimate
+}
+
+impl<Backend: Io> RewriteJob<Backend> {
+    /// Find the output a pick would write, when every root has room for it. A merge that gives back more than it writes may use
+    /// the writers' reserve, or a full disk could never free itself
+    pub fn disk_room_for(&self, volume: &Volume<Backend>, length: ByteCount) -> Option<ByteCount> {
+        let summary = hold(&volume.summary);
+        let (mut inputs, mut output) = (0, 0);
+        for row in self.numbers[..self.input_count].iter().filter_map(|number| summary.get(*number)) {
+            inputs += row.facts.file_length.0;
+            output += output_estimate(&row);
+        }
+        drop(summary);
+        let output = ByteCount(output.min(length.0));
+        has_disk_room(&self.state, volume, output, output.0 < inputs).then_some(output)
+    }
 }

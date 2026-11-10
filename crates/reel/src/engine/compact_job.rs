@@ -25,6 +25,7 @@ use crate::engine::rewrite_job::{PLANNER_LANE, RewriteJob, RewriteSeat, is_recla
 use crate::engine::rebuild::MOST_REBUILD_TRIES;
 use crate::engine::volume::{ParkedSegment, Volume};
 use crate::engine::walk_job::{FREE_IN_PLACE_BYTES, FreeRecord, WALK_RETRY};
+use crate::engine::reserve_job::RESERVE_PERIOD;
 use crate::guard::hold;
 use crate::io::device_error::is_device_error; use crate::io::job::JobStep;
 use crate::io::{InPlace, Io, IoFile, in_place};
@@ -321,6 +322,9 @@ impl<Backend: Io> CompactJob<Backend> {
         self.should_rewrite = should_rewrite && !is_deferring && self.rewrite.has_looks_left;
         if self.should_rewrite {
             return JobStep::Worked;
+        }
+        if volume.is_room_short.load(Ordering::Acquire) {
+            return JobStep::IdleUntil { deadline: Nanoseconds(now.0 + RESERVE_PERIOD.0) };
         }
         // what hot ingest or arriving writes put off starts once the window closes
         if is_deferring || is_holding_records {

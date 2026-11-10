@@ -47,7 +47,7 @@ impl<Backend: Io> RewriteJob<Backend> {
     /// twice until its footer cuts the output down
     pub fn open_output(&mut self, volume: &Volume<Backend>, target: MergeTarget) -> Result<()> {
         self.cut_bytes = self.merge_cut(target);
-        let output = self.create_output(volume, ByteCount(target.length.0.min(self.cut_bytes)), 0)?;
+        let output = self.create_output(volume, ByteCount(self.promised.0.max(1).min(target.length.0).min(self.cut_bytes)), 0)?;
         self.output = Some(output);
         let base = self.lowest_place_base(volume)?;
         self.writer.start(target.blocks_at, base);

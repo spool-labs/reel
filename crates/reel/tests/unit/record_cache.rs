@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use reel::index::record_cache::{CACHE_SHARDS, MOST_CACHED_BYTES, RecordCache};
+use reel::index::record_cache::{CACHE_SHARDS, CacheLookup, MOST_CACHED_BYTES, RecordCache};
 use reel_api::units::{ByteCount, FileOffset};
 use reel::segment::segment_tail::SegmentNumber;
 
@@ -14,9 +14,23 @@ fn value(offset: u64, length: usize) -> Vec<u8> {
     (0..length).map(|at| (offset as usize * 31 + at) as u8).collect()
 }
 
-fn offer_twice(cache: &RecordCache, offset: u64, bytes: &[u8]) {
-    cache.offer(SEGMENT, FileOffset(offset), KEY, bytes);
-    cache.offer(SEGMENT, FileOffset(offset), KEY, bytes);
+// a get as the read path makes it: a miss reads the record and puts it in when the cache admitted it
+fn read(cache: &RecordCache, offset: u64, bytes: &[u8], out: &mut Vec<u8>) -> bool {
+    match cache.get(SEGMENT, FileOffset(offset), KEY, out) {
+        CacheLookup::Hit => true,
+        CacheLookup::Miss { is_admitted } => {
+            if is_admitted {
+                cache.admit(SEGMENT, FileOffset(offset), KEY, bytes);
+            }
+            false
+        },
+    }
+}
+
+fn read_twice(cache: &RecordCache, offset: u64, bytes: &[u8]) {
+    let mut out = Vec::new();
+    read(cache, offset, bytes, &mut out);
+    read(cache, offset, bytes, &mut out);
 }
 
 // a value goes in on its second miss, and a get copies it back whole or in a window
@@ -25,14 +39,13 @@ fn second_miss_admits() {
     let cache = RecordCache::new(CACHE_BYTES);
     let bytes = value(1, 300);
     let mut out = Vec::new();
-    cache.offer(SEGMENT, FileOffset(1), KEY, &bytes);
-    assert!(!cache.get(SEGMENT, FileOffset(1), KEY, &mut out), "a first miss went in");
-    cache.offer(SEGMENT, FileOffset(1), KEY, &bytes);
-    assert!(cache.get(SEGMENT, FileOffset(1), KEY, &mut out));
+    assert!(!read(&cache, 1, &bytes, &mut out));
+    assert!(!read(&cache, 1, &bytes, &mut out), "a first miss went in");
+    assert!(read(&cache, 1, &bytes, &mut out));
     assert_eq!(out, bytes);
-    assert!(cache.get_window(SEGMENT, FileOffset(1), KEY, ByteCount(10), ByteCount(20), &mut out));
+    assert_eq!(cache.get_window(SEGMENT, FileOffset(1), KEY, ByteCount(10), ByteCount(20), &mut out), CacheLookup::Hit);
     assert_eq!(out, bytes[10..30]);
-    assert!(!cache.get(SegmentNumber(8), FileOffset(1), KEY, &mut out), "another segment's record read as cached");
+    assert_ne!(cache.get(SegmentNumber(8), FileOffset(1), KEY, &mut out), CacheLookup::Hit, "another segment's record read as cached");
 }
 
 // values past the cap stay out
@@ -40,11 +53,11 @@ fn second_miss_admits() {
 fn big_values_stay_out() {
     let cache = RecordCache::new(CACHE_BYTES);
     let bytes = value(2, MOST_CACHED_BYTES + 1);
-    offer_twice(&cache, 2, &bytes);
-    assert!(!cache.get(SEGMENT, FileOffset(2), KEY, &mut Vec::new()));
+    read_twice(&cache, 2, &bytes);
+    assert_ne!(cache.get(SEGMENT, FileOffset(2), KEY, &mut Vec::new()), CacheLookup::Hit);
 }
 
-// every value the cache answers with is the one offered for that place, through any number of wraps of every shard's log
+// every value the cache answers with is the one read for that place, through any number of wraps of every shard's log
 #[test]
 fn wraps_keep_every_answer_right() {
     let cache = RecordCache::new(CACHE_BYTES);
@@ -58,31 +71,42 @@ fn wraps_keep_every_answer_right() {
         let offset = state % (VALUES / 4);
         let length = 1 + (state >> 20) as usize % 3000;
         let bytes = offered.entry(offset).or_insert_with(|| value(offset, length)).clone();
-        offer_twice(&cache, offset, &bytes);
+        read_twice(&cache, offset, &bytes);
         let probe = (state >> 40) % (VALUES / 4);
-        if cache.get(SEGMENT, FileOffset(probe), KEY, &mut out) {
+        if cache.get(SEGMENT, FileOffset(probe), KEY, &mut out) == CacheLookup::Hit {
             assert_eq!(Some(&out), offered.get(&probe), "round {round}: place {probe} answered with other bytes");
         }
     }
     assert!(cache.value_count() > 0);
 }
 
-// a hot set read between a scan's offers stays, since the scan's values each miss once and never go in
+// a hot set read between a scan's reads stays, since the scan's values each miss once and never go in
 #[test]
 fn scan_leaves_the_hot_set() {
     let cache = RecordCache::new(CACHE_BYTES);
     let mut out = Vec::new();
     for offset in 0..HOT {
-        offer_twice(&cache, offset, &value(offset, 200));
+        read_twice(&cache, offset, &value(offset, 200));
     }
     for offset in HOT..HOT + VALUES {
-        cache.offer(SEGMENT, FileOffset(offset), KEY, &value(offset, 200));
+        read(&cache, offset, &value(offset, 200), &mut out);
         if offset % 64 == 0 {
             for hot in 0..HOT {
-                assert!(cache.get(SEGMENT, FileOffset(hot), KEY, &mut out), "hot place {hot} left under the scan at {offset}");
+                assert_eq!(cache.get(SEGMENT, FileOffset(hot), KEY, &mut out), CacheLookup::Hit, "hot place {hot} left under the scan at {offset}");
             }
         }
     }
+}
+
+// places read once each go in only when two share an admission byte and its fingerprint
+#[test]
+fn single_misses_stay_out() {
+    let cache = RecordCache::new(CACHE_BYTES);
+    let mut out = Vec::new();
+    for offset in 0..VALUES {
+        read(&cache, offset, &value(offset, 100), &mut out);
+    }
+    assert!(cache.value_count() < VALUES as usize / 100, "{} of {VALUES} single misses went in", cache.value_count());
 }
 
 // a place answers only for the key whose record sits there, so a lookup another key's hash led to it misses
@@ -90,8 +114,8 @@ fn scan_leaves_the_hot_set() {
 fn another_key_misses() {
     let cache = RecordCache::new(CACHE_BYTES);
     let bytes = value(3, 100);
-    offer_twice(&cache, 3, &bytes);
+    read_twice(&cache, 3, &bytes);
     let mut out = Vec::new();
-    assert!(cache.get(SEGMENT, FileOffset(3), KEY, &mut out));
-    assert!(!cache.get(SEGMENT, FileOffset(3), b"other-key", &mut out), "another key read this key's value");
+    assert_eq!(cache.get(SEGMENT, FileOffset(3), KEY, &mut out), CacheLookup::Hit);
+    assert_ne!(cache.get(SEGMENT, FileOffset(3), b"other-key", &mut out), CacheLookup::Hit, "another key read this key's value");
 }

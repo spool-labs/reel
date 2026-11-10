@@ -60,6 +60,15 @@ pub struct CacheShard {
     seen: Vec<u8>,
 }
 
+/// What a cache read found
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CacheLookup {
+    /// The value is in the buffer
+    Hit,
+    /// The cache lacks it, and the value goes in once read when this miss was its second
+    Miss { is_admitted: bool },
+}
+
 /// The cache over every shard
 #[derive(Debug)]
 pub struct RecordCache {
@@ -219,19 +228,17 @@ impl CacheShard {
         self.head += need as u64;
     }
 
-    /// Copy a cached value's bytes from a start into a buffer when the record there is this key's, and move it back to the head
-    /// when it sits near the tail
-    pub fn read(&mut self, segment: u64, offset: u64, key: &[u8], start: usize, length: Option<usize>, out: &mut Vec<u8>) -> bool {
-        let Some(slot) = self.find(segment, offset) else {
-            return false;
+    /// Copy a cached value into a buffer, or note a whole read's miss
+    pub fn read(&mut self, segment: u64, offset: u64, key: &[u8], start: usize, length: Option<usize>, out: &mut Vec<u8>) -> CacheLookup {
+        let Some((slot, entry)) = self.find(segment, offset).map(|slot| (slot, self.slots[slot])) else {
+            return self.note_miss(segment, offset, length);
         };
-        let entry = self.slots[slot];
         let capacity = self.arena.len() as u64;
         let physical = (entry.at % capacity) as usize;
         let key_length = usize::from(entry.key_length);
         // a place another key's lookup led to answers nothing
         if self.arena[physical..physical + key_length] != *key {
-            return false;
+            return self.note_miss(segment, offset, length);
         }
         let value_at = physical + key_length;
         let end = entry.length as usize;
@@ -239,18 +246,29 @@ impl CacheShard {
         let to = length.map_or(end, |length| (from + length).min(end));
         out.clear();
         out.extend_from_slice(&self.arena[value_at + from..value_at + to]);
-        // the oldest part of the log goes first, and a value read there moves to the head and stays
-        if entry.at - self.tail < capacity / PROMOTE_PART {
-            let mut moved = [0u8; MOST_CACHED_BYTES];
-            moved[..end].copy_from_slice(&self.arena[value_at..value_at + end]);
+        // a whole read near the tail moves to the head from the caller's copy, since making room can evict the source
+        if length.is_none() && from == 0 && entry.at - self.tail < capacity / PROMOTE_PART {
             self.remove_slot(slot);
-            self.append(segment, offset, key, &moved[..end]);
+            self.append(segment, offset, key, out);
         }
-        true
+        CacheLookup::Hit
     }
 
-    /// Take a key and its value in when this is its second miss, and note its first
-    pub fn offer(&mut self, segment: u64, offset: u64, key: &[u8], value: &[u8]) {
+    /// Note a whole read's miss, and say whether it is the record's second
+    fn note_miss(&mut self, segment: u64, offset: u64, length: Option<usize>) -> CacheLookup {
+        if length.is_some() {
+            return CacheLookup::Miss { is_admitted: false };
+        }
+        let hash = place_hash(segment, offset);
+        let count = hash as usize & (self.seen.len() - 1);
+        let print = (place_hash(offset, segment) >> 24) as u8 | 1;
+        let is_admitted = self.seen[count] == print;
+        self.seen[count] = if is_admitted { 0 } else { print };
+        CacheLookup::Miss { is_admitted }
+    }
+
+    /// Take in a key and its value that a read admitted on its miss
+    pub fn admit(&mut self, segment: u64, offset: u64, key: &[u8], value: &[u8]) {
         let stored = key.len() + value.len();
         if value.len() > MOST_CACHED_BYTES || key.len() > MOST_CACHED_KEY_BYTES || ENTRY_HEADER_BYTES + padded(stored) > self.arena.len() / 4 {
             return;
@@ -258,12 +276,6 @@ impl CacheShard {
         if self.find(segment, offset).is_some() {
             return;
         }
-        let count = place_hash(segment, offset) as usize & (self.seen.len() - 1);
-        if self.seen[count] == 0 {
-            self.seen[count] = 1;
-            return;
-        }
-        self.seen[count] = 0;
         self.append(segment, offset, key, value);
     }
 
@@ -291,19 +303,19 @@ impl RecordCache {
         &self.shards[(hash >> 58) as usize % CACHE_SHARDS]
     }
 
-    /// Copy a key's cached value into a buffer, and say whether the cache held it
-    pub fn get(&self, segment: SegmentNumber, offset: FileOffset, key: &[u8], out: &mut Vec<u8>) -> bool {
+    /// Copy a key's cached value into a buffer, or note the miss
+    pub fn get(&self, segment: SegmentNumber, offset: FileOffset, key: &[u8], out: &mut Vec<u8>) -> CacheLookup {
         hold(self.shard(segment, offset)).read(segment.0, offset.0, key, 0, None, out)
     }
 
     /// Copy a window of a key's cached value into a buffer, and say whether the cache held it
-    pub fn get_window(&self, segment: SegmentNumber, offset: FileOffset, key: &[u8], start: ByteCount, length: ByteCount, out: &mut Vec<u8>) -> bool {
+    pub fn get_window(&self, segment: SegmentNumber, offset: FileOffset, key: &[u8], start: ByteCount, length: ByteCount, out: &mut Vec<u8>) -> CacheLookup {
         hold(self.shard(segment, offset)).read(segment.0, offset.0, key, start.0 as usize, Some(length.0 as usize), out)
     }
 
-    /// Offer a key's value a read just checked
-    pub fn offer(&self, segment: SegmentNumber, offset: FileOffset, key: &[u8], value: &[u8]) {
-        hold(self.shard(segment, offset)).offer(segment.0, offset.0, key, value);
+    /// Take in a value its read's miss admitted
+    pub fn admit(&self, segment: SegmentNumber, offset: FileOffset, key: &[u8], value: &[u8]) {
+        hold(self.shard(segment, offset)).admit(segment.0, offset.0, key, value);
     }
 
     /// Read the heap the cache holds

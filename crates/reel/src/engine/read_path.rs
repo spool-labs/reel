@@ -15,7 +15,7 @@ use crate::engine::cue::JobCounts;
 use crate::engine::engine_state::EngineState;
 use crate::engine::open_segment::MOST_WINDOW_RECORD_BYTES;
 use crate::engine::volume::Volume;
-use crate::index::key_hash::{KeyHash, hash_key};
+use crate::index::key_hash::{KeyHash, hash_key}; use crate::index::record_cache::CacheLookup;
 use crate::index::spot_index::SpotLocation;
 use crate::index::write_row::WriteRow;
 use crate::io::{DeviceReads, InPlace, Io, ReadOn, in_place};
@@ -537,18 +537,18 @@ impl<Backend: Io> EngineState<Backend> {
             length: spot.length,
         };
         // the cache holds each value with its key, so a slot another key's hash led to answers nothing there
-        let is_cached = match want {
+        let lookup = match want {
             RecordWant::Whole => self.record_cache.get(spot.segment, location.offset, read.key, buf),
             RecordWant::Window(window) => self.record_cache.get_window(spot.segment, location.offset, read.key, window.offset, window.length, buf),
         };
-        if is_cached {
+        if lookup == CacheLookup::Hit {
             return Ok(Some(true));
         }
         // a slot holds no key, so a failed check here means another key or a moved record: a miss
         match self.read_record(ReadOn::new(device, &pin.file), location, spot.place, read, want, buf).await? {
             RecordRead::Valid => {
-                if want == RecordWant::Whole {
-                    self.record_cache.offer(spot.segment, location.offset, read.key, buf);
+                if lookup == (CacheLookup::Miss { is_admitted: true }) {
+                    self.record_cache.admit(spot.segment, location.offset, read.key, buf);
                 }
                 Ok(Some(true))
             },
@@ -637,17 +637,17 @@ impl<Backend: Io> EngineState<Backend> {
             length: sealed.row.length,
         };
         // a sealed record never changes where it sits, so the cache answers for its place while the segment is pinned
-        let is_cached = match want {
+        let lookup = match want {
             RecordWant::Whole => self.record_cache.get(sealed.segment, location.offset, read.key, buf),
             RecordWant::Window(window) => self.record_cache.get_window(sealed.segment, location.offset, read.key, window.offset, window.length, buf),
         };
-        if is_cached {
+        if lookup == CacheLookup::Hit {
             return Ok(true);
         }
         match self.read_record(ReadOn::new(device, &pin.file), location, sealed.row.place, read, want, buf).await? {
             RecordRead::Valid => {
-                if want == RecordWant::Whole {
-                    self.record_cache.offer(sealed.segment, location.offset, read.key, buf);
+                if lookup == (CacheLookup::Miss { is_admitted: true }) {
+                    self.record_cache.admit(sealed.segment, location.offset, read.key, buf);
                 }
                 Ok(true)
             },

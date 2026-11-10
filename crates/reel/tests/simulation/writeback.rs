@@ -158,3 +158,37 @@ fn cadence_syncs_at_the_limit() {
     assert!(synced() >= start + 2);
     store.close().expect("close");
 }
+
+const SYNC_CRASH_POINTS: u64 = 80;
+const SYNC_KEYS: u64 = 200;
+
+// a sync sends its rows with the turn held, gives the turn back for the fdatasyncs and writes its mark after: a crash at any
+// step keeps every row a flush that returned covered, and every row an earlier flush covered
+#[test]
+fn sync_crash_points() {
+    for crash_at in 0..SYNC_CRASH_POINTS {
+        let io = SimulatedIo::new(Seed(crash_at));
+        let store = open(&io);
+        for number in 0..SYNC_KEYS {
+            store.put(COLUMN, format!("first-{number:04}").as_bytes(), b"one").expect("put");
+        }
+        store.flush().expect("flush");
+        for number in 0..SYNC_KEYS {
+            store.put(COLUMN, format!("second-{number:04}").as_bytes(), b"two").expect("put");
+        }
+        io.arm_crash(reel_sim::simulated_disk::OperationCount(crash_at));
+        let is_flushed = store.flush().is_ok() && !io.is_crashed();
+        io.power_cut();
+        drop(store);
+
+        let store = open(&io);
+        let mut buf = Vec::new();
+        for number in 0..SYNC_KEYS {
+            assert!(store.get(COLUMN, format!("first-{number:04}").as_bytes(), &mut buf).expect("get"), "crash at {crash_at}: a row the first flush covered went");
+            if is_flushed {
+                assert!(store.get(COLUMN, format!("second-{number:04}").as_bytes(), &mut buf).expect("get"), "crash at {crash_at}: a flushed row went");
+            }
+        }
+        store.close().expect("close");
+    }
+}

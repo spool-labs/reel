@@ -96,7 +96,7 @@ impl<Backend: Io> EngineState<Backend> {
         let mut after: Option<OpenSlot> = None;
         while let Some((slot, pin, rows)) = self.next_open(volume, after) {
             after = Some(slot);
-            self.write_out_turn(slot, &rows, Some(&pin.file))?;
+            self.sync_slot(slot, &rows, &pin.file)?;
         }
         Ok(())
     }
@@ -181,6 +181,46 @@ impl<Backend: Io> EngineState<Backend> {
         if outcome.is_ok() && self.has_left_over_rows(slot) {
             outcome = self.send_group(slot, rows, data);
         }
+        outcome
+    }
+
+    /// Sync a slot: send its rows with the turn held, give the turn back for both fdatasyncs so other writers send meanwhile,
+    /// then take it again to write a mark that covers the rows sent before the syncs. Rows sent while they ran sit before the
+    /// mark and stay past what it covers
+    pub fn sync_slot(&self, slot: OpenSlot, rows: &Backend::File, data: &Backend::File) -> Result<(), Error> {
+        let index = slot.0 as usize;
+        self.write_out_turn(slot, rows, None)?;
+        let covered = hold(&self.queues[index]).rows_end;
+        // the records of every row up to here reached the kernel before their rows did, so the data sync makes them durable
+        data.sync()?;
+        rows.sync()?;
+        self.take_writing_turn(slot);
+        let _turn = WritingTurn { state: self, index };
+        let (rows_end, marked_end, marks) = {
+            let queue = hold(&self.queues[index]);
+            (queue.rows_end, queue.marked_end, queue.marks)
+        };
+        if covered <= marked_end {
+            return Ok(());
+        }
+        let Some(mut group) = hold(&self.spare_groups[index]).take() else {
+            return Ok(());
+        };
+        // a spare a failed send left full goes out with the next send, and this mark waits for the next sync
+        let mut outcome = Ok(());
+        if group.is_empty() {
+            let bytes = group.finish(covered, marks, self.record_key);
+            let mark_end = FileOffset(rows_end.0 + bytes.len() as u64);
+            outcome = rows.write_at(rows_end, &[IoSlice::new(bytes)]);
+            group.clear();
+            if outcome.is_ok() {
+                let mut queue = hold(&self.queues[index]);
+                queue.rows_end = mark_end;
+                queue.marked_end = mark_end;
+                queue.synced_through = queue.synced_through.max(covered);
+            }
+        }
+        *hold(&self.spare_groups[index]) = Some(group);
         outcome
     }
 

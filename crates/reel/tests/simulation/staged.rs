@@ -51,7 +51,7 @@ const SETTLE_TICK: Nanoseconds = Nanoseconds(1_000_000);
 const ROW_PERIOD: Nanoseconds = Nanoseconds(60_000_000);
 const SEED_COUNT: u64 = 16;
 // seeds a sweep found, kept so CI runs them
-const FOUND_SEEDS: [u64; 1] = [314];
+const FOUND_SEEDS: [u64; 2] = [314, 396];
 const STEPS: u64 = 4_000;
 const KEY_SPACE: u64 = 40;
 const MOST_IN_FLIGHT: usize = 6;

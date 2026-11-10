@@ -26,7 +26,7 @@ use crate::segment::row_block::ROW_BLOCK_BYTES;
 use crate::segment::segment_tail::{ColumnTail, MOST_MERGE_SEGMENTS, SegmentNumber};
 use crate::segment::summary::{ColumnFacts, SegmentFacts, SummaryRow, SummaryRows};
 
-use crate::engine::rewrite_job::{BAR_QUARTERS, EARLY_BAR_QUARTERS, MOST_PARK_WAITS, MergeTarget, RewriteJob, RewritePhase, StagedColumn, StagedOutput, rows_bytes};
+use crate::engine::rewrite_job::{BAR_QUARTERS, EARLY_BAR_QUARTERS, MOST_PARK_WAITS, MergeTarget, OUTGROW_STEP_BYTES, RewriteJob, RewritePhase, StagedColumn, StagedOutput, rows_bytes}; use crate::engine::rewrite_job::pick::has_disk_room;
 
 impl<Backend: Io> RewriteJob<Backend> {
     /// Check a merge that dropped nothing would leave its inputs' overlap as it was. One input wins back nothing unless it was
@@ -593,5 +593,26 @@ impl<Backend: Io> RewriteJob<Backend> {
     pub fn release_promise(&mut self, volume: &Volume<Backend>) {
         volume.outputs_promised.fetch_sub(self.promised.0, Ordering::AcqRel);
         self.promised = ByteCount(0);
+    }
+}
+
+impl<Backend: Io> RewriteJob<Backend> {
+    /// Check the merge has written past its promise, taking another step of room when the disk has it, and say whether it must
+    /// give way
+    pub fn outgrows_promise(&mut self) -> bool {
+        let state = Arc::clone(&self.state);
+        let volume = &state.volumes[self.volume];
+        let written = self.staged.iter().map(|staged| staged.facts.file_length.0).sum::<u64>() + self.records_end.0 + self.used as u64;
+        if written <= self.promised.0 {
+            return false;
+        }
+        let more = written - self.promised.0 + OUTGROW_STEP_BYTES;
+        if !has_disk_room(&state, volume, ByteCount(more), false) {
+            return true;
+        }
+        self.promised = ByteCount(self.promised.0 + more);
+        volume.outputs_promised.fetch_add(more, Ordering::AcqRel);
+        volume.promises_outgrown.fetch_add(1, Ordering::Relaxed);
+        false
     }
 }

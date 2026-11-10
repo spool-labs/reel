@@ -9,7 +9,7 @@ use reel_api::column_id::ColumnId;
 use reel_api::maintenance_report::{
     PickKind, PickOutcome,
 };
-use reel_api::units::{ByteCount, DeathMark, FileOffset};
+use reel_api::units::{ByteCount, DeathMark, FileOffset, WritePlace};
 
 use crate::engine::engine_state::EngineState;
 use crate::engine::seal_job::MOST_SEGMENT_BLOCKS;
@@ -707,12 +707,17 @@ impl<Backend: Io> RewriteJob<Backend> {
     /// the writers' reserve, or a full disk could never free itself
     pub fn disk_room_for(&self, volume: &Volume<Backend>, length: ByteCount) -> Option<ByteCount> {
         let summary = hold(&volume.summary);
-        let (mut inputs, mut output) = (0, 0);
+        let (mut inputs, mut output, mut highest) = (0, 0, WritePlace(0));
         for row in self.numbers[..self.input_count].iter().filter_map(|number| summary.get(*number)) {
             inputs += row.facts.file_length.0;
             output += output_estimate(&row);
+            highest = highest.max(row.facts.places.highest);
         }
         drop(summary);
+        // a live cue below the inputs' rows keeps the dead ones it can read, so the merge may write all it reads
+        if self.state.cues.has_cue_below(self.volume, highest) {
+            output = length.0;
+        }
         let output = ByteCount(output.min(length.0));
         has_disk_room(&self.state, volume, output, output.0 < inputs).then_some(output)
     }

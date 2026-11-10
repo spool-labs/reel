@@ -140,6 +140,8 @@ impl<Backend: Io> RewriteJob<Backend> {
             RewritePhase::Draining => self.drain_step(),
             RewritePhase::Installing => self.install(),
         };
+        // a merge that wrote past its promise takes more room before it goes on, or gives way
+        let outcome = outcome.and_then(|()| if self.outgrows_promise() { Err(Error::from(ErrorKind::StorageFull)) } else { Ok(()) });
         // the row blocks a pass reads, so a merge's deciding and placing reads show beside its copying one
         let pass = match phase {
             RewritePhase::Deciding => 0,

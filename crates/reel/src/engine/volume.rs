@@ -324,6 +324,8 @@ pub struct Volume<Backend: Io> {
     pub bytes_since_sync: AtomicU64,
     /// When the row job last saw a write land on the volume
     pub last_write_at: AtomicU64,
+    /// Merges that wrote past their promise and took more room
+    pub promises_outgrown: AtomicU64,
     /// A merge was refused for disk room, so the planner looks again on a timer, since no write may come to wake it
     pub is_room_short: AtomicBool,
     /// Bytes of outputs the running merges claimed room for

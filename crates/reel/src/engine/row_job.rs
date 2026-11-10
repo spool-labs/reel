@@ -75,6 +75,7 @@ impl<Backend: Io> RowJob<Backend> {
                 if segment.seen_rows != segment.row_count {
                     segment.seen_rows = segment.row_count;
                     segment.quiet_since = now;
+                    volume.last_write_at.store(now.0, Ordering::Relaxed);
                 }
                 if segment.has_deletes && segment.delete_seen.is_none() {
                     segment.delete_seen = Some(now);

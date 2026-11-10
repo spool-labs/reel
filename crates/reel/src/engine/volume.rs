@@ -12,6 +12,7 @@ use crate::engine::open_segment::OpenSegment;
 use crate::engine::ration::Ration;
 use crate::engine::held_bits::HeldBits;
 use crate::engine::walk_job::WalkSlot;
+use crate::engine::row_job::IDLE_SEAL_AFTER;
 use crate::guard::hold;
 use crate::index::open_slots::{OpenSlot, OpenSlots};
 use crate::io::Io;
@@ -319,6 +320,10 @@ pub struct Volume<Backend: Io> {
     pub seal_started_at: AtomicU64,
     /// Bytes written since the last byte-cadence sync
     pub bytes_since_sync: AtomicU64,
+    /// When the row job last saw a write land on the volume
+    pub last_write_at: AtomicU64,
+    /// Seals that ended a segment writes had gone quiet on
+    pub idle_seals: AtomicU64,
     /// Nanoseconds from the last sealed segment's first row to its seal start, the time the writes took to fill it, or 0 before a
     /// seal
     pub seal_interval: AtomicU64,
@@ -468,14 +473,17 @@ impl<Backend: Io> Volume<Backend> {
     /// Check writes are still arriving: the last seal started less than two fill times ago. Record rewrites, which spend writes
     /// only to win space back, wait while it holds, and a volume with no seal yet or whose writes stopped is past it
     pub fn is_ingesting(&self, now: Nanoseconds) -> bool {
-        let fill = self.seal_interval.load(Ordering::Relaxed);
-        fill > 0 && now.0.saturating_sub(self.seal_started_at.load(Ordering::Relaxed)) < HOT_PERIODS * fill
+        now.0 < self.hot_until().0
     }
 
-    /// Read when the hot window closes: two fill times past the last seal start
+    /// Read when the hot window closes: two fill times past the last seal start, or a quiet spell past the last write
     pub fn hot_until(&self) -> Nanoseconds {
         let interval = self.seal_interval.load(Ordering::Relaxed);
-        Nanoseconds(self.seal_started_at.load(Ordering::Relaxed).saturating_add(HOT_PERIODS.saturating_mul(interval)))
+        if interval == 0 {
+            return Nanoseconds(0);
+        }
+        let filled = self.seal_started_at.load(Ordering::Relaxed).saturating_add(HOT_PERIODS.saturating_mul(interval));
+        Nanoseconds(filled.min(self.last_write_at.load(Ordering::Relaxed).saturating_add(IDLE_SEAL_AFTER.0)))
     }
 
     /// Check the volume runs short of room: the fullest shard of its table or its park is past half, so merges run under hot

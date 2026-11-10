@@ -16,6 +16,7 @@ use reel::engine::read_path::{RecordWant, WalkAsk};
 use reel::engine::planner::Planner;
 use reel::engine::unit_bounds::unit_bound;
 use reel::engine::reel_store::ReelStore;
+use reel::engine::row_job::IDLE_SEAL_AFTER;
 use reel::engine::rewrite_job::{MERGE_BUFFER_BYTES, MergeTarget, MOST_OVERLAP, MOST_PARK_WAITS, PLANNER_LANE, RewriteJob, RewritePhase, is_overlap_input, overlaps};
 use reel::lifetime::MarkRange;
 use reel::engine::volume::{MOST_PARKED, NO_SEAL, Volume};
@@ -3129,5 +3130,20 @@ fn cut_outputs_come_one_a_step() {
 
     run_to_end(&mut job);
     check_set(&store);
+    store.close().expect("close");
+}
+
+// writes that stop close the hot window after a quiet spell, however long the last fill took
+#[test]
+fn silence_ends_ingest() {
+    let io = SimulatedIo::new(Seed(93));
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    let now = io.clock_reading().0;
+    volume.seal_interval.store(3_600_000_000_000, Ordering::Relaxed);
+    volume.seal_started_at.store(now, Ordering::Relaxed);
+    volume.last_write_at.store(now, Ordering::Relaxed);
+    assert!(volume.is_ingesting(Nanoseconds(now)));
+    assert!(!volume.is_ingesting(Nanoseconds(now + IDLE_SEAL_AFTER.0)), "an hour's fill held the window past the silence");
     store.close().expect("close");
 }

@@ -154,9 +154,13 @@ impl<Backend: Io> SealJob<Backend> {
                 // the period runs from the first row to the last, so idle gaps on either side read quiet: one before the first row,
                 // and one an idle seal waited out after the last. A recovered segment has none
                 let last_write = if segment.quiet_since.0 > 0 { segment.quiet_since } else { now };
+                if segment.quiet_since.0 > 0 {
+                    volume.idle_seals.fetch_add(1, Ordering::Relaxed);
+                }
                 let period = segment.first_row_at.map_or(0, |first| last_write.0.saturating_sub(first.0).max(1));
                 volume.seal_interval.store(period, Ordering::Relaxed);
                 volume.seal_started_at.store(last_write.0, Ordering::Relaxed);
+                volume.last_write_at.fetch_max(last_write.0, Ordering::Relaxed);
                 self.seal_started = now;
                 self.step_started = now;
                 self.rows_walked = 0;

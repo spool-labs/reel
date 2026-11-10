@@ -238,6 +238,14 @@ pub struct VolumeReading {
     pub rewrite_bytes: RewriteBytes,
     /// Walk blocks whose counts landed
     pub walk_blocks: u64,
+    /// How long the writes took to fill the last sealed segment
+    pub fill_interval: Nanoseconds,
+    /// How long a merge took for each input, lately
+    pub merge_interval: Nanoseconds,
+    /// Time left until writes count as stopped and record rewrites may run
+    pub ingest_left: Nanoseconds,
+    /// Seals that ended a segment writes had gone quiet on
+    pub idle_seals: u64,
 }
 
 /// What a rewrite lane's look for work came to. The overlap misses count beside the look's own outcome

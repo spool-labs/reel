@@ -201,6 +201,10 @@ impl<Backend: Io> EngineState<Backend> {
                     unlinked: ByteCount(volume.unlinked_bytes.load(Ordering::Acquire)),
                 },
                 walk_blocks: volume.walk_blocks.load(Ordering::Acquire),
+                fill_interval: Nanoseconds(volume.seal_interval.load(Ordering::Relaxed)),
+                merge_interval: Nanoseconds(volume.merge_interval.load(Ordering::Relaxed)),
+                ingest_left: Nanoseconds(volume.hot_until().0.saturating_sub(self.io.now().0)),
+                idle_seals: volume.idle_seals.load(Ordering::Relaxed),
             });
         }
         for (id, info) in self.columns.iter().enumerate() {

@@ -40,6 +40,58 @@ impl WriteSource {
     }
 }
 
+/// What a writer paused for
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PauseCause {
+    /// Its volume's ration of the write index
+    Ration,
+    /// Room in the write index
+    Index,
+    /// A seal of a segment it could claim in
+    SealDue,
+    /// Another writer's room step on its segment
+    RoomStep,
+    /// Room in the write order's ring
+    Ring,
+    /// A segment another writer is making
+    Creating,
+    /// A segment the volume had no room to make
+    NoSegment,
+    /// A sync another writer is running
+    Sync,
+    /// Its slot's writing turn
+    WritingTurn,
+    /// The record window's turn
+    RecordTurn,
+    /// The other claims on a batch's slot
+    OtherClaims,
+    /// The next segment reservation
+    Reservation,
+}
+
+/// Every pause cause, in the order a report lists them
+pub const PAUSE_CAUSES: [PauseCause; 12] = [
+    PauseCause::Ration,
+    PauseCause::Index,
+    PauseCause::SealDue,
+    PauseCause::RoomStep,
+    PauseCause::Ring,
+    PauseCause::Creating,
+    PauseCause::NoSegment,
+    PauseCause::Sync,
+    PauseCause::WritingTurn,
+    PauseCause::RecordTurn,
+    PauseCause::OtherClaims,
+    PauseCause::Reservation,
+];
+
+impl PauseCause {
+    /// The cause's place in a report
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
 /// Every kind of job, in the order a report lists them
 pub const JOB_KINDS: [JobKind; 7] = [
     JobKind::RowWriteOut,
@@ -340,6 +392,9 @@ pub struct RewriteBytes {
     /// Bytes the outputs took, by what the rewrite was: a record rewrite whose inputs won back under three quarters of their
     /// bytes, one that won back three quarters or more, an overlap merge, and a rebuild or forced merge
     pub written_by_share: [ByteCount; SHARE_KINDS],
+    /// Bytes past the records the outputs of each kind took: footers, row blocks and summaries, which a merge that moved no
+    /// records would still write
+    pub footers_by_share: [ByteCount; SHARE_KINDS],
     /// Input bytes rewrites of each of those kinds took off the disk
     pub gone_by_share: [ByteCount; SHARE_KINDS],
     /// Rewrites of each of those kinds
@@ -446,6 +501,10 @@ pub struct MaintenanceReport {
     pub jobs: [JobReport; JOB_KINDS.len()],
     /// Bytes written since open, by where they came from
     pub written: [ByteCount; WRITE_SOURCES.len()],
+    /// Pauses writers took since open, by what they waited for
+    pub pauses: [u64; PAUSE_CAUSES.len()],
+    /// The longest a writer took to reserve room ahead of its claims
+    pub longest_room_step: Nanoseconds,
     pub volumes: Vec<VolumeReading>,
     pub complete_columns: Vec<CompleteReading>,
     pub least_value_columns: Vec<LeastValueReading>,
@@ -522,6 +581,8 @@ impl MaintenanceReport {
         Self {
             jobs: JOB_KINDS.map(JobReport::new),
             written: [ByteCount(0); WRITE_SOURCES.len()],
+            pauses: [0; PAUSE_CAUSES.len()],
+            longest_room_step: Nanoseconds(0),
             volumes: Vec::new(),
             complete_columns: Vec::new(),
             least_value_columns: Vec::new(),

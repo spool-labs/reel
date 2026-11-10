@@ -245,6 +245,8 @@ pub struct Volume<Backend: Io> {
     pub rewrite_written: AtomicU64,
     /// Bytes the outputs took, by the kinds the report counts them in
     pub rewrite_written_by_share: [AtomicU64; SHARE_KINDS],
+    /// Bytes past the records the outputs of each kind took
+    pub rewrite_footers_by_share: [AtomicU64; SHARE_KINDS],
     pub rewrite_gone_by_share: [AtomicU64; SHARE_KINDS],
     /// Rewrites done, by the same kinds
     pub rewrites_by_share: [AtomicU64; SHARE_KINDS],

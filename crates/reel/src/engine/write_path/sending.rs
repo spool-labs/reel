@@ -3,7 +3,7 @@
 use std::io::{Error, IoSlice};
 use std::mem; use std::sync::atomic::Ordering;
 
-use reel_api::maintenance_report::{JobKind, WriteSource};
+use reel_api::maintenance_report::{JobKind, PauseCause, WriteSource};
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset};
 
@@ -62,7 +62,7 @@ impl<Backend: Io> EngineState<Backend> {
             }
             if sync.is_running {
                 drop(sync);
-                self.io.pause();
+                self.pause_for(PauseCause::Sync);
                 continue;
             }
             sync.is_running = true;
@@ -161,7 +161,7 @@ impl<Backend: Io> EngineState<Backend> {
     /// Wait for the slot's writing turn, which keeps its groups in order
     pub fn take_writing_turn(&self, slot: OpenSlot) {
         while !self.try_writing_turn(slot) {
-            self.io.pause();
+            self.pause_for(PauseCause::WritingTurn);
         }
     }
 

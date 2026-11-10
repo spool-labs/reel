@@ -5,6 +5,7 @@ use std::io::{Error, ErrorKind};
 use std::sync::atomic::Ordering;
 use std::sync::MutexGuard;
 
+use reel_api::maintenance_report::PauseCause;
 use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, DeathMark, FileOffset, Nanoseconds, RootId, RowCount, WritePlace};
@@ -78,7 +79,7 @@ impl<Backend: Io> EngineState<Backend> {
                 hint::spin_loop();
             } else {
                 spins = 0;
-                self.io.pause();
+                self.pause_for(PauseCause::Ration);
             }
         }
     }
@@ -194,7 +195,7 @@ impl<Backend: Io> EngineState<Backend> {
                     source: Error::from(ErrorKind::TimedOut),
                 });
             }
-            self.io.pause();
+            self.pause_for(PauseCause::Index);
         }
     }
 
@@ -224,7 +225,7 @@ impl<Backend: Io> EngineState<Backend> {
             if pick.must_wait {
                 drop(claims);
                 check_seal_room(volume)?;
-                self.io.pause();
+                self.pause_for(PauseCause::SealDue);
                 continue;
             }
             if pick.wants_more || pick.best.is_none() {
@@ -249,7 +250,7 @@ impl<Backend: Io> EngineState<Backend> {
                 // a claim past the room waits for a room step under way, so one runs on a segment at a time
                 let segment = &claims.open[index]; if segment.is_room_holding && segment.write_end.0 + request.bytes.0 > segment.reserved_end.0 {
                     drop(claims);
-                    self.io.pause();
+                    self.pause_for(PauseCause::RoomStep);
                     continue;
                 }
                 if let Some(room) = self.claim_room(&mut claims, volume, index, request) {
@@ -264,7 +265,7 @@ impl<Backend: Io> EngineState<Backend> {
                     if self.places.is_past_limit(request.rows) {
                         let _is_held = self.reserve_ahead();
                     }
-                    self.io.pause();
+                    self.pause_for(PauseCause::Ring);
                     continue;
                 };
 
@@ -273,7 +274,7 @@ impl<Backend: Io> EngineState<Backend> {
 
             if claims.is_creating {
                 drop(claims);
-                self.io.pause();
+                self.pause_for(PauseCause::Creating);
                 continue;
             }
             claims.is_creating = true;
@@ -292,7 +293,7 @@ impl<Backend: Io> EngineState<Backend> {
                 },
                 Ok(None) => {
                     drop(claims);
-                    self.io.pause();
+                    self.pause_for(PauseCause::NoSegment);
                 },
                 Err(error) => return Err(error),
             }
@@ -320,7 +321,9 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// Take a claim's room with no lock held, then note it. A full disk seals the segment, so no claim tries it again
     pub fn take_room(&self, volume: &Volume<Backend>, room: RoomAhead<Backend::File>) -> Result<(), StoreError> {
+        let started = self.io.now();
         let reserved = room.file.reserve_to(ByteCount(room.end));
+        self.longest_room_step.fetch_max(self.io.now().0.saturating_sub(started.0), Ordering::Relaxed);
         let mut claims = hold(&volume.claims);
         let Some(index) = claims.open.iter().position(|segment| segment.number == room.segment) else {
             return Ok(());

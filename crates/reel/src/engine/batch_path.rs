@@ -4,7 +4,7 @@ use std::io::{Error, ErrorKind, IoSlice};
 use std::slice::Iter;
 use std::sync::atomic::Ordering;
 
-use reel_api::maintenance_report::WriteSource;
+use reel_api::maintenance_report::{PauseCause, WriteSource};
 use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, DeathMark, FileOffset, RowCount, VolumeId, WritePlace};
@@ -291,7 +291,7 @@ impl<Backend: Io> EngineState<Backend> {
                     source: Error::from(ErrorKind::TimedOut),
                 });
             }
-            self.io.pause();
+            self.pause_for(PauseCause::Index);
             if self.index.hold_room(&plan.needs) {
                 let waited = self.io.now().0.saturating_sub(started.0);
                 self.longest_index_wait.fetch_max(waited, Ordering::Relaxed);
@@ -516,7 +516,7 @@ impl<Backend: Io> EngineState<Backend> {
             if is_alone {
                 return;
             }
-            self.io.pause();
+            self.pause_for(PauseCause::OtherClaims);
         }
     }
 

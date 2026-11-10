@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use reel_api::column_id::ColumnId;
 use reel_api::maintenance_report::{MaintenanceMemory, 
-    CompleteReading, JOB_KINDS, JobKind, JobState, LeastValueReading, MOST_REPORTED_LANES, MaintenanceReport, RewriteBytes, UnitKind, VolumeReading,
+    CompleteReading, JOB_KINDS, JobKind, JobState, LeastValueReading, MOST_REPORTED_LANES, MaintenanceReport, PauseCause, RewriteBytes, UnitKind, VolumeReading,
     WriteSource,
 };
 use reel_api::store_error::StoreError;
@@ -29,6 +29,12 @@ impl<Backend: Io> EngineState<Backend> {
     /// Count bytes written, by where they came from
     pub fn note_written(&self, source: WriteSource, bytes: ByteCount) {
         self.written[source.index()].fetch_add(bytes.0, Ordering::Relaxed);
+    }
+
+    /// Count a writer's pause by its cause, and take it
+    pub fn pause_for(&self, cause: PauseCause) {
+        self.pauses[cause.index()].fetch_add(1, Ordering::Relaxed);
+        self.io.pause();
     }
 
     /// Count bytes a job moved
@@ -138,6 +144,10 @@ impl<Backend: Io> EngineState<Backend> {
     pub fn maintenance(&self, report: &mut MaintenanceReport) {
         report.clear();
         let now = self.io.now();
+        for (entry, pauses) in report.pauses.iter_mut().zip(&self.pauses) {
+            *entry = pauses.load(Ordering::Relaxed);
+        }
+        report.longest_room_step = Nanoseconds(self.longest_room_step.load(Ordering::Relaxed));
         for (entry, written) in report.written.iter_mut().zip(&self.written) {
             *entry = ByteCount(written.load(Ordering::Relaxed));
         }
@@ -206,6 +216,7 @@ impl<Backend: Io> EngineState<Backend> {
                     dead_kept: ByteCount(volume.rewrite_dead_kept.load(Ordering::Acquire)),
                     unreclaimed: volume.rewrites_unreclaimed.load(Ordering::Acquire),
                     written_by_share: array::from_fn(|kind| ByteCount(volume.rewrite_written_by_share[kind].load(Ordering::Acquire))),
+                    footers_by_share: array::from_fn(|kind| ByteCount(volume.rewrite_footers_by_share[kind].load(Ordering::Acquire))),
                     gone_by_share: array::from_fn(|kind| ByteCount(volume.rewrite_gone_by_share[kind].load(Ordering::Acquire))),
                     rewrites_by_share: array::from_fn(|kind| volume.rewrites_by_share[kind].load(Ordering::Acquire)),
                     unlinked: ByteCount(volume.unlinked_bytes.load(Ordering::Acquire)),

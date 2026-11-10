@@ -133,8 +133,8 @@ impl<Backend: Io> RewriteJob<Backend> {
         save_cleared_spans(&self.state, volume);
     }
 
-    /// Count what a merge moved, dropped and carried, for the report
-    pub fn note_install(&self) {
+    /// Count what a merge moved, dropped and carried, for the report, and give back the bytes it wrote past its records
+    pub fn note_install(&self) -> u64 {
         let state = &self.state;
         let staged = self.staged_columns.iter().map(|column| &column.tail);
         let carried: u64 = staged.chain(self.writer.columns()).chain(self.grave_writer.columns()).map(|tail| tail.grave_count.0).sum();
@@ -148,6 +148,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         records += self.staged.iter().map(|staged| staged.facts.data_end.0).sum::<u64>();
         state.note_written(WriteSource::MergeRecords, ByteCount(records));
         state.note_written(WriteSource::MergeFooters, ByteCount(bytes.saturating_sub(records)));
+        bytes.saturating_sub(records)
     }
 
     /// Keep what an output's summary row and list entries will need once the writer has moved on
@@ -304,7 +305,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             self.state.filter_arena.drop_segment(*input);
         }
         let retired: [_; MOST_MERGE_SEGMENTS] = array::from_fn(|index| inputs.get(index).and_then(|number| volume.table.retire(*number)));
-        self.note_install();
+        let footers = self.note_install();
         if self.picked_as == Some(PickOutcome::Overlap) {
             let elapsed = state.io.now().0.saturating_sub(self.begun_at.0);
             volume.merge_interval.store((elapsed / inputs.len().max(1) as u64).max(1), Ordering::Relaxed);
@@ -323,6 +324,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             _other => OTHER_MERGE,
         };
         volume.note_rewrite_bytes(gone, written, kind);
+        volume.rewrite_footers_by_share[kind].fetch_add(footers, Ordering::Relaxed);
         self.end_rebuild(volume);
         let saved = state.save_summary(volume);
 

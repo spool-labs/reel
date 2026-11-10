@@ -4,6 +4,7 @@ use std::hint;
 use std::io::{Error, IoSlice};
 use std::sync::atomic::Ordering;
 
+use reel_api::maintenance_report::PauseCause;
 use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, DeathMark, FileOffset, RowCount, WritePlace};
@@ -198,7 +199,7 @@ impl<Backend: Io> EngineState<Backend> {
                     hint::spin_loop();
                 }
             } else {
-                self.io.pause();
+                self.pause_for(PauseCause::RecordTurn);
             }
         }
     }

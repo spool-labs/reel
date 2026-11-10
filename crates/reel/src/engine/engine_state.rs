@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::{PICK_KINDS, UnitKind, WRITE_SOURCES, WriteSource};
+use reel_api::maintenance_report::{PAUSE_CAUSES, PICK_KINDS, PauseCause, UnitKind, WRITE_SOURCES, WriteSource};
 use reel_api::memory_report::MemoryReport;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, SegmentCount, WritePlace};
@@ -123,6 +123,10 @@ pub struct EngineState<Backend: Io> {
     pub dropped_summary_rows: AtomicU64,
     pub tallies: JobTallies,
     pub written: [AtomicU64; WRITE_SOURCES.len()],
+    /// Pauses writers took, by what they waited for
+    pub pauses: [AtomicU64; PAUSE_CAUSES.len()],
+    /// The longest room step, in nanoseconds
+    pub longest_room_step: AtomicU64,
     pub units: UnitTallies,
     pub opened_at: Nanoseconds,
     pub graves_at_open: AtomicU64,
@@ -341,7 +345,7 @@ impl<Backend: Io> EngineState<Backend> {
                 });
             }
             if number >= self.reserved_segment.load(Ordering::Acquire) {
-                self.io.pause();
+                self.pause_for(PauseCause::Reservation);
             }
         }
         Ok(SegmentNumber(number))

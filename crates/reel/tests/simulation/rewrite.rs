@@ -31,7 +31,7 @@ use reel::segment::footer_reader::FooterReader;
 use reel::segment::segment_table::{RetiredSegment, TABLE_SHARDS, shard_of};
 use reel::segment::segment_tail::{BlockCount, MOST_MERGE_SEGMENTS, SegmentNumber, TailHead};
 use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::{MaintenanceReport, PickOutcome, UnitKind};
+use reel_api::maintenance_report::{MaintenanceReport, PickOutcome, UnitKind, WriteSource};
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RootId, VolumeId, WritePlace};
 use reel_api::write_batch::WriteBatch;
 use reel_sim::seeded_random::{Seed, SeededRandom};
@@ -3351,4 +3351,19 @@ fn check_dead_pile(store: &Store, has_live: bool) {
     for key in 0..DEAD_PILE_KEYS {
         assert_eq!(read(store, format!("d-{key}").as_bytes()), Some(dead_pile_value(OVER_THE_BOUND - 1)));
     }
+}
+
+// every byte a merge writes past its records lands in the footer count of its kind
+#[test]
+fn footers_by_kind_match_the_total() {
+    let (_io, store) = pile_on_disk(99, true);
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(start_merge(&mut job));
+    run_to_end(&mut job);
+    let mut report = MaintenanceReport::new();
+    store.maintenance_report(&mut report);
+    let footers = report.volumes[0].rewrite_bytes.footers_by_share;
+    assert!(footers.iter().any(|bytes| bytes.0 > 0));
+    assert_eq!(footers.iter().map(|bytes| bytes.0).sum::<u64>(), report.written[WriteSource::MergeFooters.index()].0);
+    store.close().expect("close");
 }

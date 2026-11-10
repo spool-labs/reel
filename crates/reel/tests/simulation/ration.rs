@@ -8,6 +8,7 @@ use reel::engine::reel_store::ReelStore;
 use reel::io::Io;
 use reel::record::codec::Codec;
 use reel_api::column_id::ColumnId;
+use reel_api::maintenance_report::{MaintenanceReport, PauseCause};
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, Nanoseconds, RowCount, VolumeId};
 use reel_api::write_batch::WriteBatch;
@@ -112,6 +113,9 @@ fn writes_keep_to_the_line() {
     settle(&io);
     let (waits, _longest) = store.index_waits();
     assert!(waits > 0);
+    let mut report = MaintenanceReport::new();
+    store.maintenance_report(&mut report);
+    assert!(report.pauses[PauseCause::Ration.index()] > 0, "the waits never paused on the ration");
     store.close().expect("close");
 }
 

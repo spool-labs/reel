@@ -21,6 +21,7 @@ pub const INEXACT_PLACE: usize = 0;
 pub const INEXACT_OVERFLOW: usize = 1;
 pub const INEXACT_DAMAGE: usize = 2;
 pub const INEXACT_POOL: usize = 3;
+pub const INEXACT_KEPT: usize = 4;
 /// Rows a merge decides by bit for each one it also asks, in a build without the test hooks
 pub const BIT_SAMPLE_EVERY: u64 = 1024;
 /// Places in the merge counts: set and dropped, clear and kept, asked as well, set with no newer row, clear with one
@@ -68,8 +69,9 @@ pub struct BitsBooks {
 pub struct DeadBits {
     words: Vec<AtomicU64>,
     books: Mutex<BitsBooks>,
-    /// Segments made inexact, by cause: unknown place, list overflow, damage, pool short
-    pub inexact: [AtomicU64; 4],
+    /// Segments made inexact, by cause: unknown place, list overflow, damage, pool short, a merge output with counts that came
+    /// with no bits
+    pub inexact: [AtomicU64; 5],
     /// Spoils so far, so a merge that read an extent reads it again after one
     pub spoils: AtomicU64,
     /// Merge rows by what their bit gave: set and dropped, clear and kept, asked as well, a set bit the ask found no newer row
@@ -188,6 +190,16 @@ impl DeadBits {
                 self.inexact[INEXACT_OVERFLOW].fetch_add(u64::from(extent.is_exact), Ordering::Relaxed);
                 extent.is_exact = false;
             }
+        }
+    }
+
+    /// Mark one segment's bits inexact for a cause, when counts land on it with no bits
+    pub fn spoil_segment(&self, segment: SegmentNumber, cause: usize) {
+        let mut books = hold(&self.books);
+        if let Some(extent) = books.extents.get_mut(&segment).filter(|extent| extent.is_exact) {
+            extent.is_exact = false;
+            self.inexact[cause].fetch_add(1, Ordering::Relaxed);
+            self.spoils.fetch_add(1, Ordering::AcqRel);
         }
     }
 

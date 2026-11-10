@@ -11,6 +11,7 @@ use reel_api::maintenance_report::{
 };
 use reel_api::units::{ByteCount, FileOffset, RootId, RowCount, WritePlace};
 
+use crate::engine::dead_bits::INEXACT_KEPT;
 use crate::engine::compact_job::park;
 use crate::engine::engine_state::EngineState;
 use crate::engine::recovery::save_cleared_spans;
@@ -95,6 +96,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         if !volume.table.install(output.file.clone(), RootId(output.root as u8), &totals.head, self.writer.columns(), self.writer.entries()) {
             return Err(Error::from(ErrorKind::OutOfMemory));
         }
+        volume.dead_bits.begin(output.number, self.writer.entries().len() as u32, totals.most_block_rows);
         self.stage_output(output.number, &totals)?;
 
         self.data_slot += 1;
@@ -375,6 +377,13 @@ impl<Backend: Io> RewriteJob<Backend> {
             }
             return Err(Error::from(ErrorKind::OutOfMemory));
         }
+        // a walk can charge an output's rows once the table has it, so its bits begin first
+        if let (Some(totals), Some(output)) = (self.totals, &self.output) {
+            volume.dead_bits.begin(output.number, self.writer.entries().len() as u32, totals.most_block_rows);
+        }
+        if let (Some(totals), Some(output)) = (self.grave_totals, &self.grave_output) {
+            volume.dead_bits.begin(output.number, self.grave_writer.entries().len() as u32, totals.most_block_rows);
+        }
         Ok(())
     }
 
@@ -418,6 +427,10 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
         self.kept_dead.sort_unstable_by_key(|count| (count.segment, count.block));
         let number = self.output.as_ref().map_or(SegmentNumber(0), |output| output.number);
+        // a row a cue kept counts dead with no bit, so its output's bits stop answering
+        for count in self.kept_dead.iter().filter(|count| count.rows > 0) {
+            volume.dead_bits.spoil_segment(count.segment, INEXACT_KEPT);
+        }
         rows.apply_walk(number, self.writer.entries().len() as u32, &self.kept_dead);
         drop(rows);
         for count in self.kept_dead.iter().filter(|count| count.rows > 0) {
@@ -464,6 +477,9 @@ impl<Backend: Io> RewriteJob<Backend> {
 
     /// Remove one lane's outputs, and note what a failed remove left there
     pub fn leave_lane_outputs(&self, volume: &Volume<Backend>, lane: usize, mut outputs: OutputSlots<Backend::File>) {
+        for output in outputs.iter().flatten() {
+            volume.dead_bits.end(output.number);
+        }
         let last = outputs[..MOST_MERGE_OUTPUTS].iter().rposition(Option::is_some);
         let mut is_held = false;
         if let Some(slot) = last {

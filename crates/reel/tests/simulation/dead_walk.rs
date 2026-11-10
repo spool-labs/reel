@@ -932,6 +932,8 @@ fn recounted_block_lands_once() {
     }
     assert_eq!(hold(&volume.summary).orders().present(), [newer, third], "the merge kept the older d");
     assert_eq!(dead_rows_of(&store, newer) + dead_rows_of(&store, third), 0, "the held row landed somewhere");
+    // a charge held through the merge leaves every output either inexact or with as many set bits as dead rows
+    check_dead_bits(volume);
     drop(job);
     io.hold_jobs(WALK_JOB, false);
     io.hold_jobs("reel-walk", false);

@@ -8,6 +8,7 @@ use std::sync::atomic::Ordering;
 use reel_api::maintenance_report::UnitKind;
 use reel_api::units::ByteCount;
 
+use crate::engine::dead_bits::INEXACT_KEPT;
 use crate::engine::volume::Volume;
 use crate::engine::walk_job::add_count;
 use crate::guard::hold;
@@ -179,6 +180,8 @@ impl<Backend: Io> RewriteJob<Backend> {
         while let Some(count) = self.drained.get(first) {
             let length = self.drained[first..].partition_point(|other| other.segment == count.segment);
             rows.apply_counts(count.segment, &self.drained[first..first + length], None);
+            // these counts come with no bits, so the segment's bits stop answering
+            volume.dead_bits.spoil_segment(count.segment, INEXACT_KEPT);
             first += length;
         }
         drop(rows);

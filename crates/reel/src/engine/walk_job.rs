@@ -31,6 +31,7 @@ use crate::io::device_error::is_device_error;
 use crate::io::job::{Job, JobStep};
 use crate::io::{Io, IoFile, IoTask};
 use crate::engine::admission::JobRole;
+use crate::engine::block_lookups::BlockLookups;
 use crate::segment::key_cursor::KeyCursor;
 use crate::segment::summary_orders::WalkList;
 use crate::segment::summary::SegmentFacts;
@@ -282,6 +283,9 @@ pub struct BlockCounter<Backend: Io> {
     pub last_column: Option<ColumnId>,
     is_next_key_unknown: bool,
     pub cursor: KeyCursor<Backend::File>,
+    pub lookups: BlockLookups,
+    collect_key: FixedList<u8>,
+    collect_last: FixedList<u8>,
 }
 
 /// The walk of one volume's sealed segments
@@ -326,12 +330,16 @@ impl<Backend: Io> BlockCounter<Backend> {
             last_column: None,
             is_next_key_unknown: false,
             cursor: KeyCursor::new(),
+            lookups: BlockLookups::new(),
+            collect_key: FixedList::on_heap(MAX_KEY_BYTES as usize),
+            collect_last: FixedList::on_heap(MAX_KEY_BYTES as usize),
         }
     }
 
     /// Read the heap the buffers hold
     pub fn heap_bytes(&self) -> ByteCount {
-        ByteCount((self.block.capacity() + self.key.capacity() + self.last_key.capacity()) as u64 + self.cursor.heap_bytes().0)
+        let keys = self.block.capacity() + self.key.capacity() + self.last_key.capacity() + self.collect_key.capacity() + self.collect_last.capacity();
+        ByteCount(keys as u64 + self.cursor.heap_bytes().0 + self.lookups.heap_bytes().0)
     }
 
     /// Count a target's next block into a list, and return the position past it
@@ -351,6 +359,10 @@ impl<Backend: Io> BlockCounter<Backend> {
         let counted = self.count_block(volume, &pin, &block, target, counts);
         self.cursor.release(&volume.table);
         self.state.note_cursor(mem::take(&mut self.cursor.counts));
+        let lookups = mem::take(&mut self.lookups.counts);
+        for (total, count) in self.state.block_lookups.iter().zip([lookups.blocks, lookups.candidates, lookups.whole, lookups.key_checks]) {
+            total.fetch_add(count, Ordering::Relaxed);
+        }
         match counted {
             Err(error) if is_device_error(&error) => counts.clear(),
             outcome => outcome?,
@@ -405,6 +417,38 @@ impl<Backend: Io> BlockCounter<Backend> {
         Ok(())
     }
 
+    /// Gather the keys a block's rows look up, in the order the count asks for them, or return false when they don't fit
+    pub fn collect_lookups(&mut self, block: &WalkBlock, place_base: WritePlace, length: usize) -> Result<bool> {
+        self.lookups.clear();
+        let Some(mut walk) = RowBlockWalk::open(&self.block[..length], place_base) else {
+            return Ok(true);
+        };
+        self.collect_last.set_from(&self.last_key)?;
+        let mut last_column = self.last_column;
+        let mut is_unknown = self.is_next_key_unknown;
+        while let Some(row) = walk.next_row(&mut self.collect_key) {
+            if row.kind == RowKind::RangeDelete {
+                continue;
+            }
+            let is_top = last_column != Some(block.column) || self.collect_last != self.collect_key;
+            if is_top && is_unknown {
+                is_unknown = false;
+                self.collect_last.set_from(&self.collect_key)?;
+                last_column = Some(block.column);
+                continue;
+            }
+            if !is_top {
+                continue;
+            }
+            self.collect_last.set_from(&self.collect_key)?;
+            last_column = Some(block.column);
+            if !self.lookups.add(&self.collect_key) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Count one block's rows
     pub fn count_block(
         &mut self,
@@ -417,6 +461,15 @@ impl<Backend: Io> BlockCounter<Backend> {
         let length = block.entry.block_length().0 as usize;
         counts.read_bytes = block.entry.block_length();
         pin.file.read_exact_at(block.entry.block_at(), &mut self.block[..length])?;
+        // the block's lookups run together, one candidate at a time, and the count below takes their answers in order
+        let mut answers = None;
+        if self.collect_lookups(block, pin.head.place_base, length)? {
+            match self.state.look_up_block(volume, block.column, target.segment, &mut self.lookups, &mut self.cursor) {
+                Ok(true) => answers = Some(0),
+                Ok(false) => {},
+                Err(_error) => return Err(Error::from(ErrorKind::Interrupted)),
+            }
+        }
         let Some(mut walk) = RowBlockWalk::open(&self.block[..length], pin.head.place_base) else {
             return Ok(());
         };
@@ -451,7 +504,17 @@ impl<Backend: Io> BlockCounter<Backend> {
 
             self.last_key.set_from(&self.key)?;
             self.last_column = Some(block.column);
-            let found = self.state.newest_walked_held(volume, block.column, &self.key, &[target.segment], None, &mut self.cursor);
+            let found = match &mut answers {
+                Some(next) => {
+                    let lookup = self.lookups.lookups[*next];
+                    *next += 1;
+                    match lookup.is_damaged {
+                        true => Err(StoreError::Corruption { column: block.column }),
+                        false => Ok(lookup.best),
+                    }
+                },
+                None => self.state.newest_walked_held(volume, block.column, &self.key, &[target.segment], None, &mut self.cursor),
+            };
             let newest = match found {
                 Ok(newest) => newest,
                 // a version a damaged block hides counts nothing, which only understates

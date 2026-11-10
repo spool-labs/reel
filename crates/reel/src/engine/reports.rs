@@ -157,6 +157,7 @@ impl<Backend: Io> EngineState<Backend> {
         }
         report.longest_room_step = Nanoseconds(self.longest_room_step.load(Ordering::Relaxed));
         report.cursor_lookups = array::from_fn(|kind| self.cursor_lookups[kind].load(Ordering::Relaxed));
+        report.block_lookups = array::from_fn(|kind| self.block_lookups[kind].load(Ordering::Relaxed));
         for (entry, written) in report.written.iter_mut().zip(&self.written) {
             *entry = ByteCount(written.load(Ordering::Relaxed));
         }

@@ -301,6 +301,14 @@ impl FilterArena {
         }
     }
 
+    /// Read the bytes the extents in use took, and the arena's whole room
+    pub fn used_bytes(&self) -> (ByteCount, ByteCount) {
+        let books = hold(&self.books);
+        let free: u64 = books.free.iter().map(|span| u64::from(span.length)).sum();
+        let room = (self.words.len() * WORD_BYTES) as u64;
+        (ByteCount(room.saturating_sub(free)), ByteCount(room))
+    }
+
     /// Take a segment's extent out. Its bytes can go to another at once, since a probe that read them fails its window
     pub fn drop_segment(&self, segment: SegmentNumber) {
         let mut books = hold(&self.books);

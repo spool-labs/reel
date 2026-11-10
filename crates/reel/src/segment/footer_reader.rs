@@ -446,6 +446,42 @@ impl FooterReader {
         Ok(answer)
     }
 
+    /// Load a row block into the reader for many searches, from the row cache when it holds the block and from the file
+    /// otherwise, adding nothing to the cache. False when the block fails its check or the device fails the read
+    pub async fn hold_block<File: IoFile>(
+        &mut self,
+        device: &impl DeviceReads<File>,
+        file: &File,
+        (segment, place_base): (SegmentNumber, WritePlace),
+        entry: &BlockEntry,
+        caches: &FooterCaches<'_>,
+    ) -> Result<bool> {
+        let length = entry.block_length().0 as usize;
+        if length > self.block.len() {
+            return Ok(false);
+        }
+        let key = BlockKey {
+            segment,
+            offset: entry.block_offset,
+        };
+        let buffer = &mut self.block[..length];
+        if caches.rows.with(key, |block| block.len() == length && { buffer.copy_from_slice(block); true }) == Some(true) {
+            return Ok(true);
+        }
+        if !read_or_damaged_on(device, file, entry.block_at(), &mut self.block[..length]).await? {
+            return Ok(false);
+        }
+        Ok(RowBlockWalk::open(&self.block[..length], place_base).is_some())
+    }
+
+    /// Find a key's newest row at a read point in the block `hold_block` loaded
+    pub fn search_loaded(&mut self, entry: &BlockEntry, place_base: WritePlace, query: &FooterQuery<'_>) -> FooterAnswer {
+        let length = entry.block_length().0 as usize;
+        let (answer, at) = search_rows(&self.block[..length], place_base, query, &mut self.key);
+        self.found_at = at;
+        answer
+    }
+
     /// Read one row block and find the key's newest row at a read point
     pub async fn search_block<File: IoFile>(
         &mut self,

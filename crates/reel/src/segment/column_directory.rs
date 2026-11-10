@@ -466,3 +466,59 @@ pub fn write_list(list: &RwLock<DirectoryList>) -> RwLockWriteGuard<'_, Director
         Err(poisoned) => crate::guard::recover(poisoned),
     }
 }
+
+/// A segment that can hold some key of a walk block, and whether its range holds all of them
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockCandidate {
+    pub entry: DirectoryEntry,
+    pub is_whole: bool,
+}
+
+impl BlockCandidate {
+    /// Check the segment's range holds a key, as the directory's search would find it
+    pub fn holds(&self, key: &[u8]) -> bool {
+        if self.is_whole {
+            return true;
+        }
+        let shared = self.entry.shared_length as usize;
+        let Some(bytes) = key.get(..shared) else {
+            return false;
+        };
+        let prefix = KeyPrefix::of_key(key, shared);
+        checksum(bytes) == self.entry.shared_sum && self.entry.lowest <= prefix && prefix <= self.entry.highest
+    }
+}
+
+impl ColumnDirectory {
+    /// Fill a buffer with every segment that can hold a key from low to high, marking those whose range holds them all, and
+    /// return the list's generation, or nothing when the buffer is full
+    pub fn block_candidates(&self, low: &[u8], high: &[u8], out: &mut Vec<BlockCandidate>) -> Option<u64> {
+        out.clear();
+        let copy = read_list(&self.list);
+        let list = &copy.entries;
+        let mut start = 0;
+        while let Some(first) = list.get(start) {
+            let shared = first.shared_length as usize;
+            let end = start + list[start..].partition_point(|entry| entry.shared_length == first.shared_length);
+            // every key between two that share their first bytes shares them too, so one group and the bounds decide
+            let same = low.get(..shared).filter(|bytes| high.get(..shared) == Some(*bytes));
+            let (group, range) = match same {
+                Some(bytes) => (group_of(&list[start..end], checksum(bytes)), Some((KeyPrefix::of_key(low, shared), KeyPrefix::of_key(high, shared)))),
+                None => (&list[start..end], None),
+            };
+            for entry in group {
+                let is_whole = match range {
+                    Some((lowest, highest)) if entry.highest < lowest || entry.lowest > highest => continue,
+                    Some((lowest, highest)) => entry.lowest <= lowest && highest <= entry.highest,
+                    None => false,
+                };
+                if out.len() == out.capacity() {
+                    return None;
+                }
+                out.push(BlockCandidate { entry: *entry, is_whole });
+            }
+            start = end;
+        }
+        Some(copy.generation)
+    }
+}

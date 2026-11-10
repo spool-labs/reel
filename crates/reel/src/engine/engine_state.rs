@@ -12,6 +12,7 @@ use reel_api::memory_report::MemoryReport;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, SegmentCount, WritePlace};
 
+use crate::engine::rewrite_job::rows_of;
 use crate::engine::admission::{Admission, Admit, Decision, JobRole, reserve_for, room_for};
 use reel_api::maintenance_report::WorkerPriority;
 use crate::engine::column_info::ColumnInfo;
@@ -129,6 +130,8 @@ pub struct EngineState<Backend: Io> {
     pub longest_room_step: AtomicU64,
     /// Walk lookups through the cursor, in the report's order
     pub cursor_lookups: [AtomicU64; 4],
+    /// Walk block lookups, in the report's order
+    pub block_lookups: [AtomicU64; 4],
     pub units: UnitTallies,
     pub opened_at: Nanoseconds,
     pub graves_at_open: AtomicU64,
@@ -530,6 +533,18 @@ impl<Backend: Io> EngineState<Backend> {
         (SegmentCount(segments), columns)
     }
 
+    /// Add up the rows of the segments whose filters the arena holds
+    pub fn arena_rows(&self) -> u64 {
+        let mut total = 0;
+        for volume in &self.volumes {
+            let rows = hold(&volume.summary);
+            for row in rows.rows().filter(|row| self.filter_arena.has_filters(row.facts.segment)) {
+                total += rows_of(&row);
+            }
+        }
+        total
+    }
+
     /// Note whether filters wait for the arena, and keep how long the first fill took after open
     pub fn note_arena(&self, has_filters_left: bool) {
         self.is_arena_full.store(!has_filters_left, Ordering::Release);
@@ -618,6 +633,7 @@ impl<Backend: Io> EngineState<Backend> {
     /// Report the heap each structure holds
     pub fn memory_report(&self) -> MemoryReport {
         let (arena_segments_left_out, arena_columns_left_out) = self.arena_left_out();
+        let (arena_used, arena_room) = self.filter_arena.used_bytes();
         let mut report = MemoryReport {
             budget: self.memory_budget,
             write_index: self.index.heap_bytes(),
@@ -637,6 +653,9 @@ impl<Backend: Io> EngineState<Backend> {
             is_arena_full: self.is_arena_full.load(Ordering::Acquire),
             arena_segments_left_out,
             arena_columns_left_out,
+            arena_used,
+            arena_room,
+            arena_rows: self.arena_rows(),
             entry_line: self.sizing.entry_line,
             disk_bytes: ByteCount(self.volumes.iter().filter_map(|volume| volume.disk_bytes).map(|bytes| bytes.0).sum()),
             disk_covered: ByteCount(self.volumes.iter().map(|volume| volume.disk_covered.0).sum()),

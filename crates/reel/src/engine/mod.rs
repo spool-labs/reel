@@ -22,6 +22,7 @@ pub mod ration;
 pub mod read_only;
 pub mod rebuild;
 pub mod read_path;
+pub mod block_lookups;
 pub mod read_pool;
 pub mod recovery;
 pub mod reel_store;

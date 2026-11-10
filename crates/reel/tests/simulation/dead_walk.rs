@@ -1061,8 +1061,8 @@ const CURSOR_KEYS: u64 = 40_000;
 const CURSOR_KEY_BYTES: usize = 200;
 
 // overwrites spread over many segments, half of them under keys whose first 16 bytes past the shared ones match, walked with
-// the cursor and through the table alone: every segment ends with the same counts. In the second pair the walk starts once
-// every segment is sealed, and merges claim and retire segments between its blocks
+// the cursor and through the table alone: every segment ends with the same counts. In the second pair merges claim, write
+// and install a step at a time between the walk's blocks
 #[test]
 fn cursor_counts_as_the_table_does() {
     for seed in 0..CURSOR_SEEDS {
@@ -1084,8 +1084,8 @@ fn cursor_arm(seed: u64, is_cursor_off: bool, is_merging: bool) -> (Vec<(u64, u6
     let volume = &store.state.volumes[0];
     volume.holds.no_cursor.store(is_cursor_off, Ordering::Release);
     volume.holds.small_bound.store(true, Ordering::Release);
-    volume.holds.walk.store(is_merging, Ordering::Release);
     let mut random = SeededRandom::new(Seed(seed));
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
     for _segment in 0..CURSOR_SEGMENTS_WRITTEN {
         for _put in 0..CURSOR_PUTS {
             let number = random.below(CURSOR_KEYS);
@@ -1098,16 +1098,12 @@ fn cursor_arm(seed: u64, is_cursor_off: bool, is_merging: bool) -> (Vec<(u64, u6
             store.put(COLUMN, &key, &random.below(u64::MAX).to_le_bytes()).expect("put");
         }
         store.seal_now();
-        settle(&io);
-    }
-    if is_merging {
-        volume.holds.walk.store(false, Ordering::Release);
-        let mut job = CompactJob::new(Arc::clone(&store.state), 0);
-        for step in 0..CURSOR_MERGE_STEPS {
+        // a merge claims, writes and installs a step at a time between the walk's blocks
+        for _step in 0..CURSOR_MERGE_STEPS {
             if io.step_any().is_none() {
                 io.advance_clock(TICK);
             }
-            if step % CURSOR_MERGE_EVERY == 0 {
+            if is_merging {
                 if job.rewrite.is_running() {
                     job.rewrite.step();
                 } else {
@@ -1115,9 +1111,9 @@ fn cursor_arm(seed: u64, is_cursor_off: bool, is_merging: bool) -> (Vec<(u64, u6
                 }
             }
         }
-        while job.rewrite.is_running() {
-            job.rewrite.step();
-        }
+    }
+    while job.rewrite.is_running() {
+        job.rewrite.step();
     }
     settle(&io);
     let counts = hold(&volume.summary).rows().map(|row| {
@@ -1129,8 +1125,7 @@ fn cursor_arm(seed: u64, is_cursor_off: bool, is_merging: bool) -> (Vec<(u64, u6
     (counts, lookups)
 }
 
-const CURSOR_MERGE_STEPS: u64 = 4_000;
-const CURSOR_MERGE_EVERY: u64 = 3;
+const CURSOR_MERGE_STEPS: u64 = 60;
 
 // a cursor holds no more than the line the budget plans for it
 #[test]

@@ -41,6 +41,10 @@ pub struct MemoryReport {
     pub is_arena_full: bool,
     /// Segments with filters the arena lacks, which a full arena left out for want of room
     pub arena_segments_left_out: SegmentCount,
+    /// Bytes the filter arena's extents take, its whole room, and the rows of the segments whose filters it holds
+    pub arena_used: ByteCount,
+    pub arena_room: ByteCount,
+    pub arena_rows: u64,
     /// Columns of those segments
     pub arena_columns_left_out: usize,
     /// The line the plan keeps for the segment entries of volumes with a known disk size, apart from the table's share

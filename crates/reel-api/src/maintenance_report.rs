@@ -507,6 +507,8 @@ pub struct MaintenanceReport {
     pub longest_room_step: Nanoseconds,
     /// Walk and merge lookups through the cursor: segments it pinned, runs it copied again, rows it answered, rows it sent to the table
     pub cursor_lookups: [u64; 4],
+    /// Walk block lookups run together: blocks, candidates asked, candidates whose range held the whole block, per-key checks
+    pub block_lookups: [u64; 4],
     pub volumes: Vec<VolumeReading>,
     pub complete_columns: Vec<CompleteReading>,
     pub least_value_columns: Vec<LeastValueReading>,
@@ -586,6 +588,7 @@ impl MaintenanceReport {
             pauses: [0; PAUSE_CAUSES.len()],
             longest_room_step: Nanoseconds(0),
             cursor_lookups: [0; 4],
+            block_lookups: [0; 4],
             volumes: Vec::new(),
             complete_columns: Vec::new(),
             least_value_columns: Vec::new(),

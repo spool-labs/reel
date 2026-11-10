@@ -1440,6 +1440,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         seals_done: AtomicU64::new(0),
         segments_unlinked: AtomicU64::new(0),
         segments_parked: AtomicU64::new(0),
+        segments_leaving: AtomicU64::new(0),
         empties_left: AtomicU64::new(0),
         parked: Mutex::new((0..MOST_PARKED * (sizing.walk_slots + 1)).map(|_slot| None).collect()),
         segments_rewritten: AtomicU64::new(0),

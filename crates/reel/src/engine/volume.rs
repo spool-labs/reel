@@ -293,6 +293,8 @@ pub struct Volume<Backend: Io> {
     pub seals_done: AtomicU64,
     pub segments_unlinked: AtomicU64,
     pub segments_parked: AtomicU64,
+    /// Segments whose summary row went and that aren't parked yet. A crash or a view finds their files with no row
+    pub segments_leaving: AtomicU64,
     /// Empty files a failed remove left with the park full, which the next open removes
     pub empties_left: AtomicU64,
     pub parked: Mutex<Vec<Option<ParkedSegment<Backend::File>>>>,
@@ -690,6 +692,11 @@ impl<Backend: Io> Volume<Backend> {
     pub fn is_short_of_room(&self) -> bool {
         let parked = hold(&self.parked).iter().filter(|slot| slot.is_some()).count();
         2 * parked > MOST_PARKED * self.lanes.len() || self.table.is_past_half()
+    }
+
+    /// Check a file with no summary row may still be on disk, where a crash or a view would read it again
+    pub fn is_parking(&self) -> bool {
+        self.segments_parked.load(Ordering::Acquire) > 0 || self.segments_leaving.load(Ordering::Acquire) > 0
     }
 
     /// Check the park has room for this many segments

@@ -1137,7 +1137,7 @@ fn grave_listed_first() {
 
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
     run_to_both_outputs(&mut job);
-    job.rewrite.install_with(|| assert_eq!(read(&store, b"key"), None)).expect("install");
+    job.rewrite.install_with(|| assert_eq!(read(&store, b"key"), None), || {}).expect("install");
     assert_eq!(read(&store, b"key"), None);
     assert_eq!(read(&store, b"d"), Some(b"first".to_vec()));
     store.close().expect("close");
@@ -2024,7 +2024,7 @@ fn read_between_a_set_and_its_inputs() {
                 let read = state.key_read_now(COLUMN, &key).expect("read");
                 assert!(in_place(state.search_footers(&InPlace, &state.volumes[0], &read)).expect("search").is_some(), "key {number}");
             }
-        })
+        }, || {})
         .expect("install");
     check_set(&store);
     store.close().expect("close");

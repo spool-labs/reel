@@ -369,7 +369,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             return Ok(None);
         }
         let state = Arc::clone(&self.state);
-        let is_settled = volume.segments_parked.load(Ordering::Acquire) == 0 && volume.stray_outputs.load(Ordering::Acquire) == 0;
+        let is_settled = !volume.is_parking() && volume.stray_outputs.load(Ordering::Acquire) == 0;
         let is_clean = (is_settled || row.kind == RowKind::Value) && volume.damage.is_empty() && hold(&volume.damaged).is_empty();
         if !is_clean || state.cues.has_cue_between(self.volume, row.place, WritePlace(u64::MAX)) {
             return Ok(None);
@@ -449,10 +449,10 @@ impl<Backend: Io> RewriteJob<Backend> {
     /// Check a grave with no newer row of its key has nothing left to hide, by this key's own rows and nothing wider. An older
     /// grave keeps it too: that one's walk count stands on this row, and a later write of the key would count it twice. It
     /// drops first, as any row with a newer one does. A file on its way out comes back at a crash, so no grave drops while
-    /// one is parked. A cue below the grave can read what it covers, and damage could be hiding an older version
+    /// one is parked or leaving. A cue below the grave can read what it covers, and damage could be hiding an older version
     pub fn hides_nothing(&self, volume: &Volume<Backend>, column: ColumnId, row: &FooterRow) -> Result<bool> {
         let state = Arc::clone(&self.state);
-        if volume.segments_parked.load(Ordering::Acquire) > 0
+        if volume.is_parking()
             || volume.stray_outputs.load(Ordering::Acquire) > 0
             || state.cues.has_cue_below(self.volume, row.place)
             || volume.damage.covering(column, &self.key).is_some()
@@ -461,7 +461,8 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
         // a complete column frees a superseded row's slot, so its footers answer for older rows as any column's do
         match state.has_older_row(volume, column, &self.key, row.place, &self.numbers[..self.input_count]) {
-            Ok(has_older) => Ok(!has_older),
+            // a segment that started leaving during the walk may hold an older row the walk missed
+            Ok(has_older) => Ok(!has_older && !volume.is_parking()),
             Err(StoreError::Corruption { .. }) => Ok(false),
             Err(_error) => Err(Error::from(ErrorKind::Interrupted)),
         }

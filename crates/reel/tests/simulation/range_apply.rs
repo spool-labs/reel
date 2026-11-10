@@ -6,8 +6,9 @@ use std::sync::atomic::Ordering;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::compact_job::CompactJob;
+use reel::engine::open_segment::data_path;
 use reel::engine::reel_store::ReelStore;
-use reel::engine::rewrite_job::has_settled_covers;
+use reel::engine::rewrite_job::{RewritePhase, has_settled_covers};
 use reel::engine::walk_job::{WalkJob, WalkTarget};
 use reel::guard::hold;
 use reel::record::codec::Codec;
@@ -623,6 +624,45 @@ fn settled_cover_stays_put() {
     drop(rows);
     assert_eq!(read(&store, b"a-000"), None);
     assert_eq!(read(&store, b"z-000"), Some(b"value".to_vec()));
+    store.close().expect("close");
+}
+
+// an install saves the summary without its inputs before it parks them, and a cover can't settle over an input file still on
+// disk, or a crash or a view would find the file with no row and no cover
+#[test]
+fn cover_waits_for_a_leaving_input() {
+    let io = SimulatedIo::new(Seed(24));
+    let store = open(&io);
+    put_keys(&store, "a", b"value");
+    let older = seal(&store, &io);
+    store.delete_range(COLUMN, b"a-000", b"a-001").expect("delete");
+    put_keys(&store, "z", b"value");
+    let holder = seal(&store, &io);
+    settle(&io);
+    let volume = &store.state.volumes[0];
+    assert_eq!(pending(&store), 1);
+
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    job.rewrite.forced = Some(older);
+    job.rewrite.start();
+    while job.rewrite.phase != RewritePhase::Installing {
+        job.rewrite.step();
+    }
+    let mut planner = CompactJob::new(Arc::clone(&store.state), 0);
+    job.rewrite
+        .install_with(|| {}, || {
+            assert!(hold(&volume.summary).get(older).is_none());
+            let data = data_path(&PathBuf::from(ROOT), older).to_path_buf();
+            assert!(io.list_directory(&PathBuf::from(ROOT)).expect("list").contains(&data));
+            assert!(!planner.settle_covers(volume));
+            assert_eq!(pending(&store), 1);
+        })
+        .expect("install");
+    store.state.ask_compaction();
+    settle(&io);
+    assert_eq!(pending(&store), 0);
+    assert!(!hold(&volume.summary).get(holder).expect("a row").facts.has_covers);
+    assert_eq!(read(&store, b"a-000"), None);
     store.close().expect("close");
 }
 

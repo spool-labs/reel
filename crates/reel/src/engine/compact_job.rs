@@ -541,8 +541,8 @@ impl<Backend: Io> CompactJob<Backend> {
     /// any went
     pub fn settle_covers(&mut self, volume: &Volume<Backend>) -> bool {
         let mut has_settled = false;
-        let is_stuck = volume.segments_parked.load(Ordering::Acquire) > 0 || volume.stray_outputs.load(Ordering::Acquire) > 0;
-        if volume.covers.is_empty() || is_stuck {
+        let is_stuck = || volume.is_parking() || volume.stray_outputs.load(Ordering::Acquire) > 0;
+        if volume.covers.is_empty() || is_stuck() {
             return false;
         }
         for _look in 0..MOST_SETTLE_LOOKS {
@@ -562,6 +562,10 @@ impl<Backend: Io> CompactJob<Backend> {
                 }
                 self.settle_at += 1;
                 continue;
+            }
+            // an install can take a segment's row while the walk above looked, and its file stays until the park ends
+            if is_stuck() {
+                return has_settled;
             }
             let cover = Cover {
                 column,
@@ -871,14 +875,18 @@ impl<Backend: Io> CompactJob<Backend> {
         if state.cues.has_cue_below(self.volume, highest_replacement) {
             return Ok(());
         }
+        // a merge's grave check runs beside this, and the segment counts as leaving before any list drops it
+        volume.segments_leaving.fetch_add(1, Ordering::AcqRel);
         for directory in state.directories.iter().flatten() {
             if !directory.replace(None, &[segment]) {
+                volume.segments_leaving.fetch_sub(1, Ordering::AcqRel);
                 return Err(Error::from(ErrorKind::OutOfMemory));
             }
         }
         self.state.filter_arena.drop_segment(segment);
         volume.dead_bits.end(segment);
         let Some(retired) = volume.table.retire(segment) else {
+            volume.segments_leaving.fetch_sub(1, Ordering::AcqRel);
             return Ok(());
         };
         let mut rows = hold(&volume.summary);
@@ -889,6 +897,7 @@ impl<Backend: Io> CompactJob<Backend> {
         // the file goes only behind a saved summary, or open would find a row with no file
         let saved = state.save_summary(volume);
         park(volume, Some(retired), segment, saved.is_ok());
+        volume.segments_leaving.fetch_sub(1, Ordering::AcqRel);
         saved?;
         volume.segments_unlinked.fetch_add(1, Ordering::AcqRel);
         volume.unlinked_bytes.fetch_add(length.0, Ordering::Relaxed);

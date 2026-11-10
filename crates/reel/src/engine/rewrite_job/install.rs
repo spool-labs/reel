@@ -230,11 +230,12 @@ impl<Backend: Io> RewriteJob<Backend> {
     pub fn install(&mut self) -> Result<()> {
         let outputs = self.staged.len() + usize::from(self.output.is_some()) + usize::from(self.grave_output.is_some());
         self.unit = (UnitKind::Install, (self.input_count + outputs) as u64);
-        self.install_with(|| {})
+        self.install_with(|| {}, || {})
     }
 
-    /// Install, and run some work once the grave output is listed and the inputs are not yet gone
-    pub fn install_with(&mut self, between: impl FnOnce()) -> Result<()> {
+    /// Install, and run some work once the grave output is listed and the inputs are not yet gone, and more once the summary
+    /// without the inputs is saved and their files aren't parked yet
+    pub fn install_with(&mut self, between: impl FnOnce(), before_park: impl FnOnce()) -> Result<()> {
         self.note_stale();
         let state = Arc::clone(&self.state);
         let volume = &state.volumes[self.volume];
@@ -291,6 +292,9 @@ impl<Backend: Io> RewriteJob<Backend> {
                 volume.table.mark_walked(output.number);
             }
         }
+        // the inputs count as leaving before any list drops them, so no check passes over a file still on disk
+        let leaving = inputs.len() as u64;
+        volume.segments_leaving.fetch_add(leaving, Ordering::AcqRel);
         // a column every row of which went has no entry to swap in
         for directory in state.directories.iter().flatten() {
             if !directory.replace(None, inputs) {
@@ -351,11 +355,13 @@ impl<Backend: Io> RewriteJob<Backend> {
         volume.early_bar_rewrites.fetch_add(self.bars_fired.early, Ordering::Relaxed);
         volume.plain_bar_rewrites.fetch_add(self.bars_fired.plain, Ordering::Relaxed);
         volume.wants_compaction.store(true, Ordering::Release);
+        before_park();
         for (segment, retired) in inputs.iter().zip(retired) {
             if let Some(retired) = retired {
                 park(volume, Some(retired), *segment, saved.is_ok());
             }
         }
+        volume.segments_leaving.fetch_sub(leaving, Ordering::AcqRel);
         self.release_region();
         saved
     }

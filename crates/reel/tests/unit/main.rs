@@ -23,6 +23,7 @@ mod range_covers;
 mod record_cache;
 mod record_check;
 mod record_head;
+mod reap_spin;
 mod record_reader;
 mod row_block;
 mod row_group;

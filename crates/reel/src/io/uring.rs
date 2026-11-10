@@ -6,6 +6,7 @@
 use std::cell::UnsafeCell;
 use std::io::{Error, ErrorKind, IoSliceMut, Result};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use io_uring::{IoUring, opcode, types};
@@ -13,7 +14,7 @@ use reel_api::units::{ByteCount, FileOffset};
 
 use crate::guard::hold;
 use crate::io::plain_file::PlainFile;
-use crate::io::ring::{RING_SLOT_BYTES, RING_SLOTS, RingDriver};
+use crate::io::ring::{RING_SLOT_BYTES, RING_SLOTS, RingDriver, reap_spin};
 use crate::pool::TOUCH_BYTE;
 
 /// The submission queue's length, past any read a ring can hold in flight with its poke beside them
@@ -23,8 +24,9 @@ pub const POKE: u64 = u64::MAX;
 /// The registered buffer every read lands in
 pub const BUFFER_INDEX: u16 = 0;
 /// How long the kernel's submit thread stays awake with nothing to submit before it sleeps, in milliseconds. While reads flow
-/// it stays up and a start costs no syscall, and at 10 ms it costs 0.4% of a core once they stop (33% at 1 s)
-pub const SUBMIT_IDLE_MS: u32 = 10;
+/// it stays up and a start costs no syscall. A trickle of reads further apart than this wakes it once a read and keeps it up
+/// for this long after, so its CPU follows the read rate. At 10 ms a read every 20 ms would keep it up half the time
+pub const SUBMIT_IDLE_MS: u32 = 1;
 /// How long a reaper looks at the completions in memory before it waits in the kernel. On the ccx33 150 us took a cold read from
 /// 141 us to 120, and 400 us bought nothing more
 pub const REAP_SPIN: Duration = Duration::from_micros(150);
@@ -43,6 +45,8 @@ pub struct UringDriver {
     ring: IoUring,
     bytes: RingBytes,
     submitting: Mutex<()>,
+    /// Reads started and not yet landed, which tells the reaper whether a spin can find one
+    in_flight: AtomicUsize,
 }
 
 impl UringDriver {
@@ -65,6 +69,7 @@ impl UringDriver {
             ring,
             bytes,
             submitting: Mutex::new(()),
+            in_flight: AtomicUsize::new(0),
         })
     }
 
@@ -99,14 +104,20 @@ impl RingDriver<PlainFile> for UringDriver {
             .offset(offset.0)
             .build()
             .user_data(slot as u64);
-        self.submit(&entry)
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        let sent = self.submit(&entry);
+        if sent.is_err() {
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+        }
+        sent
     }
 
     fn reap(&self, done: &mut dyn FnMut(usize, Result<usize>)) -> Result<bool> {
         // completions land in shared memory, so a look there costs no syscall, and a wait in the kernel costs a wake
         let spun = Instant::now();
         // SAFETY: only the one reaper reads this queue
-        while unsafe { self.ring.completion_shared() }.is_empty() && spun.elapsed() < REAP_SPIN {
+        let spin = reap_spin(self.in_flight.load(Ordering::Acquire), REAP_SPIN);
+        while unsafe { self.ring.completion_shared() }.is_empty() && spun.elapsed() < spin {
             std::hint::spin_loop();
         }
         // SAFETY: only the one reaper reads this queue
@@ -125,6 +136,7 @@ impl RingDriver<PlainFile> for UringDriver {
             }
             let answer = completion.result();
             let outcome = if answer < 0 { Err(Error::from_raw_os_error(-answer)) } else { Ok(answer as usize) };
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
             done(completion.user_data() as usize, outcome);
         }
         Ok(true)

@@ -28,6 +28,12 @@ pub const RING_READ_BYTES: u64 = 256 * 1024;
 /// Callers that wait in line, and any past that look again when the runtime polls them
 pub const MOST_RING_WAITERS: usize = 1_024;
 
+/// How long a reaper looks at the completions in memory before it waits in the kernel. A read in flight lands soon, and with
+/// none in flight a look finds nothing, so a reaper spins only while reads are out and its CPU follows the read rate
+pub fn reap_spin(in_flight: usize, most: Duration) -> Duration {
+    if in_flight > 0 { most } else { Duration::ZERO }
+}
+
 /// A backend's completion queue
 pub trait RingDriver<File>: Send + Sync + 'static {
     /// Start a read into a slot

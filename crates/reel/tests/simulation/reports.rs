@@ -366,3 +366,28 @@ fn written_by_source() {
     assert_eq!(written(WriteSource::GivenUp), 0);
     store.close().expect("close");
 }
+
+// filters come before the record cache: a reopen with rows on disk sizes the arena for their filters, out of the record cache's
+// share, and the budget holds the same
+#[test]
+fn arena_takes_room_for_rows_on_disk() {
+    let io = SimulatedIo::new(Seed(41));
+    let store = open(&io);
+    let fresh = store.state.memory_report();
+    for number in 0..ARENA_ROWS {
+        store.put(COLUMN, format!("key-{number:06}").as_bytes(), b"value").expect("put");
+    }
+    seal(&store, &io);
+    store.close().expect("close");
+
+    let store = open(&io);
+    let grown = store.state.memory_report();
+    assert!(grown.arena_room.0 > fresh.arena_room.0, "the arena stayed at {:?}", grown.arena_room);
+    assert!(grown.record_cache.0 < fresh.record_cache.0, "the record cache kept {:?}", grown.record_cache);
+    let moved = grown.arena_room.0 - fresh.arena_room.0;
+    assert!(fresh.record_cache.0 - grown.record_cache.0 + PAGE_SLACK >= moved, "the arena grew past what the record cache gave");
+    store.close().expect("close");
+}
+
+const ARENA_ROWS: u64 = 1_000_000;
+const PAGE_SLACK: u64 = 64 * 1024;

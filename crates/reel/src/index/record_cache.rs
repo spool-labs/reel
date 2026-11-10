@@ -289,6 +289,11 @@ impl CacheShard {
 
 impl RecordCache {
     /// Allocate and touch a cache of some bytes across every shard
+    /// Read the least a record cache holds, whatever share it gets
+    pub const fn least_bytes() -> u64 {
+        (CACHE_SHARDS * 2 * LEAST_SHARD_BYTES) as u64
+    }
+
     pub fn new(bytes: ByteCount) -> Self {
         let shard_bytes = (bytes.0 as usize / CACHE_SHARDS).max(2 * LEAST_SHARD_BYTES);
         let shards: Vec<_> = (0..CACHE_SHARDS).map(|_shard| Mutex::new(CacheShard::new(shard_bytes))).collect();

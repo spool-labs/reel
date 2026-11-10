@@ -244,7 +244,9 @@ impl<Backend: Io> RewriteJob<Backend> {
         let lists = (&mut self.listed, &mut self.crowd);
         let started = state.io.now();
         let is_late = || state.io.now().0.saturating_sub(started.0) > MOST_LOOK_TIME.0;
-        let found = overlap_start(rows, directory_of, &mut self.looked_up_to, can_merge, &mut self.crowded_key, lists, !volume.is_bound_pinned(), is_late);
+        let arena = &self.state.filter_arena;
+        let is_resident = |segment: SegmentNumber| !volume.are_filters_held_out() && arena.has_filters(segment);
+        let found = overlap_start(rows, directory_of, &mut self.looked_up_to, can_merge, &mut self.crowded_key, lists, !volume.is_bound_pinned(), &is_resident, is_late);
         self.has_looks_left = !rows.orders().after(self.looked_up_to).is_empty();
         let Some((crowded, column)) = found else {
             // a look stopped for time has more to see, so it ends no pass and finds no miss
@@ -580,6 +582,7 @@ pub fn overlap_start<'rows, 'state>(
     point: &mut FixedList<u8>,
     lists: (&mut FixedList<SegmentNumber>, &mut FixedList<SegmentNumber>),
     is_sized: bool,
+    is_resident: &dyn Fn(SegmentNumber) -> bool,
     is_late: impl Fn() -> bool,
 ) -> Option<(SummaryRow<'rows>, ColumnId)> {
     let (listed, crowd) = lists;
@@ -601,7 +604,7 @@ pub fn overlap_start<'rows, 'state>(
             let others = listed.iter().filter_map(|other| rows.get(*other));
             let inside = others.filter_map(|other| lowest_inside(&other, facts.column, facts.lowest, facts.bound));
             let mut probes = iter::once(facts.lowest).chain(inside.take(OVERLAP_PROBES));
-            let found = probes.find(|key| is_crowded(rows, directory, (facts.column, key), crowd, is_sized));
+            let found = probes.find(|key| is_crowded(rows, directory, (facts.column, key), crowd, is_sized, is_resident));
             if let Some(key) = found.filter(|_key| can_merge(&row)) {
                 point.set_from(key).ok()?;
                 return Some((row, facts.column));
@@ -621,21 +624,25 @@ pub fn is_crowded(
     (column, key): (ColumnId, &[u8]),
     crowd: &mut FixedList<SegmentNumber>,
     is_sized: bool,
+    is_resident: &dyn Fn(SegmentNumber) -> bool,
 ) -> bool {
     // a summary row keeps a key cut short, so the directory is asked for every key that starts with it
     let (low, high) = (KeyBound::of_key(key), KeyBound::past_prefix(key));
     let (mut covering, mut skip, mut bytes, mut rows_seen) = (0, 0, 0, 0);
+    // a bound above the least holds only while every crowd segment's filters are resident, since a get probes each of them
+    let mut is_all_resident = true;
     for _page in 0..CROWD_PAGES {
         let page = directory.overlapping(&low, &high, skip, crowd);
         skip += crowd.len();
         let over = crowd.iter().filter_map(|segment| rows.get(*segment));
         for row in over.filter(|row| can_ever_merge(row) && covers_point(row, column, key)) {
             covering += 1;
+            is_all_resident &= is_resident(row.facts.segment);
             let (row_bytes, row_rows) = record_totals(&row);
             bytes += row_bytes;
             rows_seen += row_rows;
         }
-        let bound = if is_sized { overlap_bound(bytes, rows_seen) } else { MOST_OVERLAP };
+        let bound = if is_sized && is_all_resident { overlap_bound(bytes, rows_seen) } else { MOST_OVERLAP };
         if covering > bound {
             return true;
         }

@@ -216,6 +216,8 @@ pub struct TestHolds {
     pub merge_cap: AtomicUsize,
     /// The walk lands its counts with no bits, as a missed charge would leave them
     pub lose_bits: AtomicBool,
+    /// Picks read every segment's filters as missing from the arena
+    pub filters_out: AtomicBool,
 }
 
 /// One volume of a store
@@ -492,6 +494,18 @@ impl<Backend: Io> Volume<Backend> {
     /// Check every bit decision is asked as well, which a build without the hooks never does
     #[cfg(not(feature = "test-hooks"))]
     pub const fn asks_every_bit(&self) -> bool {
+        false
+    }
+
+    /// Check a test has picks read every segment's filters as missing from the arena
+    #[cfg(feature = "test-hooks")]
+    pub fn are_filters_held_out(&self) -> bool {
+        self.holds.filters_out.load(Ordering::Acquire)
+    }
+
+    /// Check a test has picks read filters as missing, which a build without the hooks never does
+    #[cfg(not(feature = "test-hooks"))]
+    pub const fn are_filters_held_out(&self) -> bool {
         false
     }
 

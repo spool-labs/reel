@@ -18,13 +18,15 @@ use reel_api::write_batch::WriteBatch;
 
 use crate::config::{ColumnConfig, DeviceClass, StoreConfig, VolumeConfig};
 use crate::engine::dead_bits::{CHUNK_WORDS, DEAD_BITS_NAME, DeadBits, NEW_DEAD_BITS_NAME, SAVE_HEADS_PAGE};
+use crate::engine::rewrite_job::rows_of;
+use crate::segment::block_filter::BITS_PER_ROW;
 use crate::engine::caller_activity::CallerCounts;
 use crate::engine::admission::Admission;
 use reel_api::maintenance_report::WorkerPriority;
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::engine_sizing::{
     complete_block_rows, complete_row_limit,
-    DEAD_BITS_HALVES, EngineSizing, FILTER_ARENA_EIGHTHS, FILTER_CACHE_QUARTERS, FILTER_SLOT_BYTES, GROUP_BYTES, LEAST_LZ4_BUDGET, LEAST_SHARD_ENTRIES, PLANNED_LINE_BYTES,
+    ARENA_GROWTH, DEAD_BITS_HALVES, EngineSizing, FILTER_ARENA_EIGHTHS, FILTER_CACHE_QUARTERS, FILTER_SLOT_BYTES, GROUP_BYTES, LEAST_LZ4_BUDGET, LEAST_SHARD_ENTRIES, PLANNED_LINE_BYTES,
     SHARED_JOBS, StoreShape, GATHER_BYTES, READ_BUFFERS, WRITE_BUFFERS, assumed_segment_bytes, capped_entries, disk_entries, entry_cost, entry_cover, floor_entries,
     segment_bytes_for,
 };
@@ -1181,7 +1183,14 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
     let stripe = (CACHE_SHARDS * CACHE_WAYS * FILTER_SLOT_BYTES) as u64;
     let whole = filter_share.0 / stripe * stripe;
     let cache_room = (filter_share.0 / 8 * (8 - FILTER_ARENA_EIGHTHS)).max(stripe).next_multiple_of(stripe);
-    let arena_share = ByteCount(whole.saturating_sub(cache_room));
+    let base_arena = whole.saturating_sub(cache_room);
+    // filters come before the record cache: the arena takes what the rows on disk need, with room to grow, out of the record
+    // cache's half of its share, and the record cache keeps what is left
+    let rows_on_disk: u64 = volumes.iter().map(|volume| hold(&volume.summary).rows().map(|row| rows_of(&row)).sum::<u64>()).sum();
+    let arena_wanted = rows_on_disk.saturating_mul(BITS_PER_ROW as u64 * ARENA_GROWTH) / 8;
+    let record_room = sizing.record_share.0 / 2 * (2 - DEAD_BITS_HALVES);
+    let arena_taken = arena_wanted.saturating_sub(base_arena).min(record_room.saturating_sub(RecordCache::least_bytes()));
+    let arena_share = ByteCount(base_arena + arena_taken);
     let is_complete = config.columns.iter().any(|column| column.complete_rows.is_some());
     let block_share = ByteCount(sizing.cache_share.0 - filter_share.0);
     // complete columns read small blocks, and a slot sized for a full block would hold a sixteenth of what it could
@@ -1201,10 +1210,10 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         places,
         index: WriteIndex::new(&sizing.shard),
         spot: SpotIndex::new(sizing.spot_share),
-        filter_cache: BlockCache::new(ByteCount(filter_share.0 - arena_share.0), FILTER_SLOT_BYTES),
+        filter_cache: BlockCache::new(ByteCount(filter_share.0 - base_arena), FILTER_SLOT_BYTES),
         filter_arena: FilterArena::new(arena_share, planned.iter().map(|table| table.segments_per_shard * TABLE_SHARDS).sum()),
         row_cache: BlockCache::new(row_share, ROW_BLOCK_BYTES),
-        record_cache: RecordCache::new(ByteCount(sizing.record_share.0 / 2 * (2 - DEAD_BITS_HALVES))),
+        record_cache: RecordCache::new(ByteCount(record_room - arena_taken)),
         complete_cache: is_complete.then(|| BlockCache::new(complete_share, COMPLETE_BLOCK_BYTES)),
         complete_line_bytes: ByteCount(complete_lines(config) * size_of::<BlockEntry>() as u64),
         queues,

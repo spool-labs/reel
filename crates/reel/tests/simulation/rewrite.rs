@@ -3482,3 +3482,27 @@ fn run_alone(job: &mut RewriteJob<SimulatedIo>, io: &SimulatedIo) {
         job.step();
     }
 }
+
+// a crowd whose filters aren't all in the arena keeps the least bound however large its records, since each get probes every
+// segment over a key and a probe past the arena costs a cache lock or a read
+#[test]
+fn filters_out_keep_the_least_bound() {
+    let io = SimulatedIo::new(Seed(95));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let volume = &store.state.volumes[0];
+    volume.holds.filters_out.store(true, Ordering::Release);
+    let large = vec![6; 64 * 1024];
+    for number in 0..OVER_THE_BOUND {
+        store.put(COLUMN, format!("a-{number:03}").as_bytes(), &large).expect("put");
+        store.put(COLUMN, b"m-shared", &large).expect("put");
+        store.put(COLUMN, format!("z-{number:03}").as_bytes(), &large).expect("put");
+        seal(&store, &io);
+    }
+    let overlaps = || volume.picks[PickOutcome::Overlap.index()].load(Ordering::Acquire);
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(start_merge(&mut job), "no merge started");
+    assert!(overlaps() > 0, "no overlap merge started on {OVER_THE_BOUND} segments with their filters out");
+    run_to_end(&mut job);
+    store.close().expect("close");
+}

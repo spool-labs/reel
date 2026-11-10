@@ -36,6 +36,9 @@ pub struct CursorCounts {
     pub refills: u64,
     pub answered: u64,
     pub to_table: u64,
+    /// Merge rows that asked outside the merge, and those an unwalked merge settled by its own rows
+    pub rows_asked: u64,
+    pub rows_skipped: u64,
 }
 
 /// The cursor: runs in fixed room, a map to them, and a stamp that empties the map at each release

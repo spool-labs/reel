@@ -130,6 +130,8 @@ pub struct EngineState<Backend: Io> {
     pub longest_room_step: AtomicU64,
     /// Walk lookups through the cursor, in the report's order
     pub cursor_lookups: [AtomicU64; 4],
+    /// Merge lookups, in the report's order
+    pub merge_lookups: [AtomicU64; 6],
     /// Walk block lookups, in the report's order
     pub block_lookups: [AtomicU64; 4],
     pub units: UnitTallies,

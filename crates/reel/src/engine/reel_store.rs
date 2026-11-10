@@ -1233,6 +1233,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         pauses: Default::default(),
         longest_room_step: AtomicU64::new(0),
         cursor_lookups: Default::default(),
+        merge_lookups: Default::default(),
         block_lookups: Default::default(),
         units: Default::default(),
         opened_at,

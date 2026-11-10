@@ -358,7 +358,7 @@ impl<Backend: Io> BlockCounter<Backend> {
         }
         let counted = self.count_block(volume, &pin, &block, target, counts);
         self.cursor.release(&volume.table);
-        self.state.note_cursor(mem::take(&mut self.cursor.counts));
+        self.state.note_cursor(mem::take(&mut self.cursor.counts), false);
         let lookups = mem::take(&mut self.lookups.counts);
         for (total, count) in self.state.block_lookups.iter().zip([lookups.blocks, lookups.candidates, lookups.whole, lookups.key_checks]) {
             total.fetch_add(count, Ordering::Relaxed);

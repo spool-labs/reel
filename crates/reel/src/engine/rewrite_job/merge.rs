@@ -143,7 +143,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         // a merge that wrote past its promise takes more room before it goes on, or gives way
         // a step holds the segments outside the merge for its rows alone, so an unlink or close waits one step at most
         self.cursor.release(&self.state.volumes[self.volume].table);
-        self.state.note_cursor(mem::take(&mut self.cursor.counts));
+        self.state.note_cursor(mem::take(&mut self.cursor.counts), true);
         let outcome = outcome.and_then(|()| if self.outgrows_promise() { Err(Error::from(ErrorKind::StorageFull)) } else { Ok(()) });
         // the row blocks a pass reads, so a merge's deciding and placing reads show beside its copying one
         let pass = match phase {
@@ -327,6 +327,8 @@ impl<Backend: Io> RewriteJob<Backend> {
             // a cover whose walk has counted what it hides replaces a row as a newer row does
             self.cover_place = if self.is_unwalked { None } else { volume.covers.newest_applied(column, &self.key) };
             // an unwalked merge goes by its own rows, so it runs at the disk's rate and leaves the rest to the output's walk
+            self.cursor.counts.rows_skipped += u64::from(self.is_unwalked);
+            self.cursor.counts.rows_asked += u64::from(!self.is_unwalked);
             self.newest_place = match self.newest_outside(volume, column) {
                 Ok(found) => found.map(|found| found.row.place),
                 // a version a damaged block hides replaces nothing, and the row stays

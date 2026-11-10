@@ -505,8 +505,10 @@ pub struct MaintenanceReport {
     pub pauses: [u64; PAUSE_CAUSES.len()],
     /// The longest a writer took to reserve room ahead of its claims
     pub longest_room_step: Nanoseconds,
-    /// Walk and merge lookups through the cursor: segments it pinned, runs it copied again, rows it answered, rows it sent to the table
+    /// Walk lookups through the cursor: segments it pinned, runs it copied again, rows it answered, rows it sent to the table
     pub cursor_lookups: [u64; 4],
+    /// Merge lookups through the cursor, as above, then merge rows asked outside the merge and rows an unwalked merge settled alone
+    pub merge_lookups: [u64; 6],
     /// Walk block lookups run together: blocks, candidates asked, candidates whose range held the whole block, per-key checks
     pub block_lookups: [u64; 4],
     pub volumes: Vec<VolumeReading>,
@@ -588,6 +590,7 @@ impl MaintenanceReport {
             pauses: [0; PAUSE_CAUSES.len()],
             longest_room_step: Nanoseconds(0),
             cursor_lookups: [0; 4],
+            merge_lookups: [0; 6],
             block_lookups: [0; 4],
             volumes: Vec::new(),
             complete_columns: Vec::new(),

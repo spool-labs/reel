@@ -32,9 +32,10 @@ impl<Backend: Io> EngineState<Backend> {
         self.written[source.index()].fetch_add(bytes.0, Ordering::Relaxed);
     }
 
-    /// Add what a cursor did to the report's totals
-    pub fn note_cursor(&self, counts: CursorCounts) {
-        for (total, count) in self.cursor_lookups.iter().zip([counts.held, counts.refills, counts.answered, counts.to_table]) {
+    /// Add what a walk's or a merge's cursor did to the report's totals
+    pub fn note_cursor(&self, counts: CursorCounts, is_merge: bool) {
+        let totals = if is_merge { &self.merge_lookups[..] } else { &self.cursor_lookups[..] };
+        for (total, count) in totals.iter().zip([counts.held, counts.refills, counts.answered, counts.to_table, counts.rows_asked, counts.rows_skipped]) {
             total.fetch_add(count, Ordering::Relaxed);
         }
     }
@@ -157,6 +158,7 @@ impl<Backend: Io> EngineState<Backend> {
         }
         report.longest_room_step = Nanoseconds(self.longest_room_step.load(Ordering::Relaxed));
         report.cursor_lookups = array::from_fn(|kind| self.cursor_lookups[kind].load(Ordering::Relaxed));
+        report.merge_lookups = array::from_fn(|kind| self.merge_lookups[kind].load(Ordering::Relaxed));
         report.block_lookups = array::from_fn(|kind| self.block_lookups[kind].load(Ordering::Relaxed));
         for (entry, written) in report.written.iter_mut().zip(&self.written) {
             *entry = ByteCount(written.load(Ordering::Relaxed));

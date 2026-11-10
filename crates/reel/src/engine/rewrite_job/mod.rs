@@ -92,6 +92,8 @@ pub const MOST_OVERLAP: usize = 32;
 pub const OVERLAP_BASE_RECORD_BYTES: u64 = 4 * 1024;
 /// Room a merge takes at a time once it has written past its promise
 pub const OUTGROW_STEP_BYTES: u64 = 16 * 1024 * 1024;
+/// The longest an overlap look holds the summary before it stops for the next pick
+pub const MOST_LOOK_TIME: Nanoseconds = Nanoseconds(2_000_000);
 /// The planner's own lane. Worker lanes count up from one
 pub const PLANNER_LANE: usize = 0;
 /// Keys inside a new segment one look tries for the crowded point, which bounds what a look costs

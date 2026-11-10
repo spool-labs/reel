@@ -24,7 +24,7 @@ use crate::segment::segment_tail::{MOST_MERGE_SEGMENTS, SegmentNumber};
 use crate::segment::summary::{SummaryRow, SummaryRows};
 use crate::segment::summary_orders::{COVERS_LIST, ROW_FOOTER_BYTES, SHARE_BUCKETS, SHARE_SCALE, WalkList, reclaim_share, share_bucket};
 
-use crate::engine::rewrite_job::{BAR_QUARTERS, BUCKET_LOOKS, BarsFired, CROWD_PAGES, OVERLAP_BASE_RECORD_BYTES, EARLY_BAR_QUARTERS, GATHER_LOOKS, MOST_OVERLAP, MergeInput, MergeTarget, OVERLAP_LOOKS, OVERLAP_PROBES, PLAIN_BAR_QUARTERS, PLANNER_LANE, QUIET_BAR_QUARTERS, RewriteJob, RewritePhase, rows_of};
+use crate::engine::rewrite_job::{BAR_QUARTERS, BUCKET_LOOKS, BarsFired, CROWD_PAGES, MOST_LOOK_TIME, OVERLAP_BASE_RECORD_BYTES, EARLY_BAR_QUARTERS, GATHER_LOOKS, MOST_OVERLAP, MergeInput, MergeTarget, OVERLAP_LOOKS, OVERLAP_PROBES, PLAIN_BAR_QUARTERS, PLANNER_LANE, QUIET_BAR_QUARTERS, RewriteJob, RewritePhase, rows_of};
 use crate::engine::rewrite_job::install::freed_in_place;
 
 impl<Backend: Io> RewriteJob<Backend> {
@@ -233,9 +233,16 @@ impl<Backend: Io> RewriteJob<Backend> {
         // a column with a complete table has no overlap bound
         let directory_of = |column: ColumnId| state.complete_table(column).is_none().then(|| state.directories[column.0 as usize].as_ref()).flatten();
         let lists = (&mut self.listed, &mut self.crowd);
-        let found = overlap_start(rows, directory_of, &mut self.looked_up_to, can_merge, &mut self.crowded_key, lists, !volume.is_bound_pinned());
+        let started = state.io.now();
+        let is_late = || state.io.now().0.saturating_sub(started.0) > MOST_LOOK_TIME.0;
+        let found = overlap_start(rows, directory_of, &mut self.looked_up_to, can_merge, &mut self.crowded_key, lists, !volume.is_bound_pinned(), is_late);
         self.has_looks_left = !rows.orders().after(self.looked_up_to).is_empty();
         let Some((crowded, column)) = found else {
+            // a look stopped for time has more to see, so it ends no pass and finds no miss
+            if is_late() {
+                self.has_looks_left = true;
+                return None;
+            }
             self.end_pass(volume);
             volume.note_pick(PickOutcome::OverlapMiss);
             return None;
@@ -562,9 +569,14 @@ pub fn overlap_start<'rows, 'state>(
     point: &mut FixedList<u8>,
     lists: (&mut FixedList<SegmentNumber>, &mut FixedList<SegmentNumber>),
     is_sized: bool,
+    is_late: impl Fn() -> bool,
 ) -> Option<(SummaryRow<'rows>, ColumnId)> {
     let (listed, crowd) = lists;
     for _look in 0..OVERLAP_LOOKS {
+        // a look holds the summary, so one that runs long stops and the next pick goes on from here
+        if is_late() {
+            return None;
+        }
         let segment = *rows.orders().after(*looked_up_to).first()?;
         let row = rows.get(segment)?;
         let mut columns = row.cursor();

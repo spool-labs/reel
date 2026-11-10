@@ -4,6 +4,7 @@
 use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, WritePlace};
 
+use crate::pool::{touched_filled, touched_room};
 use crate::segment::block_entry::{BlockEntry, KeyPrefix};
 use crate::segment::segment_table::{BlockWindow, HeldRun, RunCopy, SegmentTable, WINDOW_BLOCKS, window_in_run};
 use crate::segment::segment_tail::SegmentNumber;
@@ -55,9 +56,9 @@ impl<File: Clone> KeyCursor<File> {
     /// Allocate the fixed room
     pub fn new() -> Self {
         Self {
-            held: Vec::with_capacity(CURSOR_SEGMENTS),
-            lines: vec![BlockEntry::default(); CURSOR_SEGMENTS * RUN_LINES],
-            map: vec![(SegmentNumber(0), ColumnId(0), 0, 0); MAP_SLOTS],
+            held: touched_room(CURSOR_SEGMENTS),
+            lines: touched_filled(CURSOR_SEGMENTS * RUN_LINES, BlockEntry::default()),
+            map: touched_filled(MAP_SLOTS, (SegmentNumber(0), ColumnId(0), 0, 0)),
             stamp: 1,
             counts: CursorCounts::default(),
         }

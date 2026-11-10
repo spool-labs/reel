@@ -55,7 +55,7 @@ impl Region {
         let Some(head) = NonNull::new(memory.cast::<RegionHead>()) else {
             return Err(Error::other("mmap gave a null mapping"));
         };
-        if populate_flag() == 0 {
+        if !populate_written(memory, mapped) {
             touch_pages(memory.cast::<u8>(), mapped, page);
         }
         // SAFETY: the mapping starts page aligned and has room for the head
@@ -123,6 +123,24 @@ fn page_bytes() -> usize {
     // SAFETY: sysconf reads a number and touches no memory of ours
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     usize::try_from(page).unwrap_or(4_096).max(4_096)
+}
+
+/// The madvise that has the kernel write-fault every page of a range in, from Linux 5.14
+#[cfg(target_os = "linux")]
+const MADV_POPULATE_WRITE: libc::c_int = 23;
+
+/// Have the kernel write every page in, where MAP_POPULATE alone left them to fault at a job's first write on Linux 7.0, and
+/// say whether it did
+#[cfg(target_os = "linux")]
+fn populate_written(memory: *mut libc::c_void, mapped: usize) -> bool {
+    // SAFETY: the range is the mapping just made, and the call only faults its pages in
+    unsafe { libc::madvise(memory, mapped, MADV_POPULATE_WRITE) == 0 }
+}
+
+/// Say no kernel populate ran, so the pages get touched
+#[cfg(not(target_os = "linux"))]
+fn populate_written(_memory: *mut libc::c_void, _mapped: usize) -> bool {
+    false
 }
 
 /// The flag that has the kernel fault every page in at the map, where it has one

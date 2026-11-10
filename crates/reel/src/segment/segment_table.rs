@@ -8,7 +8,7 @@ use reel_api::column_id::ColumnId;
 use reel_api::direction::Direction;
 use reel_api::units::{ByteCount, RootId, WritePlace};
 
-use crate::pool::touched_capacity;
+use crate::pool::{touched_capacity, touched_filled};
 use crate::guard::Shards;
 use crate::segment::block_entry::{BlockEntry, KeyPrefix, SHARED_HEAD_BYTES};
 use crate::segment::footer_reader::first_candidate;
@@ -152,7 +152,7 @@ impl NumberMap {
     pub fn new(capacity: usize) -> Self {
         let size = (capacity.max(1) * 2).next_power_of_two();
         Self {
-            numbers: vec![SegmentNumber(0); size],
+            numbers: touched_filled(size, SegmentNumber(0)),
             slots: vec![NO_SLOT; size],
             mask: size - 1,
         }

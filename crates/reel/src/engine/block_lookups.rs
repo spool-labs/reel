@@ -9,6 +9,7 @@ use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, WritePlace};
 
+use crate::pool::{touched_capacity, touched_room};
 use crate::engine::engine_state::EngineState;
 use crate::engine::read_path::{KeyRead, SealedRow, corruption};
 use crate::engine::volume::Volume;
@@ -63,9 +64,9 @@ impl BlockLookups {
     /// Allocate the fixed room
     pub fn new() -> Self {
         Self {
-            keys: Vec::with_capacity(LOOKUP_KEY_BYTES),
-            lookups: Vec::with_capacity(MOST_LOOKUPS),
-            candidates: Vec::with_capacity(CURSOR_SEGMENTS),
+            keys: touched_capacity(LOOKUP_KEY_BYTES, 0),
+            lookups: touched_room(MOST_LOOKUPS),
+            candidates: touched_room(CURSOR_SEGMENTS),
             counts: LookupCounts::default(),
         }
     }

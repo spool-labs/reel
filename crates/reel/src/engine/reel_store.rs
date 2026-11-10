@@ -66,7 +66,7 @@ use crate::index::spot_index::SpotIndex;
 use crate::index::write_index::WriteIndex;
 use crate::io::lock_outcome::LockOutcome;
 use crate::io::{Io, IoTask};
-use crate::pool::{Pool, touched_buffer, touched_filled, touched_room, touched_zeroes};
+use crate::pool::{Pool, touched_buffer, touched_capacity, touched_filled, touched_room, touched_zeroes};
 use crate::record::codec::Codec;
 use crate::record::record_check::RecordKey;
 use crate::record::record_encoder::{RecordEncoder, SHARE_BYTES};
@@ -1464,7 +1464,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         summary: Mutex::new(summary.rows),
         bits_path: summary.paths.root.join(DEAD_BITS_NAME),
         new_bits_path: summary.paths.root.join(NEW_DEAD_BITS_NAME),
-        bits_save: Mutex::new(BitsSave { heads: Vec::with_capacity(SAVE_HEADS_PAGE), chunk: Vec::with_capacity(CHUNK_WORDS * size_of::<u64>()) }),
+        bits_save: Mutex::new(BitsSave { heads: touched_room(SAVE_HEADS_PAGE), chunk: touched_capacity(CHUNK_WORDS * size_of::<u64>(), 0) }),
         bits_saved_at: AtomicU64::new(0),
         summary_paths: summary.paths,
         lost_rows: Mutex::new(summary.lost),

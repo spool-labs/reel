@@ -2,6 +2,7 @@
 
 use reel_api::units::ByteCount;
 
+use crate::pool::{touched_capacity, touched_filled};
 use crate::segment::segment_table::NumberMap;
 use crate::segment::segment_tail::SegmentNumber;
 use crate::segment::summary::SummaryRow;
@@ -122,10 +123,10 @@ impl SummaryOrders {
     pub fn new(room: usize) -> Self {
         let empty = OrderEntry { segment: SegmentNumber(0), share_list: NO_LIST, walk_list: NO_LIST, share_links: [NO_ENTRY; 2], walk_links: [NO_ENTRY; 2], dead_bytes: 0 };
         Self {
-            entries: vec![empty; room],
+            entries: touched_filled(room, empty),
             free: (0..room as u32).rev().collect(),
             slots: NumberMap::new(room),
-            present: Vec::with_capacity(room),
+            present: touched_capacity(room, SegmentNumber(0)),
             share_ends: [[NO_ENTRY; 2]; SHARE_LISTS],
             walk_ends: [[NO_ENTRY; 2]; WALK_LISTS],
             walk_counts: [0; WALK_LISTS],

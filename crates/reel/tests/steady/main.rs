@@ -700,6 +700,7 @@ fn main() {
     let unlinked_before = store.state.volumes[0].segments_unlinked.load(Ordering::Acquire);
     let freed_before = store.state.volumes[0].bytes_freed.load(Ordering::Acquire);
     let rewritten_before = store.state.volumes[0].segments_rewritten.load(Ordering::Acquire);
+    let mapped_before = store.state.admission.mapped_total.load(Ordering::Acquire);
     touch_stack();
     let mut faults = FaultCounter::new();
     let _first_read = faults.read();
@@ -720,6 +721,9 @@ fn main() {
     let unlinked = store.state.volumes[0].segments_unlinked.load(Ordering::Acquire) - unlinked_before;
     let freed = store.state.volumes[0].bytes_freed.load(Ordering::Acquire) - freed_before;
     let rewritten = store.state.volumes[0].segments_rewritten.load(Ordering::Acquire) - rewritten_before;
+    // a job maps its region at its first step with every page written in, and this kernel counts those pages as the
+    // process's faults, so they come off the count and every fault past them fails
+    let populated = (store.state.admission.mapped_total.load(Ordering::Acquire) - mapped_before) / PAGE_BYTES as u64;
     let threads_after = thread_faults();
     let unit_failures = check_units(&store);
 
@@ -733,7 +737,8 @@ fn main() {
 
     let allocations = after.allocations - before.allocations;
     let frees = after.frees - before.frees;
-    let minor_faults = after.minor_faults - before.minor_faults;
+    let counted_faults = after.minor_faults - before.minor_faults;
+    let minor_faults = counted_faults.saturating_sub(populated);
     let major_faults = after.major_faults - before.major_faults;
     if minor_faults + major_faults > 0 {
         for (name, minor, major) in threads_after {
@@ -744,7 +749,7 @@ fn main() {
             }
         }
     }
-    println!("{rounds} rounds: {allocations} allocations, {frees} frees, {minor_faults} minor faults, {major_faults} major faults");
+    println!("{rounds} rounds: {allocations} allocations, {frees} frees, {minor_faults} minor faults past {populated} region pages ({counted_faults} counted), {major_faults} major faults");
     println!("close: {close_allocations} allocations");
     println!("{unlinked} unlinks in the window");
     println!("{freed} bytes freed in place in the window");

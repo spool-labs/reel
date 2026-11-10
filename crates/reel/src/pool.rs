@@ -337,6 +337,8 @@ pub fn touched_capacity<Item: Clone>(capacity: usize, filler: Item) -> Vec<Item>
 /// Allocate an empty list of items that have no plain value yet, with every page of its room written
 pub fn touched_room<Item>(capacity: usize) -> Vec<Item> {
     let mut items: Vec<Item> = Vec::with_capacity(capacity);
+    // the pointer counts as seen before the writes, or a compiler can turn them into a zeroed allocation
+    black_box(items.as_mut_ptr());
     for slot in items.spare_capacity_mut() {
         *slot = MaybeUninit::zeroed();
     }
@@ -349,4 +351,17 @@ pub fn touched_filled<Item: Clone>(length: usize, value: Item) -> Vec<Item> {
     let mut items = touched_capacity(length, value.clone());
     items.resize(length, value);
     items
+}
+
+/// Allocate zeroed 64-bit words with every page written. Zeros collected straight into a list can come back as a zeroed
+/// allocation the kernel hasn't touched, and its first write faults on a job's thread
+pub fn touched_atomics(length: usize) -> Vec<AtomicU64> {
+    let mut words: Vec<AtomicU64> = Vec::with_capacity(length);
+    black_box(words.as_mut_ptr());
+    words.resize_with(length, || AtomicU64::new(u64::MAX));
+    for word in &words {
+        word.store(0, Ordering::Relaxed);
+    }
+    black_box(words.as_ptr());
+    words
 }

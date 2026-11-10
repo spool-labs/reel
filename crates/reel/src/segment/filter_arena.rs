@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 use reel_api::units::ByteCount;
 
 use crate::guard::hold;
-use crate::pool::touched_capacity;
+use crate::pool::{touched_capacity, touched_filled};
 use crate::index::key_hash::KeyHash;
 use crate::segment::block_filter::may_contain_bytes;
 use crate::segment::segment_tail::SegmentNumber;
@@ -146,12 +146,12 @@ impl FilterArena {
         Self {
             words: touched_words(length as usize / WORD_BYTES),
             numbers: (0..size).map(|_place| AtomicU64::new(NO_NUMBER)).collect(),
-            slots: (0..size).map(|_place| AtomicU32::new(0)).collect(),
+            slots: touched_words(size),
             mask: size - 1,
-            extents: (0..most_segments).map(|_slot| FilterExtent::default()).collect(),
+            extents: touched_extents(most_segments),
             changes: AtomicU64::new(0),
             books: Mutex::new(ArenaBooks {
-                extents: vec![ExtentBook::default(); most_segments],
+                extents: touched_filled(most_segments, ExtentBook::default()),
                 free_extents: (0..most_segments as u32).rev().collect(),
                 free,
             }),
@@ -386,4 +386,14 @@ pub fn touched_words(length: usize) -> Vec<AtomicU32> {
     }
     black_box(words.as_ptr());
     words
+}
+
+/// Allocate blank extents with every page written. Zeros collected straight into a list can come back as a zeroed allocation
+/// no page of which open has touched
+pub fn touched_extents(count: usize) -> Vec<FilterExtent> {
+    let mut extents: Vec<FilterExtent> = Vec::with_capacity(count);
+    black_box(extents.as_mut_ptr());
+    extents.resize_with(count, FilterExtent::default);
+    black_box(extents.as_ptr());
+    extents
 }

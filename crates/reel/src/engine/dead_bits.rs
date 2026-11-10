@@ -10,6 +10,7 @@ use reel_api::units::{ByteCount, Nanoseconds};
 use crate::fixed_list::FixedList;
 use crate::record::record_check::checksum;
 use crate::guard::hold;
+use crate::pool::{touched_atomics, touched_capacity};
 use crate::row_kind::RowKind;
 use crate::segment::footer_reader::RowAt;
 use crate::segment::segment_tail::SegmentNumber;
@@ -92,13 +93,13 @@ impl DeadBits {
     /// Allocate a pool of some bytes, with room in the map for a number of segments
     pub fn new(share: ByteCount, most_segments: usize) -> Self {
         let words = (share.0 / size_of::<u64>() as u64) as usize;
-        let mut free = Vec::with_capacity(most_segments + 1);
+        let mut free = touched_capacity(most_segments + 1, WordSpan::default());
         if words > 0 {
             free.push(WordSpan { start: 0, length: words as u32 });
         }
         Self {
-            words: (0..words).map(|_word| AtomicU64::new(0)).collect(),
-            books: Mutex::new(BitsBooks { extents: HashMap::with_capacity(most_segments), free }),
+            words: touched_atomics(words),
+            books: Mutex::new(BitsBooks { extents: touched_map(most_segments), free }),
             inexact: Default::default(),
             spoils: AtomicU64::new(0),
             is_changed: AtomicBool::new(false),
@@ -404,4 +405,15 @@ impl DeadBits {
     pub fn begin_words(&self, segment: SegmentNumber, block_count: u32, block_words: u32) -> bool {
         self.begin(segment, block_count, block_words.saturating_mul(WORD_BITS))
     }
+}
+
+/// Allocate the extents map with its buckets written, so open backs every page it reserves. A map's buckets come back
+/// unwritten, and its first inserts after open would fault on a job's thread
+pub fn touched_map(most_segments: usize) -> HashMap<SegmentNumber, BitsExtent> {
+    let mut map = HashMap::with_capacity(most_segments);
+    for number in 0..most_segments as u64 {
+        map.insert(SegmentNumber(number), BitsExtent::default());
+    }
+    map.clear();
+    map
 }

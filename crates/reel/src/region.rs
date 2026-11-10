@@ -2,7 +2,7 @@
 
 use std::io::{Error, Result};
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicUsize, Ordering, fence};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 
 use reel_api::units::ByteCount;
 
@@ -44,6 +44,8 @@ unsafe impl Sync for Region {}
 impl Region {
     /// Map this many bytes with every page in memory, so the job's steps never fault
     pub fn map(bytes: ByteCount) -> Result<Self> {
+        let _in_flight = MapInFlight::enter();
+        let faults_before = thread_faults();
         let page = page_bytes();
         let mapped = (REGION_HEAD_BYTES + bytes.0 as usize).div_ceil(page) * page;
         let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | populate_flag();
@@ -58,6 +60,8 @@ impl Region {
         if !populate_written(memory, mapped) {
             touch_pages(memory.cast::<u8>(), mapped, page);
         }
+        // the faults the map and its populate took on this thread, which a fault gate can tell apart from a job's own
+        note_populate(thread_faults().saturating_sub(faults_before));
         // SAFETY: the mapping starts page aligned and has room for the head
         unsafe { head.as_ptr().write(RegionHead { holders: AtomicUsize::new(1), mapped }) };
         Ok(Self { head, carved: REGION_HEAD_BYTES })
@@ -160,6 +164,79 @@ fn touch_pages(memory: *mut u8, mapped: usize, page: usize) {
     for offset in (0..mapped).step_by(page) {
         // SAFETY: the offset is inside the mapping, and the write keeps the page's zero
         unsafe { ptr::write_volatile(memory.add(offset), 0) };
+    }
+}
+
+/// Maps under way, so a fault gate reads its counts only when no populate is half counted
+pub static MAPS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// Threads whose populate faults a fault gate can read, each with its id and its total, more than a store runs
+pub const POPULATE_THREADS: usize = 64;
+/// Each thread that mapped a region: its id, and the minor faults its maps and populates took
+pub static POPULATE_FAULTS: [(AtomicU64, AtomicU64); POPULATE_THREADS] = [const { (AtomicU64::new(0), AtomicU64::new(0)) }; POPULATE_THREADS];
+
+/// Add a populate's faults to the calling thread's total, in the slot its id took first
+fn note_populate(faults: u64) {
+    let id = thread_id();
+    for (slot_id, total) in &POPULATE_FAULTS {
+        if slot_id.load(Ordering::Acquire) == id || slot_id.compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            total.fetch_add(faults, Ordering::Relaxed);
+            return;
+        }
+    }
+}
+
+/// Read the populate faults a thread took, by its kernel id
+#[cfg(feature = "test-hooks")]
+pub fn populate_faults_of(id: u64) -> u64 {
+    POPULATE_FAULTS.iter().find(|(slot_id, _total)| slot_id.load(Ordering::Acquire) == id).map_or(0, |(_id, total)| total.load(Ordering::Relaxed))
+}
+
+/// Read the calling thread's kernel id
+#[cfg(target_os = "linux")]
+fn thread_id() -> u64 {
+    // SAFETY: gettid takes nothing and can't fail
+    u64::try_from(unsafe { libc::gettid() }).unwrap_or(0)
+}
+
+/// Read no id where the kernel keeps no fault count for one thread
+#[cfg(not(target_os = "linux"))]
+fn thread_id() -> u64 {
+    0
+}
+
+/// Read the minor faults the calling thread has taken
+#[cfg(target_os = "linux")]
+fn thread_faults() -> u64 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: the call writes one rusage into the buffer, which is that size
+    if unsafe { libc::getrusage(libc::RUSAGE_THREAD, usage.as_mut_ptr()) } != 0 {
+        return 0;
+    }
+    // SAFETY: the call succeeded, so it wrote the whole struct
+    u64::try_from(unsafe { usage.assume_init() }.ru_minflt).unwrap_or(0)
+}
+
+/// Read no faults where the kernel keeps no count for one thread
+#[cfg(not(target_os = "linux"))]
+fn thread_faults() -> u64 {
+    0
+}
+
+/// One map under way, counted from its start to its end whichever way it ends
+struct MapInFlight;
+
+impl MapInFlight {
+    /// Count a map as under way
+    fn enter() -> Self {
+        MAPS_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for MapInFlight {
+    fn drop(&mut self) {
+        MAPS_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

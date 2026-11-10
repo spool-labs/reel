@@ -153,6 +153,11 @@ impl DeadBits {
         }
     }
 
+    /// Check a segment has bits at all, exact or not. One with none was born when the pool was full, and each of its rows asks
+    pub fn has_extent(&self, segment: SegmentNumber) -> bool {
+        hold(&self.books).extents.contains_key(&segment)
+    }
+
     /// Read a segment's extent while its bits answer for every row, or nothing
     pub fn exact(&self, segment: SegmentNumber) -> Option<BitsExtent> {
         hold(&self.books).extents.get(&segment).copied().filter(|extent| extent.is_exact)

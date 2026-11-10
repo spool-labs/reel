@@ -223,7 +223,12 @@ impl<Backend: Io> EngineState<Backend> {
                     return;
                 }
                 split.counted += column.dead_bytes.0;
-                if volume.dead_bits.exact(segment).is_none() {
+                if !volume.dead_bits.has_extent(segment) {
+                    split.rows_without_bits += column.row_count.0;
+                } else {
+                    split.rows_with_bits += column.row_count.0;
+                }
+                if volume.dead_bits.has_extent(segment) && volume.dead_bits.exact(segment).is_none() {
                     split.inexact += column.dead_bytes.0;
                 }
                 if volume.table.highest_replacement(segment).is_some_and(|place| self.cues.has_cue_below(index, place)) {
@@ -292,6 +297,8 @@ impl<Backend: Io> EngineState<Backend> {
                 unwalked_bytes: ByteCount(split.unwalked),
                 inexact_dead: ByteCount(split.inexact),
                 cue_held_dead: ByteCount(split.cue_held),
+                rows_with_bits: split.rows_with_bits,
+                rows_without_bits: split.rows_without_bits,
                 promises_outgrown: volume.promises_outgrown.load(Ordering::Relaxed),
             });
         }
@@ -438,4 +445,6 @@ pub struct DeadSplit {
     pub unwalked: u64,
     pub inexact: u64,
     pub cue_held: u64,
+    pub rows_with_bits: u64,
+    pub rows_without_bits: u64,
 }

@@ -369,10 +369,11 @@ fn written_by_source() {
     store.close().expect("close");
 }
 
-// filters come before the record cache: a reopen with rows on disk sizes the arena for their filters, out of the record cache's
-// share, and the budget holds the same
+// filters come before the record cache: a reopen with rows on disk past the floor grows the arena out of the filter share first,
+// and the record cache gives the dead bits and what the filter share lacks
 #[test]
 fn arena_takes_room_for_rows_on_disk() {
+    reel::engine::engine_sizing::TEST_FLOOR_ROWS.with(|floor| floor.set(FLOOR_TEST_ROWS));
     let io = SimulatedIo::new(Seed(41));
     let store = open(&io);
     let fresh = store.state.memory_report();
@@ -383,11 +384,15 @@ fn arena_takes_room_for_rows_on_disk() {
     store.close().expect("close");
 
     let store = open(&io);
+    reel::engine::engine_sizing::TEST_FLOOR_ROWS.with(|floor| floor.set(0));
     let grown = store.state.memory_report();
     assert!(grown.arena_room.0 > fresh.arena_room.0, "the arena stayed at {:?}", grown.arena_room);
-    assert!(grown.record_cache.0 < fresh.record_cache.0, "the record cache kept {:?}", grown.record_cache);
-    let moved = grown.arena_room.0 - fresh.arena_room.0;
-    assert!(fresh.record_cache.0 - grown.record_cache.0 + PAGE_SLACK >= moved, "the arena grew past what the record cache gave");
+    assert_eq!(grown.budget, fresh.budget);
+    let bits_grew = grown.dead_bits.0 - fresh.dead_bits.0;
+    let arena_grew = grown.arena_room.0 - fresh.arena_room.0;
+    let cache_gave = fresh.record_cache.0 - grown.record_cache.0;
+    assert!(cache_gave <= bits_grew + arena_grew + PAGE_SLACK, "the record cache gave past the dead bits and the arena");
+    assert!(arena_grew > cache_gave - bits_grew, "the filter share gave the arena nothing");
     store.close().expect("close");
 }
 
@@ -468,5 +473,37 @@ fn dead_space_splits_by_cause() {
     drop(cue);
     let (_counted, _unwalked, _inexact, held) = split_of(&store);
     assert_eq!(held, 0);
+    store.close().expect("close");
+}
+
+const FLOOR_TEST_ROWS: u64 = 200;
+const FLOOR_FILL_KEYS: u64 = 4_000;
+const FLOOR_ROUNDS: u64 = 4;
+
+// a store opened empty gets bits and filters for the floor's rows, and one filled past it answers every key right while the
+// report shows the rows that went without bits
+#[test]
+fn past_the_floor_answers_right() {
+    reel::engine::engine_sizing::TEST_FLOOR_ROWS.with(|floor| floor.set(FLOOR_TEST_ROWS));
+    let io = SimulatedIo::new(Seed(71));
+    let store = open(&io);
+    reel::engine::engine_sizing::TEST_FLOOR_ROWS.with(|floor| floor.set(0));
+    for round in 0..FLOOR_ROUNDS {
+        for number in 0..FLOOR_FILL_KEYS {
+            store.put(COLUMN, format!("floor-{number:05}").as_bytes(), format!("{round}").as_bytes()).expect("put");
+        }
+        store.seal_now();
+        settle(&io);
+    }
+    let last = format!("{}", FLOOR_ROUNDS - 1).into_bytes();
+    let mut value = Vec::new();
+    for number in 0..FLOOR_FILL_KEYS {
+        assert!(store.get(COLUMN, format!("floor-{number:05}").as_bytes(), &mut value).expect("get"), "key {number}");
+        assert_eq!(value, last, "key {number}");
+    }
+    let mut report = MaintenanceReport::new();
+    store.maintenance_report(&mut report);
+    assert!(report.volumes[0].rows_without_bits > 0, "no row went without a bit past the floor");
+    assert!(store.memory_report().arena_segments_left_out.0 > 0, "no segment went without filters past the floor");
     store.close().expect("close");
 }

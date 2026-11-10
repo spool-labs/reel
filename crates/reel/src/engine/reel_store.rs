@@ -27,9 +27,9 @@ use reel_api::maintenance_report::WorkerPriority;
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::engine_sizing::{
     complete_block_rows, complete_row_limit,
-    ARENA_GROWTH, DEAD_BITS_HALVES, EngineSizing, FILTER_ARENA_EIGHTHS, FILTER_CACHE_QUARTERS, FILTER_SLOT_BYTES, GROUP_BYTES, LEAST_LZ4_BUDGET, LEAST_SHARD_ENTRIES, PLANNED_LINE_BYTES,
+    EngineSizing, FILTER_CACHE_QUARTERS, FILTER_SLOT_BYTES, GROUP_BYTES, LEAST_LZ4_BUDGET, LEAST_SHARD_ENTRIES, PLANNED_LINE_BYTES,
     SHARED_JOBS, StoreShape, GATHER_BYTES, READ_BUFFERS, WRITE_BUFFERS, assumed_segment_bytes, capped_entries, disk_entries, entry_cost, entry_cover, floor_entries,
-    segment_bytes_for,
+    dead_bits_bytes, segment_bytes_for, target_rows,
 };
 use crate::engine::engine_state::{EngineState, PLACE_RUN, SEGMENT_NUMBER_BATCH, SlotFile};
 use crate::engine::open_segment::{RECORD_WINDOW_BYTES, RecordWindow, RowQueue, fits_a_segment_path};
@@ -1185,13 +1185,15 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
     // the cache takes whole stripes, so the arena works in them too and the pair never holds more than the cache alone would
     let stripe = (CACHE_SHARDS * CACHE_WAYS * FILTER_SLOT_BYTES) as u64;
     let whole = filter_share.0 / stripe * stripe;
-    let cache_room = (filter_share.0 / 8 * (8 - FILTER_ARENA_EIGHTHS)).max(stripe).next_multiple_of(stripe);
-    let base_arena = whole.saturating_sub(cache_room);
-    // filters come before the record cache: the arena takes what the rows on disk need, with room to grow, out of the record
-    // cache's half of its share, and the record cache keeps what is left
+    // filters come before the record cache: what the filter share can't hold of the arena comes out of the record cache's share,
+    // after the dead bits, and the record cache keeps what is left
     let rows_on_disk: u64 = volumes.iter().map(|volume| hold(&volume.summary).rows().map(|row| rows_of(&row)).sum::<u64>()).sum();
-    let arena_wanted = rows_on_disk.saturating_mul(BITS_PER_ROW as u64 * ARENA_GROWTH) / 8;
-    let record_room = sizing.record_share.0 / 2 * (2 - DEAD_BITS_HALVES);
+    let arena_wanted = target_rows(rows_on_disk).saturating_mul(BITS_PER_ROW as u64) / 8;
+    // the arena takes what the target rows need from the filter share first, in whole stripes, and the filter cache keeps the rest
+    let cache_room = whole.saturating_sub(arena_wanted).max(stripe).next_multiple_of(stripe);
+    let base_arena = whole.saturating_sub(cache_room);
+    let dead_bits: u64 = volumes.iter().map(|volume| volume.dead_bits.heap_bytes().0).sum();
+    let record_room = sizing.record_share.0.saturating_sub(dead_bits);
     let arena_taken = arena_wanted.saturating_sub(base_arena).min(record_room.saturating_sub(RecordCache::least_bytes()));
     let arena_share = ByteCount(base_arena + arena_taken);
     let is_complete = config.columns.iter().any(|column| column.complete_rows.is_some());
@@ -1335,7 +1337,9 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
     room.blocks_per_shard += complete_shard_lines(config, index);
     // a row for each segment the table can hold, beside open segments and the spans of gone ones
     summary.rows.make_index(room.segments_per_shard * TABLE_SHARDS + open_slots + MOST_DAMAGED_SPANS);
-    let dead_share = ByteCount(sizing.record_share.0 / 2 * DEAD_BITS_HALVES / config.volumes.len() as u64);
+    // the bits are sized from this volume's rows on disk with room to grow, and never past half the record cache's share
+    let rows_here: u64 = summary.rows.rows().map(|row| rows_of(&row)).sum();
+    let dead_share = ByteCount(dead_bits_bytes(rows_here).min(sizing.record_share.0 / 2 / config.volumes.len() as u64));
     Volume {
         dead_bits: DeadBits::new(dead_share, room.segments_per_shard * TABLE_SHARDS),
         id: VolumeId(index as u8),

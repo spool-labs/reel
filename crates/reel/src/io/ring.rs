@@ -30,6 +30,7 @@ pub const MOST_RING_WAITERS: usize = 1_024;
 
 /// How long a reaper looks at the completions in memory before it waits in the kernel. A read in flight lands soon, and with
 /// none in flight a look finds nothing, so a reaper spins only while reads are out and its CPU follows the read rate
+#[cfg(any(target_os = "linux", feature = "test-hooks"))]
 pub fn reap_spin(in_flight: usize, most: Duration) -> Duration {
     if in_flight > 0 { most } else { Duration::ZERO }
 }
@@ -572,6 +573,8 @@ impl<Driver> RingLease<'_, Driver> {
     /// Wait on this thread for the slot's read to land, and take its answer. A reader spins while a core is free for it, then parks
     /// until the reaper's completion wakes it, so a full box keeps its cores for the submit thread and the reaper
     pub fn wait_now(&self) -> Result<usize> {
+        // the first wait on a thread makes its waker, so a later park allocates nothing
+        THREAD_WAKER.with(|_| ());
         let spinners = &self.ring.spinners;
         let mut is_seated = spinners.fetch_add(1, Ordering::Relaxed) < SPIN_SEATS;
         if !is_seated {

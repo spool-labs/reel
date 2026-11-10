@@ -41,10 +41,12 @@ pub const SPOT_SIXTEENTHS: u64 = 2;
 pub const BLOCK_CACHE_SIXTEENTHS: u64 = 2;
 /// The record cache's sixteenths of what the fixed parts and the room leave, so a hot get reads no file
 pub const RECORD_CACHE_SIXTEENTHS: u64 = 2;
-/// Halves of the record cache's share that the dead bits take, one bit for each row the walk charged
-pub const DEAD_BITS_HALVES: u64 = 1;
 /// Times the filters of the rows on disk at open the arena may hold, room for the store to grow. A starting value, tuned at the end
 pub const ARENA_GROWTH: u64 = 2;
+/// Rows a fresh store holds dead bits and filters for before its segments start going without. A missing bit asks and a
+/// missing filter reads through the cache, so past it every answer stays right and takes the slow path, which the report
+/// shows. A starting value, tuned at the end
+pub const FLOOR_ROWS: u64 = 16_000_000;
 /// The summaries' sixteenths of what the fixed parts and the room leave, rows and the save buffer together. A row costs about
 /// 100 B a column and four bytes a row block, about 0.003 B a key at 1,400 rows a block, so 1B keys take 2.8 MB of it. A row that
 /// doesn't fit is dropped: its segment is never walked or counted against, which only understates
@@ -134,7 +136,6 @@ pub const FILTER_CACHE_QUARTERS: u64 = 3;
 /// Bytes of a filter cache slot, which holds the filter of a full block of typical rows
 pub const FILTER_SLOT_BYTES: usize = 4 * 1024;
 /// Eighths of the filters' share that stay resident, and the rest cache what the arena has no room for
-pub const FILTER_ARENA_EIGHTHS: u64 = 7;
 /// Read buffers a store keeps
 pub const READ_BUFFERS: usize = 8;
 /// Bytes of the buffer a batch gathers its records in, which holds the largest one-chunk record
@@ -379,4 +380,35 @@ pub fn rows_per_second(rows: RowCount, elapsed: u64) -> u64 {
 pub fn segment_bytes_for(budget: ByteCount) -> ByteCount {
     let bytes = if budget >= FULL_BUDGET { SEGMENT_TARGET } else { ByteCount(budget.0 / 2) };
     ByteCount(bytes.0.min(MOST_SEGMENT_BYTES.0 / 2))
+}
+
+/// Rows the dead bits and the arena are sized for: the rows on disk at open with room to grow, and never fewer than the floor
+pub fn target_rows(rows_on_disk: u64) -> u64 {
+    rows_on_disk.saturating_mul(ARENA_GROWTH).max(floor_rows())
+}
+
+/// Bytes of dead bits for the rows on disk at open: a bit a target row, and a quarter more for each block's words rounding up
+pub fn dead_bits_bytes(rows_on_disk: u64) -> u64 {
+    target_rows(rows_on_disk) / 8 * 5 / 4
+}
+
+#[cfg(feature = "test-hooks")]
+thread_local! {
+    /// A floor a test sets for the stores it opens on its own thread, so a small one fills past it
+    pub static TEST_FLOOR_ROWS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Read the floor: a test's when it set one, else FLOOR_ROWS
+#[cfg(feature = "test-hooks")]
+pub fn floor_rows() -> u64 {
+    match TEST_FLOOR_ROWS.with(std::cell::Cell::get) {
+        0 => FLOOR_ROWS,
+        rows => rows,
+    }
+}
+
+/// Read the floor
+#[cfg(not(feature = "test-hooks"))]
+pub const fn floor_rows() -> u64 {
+    FLOOR_ROWS
 }

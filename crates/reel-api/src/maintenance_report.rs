@@ -348,6 +348,10 @@ pub struct VolumeReading {
     pub unwalked_bytes: ByteCount,
     pub inexact_dead: ByteCount,
     pub cue_held_dead: ByteCount,
+    /// Rows of walked segments with dead bits, and rows of those born when the pool was full, each of which asks: past the
+    /// floor a store that grew since open answers on the slow path, and this says how much of it does
+    pub rows_with_bits: u64,
+    pub rows_without_bits: u64,
     /// Merges that wrote past their promise and took more room, which a right estimate never lets happen
     pub promises_outgrown: u64,
 }

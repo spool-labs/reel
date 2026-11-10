@@ -40,6 +40,9 @@ const WORKERS_VARIABLE: &str = "REEL_STEADY_WORKERS";
 // set in the child that makes the damaged store, so the measured process runs one open
 const PREPARE_ROOT: &str = "REEL_STEADY_PREPARE";
 const PAGE_BYTES: usize = 4_096;
+// the region the gate probe maps, a few pages
+#[cfg(target_os = "linux")]
+const PROBE_REGION_BYTES: u64 = 1024 * 1024;
 const MOST_OPEN_BLOCKS: usize = 32_768;
 #[cfg(target_os = "linux")]
 const MOST_BLOCK_PAGES: usize = 65_536;
@@ -250,7 +253,6 @@ struct Inputs {
 struct Counts {
     allocations: u64,
     frees: u64,
-    minor_faults: u64,
     major_faults: u64,
 }
 
@@ -299,11 +301,10 @@ impl FaultCounter {
 }
 
 fn counts(faults: &mut FaultCounter) -> Counts {
-    let (minor_faults, major_faults) = faults.read();
+    let (_minor_faults, major_faults) = faults.read();
     Counts {
         allocations: ALLOCATIONS.load(Ordering::Acquire),
         frees: FREES.load(Ordering::Acquire),
-        minor_faults,
         major_faults,
     }
 }
@@ -660,7 +661,8 @@ fn main() {
     let resident_grown = resident_bytes().zip(resident_before).map(|(after, before)| after.saturating_sub(before));
     println!("open: {live_grown} B live, {reported} B reported, {} B of stacks, resident grew {resident_grown:?}", report.thread_stacks.0);
     println!("{report:?}");
-    let mut failures = 0;
+    // the gate has to fail a fault outside a populate before its pass over the window means anything
+    let mut failures = gate_catches_faults();
     if live_grown.abs_diff(reported) > reported / REPORT_SLACK_DIVISOR {
         println!("memory_report misses the heap by more than a tenth");
         failures += 1;
@@ -700,12 +702,12 @@ fn main() {
     let unlinked_before = store.state.volumes[0].segments_unlinked.load(Ordering::Acquire);
     let freed_before = store.state.volumes[0].bytes_freed.load(Ordering::Acquire);
     let rewritten_before = store.state.volumes[0].segments_rewritten.load(Ordering::Acquire);
-    let mapped_before = store.state.admission.mapped_total.load(Ordering::Acquire);
     touch_stack();
     let mut faults = FaultCounter::new();
     let _first_read = faults.read();
-    let threads_before = thread_faults();
+    let snapshot_before = thread_snapshot();
     let before = counts(&mut faults);
+    let main_before = main_thread_faults();
     IS_WINDOW.store(true, Ordering::Release);
     // whether a reclaim lands in the window is timing, so the rounds go on until one has, and the counts cover it
     let mut rounds = 0;
@@ -717,14 +719,16 @@ fn main() {
         round(&store, &mut inputs, rounds);
     }
     IS_WINDOW.store(false, Ordering::Release);
+    let main_after = main_thread_faults();
     let after = counts(&mut faults);
     let unlinked = store.state.volumes[0].segments_unlinked.load(Ordering::Acquire) - unlinked_before;
     let freed = store.state.volumes[0].bytes_freed.load(Ordering::Acquire) - freed_before;
     let rewritten = store.state.volumes[0].segments_rewritten.load(Ordering::Acquire) - rewritten_before;
-    // a job maps its region at its first step with every page written in, and this kernel counts those pages as the
-    // process's faults, so they come off the count and every fault past them fails
-    let populated = (store.state.admission.mapped_total.load(Ordering::Acquire) - mapped_before) / PAGE_BYTES as u64;
-    let threads_after = thread_faults();
+    // the counts are read with compaction held and no map under way, so no populate straddles the read, and the read's own
+    // faults land on this thread after its count was taken
+    store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
+    let snapshot_after = thread_snapshot();
+    store.state.volumes[0].holds.compaction.store(false, Ordering::Release);
     let unit_failures = check_units(&store);
 
     let allocations_before_close = ALLOCATIONS.load(Ordering::Acquire);
@@ -737,19 +741,16 @@ fn main() {
 
     let allocations = after.allocations - before.allocations;
     let frees = after.frees - before.frees;
-    let counted_faults = after.minor_faults - before.minor_faults;
-    let minor_faults = counted_faults.saturating_sub(populated);
     let major_faults = after.major_faults - before.major_faults;
-    if minor_faults + major_faults > 0 {
-        for (name, minor, major) in threads_after {
-            let before = threads_before.iter().find(|thread| thread.0 == name);
-            let (minor_before, major_before) = before.map_or((0, 0), |thread| (thread.1, thread.2));
-            if minor != minor_before || major != major_before {
-                println!("thread {name}: {} minor, {} major", minor - minor_before, major - major_before);
-            }
-        }
+    // each thread's own populates come off its count and nothing else does, so a writer, a reader or the seal gets no allowance,
+    // and the caller's thread counts its own faults with nothing taken off
+    let main_faults = main_after - main_before;
+    let gate = fault_gate(&snapshot_before, &snapshot_after, main_thread_id());
+    for line in &gate.lines {
+        println!("{line}");
     }
-    println!("{rounds} rounds: {allocations} allocations, {frees} frees, {minor_faults} minor faults past {populated} region pages ({counted_faults} counted), {major_faults} major faults");
+    let minor_faults = gate.excess + main_faults;
+    println!("{rounds} rounds: {allocations} allocations, {frees} frees, {minor_faults} minor faults past each thread's own populates ({} populate faults, {main_faults} faults on the caller's thread), {major_faults} major faults", gate.populated);
     println!("close: {close_allocations} allocations");
     println!("{unlinked} unlinks in the window");
     println!("{freed} bytes freed in place in the window");
@@ -787,4 +788,165 @@ fn check_units(store: &Store) -> u64 {
         }
     }
     failures
+}
+
+// read a thread's kernel id from the name thread_faults gives it
+fn thread_id(name: &str) -> u64 {
+    name.split(' ').next().and_then(|id| id.parse().ok()).unwrap_or(0)
+}
+
+// add up every thread's populate faults
+fn populate_total() -> u64 {
+    reel::region::POPULATE_FAULTS.iter().map(|(_id, total)| total.load(Ordering::Acquire)).sum()
+}
+
+/// One thread's faults and the faults its own region populates took, by kernel id
+struct ThreadCount {
+    id: u64,
+    name: String,
+    minor: u64,
+    major: u64,
+    populated: u64,
+}
+
+/// The faults threads took past their own populates, the populates themselves, and a line for each thread that faulted
+struct FaultGate {
+    excess: u64,
+    populated: u64,
+    lines: Vec<String>,
+}
+
+// read every thread's faults and its own populates when no map is under way and none landed during the read, so no populate
+// straddles it
+fn thread_snapshot() -> Vec<ThreadCount> {
+    loop {
+        while reel::region::MAPS_IN_FLIGHT.load(Ordering::Acquire) > 0 {
+            thread::yield_now();
+        }
+        let total = populate_total();
+        let counts: Vec<ThreadCount> = thread_faults()
+            .into_iter()
+            .map(|(name, minor, major)| {
+                let id = thread_id(&name);
+                ThreadCount { id, populated: reel::region::populate_faults_of(id), name, minor, major }
+            })
+            .collect();
+        if reel::region::MAPS_IN_FLIGHT.load(Ordering::Acquire) == 0 && populate_total() == total {
+            return counts;
+        }
+    }
+}
+
+// count each thread's faults past its own populates between two snapshots, leaving out the caller's thread, which counts its
+// own faults with nothing taken off
+fn fault_gate(before: &[ThreadCount], after: &[ThreadCount], caller: u64) -> FaultGate {
+    let mut gate = FaultGate { excess: 0, populated: 0, lines: Vec::new() };
+    for thread in after.iter().filter(|thread| thread.id != caller) {
+        let earlier = before.iter().find(|earlier| earlier.id == thread.id);
+        let (minor, major, populated) = earlier.map_or((0, 0, 0), |earlier| (earlier.minor, earlier.major, earlier.populated));
+        let faults = thread.minor.saturating_sub(minor);
+        let own = thread.populated.saturating_sub(populated);
+        let majors = thread.major.saturating_sub(major);
+        let past = faults.saturating_sub(own) + majors;
+        gate.populated += own;
+        gate.excess += past;
+        if past > 0 {
+            gate.lines.push(format!("thread {}: {faults} minor with {own} of its own populates, {majors} major", thread.name));
+        }
+    }
+    gate
+}
+
+// read the calling thread's own minor faults, which takes no allocation and no file read
+#[cfg(target_os = "linux")]
+fn main_thread_faults() -> u64 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: the call writes one rusage into the buffer, which is that size
+    assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_THREAD, usage.as_mut_ptr()) }, 0, "getrusage");
+    // SAFETY: the call succeeded, so it wrote the whole struct
+    u64::try_from(unsafe { usage.assume_init() }.ru_minflt).unwrap_or(0)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main_thread_faults() -> u64 {
+    0
+}
+
+// read the calling thread's kernel id
+#[cfg(target_os = "linux")]
+fn main_thread_id() -> u64 {
+    // SAFETY: gettid takes nothing and can't fail
+    u64::try_from(unsafe { libc::gettid() }).unwrap_or(0)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main_thread_id() -> u64 {
+    0
+}
+
+// write one page no one has touched, which faults once
+#[cfg(target_os = "linux")]
+fn fault_fresh_page() {
+    // SAFETY: an anonymous private mapping with no address asked for touches no memory of ours
+    let page = unsafe { libc::mmap(std::ptr::null_mut(), PAGE_BYTES, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
+    assert_ne!(page, libc::MAP_FAILED, "mmap");
+    // SAFETY: the page is ours and this long
+    unsafe { std::ptr::write_volatile(page.cast::<u8>(), 1) };
+    // SAFETY: the mapping is the one just made, and nothing points into it
+    unsafe { libc::munmap(page, PAGE_BYTES) };
+}
+
+// the gate passes a region's populate on its own thread, and fails a fault outside it there or on the caller's thread
+#[cfg(target_os = "linux")]
+fn gate_catches_faults() -> u64 {
+    let mut failures = 0;
+    let steps = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let worker_steps = std::sync::Arc::clone(&steps);
+    let worker = thread::Builder::new()
+        .name("gate-probe".to_string())
+        .spawn(move || {
+            touch_stack();
+            worker_steps.wait();
+            worker_steps.wait();
+            let region = reel::region::Region::map(ByteCount(PROBE_REGION_BYTES)).expect("map");
+            worker_steps.wait();
+            worker_steps.wait();
+            fault_fresh_page();
+            worker_steps.wait();
+            worker_steps.wait();
+            drop(region);
+        })
+        .expect("spawn");
+    let caller = main_thread_id();
+    steps.wait();
+    let start = thread_snapshot();
+    steps.wait();
+    steps.wait();
+    let mapped = thread_snapshot();
+    steps.wait();
+    let populate_only = fault_gate(&start, &mapped, caller);
+    if populate_only.excess > 0 || populate_only.populated == 0 {
+        println!("gate probe: a populate alone left {} faults past it, with {} populated", populate_only.excess, populate_only.populated);
+        failures += 1;
+    }
+    steps.wait();
+    let faulted = thread_snapshot();
+    steps.wait();
+    if fault_gate(&mapped, &faulted, caller).excess == 0 {
+        println!("gate probe: a fault on a worker outside a populate passed the gate");
+        failures += 1;
+    }
+    worker.join().expect("join");
+    let caller_before = main_thread_faults();
+    fault_fresh_page();
+    if main_thread_faults() == caller_before {
+        println!("gate probe: a fault on the caller's thread passed the gate");
+        failures += 1;
+    }
+    failures
+}
+
+#[cfg(not(target_os = "linux"))]
+fn gate_catches_faults() -> u64 {
+    0
 }

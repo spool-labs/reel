@@ -694,7 +694,8 @@ impl<Backend: Io> Volume<Backend> {
     /// Check the volume runs short of room: the fullest shard of its table or its park is past half, so merges run under hot
     /// ingest
     pub fn is_short_of_room(&self) -> bool {
-        let parked = hold(&self.parked).iter().filter(|slot| slot.is_some()).count();
+        // both read atomics, so a planner step takes no lock to ask
+        let parked = self.segments_parked.load(Ordering::Acquire) as usize;
         2 * parked > MOST_PARKED * self.lanes.len() || self.table.is_past_half()
     }
 

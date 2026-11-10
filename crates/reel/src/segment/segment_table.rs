@@ -129,6 +129,8 @@ pub struct SegmentTable<File> {
     pins: Vec<Vec<AtomicU32>>,
     /// Each slot's walked flag, which a cursor holding the slot reads with no lock
     walked: Vec<Vec<AtomicBool>>,
+    /// A bit for each shard past half of its slots or pools, so a check of room reads one word and takes no lock
+    past_half: AtomicU32,
 }
 
 /// How much of each pool one shard gets
@@ -250,7 +252,7 @@ impl<File: Clone> SegmentTable<File> {
             pins.push(shard_pins);
             walked.push(shard_walked);
         }
-        Self { shards: Shards(shards), pins, walked }
+        Self { shards: Shards(shards), pins, walked, past_half: AtomicU32::new(0) }
     }
 
     /// Read the heap every shard holds
@@ -305,6 +307,7 @@ impl<File: Clone> SegmentTable<File> {
         });
         self.walked[shard_of(head.segment)][slot as usize].store(false, Ordering::Release);
         guard.map.insert(head.segment, slot);
+        self.note_fill(shard_of(head.segment), &guard);
         true
     }
 
@@ -315,11 +318,19 @@ impl<File: Clone> SegmentTable<File> {
 
     /// Check the fullest shard has used more than half of its segment slots, its column pool or its block pool
     pub fn is_past_half(&self) -> bool {
-        (0..TABLE_SHARDS).any(|shard| {
-            let shard = self.shards.read(shard);
-            let used = shard.segments.len() - shard.free_slots.len();
-            2 * used > shard.segments.len() || 2 * shard.columns.len() > shard.columns.capacity() || 2 * shard.blocks.len() > shard.blocks.capacity()
-        })
+        self.past_half.load(Ordering::Acquire) != 0
+    }
+
+    /// Set or clear a shard's bit in the past-half word, under its write lock
+    fn note_fill(&self, shard: usize, guard: &TableShard<File>) {
+        let used = guard.segments.len() - guard.free_slots.len();
+        let is_past = 2 * used > guard.segments.len() || 2 * guard.columns.len() > guard.columns.capacity() || 2 * guard.blocks.len() > guard.blocks.capacity();
+        let bit = 1 << shard;
+        if is_past {
+            self.past_half.fetch_or(bit, Ordering::AcqRel);
+        } else {
+            self.past_half.fetch_and(!bit, Ordering::AcqRel);
+        }
     }
 
     /// Count the segments in the table
@@ -492,7 +503,9 @@ impl<File: Clone> SegmentTable<File> {
 
     /// Give a retired segment's slot back, once no read holds it
     pub fn free_retired(&self, retired: &RetiredSegment<File>) {
-        self.shards.write(retired.shard).free_slots.push(retired.slot);
+        let mut guard = self.shards.write(retired.shard);
+        guard.free_slots.push(retired.slot);
+        self.note_fill(retired.shard, &guard);
     }
 
     /// Read where a column's blocks start in a segment and how many there are

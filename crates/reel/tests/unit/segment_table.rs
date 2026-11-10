@@ -130,3 +130,25 @@ fn retired_keeps_slot() {
     table.free_retired(&retired);
     assert_eq!(table.shards.read(retired.shard).free_slots.len(), 3);
 }
+
+// the past-half word follows a shard's slots as segments come and go, with no shard lock taken to read it
+#[test]
+fn past_half_follows_the_slots() {
+    let head = |number: u64| TailHead {
+        segment: SegmentNumber(number),
+        ..TailHead::default()
+    };
+    let per_shard = 4;
+    let table = table_with(per_shard);
+    let numbers: Vec<u64> = (1..NUMBERS).filter(|number| shard_of(SegmentNumber(*number)) == 0).take(per_shard).collect();
+    assert!(!table.is_past_half());
+    for (taken, number) in numbers.iter().enumerate() {
+        assert!(table.install(1, RootId(0), &head(*number), &[], &[]));
+        assert_eq!(table.is_past_half(), 2 * (taken + 1) > per_shard, "{} taken", taken + 1);
+    }
+    for number in &numbers {
+        let retired = table.retire(SegmentNumber(*number)).expect("a segment");
+        table.free_retired(&retired);
+    }
+    assert!(!table.is_past_half());
+}

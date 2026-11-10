@@ -46,7 +46,7 @@ pub use pick::is_reclaim_due;
 #[cfg(any(test, feature = "test-hooks"))]
 pub use install::freed_in_place;
 #[cfg(any(test, feature = "test-hooks"))]
-pub use pick::{column_range, has_settled_covers, is_crowded, is_overlap_input, overlaps};
+pub use pick::{column_range, covers_point, has_settled_covers, is_crowded, is_overlap_input, overlaps};
 
 /// A bar counts in quarters of a segment's bytes
 pub const BAR_QUARTERS: u64 = 4;

@@ -257,3 +257,38 @@ fn covers_reach_a_view() {
     viewer.close().expect("close");
     store.close().expect("close");
 }
+
+// a view taken at any step of the seal of a range delete's segment hides every key the delete covers: it holds the delete's
+// row and its cover together, or neither
+#[test]
+fn view_mid_seal_keeps_covers() {
+    let io = SimulatedIo::new(Seed(31));
+    let store = open(&io);
+    for number in 0..SPAN_KEYS {
+        store.put(COLUMN, format!("span-{number:06}").as_bytes(), b"value").expect("put");
+    }
+    seal(&store, &io);
+    store.delete_range(COLUMN, b"span-000000", format!("span-{SPAN_KEYS:06}").as_bytes()).expect("delete");
+    store.put(COLUMN, b"tail", b"value").expect("put");
+    store.flush().expect("flush");
+    land_rows(&io);
+    store.seal_now();
+    let mut buf = Vec::new();
+    let mut views = 0;
+    for _step in 0..STEPS {
+        let view = view(&io);
+        for number in 0..SPAN_KEYS {
+            let key = format!("span-{number:06}");
+            assert!(!view.get(COLUMN, key.as_bytes(), &mut buf).expect("get"), "{key} came back in a view after {views} steps");
+        }
+        view.close().expect("close");
+        views += 1;
+        if io.step_any().is_none() {
+            break;
+        }
+    }
+    assert!(views > 1);
+    store.close().expect("close");
+}
+
+const SPAN_KEYS: u64 = 100;

@@ -235,7 +235,14 @@ impl<Backend: Io> EngineState<Backend> {
             None => self.key_read_now(scan.column, candidate)?,
         };
         let is_pinned = at.fixed_point.is_some();
-        let found = self.index.lookup(scan.column, candidate, read.read_point, volume.view());
+        // a key no head shows has no index row at a point the heads already saw
+        let found = match scan.is_off_the_heads(candidate, read.read_point) {
+            true => None,
+            false => {
+                scan.lookups += 1;
+                self.index.lookup(scan.column, candidate, read.read_point, volume.view()).row
+            },
+        };
         let taken = self.take_rows(device, volume, scan, candidate, read.read_point).await?;
         let sealed = if scan.is_spilled { self.search_sealed(device, volume, &read).await? } else { taken };
         // a seal moves rows from the index to a segment this walk hasn't seated, and both of its looks must see one list
@@ -244,7 +251,7 @@ impl<Backend: Io> EngineState<Backend> {
             return Ok(StepOutcome::Moved);
         }
 
-        let located = newest_of(found.row, sealed);
+        let located = newest_of(found, sealed);
         let is_hidden = located.place().is_some_and(|place| read.cover.is_some_and(|cover| cover > place));
         if !located.has_value() || is_hidden {
             scan.pass(candidate);
@@ -379,12 +386,17 @@ impl<Backend: Io> EngineState<Backend> {
             is_inclusive: scan.is_inclusive,
             direction: scan.direction,
         };
+        // every place at or below the mark is in the index before the heads look
+        let mark = self.read_point(volume);
         let view = volume.view();
+        let is_new_view = view != scan.heads_view;
+        scan.heads_view = view;
         let mut has_moved = false;
         for (shard, head) in scan.heads.iter_mut().enumerate() {
-            if !head.is_placed {
+            if !head.is_placed || is_new_view {
                 head.has_key = self.index.next_key(shard, &mut head.cursor, &bound, view, &mut head.key);
                 head.is_placed = true;
+                head.placed_at = mark;
                 has_moved = true;
             }
         }

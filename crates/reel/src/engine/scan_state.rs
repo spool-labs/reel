@@ -5,6 +5,7 @@ use reel_api::direction::Direction;
 use reel_api::units::{ByteCount, FileOffset, WritePlace};
 
 use crate::index::shard_cursor::{ShardCursor, TreeCursor};
+use crate::index::open_slots::OpenSlots;
 use crate::index::write_index::SHARD_COUNT;
 use crate::pool::{touched_capacity, touched_filled};
 use crate::row_kind::RowKind;
@@ -73,6 +74,8 @@ pub struct ShardHead {
     pub key: Vec<u8>,
     pub has_key: bool,
     pub is_placed: bool,
+    /// Every place at or below this was in the index when the head was placed
+    pub placed_at: WritePlace,
 }
 
 /// One scan's fixed buffers and place, out of the store's pool for as long as the scan lives
@@ -93,6 +96,9 @@ pub struct ScanState {
     pub is_spilled: bool,
     pub heads: Vec<ShardHead>,
     pub closest_head: Option<usize>,
+    /// The oldest place any head was placed at, and the view they were placed in
+    pub heads_mark: WritePlace,
+    pub heads_view: OpenSlots,
     pub key: Vec<u8>,
     pub found: Vec<SegmentNumber>,
     pub origin: Vec<u8>,
@@ -100,6 +106,8 @@ pub struct ScanState {
     pub is_counting: bool,
     pub counted: u64,
     pub taken: u64,
+    /// Index lookups this walk made, for keys a head showed or that came in under it
+    pub lookups: u64,
     pub window: ScanWindows,
 }
 
@@ -192,6 +200,7 @@ impl ShardHead {
             key: touched_capacity(widest_key, 0),
             has_key: false,
             is_placed: false,
+            placed_at: WritePlace(0),
         }
     }
 }
@@ -215,6 +224,8 @@ impl ScanState {
             is_spilled: false,
             heads: (0..SHARD_COUNT).map(|_head| ShardHead::new(widest_key, open_slots)).collect(),
             closest_head: None,
+            heads_mark: WritePlace(0),
+            heads_view: OpenSlots(0),
             key: touched_capacity(widest_key, 0),
             found: touched_capacity(MOST_SCAN_SOURCES, SegmentNumber(0)),
             origin: touched_capacity(widest_key, 0),
@@ -222,6 +233,7 @@ impl ScanState {
             is_counting: false,
             counted: 0,
             taken: 0,
+            lookups: 0,
             window: ScanWindows::new(),
         }
     }
@@ -238,6 +250,7 @@ impl ScanState {
         self.is_counting = false;
         self.counted = 0;
         self.taken = 0;
+        self.lookups = 0;
         self.window.clear();
         self.limit.clear();
         self.has_limit = match range.limit {
@@ -308,6 +321,12 @@ impl ScanState {
         sources.chain(head).reduce(|best, key| if self.is_before(key, best) { key } else { best })
     }
 
+    /// Check the index holds no row of a key at a read point: no head shows it, and nothing at or below the point came in
+    /// since the heads were placed
+    pub fn is_off_the_heads(&self, key: &[u8], read_point: WritePlace) -> bool {
+        read_point <= self.heads_mark && self.closest_head.is_none_or(|head| self.heads[head].key != key)
+    }
+
     /// Find the closest of the heads, once any has moved
     pub fn find_closest_head(&mut self) {
         let mut closest: Option<usize> = None;
@@ -317,6 +336,7 @@ impl ScanState {
             }
         }
         self.closest_head = closest;
+        self.heads_mark = self.heads.iter().map(|head| head.placed_at).min().unwrap_or(WritePlace(0));
     }
 
     /// Check a key lies past the walk's far end

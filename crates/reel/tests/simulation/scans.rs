@@ -907,3 +907,51 @@ fn interleaved_rows_keep_their_windows() {
     assert!(reads < WINDOW_KEYS / 4, "{reads} reads for {WINDOW_KEYS} rows across two segments");
     store.close().expect("close");
 }
+
+// step a walk to its end or a number of keys, and return what it found
+fn step_keys(store: &Store, scan: &mut reel::engine::scan_state::ScanState, most: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let (mut key, mut value, mut found) = (Vec::new(), Vec::new(), Vec::new());
+    while (found.len() as u64) < most {
+        match store.state.step_scan(scan, &mut key, reel::engine::scan_path::ScanWant::Value(&mut value)).expect("step") {
+            ScanStep::Found => found.push((key.clone(), value.clone())),
+            ScanStep::End => break,
+            ScanStep::Corrupt => panic!("a corrupt row"),
+        }
+    }
+    found
+}
+
+// a walk asks the index only for the keys its heads show, and still sees a row that comes in under it
+#[test]
+fn index_asked_for_its_own_keys() {
+    let io = SimulatedIo::new(Seed(40));
+    let store = open(&io);
+    for number in 0..KEYS {
+        store.put(COLUMN, &key(number), b"sealed").expect("put");
+    }
+    seal(&store, &io);
+    let open_keys = [3, 90, 150];
+    for number in open_keys {
+        store.put(COLUMN, &key(number), b"open").expect("put");
+    }
+
+    let range = reel::engine::scan_state::from_key(COLUMN, b"", Direction::Ascending);
+    let mut scan = store.state.take_scan(&range, None).expect("scan");
+    let found = step_keys(&store, &mut scan, u64::MAX);
+    assert_eq!(found.len() as u64, KEYS);
+    assert_eq!(scan.lookups, open_keys.len() as u64);
+    assert!(found.iter().all(|(found, value)| value == if open_keys.iter().any(|number| key(*number) == *found) { b"open".as_slice() } else { b"sealed".as_slice() }));
+    store.state.give_back_scan(scan);
+
+    let mut scan = store.state.take_scan(&range, None).expect("scan");
+    let first = step_keys(&store, &mut scan, 10);
+    assert_eq!(first.len(), 10);
+    store.delete(COLUMN, &key(50)).expect("delete");
+    store.put(COLUMN, &key(60), b"new").expect("put");
+    let rest = step_keys(&store, &mut scan, u64::MAX);
+    assert_eq!(rest.len() as u64, KEYS - 11);
+    assert!(rest.iter().all(|(found, _value)| *found != key(50)));
+    assert_eq!(rest.iter().find(|(found, _value)| *found == key(60)).expect("key 60").1, b"new");
+    store.state.give_back_scan(scan);
+    store.close().expect("close");
+}

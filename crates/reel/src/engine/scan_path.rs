@@ -13,7 +13,7 @@ use reel_api::units::{ByteCount, RowCount, WritePlace};
 
 use crate::engine::engine_state::EngineState;
 use crate::engine::read_path::{HeldPin, KeyRead, Located, MOST_READ_TRIES, RecordWant, SealedRow, newest_of};
-use crate::engine::scan_state::{BlockTake, MOST_SCANS, MOST_WINDOW_RECORD, NO_GENERATION, ScanRange, ScanState, ScanWindow, SegmentSource, under_prefix};
+use crate::engine::scan_state::{BlockTake, MOST_SCANS, MOST_WINDOW_RECORD, NO_GENERATION, ScanRange, ScanState, ScanWindows, SegmentSource, under_prefix};
 use crate::engine::volume::Volume;
 use crate::guard::hold;
 use crate::index::write_shard::WalkBound;
@@ -285,7 +285,7 @@ impl<Backend: Io> EngineState<Backend> {
         on: ReadOn<'_, impl DeviceReads<Backend::File>, Volume<Backend>>,
         read: &KeyRead<'_>,
         located: &Located,
-        window: &mut ScanWindow,
+        window: &mut ScanWindows,
         direction: Direction,
         value: &mut Vec<u8>,
     ) -> Result<bool, StoreError> {
@@ -311,7 +311,7 @@ impl<Backend: Io> EngineState<Backend> {
         on: ReadOn<'_, impl DeviceReads<Backend::File>, Volume<Backend>>,
         read: &KeyRead<'_>,
         sealed: &SealedRow,
-        window: &mut ScanWindow,
+        window: &mut ScanWindows,
         direction: Direction,
         value: &mut Vec<u8>,
     ) -> Option<bool> {

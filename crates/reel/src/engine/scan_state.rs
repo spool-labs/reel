@@ -100,7 +100,7 @@ pub struct ScanState {
     pub is_counting: bool,
     pub counted: u64,
     pub taken: u64,
-    pub window: ScanWindow,
+    pub window: ScanWindows,
 }
 
 impl SegmentSource {
@@ -222,7 +222,7 @@ impl ScanState {
             is_counting: false,
             counted: 0,
             taken: 0,
-            window: ScanWindow::new(),
+            window: ScanWindows::new(),
         }
     }
 
@@ -439,7 +439,9 @@ pub fn planned_scan_bytes(widest_key: u64, open_slots: usize) -> u64 {
 
 
 /// Bytes a scan's window reads at its widest
-pub const SCAN_WINDOW_BYTES: usize = 64 * 1024;
+pub const SCAN_WINDOW_BYTES: usize = 32 * 1024;
+/// Windows a scan keeps, so rows interleaved across segments each keep their stretch
+pub const SCAN_WINDOWS: usize = 4;
 /// Bytes a window reads until rows show they lie side by side
 pub const LEAST_WINDOW_BYTES: usize = 4 * 1024;
 /// The largest record a window takes, so a big value goes through its own read
@@ -536,6 +538,58 @@ impl ScanWindow {
 }
 
 impl Default for ScanWindow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A scan's windows, one a segment, the least recently read giving way to a new segment
+#[derive(Clone, Debug)]
+pub struct ScanWindows {
+    windows: [ScanWindow; SCAN_WINDOWS],
+    used: [u64; SCAN_WINDOWS],
+    clock: u64,
+}
+
+impl ScanWindows {
+    /// Allocate every window's bytes
+    pub fn new() -> Self {
+        Self {
+            windows: std::array::from_fn(|_window| ScanWindow::new()),
+            used: [0; SCAN_WINDOWS],
+            clock: 0,
+        }
+    }
+
+    /// Read the heap the windows hold
+    pub fn heap_bytes(&self) -> usize {
+        self.windows.iter().map(ScanWindow::heap_bytes).sum()
+    }
+
+    /// Forget what every window holds
+    pub fn clear(&mut self) {
+        for window in &mut self.windows {
+            window.clear();
+        }
+    }
+
+    /// Find a record's bytes in the window that holds its segment
+    pub fn holding(&self, segment: SegmentNumber, offset: u64, length: usize) -> Option<&[u8]> {
+        self.windows.iter().find_map(|window| window.holding(segment, offset, length))
+    }
+
+    /// Plan a read for a record in its segment's window, or in the least recently read one
+    pub fn plan(&mut self, segment: SegmentNumber, record: (u64, usize), direction: Direction, data_end: u64) -> (FileOffset, &mut [u8]) {
+        let own = self.windows.iter().position(|window| window.segment == Some(segment));
+        let oldest = (0..SCAN_WINDOWS).min_by_key(|index| self.used[*index]).unwrap_or(0);
+        let index = own.unwrap_or(oldest);
+        self.clock += 1;
+        self.used[index] = self.clock;
+        self.windows[index].plan(segment, record, direction, data_end)
+    }
+}
+
+impl Default for ScanWindows {
     fn default() -> Self {
         Self::new()
     }

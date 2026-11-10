@@ -884,3 +884,26 @@ fn compressed_rows_share_reads() {
     assert_eq!(rows, SPREAD_ROWS);
     assert!(reads < SPREAD_ROWS / 4, "{reads} reads for {rows} rows");
 }
+
+// rows that alternate between two segments each come from their own segment's window
+#[test]
+fn interleaved_rows_keep_their_windows() {
+    let io = SimulatedIo::new(Seed(72));
+    let store = open(&io);
+    for parity in [0, 1] {
+        for number in (parity..WINDOW_KEYS).step_by(2) {
+            store.put(COLUMN, &key(number), format!("value-{number:06}").as_bytes()).expect("put");
+        }
+        seal(&store, &io);
+    }
+    store.close().expect("close");
+    drop(store);
+    let store = open(&io);
+
+    let before = io.read_count().0;
+    let rows = walk_values(&store, Direction::Ascending);
+    let reads = io.read_count().0 - before;
+    assert_eq!(rows.len() as u64, WINDOW_KEYS);
+    assert!(reads < WINDOW_KEYS / 4, "{reads} reads for {WINDOW_KEYS} rows across two segments");
+    store.close().expect("close");
+}

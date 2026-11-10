@@ -178,7 +178,7 @@ impl<Backend: Io> EngineState<Backend> {
     pub fn send_in_turn(&self, slot: OpenSlot, rows: &Backend::File, data: Option<&Backend::File>) -> Result<(), Error> {
         let _turn = WritingTurn { state: self, index: slot.0 as usize };
         let mut outcome = self.send_group(slot, rows, data);
-        if outcome.is_ok() && self.has_left_over_rows(slot) {
+        if outcome.is_ok() && self.has_waiting_rows(slot) {
             outcome = self.send_group(slot, rows, data);
         }
         outcome
@@ -222,11 +222,6 @@ impl<Backend: Io> EngineState<Backend> {
         }
         *hold(&self.spare_groups[index]) = Some(group);
         outcome
-    }
-
-    /// Check rows are waiting beyond the group just sent
-    pub fn has_left_over_rows(&self, slot: OpenSlot) -> bool {
-        !hold(&self.queues[slot.0 as usize]).filling.is_empty()
     }
 
     /// Send one group: fix its rows first, then sync their records, then write and sync the rows

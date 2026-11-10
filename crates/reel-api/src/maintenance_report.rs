@@ -93,13 +93,12 @@ impl PauseCause {
 }
 
 /// Every kind of job, in the order a report lists them
-pub const JOB_KINDS: [JobKind; 7] = [
+pub const JOB_KINDS: [JobKind; 6] = [
     JobKind::RowWriteOut,
     JobKind::Seal,
     JobKind::DeadByteWalk,
     JobKind::RangeDeleteApply,
     JobKind::Compaction,
-    JobKind::KeyRunMerge,
     JobKind::SpotCacheUpkeep,
 ];
 
@@ -116,8 +115,6 @@ pub enum JobKind {
     RangeDeleteApply,
     /// Merging and rewriting sealed segments
     Compaction,
-    /// Merging key runs
-    KeyRunMerge,
     /// Keeping the spot cache in its budget
     SpotCacheUpkeep,
 }

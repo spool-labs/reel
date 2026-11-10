@@ -489,9 +489,9 @@ thread_local! {
 }
 
 /// Reads that wait for a ring on the calling thread, for a blocking get. What the kernel holds answers with no submit, and a read
-/// it doesn't hold goes to the ring, and the caller waits on its slot until the reaper lands it
+/// it doesn't hold goes to the ring, and the caller waits on its slot until the reaper lands it. A store with no ring reads in place
 #[derive(Debug)]
-pub struct RingWait<'ring, Driver>(pub &'ring ReadRing<Driver>);
+pub struct RingWait<'ring, Driver>(pub Option<&'ring ReadRing<Driver>>);
 
 impl<Driver> ReadRing<Driver> {
     fn read_once_now<File>(&self, file: &File, offset: FileOffset, out: &mut [u8]) -> Result<usize>
@@ -526,8 +526,8 @@ impl<Driver> ReadRing<Driver> {
             }
         }
         while done < buf.len() {
-            let end = (done + RING_SLOT_BYTES).min(buf.len());
-            let read = self.read_once_now(file, FileOffset(offset.0 + done as u64), &mut buf[done..end])?;
+            // the buffer fits one slot, so each try reads what's left, and a short read comes back for the rest
+            let read = self.read_once_now(file, FileOffset(offset.0 + done as u64), &mut buf[done..])?;
             if read == 0 {
                 return Err(Error::from(ErrorKind::UnexpectedEof));
             }
@@ -612,10 +612,16 @@ impl<Driver> RingLease<'_, Driver> {
 
 impl<File: IoFile, Driver: RingDriver<File>> DeviceReads<File> for RingWait<'_, Driver> {
     fn read_exact(&self, file: &File, offset: FileOffset, buf: &mut [u8]) -> impl Future<Output = Result<()>> + Send {
-        std::future::ready(self.0.read_into_now(file, offset, buf))
+        std::future::ready(match self.0 {
+            Some(ring) => ring.read_into_now(file, offset, buf),
+            None => file.read_exact_at(offset, buf),
+        })
     }
 
     fn read_parts(&self, file: &File, offset: FileOffset, parts: &mut [IoSliceMut<'_>]) -> impl Future<Output = Result<()>> + Send {
-        std::future::ready(self.0.read_parts_now(file, offset, parts))
+        std::future::ready(match self.0 {
+            Some(ring) => ring.read_parts_now(file, offset, parts),
+            None => file.read_parts_at(offset, parts),
+        })
     }
 }

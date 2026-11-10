@@ -95,22 +95,13 @@ impl<Backend: Io> EngineState<Backend> {
     ) -> Result<(Claim<'state, Backend>, RowRoom<'state>), StoreError> {
         loop {
             let claim = self.claim(volume, request)?;
-            let queue = &self.queues[claim.slot.0 as usize];
-            {
-                let mut guard = hold(queue);
-                if guard.filling.has_room(guard.reserved + size) {
-                    guard.reserved += size;
-                    drop(guard);
-                    return Ok((claim, RowRoom { queue, size }));
-                }
+            if self.try_reserve(claim.slot, size) {
+                let queue = &self.queues[claim.slot.0 as usize];
+                return Ok((claim, RowRoom { queue, size }));
             }
-
             let slot = claim.slot;
             drop(claim);
-            self.write_out(slot).map_err(|source| StoreError::Io {
-                action: "writing rows",
-                source,
-            })?;
+            self.send_rows(slot)?;
         }
     }
 
@@ -149,20 +140,28 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// Hold room for a row in the group filling, sending the group out when it's full
     pub fn reserve_row(&self, slot: OpenSlot, size: usize) -> Result<(), StoreError> {
-        let queue = &self.queues[slot.0 as usize];
-        loop {
-            {
-                let mut guard = hold(queue);
-                if guard.filling.has_room(guard.reserved + size) {
-                    guard.reserved += size;
-                    return Ok(());
-                }
-            }
-            self.write_out(slot).map_err(|source| StoreError::Io {
-                action: "writing rows",
-                source,
-            })?;
+        while !self.try_reserve(slot, size) {
+            self.send_rows(slot)?;
         }
+        Ok(())
+    }
+
+    /// Hold room for a row's bytes in the slot's filling group, or say it has none
+    pub fn try_reserve(&self, slot: OpenSlot, size: usize) -> bool {
+        let mut guard = hold(&self.queues[slot.0 as usize]);
+        let has_room = guard.filling.has_room(guard.reserved + size);
+        if has_room {
+            guard.reserved += size;
+        }
+        has_room
+    }
+
+    /// Send a slot's waiting rows to make room in its group
+    pub fn send_rows(&self, slot: OpenSlot) -> Result<(), StoreError> {
+        self.write_out(slot).map_err(|source| StoreError::Io {
+            action: "writing rows",
+            source,
+        })
     }
 
     /// Wake the row job, which only sleeps with no deadline when it found nothing to do

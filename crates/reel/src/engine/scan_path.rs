@@ -637,18 +637,8 @@ impl<Backend: Io> EngineState<Backend> {
                     scan.is_spilled = true;
                     continue;
                 }
-                let at = SeatAt {
-                    column: scan.column,
-                    key: &scan.position,
-                    is_inclusive: scan.is_inclusive,
-                    direction: scan.direction,
-                    point,
-                    is_counting: scan.is_counting,
-                };
-                let source = &mut scan.sources[scan.source_count];
-                source.segment = segment;
                 // a segment gone from under the list is in the next one, which the step's last look will see
-                if self.seat_source(device, volume, source, &at).await? == SourceMove::Row {
+                if self.seat_listed(ReadOn::new(device, volume), scan, segment, point, false).await? == SourceMove::Row {
                     scan.source_count += 1;
                     scan.is_tree_stale = true;
                 }
@@ -686,16 +676,7 @@ impl<Backend: Io> EngineState<Backend> {
                 if scan.holds(segment) {
                     continue;
                 }
-                let at = SeatAt {
-                    column: scan.column,
-                    key: &scan.position,
-                    is_inclusive: scan.is_inclusive,
-                    direction: scan.direction,
-                    point,
-                    is_counting: scan.is_counting,
-                };
-                scan.spill.segment = segment;
-                if self.seat_source(device, volume, &mut scan.spill, &at).await? == SourceMove::Row
+                if self.seat_listed(ReadOn::new(device, volume), scan, segment, point, true).await? == SourceMove::Row
                     && (!has_key || scan.is_before(&scan.spill.key, candidate))
                 {
                     candidate.clear();
@@ -707,6 +688,29 @@ impl<Backend: Io> EngineState<Backend> {
                 return Ok(has_key);
             }
         }
+    }
+
+    /// Seat a listed segment at the walk's place, in the next free source or in the spill slot
+    pub async fn seat_listed(
+        &self,
+        on: ReadOn<'_, impl DeviceReads<Backend::File>, Volume<Backend>>,
+        scan: &mut ScanState,
+        segment: SegmentNumber,
+        point: WritePlace,
+        is_spill: bool,
+    ) -> Result<SourceMove, StoreError> {
+        let ScanState { column, position, is_inclusive, direction, is_counting, sources, spill, source_count, .. } = scan;
+        let at = SeatAt {
+            column: *column,
+            key: position,
+            is_inclusive: *is_inclusive,
+            direction: *direction,
+            point,
+            is_counting: *is_counting,
+        };
+        let source = if is_spill { spill } else { &mut sources[*source_count] };
+        source.segment = segment;
+        self.seat_source(on.device, on.target, source, &at).await
     }
 
     /// Walk every source past a key, and return its newest row at a point

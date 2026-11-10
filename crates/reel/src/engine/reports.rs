@@ -342,7 +342,7 @@ impl<Backend: Io> EngineState<Backend> {
             JobKind::DeadByteWalk => self.volumes.iter().any(has_walk_work),
             JobKind::RangeDeleteApply => self.volumes.iter().any(|volume| volume.is_applying.load(Ordering::Acquire)),
             JobKind::Compaction => self.volumes.iter().any(has_reclaim_work),
-            JobKind::KeyRunMerge | JobKind::SpotCacheUpkeep => false,
+            JobKind::SpotCacheUpkeep => false,
         }
     }
 

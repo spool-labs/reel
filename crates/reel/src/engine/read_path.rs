@@ -173,6 +173,11 @@ impl<Backend: Io> EngineState<Backend> {
         if device.holds_across_waits() { self.ring_footer_readers.lease() } else { self.footer_readers.lease() }
     }
 
+    /// Read through the ring on this thread when the store has one, and in place when it doesn't
+    pub fn blocking_reads(&self) -> RingWait<'_, Backend::Ring> {
+        RingWait(self.ring.as_ref())
+    }
+
     /// Fill a buffer with a key's newest value, and say whether it has one
     pub fn get_latest(
         &self,
@@ -182,10 +187,7 @@ impl<Backend: Io> EngineState<Backend> {
         buf: &mut Vec<u8>,
     ) -> Result<bool, StoreError> {
         // a store with a ring reads what the kernel doesn't hold through it, on this thread with no wake
-        match &self.ring {
-            Some(ring) => in_place(self.get_latest_on(&RingWait(ring), column, key, want, buf)),
-            None => in_place(self.get_latest_on(&InPlace, column, key, want, buf)),
-        }
+        in_place(self.get_latest_on(&self.blocking_reads(), column, key, want, buf))
     }
 
     /// Answer a get through a device's read path, starting over when a job crosses it
@@ -259,10 +261,7 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// Answer every key at one read point, so a batch from one write_batch is seen whole or not at all
     pub fn get_many_now(&self, column: ColumnId, keys: &[&[u8]], values: &mut ValueList) -> Result<(), StoreError> {
-        match &self.ring {
-            Some(ring) => in_place(self.get_many_on(&RingWait(ring), column, keys, values)),
-            None => in_place(self.get_many_on(&InPlace, column, keys, values)),
-        }
+        in_place(self.get_many_on(&self.blocking_reads(), column, keys, values))
     }
 
     /// Answer every key at one read point through a device's read path
@@ -537,24 +536,9 @@ impl<Backend: Io> EngineState<Backend> {
             offset: spot.offset,
             length: spot.length,
         };
-        // the cache holds each value with its key, so a slot another key's hash led to answers nothing there
-        let lookup = match want {
-            RecordWant::Whole => self.record_cache.get(spot.segment, location.offset, read.key, buf),
-            RecordWant::Window(window) => self.record_cache.get_window(spot.segment, location.offset, read.key, window.offset, window.length, buf),
-        };
-        if lookup == CacheLookup::Hit {
-            return Ok(Some(true));
-        }
-        // a slot holds no key, so a failed check here means another key or a moved record: a miss
-        match self.read_record(ReadOn::new(device, &pin.file), location, spot.place, read, want, buf).await? {
-            RecordRead::Valid => {
-                if lookup == (CacheLookup::Miss { is_admitted: true }) {
-                    self.record_cache.admit(spot.segment, location.offset, read.key, buf);
-                }
-                Ok(Some(true))
-            },
-            RecordRead::Failed => Ok(None),
-        }
+        // a failed check here means another key or a moved record: a miss
+        let is_valid = self.read_cached(device, &pin.file, spot.segment, location, spot.place, read, want, buf).await?;
+        Ok(is_valid.then_some(true))
     }
 
     /// Answer from a record still in its slot's windows, or return nothing when it has reached the kernel. This takes
@@ -638,21 +622,42 @@ impl<Backend: Io> EngineState<Backend> {
             length: sealed.row.length,
         };
         // a sealed record never changes where it sits, so the cache answers for its place while the segment is pinned
+        let is_valid = self.read_cached(device, &pin.file, sealed.segment, location, sealed.row.place, read, want, buf).await?;
+        if !is_valid {
+            return Err(corruption(read));
+        }
+        Ok(true)
+    }
+
+    /// Answer a sealed record through the record cache, and keep a value the cache admitted. The cache holds each value with
+    /// its key, so a slot another key's hash led to answers nothing there. False when the record fails its check
+    #[allow(clippy::too_many_arguments, reason = "a record's segment, place and location, and the read it answers")]
+    pub async fn read_cached(
+        &self,
+        device: &impl DeviceReads<Backend::File>,
+        file: &Backend::File,
+        segment: SegmentNumber,
+        location: RecordLocation,
+        place: WritePlace,
+        read: &KeyRead<'_>,
+        want: RecordWant,
+        buf: &mut Vec<u8>,
+    ) -> Result<bool, StoreError> {
         let lookup = match want {
-            RecordWant::Whole => self.record_cache.get(sealed.segment, location.offset, read.key, buf),
-            RecordWant::Window(window) => self.record_cache.get_window(sealed.segment, location.offset, read.key, window.offset, window.length, buf),
+            RecordWant::Whole => self.record_cache.get(segment, location.offset, read.key, buf),
+            RecordWant::Window(window) => self.record_cache.get_window(segment, location.offset, read.key, window.offset, window.length, buf),
         };
         if lookup == CacheLookup::Hit {
             return Ok(true);
         }
-        match self.read_record(ReadOn::new(device, &pin.file), location, sealed.row.place, read, want, buf).await? {
+        match self.read_record(ReadOn::new(device, file), location, place, read, want, buf).await? {
             RecordRead::Valid => {
                 if lookup == (CacheLookup::Miss { is_admitted: true }) {
-                    self.record_cache.admit(sealed.segment, location.offset, read.key, buf);
+                    self.record_cache.admit(segment, location.offset, read.key, buf);
                 }
                 Ok(true)
             },
-            RecordRead::Failed => Err(corruption(read)),
+            RecordRead::Failed => Ok(false),
         }
     }
 
@@ -698,7 +703,7 @@ impl<Backend: Io> EngineState<Backend> {
         };
 
         let mut reader = self.footer_reader_for(device);
-        self.search_directory(device, volume, directory, read, &mut reader).await
+        self.walk_candidates(device, volume, directory, read, &mut reader, WalkAsk::EVERY).await
     }
 
     /// Check a newer row of a key than a place sits in a sealed segment other than some, walked or not
@@ -922,18 +927,6 @@ impl<Backend: Io> EngineState<Backend> {
             point.read_point = WritePlace(below);
         }
         Ok(())
-    }
-
-    /// Ask every segment a directory lists for a key
-    pub async fn search_directory(
-        &self,
-        device: &impl DeviceReads<Backend::File>,
-        volume: &Volume<Backend>,
-        directory: &ColumnDirectory,
-        read: &KeyRead<'_>,
-        reader: &mut FooterReader,
-    ) -> Result<Option<SealedRow>, StoreError> {
-        self.walk_candidates(device, volume, directory, read, reader, WalkAsk::EVERY).await
     }
 
     /// Walk a directory's pages, starting over when the list changes between them

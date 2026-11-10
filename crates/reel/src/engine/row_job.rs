@@ -7,10 +7,10 @@ use std::sync::atomic::Ordering;
 use reel_api::units::{ByteCount, Nanoseconds};
 
 use crate::engine::engine_state::EngineState;
-use crate::engine::open_segment::SegmentPhase;
+use crate::engine::open_segment::{OpenSegment, SegmentPhase};
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
-use crate::io::{Io, IoTask};
+use crate::io::{Io, IoFile, IoTask};
 use crate::io::job::{Job, JobStep};
 
 /// How long rows wait in memory, well inside the 100 ms a kill can cost
@@ -69,13 +69,23 @@ impl<Backend: Io> RowJob<Backend> {
             let mut claims = hold(&volume.claims);
             for index in 0..claims.open.len() {
                 let segment = &mut claims.open[index];
-                if segment.phase != SegmentPhase::Taking || segment.row_count.0 == 0 {
+                if segment.phase != SegmentPhase::Taking {
                     continue;
                 }
-                if segment.seen_rows != segment.row_count {
+                // an empty segment starts its quiet when the job first sees it
+                if segment.seen_rows != segment.row_count || segment.quiet_since.0 == 0 {
                     segment.seen_rows = segment.row_count;
                     segment.quiet_since = now;
-                    volume.last_write_at.store(now.0, Ordering::Relaxed);
+                    if segment.row_count.0 > 0 {
+                        volume.last_write_at.store(now.0, Ordering::Relaxed);
+                    }
+                }
+                let room_due = Nanoseconds(segment.quiet_since.0 + IDLE_SEAL_AFTER.0);
+                if has_room_ahead(segment) && room_due.0 > now.0 {
+                    deadline = Some(deadline.map_or(room_due, |soonest| soonest.min(room_due)));
+                }
+                if segment.row_count.0 == 0 {
+                    continue;
                 }
                 if segment.has_deletes && segment.delete_seen.is_none() {
                     segment.delete_seen = Some(now);
@@ -94,6 +104,37 @@ impl<Backend: Io> RowJob<Backend> {
             }
         }
         deadline
+    }
+
+    /// Give back the room one quiet open segment holds ahead of its writes, and say whether one did. The room's end drops to the
+    /// writes before the lock goes, so a claim past it waits for the change, and the first write after takes room again
+    pub fn give_back_room(&self) -> bool {
+        let now = self.state.io.now();
+        for volume in &self.state.volumes {
+            let mut claims = hold(&volume.claims);
+            let Some(segment) = claims.open.iter_mut().find(|segment| is_room_idle(segment, now)) else {
+                continue;
+            };
+            segment.is_room_holding = true;
+            segment.reserved_end = segment.write_end;
+            let (file, number, end) = (segment.data.clone(), segment.number, segment.write_end);
+            drop(claims);
+            let is_given = file.truncate(ByteCount(end.0)).is_ok();
+            let mut claims = hold(&volume.claims);
+            if let Some(segment) = claims.open.iter_mut().find(|segment| segment.number == number) {
+                segment.is_room_holding = false;
+                volume.progress.wake();
+                // a seal that came while the room changed waited for it
+                if segment.phase == SegmentPhase::Sealing
+                    && let Some(task) = self.state.seal_tasks[volume.id.0 as usize].get()
+                {
+                    task.wake();
+                }
+            }
+            volume.rooms_given_back.fetch_add(u64::from(is_given), Ordering::Relaxed);
+            return true;
+        }
+        false
     }
 
     /// Check any slot has rows waiting
@@ -125,6 +166,7 @@ impl<Backend: Io> Job for RowJob<Backend> {
             let now = self.state.io.now();
             // a busy store still has quiet segments, and each goes by its own last write
             let _deadline = self.seal_idle_segments();
+            while self.give_back_room() {}
             return JobStep::IdleUntil {
                 deadline: Nanoseconds(now.0 + WRITE_OUT_PERIOD.0),
             };
@@ -136,9 +178,27 @@ impl<Backend: Io> Job for RowJob<Backend> {
             self.state.row_job_idle.store(false, Ordering::Release);
             return JobStep::Worked;
         }
-        match self.seal_idle_segments() {
+        let deadline = self.seal_idle_segments();
+        while self.give_back_room() {}
+        match deadline {
             Some(deadline) => JobStep::IdleUntil { deadline },
             None => JobStep::Idle,
         }
     }
+}
+
+/// Bytes of room ahead of an open segment's writes worth giving back once it sits quiet
+pub const GIVE_BACK_LEAST: u64 = 1024 * 1024;
+
+/// Check an open segment holds room ahead of its writes worth giving back, with no room change under way or asked for
+pub fn has_room_ahead<File>(segment: &OpenSegment<File>) -> bool {
+    segment.phase == SegmentPhase::Taking
+        && !segment.is_room_holding
+        && !segment.is_reserve_asked
+        && segment.reserved_end.0 >= segment.write_end.0 + GIVE_BACK_LEAST
+}
+
+/// Check an open segment's room ahead can go: it sat with no write since the quiet that seals a large one
+pub fn is_room_idle<File>(segment: &OpenSegment<File>, now: Nanoseconds) -> bool {
+    has_room_ahead(segment) && segment.quiet_since.0 > 0 && now.0 >= segment.quiet_since.0 + IDLE_SEAL_AFTER.0
 }

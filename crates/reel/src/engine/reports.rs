@@ -212,6 +212,15 @@ impl<Backend: Io> EngineState<Backend> {
             let rows = hold(&volume.summary);
             let segment_count = rows.orders().len() as u64;
             let used_bytes = rows.file_bytes().0;
+            let (mut live, mut dead) = (0, 0);
+            for_each_column(&rows, |_row, column| {
+                live += column.live_bytes.0;
+                dead += column.dead_bytes.0;
+            });
+            let claims = hold(&volume.claims);
+            let open_bytes: u64 = claims.open.iter().map(|segment| segment.write_end.0).sum();
+            let preallocated: u64 = claims.open.iter().map(|segment| segment.reserved_end.0.saturating_sub(segment.write_end.0)).sum();
+            drop(claims);
             report.volumes.push(VolumeReading {
                 volume: VolumeId(index as u8),
                 segment_count: SegmentCount(segment_count),
@@ -260,6 +269,11 @@ impl<Backend: Io> EngineState<Backend> {
                 merge_interval: Nanoseconds(volume.merge_interval.load(Ordering::Relaxed)),
                 ingest_left: Nanoseconds(volume.hot_until().0.saturating_sub(self.io.now().0)),
                 idle_seals: volume.idle_seals.load(Ordering::Relaxed),
+                rooms_given_back: volume.rooms_given_back.load(Ordering::Relaxed),
+                live_bytes: ByteCount(live),
+                dead_bytes: ByteCount(dead),
+                open_bytes: ByteCount(open_bytes),
+                preallocated: ByteCount(preallocated),
                 promises_outgrown: volume.promises_outgrown.load(Ordering::Relaxed),
             });
         }

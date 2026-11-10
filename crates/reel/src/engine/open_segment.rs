@@ -69,6 +69,15 @@ pub struct OpenSegment<File> {
 /// Bytes an open segment holds on its disk ahead of its writes. It holds this much at create and gains it again a step at a
 /// time, so a store holds no whole segment of disk it hasn't written
 pub const RESERVE_STEP_BYTES: u64 = 64 * 1024 * 1024;
+/// A step is at most this share of a segment, so a small store holds little room ahead of each open slot
+pub const RESERVE_STEP_SHARE: u64 = 8;
+/// The least step, so a small segment still grows a few writes at a time
+pub const LEAST_RESERVE_STEP: u64 = 1024 * 1024;
+
+/// Work out a volume's room step from its segment size
+pub fn reserve_step(segment_bytes: ByteCount) -> u64 {
+    (segment_bytes.0 / RESERVE_STEP_SHARE).clamp(LEAST_RESERVE_STEP, RESERVE_STEP_BYTES)
+}
 
 /// Bytes of the file range a slot's small records fill before they reach the kernel in one write call
 pub const RECORD_WINDOW_BYTES: usize = 64 * 1024;

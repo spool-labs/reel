@@ -375,6 +375,8 @@ pub struct Volume<Backend: Io> {
     pub outputs_promised: AtomicU64,
     /// Seals that ended a segment writes had gone quiet on
     pub idle_seals: AtomicU64,
+    /// Quiet open segments that gave their room ahead back
+    pub rooms_given_back: AtomicU64,
     /// The store's line writers wait on, which anything that clears a wait moves
     pub progress: Arc<WakeLine>,
     /// Picks refused because the park had no room for their inputs

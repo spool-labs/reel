@@ -15,7 +15,7 @@ use crate::engine::ration::RATION_SPINS; use crate::engine::reserve_job::RoomAhe
 use crate::engine::engine_sizing::{OPEN_PER_ROOT, SEAL_ROWS_EIGHTHS};
 use crate::engine::engine_state::{EngineState, IndexWait, SlotData};
 use crate::engine::open_segment::{
-    OpenSegment, RESERVE_STEP_BYTES, SegmentPhase, data_path,
+    OpenSegment, SegmentPhase, data_path, reserve_step,
     rows_path,
 };
 use crate::engine::volume::{ClaimState, Volume};
@@ -311,7 +311,7 @@ impl<Backend: Io> EngineState<Backend> {
             segment.is_room_holding = true;
             return Some(RoomAhead { file: segment.data.clone(), segment: segment.number, end: reserve_target(segment, volume, end) });
         }
-        let is_short = segment.reserved_end.0 < volume.segment_bytes.0 && segment.reserved_end.0.saturating_sub(end) < RESERVE_STEP_BYTES / 2;
+        let is_short = segment.reserved_end.0 < volume.segment_bytes.0 && segment.reserved_end.0.saturating_sub(end) < reserve_step(volume.segment_bytes) / 2;
         if !segment.is_reserve_asked && is_short {
             segment.is_reserve_asked = true;
             if let Some(task) = self.reserve_task.get() {
@@ -625,7 +625,7 @@ impl<Backend: Io> EngineState<Backend> {
         let path = &volume.roots[root.0 as usize];
         let number = self.next_segment_number()?;
         let reserved = if request.has_records {
-            ByteCount(RESERVE_STEP_BYTES.max(request.bytes.0).min(volume.segment_bytes.0.max(request.bytes.0)))
+            ByteCount(reserve_step(volume.segment_bytes).max(request.bytes.0).min(volume.segment_bytes.0.max(request.bytes.0)))
         } else {
             ByteCount(0)
         };

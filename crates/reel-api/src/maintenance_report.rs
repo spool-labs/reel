@@ -335,6 +335,14 @@ pub struct VolumeReading {
     pub ingest_left: Nanoseconds,
     /// Seals that ended a segment writes had gone quiet on
     pub idle_seals: u64,
+    /// Quiet open segments that gave their room ahead back
+    pub rooms_given_back: u64,
+    /// Where the volume's disk goes: live and dead record bytes in sealed segments, bytes written to open ones, and room open
+    /// segments hold ahead of their writes
+    pub live_bytes: ByteCount,
+    pub dead_bytes: ByteCount,
+    pub open_bytes: ByteCount,
+    pub preallocated: ByteCount,
     /// Merges that wrote past their promise and took more room, which a right estimate never lets happen
     pub promises_outgrown: u64,
 }

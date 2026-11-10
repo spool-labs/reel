@@ -1413,6 +1413,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         is_sync_due: AtomicBool::new(false),
         bytes_since_sync: AtomicU64::new(0),
         idle_seals: AtomicU64::new(0),
+        rooms_given_back: AtomicU64::new(0),
         progress: Arc::clone(progress),
         park_refusals: AtomicU64::new(0),
         most_in_flight: AtomicU64::new(0),

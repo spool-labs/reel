@@ -9,7 +9,7 @@ use std::thread;
 
 use crate::seed_sets::seeds;
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
-use reel::engine::open_segment::{RECORD_WINDOW_BYTES, RESERVE_STEP_BYTES, SegmentPhase, rows_path};
+use reel::engine::open_segment::{RECORD_WINDOW_BYTES, SegmentPhase, reserve_step, rows_path};
 use reel::engine::engine_sizing::OPEN_PER_ROOT;
 use reel::engine::reserve_job::RESERVE_PERIOD;
 use reel::engine::write_path::{ClaimRequest, SPARE_REQUEST, WRITES_PER_OPEN, WindowSwitch};
@@ -1207,7 +1207,8 @@ fn room_grows_a_step_at_a_time() {
     config.memory_budget = ROOM_BUDGET;
     let store = ReelStore::open(io.clone(), &config).expect("open");
     let volume = &store.state.volumes[0];
-    assert!(volume.segment_bytes.0 > 2 * RESERVE_STEP_BYTES, "a segment of {} B takes no step", volume.segment_bytes.0);
+    let step = reserve_step(volume.segment_bytes);
+    assert!(volume.segment_bytes.0 > 2 * step, "a segment of {} B takes no step", volume.segment_bytes.0);
     let value = vec![7; ROOM_VALUE];
     let held = || {
         let claims = hold(&volume.claims);
@@ -1218,18 +1219,75 @@ fn room_grows_a_step_at_a_time() {
 
     store.put(COLUMN, b"first", &value).expect("put");
     let (length, _written, _spare) = held();
-    assert_eq!(length, RESERVE_STEP_BYTES);
+    assert_eq!(length, step);
 
     for number in 0..ROOM_VALUES {
         store.put(COLUMN, format!("key-{number:04}").as_bytes(), &value).expect("put");
     }
     settle(&io);
     let (length, written, spare) = held();
-    assert!(written > RESERVE_STEP_BYTES, "the writes stayed inside the first step");
+    assert!(written > step, "the writes stayed inside the first step");
     // the job takes the next step once the writes come within half a step of the room's end
-    assert!(length >= written && length < written + RESERVE_STEP_BYTES * 3 / 2, "{length} B held for {written} B written");
+    assert!(length >= written && length < written + step * 3 / 2, "{length} B held for {written} B written");
     assert!(length < volume.segment_bytes.0, "a whole segment held");
-    assert!(spare.is_none_or(|spare| spare <= RESERVE_STEP_BYTES), "a spare holds {spare:?} B");
+    assert!(spare.is_none_or(|spare| spare <= step), "a spare holds {spare:?} B");
+    store.close().expect("close");
+}
+
+
+// a quiet open segment gives its room ahead back after the idle seal's quiet and takes it again at its next write, and the report
+// shows the room apart from what was written
+#[test]
+fn quiet_room_goes_back() {
+    let io = SimulatedIo::new(Seed(63));
+    let mut config = config(SyncPolicy::Never);
+    config.memory_budget = ROOM_BUDGET;
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let volume = &store.state.volumes[0];
+    let held = || {
+        let claims = hold(&volume.claims);
+        let segment = claims.open.iter().find(|segment| segment.phase == SegmentPhase::Taking && segment.row_count.0 > 0).expect("an open segment");
+        (segment.data.length().expect("length").0, segment.write_end.0)
+    };
+    let preallocated = || {
+        let mut report = reel_api::maintenance_report::MaintenanceReport::default();
+        store.maintenance_report(&mut report);
+        report.volumes[0].preallocated.0
+    };
+
+    store.put(COLUMN, b"first", &[7; ROOM_VALUE]).expect("put");
+    let (length, written) = held();
+    assert!(length > written + reel::engine::row_job::GIVE_BACK_LEAST);
+    assert!(preallocated() >= length - written);
+
+    settle(&io);
+    io.advance_clock(Nanoseconds(reel::engine::row_job::IDLE_SEAL_AFTER.0 + SETTLE_TICK.0));
+    settle(&io);
+    let (length, written) = held();
+    assert_eq!(length, written);
+    assert_eq!(volume.rooms_given_back.load(Ordering::Relaxed), 1);
+    assert_eq!(read(&store, b"first"), Some(vec![7; ROOM_VALUE]));
+
+    store.put(COLUMN, b"second", &[8; ROOM_VALUE]).expect("put");
+    let (length, written) = held();
+    assert!(length > written, "the next write took no room");
+    assert_eq!(read(&store, b"second"), Some(vec![8; ROOM_VALUE]));
+    store.close().expect("close");
+}
+
+// a small store steps its room ahead by a share of its segment, short of the 64 MiB a large one takes
+#[test]
+fn small_store_steps_less() {
+    let io = SimulatedIo::new(Seed(64));
+    let store = ReelStore::open(io.clone(), &config(SyncPolicy::Never)).expect("open");
+    let volume = &store.state.volumes[0];
+    let step = reserve_step(volume.segment_bytes);
+    assert!(step < reel::engine::open_segment::RESERVE_STEP_BYTES, "a segment of {} B steps a whole 64 MiB", volume.segment_bytes.0);
+    store.put(COLUMN, b"first", b"value").expect("put");
+    let claims = hold(&volume.claims);
+    let segment = claims.open.iter().find(|segment| segment.row_count.0 > 0).expect("an open segment");
+    assert!(segment.data.length().expect("length").0 <= step);
+    drop(claims);
     store.close().expect("close");
 }
 
@@ -1243,8 +1301,13 @@ fn room_skips_a_sealing_segment() {
     let store = ReelStore::open(io.clone(), &config).expect("open");
     let value = vec![7; ROOM_VALUE];
     io.hold_jobs("reel-reserve", true);
-    for number in 0..ROOM_VALUES {
-        store.put(COLUMN, format!("key-{number:04}").as_bytes(), &value).expect("put");
+    // a write that ends within half a step of the room asks the held job for more, and the seal has to start with that ask out
+    let is_asked = || hold(&store.state.volumes[0].claims).open.iter().any(|segment| segment.is_reserve_asked);
+    let mut written = 0;
+    while written < ROOM_VALUES || !is_asked() {
+        store.put(COLUMN, format!("key-{written:04}").as_bytes(), &value).expect("put");
+        written += 1;
+        assert!(written < 4 * ROOM_VALUES, "no write asked for room");
     }
     store.seal_now();
     // step until the seal has cut the file to its tails while the segment still sits among the open ones, then hold the seal
@@ -1268,7 +1331,7 @@ fn room_skips_a_sealing_segment() {
 
     let store = ReelStore::open(io.clone(), &config).expect("open");
     assert_eq!(store.damaged_segments(), 0);
-    for number in 0..ROOM_VALUES {
+    for number in 0..written {
         assert_eq!(read(&store, format!("key-{number:04}").as_bytes()), Some(value.clone()), "key {number}");
     }
     store.close().expect("close");

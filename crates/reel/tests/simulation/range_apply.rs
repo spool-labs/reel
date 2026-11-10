@@ -639,3 +639,30 @@ fn cover_alone_goes() {
     assert!(!store.state.volumes[0].table.holds(holder));
     store.close().expect("close");
 }
+
+// a range delete whose walk has settled its cover still hides every row under it after a reopen, whether or not a merge has
+// taken those rows off the disk yet
+#[test]
+fn settled_cover_hides_after_reopen() {
+    let io = SimulatedIo::new(Seed(91));
+    let store = open(&io);
+    for number in 0..SPAN_KEYS {
+        store.put(COLUMN, format!("span-{number:06}").as_bytes(), b"value").expect("put");
+    }
+    seal(&store, &io);
+    store.delete_range(COLUMN, b"span-000000", format!("span-{SPAN_KEYS:06}").as_bytes()).expect("delete");
+    seal(&store, &io);
+    settle(&io);
+    let mut buf = Vec::new();
+    assert!(!store.get(COLUMN, b"span-000001", &mut buf).expect("get"), "the live store showed a deleted key");
+    store.close().expect("close");
+
+    let store = open(&io);
+    settle(&io);
+    for number in 0..SPAN_KEYS {
+        assert!(!store.get(COLUMN, format!("span-{number:06}").as_bytes(), &mut buf).expect("get"), "span-{number:06} came back after a reopen");
+    }
+    store.close().expect("close");
+}
+
+const SPAN_KEYS: u64 = 1_000;

@@ -362,6 +362,54 @@ impl FooterReader {
         Ok(FooterAnswer::Absent)
     }
 
+    /// Ask a block's filter for a key, keeping the filter in the reader when the arena lacks it, so the next key of the same
+    /// block takes no cache lock. `held` names the filter the reader keeps and its length
+    pub async fn probe_held<File: IoFile>(
+        &mut self,
+        on: ReadOn<'_, impl DeviceReads<File>, File>,
+        segment: SegmentNumber,
+        entry: &BlockEntry,
+        filter_end: u64,
+        caches: &FooterCaches<'_>,
+        query: &FooterQuery<'_>,
+        held: &mut Option<(u32, usize)>,
+    ) -> Result<FilterAnswer> {
+        let ReadOn { device, target: file } = on;
+        if let Some(may_hold) = caches.resident.probe(segment, entry.filter_offset, query.hash) {
+            return Ok(FilterAnswer::of(may_hold));
+        }
+        if held.is_none_or(|(offset, _length)| offset != entry.filter_offset) {
+            *held = None;
+            let key = BlockKey {
+                segment,
+                offset: entry.filter_offset,
+            };
+            let buffer = &mut self.filter;
+            let copied = caches.filters.with(key, |bits| (bits.len() <= buffer.len()).then(|| {
+                buffer[..bits.len()].copy_from_slice(bits);
+                bits.len()
+            }));
+            let length = match copied.flatten() {
+                Some(length) => length,
+                None => {
+                    let length = (filter_end - u64::from(entry.filter_offset)) as usize;
+                    if length > self.filter.len() {
+                        return Ok(FilterAnswer::Damaged);
+                    }
+                    device.read_exact(file, FileOffset(u64::from(entry.filter_offset)), &mut self.filter[..length]).await?;
+                    let Some(bits) = open_filter(&self.filter[..length]) else {
+                        return Ok(FilterAnswer::Damaged);
+                    };
+                    caches.filters.insert(key, bits);
+                    bits.len()
+                },
+            };
+            *held = Some((entry.filter_offset, length));
+        }
+        let length = held.map_or(0, |(_offset, length)| length);
+        Ok(FilterAnswer::of(may_contain(&self.filter[..length], query.hash)))
+    }
+
     /// Ask a block's filter, reading and checking it once when the cache lacks it
     pub async fn probe_filter<File: IoFile>(
         &mut self,

@@ -216,7 +216,7 @@ impl<Backend: Io> EngineState<Backend> {
                 Some(next) if position + 1 < window.count => next.header_at().0,
                 _last_line => window.filter_end_of_last,
             };
-            match in_place(reader.probe_filter(ReadOn::new(&InPlace, &file), segment, &entry, filter_end, &caches, &query)).map_err(footer_error)? {
+            match in_place(reader.probe_held(ReadOn::new(&InPlace, &file), segment, &entry, filter_end, &caches, &query, &mut held.filter)).map_err(footer_error)? {
                 FilterAnswer::Damaged => return Err(corruption(read)),
                 FilterAnswer::No => continue,
                 FilterAnswer::Maybe => {},

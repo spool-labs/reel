@@ -1,6 +1,7 @@
 //! An open segment's bytes start for the device during ingest, so a seal's sync finds little left to send
 
 use std::path::PathBuf;
+use std::thread;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
@@ -12,6 +13,7 @@ use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, Nanoseconds, VolumeId};
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_io::SimulatedIo;
+use reel_sim::wait::wait_until;
 
 const ROOT: &str = "/disk/writeback";
 const COLUMN: ColumnId = ColumnId(1);
@@ -120,5 +122,30 @@ fn cadence_syncs_at_the_limit() {
     assert_eq!(synced(), start);
     fill(&store, 2 * VALUE_BYTES);
     assert_eq!(synced(), start + 1);
+    store.close().expect("close");
+}
+
+// a writer that runs past its segment's room takes more with the claims lock let go, so other writers go on
+#[test]
+fn room_step_frees_the_claims() {
+    let io = SimulatedIo::new(Seed(6));
+    let store = open(&io);
+    fill(&store, VALUE_BYTES);
+    let volume = &store.state.volumes[0];
+    {
+        let mut claims = hold(&volume.claims);
+        let segment = claims.open.first_mut().expect("an open segment");
+        segment.reserved_end = segment.write_end;
+    }
+    io.hold_reserves(true);
+    thread::scope(|scope| {
+        let writer = scope.spawn(|| store.put(COLUMN, b"past-the-room", &vec![3; 4 * VALUE_BYTES as usize]));
+        wait_until(|| io.held_reserves() > 0, "the writer never reached its room step");
+        assert!(volume.claims.try_lock().is_ok(), "the room step held the claims");
+        io.hold_reserves(false);
+        writer.join().expect("join").expect("put");
+    });
+    let mut value = Vec::new();
+    assert!(store.get(COLUMN, b"past-the-room", &mut value).expect("get"));
     store.close().expect("close");
 }

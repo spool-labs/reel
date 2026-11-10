@@ -10,7 +10,7 @@ use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, DeathMark, FileOffset, Nanoseconds, RootId, RowCount, WritePlace};
 
 use crate::engine::claim::Claim;
-use crate::engine::ration::RATION_SPINS;
+use crate::engine::ration::RATION_SPINS; use crate::engine::reserve_job::RoomAhead;
 use crate::engine::engine_sizing::{OPEN_PER_ROOT, SEAL_ROWS_EIGHTHS};
 use crate::engine::engine_state::{EngineState, IndexWait, SlotData};
 use crate::engine::open_segment::{
@@ -246,7 +246,17 @@ impl<Backend: Io> EngineState<Backend> {
             }
 
             if let Some(index) = pick.best {
-                self.hold_claim_room(&mut claims, volume, index, request)?;
+                // a claim past the room waits for a room step under way, so one runs on a segment at a time
+                let segment = &claims.open[index]; if segment.is_room_holding && segment.write_end.0 + request.bytes.0 > segment.reserved_end.0 {
+                    drop(claims);
+                    self.io.pause();
+                    continue;
+                }
+                if let Some(room) = self.claim_room(&mut claims, volume, index, request) {
+                    drop(claims);
+                    self.take_room(volume, room)?;
+                    continue;
+                }
 
                 let Some(ticket) = volume.order.try_claim(request.rows) else {
                     // the ring frees when claims end, and ending one needs this lock, and so does a raise
@@ -289,19 +299,14 @@ impl<Backend: Io> EngineState<Backend> {
         }
     }
 
-    /// Hold disk room for a claim in a segment: the reserve job keeps a step held ahead, and a claim past what it holds takes
-    /// the room itself. A full disk seals the segment, so no claim tries it again
-    pub fn hold_claim_room(&self, claims: &mut ClaimState<Backend::File>, volume: &Volume<Backend>, index: usize, request: &ClaimRequest) -> Result<(), StoreError> {
+    /// Ask the reserve job for room ahead of a claim, or return the room the claim needs now, with its segment marked held so
+    /// the call runs with no lock and its seal waits
+    pub fn claim_room(&self, claims: &mut ClaimState<Backend::File>, volume: &Volume<Backend>, index: usize, request: &ClaimRequest) -> Option<RoomAhead<Backend::File>> {
         let segment = &mut claims.open[index];
         let end = segment.write_end.0 + request.bytes.0;
         if end > segment.reserved_end.0 {
-            let target = reserve_target(segment, volume, end);
-            if let Err(source) = segment.data.reserve_to(ByteCount(target)) {
-                self.seal_at(claims, volume, index);
-                return Err(store_error(volume, "reserving a segment's room", source));
-            }
-            segment.reserved_end = FileOffset(target);
-            segment.is_reserve_asked = false;
+            segment.is_room_holding = true;
+            return Some(RoomAhead { file: segment.data.clone(), segment: segment.number, end: reserve_target(segment, volume, end) });
         }
         let is_short = segment.reserved_end.0 < volume.segment_bytes.0 && segment.reserved_end.0.saturating_sub(end) < RESERVE_STEP_BYTES / 2;
         if !segment.is_reserve_asked && is_short {
@@ -309,6 +314,30 @@ impl<Backend: Io> EngineState<Backend> {
             if let Some(task) = self.reserve_task.get() {
                 task.wake();
             }
+        }
+        None
+    }
+
+    /// Take a claim's room with no lock held, then note it. A full disk seals the segment, so no claim tries it again
+    pub fn take_room(&self, volume: &Volume<Backend>, room: RoomAhead<Backend::File>) -> Result<(), StoreError> {
+        let reserved = room.file.reserve_to(ByteCount(room.end));
+        let mut claims = hold(&volume.claims);
+        let Some(index) = claims.open.iter().position(|segment| segment.number == room.segment) else {
+            return Ok(());
+        };
+        let segment = &mut claims.open[index];
+        segment.is_room_holding = false;
+        if let Err(source) = reserved {
+            self.seal_at(&mut claims, volume, index);
+            return Err(store_error(volume, "reserving a segment's room", source));
+        }
+        segment.reserved_end = FileOffset(segment.reserved_end.0.max(room.end));
+        segment.is_reserve_asked = false;
+        // a seal that came while the room grew waited for it
+        if segment.phase == SegmentPhase::Sealing
+            && let Some(task) = self.seal_tasks[volume.id.0 as usize].get()
+        {
+            task.wake();
         }
         Ok(())
     }

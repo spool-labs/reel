@@ -115,6 +115,8 @@ pub struct SimulatedDisk {
     pub refuses_free_blocks: bool,
     pub freed_bytes: ByteCount,
     pub host_memory: HostMemory,
+    pub is_reserve_held: bool,
+    pub held_reserves: u64,
 }
 
 impl SimulatedDisk {
@@ -151,6 +153,8 @@ impl SimulatedDisk {
             warm_tries: 0,
             tries: OperationCount::default(),
             cold_tries: OperationCount::default(),
+            is_reserve_held: false,
+            held_reserves: 0,
             ring_reads: OperationCount::default(),
             writes: OperationCount::default(),
             bytes_read: ByteCount::default(),

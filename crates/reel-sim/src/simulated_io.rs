@@ -244,6 +244,16 @@ impl SimulatedIo {
         hold(&self.disk).file_sync_fault = None;
     }
 
+    /// Hold every reserve call until released, so a test can look at the store while one waits
+    pub fn hold_reserves(&self, is_held: bool) {
+        hold(&self.disk).is_reserve_held = is_held;
+    }
+
+    /// Count the reserve calls that have waited on a hold
+    pub fn held_reserves(&self) -> u64 {
+        hold(&self.disk).held_reserves
+    }
+
     /// Make the next syncs fail
     pub fn fail_syncs(&self, count: OperationCount) {
         hold(&self.disk).failing_syncs = count;

@@ -288,6 +288,19 @@ impl IoFile for SimulatedFile {
     }
 
     fn reserve_to(&self, end: ByteCount) -> Result<()> {
+        let mut is_counted = false;
+        loop {
+            let mut disk = hold(&self.disk);
+            if !disk.is_reserve_held {
+                break;
+            }
+            if !is_counted {
+                disk.held_reserves += 1;
+                is_counted = true;
+            }
+            drop(disk);
+            std::thread::yield_now();
+        }
         let _pause = CountPause::new();
         let mut disk = hold(&self.disk);
         self.check(&mut disk, true)?;

@@ -19,6 +19,7 @@ use crate::guard::hold;
 use crate::lifetime::MarkRange;
 use crate::io::Io;
 use crate::fixed_list::FixedList;
+use crate::index::key_hash::hash_key;
 use crate::segment::block_entry::KeyBound;
 use crate::segment::column_directory::ColumnDirectory;
 use crate::segment::segment_tail::{MOST_MERGE_SEGMENTS, SegmentNumber};
@@ -249,7 +250,10 @@ impl<Backend: Io> RewriteJob<Backend> {
         let is_late = || state.io.now().0.saturating_sub(started.0) > MOST_LOOK_TIME.0;
         let arena = &self.state.filter_arena;
         let is_resident = |segment: SegmentNumber| !volume.are_filters_held_out() && arena.has_filters(segment);
-        let found = overlap_start(rows, directory_of, &mut self.looked_up_to, can_merge, &mut self.crowded_key, lists, !volume.is_bound_pinned(), &is_resident, is_late);
+        // a crowd answer holds while no filter came or went, and holding the filters out changes every answer
+        let filters = 2 * arena.changes() + u64::from(volume.are_filters_held_out());
+        let answers = (&mut self.crowd_answers, filters);
+        let found = overlap_start(rows, directory_of, &mut self.looked_up_to, can_merge, &mut self.crowded_key, lists, !volume.is_bound_pinned(), &is_resident, is_late, answers);
         self.has_looks_left = !rows.orders().after(self.looked_up_to).is_empty();
         let Some((crowded, column)) = found else {
             // a look stopped for time has more to see, so it ends no pass and finds no miss
@@ -587,6 +591,7 @@ pub fn overlap_start<'rows, 'state>(
     is_sized: bool,
     is_resident: &dyn Fn(SegmentNumber) -> bool,
     is_late: impl Fn() -> bool,
+    (answers, filters): (&mut CrowdAnswers, u64),
 ) -> Option<(SummaryRow<'rows>, ColumnId)> {
     let (listed, crowd) = lists;
     for _look in 0..OVERLAP_LOOKS {
@@ -607,7 +612,8 @@ pub fn overlap_start<'rows, 'state>(
             let others = listed.iter().filter_map(|other| rows.get(*other));
             let inside = others.filter_map(|other| lowest_inside(&other, facts.column, facts.lowest, facts.bound));
             let mut probes = iter::once(facts.lowest).chain(inside.take(OVERLAP_PROBES));
-            let found = probes.find(|key| is_crowded(rows, directory, (facts.column, key), crowd, is_sized, is_resident));
+            let stamp = CrowdStamp { directory: directory.generation(), filters, is_sized };
+            let found = probes.find(|key| answers.answer(facts.column, key, stamp, || is_crowded(rows, directory, (facts.column, key), crowd, is_sized, is_resident)));
             if let Some(key) = found.filter(|_key| can_merge(&row)) {
                 point.set_from(key).ok()?;
                 return Some((row, facts.column));
@@ -616,6 +622,73 @@ pub fn overlap_start<'rows, 'state>(
         *looked_up_to = segment;
     }
     None
+}
+
+/// Crowd answers a pick keeps, so a point one pass asks again costs nothing while the lists and the filters stay as they were
+pub const CROWD_ANSWERS: usize = 64;
+
+/// What the lists and the filters were when a crowd answer was worked out
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CrowdStamp {
+    pub directory: u64,
+    pub filters: u64,
+    pub is_sized: bool,
+}
+
+/// One point's crowd answer
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CrowdAnswer {
+    pub column: ColumnId,
+    pub hash: u64,
+    pub length: usize,
+    pub stamp: CrowdStamp,
+    pub is_crowded: bool,
+    pub is_set: bool,
+}
+
+/// A ring of crowd answers, the oldest going first. A hash that matches another point's only changes which merge a pick starts
+#[derive(Clone, Debug)]
+pub struct CrowdAnswers {
+    pub answers: Vec<CrowdAnswer>,
+    pub next: usize,
+    pub worked: u64,
+    pub reused: u64,
+}
+
+impl CrowdAnswers {
+    /// Allocate the ring
+    pub fn new() -> Self {
+        Self {
+            answers: vec![CrowdAnswer::default(); CROWD_ANSWERS],
+            next: 0,
+            worked: 0,
+            reused: 0,
+        }
+    }
+
+    /// Answer a point from the ring when the stamp still holds, or work it out and keep it
+    pub fn answer(&mut self, column: ColumnId, key: &[u8], stamp: CrowdStamp, work: impl FnOnce() -> bool) -> bool {
+        let hash = hash_key(column, key).0;
+        let is_same = |answer: &CrowdAnswer| answer.is_set && answer.column == column && answer.hash == hash && answer.length == key.len();
+        if let Some(answer) = self.answers.iter_mut().find(|answer| is_same(answer)) {
+            if answer.stamp == stamp {
+                self.reused += 1;
+                return answer.is_crowded;
+            }
+            answer.is_set = false;
+        }
+        self.worked += 1;
+        let is_crowded = work();
+        self.answers[self.next] = CrowdAnswer { column, hash, length: key.len(), stamp, is_crowded, is_set: true };
+        self.next = (self.next + 1) % CROWD_ANSWERS;
+        is_crowded
+    }
+}
+
+impl Default for CrowdAnswers {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Check more than the bound's segments hold a key, counting the directory's segments over it against their rows. A segment a

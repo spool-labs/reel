@@ -78,6 +78,8 @@ pub struct FilterArena {
     slots: Vec<AtomicU32>,
     mask: usize,
     extents: Vec<FilterExtent>,
+    /// Moves at every change to any segment's filters, so an answer worked out from which filters were resident can tell it still holds
+    changes: AtomicU64,
     books: Mutex<ArenaBooks>,
 }
 
@@ -147,12 +149,18 @@ impl FilterArena {
             slots: (0..size).map(|_place| AtomicU32::new(0)).collect(),
             mask: size - 1,
             extents: (0..most_segments).map(|_slot| FilterExtent::default()).collect(),
+            changes: AtomicU64::new(0),
             books: Mutex::new(ArenaBooks {
                 extents: vec![ExtentBook::default(); most_segments],
                 free_extents: (0..most_segments as u32).rev().collect(),
                 free,
             }),
         }
+    }
+
+    /// Read how many times any segment's filters changed
+    pub fn changes(&self) -> u64 {
+        self.changes.load(Ordering::Acquire)
     }
 
     /// Read the heap the arena holds
@@ -271,6 +279,7 @@ impl FilterArena {
         // an extent with nothing to fill is whole already
         if blocks == 0 {
             extent.end_change();
+            self.changes.fetch_add(1, Ordering::Release);
         }
         true
     }
@@ -298,6 +307,7 @@ impl FilterArena {
         books.extents[slot] = book;
         if book.lines_used == book.blocks {
             self.extents[slot].end_change();
+            self.changes.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -320,6 +330,7 @@ impl FilterArena {
         extent.start_change();
         extent.segment.store(NO_NUMBER, Ordering::Relaxed);
         extent.end_change();
+        self.changes.fetch_add(1, Ordering::Release);
         self.remove(place);
         let span = books.extents[slot as usize].span;
         books.free_extents.push(slot);

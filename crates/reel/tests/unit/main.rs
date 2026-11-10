@@ -8,6 +8,7 @@ mod chunk_table;
 mod column_directory;
 mod cue;
 mod complete_table;
+mod crowd_answers;
 mod damage_list;
 mod device_error;
 mod filter_arena;

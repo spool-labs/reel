@@ -48,7 +48,7 @@ pub use pick::is_reclaim_due;
 #[cfg(any(test, feature = "test-hooks"))]
 pub use install::freed_in_place;
 #[cfg(any(test, feature = "test-hooks"))]
-pub use pick::{column_range, covers_point, has_settled_covers, is_crowded, is_overlap_input, overlap_bound, overlaps};
+pub use pick::{CROWD_ANSWERS, CrowdAnswer, CrowdAnswers, CrowdStamp, column_range, covers_point, has_settled_covers, is_crowded, is_overlap_input, overlap_bound, overlaps};
 
 /// A bar counts in quarters of a segment's bytes
 pub const BAR_QUARTERS: u64 = 4;
@@ -460,6 +460,7 @@ pub struct RewriteJob<Backend: Io> {
     crowded_key: FixedList<u8>,
     listed: FixedList<SegmentNumber>,
     crowd: FixedList<SegmentNumber>,
+    pub crowd_answers: CrowdAnswers,
     pub has_looks_left: bool,
     pub picked_as: Option<PickOutcome>,
     /// The overlap look's current pass began at the oldest segment, with no merge started since
@@ -578,6 +579,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             crowded_key: FixedList::on_heap(SUMMARY_KEY_BYTES),
             listed: FixedList::on_heap(OVERLAP_LISTED),
             crowd: FixedList::on_heap(OVERLAP_LISTED),
+            crowd_answers: CrowdAnswers::new(),
             has_looks_left: false,
             picked_as: None,
             promised: ByteCount(0),
@@ -600,7 +602,7 @@ impl<Backend: Io> RewriteJob<Backend> {
     /// Read the heap the job's buffers hold
     pub fn heap_bytes(&self) -> ByteCount {
         let inputs = self.inputs.capacity() * size_of::<MergeInput>();
-        let lists = self.listed.held_bytes() + self.crowd.held_bytes();
+        let lists = self.listed.held_bytes() + self.crowd.held_bytes() + self.crowd_answers.answers.capacity() * size_of::<CrowdAnswer>();
         ByteCount((self.crowded_key.held_bytes() + lists + inputs) as u64 + self.cursor.heap_bytes().0)
     }
 

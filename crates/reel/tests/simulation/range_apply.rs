@@ -31,6 +31,7 @@ const KEYS: u64 = 40;
 const WHOLE_KEYS: u64 = 14_000;
 const LIVE_KEYS: u64 = 50_000;
 const MOST_WHOLE_READS: u64 = 40;
+const MOST_CRASH_POINTS: u64 = 200;
 
 type Store = ReelStore<SimulatedIo>;
 
@@ -664,6 +665,45 @@ fn cover_waits_for_a_leaving_input() {
     assert!(!hold(&volume.summary).get(holder).expect("a row").facts.has_covers);
     assert_eq!(read(&store, b"a-000"), None);
     store.close().expect("close");
+}
+
+// a crash anywhere from the input's unlink to the settle's summary save leaves the range deleted after a reopen
+#[test]
+fn leaving_input_crash_points() {
+    for crash_at in 0..MOST_CRASH_POINTS {
+        let io = SimulatedIo::new(Seed(25));
+        let store = open(&io);
+        put_keys(&store, "a", b"value");
+        let older = seal(&store, &io);
+        store.delete_range(COLUMN, b"a-000", b"a-001").expect("delete");
+        put_keys(&store, "z", b"value");
+        seal(&store, &io);
+        settle(&io);
+        let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+        job.rewrite.forced = Some(older);
+        job.rewrite.start();
+        while job.rewrite.is_running() {
+            job.rewrite.step();
+        }
+        drop(job);
+
+        io.arm_crash(reel_sim::simulated_disk::OperationCount(crash_at));
+        store.state.ask_compaction();
+        settle(&io);
+        let is_done = !io.is_crashed();
+        io.power_cut();
+        drop(store);
+
+        let store = open(&io);
+        settle(&io);
+        assert_eq!(read(&store, b"a-000"), None, "crash at {crash_at}");
+        assert_eq!(read(&store, b"z-000"), Some(b"value".to_vec()), "crash at {crash_at}");
+        store.close().expect("close");
+        if is_done {
+            return;
+        }
+    }
+    panic!("the settle never ran to the end");
 }
 
 // a segment that held nothing but a settled cover goes like any other dead segment

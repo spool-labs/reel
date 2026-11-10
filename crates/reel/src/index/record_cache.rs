@@ -77,8 +77,10 @@ pub struct RecordCache {
 
 /// Mix a record's place into a hash
 pub fn place_hash(segment: u64, offset: u64) -> u64 {
-    let mixed = (segment ^ offset.rotate_left(29)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    mixed ^ (mixed >> 31)
+    let mut hash = segment ^ offset.rotate_left(29);
+    hash = (hash ^ (hash >> 33)).wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    hash = (hash ^ (hash >> 33)).wrapping_mul(0xC4CE_B9FE_1A85_EC53);
+    hash ^ (hash >> 33)
 }
 
 /// Round a length up to whole words, so every header starts aligned
@@ -261,7 +263,7 @@ impl CacheShard {
         }
         let hash = place_hash(segment, offset);
         let count = hash as usize & (self.seen.len() - 1);
-        let print = (place_hash(offset, segment) >> 24) as u8 | 1;
+        let print = (hash >> 24) as u8 | 1;
         let is_admitted = self.seen[count] == print;
         self.seen[count] = if is_admitted { 0 } else { print };
         CacheLookup::Miss { is_admitted }

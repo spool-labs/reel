@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use reel::index::record_cache::{CACHE_SHARDS, CacheLookup, MOST_CACHED_BYTES, RecordCache};
+use reel::index::record_cache::{CACHE_SHARDS, CacheLookup, MOST_CACHED_BYTES, RecordCache, place_hash};
 use reel_api::units::{ByteCount, FileOffset};
 use reel::segment::segment_tail::SegmentNumber;
 
@@ -118,4 +118,13 @@ fn another_key_misses() {
     let mut out = Vec::new();
     assert_eq!(cache.get(SEGMENT, FileOffset(3), KEY, &mut out), CacheLookup::Hit);
     assert_ne!(cache.get(SEGMENT, FileOffset(3), b"other-key", &mut out), CacheLookup::Hit, "another key read this key's value");
+}
+
+// records of one size still spread over every slot, since a slot takes the hash's low bits
+#[test]
+fn even_sizes_spread() {
+    for size in [4096, 4120] {
+        let slots: BTreeSet<u64> = (0..4096).map(|record| place_hash(SEGMENT.0, record * size) & 1023).collect();
+        assert!(slots.len() > 1000, "records of {size} bytes fell on {} of 1024 slots", slots.len());
+    }
 }

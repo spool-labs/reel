@@ -25,6 +25,7 @@ use crate::row_kind::RowKind;
 use crate::segment::footer_reader::RowAt;
 use crate::segment::block_cache::BlockKey;
 use crate::segment::block_entry::{BlockEntry, KeyBound, SHARED_HEAD_BYTES};
+use crate::segment::segment_table::Seat;
 use crate::segment::column_directory::ColumnDirectory;
 use crate::segment::damage_list::KeyRange;
 use crate::segment::segment_tail::{ColumnTail, SegmentNumber};
@@ -668,32 +669,38 @@ impl<Backend: Io> EngineState<Backend> {
         source: &mut SegmentSource,
         at: &SeatAt<'_>,
     ) -> Result<SourceMove, StoreError> {
-        let Some(pin) = volume.table.pin(source.segment) else {
-            return Ok(SourceMove::Left);
+        let seat = match volume.table.seat_line(source.segment, at.column, at.key, at.direction) {
+            Seat::Left => return Ok(SourceMove::Left),
+            Seat::NoColumn => return Ok(SourceMove::Done),
+            Seat::Line(seat) => seat,
         };
-        source.place_base = pin.head.place_base;
-        let can_take = at.is_counting && pin.is_walked && pin.head.places.highest <= at.point;
-        drop(pin);
-        let Some(tail) = volume.table.column_tail(source.segment, at.column) else {
-            return Ok(SourceMove::Done);
-        };
+        let tail = seat.tail;
+        source.place_base = seat.head.place_base;
+        let can_take = at.is_counting && seat.is_walked && seat.head.places.highest <= at.point;
         source.is_countable = can_take && has_no_live_graves(volume, source.segment, at.column);
         source.tail = tail;
         source.first_block = tail.first_block;
         source.end_block = tail.first_block + tail.block_count.0;
-        let spot = self.column_spot(device, volume, source, &tail, at).await?;
-        let start = match (spot, at.direction) {
-            (ColumnSpot::Inside, direction) => volume.table.entry_block(source.segment, &tail, at.key, direction),
-            (ColumnSpot::Below, Direction::Ascending) => Some(source.first_block),
-            (ColumnSpot::Above, Direction::Descending) => source.end_block.checked_sub(1),
-            (ColumnSpot::Below, Direction::Descending) | (ColumnSpot::Above, Direction::Ascending) => None,
-        };
-        let Some(start) = start.filter(|_start| tail.block_count.0 > 0) else {
-            return Ok(SourceMove::Done);
-        };
-
-        let Some((line, replacement)) = volume.table.block_line(source.segment, start) else {
-            return Ok(SourceMove::Left);
+        let (start, line, replacement) = match (seat.is_settled, seat.start) {
+            (true, Some((start, line))) => (start, line, seat.replacement),
+            (true, None) => return Ok(SourceMove::Done),
+            // a key that matches more shared bytes than the tail holds takes the column's first row to place
+            (false, _start) => {
+                let spot = self.column_spot(device, volume, source, &tail, at).await?;
+                let start = match (spot, at.direction) {
+                    (ColumnSpot::Inside, direction) => volume.table.entry_block(source.segment, &tail, at.key, direction),
+                    (ColumnSpot::Below, Direction::Ascending) => Some(source.first_block),
+                    (ColumnSpot::Above, Direction::Descending) => source.end_block.checked_sub(1),
+                    (ColumnSpot::Below, Direction::Descending) | (ColumnSpot::Above, Direction::Ascending) => None,
+                };
+                let Some(start) = start.filter(|_start| tail.block_count.0 > 0) else {
+                    return Ok(SourceMove::Done);
+                };
+                let Some((line, replacement)) = volume.table.block_line(source.segment, start) else {
+                    return Ok(SourceMove::Left);
+                };
+                (start, line, replacement)
+            },
         };
         source.block = start;
         source.enter_block(line);

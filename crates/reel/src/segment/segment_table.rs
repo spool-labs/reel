@@ -1,5 +1,6 @@
 //! Every sealed segment's handle, tail and block index, sharded so no read takes a global lock
 
+use std::cmp;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::RwLock;
 
@@ -9,7 +10,7 @@ use reel_api::units::{ByteCount, RootId, WritePlace};
 
 use crate::pool::touched_capacity;
 use crate::guard::Shards;
-use crate::segment::block_entry::{BlockEntry, KeyPrefix};
+use crate::segment::block_entry::{BlockEntry, KeyPrefix, SHARED_HEAD_BYTES};
 use crate::segment::footer_reader::first_candidate;
 use crate::segment::segment_tail::{ColumnTail, SegmentNumber, TailHead};
 
@@ -44,6 +45,29 @@ pub struct TableEntry<File> {
     pub highest_replacement: WritePlace,
     pub has_held_frees: bool,
     pub is_unproven: bool,
+}
+
+/// What a walk reads from the table to stand in a segment's column
+#[derive(Clone, Copy, Debug)]
+pub struct SeatLine {
+    pub head: TailHead,
+    pub is_walked: bool,
+    pub tail: ColumnTail,
+    /// The block a key enters the column at and its line, or nothing when the key falls outside the column's blocks
+    pub start: Option<(u32, BlockEntry)>,
+    pub replacement: WritePlace,
+    /// False when the column's keys share more bytes than the tail holds, so a row has to place the key and `start` is empty
+    pub is_settled: bool,
+}
+
+/// A segment's answer to a walk standing in it
+#[derive(Clone, Copy, Debug)]
+pub enum Seat {
+    /// The segment has left the table
+    Left,
+    /// It has no rows in the column
+    NoColumn,
+    Line(SeatLine),
 }
 
 /// A segment held open for a read, let go when dropped
@@ -528,6 +552,46 @@ impl<File: Clone> SegmentTable<File> {
         }
         let line = guard.blocks.get(entry.blocks.start as usize + index as usize)?;
         Some((*line, entry.highest_replacement))
+    }
+
+    /// Read what a walk needs to stand in a segment's column under one lock: its head, the column's tail, and the block a key
+    /// enters the column at with its line
+    pub fn seat_line(&self, number: SegmentNumber, column: ColumnId, key: &[u8], direction: Direction) -> Seat {
+        let guard = self.shards.read(shard_of(number));
+        let Some(entry) = guard.map.get(number).and_then(|slot| guard.segments[slot as usize].as_ref()) else {
+            return Seat::Left;
+        };
+        let Some(tail) = guard.column_of(entry, column).copied() else {
+            return Seat::NoColumn;
+        };
+        let mut line = SeatLine {
+            head: entry.head,
+            is_walked: entry.is_walked,
+            tail,
+            start: None,
+            replacement: entry.highest_replacement,
+            is_settled: true,
+        };
+        let order = tail.order_against_shared(key);
+        // keys that share more than the tail holds take a row to place against
+        if order == cmp::Ordering::Equal && tail.shared_length as usize > SHARED_HEAD_BYTES {
+            line.is_settled = false;
+            return Seat::Line(line);
+        }
+        let first = entry.blocks.start as usize + tail.first_block as usize;
+        let Some(lines) = guard.blocks.get(first..first + tail.block_count.0 as usize).filter(|lines| !lines.is_empty()) else {
+            return Seat::Line(line);
+        };
+        let prefix = KeyPrefix::of_key(key, tail.shared_length as usize);
+        let at = match (order, direction) {
+            (cmp::Ordering::Equal, Direction::Ascending) => Some(first_candidate(lines, prefix)),
+            (cmp::Ordering::Equal, Direction::Descending) => lines.partition_point(|line| line.first_key <= prefix).checked_sub(1),
+            (cmp::Ordering::Less, Direction::Ascending) => Some(0),
+            (cmp::Ordering::Greater, Direction::Descending) => Some(lines.len() - 1),
+            (cmp::Ordering::Less, Direction::Descending) | (cmp::Ordering::Greater, Direction::Ascending) => None,
+        };
+        line.start = at.and_then(|at| lines.get(at).map(|block| (tail.first_block + at as u32, *block)));
+        Seat::Line(line)
     }
 
     /// Find the block a walk enters a column at, for a key known to start with the bytes the column shares. Going up that is

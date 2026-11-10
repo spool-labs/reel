@@ -1002,3 +1002,64 @@ fn sources_hold_their_blocks() {
     store.state.give_back_scan(scan);
     store.close().expect("close");
 }
+
+// the old answer from three table calls: where a key enters the column, by its shared bytes and the block lines
+fn entry_by_parts(store: &Store, segment: reel::segment::segment_tail::SegmentNumber, probe: &[u8], direction: Direction) -> Option<(u32, reel::segment::block_entry::BlockEntry)> {
+    let table = &store.state.volumes[0].table;
+    let tail = table.column_tail(segment, COLUMN).expect("the column");
+    let end = tail.first_block + tail.block_count.0;
+    let start = match (tail.order_against_shared(probe), direction) {
+        (std::cmp::Ordering::Equal, direction) => table.entry_block(segment, &tail, probe, direction),
+        (std::cmp::Ordering::Less, Direction::Ascending) => Some(tail.first_block),
+        (std::cmp::Ordering::Greater, Direction::Descending) => end.checked_sub(1),
+        _other => None,
+    }?;
+    table.block_line(segment, start).map(|(line, _replacement)| (start, line))
+}
+
+// one table call finds the same entry block as the three it replaced, for every key, the gaps and both ends, both ways
+#[test]
+fn seat_line_matches_its_parts() {
+    use reel::segment::segment_table::Seat;
+    let io = SimulatedIo::new(Seed(42));
+    let store = open(&io);
+    for number in 0..HELD_KEYS {
+        store.put(COLUMN, &key(2 * number), &[7; 60]).expect("put");
+    }
+    seal(&store, &io);
+    let volume = &store.state.volumes[0];
+    let segment = hold(&volume.summary).rows().map(|row| row.facts.segment).next().expect("a segment");
+    let mut probes: Vec<Vec<u8>> = (0..2 * HELD_KEYS + 1).map(key).collect();
+    probes.extend([b"a".to_vec(), b"zzz".to_vec(), Vec::new()]);
+    for probe in &probes {
+        for direction in [Direction::Ascending, Direction::Descending] {
+            let Seat::Line(seat) = volume.table.seat_line(segment, COLUMN, probe, direction) else {
+                panic!("no seat");
+            };
+            assert!(seat.is_settled);
+            let start = seat.start.map(|(start, line)| (start, line.block_offset));
+            let parts = entry_by_parts(&store, segment, probe, direction).map(|(start, line)| (start, line.block_offset));
+            assert_eq!(start, parts, "{} {direction:?}", String::from_utf8_lossy(probe));
+        }
+    }
+    assert!(matches!(volume.table.seat_line(segment, OTHER_COLUMN, b"key", Direction::Ascending), Seat::NoColumn));
+    store.close().expect("close");
+
+    // keys that share more bytes than a tail holds take a row to place a key that matches them
+    let io = SimulatedIo::new(Seed(43));
+    let store = open(&io);
+    let shared = vec![b's'; LONG_SHARED];
+    for number in 0..KEYS {
+        let mut long = shared.clone();
+        long.extend_from_slice(&key(number));
+        store.put(COLUMN, &long, b"value").expect("put");
+    }
+    seal(&store, &io);
+    let volume = &store.state.volumes[0];
+    let segment = hold(&volume.summary).rows().map(|row| row.facts.segment).next().expect("a segment");
+    let Seat::Line(seat) = volume.table.seat_line(segment, COLUMN, &shared, Direction::Ascending) else {
+        panic!("no seat");
+    };
+    assert!(!seat.is_settled);
+    store.close().expect("close");
+}

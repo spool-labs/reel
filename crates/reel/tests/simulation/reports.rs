@@ -144,6 +144,8 @@ fn stall_shows() {
     assert_eq!(job(&report, JobKind::DeadByteWalk), JobState::Stalled);
 
     volume.holds.walk.store(false, Ordering::Release);
+    volume.holds.compaction.store(false, Ordering::Release);
+    store.state.ask_compaction();
     store.state.ask_compaction();
     settle(&io);
     store.maintenance_report(&mut report);
@@ -421,5 +423,50 @@ fn stuck_shard_comes_free() {
     for key in 0..number {
         assert!(store.get(COLUMN, format!("key-{key:05}").as_bytes(), &mut value).expect("get"), "key {key}");
     }
+    store.close().expect("close");
+}
+
+const SPLIT_KEYS: u64 = 500;
+
+fn split_of(store: &Store) -> (u64, u64, u64, u64) {
+    let mut report = MaintenanceReport::new();
+    store.maintenance_report(&mut report);
+    let volume = &report.volumes[0];
+    (volume.dead_counted.0, volume.unwalked_bytes.0, volume.inexact_dead.0, volume.cue_held_dead.0)
+}
+
+// the report splits dead space: segments the walk hasn't reached count as unknown, the walk then counts their dead bytes, and
+// a live cue that can read the replaced rows holds them
+#[test]
+fn dead_space_splits_by_cause() {
+    let io = SimulatedIo::new(Seed(70));
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    volume.holds.compaction.store(true, Ordering::Release);
+    volume.holds.walk.store(true, Ordering::Release);
+    let write_all = |value: &[u8]| {
+        for number in 0..SPLIT_KEYS {
+            store.put(COLUMN, format!("split-{number:04}").as_bytes(), value).expect("put");
+        }
+        store.seal_now();
+        settle(&io);
+    };
+    write_all(b"first");
+    let cue = store.cue().expect("cue");
+    write_all(b"second");
+    let (_counted, unwalked, _inexact, _held) = split_of(&store);
+    assert!(unwalked > 0, "segments the walk hasn't reached show as unknown");
+
+    volume.holds.walk.store(false, Ordering::Release);
+    volume.holds.compaction.store(false, Ordering::Release);
+    store.state.ask_compaction();
+    settle(&io);
+    let (counted, unwalked, _inexact, held) = split_of(&store);
+    assert_eq!(unwalked, 0);
+    assert!(counted > 0, "the walk counted the replaced rows");
+    assert_eq!(held, counted, "the cue can read every replaced row");
+    drop(cue);
+    let (_counted, _unwalked, _inexact, held) = split_of(&store);
+    assert_eq!(held, 0);
     store.close().expect("close");
 }

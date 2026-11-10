@@ -213,9 +213,22 @@ impl<Backend: Io> EngineState<Backend> {
             let segment_count = rows.orders().len() as u64;
             let used_bytes = rows.file_bytes().0;
             let (mut live, mut dead) = (0, 0);
-            for_each_column(&rows, |_row, column| {
+            let mut split = DeadSplit::default();
+            for_each_column(&rows, |row, column| {
                 live += column.live_bytes.0;
                 dead += column.dead_bytes.0;
+                let segment = row;
+                if !rows.get(segment).is_some_and(|summary| summary.facts.is_walked()) {
+                    split.unwalked += column.live_bytes.0 + column.dead_bytes.0;
+                    return;
+                }
+                split.counted += column.dead_bytes.0;
+                if volume.dead_bits.exact(segment).is_none() {
+                    split.inexact += column.dead_bytes.0;
+                }
+                if volume.table.highest_replacement(segment).is_some_and(|place| self.cues.has_cue_below(index, place)) {
+                    split.cue_held += column.dead_bytes.0;
+                }
             });
             let claims = hold(&volume.claims);
             let open_bytes: u64 = claims.open.iter().map(|segment| segment.write_end.0).sum();
@@ -270,10 +283,15 @@ impl<Backend: Io> EngineState<Backend> {
                 ingest_left: Nanoseconds(volume.hot_until().0.saturating_sub(self.io.now().0)),
                 idle_seals: volume.idle_seals.load(Ordering::Relaxed),
                 rooms_given_back: volume.rooms_given_back.load(Ordering::Relaxed),
+                is_compaction_held: volume.is_compaction_held(),
                 live_bytes: ByteCount(live),
                 dead_bytes: ByteCount(dead),
                 open_bytes: ByteCount(open_bytes),
                 preallocated: ByteCount(preallocated),
+                dead_counted: ByteCount(split.counted),
+                unwalked_bytes: ByteCount(split.unwalked),
+                inexact_dead: ByteCount(split.inexact),
+                cue_held_dead: ByteCount(split.cue_held),
                 promises_outgrown: volume.promises_outgrown.load(Ordering::Relaxed),
             });
         }
@@ -410,4 +428,14 @@ pub fn lane_counts<Backend: Io>(volume: &Volume<Backend>) -> [u64; MOST_REPORTED
         counts[index.min(MOST_REPORTED_LANES - 1)] += lane.rewrites_done.load(Ordering::Acquire);
     }
     counts
+}
+
+/// Where a volume's dead bytes stand: counted by the walk, on segments the walk hasn't reached, on segments whose bits only
+/// ask, and under a live cue
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeadSplit {
+    pub counted: u64,
+    pub unwalked: u64,
+    pub inexact: u64,
+    pub cue_held: u64,
 }

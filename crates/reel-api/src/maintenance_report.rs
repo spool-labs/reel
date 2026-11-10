@@ -334,12 +334,20 @@ pub struct VolumeReading {
     pub idle_seals: u64,
     /// Quiet open segments that gave their room ahead back
     pub rooms_given_back: u64,
+    /// A test holds compaction off, which only a build with the test hooks can, so a bench run held by accident shows it
+    pub is_compaction_held: bool,
     /// Where the volume's disk goes: live and dead record bytes in sealed segments, bytes written to open ones, and room open
     /// segments hold ahead of their writes
     pub live_bytes: ByteCount,
     pub dead_bytes: ByteCount,
     pub open_bytes: ByteCount,
     pub preallocated: ByteCount,
+    /// Dead bytes the walk has counted, of which some sit on segments whose dead bits only ask and some under a live cue, and
+    /// the record bytes of segments the walk hasn't reached, whose dead share nobody knows yet
+    pub dead_counted: ByteCount,
+    pub unwalked_bytes: ByteCount,
+    pub inexact_dead: ByteCount,
+    pub cue_held_dead: ByteCount,
     /// Merges that wrote past their promise and took more room, which a right estimate never lets happen
     pub promises_outgrown: u64,
 }

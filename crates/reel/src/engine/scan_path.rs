@@ -742,7 +742,14 @@ impl<Backend: Io> EngineState<Backend> {
                         at: RowAt::UNKNOWN,
                     });
                 }
-                step = self.step_source(ReadOn::new(device, volume), column, source, direction, point, take.as_mut()).await?;
+                step = match self.step_source(ReadOn::new(device, volume), column, source, direction, point, take.as_mut()).await {
+                    Ok(step) => step,
+                    // a source that failed partway may have moved, and the tree builds again before it picks
+                    Err(error) => {
+                        scan.is_tree_stale = true;
+                        return Err(error);
+                    },
+                };
             }
             let taken = take.map_or(0, |take| take.rows);
             scan.counted += taken;

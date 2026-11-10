@@ -142,6 +142,14 @@ impl<Backend: Io> RewriteJob<Backend> {
             return Some((target, false));
         }
         let now = self.state.io.now();
+        // busy callers keep their cores: a few merges run while they call, and every worker may merge once they go quiet
+        volume.note_callers(self.state.caller_ops.total(), now);
+        let in_flight = volume.lanes.iter().filter(|lane| lane.is_rewriting.load(Ordering::Acquire)).count();
+        if volume.is_caller_active(now) && in_flight >= volume.merge_cap() {
+            volume.capped_picks.fetch_add(1, Ordering::Relaxed);
+            volume.note_pick(PickOutcome::Deferred);
+            return None;
+        }
         let is_short = volume.is_short_of_room();
         let is_deferring = volume.is_hot(now) && !is_short;
         let is_ingesting = volume.is_ingesting(now);

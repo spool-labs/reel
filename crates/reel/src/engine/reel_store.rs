@@ -18,6 +18,7 @@ use reel_api::write_batch::WriteBatch;
 
 use crate::config::{ColumnConfig, DeviceClass, StoreConfig, VolumeConfig};
 use crate::engine::dead_bits::DeadBits;
+use crate::engine::caller_activity::CallerCounts;
 use crate::engine::admission::Admission;
 use reel_api::maintenance_report::WorkerPriority;
 use crate::engine::column_info::ColumnInfo;
@@ -228,6 +229,8 @@ impl<Backend: Io> ReelStore<Backend> {
 
     /// Refuse a call after close
     pub fn check_open(&self) -> Result<(), StoreError> {
+        // every caller operation comes through here, and its count tells maintenance callers are still busy
+        self.state.caller_ops.note();
         if self.is_closed.load(Ordering::Acquire) {
             return Err(StoreError::Closed);
         }
@@ -1243,6 +1246,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         graves_carried: AtomicU64::new(0),
         empty_rewrites: AtomicU64::new(0),
         corruption_errors: AtomicU64::new(0),
+        caller_ops: CallerCounts::default(),
         is_arena_full: AtomicBool::new(false),
         arena_fill: AtomicU64::new(0),
         unlinks_refused: AtomicU64::new(0),
@@ -1390,6 +1394,9 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         idle_seals: AtomicU64::new(0),
         park_refusals: AtomicU64::new(0),
         most_in_flight: AtomicU64::new(0),
+        callers_seen: AtomicU64::new(0),
+        last_call_at: AtomicU64::new(0),
+        capped_picks: AtomicU64::new(0),
         outputs_promised: AtomicU64::new(0),
         is_room_short: AtomicBool::new(false),
         is_room_refused: AtomicBool::new(false),

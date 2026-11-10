@@ -23,6 +23,7 @@ pub mod read_only;
 pub mod rebuild;
 pub mod read_path;
 pub mod block_lookups;
+pub mod caller_activity;
 pub mod dead_bits;
 pub mod read_pool;
 pub mod recovery;

@@ -12,6 +12,7 @@ use reel_api::memory_report::MemoryReport;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, SegmentCount, WritePlace};
 
+use crate::engine::caller_activity::CallerCounts;
 use crate::engine::rewrite_job::rows_of;
 use crate::engine::admission::{Admission, Admit, Decision, JobRole, reserve_for, room_for};
 use reel_api::maintenance_report::WorkerPriority;
@@ -141,6 +142,8 @@ pub struct EngineState<Backend: Io> {
     pub graves_carried: AtomicU64,
     pub empty_rewrites: AtomicU64,
     pub corruption_errors: AtomicU64,
+    /// Caller operations, so maintenance can tell callers are busy
+    pub caller_ops: CallerCounts,
     pub is_arena_full: AtomicBool,
     pub arena_fill: AtomicU64,
     pub unlinks_refused: AtomicU64,

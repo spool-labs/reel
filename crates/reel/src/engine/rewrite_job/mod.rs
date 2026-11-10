@@ -28,6 +28,7 @@ use crate::fixed_list::{FixedList, ListFull};
 use crate::region::{LIST_ALIGN_ROOM, REGION_HEAD_BYTES, Region, list_bytes};
 use crate::engine::held_bits::HeldBits;
 use crate::engine::admission::{Admit, JobRole, PICK_HALVINGS};
+use crate::engine::dead_bits::BitsExtent;
 use crate::segment::key_cursor::KeyCursor;
 use crate::segment::damage_list::DamagedRange;
 use crate::segment::footer_writer::{FooterTotals, FooterWriter};
@@ -268,6 +269,14 @@ impl MergeInput {
         if self.row.is_some() { self.rows_seen - 1 } else { self.rows_seen }
     }
 
+    /// Read the block of the row in hand and its place among the block's rows
+    pub fn row_place(&self) -> Option<(u32, u32)> {
+        self.row?;
+        let block = self.next_block.checked_sub(1)?;
+        let first = u64::from(*self.block_firsts.get(block as usize)?);
+        Some((block, u32::try_from(self.ordinal().checked_sub(first)?).ok()?))
+    }
+
     /// Go back to the first row
     pub fn rewind(&mut self) {
         self.rows_seen = 0;
@@ -413,6 +422,13 @@ pub struct RewriteJob<Backend: Io> {
     unit: (UnitKind, u64),
     /// The input the row in hand came from
     row_input: usize,
+    /// The row in hand comes from an input whose walk had finished when the step pinned it
+    row_walked: bool,
+    /// Each input's exact bits, read once a merge, and the volume's spoils when they were read
+    bit_extents: [Option<Option<BitsExtent>>; MOST_MERGE_SEGMENTS],
+    bits_seen: u64,
+    /// Rows a bit decided this merge, so one in so many is asked as well
+    bit_rows: u64,
     /// The row in hand's place among every input's rows, its input's base and its place in that input
     row_at: u64,
     is_ordered: bool,
@@ -538,6 +554,10 @@ impl<Backend: Io> RewriteJob<Backend> {
             stripe_copied: None,
             unit: (UnitKind::MergeRows, 0),
             row_input: 0,
+            row_walked: false,
+            bit_extents: [None; MOST_MERGE_SEGMENTS],
+            bits_seen: 0,
+            bit_rows: 0,
             row_at: 0,
             is_ordered: false,
             cut_ordinals: [[0; MOST_MERGE_SEGMENTS]; MOST_MERGE_OUTPUTS],

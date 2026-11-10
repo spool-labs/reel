@@ -202,6 +202,8 @@ pub struct TestHolds {
     pub low_estimate: AtomicBool,
     /// Walks and merges look keys up through the table alone, to compare against the cursor
     pub no_cursor: AtomicBool,
+    /// Merges ask every row, to compare against the dead bits
+    pub no_bits: AtomicBool,
 }
 
 /// One volume of a store
@@ -450,6 +452,18 @@ impl<Backend: Io> Volume<Backend> {
     /// Check a test has walks and merges skip the cursor, which a build without the hooks never does
     #[cfg(not(feature = "test-hooks"))]
     pub const fn is_cursor_held_off(&self) -> bool {
+        false
+    }
+
+    /// Check a test has merges ask every row
+    #[cfg(feature = "test-hooks")]
+    pub fn are_bits_held_off(&self) -> bool {
+        self.holds.no_bits.load(Ordering::Acquire)
+    }
+
+    /// Check a test has merges ask every row, which a build without the hooks never does
+    #[cfg(not(feature = "test-hooks"))]
+    pub const fn are_bits_held_off(&self) -> bool {
         false
     }
 

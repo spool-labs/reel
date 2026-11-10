@@ -8,6 +8,7 @@ use std::sync::atomic::Ordering;
 use std::thread;
 
 use crate::seed_sets::seeds;
+use reel::engine::dead_bits::DECIDED_WRONG;
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::claim::Claim;
 use reel::engine::engine_state::EngineState;
@@ -931,6 +932,7 @@ fn run_interleaving(seed: Seed) {
                 let volume = &state.volumes[0];
                 assert_eq!(volume.promises_outgrown.load(Ordering::Acquire), 0, "a merge wrote past its estimate");
                 assert_eq!(volume.outputs_promised.load(Ordering::Acquire), 0, "a settled store kept a promise");
+                assert_eq!(volume.dead_bits.decided[DECIDED_WRONG].load(Ordering::Acquire), 0, "a set bit had no newer row");
                 let mark = state.read_point(&state.volumes[0]).0;
                 for key in history.keys() {
                     assert_eq!(read(&store, key), newest_at(&history, key, mark));

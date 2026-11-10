@@ -110,6 +110,12 @@ impl HeldBits {
         }
     }
 
+    /// Check a row of an input has its bit set
+    pub fn is_set(&self, segment: SegmentNumber, block: u32, index: u32) -> bool {
+        let row = HeldRow { segment, lane: 0, block, at: RowAt { index, rows: index + 1 } };
+        self.bit_of(&row).is_ok_and(|(word, mask)| self.words[word] & mask != 0)
+    }
+
     /// Read the bits of one block of an input
     pub fn block_bits(&self, input: usize, block: u32) -> &[u64] {
         let held = &self.inputs[input];

@@ -14,6 +14,7 @@ use reel::engine::open_segment::SegmentPhase;
 use reel::engine::planner::{Planner, WALK_LAG_SEGMENTS};
 use reel::engine::reel_store::ReelStore;
 use reel::engine::engine_sizing::CURSOR_BYTES;
+use reel::engine::dead_bits::{DECIDED_CLEAR, DECIDED_SET, DECIDED_WRONG};
 use reel::segment::key_cursor::KeyCursor;
 use reel_sim::simulated_file::SimulatedFile;
 use reel::engine::held_bits::HeldBits;
@@ -1117,6 +1118,7 @@ fn cursor_arm(seed: u64, is_cursor_off: bool, is_merging: bool) -> (Vec<(u64, u6
     }
     settle(&io);
     let exact = check_dead_bits(volume);
+    assert_eq!(volume.dead_bits.decided[DECIDED_WRONG].load(Ordering::Acquire), 0, "seed {seed}: a set bit had no newer row");
     assert!(is_cursor_off || exact > 0, "seed {seed}: no segment kept exact bits");
     let counts = hold(&volume.summary).rows().map(|row| {
         let column = row.cursor().column().expect("a column");
@@ -1154,4 +1156,70 @@ fn check_dead_bits(volume: &reel::engine::volume::Volume<SimulatedIo>) -> usize 
         exact += 1;
     }
     exact
+}
+
+// a merge of a walked segment whose rows newer segments replaced drops them by their bits, with no ask, and every bit it
+// trusted the old ask confirms
+#[test]
+fn set_bits_drop_with_no_ask() {
+    let io = SimulatedIo::new(Seed(64));
+    let store = open_workers(&io);
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    let (older, newer, third) = three_segments(&store, &io, &[b"d"]);
+    io.hold_jobs(WALK_JOB, false);
+    io.hold_jobs("reel-walk", false);
+    settle(&io);
+    assert_eq!(dead_rows_of(&store, older), 4, "the walk left a row of the older segment uncounted");
+
+    let mut merge = CompactJob::new(state.clone(), 0);
+    while !merge.rewrite.start() {
+        assert!(merge.rewrite.has_looks_left, "no rewrite started");
+    }
+    assert_eq!(merge.rewrite.input_numbers(), [older]);
+    while merge.rewrite.is_running() {
+        merge.rewrite.step();
+    }
+    let decided = volume.dead_bits.decided.each_ref().map(|count| count.load(Ordering::Acquire));
+    assert!(decided[DECIDED_SET] > 0, "no bit decided a drop: {decided:?}");
+    assert_eq!(decided[DECIDED_WRONG], 0);
+    assert_eq!(hold(&volume.summary).orders().present(), [newer, third], "the merge kept an older row");
+    for (key, value) in [(b"a", &b"second"[..]), (b"b", b"second"), (b"c", b"second"), (b"d", b"third")] {
+        let mut buf = Vec::new();
+        assert!(store.get(COLUMN, key, &mut buf).expect("get"));
+        assert_eq!(buf, value);
+    }
+    store.close().expect("close");
+}
+
+// damage spoils the volume's bits for good: once its record is gone and the volume reads clean, a merge still asks every row,
+// since a bit can't say whether the row that set it was among what was lost
+#[test]
+fn healed_volume_keeps_bits_spoiled() {
+    let io = SimulatedIo::new(Seed(65));
+    let store = open_workers(&io);
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    let (older, newer, _third) = three_segments(&store, &io, &[b"d"]);
+    io.hold_jobs(WALK_JOB, false);
+    io.hold_jobs("reel-walk", false);
+    settle(&io);
+    assert!(volume.dead_bits.exact(older).is_some());
+
+    state.damage_unread(0, newer);
+    volume.damage.drop_segment(newer);
+    hold(&volume.damaged).retain(|number| *number != newer);
+    assert!(volume.damage.is_empty() && hold(&volume.damaged).is_empty(), "the volume still reads damaged");
+    assert!(volume.dead_bits.exact(older).is_none(), "the damage left the bits exact");
+
+    let mut merge = CompactJob::new(state.clone(), 0);
+    while !merge.rewrite.start() {
+        assert!(merge.rewrite.has_looks_left, "no rewrite started");
+    }
+    while merge.rewrite.is_running() {
+        merge.rewrite.step();
+    }
+    let decided = volume.dead_bits.decided.each_ref().map(|count| count.load(Ordering::Acquire));
+    assert_eq!(decided[DECIDED_SET] + decided[DECIDED_CLEAR], 0, "a merge trusted a spoiled bit: {decided:?}");
+    store.close().expect("close");
 }

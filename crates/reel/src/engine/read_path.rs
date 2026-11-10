@@ -701,6 +701,24 @@ impl<Backend: Io> EngineState<Backend> {
         self.search_directory(device, volume, directory, read, &mut reader).await
     }
 
+    /// Check a newer row of a key than a place sits in a sealed segment other than some, walked or not
+    pub fn has_newer_sealed(
+        &self,
+        volume: &Volume<Backend>,
+        column: ColumnId,
+        key: &[u8],
+        place: WritePlace,
+        skipped: &[SegmentNumber],
+    ) -> Result<bool, StoreError> {
+        let Some(directory) = &self.directories[column.0 as usize] else {
+            return Ok(false);
+        };
+        let read = self.key_read(column, key, WritePlace(u64::MAX), false)?;
+        let mut reader = self.job_footer_readers.lease();
+        let sealed = in_place(self.walk_candidates(&InPlace, volume, directory, &read, &mut reader, WalkAsk { skipped, above: Some(place), ..WalkAsk::EVERY }))?;
+        Ok(sealed.is_some_and(|found| found.row.place > place))
+    }
+
     /// Check an older row of a key could still be read: in a sealed segment other than one, or among the open rows
     pub fn has_older_row(
         &self,

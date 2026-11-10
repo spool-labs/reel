@@ -21,6 +21,14 @@ pub const INEXACT_PLACE: usize = 0;
 pub const INEXACT_OVERFLOW: usize = 1;
 pub const INEXACT_DAMAGE: usize = 2;
 pub const INEXACT_POOL: usize = 3;
+/// Rows a merge decides by bit for each one it also asks, in a build without the test hooks
+pub const BIT_SAMPLE_EVERY: u64 = 1024;
+/// Places in the merge counts: set and dropped, clear and kept, asked as well, set with no newer row, clear with one
+pub const DECIDED_SET: usize = 0;
+pub const DECIDED_CLEAR: usize = 1;
+pub const DECIDED_ASKED: usize = 2;
+pub const DECIDED_WRONG: usize = 3;
+pub const DECIDED_SHORT: usize = 4;
 
 /// A row the walk charged, kept beside its block's count until the count lands
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -62,6 +70,11 @@ pub struct DeadBits {
     books: Mutex<BitsBooks>,
     /// Segments made inexact, by cause: unknown place, list overflow, damage, pool short
     pub inexact: [AtomicU64; 4],
+    /// Spoils so far, so a merge that read an extent reads it again after one
+    pub spoils: AtomicU64,
+    /// Merge rows by what their bit gave: set and dropped, clear and kept, asked as well, a set bit the ask found no newer row
+    /// for, a clear bit the ask found one for
+    pub decided: [AtomicU64; 5],
 }
 
 /// Words one block of a segment takes, enough for the most rows any of its blocks holds
@@ -81,6 +94,8 @@ impl DeadBits {
             words: (0..words).map(|_word| AtomicU64::new(0)).collect(),
             books: Mutex::new(BitsBooks { extents: HashMap::with_capacity(most_segments), free }),
             inexact: Default::default(),
+            spoils: AtomicU64::new(0),
+            decided: Default::default(),
         }
     }
 
@@ -166,6 +181,7 @@ impl DeadBits {
 
     /// Mark the segments a block charged inexact, when the block's rows didn't fit their list
     pub fn spoil(&self, counts: &[DeadCount]) {
+        self.spoils.fetch_add(1, Ordering::AcqRel);
         let mut books = hold(&self.books);
         for count in counts {
             if let Some(extent) = books.extents.get_mut(&count.segment) {
@@ -177,6 +193,7 @@ impl DeadBits {
 
     /// Mark every segment's bits inexact, after damage or a rebuild, since a bit can't say which row set it and that row may be gone
     pub fn spoil_all(&self) {
+        self.spoils.fetch_add(1, Ordering::AcqRel);
         let mut books = hold(&self.books);
         let mut spoiled = 0;
         for extent in books.extents.values_mut().filter(|extent| extent.is_exact) {

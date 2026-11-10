@@ -159,11 +159,12 @@ impl<Backend: Io> EngineState<Backend> {
         report.longest_room_step = Nanoseconds(self.longest_room_step.load(Ordering::Relaxed));
         report.cursor_lookups = array::from_fn(|kind| self.cursor_lookups[kind].load(Ordering::Relaxed));
         report.merge_lookups = array::from_fn(|kind| self.merge_lookups[kind].load(Ordering::Relaxed));
-        report.dead_bits = [0; 7];
+        report.dead_bits = [0; 12];
         for volume in &self.volumes {
             let (used, segments) = volume.dead_bits.used();
             let inexact = volume.dead_bits.inexact.each_ref().map(|count| count.load(Ordering::Relaxed));
-            let readings = [volume.dead_bits.heap_bytes().0, used.0, segments, inexact[0], inexact[1], inexact[2], inexact[3]];
+            let decided = volume.dead_bits.decided.each_ref().map(|count| count.load(Ordering::Relaxed));
+            let readings = [volume.dead_bits.heap_bytes().0, used.0, segments, inexact[0], inexact[1], inexact[2], inexact[3], decided[0], decided[1], decided[2], decided[3], decided[4]];
             for (total, reading) in report.dead_bits.iter_mut().zip(readings) {
                 *total += reading;
             }

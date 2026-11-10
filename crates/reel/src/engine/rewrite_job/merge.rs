@@ -13,6 +13,7 @@ use reel_api::maintenance_report::{
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, WritePlace};
 
+use crate::engine::dead_bits::{BIT_SAMPLE_EVERY, DECIDED_ASKED, DECIDED_CLEAR, DECIDED_SET, DECIDED_SHORT, DECIDED_WRONG};
 use crate::engine::read_path::SealedRow;
 use crate::engine::open_segment::output_path;
 use crate::engine::seal_job::MOST_SEGMENT_BLOCKS;
@@ -99,6 +100,8 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.highest_replacement = WritePlace(0);
         self.dropped_rows = 0;
         self.dropped_graves = 0;
+        self.bit_extents = [None; MOST_MERGE_SEGMENTS];
+        self.bit_rows = 0;
         self.park_wait_since = None;
         self.data_slot = 0;
         self.is_cutting = false;
@@ -210,6 +213,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             };
             self.key.set_from(&input.key)?;
             self.row_input = index;
+            self.row_walked = pin.is_walked;
             self.row_at = input.base + input.ordinal();
             // the lists are sized to the summary's rows, and a row past its input's count says the summary counted short
             if self.is_ordered && input.ordinal() >= input.block_rows {
@@ -327,17 +331,90 @@ impl<Backend: Io> RewriteJob<Backend> {
             // a cover whose walk has counted what it hides replaces a row as a newer row does
             self.cover_place = if self.is_unwalked { None } else { volume.covers.newest_applied(column, &self.key) };
             // an unwalked merge goes by its own rows, so it runs at the disk's rate and leaves the rest to the output's walk
-            self.cursor.counts.rows_skipped += u64::from(self.is_unwalked);
-            self.cursor.counts.rows_asked += u64::from(!self.is_unwalked);
-            self.newest_place = match self.newest_outside(volume, column) {
-                Ok(found) => found.map(|found| found.row.place),
-                // a version a damaged block hides replaces nothing, and the row stays
-                Err(StoreError::Corruption { .. }) => None,
-                Err(_error) => return Err(Error::from(ErrorKind::Interrupted)),
+            self.newest_place = match self.bit_answer(volume, column, row)? {
+                Some(answer) => answer,
+                None => {
+                    self.cursor.counts.rows_skipped += u64::from(self.is_unwalked);
+                    self.cursor.counts.rows_asked += u64::from(!self.is_unwalked);
+                    self.asked_outside(volume, column)?
+                },
             };
         }
         let own = (!is_top).then_some(self.top_place);
         Ok(own.max(self.newest_place).max(self.cover_place).filter(|place| *place > row.place))
+    }
+
+    /// Ask the finished segments outside the merge for the key's newest place above its top row here
+    pub fn asked_outside(&mut self, volume: &Volume<Backend>, column: ColumnId) -> Result<Option<WritePlace>> {
+        match self.newest_outside(volume, column) {
+            Ok(found) => Ok(found.map(|found| found.row.place)),
+            // a version a damaged block hides replaces nothing, and the row stays
+            Err(StoreError::Corruption { .. }) => Ok(None),
+            Err(_error) => Err(Error::from(ErrorKind::Interrupted)),
+        }
+    }
+
+    /// Answer a key's top row by its dead bit: set, a newer row replaced it at or under the input's highest replacement; clear,
+    /// nothing outside did. Nothing when the row has to ask: an unwalked input or merge, bits that aren't exact, damage, a parked
+    /// segment, a stray output, or a live cue that could read the row
+    pub fn bit_answer(&mut self, volume: &Volume<Backend>, column: ColumnId, row: &FooterRow) -> Result<Option<Option<WritePlace>>> {
+        if self.is_unwalked || !self.row_walked || volume.are_bits_held_off() {
+            return Ok(None);
+        }
+        let state = Arc::clone(&self.state);
+        let is_clean = volume.segments_parked.load(Ordering::Acquire) == 0
+            && volume.stray_outputs.load(Ordering::Acquire) == 0
+            && volume.damage.is_empty()
+            && hold(&volume.damaged).is_empty();
+        if !is_clean || state.cues.has_cue_between(self.volume, row.place, WritePlace(u64::MAX)) {
+            return Ok(None);
+        }
+        let spoils = volume.dead_bits.spoils.load(Ordering::Acquire);
+        if spoils != self.bits_seen {
+            self.bit_extents = [None; MOST_MERGE_SEGMENTS];
+            self.bits_seen = spoils;
+        }
+        let input = self.row_input;
+        let segment = self.numbers[input];
+        let Some(extent) = *self.bit_extents[input].get_or_insert_with(|| volume.dead_bits.exact(segment)) else {
+            return Ok(None);
+        };
+        let Some((block, index)) = self.inputs[input].row_place() else {
+            return Ok(None);
+        };
+        let Some(is_dead) = volume.dead_bits.is_set(&extent, block, index) else {
+            return Ok(None);
+        };
+        // a walk that charges a row of a held input sets the lane's bit, and leaves the table's replacement as it was
+        let is_held = !is_dead && hold(&volume.lanes[self.lane].held).is_set(segment, block, index);
+        let is_set = is_dead || is_held;
+        let bound = match is_held {
+            true => Some(WritePlace(volume.highest_sealed.load(Ordering::Acquire))),
+            false => volume.table.highest_replacement(segment),
+        };
+        let answer = match is_set {
+            true => match bound.filter(|place| *place > row.place) {
+                Some(place) => Some(place),
+                None => return Ok(None),
+            },
+            false => None,
+        };
+        let decided = &volume.dead_bits.decided;
+        decided[if is_set { DECIDED_SET } else { DECIDED_CLEAR }].fetch_add(1, Ordering::Relaxed);
+        self.bit_rows += 1;
+        // one row in so many asks as well: a set bit with no newer row anywhere is wrong, a clear bit the ask finds replaced is
+        // a row the walk didn't charge
+        if cfg!(feature = "test-hooks") || self.bit_rows % BIT_SAMPLE_EVERY == 0 {
+            decided[DECIDED_ASKED].fetch_add(1, Ordering::Relaxed);
+            let inputs = &self.numbers[..self.input_count];
+            if is_set && !state.has_newer_sealed(volume, column, &self.key, row.place, inputs).unwrap_or(true) {
+                decided[DECIDED_WRONG].fetch_add(1, Ordering::Relaxed);
+            }
+            if !is_set && self.asked_outside(volume, column)?.is_some_and(|place| place > row.place) {
+                decided[DECIDED_SHORT].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Ok(Some(answer))
     }
 
     /// Find a key's newest row in a finished segment outside the merge, above its top row here. One below that replaces nothing
@@ -363,7 +440,7 @@ impl<Backend: Io> RewriteJob<Backend> {
     /// drops first, as any row with a newer one does. A file on its way out comes back at a crash, so no grave drops while
     /// one is parked. A cue below the grave can read what it covers, and damage could be hiding an older version
     pub fn hides_nothing(&self, volume: &Volume<Backend>, column: ColumnId, row: &FooterRow) -> Result<bool> {
-        let state = &self.state;
+        let state = Arc::clone(&self.state);
         if volume.segments_parked.load(Ordering::Acquire) > 0
             || volume.stray_outputs.load(Ordering::Acquire) > 0
             || state.cues.has_cue_below(self.volume, row.place)

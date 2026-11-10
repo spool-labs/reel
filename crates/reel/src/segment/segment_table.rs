@@ -392,6 +392,13 @@ impl<File: Clone> SegmentTable<File> {
         lines.get(index).filter(|line| line.block_offset == offset).map(|_line| index as u32)
     }
 
+    /// Read the highest place any charge on a segment's rows named, which bounds the replacement of each of them
+    pub fn highest_replacement(&self, number: SegmentNumber) -> Option<WritePlace> {
+        let guard = self.shards.read(shard_of(number));
+        let slot = guard.map.get(number)?;
+        Some(guard.segments[slot as usize].as_ref()?.highest_replacement)
+    }
+
     /// Read the highest place that replaced a segment's rows, or nothing while a block still has a live row. The place lives
     /// here alone, and it starts at zero after an open, where no cue can read below what was already written
     pub fn dead_replacement(&self, number: SegmentNumber) -> Option<WritePlace> {

@@ -32,7 +32,7 @@ fn reach_grows_along_a_run() {
         lengths.push(length);
         offset += length as u64;
     }
-    assert_eq!(lengths, [4_096, 8_192, 16_384, 32_768, 65_536, 65_536]);
+    assert_eq!(lengths, [4_096, 8_192, 16_384, 16_384, 16_384, 16_384]);
 }
 
 // a row far from the window starts the reach over, so a scattered walk reads no more than its rows

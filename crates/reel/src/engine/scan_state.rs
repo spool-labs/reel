@@ -434,12 +434,12 @@ pub fn planned_scan_bytes(widest_key: u64, open_slots: usize) -> u64 {
     let keys = (MOST_SCAN_SOURCES + SHARD_COUNT + 6) as u64 * widest_key;
     let sources = (MOST_SCAN_SOURCES + 1) * size_of::<SegmentSource>();
     let heads = SHARD_COUNT * (size_of::<ShardHead>() + open_slots * size_of::<TreeCursor>());
-    keys + (sources + heads + MOST_SCAN_SOURCES * size_of::<SegmentNumber>() + SCAN_WINDOW_BYTES) as u64
+    keys + (sources + heads + MOST_SCAN_SOURCES * size_of::<SegmentNumber>() + SCAN_WINDOWS * SCAN_WINDOW_BYTES) as u64
 }
 
 
 /// Bytes a scan's window reads at its widest
-pub const SCAN_WINDOW_BYTES: usize = 32 * 1024;
+pub const SCAN_WINDOW_BYTES: usize = 16 * 1024;
 /// Windows a scan keeps, so rows interleaved across segments each keep their stretch
 pub const SCAN_WINDOWS: usize = 4;
 /// Bytes a window reads until rows show they lie side by side

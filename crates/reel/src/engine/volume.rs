@@ -1,7 +1,7 @@
 //! One volume: its roots, its open segments, its sealed segments and its sync state
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use reel_api::maintenance_report::{PICK_OUTCOMES, PickOutcome, SHARE_KINDS, SPAN_RUN_BUCKETS, SealSteps};
@@ -328,6 +328,10 @@ pub struct Volume<Backend: Io> {
     pub given_up_by_phase: [AtomicU64; 6],
     /// Bytes merges wrote and gave up, by why: interrupted, out of room, an input gone, bad data, anything else
     pub given_up_by_kind: [AtomicU64; 5],
+    /// Park slots the running merges claimed for their inputs
+    pub parks_promised: AtomicUsize,
+    /// Installs that waited past MOST_PARK_WAIT for park room
+    pub long_park_waits: AtomicU64,
     /// Merges that wrote past their promise and took more room
     pub promises_outgrown: AtomicU64,
     /// A merge was refused for disk room, so the planner looks again on a timer, since no write may come to wake it
@@ -573,6 +577,11 @@ impl<Backend: Io> Volume<Backend> {
 
     /// Count the park's free slots
     pub fn park_room(&self) -> usize {
+        self.free_park_slots().saturating_sub(self.parks_promised.load(Ordering::Acquire))
+    }
+
+    /// Count the park's free slots, with none set aside for merges under way
+    pub fn free_park_slots(&self) -> usize {
         hold(&self.parked).iter().filter(|slot| slot.is_none()).count()
     }
 

@@ -84,7 +84,7 @@ pub const STAGED_COLUMN_KEY_BYTES: usize = 2 * SUMMARY_KEY_BYTES + 2;
 pub const RUN_KEYS: usize = 8;
 /// Most row blocks the output for kept graves can have, past which the merge gives way
 pub const MOST_GRAVE_BLOCKS: BlockCount = BlockCount(2_048);
-/// How long an install waits for room to park its inputs, past which the merge gives way
+/// How long an install waits for room to park its inputs before the report counts it as long
 pub const MOST_PARK_WAIT: Nanoseconds = Nanoseconds(10_000_000_000);
 /// Most segments of a column that overlap one key before a merge is due, for records up to the base size
 pub const MOST_OVERLAP: usize = 32;
@@ -333,6 +333,7 @@ pub struct RewriteJob<Backend: Io> {
     pub target: Option<MergeTarget>,
     pub phase: RewritePhase,
     promised: ByteCount,
+    parks_held: usize,
     pub output: Option<RewriteOutput<Backend::File>>,
     pub grave_output: Option<RewriteOutput<Backend::File>>,
     pub writer: FooterWriter,
@@ -365,7 +366,7 @@ pub struct RewriteJob<Backend: Io> {
     dropped_rows: u64,
     dropped_graves: u64,
     kept_dead: FixedList<DeadCount>,
-    park_wait_since: Option<Nanoseconds>,
+    park_wait_since: Option<Nanoseconds>, is_long_wait_noted: bool,
     pub cut_floor: u64,
     cut_bytes: u64,
     data_slot: usize,
@@ -502,7 +503,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             dropped_rows: 0,
             dropped_graves: 0,
             kept_dead: FixedList::empty(),
-            park_wait_since: None,
+            park_wait_since: None, is_long_wait_noted: false,
             cut_floor,
             cut_bytes: 0,
             data_slot: 0,
@@ -554,6 +555,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             has_looks_left: false,
             picked_as: None,
             promised: ByteCount(0),
+            parks_held: 0,
             is_whole_pass: true,
             begun_at: Nanoseconds(0),
             held_words: FixedList::empty(),
@@ -728,6 +730,8 @@ impl<Backend: Io> RewriteJob<Backend> {
                 self.admitted = Some((admit, bound));
                 self.promised = output;
                 volume.outputs_promised.fetch_add(output.0, Ordering::AcqRel);
+                self.parks_held = self.input_count;
+                volume.parks_promised.fetch_add(self.input_count, Ordering::AcqRel);
                 volume.is_room_short.store(false, Ordering::Release);
                 self.forced_pick = None;
                 return Some(picked);

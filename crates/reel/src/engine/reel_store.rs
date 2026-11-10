@@ -2,7 +2,7 @@
 
 use std::io::{Error, ErrorKind};
 use std::mem;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use reel_api::column_id::ColumnId;
@@ -1380,6 +1380,8 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         outputs_promised: AtomicU64::new(0),
         is_room_short: AtomicBool::new(false),
         promises_outgrown: AtomicU64::new(0),
+        parks_promised: AtomicUsize::new(0),
+        long_park_waits: AtomicU64::new(0),
         given_up_by_phase: Default::default(),
         given_up_by_kind: Default::default(),
         last_write_at: AtomicU64::new(0),

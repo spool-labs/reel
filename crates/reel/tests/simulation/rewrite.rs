@@ -1263,10 +1263,10 @@ fn overlap_needs_two() {
     io.kill();
 }
 
-// a park that stays full ends the wait once its time runs out, however many steps it took, and the merge gives way with the
-// inputs where they were
+// a merge with its outputs written waits on a full park as long as it takes, counts a long wait, and gives way only to a stop,
+// with the inputs where they were
 #[test]
-fn park_wait_ends() {
+fn park_wait_lasts_until_a_stop() {
     let io = SimulatedIo::new(Seed(35));
     let store = open(&io);
     hold_compaction(&store, true);
@@ -1287,6 +1287,10 @@ fn park_wait_ends() {
     }
     assert!(job.rewrite.is_running(), "steps alone ended the wait");
     io.advance_clock(Nanoseconds(MOST_PARK_WAIT.0 + 1));
+    job.rewrite.step();
+    assert!(job.rewrite.is_running(), "a long wait gave the written merge up");
+    assert_eq!(volume.long_park_waits.load(Ordering::Acquire), 1);
+    store.state.is_stopping.store(true, Ordering::Release);
     job.rewrite.step();
     assert!(!job.rewrite.is_running());
     assert!(inputs.iter().all(|input| volume.table.holds(*input)));
@@ -3211,4 +3215,32 @@ fn large_records_raise_the_bound() {
         run_to_end(&mut job);
     }
     store.close().expect("close");
+}
+
+// a claim sets its inputs' park slots aside, so a merge beside it starts only when the park holds both
+#[test]
+fn claims_share_the_park() {
+    let io = SimulatedIo::new(Seed(96));
+    let mut config = config();
+    config.threads.maintenance_workers = Some(2);
+    config.memory_budget = WORKER_BUDGET;
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    hold_compaction(&store, true);
+    pile_up(&store, &io, 2 * OVER_THE_BOUND);
+    let stand_in = stand_in_parked(&store);
+    fill_park(&store, &stand_in, MOST_PARKED - MOST_MERGE_SEGMENTS);
+
+    let start = |job: &mut RewriteJob<SimulatedIo>| loop {
+        if job.start() {
+            return true;
+        }
+        if !job.has_looks_left {
+            return false;
+        }
+    };
+    let mut first = RewriteJob::new(Arc::clone(&store.state), 0, PLANNER_LANE + 1);
+    let mut second = RewriteJob::new(Arc::clone(&store.state), 0, PLANNER_LANE + 2);
+    assert!(start(&mut first));
+    assert!(!start(&mut second), "a second merge claimed the park slots the first set aside");
+    io.kill();
 }

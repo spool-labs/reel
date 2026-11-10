@@ -235,19 +235,25 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.note_stale();
         let state = Arc::clone(&self.state);
         let volume = &state.volumes[self.volume];
-        // a full park clears as reads finish, and this step comes round again until the wait runs out
-        if !volume.can_park(self.input_count) {
-            let now = state.io.now();
-            let since = *self.park_wait_since.get_or_insert(now);
-            // the planner clears the park once reads let go of what it holds, so it gets the turn this wait is for
+        // the claim set park slots aside, so the free ones are this merge's, and a full park clears as reads let go
+        if volume.free_park_slots() < self.input_count {
+            // the planner clears the park, so it gets the turn this wait is for
             if let Some(task) = state.planner_task.get() {
                 task.wake();
             }
-            if now.0.saturating_sub(since.0) > MOST_PARK_WAIT.0 {
+            // a merge with every output written gives way only to a stop, since giving up costs the whole write
+            if state.is_stopping.load(Ordering::Acquire) {
                 return Err(Error::from(ErrorKind::Interrupted));
+            }
+            let now = state.io.now();
+            let since = *self.park_wait_since.get_or_insert(now);
+            if now.0.saturating_sub(since.0) > MOST_PARK_WAIT.0 && !self.is_long_wait_noted {
+                volume.long_park_waits.fetch_add(1, Ordering::Relaxed);
+                self.is_long_wait_noted = true;
             }
             return Ok(());
         }
+        self.is_long_wait_noted = false;
         self.park_wait_since = None;
         if state.read_point(volume) < self.highest_replacement {
             return Err(Error::from(ErrorKind::Interrupted));
@@ -598,6 +604,8 @@ impl<Backend: Io> RewriteJob<Backend> {
     /// Give back the output room this merge claimed
     pub fn release_promise(&mut self, volume: &Volume<Backend>) {
         volume.outputs_promised.fetch_sub(self.promised.0, Ordering::AcqRel);
+        volume.parks_promised.fetch_sub(self.parks_held, Ordering::AcqRel);
+        self.parks_held = 0;
         self.promised = ByteCount(0);
     }
 }

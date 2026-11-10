@@ -768,7 +768,9 @@ impl<Backend: Io> WalkJob<Backend> {
         if counts.are_rows_cut {
             volume.dead_bits.spoil(&counts.counts);
         }
-        volume.dead_bits.land(&counts.dead_rows, &mut counts.counts);
+        if !volume.are_bits_lost() {
+            volume.dead_bits.land(&counts.dead_rows, &mut counts.counts);
+        }
         counts.counts.sort_unstable_by_key(|count| count.segment);
         let mut rows = hold(&volume.summary);
         rows.apply_walk(target.segment, next_block, &counts.counts);

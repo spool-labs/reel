@@ -214,6 +214,8 @@ pub struct TestHolds {
     pub sample_bits: AtomicBool,
     /// Merges in flight while callers are busy, in place of the built-in cap, for a sweep; zero keeps the cap
     pub merge_cap: AtomicUsize,
+    /// The walk lands its counts with no bits, as a missed charge would leave them
+    pub lose_bits: AtomicBool,
 }
 
 /// One volume of a store
@@ -484,6 +486,18 @@ impl<Backend: Io> Volume<Backend> {
     /// Check every bit decision is asked as well, which a build without the hooks never does
     #[cfg(not(feature = "test-hooks"))]
     pub const fn asks_every_bit(&self) -> bool {
+        false
+    }
+
+    /// Check a test has the walk land counts with no bits
+    #[cfg(feature = "test-hooks")]
+    pub fn are_bits_lost(&self) -> bool {
+        self.holds.lose_bits.load(Ordering::Acquire)
+    }
+
+    /// Check a test has the walk land counts with no bits, which a build without the hooks never does
+    #[cfg(not(feature = "test-hooks"))]
+    pub const fn are_bits_lost(&self) -> bool {
         false
     }
 

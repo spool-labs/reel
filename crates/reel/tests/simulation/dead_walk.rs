@@ -14,7 +14,7 @@ use reel::engine::open_segment::SegmentPhase;
 use reel::engine::planner::{Planner, WALK_LAG_SEGMENTS};
 use reel::engine::reel_store::ReelStore;
 use reel::engine::engine_sizing::CURSOR_BYTES;
-use reel::engine::dead_bits::{DECIDED_CLEAR, DECIDED_SET, DECIDED_WRONG};
+use reel::engine::dead_bits::{DECIDED_CLEAR, DECIDED_SET, DECIDED_SHORT, DECIDED_WRONG, INEXACT_SHORT};
 use reel::segment::key_cursor::KeyCursor;
 use reel_sim::simulated_file::SimulatedFile;
 use reel::engine::held_bits::HeldBits;
@@ -1223,5 +1223,36 @@ fn healed_volume_keeps_bits_spoiled() {
     }
     let decided = volume.dead_bits.decided.each_ref().map(|count| count.load(Ordering::Acquire));
     assert_eq!(decided[DECIDED_SET] + decided[DECIDED_CLEAR], 0, "a merge trusted a spoiled bit: {decided:?}");
+    store.close().expect("close");
+}
+
+// a clear bit the ask finds replaced shows the walk missed a charge: the segment's bits stop answering, and the merge drops its
+// dead rows by asking
+#[test]
+fn missed_charge_spoils_and_asks() {
+    let io = SimulatedIo::new(Seed(66));
+    let store = open_workers(&io);
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    volume.holds.lose_bits.store(true, Ordering::Release);
+    let (older, newer, third) = three_segments(&store, &io, &[b"d"]);
+    io.hold_jobs(WALK_JOB, false);
+    io.hold_jobs("reel-walk", false);
+    settle(&io);
+    assert!(volume.dead_bits.exact(older).is_some());
+    assert_eq!(dead_rows_of(&store, older), 4, "the walk left a row uncounted");
+
+    let mut merge = CompactJob::new(state.clone(), 0);
+    while !merge.rewrite.start() {
+        assert!(merge.rewrite.has_looks_left, "no rewrite started");
+    }
+    assert_eq!(merge.rewrite.input_numbers(), [older]);
+    while merge.rewrite.is_running() {
+        merge.rewrite.step();
+    }
+    let decided = volume.dead_bits.decided.each_ref().map(|count| count.load(Ordering::Acquire));
+    assert!(decided[DECIDED_SHORT] > 0, "no clear bit was found short: {decided:?}");
+    assert_eq!(volume.dead_bits.inexact[INEXACT_SHORT].load(Ordering::Acquire), 1);
+    assert_eq!(hold(&volume.summary).orders().present(), [newer, third], "the merge kept a dead row");
     store.close().expect("close");
 }

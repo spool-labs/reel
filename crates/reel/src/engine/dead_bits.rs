@@ -22,6 +22,7 @@ pub const INEXACT_OVERFLOW: usize = 1;
 pub const INEXACT_DAMAGE: usize = 2;
 pub const INEXACT_POOL: usize = 3;
 pub const INEXACT_KEPT: usize = 4;
+pub const INEXACT_SHORT: usize = 5;
 /// Rows a merge decides by bit for each one it also asks, in a build without the test hooks
 pub const BIT_SAMPLE_EVERY: u64 = 1024;
 /// Places in the merge counts: set and dropped, clear and kept, asked as well, set with no newer row, clear with one
@@ -70,8 +71,8 @@ pub struct DeadBits {
     words: Vec<AtomicU64>,
     books: Mutex<BitsBooks>,
     /// Segments made inexact, by cause: unknown place, list overflow, damage, pool short, a merge output with counts that came
-    /// with no bits
-    pub inexact: [AtomicU64; 5],
+    /// with no bits, and a clear bit the ask found replaced, where the walk missed a charge and every row asks from then on
+    pub inexact: [AtomicU64; 6],
     /// Spoils so far, so a merge that read an extent reads it again after one
     pub spoils: AtomicU64,
     /// Merge rows by what their bit gave: set and dropped, clear and kept, asked as well, a set bit the ask found no newer row

@@ -13,7 +13,7 @@ use reel_api::maintenance_report::{
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, WritePlace};
 
-use crate::engine::dead_bits::{BIT_SAMPLE_EVERY, DECIDED_ASKED, DECIDED_CLEAR, DECIDED_SET, DECIDED_SHORT, DECIDED_WRONG};
+use crate::engine::dead_bits::{BIT_SAMPLE_EVERY, DECIDED_ASKED, DECIDED_CLEAR, DECIDED_SET, DECIDED_SHORT, DECIDED_WRONG, INEXACT_SHORT};
 use crate::engine::read_path::SealedRow;
 use crate::engine::open_segment::output_path;
 use crate::engine::seal_job::MOST_SEGMENT_BLOCKS;
@@ -410,8 +410,11 @@ impl<Backend: Io> RewriteJob<Backend> {
             if is_set && !state.has_newer_sealed(volume, column, &self.key, row.place, inputs).unwrap_or(true) {
                 decided[DECIDED_WRONG].fetch_add(1, Ordering::Relaxed);
             }
+            // the walk missed a charge on this segment, so its bits stop answering and this row and every later one ask
             if !is_set && self.asked_outside(volume, column)?.is_some_and(|place| place > row.place) {
                 decided[DECIDED_SHORT].fetch_add(1, Ordering::Relaxed);
+                volume.dead_bits.spoil_segment(segment, INEXACT_SHORT);
+                return Ok(None);
             }
         }
         Ok(Some(answer))

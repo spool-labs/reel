@@ -1063,3 +1063,92 @@ fn seat_line_matches_its_parts() {
     assert!(!seat.is_settled);
     store.close().expect("close");
 }
+
+const BATCH_TEST_KEYS: u64 = 500;
+
+fn batch_value(number: u64) -> Vec<u8> {
+    format!("first-{number}").into_bytes()
+}
+
+// a walk for values reads its small sealed records in batches, answers a batch as of the point it located it, and seeks
+// again from the key it stands on when the batch's segment leaves under it
+#[test]
+fn scans_read_values_in_batches() {
+    let batch_keys = reel::engine::scan_state::BATCH_KEYS as u64;
+    let io = SimulatedIo::new(Seed(44));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    for number in 0..BATCH_TEST_KEYS {
+        store.put(COLUMN, &key(number), &batch_value(number)).expect("put");
+    }
+    seal(&store, &io);
+    let segment = hold(&store.state.volumes[0].summary).rows().map(|row| row.facts.segment).next().expect("a segment");
+    let range = reel::engine::scan_state::from_key(COLUMN, b"", Direction::Ascending);
+
+    let mut scan = store.state.take_scan(&range, None).expect("scan");
+    let found = step_keys(&store, &mut scan, u64::MAX);
+    assert_eq!(found.len() as u64, BATCH_TEST_KEYS);
+    assert!(found.iter().enumerate().all(|(number, (found, value))| *found == key(number as u64) && *value == batch_value(number as u64)));
+    assert_eq!(scan.batched, BATCH_TEST_KEYS);
+    store.state.give_back_scan(scan);
+
+    // a write inside the batch shows from the next batch on, and one past it shows at once
+    let mut scan = store.state.take_scan(&range, None).expect("scan");
+    assert_eq!(step_keys(&store, &mut scan, 1).len(), 1);
+    store.put(COLUMN, &key(5), b"second").expect("put");
+    store.put(COLUMN, &key(batch_keys + 5), b"second").expect("put");
+    let rest = step_keys(&store, &mut scan, u64::MAX);
+    assert_eq!(rest.len() as u64, BATCH_TEST_KEYS - 1);
+    assert_eq!(rest[4], (key(5), batch_value(5)));
+    assert_eq!(rest[batch_keys as usize + 4], (key(batch_keys + 5), b"second".to_vec()));
+    store.state.give_back_scan(scan);
+
+    // the segments leave while a batch stands in them: the records it read answer as of its point, and key 5, whose row sat in
+    // an open segment that sealed since, takes the walk back to locate again at the newer point
+    let mut scan = store.state.take_scan(&range, None).expect("scan");
+    let first = step_keys(&store, &mut scan, 1);
+    for number in 0..BATCH_TEST_KEYS {
+        store.put(COLUMN, &key(number), b"third").expect("put");
+    }
+    hold_compaction(&store, false);
+    seal(&store, &io);
+    assert!(!store.state.volumes[0].table.holds(segment));
+    let rest = step_keys(&store, &mut scan, u64::MAX);
+    let keys: Vec<Vec<u8>> = first.iter().chain(&rest).map(|(found, _value)| found.clone()).collect();
+    assert_eq!(keys, (0..BATCH_TEST_KEYS).map(key).collect::<Vec<_>>());
+    let held = 4;
+    assert!(rest[..held].iter().all(|(_key, value)| value != b"third"));
+    assert!(rest[held..].iter().all(|(_key, value)| value == b"third"));
+    store.state.give_back_scan(scan);
+    store.close().expect("close");
+}
+
+const LARGE_VALUE_BYTES: usize = 6_000;
+
+// a large record takes its own read when its key is answered, so a batch whose segment left seeks again from that key
+#[test]
+fn moved_batch_seeks_again() {
+    let io = SimulatedIo::new(Seed(45));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    for number in 0..BATCH_TEST_KEYS {
+        store.put(COLUMN, &key(number), &[1; LARGE_VALUE_BYTES]).expect("put");
+    }
+    seal(&store, &io);
+    let segment = hold(&store.state.volumes[0].summary).rows().map(|row| row.facts.segment).next().expect("a segment");
+    let range = reel::engine::scan_state::from_key(COLUMN, b"", Direction::Ascending);
+    let mut scan = store.state.take_scan(&range, None).expect("scan");
+    let first = step_keys(&store, &mut scan, 1);
+    for number in 0..BATCH_TEST_KEYS {
+        store.put(COLUMN, &key(number), b"newer").expect("put");
+    }
+    hold_compaction(&store, false);
+    seal(&store, &io);
+    assert!(!store.state.volumes[0].table.holds(segment));
+    let rest = step_keys(&store, &mut scan, u64::MAX);
+    let keys: Vec<Vec<u8>> = first.iter().chain(&rest).map(|(found, _value)| found.clone()).collect();
+    assert_eq!(keys, (0..BATCH_TEST_KEYS).map(key).collect::<Vec<_>>());
+    assert!(rest.iter().all(|(_key, value)| value == b"newer"));
+    store.state.give_back_scan(scan);
+    store.close().expect("close");
+}

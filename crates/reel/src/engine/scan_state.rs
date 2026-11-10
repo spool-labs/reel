@@ -7,6 +7,7 @@ use reel_api::direction::Direction;
 use reel_api::units::{ByteCount, FileOffset, WritePlace};
 
 use crate::index::shard_cursor::{ShardCursor, TreeCursor};
+use crate::engine::read_path::Located;
 use crate::index::open_slots::OpenSlots;
 use crate::index::write_index::SHARD_COUNT;
 use crate::pool::{touched_capacity, touched_filled};
@@ -90,6 +91,70 @@ pub struct ShardHead {
     pub placed_at: WritePlace,
 }
 
+/// The most keys a scan locates ahead of its caller at one point, and the bytes of records it reads for them in one go
+pub const BATCH_KEYS: usize = 32;
+pub const BATCH_BYTES: usize = 64 * 1024;
+/// Records in one segment this close join into one read
+pub const JOIN_GAP: u64 = 4 * 1024;
+
+/// One key a scan located ahead, and where its record sits in the batch's buffer once read
+#[derive(Clone, Copy, Debug)]
+pub struct BatchEntry {
+    pub key_at: usize,
+    pub key_length: usize,
+    pub located: Located,
+    pub record: Option<(usize, usize)>,
+}
+
+/// Keys a scan located ahead at one point, answered in order. Each answer stands as of that point, so a write that lands
+/// while the batch lasts shows from the next batch on
+#[derive(Clone, Debug)]
+pub struct ScanBatch {
+    pub entries: Vec<BatchEntry>,
+    pub next: usize,
+    pub point: WritePlace,
+    pub keys: Vec<u8>,
+    pub records: Vec<u8>,
+    pub order: Vec<u16>,
+}
+
+impl ScanBatch {
+    /// Allocate a batch's buffers
+    pub fn new(widest_key: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(BATCH_KEYS),
+            next: 0,
+            point: WritePlace(0),
+            keys: touched_capacity(BATCH_KEYS * widest_key, 0),
+            records: touched_capacity(BATCH_BYTES, 0),
+            order: touched_capacity(BATCH_KEYS, 0),
+        }
+    }
+
+    /// Drop every key the batch holds
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.next = 0;
+        self.keys.clear();
+        self.records.clear();
+    }
+
+    /// Check the batch has a key left to answer
+    pub fn has_next(&self) -> bool {
+        self.next < self.entries.len()
+    }
+
+    /// Read an entry's key
+    pub fn key_of(&self, entry: &BatchEntry) -> &[u8] {
+        &self.keys[entry.key_at..entry.key_at + entry.key_length]
+    }
+
+    /// Read the heap the batch holds
+    pub fn heap_bytes(&self) -> usize {
+        self.entries.capacity() * size_of::<BatchEntry>() + self.keys.capacity() + self.records.capacity() + self.order.capacity() * size_of::<u16>()
+    }
+}
+
 /// One scan's fixed buffers and place, out of the store's pool for as long as the scan lives
 #[derive(Clone, Debug)]
 pub struct ScanState {
@@ -126,7 +191,10 @@ pub struct ScanState {
     pub taken: u64,
     /// Index lookups this walk made, for keys a head showed or that came in under it
     pub lookups: u64,
+    /// Keys answered from a record the batch read in a joined run
+    pub batched: u64,
     pub window: ScanWindows,
+    pub batch: ScanBatch,
 }
 
 impl SegmentSource {
@@ -272,7 +340,9 @@ impl ScanState {
             counted: 0,
             taken: 0,
             lookups: 0,
+            batched: 0,
             window: ScanWindows::new(),
+            batch: ScanBatch::new(widest_key),
         }
     }
 
@@ -289,12 +359,14 @@ impl ScanState {
         self.counted = 0;
         self.taken = 0;
         self.lookups = 0;
+        self.batched = 0;
         for source in &mut self.sources {
             source.fills = 0;
             source.cache_steps = 0;
         }
         self.forget_held();
         self.window.clear();
+        self.batch.clear();
         self.limit.clear();
         self.has_limit = match range.limit {
             ScanLimit::None => false,
@@ -499,7 +571,7 @@ impl ScanState {
         let own = self.position.capacity() + self.limit.capacity() + self.key.capacity() + self.spill.key.capacity() + self.origin.capacity() + self.out_key.capacity();
         let found = self.found.capacity() * size_of::<SegmentNumber>() + (self.losers.capacity() + self.winners.capacity()) * size_of::<u16>();
         let head = self.heads.capacity() * size_of::<ShardHead>();
-        ByteCount(self.sources.capacity() as u64 * source + (keys + heads + own + found + head + self.window.heap_bytes()) as u64)
+        ByteCount(self.sources.capacity() as u64 * source + (keys + heads + own + found + head + self.window.heap_bytes() + self.batch.heap_bytes()) as u64)
     }
 }
 
@@ -559,7 +631,8 @@ pub fn planned_scan_bytes(widest_key: u64, open_slots: usize) -> u64 {
     let heads = SHARD_COUNT * (size_of::<ShardHead>() + open_slots * size_of::<TreeCursor>());
     let held = HELD_SOURCE_BLOCKS * ROW_BLOCK_BYTES;
     let tree = 2 * MOST_SCAN_SOURCES * size_of::<u16>();
-    keys + (sources + heads + held + tree + MOST_SCAN_SOURCES * size_of::<SegmentNumber>() + SCAN_WINDOWS * SCAN_WINDOW_BYTES) as u64
+    let batch = BATCH_KEYS * (widest_key as usize + size_of::<BatchEntry>() + size_of::<u16>()) + BATCH_BYTES;
+    keys + (sources + heads + held + tree + batch + MOST_SCAN_SOURCES * size_of::<SegmentNumber>() + SCAN_WINDOWS * SCAN_WINDOW_BYTES) as u64
 }
 
 

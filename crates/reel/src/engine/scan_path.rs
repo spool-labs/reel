@@ -9,11 +9,13 @@ use reel_api::column_id::ColumnId;
 use reel_api::direction::Direction;
 use reel_api::scan::ScanStep;
 use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, RowCount, WritePlace};
+use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
 use crate::engine::engine_state::EngineState;
 use crate::engine::read_path::{HeldPin, KeyRead, Located, MOST_READ_TRIES, RecordWant, SealedRow, newest_of};
-use crate::engine::scan_state::{BlockTake, MOST_SCANS, MOST_WINDOW_RECORD, NO_GENERATION, ScanRange, ScanState, ScanWindows, SegmentSource, under_prefix};
+use crate::engine::scan_state::{
+    BATCH_KEYS, BatchEntry, BlockTake, JOIN_GAP, MOST_SCANS, MOST_WINDOW_RECORD, NO_GENERATION, ScanRange, ScanState, ScanWindows, SegmentSource, under_prefix,
+};
 use crate::engine::volume::Volume;
 use crate::guard::hold;
 use crate::index::write_shard::WalkBound;
@@ -70,6 +72,8 @@ pub enum ScanWant<'value> {
     Key,
     /// Read its value
     Value(&'value mut Vec<u8>),
+    /// Keep its row in the scan's batch with no value read
+    Locate,
     /// Add up the bytes its value takes on disk
     Bytes,
 }
@@ -135,6 +139,15 @@ impl<Backend: Io> EngineState<Backend> {
         let info = self.column(scan.column)?;
         let volume = &self.volumes[info.volume.0 as usize];
         let directory = self.directories[scan.column.0 as usize].as_ref();
+        // a walk for values answers a batch of keys located at one point, so a write landing while it lasts shows from the next
+        if let ScanWant::Value(value) = &mut want {
+            if !scan.batch.has_next() {
+                self.fill_batch(device, volume, directory, scan).await?;
+            }
+            if let Some(step) = self.answer_from_batch(ReadOn::new(device, volume), scan, key, value).await? {
+                return Ok(step);
+            }
+        }
         let mut tries = 0;
         loop {
             if self.is_stopping.load(Ordering::Acquire) {
@@ -265,6 +278,12 @@ impl<Backend: Io> EngineState<Backend> {
                 scan.counted += 1;
                 Ok(true)
             },
+            ScanWant::Locate => {
+                let key_at = scan.batch.keys.len();
+                scan.batch.keys.extend_from_slice(candidate);
+                scan.batch.entries.push(BatchEntry { key_at, key_length: candidate.len(), located, record: None });
+                Ok(true)
+            },
             ScanWant::Bytes => {
                 scan.counted += located.length().0;
                 Ok(true)
@@ -285,6 +304,158 @@ impl<Backend: Io> EngineState<Backend> {
         key.extend_from_slice(candidate);
         scan.pass(candidate);
         Ok(StepOutcome::Answer(step))
+    }
+
+    /// Locate the walk's next keys at one point with no value read, then read their small sealed records in joined runs
+    pub async fn fill_batch(
+        &self,
+        device: &impl DeviceReads<Backend::File>,
+        volume: &Volume<Backend>,
+        directory: Option<&ColumnDirectory>,
+        scan: &mut ScanState,
+    ) -> Result<(), StoreError> {
+        scan.batch.clear();
+        let point = scan.point.unwrap_or_else(|| self.read_point(volume));
+        scan.batch.point = point;
+        let mut key = mem::take(&mut scan.out_key);
+        let mut outcome = Ok(());
+        while scan.batch.entries.len() < BATCH_KEYS {
+            match self.counted(self.try_step(ReadOn::new(device, volume), directory, scan, Some(point), &mut key, ScanWant::Locate).await) {
+                Ok(StepOutcome::Answer(ScanStep::Found) | StepOutcome::Passed) => {},
+                // the step that answers one key at a time takes the end, a crossed try and anything it can't locate
+                Ok(StepOutcome::Moved) => {
+                    scan.generation = NO_GENERATION;
+                    break;
+                },
+                Ok(StepOutcome::Answer(_step)) => break,
+                Err(error) => {
+                    outcome = Err(error);
+                    break;
+                },
+            }
+        }
+        scan.out_key = key;
+        // keys located before a failure answer first, and the next fill meets the failure again
+        if scan.batch.entries.is_empty() {
+            outcome?;
+        }
+        self.read_batch(device, volume, scan).await;
+        Ok(())
+    }
+
+    /// Read the batch's small sealed records in segment and offset order, one read for each run of neighbours. A record left
+    /// out takes its own read when its key is answered
+    pub async fn read_batch(&self, device: &impl DeviceReads<Backend::File>, volume: &Volume<Backend>, scan: &mut ScanState) {
+        let batch = &mut scan.batch;
+        let sealed_of = |entry: &BatchEntry| match entry.located {
+            Located::Sealed(row) if row.row.length.0 as usize <= MOST_WINDOW_RECORD => Some(row),
+            _other => None,
+        };
+        batch.order.clear();
+        for (index, entry) in batch.entries.iter().enumerate() {
+            if sealed_of(entry).is_some() {
+                batch.order.push(index as u16);
+            }
+        }
+        let entries = &mut batch.entries;
+        batch.order.sort_unstable_by_key(|index| sealed_of(&entries[*index as usize]).map(|row| (row.segment, row.row.offset.0)));
+        let mut at = 0;
+        while at < batch.order.len() {
+            let Some(first) = sealed_of(&entries[batch.order[at] as usize]) else {
+                break;
+            };
+            let start = first.row.offset.0;
+            let mut end = start + first.row.length.0;
+            let mut last = at;
+            let room = (batch.records.capacity() - batch.records.len()) as u64;
+            while let Some(next) = batch.order.get(last + 1).and_then(|index| sealed_of(&entries[*index as usize])) {
+                let next_end = next.row.offset.0 + next.row.length.0;
+                if next.segment != first.segment || next.row.offset.0 > end + JOIN_GAP || next_end.max(end) - start > room {
+                    break;
+                }
+                end = end.max(next_end);
+                last += 1;
+            }
+            if end - start > room {
+                return;
+            }
+            let Some(pin) = volume.table.pin(first.segment) else {
+                at = last + 1;
+                continue;
+            };
+            let base = batch.records.len();
+            batch.records.resize(base + (end - start) as usize, 0);
+            if device.read_exact(&pin.file, FileOffset(start), &mut batch.records[base..]).await.is_err() {
+                batch.records.truncate(base);
+                at = last + 1;
+                continue;
+            }
+            for index in &batch.order[at..=last] {
+                let entry = &mut entries[*index as usize];
+                if let Some(row) = sealed_of(entry) {
+                    entry.record = Some((base + (row.row.offset.0 - start) as usize, row.row.length.0 as usize));
+                }
+            }
+            at = last + 1;
+        }
+    }
+
+    /// Answer the batch's next key from its record, or by its own read when the batch holds none. Nothing when the batch is
+    /// empty, or its row moved on, and then the walk seeks again from that key
+    pub async fn answer_from_batch(
+        &self,
+        on: ReadOn<'_, impl DeviceReads<Backend::File>, Volume<Backend>>,
+        scan: &mut ScanState,
+        key: &mut Vec<u8>,
+        value: &mut Vec<u8>,
+    ) -> Result<Option<ScanStep>, StoreError> {
+        let ScanState { batch, window, direction, column, .. } = scan;
+        let Some(entry) = batch.entries.get(batch.next).copied() else {
+            return Ok(None);
+        };
+        let read = self.key_read(*column, batch.key_of(&entry), batch.point, true)?;
+        let held = match (entry.record, entry.located) {
+            (Some((at, length)), Located::Sealed(row)) => self.open_batched(on.device, &read, &row, &batch.records[at..at + length], value),
+            _other => false,
+        };
+        let is_found = held
+            || match self.read_located(on, &read, &entry.located, window, *direction, value).await {
+                Ok(is_found) => is_found,
+                Err(StoreError::Corruption { .. }) => false,
+                Err(error) => return Err(error),
+            };
+        if !is_found {
+            scan.position.clear();
+            scan.position.extend_from_slice(scan.batch.key_of(&entry));
+            scan.is_inclusive = true;
+            scan.generation = NO_GENERATION;
+            scan.batch.clear();
+            return Ok(None);
+        }
+        key.clear();
+        key.extend_from_slice(scan.batch.key_of(&entry));
+        scan.batch.next += 1;
+        scan.batched += u64::from(held);
+        Ok(Some(ScanStep::Found))
+    }
+
+    /// Check and open a small record the batch read, as the window does
+    pub fn open_batched(&self, device: &impl DeviceReads<Backend::File>, read: &KeyRead<'_>, sealed: &SealedRow, record: &[u8], value: &mut Vec<u8>) -> bool {
+        let identity = RecordIdentity {
+            record_key: self.record_key,
+            column: read.column,
+            key: read.key,
+            kind: RowKind::Value,
+            place: sealed.row.place,
+        };
+        let Some(form) = form_of(record).filter(|form| !form.is_chunked) else {
+            return false;
+        };
+        let opened = match form.codec {
+            Codec::None => open_small(record, form, &identity, &mut [], value),
+            Codec::Lz4 => self.record_reader_for(device).check_held(record, form, &identity, value),
+        };
+        opened == RecordRead::Valid
     }
 
     /// Read the value of the row a key landed on, and return false when its segment or slot moved on
@@ -885,6 +1056,7 @@ impl ScanWant<'_> {
             ScanWant::Key => ScanWant::Key,
             ScanWant::Value(value) => ScanWant::Value(value),
             ScanWant::Bytes => ScanWant::Bytes,
+            ScanWant::Locate => ScanWant::Locate,
         }
     }
 }

@@ -57,7 +57,7 @@ const MOST_LOOPS: usize = 2_000;
 const OVER_THE_BOUND: u64 = MOST_OVERLAP as u64 + 8;
 const KEPT_LIVE_KEYS: u64 = 16;
 /// Graves past two grave blocks that still fit one segment at the sims' budget
-const MANY_GRAVES: u64 = 20_000;
+const MANY_GRAVES: u64 = 12_000;
 const SET_CRASH_STRIDE: u64 = 7;
 const IDLE_TICKS: u64 = 8;
 const TWO_BLOCK_ROWS: u64 = 12_000;

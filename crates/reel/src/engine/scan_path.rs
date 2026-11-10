@@ -591,11 +591,18 @@ impl<Backend: Io> EngineState<Backend> {
     ) -> Result<SourceMove, StoreError> {
         let ReadOn { device, target: volume } = on;
         loop {
-            let (segment, line) = (source.segment, source.line);
-            let row = self.visit_block(device, volume, column, segment, &line, |block| match direction {
-                Direction::Ascending => source.next_in_block(block),
-                Direction::Descending => source.previous_in_block(block),
-            }).await?;
+            let row = match self.hold_block(device, volume, column, source).await? {
+                Some(true) => Some(source.step_held(direction)),
+                Some(false) => {
+                    source.cache_steps += 1;
+                    let (segment, line) = (source.segment, source.line);
+                    self.visit_block(device, volume, column, segment, &line, |block| match direction {
+                        Direction::Ascending => source.next_in_block(block),
+                        Direction::Descending => source.previous_in_block(block),
+                    }).await?
+                },
+                None => None,
+            };
             match row {
                 None => return Ok(SourceMove::Left),
                 Some(Some(row)) => {
@@ -802,6 +809,37 @@ impl<Backend: Io> EngineState<Backend> {
             KeyOrder::Equal => ColumnSpot::Inside,
             KeyOrder::Greater => ColumnSpot::Above,
         })
+    }
+
+    /// Copy a source's block into its own buffer once, and say whether it holds it there. A source with no buffer, or a block
+    /// too long for it, goes through the cache. Nothing when the segment has left
+    pub async fn hold_block(
+        &self,
+        device: &impl DeviceReads<Backend::File>,
+        volume: &Volume<Backend>,
+        column: ColumnId,
+        source: &mut SegmentSource,
+    ) -> Result<Option<bool>, StoreError> {
+        let at = (source.segment, source.line.block_offset);
+        if source.held_at == Some(at) {
+            return Ok(Some(true));
+        }
+        let length = source.line.block_length().0 as usize;
+        if length > source.held.capacity() {
+            return Ok(Some(false));
+        }
+        let held = &mut source.held;
+        let line = source.line;
+        let copied = self.visit_block(device, volume, column, at.0, &line, |block| {
+            held.clear();
+            held.extend_from_slice(block);
+        }).await?;
+        if copied.is_none() {
+            return Ok(None);
+        }
+        source.held_at = Some(at);
+        source.fills += 1;
+        Ok(Some(true))
     }
 
     /// Run a function over a row block through the cache, and return nothing when its segment has left

@@ -1,5 +1,7 @@
 //! One scan's place: a source for each sealed segment it stands in, a cursor for each write index shard, and its last key
 
+use std::mem;
+
 use reel_api::column_id::ColumnId;
 use reel_api::direction::Direction;
 use reel_api::units::{ByteCount, FileOffset, WritePlace};
@@ -10,13 +12,15 @@ use crate::index::write_index::SHARD_COUNT;
 use crate::pool::{touched_capacity, touched_filled};
 use crate::row_kind::RowKind;
 use crate::segment::block_entry::{BlockEntry, KeyBound};
-use crate::segment::row_block::{FooterRow, RowBlockWalk};
+use crate::segment::row_block::{FooterRow, ROW_BLOCK_BYTES, RowBlockWalk};
 use crate::segment::segment_tail::{ColumnTail, SegmentNumber};
 
 /// The most scans a store holds at once
 pub const MOST_SCANS: usize = 32;
 /// The most segments a scan keeps a place in, twice the overlap bound's worth of room. A key past that many goes by seeks
 pub const MOST_SCAN_SOURCES: usize = 64;
+/// The sources that keep their block in their own buffer, so a step reads it with no cache lookup. The rest go through the cache
+pub const HELD_SOURCE_BLOCKS: usize = 8;
 /// A generation no directory has, so a scan seats itself at its next step
 pub const NO_GENERATION: u64 = u64::MAX;
 
@@ -65,6 +69,12 @@ pub struct SegmentSource {
     pub row: FooterRow,
     pub tail: ColumnTail,
     pub is_countable: bool,
+    /// The block this source stands in, copied out of the cache, and where it came from
+    pub held: Vec<u8>,
+    pub held_at: Option<(SegmentNumber, u32)>,
+    /// Blocks this source copied into its buffer, and rows it read through the cache, since the walk started
+    pub fills: u64,
+    pub cache_steps: u64,
 }
 
 /// One write index shard's next key
@@ -112,8 +122,8 @@ pub struct ScanState {
 }
 
 impl SegmentSource {
-    /// Allocate a source's key buffer
-    pub fn new(widest_key: usize) -> Self {
+    /// Allocate a source's key buffer, and a block buffer of this many bytes
+    pub fn new(widest_key: usize, held_bytes: usize) -> Self {
         Self {
             segment: SegmentNumber(0),
             place_base: WritePlace(0),
@@ -134,6 +144,10 @@ impl SegmentSource {
             },
             tail: ColumnTail::default(),
             is_countable: false,
+            held: touched_capacity(held_bytes, 0),
+            held_at: None,
+            fills: 0,
+            cache_steps: 0,
         }
     }
 
@@ -168,6 +182,17 @@ impl SegmentSource {
         }
         self.rows_left -= 1;
         walk.row_in_run(self.run, self.rows_left, &mut self.key)
+    }
+
+    /// Step to the next row in the walk's direction in the held block
+    pub fn step_held(&mut self, direction: Direction) -> Option<FooterRow> {
+        let held = mem::take(&mut self.held);
+        let row = match direction {
+            Direction::Ascending => self.next_in_block(&held),
+            Direction::Descending => self.previous_in_block(&held),
+        };
+        self.held = held;
+        row
     }
 
     /// Find a block's first row past a key going up, or nothing when its rows end first
@@ -218,9 +243,9 @@ impl ScanState {
             point: None,
             generation: NO_GENERATION,
             frontier: None,
-            sources: (0..MOST_SCAN_SOURCES).map(|_source| SegmentSource::new(widest_key)).collect(),
+            sources: (0..MOST_SCAN_SOURCES).map(|index| SegmentSource::new(widest_key, if index < HELD_SOURCE_BLOCKS { ROW_BLOCK_BYTES } else { 0 })).collect(),
             source_count: 0,
-            spill: SegmentSource::new(widest_key),
+            spill: SegmentSource::new(widest_key, 0),
             is_spilled: false,
             heads: (0..SHARD_COUNT).map(|_head| ShardHead::new(widest_key, open_slots)).collect(),
             closest_head: None,
@@ -251,6 +276,11 @@ impl ScanState {
         self.counted = 0;
         self.taken = 0;
         self.lookups = 0;
+        for source in &mut self.sources {
+            source.fills = 0;
+            source.cache_steps = 0;
+        }
+        self.forget_held();
         self.window.clear();
         self.limit.clear();
         self.has_limit = match range.limit {
@@ -294,10 +324,18 @@ impl ScanState {
         self.source_count = 0;
         self.is_spilled = false;
         self.frontier = Some(KeyBound::of_key(&self.position));
+        self.forget_held();
         for head in &mut self.heads {
             head.cursor.reset();
             head.is_placed = false;
             head.has_key = false;
+        }
+    }
+
+    /// Drop what each source held, so its next block comes through the cache
+    pub fn forget_held(&mut self) {
+        for source in &mut self.sources {
+            source.held_at = None;
         }
     }
 
@@ -391,7 +429,7 @@ impl ScanState {
     /// Read the heap these buffers hold
     pub fn heap_bytes(&self) -> ByteCount {
         let source = size_of::<SegmentSource>() as u64;
-        let keys: usize = self.sources.iter().map(|source| source.key.capacity()).sum();
+        let keys: usize = self.sources.iter().map(|source| source.key.capacity() + source.held.capacity()).sum();
         let heads: usize = self.heads.iter().map(|head| head.key.capacity() + head.cursor.trees.capacity() * size_of::<TreeCursor>()).sum();
         let own = self.position.capacity() + self.limit.capacity() + self.key.capacity() + self.spill.key.capacity() + self.origin.capacity() + self.out_key.capacity();
         let found = self.found.capacity() * size_of::<SegmentNumber>();
@@ -454,7 +492,8 @@ pub fn planned_scan_bytes(widest_key: u64, open_slots: usize) -> u64 {
     let keys = (MOST_SCAN_SOURCES + SHARD_COUNT + 6) as u64 * widest_key;
     let sources = (MOST_SCAN_SOURCES + 1) * size_of::<SegmentSource>();
     let heads = SHARD_COUNT * (size_of::<ShardHead>() + open_slots * size_of::<TreeCursor>());
-    keys + (sources + heads + MOST_SCAN_SOURCES * size_of::<SegmentNumber>() + SCAN_WINDOWS * SCAN_WINDOW_BYTES) as u64
+    let held = HELD_SOURCE_BLOCKS * ROW_BLOCK_BYTES;
+    keys + (sources + heads + held + MOST_SCAN_SOURCES * size_of::<SegmentNumber>() + SCAN_WINDOWS * SCAN_WINDOW_BYTES) as u64
 }
 
 

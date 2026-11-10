@@ -955,3 +955,50 @@ fn index_asked_for_its_own_keys() {
     store.state.give_back_scan(scan);
     store.close().expect("close");
 }
+
+const HELD_KEYS: u64 = 2_000;
+const HELD_SEGMENTS: u64 = reel::engine::scan_state::HELD_SOURCE_BLOCKS as u64 + 3;
+
+// a walk reads each block of a held source once into its own buffer and steps its rows there, and the sources past the
+// held ones go through the cache, both ways
+#[test]
+fn sources_hold_their_blocks() {
+    let io = SimulatedIo::new(Seed(41));
+    let store = open(&io);
+    for number in 0..HELD_KEYS {
+        store.put(COLUMN, &key(number), &[7; 60]).expect("put");
+    }
+    seal(&store, &io);
+    let volume = &store.state.volumes[0];
+    let segment = hold(&volume.summary).rows().map(|row| row.facts.segment).next().expect("a segment");
+    let (_first, blocks) = volume.table.column_blocks(segment, COLUMN).expect("the column");
+    assert!(blocks > 1);
+    for direction in [Direction::Ascending, Direction::Descending] {
+        let start: &[u8] = if direction == Direction::Ascending { b"" } else { b"zzz" };
+        let range = reel::engine::scan_state::from_key(COLUMN, start, direction);
+        let mut scan = store.state.take_scan(&range, None).expect("scan");
+        let found = step_keys(&store, &mut scan, u64::MAX);
+        assert_eq!(found.len() as u64, HELD_KEYS);
+        assert!(found.windows(2).all(|pair| (pair[0].0 < pair[1].0) == (direction == Direction::Ascending)));
+        assert_eq!(scan.sources.iter().map(|source| source.fills).sum::<u64>(), u64::from(blocks));
+        assert_eq!(scan.sources.iter().map(|source| source.cache_steps).sum::<u64>(), 0);
+        store.state.give_back_scan(scan);
+    }
+
+    // more segments than hold their blocks, each spanning the keys, so the walk stands in all of them at once
+    hold_compaction(&store, true);
+    for segment in 0..HELD_SEGMENTS {
+        store.put(COLUMN, &key(segment), b"later").expect("put");
+        store.put(COLUMN, &key(HELD_KEYS - 1 - segment), b"later").expect("put");
+        seal(&store, &io);
+    }
+    let range = reel::engine::scan_state::from_key(COLUMN, b"", Direction::Ascending);
+    let mut scan = store.state.take_scan(&range, None).expect("scan");
+    let found = step_keys(&store, &mut scan, u64::MAX);
+    assert_eq!(found.len() as u64, HELD_KEYS);
+    assert_eq!(found.iter().filter(|(_key, value)| value == b"later").count() as u64, 2 * HELD_SEGMENTS);
+    assert!(found.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    assert!(scan.sources.iter().map(|source| source.cache_steps).sum::<u64>() > 0);
+    store.state.give_back_scan(scan);
+    store.close().expect("close");
+}

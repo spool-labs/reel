@@ -8,6 +8,7 @@ use reel_api::maintenance_report::{PICK_OUTCOMES, PickOutcome, SHARE_KINDS, SPAN
 use reel_api::units::{ByteCount, Nanoseconds, RowCount, VolumeId, WritePlace};
 
 use crate::config::SyncPolicy;
+use crate::engine::dead_bits::DeadBits;
 use crate::engine::open_segment::OpenSegment;
 use crate::engine::ration::Ration;
 use crate::engine::held_bits::HeldBits;
@@ -351,6 +352,8 @@ pub struct Volume<Backend: Io> {
     pub outputs_promised: AtomicU64,
     /// Seals that ended a segment writes had gone quiet on
     pub idle_seals: AtomicU64,
+    /// One bit for each row the walk charged, for segments born since open
+    pub dead_bits: DeadBits,
     /// Nanoseconds from the last sealed segment's first row to its seal start, the time the writes took to fill it, or 0 before a
     /// seal
     pub seal_interval: AtomicU64,

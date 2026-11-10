@@ -501,6 +501,7 @@ impl<Backend: Io> SealJob<Backend> {
                 // the rows file stays until the table has room, so a retry loses nothing
                 return Err(Error::other("segment table is full"));
             }
+            volume.dead_bits.begin(target.number, self.writer.entries().len() as u32, totals.most_block_rows);
             volume.note_sealed(totals.head.places.highest);
             state.note_moved(JobKind::Seal, totals.file_length);
             state.note_written(WriteSource::SealFooters, ByteCount(totals.file_length.0.saturating_sub(totals.head.data_end.0)));

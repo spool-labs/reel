@@ -509,6 +509,9 @@ pub struct MaintenanceReport {
     pub cursor_lookups: [u64; 4],
     /// Merge lookups through the cursor, as above, then merge rows asked outside the merge and rows an unwalked merge settled alone
     pub merge_lookups: [u64; 6],
+    /// Dead bits over every volume: pool bytes, bytes in use, segments with bits, then segments made inexact by an unknown place,
+    /// a full charge list, damage and a short pool
+    pub dead_bits: [u64; 7],
     /// Walk block lookups run together: blocks, candidates asked, candidates whose range held the whole block, per-key checks
     pub block_lookups: [u64; 4],
     pub volumes: Vec<VolumeReading>,
@@ -591,6 +594,7 @@ impl MaintenanceReport {
             longest_room_step: Nanoseconds(0),
             cursor_lookups: [0; 4],
             merge_lookups: [0; 6],
+            dead_bits: [0; 7],
             block_lookups: [0; 4],
             volumes: Vec::new(),
             complete_columns: Vec::new(),

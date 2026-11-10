@@ -225,6 +225,8 @@ impl<Backend: Io> EngineState<Backend> {
     /// as absent. The segment stays in the table and its row keeps its facts
     pub fn damage_unread(&self, index: usize, number: SegmentNumber) {
         let volume = &self.volumes[index];
+        // a bit can't say which row set it, and the row may sit in what was lost
+        volume.dead_bits.spoil_all();
         let counter = self.places.last_given();
         for range in whole_columns(self, index, number, counter) {
             volume.damage.add(&range);

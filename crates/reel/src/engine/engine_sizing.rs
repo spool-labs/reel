@@ -41,6 +41,8 @@ pub const SPOT_SIXTEENTHS: u64 = 2;
 pub const BLOCK_CACHE_SIXTEENTHS: u64 = 2;
 /// The record cache's sixteenths of what the fixed parts and the room leave, so a hot get reads no file
 pub const RECORD_CACHE_SIXTEENTHS: u64 = 2;
+/// Halves of the record cache's share that the dead bits take, one bit for each row the walk charged
+pub const DEAD_BITS_HALVES: u64 = 1;
 /// The summaries' sixteenths of what the fixed parts and the room leave, rows and the save buffer together. A row costs about
 /// 100 B a column and four bytes a row block, about 0.003 B a key at 1,400 rows a block, so 1B keys take 2.8 MB of it. A row that
 /// doesn't fit is dropped: its segment is never walked or counted against, which only understates

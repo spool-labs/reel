@@ -303,6 +303,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         let gone = rows_bytes(&hold(&volume.summary), inputs.iter().copied());
         for input in inputs {
             self.state.filter_arena.drop_segment(*input);
+            volume.dead_bits.end(*input);
         }
         let retired: [_; MOST_MERGE_SEGMENTS] = array::from_fn(|index| inputs.get(index).and_then(|number| volume.table.retire(*number)));
         let footers = self.note_install();

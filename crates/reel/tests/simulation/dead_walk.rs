@@ -1116,6 +1116,8 @@ fn cursor_arm(seed: u64, is_cursor_off: bool, is_merging: bool) -> (Vec<(u64, u6
         job.rewrite.step();
     }
     settle(&io);
+    let exact = check_dead_bits(volume);
+    assert!(is_cursor_off || exact > 0, "seed {seed}: no segment kept exact bits");
     let counts = hold(&volume.summary).rows().map(|row| {
         let column = row.cursor().column().expect("a column");
         (row.facts.segment.0, column.row_count.0, column.dead_rows.0)
@@ -1132,4 +1134,24 @@ const CURSOR_MERGE_STEPS: u64 = 60;
 fn cursor_fits_its_plan() {
     let cursor: KeyCursor<SimulatedFile> = KeyCursor::new();
     assert!(cursor.heap_bytes().0 <= CURSOR_BYTES, "{:?} past {CURSOR_BYTES}", cursor.heap_bytes());
+}
+
+// every segment whose bits stayed exact has as many set bits as dead rows, so a row counts once; returns how many were exact
+fn check_dead_bits(volume: &reel::engine::volume::Volume<SimulatedIo>) -> usize {
+    let mut exact = 0;
+    for row in hold(&volume.summary).rows() {
+        let segment = row.facts.segment;
+        let Some(extent) = volume.dead_bits.exact(segment) else {
+            continue;
+        };
+        let set: u32 = (0..extent.block_count).map(|block| volume.dead_bits.block_set(segment, block).expect("a block")).sum();
+        let mut dead = 0;
+        let mut cursor = row.cursor();
+        for _column in 0..row.column_count {
+            dead += cursor.column().expect("a column").dead_rows.0;
+        }
+        assert_eq!(u64::from(set), dead, "{segment:?}: set bits against dead rows");
+        exact += 1;
+    }
+    exact
 }

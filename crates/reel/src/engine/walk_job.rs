@@ -32,6 +32,8 @@ use crate::io::job::{Job, JobStep};
 use crate::io::{Io, IoFile, IoTask};
 use crate::engine::admission::JobRole;
 use crate::engine::block_lookups::BlockLookups;
+use crate::engine::dead_bits::DeadRow;
+use crate::segment::footer_reader::RowAt;
 use crate::segment::key_cursor::KeyCursor;
 use crate::segment::summary_orders::WalkList;
 use crate::segment::summary::SegmentFacts;
@@ -123,6 +125,10 @@ pub struct BlockCounts {
     pub claims_seen: u64,
     /// A count can be thrown away and taken again, and a slot it freed early would hide the version the next count must charge
     pub slot_frees: FixedList<SlotFree>,
+    /// Each charged row's place, so its bit lands with its count
+    pub dead_rows: FixedList<DeadRow>,
+    /// A charged row didn't fit the list, so the block's segments lose exact bits
+    pub are_rows_cut: bool,
 }
 
 impl BlockCounts {
@@ -138,6 +144,8 @@ impl BlockCounts {
             holding: FixedList::on_heap(MOST_HOLDING),
             claims_seen: 0,
             slot_frees: FixedList::on_heap(MOST_BLOCK_ROWS),
+            dead_rows: FixedList::on_heap(2 * MOST_BLOCK_ROWS),
+            are_rows_cut: false,
         }
     }
 
@@ -153,18 +161,20 @@ impl BlockCounts {
             holding: region.carve(MOST_HOLDING)?,
             claims_seen: 0,
             slot_frees: region.carve(rows + 1)?,
+            dead_rows: region.carve(2 * rows + 1)?,
+            are_rows_cut: false,
         })
     }
 
     /// Count the region bytes room for a block of up to this many rows takes
     pub fn region_bytes(rows: usize) -> usize {
-        let held = list_bytes::<HeldRow>(rows + 1) + list_bytes::<(SegmentNumber, u8)>(MOST_HOLDING) + list_bytes::<SlotFree>(rows + 1);
+        let held = list_bytes::<HeldRow>(rows + 1) + list_bytes::<(SegmentNumber, u8)>(MOST_HOLDING) + list_bytes::<SlotFree>(rows + 1) + list_bytes::<DeadRow>(2 * rows + 1);
         list_bytes::<DeadCount>(rows + 1) + list_bytes::<FreeRecord>(MOST_BLOCK_FREES) + list_bytes::<SegmentNumber>(MOST_BLOCK_FREES) + held
     }
 
     /// Give the lists back, and return the most bytes they wrote
     pub fn release(&mut self) -> usize {
-        let held = self.held.peak_bytes() + self.holding.peak_bytes() + self.slot_frees.peak_bytes();
+        let held = self.held.peak_bytes() + self.holding.peak_bytes() + self.slot_frees.peak_bytes() + self.dead_rows.peak_bytes();
         let peak = self.counts.peak_bytes() + self.frees.peak_bytes() + self.overflowed.peak_bytes() + held;
         *self = Self::default();
         peak
@@ -172,7 +182,7 @@ impl BlockCounts {
 
     /// Read the heap they hold
     pub fn heap_bytes(&self) -> ByteCount {
-        let counts = self.counts.capacity() * size_of::<DeadCount>() + self.slot_frees.capacity() * size_of::<SlotFree>();
+        let counts = self.counts.capacity() * size_of::<DeadCount>() + self.slot_frees.capacity() * size_of::<SlotFree>() + self.dead_rows.capacity() * size_of::<DeadRow>();
         ByteCount((counts + self.frees.capacity() * size_of::<FreeRecord>()) as u64)
     }
 
@@ -185,6 +195,8 @@ impl BlockCounts {
         self.rows = 0;
         self.held.clear();
         self.slot_frees.clear();
+        self.dead_rows.clear();
+        self.are_rows_cut = false;
     }
 
     /// Note which inputs the rewrites hold now, and the claims' count they were read at, before a block is counted
@@ -214,8 +226,12 @@ impl BlockCounts {
         block: u32,
         row: &FooterRow,
         replacement: WritePlace,
+        at: RowAt,
     ) -> std::result::Result<(), ListFull> {
         add_count(&mut self.counts, segment, column, block, row, Some(replacement))?;
+        if !self.dead_rows.push_if_room(DeadRow::of(segment, block, at, row.length.0, row.kind)) {
+            self.are_rows_cut = true;
+        }
         if row.kind != RowKind::Value || row.length < FREE_IN_PLACE_BYTES {
             return Ok(());
         }
@@ -498,7 +514,7 @@ impl<Backend: Io> BlockCounter<Backend> {
             if !is_top {
                 // the key's top is in this segment, and its highest place is at or above that
                 let replacement = pin.head.places.highest;
-                counts.count_dead(target.segment, block.column, target.next_block, &row, replacement)?;
+                counts.count_dead(target.segment, block.column, target.next_block, &row, replacement, RowAt::of_walk(&walk))?;
                 continue;
             }
 
@@ -528,19 +544,19 @@ impl<Backend: Io> BlockCounter<Backend> {
                 Some(found) if found.row.place > row.place => {
                     let replacement = found.row.place;
                     counts.slot_frees.push(SlotFree { column: block.column, hash: hash_key(block.column, &self.key), segment: target.segment, block_offset: block.entry.block_offset })?;
-                    counts.count_dead(target.segment, block.column, target.next_block, &row, replacement)?;
+                    counts.count_dead(target.segment, block.column, target.next_block, &row, replacement, RowAt::of_walk(&walk))?;
                 },
                 // a row under an applied cover is dead by it, and so is any older one a row here would find
                 _ if is_covered(row.place) => {
                     let replacement = covered.unwrap_or(row.place);
-                    counts.count_dead(target.segment, block.column, target.next_block, &row, replacement)?;
+                    counts.count_dead(target.segment, block.column, target.next_block, &row, replacement, RowAt::of_walk(&walk))?;
                 },
                 Some(found) if !target.is_backward && !is_covered(found.row.place) => {
                     if let Some(index) = volume.table.block_at(found.segment, found.block_offset) {
                         // a row of an input a rewrite holds goes to its bits, which its drain lands where the row went
                         match counts.holder(found.segment) {
                             Some(lane) => counts.held.push(HeldRow { segment: found.segment, lane, block: index, at: found.at })?,
-                            None => counts.count_dead(found.segment, block.column, index, &found.row, row.place)?,
+                            None => counts.count_dead(found.segment, block.column, index, &found.row, row.place, found.at)?,
                         }
                         counts.slot_frees.push(SlotFree { column: block.column, hash: hash_key(block.column, &self.key), segment: found.segment, block_offset: found.block_offset })?;
                     }
@@ -748,6 +764,11 @@ impl<Backend: Io> WalkJob<Backend> {
     /// nowhere, since a segment number is never used twice
     pub fn apply_block(&mut self, volume: &Volume<Backend>, target: WalkTarget, next_block: u32, counts: &mut BlockCounts) {
         self.state.note_moved(JobKind::DeadByteWalk, counts.read_bytes);
+        // a row's bit lands with its count, and a row counted before comes back out, so a row counts once
+        if counts.are_rows_cut {
+            volume.dead_bits.spoil(&counts.counts);
+        }
+        volume.dead_bits.land(&counts.dead_rows, &mut counts.counts);
         counts.counts.sort_unstable_by_key(|count| count.segment);
         let mut rows = hold(&volume.summary);
         rows.apply_walk(target.segment, next_block, &counts.counts);

@@ -869,6 +869,7 @@ impl<Backend: Io> CompactJob<Backend> {
             }
         }
         self.state.filter_arena.drop_segment(segment);
+        volume.dead_bits.end(segment);
         let Some(retired) = volume.table.retire(segment) else {
             return Ok(());
         };

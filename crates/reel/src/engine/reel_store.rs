@@ -17,12 +17,13 @@ use reel_api::usage::{ColumnUsage, UsageReport};
 use reel_api::write_batch::WriteBatch;
 
 use crate::config::{ColumnConfig, DeviceClass, StoreConfig, VolumeConfig};
+use crate::engine::dead_bits::DeadBits;
 use crate::engine::admission::Admission;
 use reel_api::maintenance_report::WorkerPriority;
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::engine_sizing::{
     complete_block_rows, complete_row_limit,
-    EngineSizing, FILTER_ARENA_EIGHTHS, FILTER_CACHE_QUARTERS, FILTER_SLOT_BYTES, GROUP_BYTES, LEAST_LZ4_BUDGET, LEAST_SHARD_ENTRIES, PLANNED_LINE_BYTES,
+    DEAD_BITS_HALVES, EngineSizing, FILTER_ARENA_EIGHTHS, FILTER_CACHE_QUARTERS, FILTER_SLOT_BYTES, GROUP_BYTES, LEAST_LZ4_BUDGET, LEAST_SHARD_ENTRIES, PLANNED_LINE_BYTES,
     SHARED_JOBS, StoreShape, GATHER_BYTES, READ_BUFFERS, WRITE_BUFFERS, assumed_segment_bytes, capped_entries, disk_entries, entry_cost, entry_cover, floor_entries,
     segment_bytes_for,
 };
@@ -1192,7 +1193,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         filter_cache: BlockCache::new(ByteCount(filter_share.0 - arena_share.0), FILTER_SLOT_BYTES),
         filter_arena: FilterArena::new(arena_share, planned.iter().map(|table| table.segments_per_shard * TABLE_SHARDS).sum()),
         row_cache: BlockCache::new(row_share, ROW_BLOCK_BYTES),
-        record_cache: RecordCache::new(sizing.record_share),
+        record_cache: RecordCache::new(ByteCount(sizing.record_share.0 / 2 * (2 - DEAD_BITS_HALVES))),
         complete_cache: is_complete.then(|| BlockCache::new(complete_share, COMPLETE_BLOCK_BYTES)),
         complete_line_bytes: ByteCount(complete_lines(config) * size_of::<BlockEntry>() as u64),
         queues,
@@ -1308,7 +1309,9 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
     room.blocks_per_shard += complete_shard_lines(config, index);
     // a row for each segment the table can hold, beside open segments and the spans of gone ones
     summary.rows.make_index(room.segments_per_shard * TABLE_SHARDS + open_slots + MOST_DAMAGED_SPANS);
+    let dead_share = ByteCount(sizing.record_share.0 / 2 * DEAD_BITS_HALVES / config.volumes.len() as u64);
     Volume {
+        dead_bits: DeadBits::new(dead_share, room.segments_per_shard * TABLE_SHARDS),
         id: VolumeId(index as u8),
         name: volume.name.clone(),
         roots: volume.roots.clone(),

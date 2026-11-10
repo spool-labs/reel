@@ -11,6 +11,8 @@ pub struct MemoryReport {
     pub complete_tables: ByteCount,
     pub block_cache: ByteCount,
     pub record_cache: ByteCount,
+    /// Bytes the dead bits' pools hold, one bit for each charged row
+    pub dead_bits: ByteCount,
     pub block_indexes: ByteCount,
     pub segment_table: ByteCount,
     pub summary: ByteCount,
@@ -63,7 +65,7 @@ impl MemoryReport {
                 + self.spot_cache.0
                 + self.complete_tables.0
                 + self.block_cache.0
-                + self.record_cache.0
+                + self.record_cache.0 + self.dead_bits.0
                 + self.block_indexes.0
                 + self.segment_table.0
                 + self.summary.0

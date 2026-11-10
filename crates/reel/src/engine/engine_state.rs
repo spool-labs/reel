@@ -641,6 +641,7 @@ impl<Backend: Io> EngineState<Backend> {
             write_index: self.index.heap_bytes(),
             spot_cache: self.spot.heap_bytes(),
             record_cache: self.record_cache.heap_bytes(),
+            dead_bits: ByteCount(self.volumes.iter().map(|volume| volume.dead_bits.heap_bytes().0).sum()),
             complete_tables: ByteCount(self.complete.iter().flatten().map(|table| table.heap_bytes().0).sum()),
             block_cache: ByteCount(self.filter_arena.heap_bytes().0 + self.filter_cache.heap_bytes().0 + self.row_cache.heap_bytes().0 + self.complete_cache_bytes()),
             footer_space: ByteCount(self.seal_heap.load(Ordering::Acquire) + self.walk_heap.load(Ordering::Acquire)),

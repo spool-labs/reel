@@ -97,6 +97,8 @@ impl<Backend: Io> CompactJob<Backend> {
             ..TailHead::default()
         };
         let root = root_of_path(volume, &path);
+        // the rebuilt segment lost rows whose walks set bits elsewhere
+        volume.dead_bits.spoil_all();
         if !volume.table.install(file.clone(), root, &head, &finds.columns, &finds.lines) {
             state.io.close_file(file);
             return Ok(false);

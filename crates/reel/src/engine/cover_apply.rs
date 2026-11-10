@@ -249,8 +249,8 @@ impl<Backend: Io> CoverApply<Backend> {
                 Err(StoreError::Corruption { .. }) => None,
                 Err(_error) => return Err(Error::from(ErrorKind::Interrupted)),
             };
-            if newest.is_some_and(|found| found.segment == target.segment && found.row.place == row.place) {
-                self.counts.count_dead(target.segment, column, target.next_block, &row, place)?;
+            if let Some(found) = newest.filter(|found| found.segment == target.segment && found.row.place == row.place) {
+                self.counts.count_dead(target.segment, column, target.next_block, &row, place, found.at)?;
             }
         }
         self.land(volume, target.segment)
@@ -316,6 +316,10 @@ impl<Backend: Io> CoverApply<Backend> {
     /// Land a block's counts on its segment
     pub fn land(&mut self, volume: &Volume<Backend>, segment: SegmentNumber) -> Result<()> {
         self.state.note_moved(JobKind::RangeDeleteApply, self.counts.read_bytes);
+        if self.counts.are_rows_cut {
+            volume.dead_bits.spoil(&self.counts.counts);
+        }
+        volume.dead_bits.land(&self.counts.dead_rows, &mut self.counts.counts);
         self.counts.counts.sort_unstable_by_key(|count| count.block);
         hold(&volume.summary).apply_counts(segment, &self.counts.counts, None);
         for count in self.counts.counts.iter().filter(|count| count.rows > 0) {

@@ -24,7 +24,7 @@ use crate::segment::segment_tail::{MOST_MERGE_SEGMENTS, SegmentNumber};
 use crate::segment::summary::{SummaryRow, SummaryRows};
 use crate::segment::summary_orders::{COVERS_LIST, ROW_FOOTER_BYTES, SHARE_BUCKETS, SHARE_SCALE, WalkList, reclaim_share, share_bucket};
 
-use crate::engine::rewrite_job::{BAR_QUARTERS, BUCKET_LOOKS, BarsFired, CROWD_PAGES, EARLY_BAR_QUARTERS, GATHER_LOOKS, MOST_OVERLAP, MergeInput, MergeTarget, OVERLAP_LOOKS, OVERLAP_PROBES, PLAIN_BAR_QUARTERS, PLANNER_LANE, QUIET_BAR_QUARTERS, RewriteJob, RewritePhase, rows_of};
+use crate::engine::rewrite_job::{BAR_QUARTERS, BUCKET_LOOKS, BarsFired, CROWD_PAGES, OVERLAP_BASE_RECORD_BYTES, EARLY_BAR_QUARTERS, GATHER_LOOKS, MOST_OVERLAP, MergeInput, MergeTarget, OVERLAP_LOOKS, OVERLAP_PROBES, PLAIN_BAR_QUARTERS, PLANNER_LANE, QUIET_BAR_QUARTERS, RewriteJob, RewritePhase, rows_of};
 use crate::engine::rewrite_job::install::freed_in_place;
 
 impl<Backend: Io> RewriteJob<Backend> {
@@ -233,7 +233,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         // a column with a complete table has no overlap bound
         let directory_of = |column: ColumnId| state.complete_table(column).is_none().then(|| state.directories[column.0 as usize].as_ref()).flatten();
         let lists = (&mut self.listed, &mut self.crowd);
-        let found = overlap_start(rows, directory_of, &mut self.looked_up_to, can_merge, &mut self.crowded_key, lists);
+        let found = overlap_start(rows, directory_of, &mut self.looked_up_to, can_merge, &mut self.crowded_key, lists, !volume.is_bound_pinned());
         self.has_looks_left = !rows.orders().after(self.looked_up_to).is_empty();
         let Some((crowded, column)) = found else {
             self.end_pass(volume);
@@ -561,6 +561,7 @@ pub fn overlap_start<'rows, 'state>(
     can_merge: impl Fn(&SummaryRow<'_>) -> bool,
     point: &mut FixedList<u8>,
     lists: (&mut FixedList<SegmentNumber>, &mut FixedList<SegmentNumber>),
+    is_sized: bool,
 ) -> Option<(SummaryRow<'rows>, ColumnId)> {
     let (listed, crowd) = lists;
     for _look in 0..OVERLAP_LOOKS {
@@ -577,7 +578,7 @@ pub fn overlap_start<'rows, 'state>(
             let others = listed.iter().filter_map(|other| rows.get(*other));
             let inside = others.filter_map(|other| lowest_inside(&other, facts.column, facts.lowest, facts.bound));
             let mut probes = iter::once(facts.lowest).chain(inside.take(OVERLAP_PROBES));
-            let found = probes.find(|key| is_crowded(rows, directory, (facts.column, key), crowd));
+            let found = probes.find(|key| is_crowded(rows, directory, (facts.column, key), crowd, is_sized));
             if let Some(key) = found.filter(|_key| can_merge(&row)) {
                 point.set_from(key).ok()?;
                 return Some((row, facts.column));
@@ -596,16 +597,23 @@ pub fn is_crowded(
     directory: &ColumnDirectory,
     (column, key): (ColumnId, &[u8]),
     crowd: &mut FixedList<SegmentNumber>,
+    is_sized: bool,
 ) -> bool {
     // a summary row keeps a key cut short, so the directory is asked for every key that starts with it
     let (low, high) = (KeyBound::of_key(key), KeyBound::past_prefix(key));
-    let (mut covering, mut skip) = (0, 0);
+    let (mut covering, mut skip, mut bytes, mut rows_seen) = (0, 0, 0, 0);
     for _page in 0..CROWD_PAGES {
         let page = directory.overlapping(&low, &high, skip, crowd);
         skip += crowd.len();
         let over = crowd.iter().filter_map(|segment| rows.get(*segment));
-        covering += over.filter(|row| can_ever_merge(row) && covers_point(row, column, key)).count();
-        if covering > MOST_OVERLAP {
+        for row in over.filter(|row| can_ever_merge(row) && covers_point(row, column, key)) {
+            covering += 1;
+            let (row_bytes, row_rows) = record_totals(&row);
+            bytes += row_bytes;
+            rows_seen += row_rows;
+        }
+        let bound = if is_sized { overlap_bound(bytes, rows_seen) } else { MOST_OVERLAP };
+        if covering > bound {
             return true;
         }
         if !page.is_cut {
@@ -708,4 +716,25 @@ impl<Backend: Io> RewriteJob<Backend> {
         let output = ByteCount(output.min(length.0));
         has_disk_room(&self.state, volume, output, output.0 < inputs).then_some(output)
     }
+}
+
+/// Add up a segment's record bytes and rows over every column, since a merge copies the whole segment
+pub fn record_totals(row: &SummaryRow<'_>) -> (u64, u64) {
+    let (mut bytes, mut rows) = (0, 0);
+    let mut cursor = row.cursor();
+    for _column in 0..row.column_count {
+        let Some(column) = cursor.column() else {
+            break;
+        };
+        bytes += column.live_bytes.0 + column.dead_bytes.0;
+        rows += column.row_count.0;
+    }
+    (bytes, rows)
+}
+
+/// Work out how many segments over one key a crowd of this mean record size may hold before a merge is due
+pub fn overlap_bound(bytes: u64, rows: u64) -> usize {
+    let mean = bytes / rows.max(1);
+    let scaled = MOST_OVERLAP as u64 * mean / OVERLAP_BASE_RECORD_BYTES;
+    MOST_OVERLAP.max(scaled as usize)
 }

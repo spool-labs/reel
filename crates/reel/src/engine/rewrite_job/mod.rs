@@ -46,7 +46,7 @@ pub use pick::is_reclaim_due;
 #[cfg(any(test, feature = "test-hooks"))]
 pub use install::freed_in_place;
 #[cfg(any(test, feature = "test-hooks"))]
-pub use pick::{column_range, covers_point, has_settled_covers, is_crowded, is_overlap_input, overlaps};
+pub use pick::{column_range, covers_point, has_settled_covers, is_crowded, is_overlap_input, overlap_bound, overlaps};
 
 /// A bar counts in quarters of a segment's bytes
 pub const BAR_QUARTERS: u64 = 4;
@@ -86,8 +86,10 @@ pub const RUN_KEYS: usize = 8;
 pub const MOST_GRAVE_BLOCKS: BlockCount = BlockCount(2_048);
 /// Rounds an install waits for room to park its inputs, past which the merge gives way
 pub const MOST_PARK_WAITS: u32 = 4_096;
-/// Most segments of a column that overlap one key before a merge is due
+/// Most segments of a column that overlap one key before a merge is due, for records up to the base size
 pub const MOST_OVERLAP: usize = 32;
+/// Records this size or smaller keep the bound at MOST_OVERLAP, and larger ones raise it in step, so large values seldom merge
+pub const OVERLAP_BASE_RECORD_BYTES: u64 = 4 * 1024;
 /// The planner's own lane. Worker lanes count up from one
 pub const PLANNER_LANE: usize = 0;
 /// Keys inside a new segment one look tries for the crowded point, which bounds what a look costs

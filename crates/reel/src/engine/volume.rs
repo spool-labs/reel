@@ -195,6 +195,8 @@ pub struct TestHolds {
     pub rebuild: AtomicBool,
     /// Quiet-time reclaim waits, so a segment keeps the few dead rows it was built with
     pub reclaim: AtomicBool,
+    /// The overlap bound stays at its least whatever the records' size, for tests of merge mechanics with large values
+    pub small_bound: AtomicBool,
 }
 
 /// One volume of a store
@@ -401,6 +403,18 @@ impl<Backend: Io> Volume<Backend> {
     /// Check a test holds rebuilds off, which a build without the hooks never does
     #[cfg(not(feature = "test-hooks"))]
     pub const fn is_rebuild_held(&self) -> bool {
+        false
+    }
+
+    /// Check a test holds the overlap bound at its least
+    #[cfg(feature = "test-hooks")]
+    pub fn is_bound_pinned(&self) -> bool {
+        self.holds.small_bound.load(Ordering::Acquire)
+    }
+
+    /// Check a test holds the overlap bound at its least, which a build without the hooks never does
+    #[cfg(not(feature = "test-hooks"))]
+    pub const fn is_bound_pinned(&self) -> bool {
         false
     }
 

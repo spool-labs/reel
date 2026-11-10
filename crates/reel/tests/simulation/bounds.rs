@@ -164,6 +164,7 @@ fn widest_records() {
     let volume = &store.state.volumes[0];
     volume.holds.compaction.store(true, Ordering::Release);
     volume.holds.walk.store(true, Ordering::Release);
+    volume.holds.small_bound.store(true, Ordering::Release);
     let value = vec![7; WIDE_VALUE_BYTES];
     for number in 0..PILE {
         store.put(COLUMN, &wide_key(b'a', number), &value).expect("put");

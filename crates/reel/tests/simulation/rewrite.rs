@@ -1674,6 +1674,8 @@ fn newest_first_stops() {
 fn full_segment_stays_out() {
     let io = SimulatedIo::new(Seed(61));
     let store = open(&io);
+    // the merge mechanics under test, not the size of the records, decide what merges
+    store.state.volumes[0].holds.small_bound.store(true, Ordering::Release);
     hold_compaction(&store, true);
     hold_walk(&store, true);
     let half = store.state.volumes[0].segment_bytes.0 as usize / 2;
@@ -1696,6 +1698,8 @@ fn full_segment_stays_out() {
 fn large_merge_when_alone() {
     let io = SimulatedIo::new(Seed(62));
     let store = open(&io);
+    // the merge mechanics under test, not the size of the records, decide what merges
+    store.state.volumes[0].holds.small_bound.store(true, Ordering::Release);
     hold_compaction(&store, true);
     hold_walk(&store, true);
     let large = store.state.volumes[0].segment_bytes.0 as usize * 3 / 5;
@@ -1722,6 +1726,8 @@ fn large_merge_when_alone() {
 fn small_segments_merge_by_size() {
     let io = SimulatedIo::new(Seed(63));
     let store = open(&io);
+    // the merge mechanics under test, not the size of the records, decide what merges
+    store.state.volumes[0].holds.small_bound.store(true, Ordering::Release);
     hold_compaction(&store, true);
     hold_walk(&store, true);
     let large = store.state.volumes[0].segment_bytes.0 as usize * 3 / 5;
@@ -2802,6 +2808,8 @@ fn cool(store: &Store, io: &SimulatedIo) {
 fn overlap_takes_the_widest_first() {
     let io = SimulatedIo::new(Seed(82));
     let store = open(&io);
+    // the merge mechanics under test, not the size of the records, decide what merges
+    store.state.volumes[0].holds.small_bound.store(true, Ordering::Release);
     hold_compaction(&store, true);
     let value = vec![7; WIDE_VALUE_BYTES];
     let mut wide = Vec::new();
@@ -3176,5 +3184,29 @@ fn merge_waits_for_disk_room() {
     assert!(overlaps() > before);
     run_to_end(&mut job);
     check_pile(&store, OVER_THE_BOUND);
+    store.close().expect("close");
+}
+
+// a column of large records holds more segments over a key before a merge is due, so its bytes seldom move
+#[test]
+fn large_records_raise_the_bound() {
+    let io = SimulatedIo::new(Seed(95));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let large = vec![6; 64 * 1024];
+    for number in 0..OVER_THE_BOUND {
+        store.put(COLUMN, format!("a-{number:03}").as_bytes(), &large).expect("put");
+        store.put(COLUMN, b"m-shared", &large).expect("put");
+        store.put(COLUMN, format!("z-{number:03}").as_bytes(), &large).expect("put");
+        seal(&store, &io);
+    }
+    let volume = &store.state.volumes[0];
+    let overlaps = || volume.picks[PickOutcome::Overlap.index()].load(Ordering::Acquire);
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    let started = start_merge(&mut job);
+    assert_eq!(overlaps(), 0, "a merge started on {OVER_THE_BOUND} segments of 64 KiB records");
+    if started {
+        run_to_end(&mut job);
+    }
     store.close().expect("close");
 }

@@ -313,3 +313,13 @@ fn footer_total_follows_rows() {
     rows.remove(SegmentNumber(2));
     assert_eq!(rows.footer_bytes(), ByteCount(0));
 }
+
+// small records keep the bound at its least, and larger ones raise it in step with their mean size
+#[test]
+fn bound_follows_record_size() {
+    use reel::engine::rewrite_job::{MOST_OVERLAP, OVERLAP_BASE_RECORD_BYTES, overlap_bound};
+    assert_eq!(overlap_bound(100 * 1_000, 1_000), MOST_OVERLAP);
+    assert_eq!(overlap_bound(0, 0), MOST_OVERLAP);
+    assert_eq!(overlap_bound(16 * OVERLAP_BASE_RECORD_BYTES, 1), 16 * MOST_OVERLAP);
+    assert_eq!(overlap_bound(1024 * 1024 * 10, 10), MOST_OVERLAP * 256);
+}

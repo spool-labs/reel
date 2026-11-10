@@ -256,8 +256,9 @@ impl<Backend: Io> RewriteJob<Backend> {
             directory.overlapping(&KeyBound::of_key(point), &KeyBound::past_prefix(point), 0, &mut self.listed);
         }
         let near = self.listed.iter().filter_map(|segment| rows.get(*segment)).filter(is_near);
-        // unwalked segments go first, since they need nothing from the walk
-        let is_unwalked = near.filter(|row| !row.facts.is_walked()).take(2).count() == 2;
+        // walked segments go first, since their dead rows leave in the same copy that brings overlap down, and unwalked ones only
+        // when fewer than two walked ones cover the point
+        let is_unwalked = near.filter(|row| row.facts.is_walked()).take(2).count() < 2;
         let is_more = |row: &SummaryRow<'_>| is_near(row) && row.facts.is_walked() != is_unwalked;
         // the widest ranges over the point go first: segments that span the same keys merge overlap down across all of them,
         // and pieces of different merges meet only near the point
@@ -460,7 +461,8 @@ pub fn gather_tier<Backend: Io>(
             is_inside && blocks + row.facts.block_count <= MOST_MERGE_OUTPUTS as u32 * MOST_SEGMENT_BLOCKS.0 && !taken.contains(&row.facts.segment)
         };
         let listed = candidates.iter().filter_map(|segment| rows.get(*segment));
-        let Some(row) = listed.filter(|row| is_more(row) && fits(row)).min_by_key(|row| (Reverse(width(row)), row.facts.data_end)) else {
+        // the deadest go first, so the copy that brings overlap down also wins the most back, then the widest, then the smallest
+        let Some(row) = listed.filter(|row| is_more(row) && fits(row)).min_by_key(|row| (Reverse(dead_permille(row)), Reverse(width(row)), row.facts.data_end)) else {
             break;
         };
         let facts = row.facts;
@@ -772,4 +774,18 @@ pub fn overlap_bound(bytes: u64, rows: u64) -> usize {
     let mean = bytes / rows.max(1);
     let scaled = MOST_OVERLAP as u64 * mean / OVERLAP_BASE_RECORD_BYTES;
     MOST_OVERLAP.max(scaled as usize)
+}
+
+/// Read the share of a segment's record bytes its walk counted dead, in thousandths
+pub fn dead_permille(row: &SummaryRow<'_>) -> u64 {
+    let (mut bytes, mut dead) = (0, 0);
+    let mut cursor = row.cursor();
+    for _column in 0..row.column_count {
+        let Some(column) = cursor.column() else {
+            break;
+        };
+        bytes += column.live_bytes.0 + column.dead_bytes.0;
+        dead += column.dead_bytes.0;
+    }
+    dead * 1_000 / bytes.max(1)
 }

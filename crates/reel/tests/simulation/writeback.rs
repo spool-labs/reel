@@ -6,6 +6,7 @@ use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig
 use reel::engine::reel_store::ReelStore;
 use reel::engine::reserve_job::WRITEBACK_STEP_BYTES;
 use reel::engine::row_job::WRITE_OUT_PERIOD;
+use reel::guard::hold;
 use reel::record::codec::Codec;
 use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, Nanoseconds, VolumeId};
@@ -22,13 +23,17 @@ const TICK: Nanoseconds = Nanoseconds(1_000_000);
 type Store = ReelStore<SimulatedIo>;
 
 fn open(io: &SimulatedIo) -> Store {
+    open_with(io, SyncPolicy::Never)
+}
+
+fn open_with(io: &SimulatedIo, sync: SyncPolicy) -> Store {
     let config = StoreConfig {
         memory_budget: BUDGET,
         threads: reel::config::NO_WORKERS,
         volumes: vec![VolumeConfig {
             name: "writeback".to_string(),
             roots: vec![PathBuf::from(ROOT)],
-            sync: SyncPolicy::Never,
+            sync,
             device: Default::default(),
         }],
         columns: vec![ColumnConfig {
@@ -100,5 +105,20 @@ fn starts_a_range_once() {
     store.put(COLUMN, b"small", b"value").expect("put");
     two_periods(&io);
     assert_eq!(io.writeback_bytes(), started);
+    store.close().expect("close");
+}
+
+// a byte-cadence volume syncs once each time its writes pass the limit
+#[test]
+fn cadence_syncs_at_the_limit() {
+    let io = SimulatedIo::new(Seed(5));
+    let store = open_with(&io, SyncPolicy::EveryBytes(ByteCount(10 * VALUE_BYTES)));
+    let volume = &store.state.volumes[0];
+    let synced = || hold(&volume.sync).completed;
+    let start = synced();
+    fill(&store, 9 * VALUE_BYTES);
+    assert_eq!(synced(), start);
+    fill(&store, 2 * VALUE_BYTES);
+    assert_eq!(synced(), start + 1);
     store.close().expect("close");
 }

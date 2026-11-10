@@ -72,7 +72,6 @@ pub struct ClaimState<File> {
     pub is_creating: bool,
     pub prepared: Option<OpenSegment<File>>,
     pub wants_prepared: bool,
-    pub bytes_since_sync: ByteCount,
     pub next_root: usize,
 }
 
@@ -318,6 +317,8 @@ pub struct Volume<Backend: Io> {
     pub ingest_rate: AtomicU64,
     /// When the last sealed segment last took a write, in the clock's nanoseconds, or 0 before a seal
     pub seal_started_at: AtomicU64,
+    /// Bytes written since the last byte-cadence sync
+    pub bytes_since_sync: AtomicU64,
     /// Nanoseconds from the last sealed segment's first row to its seal start, the time the writes took to fill it, or 0 before a
     /// seal
     pub seal_interval: AtomicU64,

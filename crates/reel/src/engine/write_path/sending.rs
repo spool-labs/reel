@@ -24,17 +24,9 @@ impl<Backend: Io> EngineState<Backend> {
         match volume.policy {
             SyncPolicy::EveryWrite => self.sync_volume(volume),
             SyncPolicy::EveryBytes(limit) => {
-                let is_due = {
-                    let mut claims = hold(&volume.claims);
-                    claims.bytes_since_sync = ByteCount(claims.bytes_since_sync.0 + length.0);
-                    if claims.bytes_since_sync >= limit {
-                        claims.bytes_since_sync = ByteCount(0);
-                        true
-                    } else {
-                        false
-                    }
-                };
-                if is_due {
+                let before = volume.bytes_since_sync.fetch_add(length.0, Ordering::AcqRel);
+                // the writer that crosses the limit takes the count back to nothing and syncs
+                if before + length.0 >= limit.0 && volume.bytes_since_sync.swap(0, Ordering::AcqRel) >= limit.0 {
                     return self.sync_volume(volume);
                 }
                 Ok(())

@@ -536,9 +536,33 @@ impl<File: Clone> SegmentTable<File> {
         let guard = self.shards.read(shard_of(number));
         let slot = guard.map.get(number)?;
         let entry = guard.segments[slot as usize].as_ref()?;
-        let column_tail = guard.column_of(entry, column)?;
+        guard.window_of(entry, column, key, skip)
+    }
+
+    /// Pin a segment and find its first window of blocks that could hold a key, under one take of the shard's lock. The
+    /// window is nothing when the segment has no rows of the column
+    pub fn pin_window(&self, number: SegmentNumber, column: ColumnId, key: &[u8]) -> Option<(SegmentPin<'_, File>, Option<BlockWindow>)>
+    where
+        File: Clone,
+    {
+        let shard = shard_of(number);
+        let guard = self.shards.read(shard);
+        let slot = guard.map.get(number)?;
+        let entry = guard.segments[slot as usize].as_ref()?;
+        let window = guard.window_of(entry, column, key, 0);
+        let pin = &self.pins[shard][slot as usize];
+        pin.fetch_add(1, Ordering::AcqRel);
+        let segment_pin = SegmentPin { file: entry.file.clone(), head: entry.head, is_walked: entry.is_walked, pin };
+        Some((segment_pin, window))
+    }
+}
+
+impl<File> TableShard<File> {
+    /// Find a window of a segment's blocks that could hold a key, past the first `skip` of them
+    pub fn window_of(&self, entry: &TableEntry<File>, column: ColumnId, key: &[u8], skip: usize) -> Option<BlockWindow> {
+        let column_tail = self.column_of(entry, column)?;
         let first = entry.blocks.start as usize + column_tail.first_block as usize;
-        let lines = guard.blocks.get(first..first + column_tail.block_count.0 as usize)?;
+        let lines = self.blocks.get(first..first + column_tail.block_count.0 as usize)?;
 
         let prefix = KeyPrefix::of_key(key, column_tail.shared_length as usize);
         let start = first_candidate(lines, prefix) + skip;
@@ -562,7 +586,7 @@ impl<File: Clone> SegmentTable<File> {
             window.count += 1;
             window.filter_end_of_last = match lines.get(index + 1) {
                 Some(next) => next.header_at().0,
-                None => filter_end(entry, column_tail, &guard.blocks),
+                None => filter_end(entry, column_tail, &self.blocks),
             };
         }
         Some(window)

@@ -272,7 +272,7 @@ impl<Backend: Io> CoverApply<Backend> {
         let own = state.job_footer_readers.with(|reader| {
             let mut best = None;
             if let Some(pin) = volume.table.pin(segment) {
-                in_place(state.ask_rows(ReadOn::new(&InPlace, volume), &read, segment, &pin, reader, &mut best))?;
+                in_place(state.ask_rows(ReadOn::new(&InPlace, volume), &read, segment, &pin, reader, &mut best, None))?;
             }
             Ok::<_, StoreError>(best)
         })?;

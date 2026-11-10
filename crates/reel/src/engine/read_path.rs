@@ -28,7 +28,7 @@ use crate::row_kind::RowKind;
 use crate::segment::column_directory::ColumnDirectory;
 use crate::segment::footer_reader::{FooterAnswer, FooterCaches, FooterQuery, FooterReader, RowAt, WindowRead};
 use crate::segment::row_block::FooterRow;
-use crate::segment::segment_table::{SegmentPin, WINDOW_BLOCKS};
+use crate::segment::segment_table::{BlockWindow, SegmentPin, WINDOW_BLOCKS};
 use crate::segment::segment_tail::SegmentNumber;
 
 /// Tries a read makes before it takes a pin, and tries it makes for the pin
@@ -768,13 +768,16 @@ impl<Backend: Io> EngineState<Backend> {
                 source: Error::from(ErrorKind::Interrupted),
             });
         }
-        let Some(pin) = volume.table.pin(segment) else {
+        let Some((pin, window)) = volume.table.pin_window(segment, read.column, read.key) else {
             return Ok(());
         };
         if !pin.is_walked {
             return Ok(());
         }
-        self.ask_rows(ReadOn::new(device, volume), read, segment, &pin, reader, best).await
+        let Some(window) = window else {
+            return Ok(());
+        };
+        self.ask_rows(ReadOn::new(device, volume), read, segment, &pin, reader, best, Some(window)).await
     }
 
     /// Ask one pinned segment for a key's newest row that isn't a range delete, whether or not its walk has finished
@@ -786,10 +789,11 @@ impl<Backend: Io> EngineState<Backend> {
         pin: &SegmentPin<'_, Backend::File>,
         reader: &mut FooterReader,
         best: &mut Option<SealedRow>,
+        mut first: Option<BlockWindow>,
     ) -> Result<(), StoreError> {
         let ReadOn { device, target: volume } = on;
         let mut point = *read;
-        while let Some(found) = self.search_segment(device, volume, &point, segment, pin, reader).await? {
+        while let Some(found) = self.search_segment(device, volume, &point, segment, pin, reader, first.take()).await? {
             if found.kind != RowKind::RangeDelete {
                 if best.is_none_or(|current| current.row.place < found.place) {
                     *best = Some(SealedRow { segment, row: found, block_offset: reader.found_block, at: reader.found_at });
@@ -912,10 +916,13 @@ impl<Backend: Io> EngineState<Backend> {
         reader: &mut FooterReader,
         best: &mut Option<SealedRow>,
     ) -> Result<(), StoreError> {
-        let Some(pin) = volume.table.pin(segment) else {
+        let Some((pin, window)) = volume.table.pin_window(segment, read.column, read.key) else {
             return Ok(());
         };
-        let row = self.search_segment(device, volume, read, segment, &pin, reader).await?;
+        let Some(window) = window else {
+            return Ok(());
+        };
+        let row = self.search_segment(device, volume, read, segment, &pin, reader, Some(window)).await?;
         if let Some(found) = row
             && best.is_none_or(|current| current.row.place < found.place)
         {
@@ -933,6 +940,7 @@ impl<Backend: Io> EngineState<Backend> {
         segment: SegmentNumber,
         pin: &SegmentPin<'_, Backend::File>,
         reader: &mut FooterReader,
+        mut first: Option<BlockWindow>,
     ) -> Result<Option<FooterRow>, StoreError> {
         let caches = FooterCaches {
             resident: &self.filter_arena,
@@ -947,7 +955,7 @@ impl<Backend: Io> EngineState<Backend> {
 
         let mut skip = 0;
         loop {
-            let Some(window) = volume.table.block_window(segment, read.column, read.key, skip) else {
+            let Some(window) = first.take().or_else(|| volume.table.block_window(segment, read.column, read.key, skip)) else {
                 return Ok(None);
             };
             let window_read = WindowRead {

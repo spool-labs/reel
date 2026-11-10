@@ -581,6 +581,7 @@ pub fn overlaps(left: &SummaryRow<'_>, right: &SummaryRow<'_>) -> bool {
 /// Find a point more segments cover than the bound allows, in a segment no look has passed, and fill in the key. Overlap only
 /// grows when a segment arrives, so each one takes one look, and with none new a look costs nothing. It rises at a segment's
 /// lowest key, so the points worth trying are the new segment's own and those of a few that begin inside it
+#[allow(clippy::too_many_arguments, reason = "the summary rows, the directories, the look-up mark and the crowd answers")]
 pub fn overlap_start<'rows, 'state>(
     rows: &'rows SummaryRows,
     directory_of: impl Fn(ColumnId) -> Option<&'state ColumnDirectory>,

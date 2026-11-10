@@ -74,13 +74,10 @@ fn tree_merges_the_sources() {
                     while lists[last].get(next[last]).is_some_and(|key| !scan.is_before(&passed, key) && *key != passed) {
                         next[last] += 1;
                     }
-                    match lists[last].get(next[last]) {
-                        Some(key) => {
-                            scan.sources[scan.source_count].key = key.clone();
-                            scan.source_count += 1;
-                            scan.is_tree_stale = true;
-                        },
-                        None => {},
+                    if let Some(key) = lists[last].get(next[last]) {
+                        scan.sources[scan.source_count].key = key.clone();
+                        scan.source_count += 1;
+                        scan.is_tree_stale = true;
                     }
                 }
             }

@@ -176,6 +176,7 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// Ask one walked segment for a row through the cursor, keeping the block the reader holds for the next row. A range
     /// delete, a window past its lines or a key the cursor can't place asks as `ask_held` does
+    #[allow(clippy::too_many_arguments, reason = "a walked segment, the read, the cursor and the block it holds")]
     pub fn ask_held_once(
         &self,
         volume: &Volume<Backend>,

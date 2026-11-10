@@ -17,6 +17,7 @@ pub const RUN_LINES: usize = WINDOW_BLOCKS + 2;
 const MAP_SLOTS: usize = 2 * CURSOR_SEGMENTS;
 
 /// What a cursor gives for a segment
+#[allow(clippy::large_enum_variant, reason = "returned by value on every row a walk asks, where a box would allocate")]
 pub enum CursorAnswer<'cursor, File> {
     /// Nothing to ask: the segment left, or its walk hasn't finished
     Skip,

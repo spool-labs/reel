@@ -902,6 +902,7 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Ask one pinned segment for a key's newest row that isn't a range delete, whether or not its walk has finished
+    #[allow(clippy::too_many_arguments, reason = "a pinned segment, the read, its window and the best row so far")]
     pub async fn ask_rows(
         &self,
         on: ReadOn<'_, impl DeviceReads<Backend::File>, Volume<Backend>>,
@@ -1041,6 +1042,7 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Search a pinned segment window by window
+    #[allow(clippy::too_many_arguments, reason = "a pinned segment, the read, its window and the best row so far")]
     pub async fn search_segment(
         &self,
         device: &impl DeviceReads<Backend::File>,
@@ -1055,6 +1057,7 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Search a segment's file window by window, while the caller holds it
+    #[allow(clippy::too_many_arguments, reason = "a segment's file, the read, its window and the best row so far")]
     pub async fn search_file(
         &self,
         device: &impl DeviceReads<Backend::File>,

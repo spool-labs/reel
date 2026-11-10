@@ -364,6 +364,7 @@ impl FooterReader {
 
     /// Ask a block's filter for a key, keeping the filter in the reader when the arena lacks it, so the next key of the same
     /// block takes no cache lock. `held` names the filter the reader keeps and its length
+    #[allow(clippy::too_many_arguments, reason = "a block's filter, the key and the filter the reader holds")]
     pub async fn probe_held<File: IoFile>(
         &mut self,
         on: ReadOn<'_, impl DeviceReads<File>, File>,

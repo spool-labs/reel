@@ -243,6 +243,7 @@ pub struct Volume<Backend: Io> {
     pub rewrite_written: AtomicU64,
     /// Bytes the outputs took, by the kinds the report counts them in
     pub rewrite_written_by_share: [AtomicU64; SHARE_KINDS],
+    pub rewrite_gone_by_share: [AtomicU64; SHARE_KINDS],
     /// Rewrites done, by the same kinds
     pub rewrites_by_share: [AtomicU64; SHARE_KINDS],
     /// File bytes whole unlinks took off the disk
@@ -531,6 +532,7 @@ impl<Backend: Io> Volume<Backend> {
         self.rewrite_inputs_gone.fetch_add(gone.file, Ordering::Relaxed);
         self.rewrite_written.fetch_add(written.file, Ordering::Relaxed);
         self.rewrite_written_by_share[kind].fetch_add(written.file, Ordering::Relaxed);
+        self.rewrite_gone_by_share[kind].fetch_add(gone.file, Ordering::Relaxed);
         self.rewrites_by_share[kind].fetch_add(1, Ordering::Relaxed);
         self.rewrite_dead_gone.fetch_add(gone.dead, Ordering::Relaxed);
         self.rewrite_dead_kept.fetch_add(written.dead, Ordering::Relaxed);

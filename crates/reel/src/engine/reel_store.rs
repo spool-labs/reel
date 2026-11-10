@@ -1341,6 +1341,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         rewrite_inputs_gone: AtomicU64::new(0),
         rewrite_written: AtomicU64::new(0),
         rewrite_written_by_share: Default::default(),
+        rewrite_gone_by_share: Default::default(),
         rewrites_by_share: Default::default(),
         unlinked_bytes: AtomicU64::new(0),
         rewrite_dead_gone: AtomicU64::new(0),

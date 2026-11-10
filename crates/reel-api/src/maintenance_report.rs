@@ -338,6 +338,8 @@ pub struct RewriteBytes {
     /// Bytes the outputs took, by what the rewrite was: a record rewrite whose inputs won back under three quarters of their
     /// bytes, one that won back three quarters or more, an overlap merge, and a rebuild or forced merge
     pub written_by_share: [ByteCount; SHARE_KINDS],
+    /// Input bytes rewrites of each of those kinds took off the disk
+    pub gone_by_share: [ByteCount; SHARE_KINDS],
     /// Rewrites of each of those kinds
     pub rewrites_by_share: [u64; SHARE_KINDS],
     /// File bytes whole unlinks took off the disk, which write nothing

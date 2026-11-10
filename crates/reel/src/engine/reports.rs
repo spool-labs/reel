@@ -206,6 +206,7 @@ impl<Backend: Io> EngineState<Backend> {
                     dead_kept: ByteCount(volume.rewrite_dead_kept.load(Ordering::Acquire)),
                     unreclaimed: volume.rewrites_unreclaimed.load(Ordering::Acquire),
                     written_by_share: array::from_fn(|kind| ByteCount(volume.rewrite_written_by_share[kind].load(Ordering::Acquire))),
+                    gone_by_share: array::from_fn(|kind| ByteCount(volume.rewrite_gone_by_share[kind].load(Ordering::Acquire))),
                     rewrites_by_share: array::from_fn(|kind| volume.rewrites_by_share[kind].load(Ordering::Acquire)),
                     unlinked: ByteCount(volume.unlinked_bytes.load(Ordering::Acquire)),
                 },

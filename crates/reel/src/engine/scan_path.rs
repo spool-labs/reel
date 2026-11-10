@@ -478,6 +478,7 @@ impl<Backend: Io> EngineState<Backend> {
                 // a segment gone from under the list is in the next one, which the step's last look will see
                 if self.seat_source(device, volume, source, &at).await? == SourceMove::Row {
                     scan.source_count += 1;
+                    scan.is_tree_stale = true;
                 }
             }
             if !page.is_cut {
@@ -547,14 +548,14 @@ impl<Backend: Io> EngineState<Backend> {
     ) -> Result<Option<SealedRow>, StoreError> {
         let mut best: Option<SealedRow> = None;
         let (column, direction) = (scan.column, scan.direction);
-        let mut index = 0;
-        while index < scan.source_count {
+        // the tree's closest source stands on the key while any does, and one that moves past it plays its matches again
+        loop {
+            scan.settle_tree();
+            let Some(index) = scan.closest_source().filter(|index| scan.sources[*index].key == key) else {
+                return Ok(best);
+            };
             let mut take = (scan.is_counting && !scan.is_spilled).then(|| BlockTake { gate: scan.gate_without(index), rows: 0 });
             let source = &mut scan.sources[index];
-            if source.key != key {
-                index += 1;
-                continue;
-            }
             let mut step = SourceMove::Row;
             while step == SourceMove::Row && source.key == key {
                 if source.row.place <= point && best.is_none_or(|row| row.row.place < source.row.place) {
@@ -571,12 +572,11 @@ impl<Backend: Io> EngineState<Backend> {
             scan.counted += taken;
             scan.taken += taken;
             match step {
-                SourceMove::Row => index += 1,
+                SourceMove::Row => scan.replay(index),
                 // a segment leaves its list before the table, so the step's look at the list sees this
                 SourceMove::Done | SourceMove::Left => scan.drop_source(index),
             }
         }
-        Ok(best)
     }
 
     /// Move a source to its next row in the walk's direction

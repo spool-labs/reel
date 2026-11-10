@@ -23,6 +23,8 @@ pub const MOST_SCAN_SOURCES: usize = 64;
 pub const HELD_SOURCE_BLOCKS: usize = 8;
 /// A generation no directory has, so a scan seats itself at its next step
 pub const NO_GENERATION: u64 = u64::MAX;
+/// A leaf of the scan's tree with no source
+const NO_SOURCE: u16 = u16::MAX;
 
 /// Where a scan stops
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -102,6 +104,12 @@ pub struct ScanState {
     pub frontier: Option<KeyBound>,
     pub sources: Vec<SegmentSource>,
     pub source_count: usize,
+    /// A loser tree over the sources: each inner node keeps the loser of its match, and `winner` the closest source
+    pub losers: Vec<u16>,
+    pub winners: Vec<u16>,
+    pub winner: u16,
+    pub width: usize,
+    pub is_tree_stale: bool,
     pub spill: SegmentSource,
     pub is_spilled: bool,
     pub heads: Vec<ShardHead>,
@@ -245,6 +253,11 @@ impl ScanState {
             frontier: None,
             sources: (0..MOST_SCAN_SOURCES).map(|index| SegmentSource::new(widest_key, if index < HELD_SOURCE_BLOCKS { ROW_BLOCK_BYTES } else { 0 })).collect(),
             source_count: 0,
+            losers: touched_filled(MOST_SCAN_SOURCES, NO_SOURCE),
+            winners: touched_filled(MOST_SCAN_SOURCES, NO_SOURCE),
+            winner: NO_SOURCE,
+            width: 1,
+            is_tree_stale: true,
             spill: SegmentSource::new(widest_key, 0),
             is_spilled: false,
             heads: (0..SHARD_COUNT).map(|_head| ShardHead::new(widest_key, open_slots)).collect(),
@@ -322,6 +335,7 @@ impl ScanState {
     pub fn reseat(&mut self, generation: u64) {
         self.generation = generation;
         self.source_count = 0;
+        self.is_tree_stale = true;
         self.is_spilled = false;
         self.frontier = Some(KeyBound::of_key(&self.position));
         self.forget_held();
@@ -353,10 +367,60 @@ impl ScanState {
     }
 
     /// Find the key the walk reaches next among the places it holds
-    pub fn closest_key(&self) -> Option<&[u8]> {
-        let sources = self.sources[..self.source_count].iter().map(|source| source.key.as_slice());
+    pub fn closest_key(&mut self) -> Option<&[u8]> {
+        self.settle_tree();
+        let source = self.closest_source().map(|index| self.sources[index].key.as_slice());
         let head = self.closest_head.map(|head| self.heads[head].key.as_slice());
-        sources.chain(head).reduce(|best, key| if self.is_before(key, best) { key } else { best })
+        match (source, head) {
+            (Some(source), Some(head)) => Some(if self.is_before(head, source) { head } else { source }),
+            (source, head) => source.or(head),
+        }
+    }
+
+    /// Read the source the tree has closest, once it's settled
+    pub fn closest_source(&self) -> Option<usize> {
+        (self.winner != NO_SOURCE).then_some(self.winner as usize)
+    }
+
+    /// Check one leaf of the tree comes before another, where an empty leaf comes after every source
+    pub fn beats(&self, leaf: u16, other: u16) -> bool {
+        leaf != NO_SOURCE && (other == NO_SOURCE || self.is_before(&self.sources[leaf as usize].key, &self.sources[other as usize].key))
+    }
+
+    /// Build the tree again over the sources, once a source came or went
+    pub fn settle_tree(&mut self) {
+        if !self.is_tree_stale {
+            return;
+        }
+        self.is_tree_stale = false;
+        self.width = self.source_count.next_power_of_two();
+        let width = self.width;
+        let leaf = |index: usize, count: usize| if index < count { index as u16 } else { NO_SOURCE };
+        for node in (1..width).rev() {
+            let (left, right) = (2 * node, 2 * node + 1);
+            let left = if left >= width { leaf(left - width, self.source_count) } else { self.winners[left] };
+            let right = if right >= width { leaf(right - width, self.source_count) } else { self.winners[right] };
+            let (winner, loser) = if self.beats(right, left) { (right, left) } else { (left, right) };
+            self.winners[node] = winner;
+            self.losers[node] = loser;
+        }
+        self.winner = if width == 1 { leaf(0, self.source_count) } else { self.winners[1] };
+    }
+
+    /// Play a source's matches again from its leaf, after it moved to a later key
+    pub fn replay(&mut self, index: usize) {
+        if self.is_tree_stale {
+            return;
+        }
+        let mut current = index as u16;
+        let mut node = (self.width + index) / 2;
+        while node >= 1 {
+            if self.beats(self.losers[node], current) {
+                mem::swap(&mut self.losers[node], &mut current);
+            }
+            node /= 2;
+        }
+        self.winner = current;
     }
 
     /// Check the index holds no row of a key at a read point: no head shows it, and nothing at or below the point came in
@@ -424,6 +488,7 @@ impl ScanState {
     pub fn drop_source(&mut self, index: usize) {
         self.source_count -= 1;
         self.sources.swap(index, self.source_count);
+        self.is_tree_stale = true;
     }
 
     /// Read the heap these buffers hold
@@ -432,7 +497,7 @@ impl ScanState {
         let keys: usize = self.sources.iter().map(|source| source.key.capacity() + source.held.capacity()).sum();
         let heads: usize = self.heads.iter().map(|head| head.key.capacity() + head.cursor.trees.capacity() * size_of::<TreeCursor>()).sum();
         let own = self.position.capacity() + self.limit.capacity() + self.key.capacity() + self.spill.key.capacity() + self.origin.capacity() + self.out_key.capacity();
-        let found = self.found.capacity() * size_of::<SegmentNumber>();
+        let found = self.found.capacity() * size_of::<SegmentNumber>() + (self.losers.capacity() + self.winners.capacity()) * size_of::<u16>();
         let head = self.heads.capacity() * size_of::<ShardHead>();
         ByteCount(self.sources.capacity() as u64 * source + (keys + heads + own + found + head + self.window.heap_bytes()) as u64)
     }
@@ -493,7 +558,8 @@ pub fn planned_scan_bytes(widest_key: u64, open_slots: usize) -> u64 {
     let sources = (MOST_SCAN_SOURCES + 1) * size_of::<SegmentSource>();
     let heads = SHARD_COUNT * (size_of::<ShardHead>() + open_slots * size_of::<TreeCursor>());
     let held = HELD_SOURCE_BLOCKS * ROW_BLOCK_BYTES;
-    keys + (sources + heads + held + MOST_SCAN_SOURCES * size_of::<SegmentNumber>() + SCAN_WINDOWS * SCAN_WINDOW_BYTES) as u64
+    let tree = 2 * MOST_SCAN_SOURCES * size_of::<u16>();
+    keys + (sources + heads + held + tree + MOST_SCAN_SOURCES * size_of::<SegmentNumber>() + SCAN_WINDOWS * SCAN_WINDOW_BYTES) as u64
 }
 
 

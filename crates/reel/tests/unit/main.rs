@@ -25,6 +25,7 @@ mod record_head;
 mod record_reader;
 mod row_block;
 mod row_group;
+mod scan_tree;
 mod scan_window;
 mod segment_table;
 mod segment_tail;

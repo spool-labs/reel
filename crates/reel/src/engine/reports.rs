@@ -13,6 +13,7 @@ use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, Nanoseconds, RootId, RowCount, SegmentCount, VolumeId};
 use reel_api::usage::{ColumnRootUsage, ColumnUsage, RootUsage, UsageReport, VolumeUsage};
 
+use crate::engine::rewrite_job::rows_of;
 use crate::engine::engine_state::EngineState;
 use crate::engine::job_tally::STALL_AFTER;
 use crate::engine::planner::is_sealing;
@@ -160,6 +161,16 @@ impl<Backend: Io> EngineState<Backend> {
         report.cursor_lookups = array::from_fn(|kind| self.cursor_lookups[kind].load(Ordering::Relaxed));
         report.merge_lookups = array::from_fn(|kind| self.merge_lookups[kind].load(Ordering::Relaxed));
         report.dead_bits = [0; 13];
+        report.bit_rows = [0; 2];
+        for volume in &self.volumes {
+            for row in hold(&volume.summary).rows() {
+                let rows = rows_of(&row);
+                report.bit_rows[1] += rows;
+                if volume.dead_bits.exact(row.facts.segment).is_some() {
+                    report.bit_rows[0] += rows;
+                }
+            }
+        }
         for volume in &self.volumes {
             let (used, segments) = volume.dead_bits.used();
             let inexact = volume.dead_bits.inexact.each_ref().map(|count| count.load(Ordering::Relaxed));

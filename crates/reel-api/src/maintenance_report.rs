@@ -514,6 +514,8 @@ pub struct MaintenanceReport {
     /// kept, asked as well, a set bit
     /// the ask found no newer row for, and a clear bit the ask found one for
     pub dead_bits: [u64; 13],
+    /// Rows on disk in segments whose bits are exact, and all rows on disk
+    pub bit_rows: [u64; 2],
     /// Walk block lookups run together: blocks, candidates asked, candidates whose range held the whole block, per-key checks
     pub block_lookups: [u64; 4],
     pub volumes: Vec<VolumeReading>,
@@ -597,6 +599,7 @@ impl MaintenanceReport {
             cursor_lookups: [0; 4],
             merge_lookups: [0; 6],
             dead_bits: [0; 13],
+            bit_rows: [0; 2],
             block_lookups: [0; 4],
             volumes: Vec::new(),
             complete_columns: Vec::new(),

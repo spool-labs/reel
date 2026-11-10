@@ -26,7 +26,7 @@ use crate::segment::segment_tail::{MOST_MERGE_SEGMENTS, SegmentNumber};
 use crate::segment::summary::{SummaryRow, SummaryRows};
 use crate::segment::summary_orders::{COVERS_LIST, ROW_FOOTER_BYTES, SHARE_BUCKETS, SHARE_SCALE, WalkList, reclaim_share, share_bucket};
 
-use crate::engine::rewrite_job::{BAR_QUARTERS, BUCKET_LOOKS, BarsFired, CROWD_PAGES, MOST_LOOK_TIME, OVERLAP_BASE_RECORD_BYTES, EARLY_BAR_QUARTERS, GATHER_LOOKS, MOST_OVERLAP, MergeInput, MergeTarget, OVERLAP_LOOKS, OVERLAP_PROBES, PLAIN_BAR_QUARTERS, PLANNER_LANE, QUIET_BAR_QUARTERS, RewriteJob, RewritePhase, rows_of};
+use crate::engine::rewrite_job::{BAR_QUARTERS, BUCKET_LOOKS, BarsFired, CROWD_PAGES, MOST_COUNTED_CROWD, MOST_LOOK_TIME, OVERLAP_BASE_RECORD_BYTES, EARLY_BAR_QUARTERS, GATHER_LOOKS, MOST_OVERLAP, MergeInput, MergeTarget, OVERLAP_LOOKS, OVERLAP_PROBES, PLAIN_BAR_QUARTERS, PLANNER_LANE, QUIET_BAR_QUARTERS, RewriteJob, RewritePhase, rows_of};
 use crate::engine::rewrite_job::install::freed_in_place;
 
 impl<Backend: Io> RewriteJob<Backend> {
@@ -860,11 +860,12 @@ pub fn record_totals(row: &SummaryRow<'_>) -> (u64, u64) {
     (bytes, rows)
 }
 
-/// Work out how many segments over one key a crowd of this mean record size may hold before a merge is due
+/// Work out how many segments over one key a crowd of this mean record size may hold before a merge is due, short of the most a
+/// crowd count reaches
 pub fn overlap_bound(bytes: u64, rows: u64) -> usize {
     let mean = bytes / rows.max(1);
     let scaled = MOST_OVERLAP as u64 * mean / OVERLAP_BASE_RECORD_BYTES;
-    MOST_OVERLAP.max(scaled as usize)
+    MOST_OVERLAP.max(scaled.min(MOST_COUNTED_CROWD as u64 - 1) as usize)
 }
 
 /// Read the share of a segment's record bytes its walk counted dead, in thousandths

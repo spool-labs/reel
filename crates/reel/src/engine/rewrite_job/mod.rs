@@ -110,6 +110,9 @@ pub const GATHER_LOOKS: usize = 64;
 pub const OVERLAP_LISTED: usize = 4 * (MOST_OVERLAP + 1);
 /// Most listings a count of the segments over one key pages through
 pub const CROWD_PAGES: usize = 4;
+/// The most segments a crowd count reaches, a page of listed segments at a time. A bound at or past it would never be met, so
+/// a column with large records merges at one below it
+pub const MOST_COUNTED_CROWD: usize = CROWD_PAGES * OVERLAP_LISTED;
 /// Numbers an output skips looking for one outside a stuck seal's shard, which one in 16 lands in
 pub const MOST_NUMBER_TRIES: usize = 64;
 

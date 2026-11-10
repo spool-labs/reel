@@ -1258,6 +1258,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         written: Default::default(),
         pauses: Default::default(),
         longest_room_step: AtomicU64::new(0),
+        longest_walkless_steps: AtomicU64::new(0),
         cursor_lookups: Default::default(),
         merge_lookups: Default::default(),
         block_lookups: Default::default(),

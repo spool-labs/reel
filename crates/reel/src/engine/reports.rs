@@ -159,6 +159,7 @@ impl<Backend: Io> EngineState<Backend> {
             *entry = pauses.load(Ordering::Relaxed);
         }
         report.longest_room_step = Nanoseconds(self.longest_room_step.load(Ordering::Relaxed));
+        report.longest_walkless_steps = self.longest_walkless_steps.load(Ordering::Relaxed);
         report.cursor_lookups = array::from_fn(|kind| self.cursor_lookups[kind].load(Ordering::Relaxed));
         report.merge_lookups = array::from_fn(|kind| self.merge_lookups[kind].load(Ordering::Relaxed));
         report.dead_bits = [0; 14];

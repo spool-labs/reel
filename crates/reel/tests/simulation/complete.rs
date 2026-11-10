@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::compact_job::CompactJob;
+use reel::engine::planner::MOST_WALKLESS_STEPS;
 use reel::engine::open_segment::data_path;
 use reel::io::job::JobStep;
 use reel::engine::complete_image::IMAGE_HEAD_BYTES;
@@ -23,7 +24,7 @@ use reel::record::codec::Codec;
 use reel::segment::segment_tail::SegmentNumber;
 use reel_api::column_id::ColumnId;
 use reel_api::direction::Direction;
-use reel_api::maintenance_report::MaintenanceReport;
+use reel_api::maintenance_report::{MaintenanceReport, UNIT_KINDS, UnitKind};
 use reel_api::scan::ScanStep;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RowCount, VolumeId};
@@ -1007,5 +1008,59 @@ fn refill_waits_for_segments_in_flight() {
     assert!(store.state.start_refill(0, u64::MAX).is_some(), "a refill waited with nothing in flight");
     volume.holds.compaction.store(false, Ordering::Release);
     volume.holds.walk.store(false, Ordering::Release);
+    store.close().expect("close");
+}
+
+const REFILL_ROUNDS: u64 = 12;
+const REFILL_KEYS: u64 = 8_000;
+const MOST_REFILLS_ALONE: u64 = 3;
+
+// a refill shares the planner with the walk, so walk blocks land between refill steps while a long refill runs, and the mark
+// clears once the walk has freed the slots
+#[test]
+fn walk_runs_beside_a_refill() {
+    let io = SimulatedIo::new(Seed(33));
+    let store = open(&io, RowCount(2 * REFILL_KEYS));
+    let volume = &store.state.volumes[0];
+    let table = store.state.complete_table(COLUMN).expect("a table");
+    volume.holds.walk.store(true, Ordering::Release);
+    volume.holds.compaction.store(true, Ordering::Release);
+    for round in 0..REFILL_ROUNDS {
+        for number in 0..REFILL_KEYS {
+            store.put(COLUMN, &key(number), format!("round-{round}").as_bytes()).expect("put");
+        }
+        seal(&store, &io);
+    }
+    assert!(table.mark().is_some(), "{REFILL_ROUNDS} versions of every key fit a table sized for two");
+    volume.holds.compaction.store(false, Ordering::Release);
+    volume.holds.walk.store(false, Ordering::Release);
+    let refill = UNIT_KINDS.iter().position(|kind| *kind == UnitKind::SlotRefill).expect("a refill unit");
+    store.state.ask_compaction();
+    let mut report = MaintenanceReport::new();
+    let (mut refills, mut walked, mut alone, mut most_alone, mut refill_steps) = (0, 0, 0, 0, 0);
+    for _step in 0..STEPS {
+        if io.step_any().is_none() {
+            io.advance_clock(TICK);
+            if io.step_any().is_none() {
+                break;
+            }
+        }
+        store.maintenance_report(&mut report);
+        let (now_refills, now_walked) = (report.longest_units[refill].work_sum, report.volumes[0].walk_blocks);
+        if now_refills != refills {
+            refill_steps += 1;
+            alone = if now_walked == walked { alone + 1 } else { 0 };
+            most_alone = most_alone.max(alone);
+            walked = now_walked;
+        }
+        refills = now_refills;
+    }
+    assert!(refill_steps > MOST_REFILLS_ALONE, "only {refill_steps} refill steps ran, mark {:?}, used {:?}, past {:?}, walked {walked}, unwalked {}", table.mark(), table.used_slots(), table.past_capacity(), store.state.pending_walks(0));
+    assert!(most_alone <= MOST_REFILLS_ALONE, "{most_alone} refill steps ran in a row with no walk block between");
+    assert!(report.longest_walkless_steps <= MOST_WALKLESS_STEPS, "the planner held the walk back {} steps", report.longest_walkless_steps);
+    assert_eq!(table.mark(), None, "the mark stood once the walk had freed the slots");
+    for number in 0..REFILL_KEYS {
+        assert_eq!(read(&store, &key(number)), Some(format!("round-{}", REFILL_ROUNDS - 1).into_bytes()));
+    }
     store.close().expect("close");
 }

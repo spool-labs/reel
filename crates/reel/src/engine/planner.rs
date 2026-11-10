@@ -28,6 +28,9 @@ pub const WRITER_YIELD: Nanoseconds = Nanoseconds(200_000);
 /// the seals still falls behind while ingest lasts
 pub const WALK_LAG_SEGMENTS: u64 = 8;
 
+/// Planner steps in a row that may end before the walk's turn while a walk is pending, a merge's steps on a store with no workers
+pub const MOST_WALKLESS_STEPS: u64 = 64;
+
 /// Every volume's units and whose turn it is
 pub struct Planner<Backend: Io> {
     pub state: Arc<EngineState<Backend>>,
@@ -57,6 +60,16 @@ impl<Backend: Io> Planner<Backend> {
             Some(deadline) => JobStep::IdleUntil { deadline },
             None => JobStep::Idle,
         }
+    }
+
+    /// Count a step that ended before the walk's turn while a walk was pending, and keep the longest run
+    pub fn note_walkless(&mut self, index: usize) {
+        if self.state.pending_walks(index) == 0 {
+            self.compactions[index].walkless_steps = 0;
+            return;
+        }
+        self.compactions[index].walkless_steps += 1;
+        self.state.longest_walkless_steps.fetch_max(self.compactions[index].walkless_steps, Ordering::Relaxed);
     }
 
     /// Note what a unit's step found, and say whether it worked
@@ -103,14 +116,19 @@ impl<Backend: Io> Job for Planner<Backend> {
             let index = (first + turn) % count;
             // a ready reclaim runs ahead of the next walk target, and each segment it frees is one that walk won't probe. A
             // merge of unwalked segments needs nothing from a walk, so an overlap past the bound doesn't wait for one to end
+            let mut did_background = false;
             if self.walks[index].target.is_none() || self.compactions[index].has_overlap_work() {
                 let step = self.compactions[index].step_unit(now);
-                if self.note_step(index, step, &mut soonest) {
+                // a refill or a sweep step leaves the walk its turn, so a long pass never holds the walk back
+                did_background = self.compactions[index].did_background;
+                if self.note_step(index, step, &mut soonest) && !did_background {
+                    self.note_walkless(index);
                     return JobStep::Worked;
                 }
             }
+            self.compactions[index].walkless_steps = 0;
             let step = self.walks[index].step_unit(now);
-            if self.note_step(index, step, &mut soonest) {
+            if self.note_step(index, step, &mut soonest) || did_background {
                 return JobStep::Worked;
             }
         }

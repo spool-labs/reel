@@ -133,6 +133,8 @@ pub struct EngineState<Backend: Io> {
     pub pauses: [AtomicU64; PAUSE_CAUSES.len()],
     /// The longest room step, in nanoseconds
     pub longest_room_step: AtomicU64,
+    /// The most planner steps in a row that ended before the walk's turn while a walk was pending
+    pub longest_walkless_steps: AtomicU64,
     /// Walk lookups through the cursor, in the report's order
     pub cursor_lookups: [AtomicU64; 4],
     /// Merge lookups, in the report's order

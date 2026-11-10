@@ -15,6 +15,7 @@ use std::thread;
 use std::time::Duration;
 
 use reel::engine::unit_bounds::unit_bound;
+use reel::engine::planner::MOST_WALKLESS_STEPS;
 use reel::engine::reel_store::ReelStore;
 use reel::segment::summary_orders::{SHARE_SCALE, reclaim_share};
 use reel::engine::walk_job::FREE_IN_PLACE_BYTES;
@@ -786,6 +787,11 @@ fn check_units(store: &Store) -> u64 {
             println!("unit {kind:?} is past its bound {bound:?} or the {} ms line", UNIT_TIME_LINE.0 / 1_000_000);
             failures += 1;
         }
+    }
+    println!("planner: {} steps in a row before the walk's turn", report.longest_walkless_steps);
+    if report.longest_walkless_steps > MOST_WALKLESS_STEPS {
+        println!("the planner held the walk back past {MOST_WALKLESS_STEPS} steps");
+        failures += 1;
     }
     failures
 }

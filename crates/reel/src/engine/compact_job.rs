@@ -27,7 +27,8 @@ use crate::engine::volume::{ParkedSegment, Volume};
 use crate::engine::walk_job::{FREE_IN_PLACE_BYTES, FreeRecord, WALK_RETRY};
 use crate::engine::reserve_job::RESERVE_PERIOD;
 use crate::guard::hold;
-use crate::io::device_error::is_device_error; use crate::io::job::JobStep;
+use crate::io::device_error::is_device_error;
+use crate::io::job::JobStep;
 use crate::io::{InPlace, Io, IoFile, in_place};
 use crate::fixed_list::FixedList;
 use crate::index::complete_table::{COMPLETE_SHARDS, CompleteTable, SWEEP_STEP_BUCKETS};
@@ -134,6 +135,10 @@ pub struct CompactJob<Backend: Io> {
     row_key: FixedList<u8>,
     end: FixedList<u8>,
     unit: Option<(UnitKind, u64)>,
+    /// The last step took a refill or a sweep step, which leaves the walk its turn
+    pub did_background: bool,
+    /// Planner steps in a row that ended before the walk's turn while a walk was pending
+    pub walkless_steps: u64,
 }
 
 impl<Backend: Io> CompactJob<Backend> {
@@ -151,6 +156,8 @@ impl<Backend: Io> CompactJob<Backend> {
             should_rewrite: false,
             is_ask_held: false,
             unit: None,
+            did_background: false,
+            walkless_steps: 0,
             held_pass: None,
             confirm_pass: None,
             state,
@@ -219,6 +226,7 @@ impl<Backend: Io> CompactJob<Backend> {
 
     /// Step once: a parked file no read holds any more, then the candidate work
     pub fn step_work(&mut self, now: Nanoseconds) -> JobStep {
+        self.did_background = false;
         let state = Arc::clone(&self.state);
         let volume = &state.volumes[self.volume];
         if volume.has_failed() || volume.is_compaction_held() {
@@ -246,35 +254,52 @@ impl<Backend: Io> CompactJob<Backend> {
         }
         if cleared > 0 {
             self.unit = Some((UnitKind::ParkedClear, cleared));
+            self.did_background = true;
+            self.hand_out_on_change(volume);
             return JobStep::Worked;
         }
-        if self.step_refill() {
-            return JobStep::Worked;
+        // a refill or a sweep takes one step and the rest still runs, so a long pass holds back no pick and no merge
+        let started = self.state.io.now();
+        self.did_background = self.step_refill() || self.step_sweep();
+        if let Some((kind, work)) = self.unit.take() {
+            self.state.note_unit(kind, work, started);
         }
-        if self.step_sweep() {
-            return JobStep::Worked;
+        match self.step_rest(now) {
+            JobStep::Idle | JobStep::IdleUntil { .. } if self.did_background => JobStep::Worked,
+            step => step,
         }
+    }
+
+    /// Step the work past the background passes: the covers, the held frees, the unlinks and the picks
+    fn step_rest(&mut self, now: Nanoseconds) -> JobStep {
+        let state = Arc::clone(&self.state);
+        let volume = &state.volumes[self.volume];
+        // the passes below run a step at a time beside the walk, and every step hands out what changed
+        self.hand_out_on_change(volume);
         // a live cue may still need what it kept, and its going brings the planner back
         if state.cues.is_empty() && volume.has_kept_covers.swap(false, Ordering::AcqRel) {
             self.unit = Some((UnitKind::CoverSweep, 0));
             self.sweep_covers(volume);
+            self.did_background = true;
             return JobStep::Worked;
         }
         if state.cues.is_empty() && volume.has_held_frees.load(Ordering::Acquire) {
             self.unit = Some((UnitKind::HeldFrees, 0));
-            return match self.step_held_pass(volume) {
+            let step = self.step_held_pass(volume);
+            self.did_background |= step.is_ok();
+            return match step {
                 Ok(()) => JobStep::Worked,
                 Err(_) => JobStep::IdleUntil { deadline: Nanoseconds(now.0 + WALK_RETRY.0) },
             };
         }
         if self.confirm_pass.is_some() {
+            // a ready unlink runs ahead of the next walk target, so ingest that keeps walks waiting still frees segments
             self.unit = Some((UnitKind::UnlinkCheck, 0));
             return match self.step_confirm(volume) {
                 Ok(()) => JobStep::Worked,
                 Err(_) => self.wait_for_retry(now),
             };
         }
-        self.hand_out_on_change(volume);
         if self.rewrite.is_running() {
             self.rewrite.step();
             return JobStep::Worked;

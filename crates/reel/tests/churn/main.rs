@@ -6,10 +6,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use reel::engine::planner::MOST_WALKLESS_STEPS;
 use reel::engine::reel_store::ReelStore;
 use reel::engine::store_scan::StoreScan;
 use reel::io::plain::PlainIo;
 use reel_api::direction::Direction;
+use reel_api::maintenance_report::MaintenanceReport;
 use reel_api::scan::ScanStep;
 use reel_api::units::ByteCount;
 
@@ -192,6 +194,9 @@ fn churn(has_cue: bool) -> JobsRun {
     println!("{} walks and {views} views beside {} unlinks and {} rewrites", walks.load(Ordering::Relaxed), run.unlinks, run.rewrites);
     assert!(walks.load(Ordering::Relaxed) > 0);
     assert_eq!(store.state.cues.refused_reads(), 0);
+    let mut report = MaintenanceReport::new();
+    store.maintenance_report(&mut report);
+    assert!(report.longest_walkless_steps <= MOST_WALKLESS_STEPS, "the planner held the walk back {} steps", report.longest_walkless_steps);
     store.close().expect("close");
     drop(store);
     let _removed = fs::remove_dir_all(&root);

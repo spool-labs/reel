@@ -522,6 +522,8 @@ pub struct MaintenanceReport {
     pub pauses: [u64; PAUSE_CAUSES.len()],
     /// The longest a writer took to reserve room ahead of its claims
     pub longest_room_step: Nanoseconds,
+    /// The most planner steps in a row that ended before the walk's turn while a walk was pending
+    pub longest_walkless_steps: u64,
     /// Walk lookups through the cursor: segments it pinned, runs it copied again, rows it answered, rows it sent to the table
     pub cursor_lookups: [u64; 4],
     /// Merge lookups through the cursor, as above, then merge rows asked outside the merge and rows an unwalked merge settled alone
@@ -612,6 +614,7 @@ impl MaintenanceReport {
             written: [ByteCount(0); WRITE_SOURCES.len()],
             pauses: [0; PAUSE_CAUSES.len()],
             longest_room_step: Nanoseconds(0),
+            longest_walkless_steps: 0,
             cursor_lookups: [0; 4],
             merge_lookups: [0; 6],
             dead_bits: [0; 14],

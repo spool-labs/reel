@@ -44,11 +44,11 @@ mod merge;
 mod pick;
 mod place;
 
-pub use pick::is_reclaim_due;
+pub use pick::{CROWD_ANSWERS, CrowdAnswer, CrowdAnswers, CrowdStamp, is_mergeable, is_reclaim_due};
 #[cfg(any(test, feature = "test-hooks"))]
 pub use install::freed_in_place;
 #[cfg(any(test, feature = "test-hooks"))]
-pub use pick::{CROWD_ANSWERS, CrowdAnswer, CrowdAnswers, CrowdStamp, column_range, covers_point, has_settled_covers, is_crowded, is_mergeable, is_overlap_input, overlap_bound, overlaps};
+pub use pick::{column_range, covers_point, has_settled_covers, is_crowded, is_overlap_input, overlap_bound, overlaps};
 
 /// A bar counts in quarters of a segment's bytes
 pub const BAR_QUARTERS: u64 = 4;

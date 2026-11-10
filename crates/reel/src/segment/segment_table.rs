@@ -62,6 +62,7 @@ pub struct SeatLine {
 
 /// A segment's answer to a walk standing in it
 #[derive(Clone, Copy, Debug)]
+#[allow(clippy::large_enum_variant, reason = "returned by value from under the shard lock, where a box would allocate on every seat")]
 pub enum Seat {
     /// The segment has left the table
     Left,

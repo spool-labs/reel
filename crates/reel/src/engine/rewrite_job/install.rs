@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use reel_api::maintenance_report::{
-    JobKind, OTHER_MERGE, OVERLAP_MERGE, PickOutcome, RECORD_PAST_EARLY_BAR, RECORD_UNDER_EARLY_BAR, UnitKind,
+    JobKind, OTHER_MERGE, OVERLAP_MERGE, PickOutcome, RECORD_PAST_EARLY_BAR, RECORD_UNDER_EARLY_BAR, UnitKind, WriteSource,
 };
 use reel_api::units::{ByteCount, FileOffset, RootId, RowCount, WritePlace};
 
@@ -144,6 +144,10 @@ impl<Backend: Io> RewriteJob<Backend> {
         state.graves_carried.fetch_add(carried, Ordering::Relaxed);
         state.empty_rewrites.fetch_add(u64::from(self.dropped_rows == 0), Ordering::Relaxed);
         state.note_moved(JobKind::Compaction, ByteCount(bytes));
+        let mut records: u64 = [self.totals, self.grave_totals].into_iter().flatten().map(|totals| totals.head.data_end.0).sum();
+        records += self.staged.iter().map(|staged| staged.facts.data_end.0).sum::<u64>();
+        state.note_written(WriteSource::MergeRecords, ByteCount(records));
+        state.note_written(WriteSource::MergeFooters, ByteCount(bytes.saturating_sub(records)));
     }
 
     /// Keep what an output's summary row and list entries will need once the writer has moved on
@@ -509,6 +513,8 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
         let state = Arc::clone(&self.state);
         let volume = &state.volumes[self.volume];
+        let given_up = self.staged.iter().map(|staged| staged.facts.file_length.0).sum::<u64>() + self.records_end.0 + self.used as u64;
+        state.note_written(WriteSource::GivenUp, ByteCount(given_up));
         let slots = mem::take(&mut *hold(&volume.lanes[self.lane].partial_outputs));
         // what the table holds waits for no read, since no list ever had it, and the removes below close the files
         for staged in &self.staged {

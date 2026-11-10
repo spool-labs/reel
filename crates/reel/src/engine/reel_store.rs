@@ -1229,6 +1229,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         damaged_segments: AtomicU64::new(0),
         dropped_summary_rows: AtomicU64::new(0),
         tallies: Default::default(),
+        written: Default::default(),
         units: Default::default(),
         opened_at,
         graves_at_open: AtomicU64::new(0),

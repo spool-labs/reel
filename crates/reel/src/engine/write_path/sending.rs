@@ -3,7 +3,7 @@
 use std::io::{Error, IoSlice};
 use std::mem; use std::sync::atomic::Ordering;
 
-use reel_api::maintenance_report::JobKind;
+use reel_api::maintenance_report::{JobKind, WriteSource};
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset};
 
@@ -21,6 +21,7 @@ use crate::io::{Io, IoFile};
 impl<Backend: Io> EngineState<Backend> {
     /// Run the volume's sync policy after a write
     pub fn after_write(&self, volume: &Volume<Backend>, length: ByteCount) -> Result<(), StoreError> {
+        self.note_written(WriteSource::Records, length);
         match volume.policy {
             SyncPolicy::EveryWrite => self.sync_volume(volume),
             SyncPolicy::EveryBytes(limit) => {
@@ -214,6 +215,7 @@ impl<Backend: Io> EngineState<Backend> {
             outcome = rows.write_at(rows_end, &parts);
             new_end = FileOffset(rows_end.0 + bytes.len() as u64);
             self.note_moved(JobKind::RowWriteOut, ByteCount(bytes.len() as u64));
+            self.note_written(WriteSource::Rows, ByteCount(bytes.len() as u64));
         }
         if outcome.is_ok() && data.is_some() {
             outcome = rows.sync();

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::{PICK_KINDS, UnitKind};
+use reel_api::maintenance_report::{PICK_KINDS, UnitKind, WRITE_SOURCES, WriteSource};
 use reel_api::memory_report::MemoryReport;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, SegmentCount, WritePlace};
@@ -122,6 +122,7 @@ pub struct EngineState<Backend: Io> {
     pub damaged_segments: AtomicU64,
     pub dropped_summary_rows: AtomicU64,
     pub tallies: JobTallies,
+    pub written: [AtomicU64; WRITE_SOURCES.len()],
     pub units: UnitTallies,
     pub opened_at: Nanoseconds,
     pub graves_at_open: AtomicU64,
@@ -276,6 +277,7 @@ impl<Backend: Io> EngineState<Backend> {
             self.note_unit(UnitKind::SummaryCopy, bytes, started);
             let saved = write_summary(&self.io, &volume.summary_paths, self.read_point(volume), forward, buffer);
             self.note_unit(UnitKind::SummarySave, bytes, started);
+            self.note_written(WriteSource::Summaries, ByteCount(bytes));
             saved
         })
     }

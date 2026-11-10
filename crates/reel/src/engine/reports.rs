@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use reel_api::column_id::ColumnId;
 use reel_api::maintenance_report::{MaintenanceMemory, 
     CompleteReading, JOB_KINDS, JobKind, JobState, LeastValueReading, MOST_REPORTED_LANES, MaintenanceReport, RewriteBytes, UnitKind, VolumeReading,
+    WriteSource,
 };
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, Nanoseconds, RootId, RowCount, SegmentCount, VolumeId};
@@ -25,6 +26,11 @@ use crate::segment::segment_tail::SegmentNumber;
 use crate::segment::summary::{ColumnFacts, SummaryRows};
 
 impl<Backend: Io> EngineState<Backend> {
+    /// Count bytes written, by where they came from
+    pub fn note_written(&self, source: WriteSource, bytes: ByteCount) {
+        self.written[source.index()].fetch_add(bytes.0, Ordering::Relaxed);
+    }
+
     /// Count bytes a job moved
     pub fn note_moved(&self, kind: JobKind, bytes: ByteCount) {
         self.tallies[kind.index()].note_moved(bytes, self.io.now());
@@ -132,6 +138,9 @@ impl<Backend: Io> EngineState<Backend> {
     pub fn maintenance(&self, report: &mut MaintenanceReport) {
         report.clear();
         let now = self.io.now();
+        for (entry, written) in report.written.iter_mut().zip(&self.written) {
+            *entry = ByteCount(written.load(Ordering::Relaxed));
+        }
         for (entry, kind) in report.jobs.iter_mut().zip(JOB_KINDS) {
             let tally = &self.tallies[kind.index()];
             entry.bytes_moved = tally.bytes_moved();

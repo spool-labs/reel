@@ -10,7 +10,7 @@ use reel::engine::reel_store::ReelStore;
 use reel::io::Io;
 use reel::record::codec::Codec;
 use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::{JobKind, JobState, MaintenanceReport, PickOutcome};
+use reel_api::maintenance_report::{JobKind, JobState, MaintenanceReport, PickOutcome, WriteSource};
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, Nanoseconds, RootId, RowCount, SegmentCount, VolumeId};
 use reel_api::usage::{ColumnUsage, UsageReport};
@@ -344,5 +344,25 @@ fn undeclared_column_on_a_big_disk() {
     assert!(memory.disk_covered < BIG_DISK, "the cover at the row floor reached the disk");
     assert!(volume.cover_at_mean >= BIG_DISK, "the room at the real segment size falls short of the disk");
     assert_eq!(volume.seal_stops, 0);
+    store.close().expect("close");
+}
+
+// the report splits what reel wrote by source: the records, their rows and the seal's footers
+#[test]
+fn written_by_source() {
+    let io = SimulatedIo::new(Seed(31));
+    let store = open(&io);
+    let value = vec![4; 1_000];
+    for number in 0..100 {
+        store.put(COLUMN, format!("key-{number:03}").as_bytes(), &value).expect("put");
+    }
+    seal(&store, &io);
+    let mut report = MaintenanceReport::new();
+    store.maintenance_report(&mut report);
+    let written = |source: WriteSource| report.written[source.index()].0;
+    assert!(written(WriteSource::Records) >= 100 * 1_000);
+    assert!(written(WriteSource::Rows) > 0);
+    assert!(written(WriteSource::SealFooters) > 0);
+    assert_eq!(written(WriteSource::GivenUp), 0);
     store.close().expect("close");
 }

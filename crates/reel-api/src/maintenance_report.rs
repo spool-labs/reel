@@ -3,6 +3,43 @@
 use crate::column_id::ColumnId;
 use crate::units::{ByteCount, Nanoseconds, RowCount, SegmentCount, VolumeId};
 
+/// Where the bytes reel writes come from
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WriteSource {
+    /// Records written as they come in
+    Records,
+    /// Rows files
+    Rows,
+    /// A seal's row blocks, index and tail
+    SealFooters,
+    /// Records a merge carried into its outputs
+    MergeRecords,
+    /// A merge output's row blocks, index and tail
+    MergeFooters,
+    /// Bytes a merge wrote and then gave up
+    GivenUp,
+    /// Summary saves
+    Summaries,
+}
+
+/// Every write source, in the order a report lists them
+pub const WRITE_SOURCES: [WriteSource; 7] = [
+    WriteSource::Records,
+    WriteSource::Rows,
+    WriteSource::SealFooters,
+    WriteSource::MergeRecords,
+    WriteSource::MergeFooters,
+    WriteSource::GivenUp,
+    WriteSource::Summaries,
+];
+
+impl WriteSource {
+    /// The source's place in a report
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
 /// Every kind of job, in the order a report lists them
 pub const JOB_KINDS: [JobKind; 7] = [
     JobKind::RowWriteOut,
@@ -403,6 +440,8 @@ pub struct LeastValueReading {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaintenanceReport {
     pub jobs: [JobReport; JOB_KINDS.len()],
+    /// Bytes written since open, by where they came from
+    pub written: [ByteCount; WRITE_SOURCES.len()],
     pub volumes: Vec<VolumeReading>,
     pub complete_columns: Vec<CompleteReading>,
     pub least_value_columns: Vec<LeastValueReading>,
@@ -478,6 +517,7 @@ impl MaintenanceReport {
     pub fn new() -> Self {
         Self {
             jobs: JOB_KINDS.map(JobReport::new),
+            written: [ByteCount(0); WRITE_SOURCES.len()],
             volumes: Vec::new(),
             complete_columns: Vec::new(),
             least_value_columns: Vec::new(),

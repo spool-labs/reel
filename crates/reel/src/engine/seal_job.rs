@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::JobKind;
+use reel_api::maintenance_report::{JobKind, WriteSource};
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RootId, RowCount, WritePlace};
 
 use crate::pool::touched_capacity;
@@ -503,6 +503,7 @@ impl<Backend: Io> SealJob<Backend> {
             }
             volume.note_sealed(totals.head.places.highest);
             state.note_moved(JobKind::Seal, totals.file_length);
+            state.note_written(WriteSource::SealFooters, ByteCount(totals.file_length.0.saturating_sub(totals.head.data_end.0)));
             if !target.marks.is_empty() {
                 volume.marked_seals.fetch_add(1, Ordering::Relaxed);
                 volume.marked_seal_bytes.fetch_add(target.data_end.0, Ordering::Relaxed);

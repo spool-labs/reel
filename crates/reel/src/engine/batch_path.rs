@@ -4,6 +4,7 @@ use std::io::{Error, ErrorKind, IoSlice};
 use std::slice::Iter;
 use std::sync::atomic::Ordering;
 
+use reel_api::maintenance_report::WriteSource;
 use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, DeathMark, FileOffset, RowCount, VolumeId, WritePlace};
@@ -457,6 +458,9 @@ impl<Backend: Io> EngineState<Backend> {
         let turn = WritingTurn { state: self, index: slot.0 as usize };
         let (batch, first_place) = (rows_of_batch.batch, rows_of_batch.cursor.place);
         let sent = self.send_long_group(slot, &rows, plan, rows_of_batch.clone(), stage);
+        if sent.is_ok() {
+            self.note_written(WriteSource::Rows, total);
+        }
         drop(turn);
         let held = self.io.now().0.saturating_sub(started.0);
         self.longest_turn.fetch_max(held, Ordering::Relaxed);

@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 
 use reel::config::{default_workers, ColumnConfig, DeviceClass, KeyShape, StoreConfig, SyncPolicy, ThreadCounts, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
-use reel::engine::walk_job::SLOT_ASSIGNED;
+use reel::engine::walk_job::{SLOT_ASSIGNED, SLOT_FREE};
 use reel::guard::hold;
 use reel::record::codec::Codec;
 use reel::segment::segment_tail::SegmentNumber;
@@ -364,3 +364,48 @@ fn cool(store: &Store, io: &SimulatedIo) {
 fn reads_hold_merges_at_the_cap() {
     assert_eq!(most_rewrites(DeviceClass::Solid, true), 1);
 }
+
+// the most walk slots holding a block at once over a backlog of unwalked segments, with a get on every step when asked
+fn most_walk_slots(is_reading: bool) -> usize {
+    let io = SimulatedIo::new(Seed(7));
+    let threads = ThreadCounts { maintenance_workers: Some(4), ..ThreadCounts::default() };
+    let store: Store = ReelStore::open(io.clone(), &config_on(threads, DeviceClass::Solid)).expect("open");
+    let volume = &store.state.volumes[0];
+    volume.holds.compaction.store(true, Ordering::Release);
+    volume.holds.walk.store(true, Ordering::Release);
+    for round in 0..DEAD_SEGMENTS {
+        for number in 0..WALK_KEYS {
+            store.put(COLUMN, format!("key-{round}-{number:05}").as_bytes(), b"first").expect("put");
+        }
+        store.seal_now();
+        settle(&io);
+    }
+    cool(&store, &io);
+    volume.holds.walk.store(false, Ordering::Release);
+    store.state.ask_compaction();
+    let mut most = 0;
+    for _step in 0..STEPS {
+        let busy = volume.walk_slots.iter().filter(|slot| slot.phase.load(Ordering::Acquire) != SLOT_FREE).count();
+        most = most.max(busy);
+        if is_reading {
+            let mut buf = Vec::new();
+            let _found = store.get(COLUMN, b"key-0-0000", &mut buf).expect("get");
+        }
+        if io.step_any().is_none() {
+            io.advance_clock(TICK);
+            if io.step_any().is_none() {
+                break;
+            }
+        }
+    }
+    store.close().expect("close");
+    most
+}
+
+// callers reading keep the walk to its cap, and a quiet volume hands blocks to every worker
+#[test]
+fn reads_pace_the_walk() {
+    assert_eq!(most_walk_slots(true), 1);
+    assert!(most_walk_slots(false) > 1);
+}
+const WALK_KEYS: u64 = 20_000;

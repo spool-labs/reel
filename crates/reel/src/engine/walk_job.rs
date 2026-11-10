@@ -884,11 +884,17 @@ impl<Backend: Io> WalkJob<Backend> {
         self.waiting_frees = waiting;
     }
 
-    /// Give every free worker the next block. The slots bound how far ahead of the landing the workers get
+    /// Give free workers the next blocks, up to the walk cap while callers are busy. The slots bound how far ahead of the landing
+    /// the workers get
     pub fn hand_out(&mut self, volume: &Volume<Backend>, target: WalkTarget) {
         self.next_handed_out = self.next_handed_out.max(target.next_block);
+        // busy callers keep their cores: a few workers count blocks while they call, and every worker may once they go quiet
+        let now = self.state.io.now();
+        volume.note_callers(self.state.caller_ops.total(), now);
+        let cap = if volume.is_caller_active(now) { volume.walk_cap() } else { usize::MAX };
+        let mut busy = volume.walk_slots.iter().filter(|slot| slot.phase.load(Ordering::Acquire) != SLOT_FREE).count();
         for (index, slot) in volume.walk_slots.iter().enumerate() {
-            if self.next_handed_out >= target.block_count {
+            if self.next_handed_out >= target.block_count || busy >= cap {
                 return;
             }
             if slot.phase.load(Ordering::Acquire) == SLOT_FREE {
@@ -904,6 +910,7 @@ impl<Backend: Io> WalkJob<Backend> {
                 drop(work);
                 self.next_handed_out += 1;
                 assign(&self.state.workers, slot);
+                busy += 1;
             }
         }
     }

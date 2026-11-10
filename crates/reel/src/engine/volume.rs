@@ -35,6 +35,8 @@ pub const MOST_PARKED: usize = 8;
 /// Workers for each merge that may run while callers are busy, so gets keep their cores; once callers go quiet every worker may
 /// merge. A starting value, tuned at the end
 pub const MERGE_CAP_WORKERS: usize = 4;
+/// Walk slots for each one that counts blocks while callers are busy. A starting value, tuned at the end
+pub const WALK_CAP_WORKERS: usize = 4;
 /// The call time of a volume no caller has read from yet
 pub const NO_CALL: u64 = u64::MAX;
 
@@ -636,6 +638,11 @@ impl<Backend: Io> Volume<Backend> {
     /// Read the cap a volume starts with: a quarter of its workers, at least one
     pub fn default_merge_cap(&self) -> usize {
         (self.lanes.len().saturating_sub(1) / MERGE_CAP_WORKERS).max(1)
+    }
+
+    /// Read the most walk slots that count blocks at once while callers are busy: a quarter of them, at least one
+    pub fn walk_cap(&self) -> usize {
+        (self.walk_slots.len() / WALK_CAP_WORKERS).max(1)
     }
 
 

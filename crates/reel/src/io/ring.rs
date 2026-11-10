@@ -506,12 +506,15 @@ impl<Driver> ReadRing<Driver> {
         Ok(length)
     }
 
-    /// Fill a buffer on this thread: what the kernel holds first, then a slot at a time through the ring
+    /// Fill a buffer on this thread: through the ring when it fits a slot, else in one plain read
     pub fn read_into_now<File>(&self, file: &File, offset: FileOffset, buf: &mut [u8]) -> Result<()>
     where
         Driver: RingDriver<File>,
         File: IoFile,
     {
+        if buf.len() > RING_SLOT_BYTES {
+            return file.read_exact_at(offset, buf);
+        }
         let mut done = 0;
         while done < buf.len() {
             match file.try_read_at(FileOffset(offset.0 + done as u64), &mut buf[done..]) {
@@ -530,25 +533,27 @@ impl<Driver> ReadRing<Driver> {
         Ok(())
     }
 
-    /// Fill parts on this thread, in one read when the kernel holds them or a slot holds them all
+    /// Fill parts on this thread: through the ring when they fit a slot, else in one plain read
     pub fn read_parts_now<File>(&self, file: &File, offset: FileOffset, parts: &mut [IoSliceMut<'_>]) -> Result<()>
     where
         Driver: RingDriver<File>,
         File: IoFile,
     {
         let total: usize = parts.iter().map(|part| part.len()).sum();
+        if total > RING_SLOT_BYTES {
+            return file.read_parts_at(offset, parts);
+        }
         if matches!(file.try_read_parts_at(offset, parts), Ok(Some(ByteCount(count))) if count == total as u64) {
             return Ok(());
         }
-        if total <= RING_SLOT_BYTES {
-            let lease = self.claim_now()?;
-            lease.start(file, offset, total)?;
-            if lease.wait_now()? == total {
-                self.driver.copy_parts(lease.slot, parts);
-                return Ok(());
-            }
+        let lease = self.claim_now()?;
+        lease.start(file, offset, total)?;
+        if lease.wait_now()? == total {
+            self.driver.copy_parts(lease.slot, parts);
+            return Ok(());
         }
-        // a part too big for a slot, or a short read, goes part by part
+        // a short read goes part by part
+        drop(lease);
         let mut at = offset.0;
         for part in parts {
             self.read_into_now(file, FileOffset(at), part)?;

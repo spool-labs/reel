@@ -1,7 +1,7 @@
 //! Async reads through the completion ring: each answers as its blocking twin does, on the caller's task
 
 use std::future::Future;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, IoSlice, IoSliceMut};
 use std::path::PathBuf;
 use std::pin::{Pin, pin};
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use reel::engine::reel_store::ReelStore;
 use reel::engine::ring_job::RingReaper;
 use reel::engine::scan_state::MOST_SCANS;
 use reel::guard::hold;
-use reel::io::InPlace;
+use reel::io::{InPlace, Io, IoFile};
 use reel::io::job::{Job, JobStep};
 use reel::io::ring::{RING_READS, RING_SLOT_BYTES, RING_SLOTS, ReadRing};
 use reel::record::codec::Codec;
@@ -23,7 +23,7 @@ use reel_api::direction::Direction;
 use reel_api::reads::{Reads, ValueWindow};
 use reel_api::scan::Scan;
 use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, Nanoseconds, VolumeId};
+use reel_api::units::{ByteCount, FileOffset, Nanoseconds, VolumeId};
 use reel_api::value_list::{ValueAnswer, ValueList};
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_disk::OperationCount;
@@ -703,4 +703,24 @@ fn close_wakes_the_seat_line() {
     let answer = waiting.as_mut().poll(&mut context);
     assert!(matches!(answer, Poll::Ready(Err(error)) if error.kind() == ErrorKind::BrokenPipe));
     drop(seats);
+}
+
+// a blocking read past one slot goes to the kernel in one plain call: no try, and nothing on the ring
+#[test]
+fn big_blocking_read_skips_the_ring() {
+    let (io, store) = ringed(44);
+    let path = PathBuf::from("/big-read");
+    let file = io.create_file(&path, ByteCount(0)).expect("create");
+    let large: Vec<u8> = (0..3 * RING_SLOT_BYTES + 17).map(|at| (at % 251) as u8).collect();
+    file.write_at(FileOffset(0), &[IoSlice::new(&large)]).expect("write");
+
+    let before = io.try_counts();
+    let mut buf = vec![0; large.len()];
+    ring(&store).read_into_now(&file, FileOffset(0), &mut buf).expect("read");
+    assert_eq!(buf, large);
+    let (head, tail) = buf.split_at_mut(RING_SLOT_BYTES);
+    ring(&store).read_parts_now(&file, FileOffset(0), &mut [IoSliceMut::new(head), IoSliceMut::new(tail)]).expect("read");
+    assert_eq!(buf, large);
+    assert_eq!(try_deltas(&io, before), (0, 0, 0));
+    store.close().expect("close");
 }

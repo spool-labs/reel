@@ -131,7 +131,7 @@ impl<Backend: Io> EngineState<Backend> {
     /// Rebuild an open segment from its rows, ready to go on taking writes, or return false
     /// with nothing changed when its rows don't fit the write index
     pub fn recover_open(&self, volume: &Volume<Backend>, scanned: &ScannedOpen<Backend::File>) -> Result<bool> {
-        let Some(slot) = self.take_slot() else {
+        let Some(slot) = self.take_slot(volume.id.0 as usize) else {
             return Err(Error::other("more open segments than slots"));
         };
         let found = &scanned.found;

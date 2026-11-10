@@ -129,7 +129,7 @@ pub fn close_read_only<Backend: Io>(state: &EngineState<Backend>) {
 impl<Backend: Io> EngineState<Backend> {
     /// Put an open segment's rows in the index group by group, up to a torn group or one that lists a record not there yet
     pub fn view_open(&self, volume: &Volume<Backend>, scanned: &ScannedOpen<Backend::File>) -> IoResult<()> {
-        let Some(slot) = self.take_slot() else {
+        let Some(slot) = self.take_slot(volume.id.0 as usize) else {
             return Err(Error::other("more open segments than slots"));
         };
         let found = &scanned.found;

@@ -3,7 +3,7 @@
 use std::io::{Error, ErrorKind};
 use std::path::Path;
 use std::mem;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use reel_api::column_id::ColumnId;
@@ -72,6 +72,7 @@ pub struct SlotFile<File> {
     pub data: RwLock<Option<SlotData<File>>>,
     pub leaving_rows: Mutex<Option<File>>,
     pub pins: AtomicU32,
+    pub volume: AtomicUsize,
 }
 
 /// The state every store handle and job shares
@@ -180,6 +181,7 @@ impl<File: Clone> SlotFile<File> {
             data: RwLock::new(None),
             leaving_rows: Mutex::new(None),
             pins: AtomicU32::new(0),
+            volume: AtomicUsize::new(0),
         };
         // some platforms set a lock up at its first use, and that's a job for open
         drop(hold(&slot.leaving_rows));
@@ -343,9 +345,11 @@ impl<Backend: Io> EngineState<Backend> {
         Ok(SegmentNumber(number))
     }
 
-    /// Take a free open slot
-    pub fn take_slot(&self) -> Option<OpenSlot> {
-        hold(&self.free_slots).pop()
+    /// Take a free open slot for a volume
+    pub fn take_slot(&self, volume: usize) -> Option<OpenSlot> {
+        let slot = hold(&self.free_slots).pop()?;
+        self.slot_files[slot.0 as usize].volume.store(volume, Ordering::Release);
+        Some(slot)
     }
 
     /// Check a slot is free

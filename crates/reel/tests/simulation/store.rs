@@ -1091,7 +1091,7 @@ fn spare_after_seal() {
     store.put(COLUMN, b"key", b"value").expect("put");
     let volume = &store.state.volumes[0];
     let mut taken = Vec::new();
-    while let Some(slot) = store.state.take_slot() {
+    while let Some(slot) = store.state.take_slot(0) {
         taken.push(slot);
     }
     hold(&volume.claims).wants_prepared = true;

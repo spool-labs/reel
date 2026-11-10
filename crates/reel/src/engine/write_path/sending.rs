@@ -1,7 +1,7 @@
 //! Sending a slot's rows and windows to its files in turn, and the syncs a volume's policy asks for
 
 use std::io::{Error, IoSlice};
-use std::mem;
+use std::mem; use std::sync::atomic::Ordering;
 
 use reel_api::maintenance_report::JobKind;
 use reel_api::store_error::StoreError;
@@ -143,16 +143,11 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// Pin an open slot and find its rows file, which a seal closes only once the pins are gone
     pub fn pin_rows(&self, slot: OpenSlot) -> Option<(SlotPin<'_, Backend::File>, Backend::File)> {
-        for volume in &self.volumes {
-            let claims = hold(&volume.claims);
-            for segment in &claims.open {
-                if segment.slot == slot {
-                    let pin = self.slot_files[slot.0 as usize].pin(segment.number)?;
-                    return Some((pin, segment.rows.clone()));
-                }
-            }
-        }
-        None
+        let volume = self.volumes.get(self.slot_files[slot.0 as usize].volume.load(Ordering::Acquire))?;
+        let claims = hold(&volume.claims);
+        let segment = claims.open.iter().find(|segment| segment.slot == slot)?;
+        let pin = self.slot_files[slot.0 as usize].pin(segment.number)?;
+        Some((pin, segment.rows.clone()))
     }
 
     /// Take the slot's writing turn if it's free

@@ -566,7 +566,7 @@ impl<Backend: Io> EngineState<Backend> {
             return Err(StoreError::VolumeFull { volume: volume.id });
         }
 
-        let Some(slot) = self.take_slot() else {
+        let Some(slot) = self.take_slot(volume.id.0 as usize) else {
             return Ok(None);
         };
         match self.create_files(volume, root, slot, request) {

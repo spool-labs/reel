@@ -1,7 +1,7 @@
 //! A landed mark a volume: a write waits for its own volume alone, and a cue still holds one moment across them
 
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
@@ -16,6 +16,7 @@ use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, Nanoseconds, RowCount, VolumeId, WritePlace};
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_io::SimulatedIo;
+use reel_sim::wait::wait_until;
 
 const BULK_ROOT: &str = "/disk/bulk";
 const META_ROOT: &str = "/disk/meta";
@@ -435,5 +436,28 @@ fn first_point_keeps_no_blocks() {
     assert!(store.state.volumes[1].bytes_freed.load(Ordering::Acquire) > 0);
     assert_eq!(read(&store, META, b"key"), Some(large(2)));
     drop(cue);
+    store.close().expect("close");
+}
+
+// a flush finds its slot under its own volume's lock, so a writer on one volume never waits on another's
+#[test]
+fn flush_locks_its_own_volume() {
+    let io = SimulatedIo::new(Seed(62));
+    let store = open(&io);
+    store.put(BULK, b"bulk-key", b"value").expect("put");
+    store.put(META, b"meta-key", b"value").expect("put");
+    let state = &store.state;
+    let meta_slot = hold(&state.volumes[1].claims).open.first().map(|segment| segment.slot).expect("an open meta segment");
+
+    let is_pinned = AtomicBool::new(false);
+    let bulk_claims = hold(&state.volumes[0].claims);
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            let pinned = state.pin_rows(meta_slot);
+            is_pinned.store(pinned.is_some(), Ordering::Release);
+        });
+        wait_until(|| is_pinned.load(Ordering::Acquire), "a meta flush waited on the bulk volume's lock");
+    });
+    drop(bulk_claims);
     store.close().expect("close");
 }

@@ -1418,6 +1418,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         outputs_promised: AtomicU64::new(0),
         is_room_short: AtomicBool::new(false),
         is_room_refused: AtomicBool::new(false),
+        room_refused_at: AtomicU64::new(0),
         promises_outgrown: AtomicU64::new(0),
         parks_promised: AtomicUsize::new(0),
         long_park_waits: AtomicU64::new(0),

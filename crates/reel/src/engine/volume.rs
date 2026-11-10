@@ -364,6 +364,8 @@ pub struct Volume<Backend: Io> {
     pub is_room_short: AtomicBool,
     /// A merge was refused for disk room, so the planner looks again on a timer, since no write may come to wake it
     pub is_room_refused: AtomicBool,
+    /// When the last merge gave up for room, so picks wait a reserve period after it
+    pub room_refused_at: AtomicU64,
     /// Bytes of outputs the running merges claimed room for
     pub outputs_promised: AtomicU64,
     /// Seals that ended a segment writes had gone quiet on

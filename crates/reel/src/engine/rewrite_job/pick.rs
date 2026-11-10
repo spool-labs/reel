@@ -11,6 +11,7 @@ use reel_api::maintenance_report::{
 };
 use reel_api::units::{ByteCount, DeathMark, FileOffset, WritePlace};
 
+use crate::engine::reserve_job::RESERVE_PERIOD;
 use crate::engine::engine_state::EngineState;
 use crate::engine::seal_job::MOST_SEGMENT_BLOCKS;
 use crate::engine::volume::{MOST_MERGE_OUTPUTS, Volume};
@@ -116,7 +117,9 @@ impl<Backend: Io> RewriteJob<Backend> {
     /// Pick up to this many inputs
     pub fn pick_within(&mut self, volume: &Volume<Backend>, most: usize) -> Option<(MergeTarget, bool)> {
         let room = volume.park_room().min(most);
-        if !volume.can_start_rewrite() || volume.stray_outputs.load(Ordering::Acquire) > 0 || room == 0 {
+        let refused_at = volume.room_refused_at.load(Ordering::Acquire);
+        let is_backing_off = refused_at != 0 && self.state.io.now().0.saturating_sub(refused_at) < RESERVE_PERIOD.0;
+        if !volume.can_start_rewrite() || volume.stray_outputs.load(Ordering::Acquire) > 0 || room == 0 || is_backing_off {
             volume.park_refusals.fetch_add(u64::from(room == 0), Ordering::Relaxed);
             volume.note_pick(PickOutcome::Refused);
             return None;
@@ -173,9 +176,9 @@ impl<Backend: Io> RewriteJob<Backend> {
             volume.note_pick(PickOutcome::Forced);
             return Some((target, false));
         }
-        // hot ingest with room to spare leaves overlap merges for quiet time, and writes still arriving leave record rewrites, which
-        // spend writes only to win space back
-        if is_deferring || (is_ingesting && !is_short) {
+        // hot ingest with room to spare leaves overlap merges and record rewrites for quiet time. A trickle a merge outpaces
+        // isn't hot, so record rewrites reclaim under it at the plain bar
+        if is_deferring {
             volume.note_pick(PickOutcome::Deferred);
             return None;
         }

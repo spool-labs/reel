@@ -3003,10 +3003,9 @@ fn held_segments_count_toward_the_crowd() {
     store.close().expect("close");
 }
 
-// a mostly dead segment waits for its record rewrite while writes still arrive, even with merges keeping up, and is rewritten
-// once they stop
+// a mostly dead segment is rewritten while writes still arrive, as long as merges keep up with them, so steady writes reclaim
 #[test]
-fn records_wait_while_writes_arrive() {
+fn records_reclaim_under_a_trickle() {
     let io = SimulatedIo::new(Seed(88));
     let store = open(&io);
     let volume = &store.state.volumes[0];
@@ -3024,10 +3023,8 @@ fn records_wait_while_writes_arrive() {
     store.seal_now();
     settle(&io);
     assert!(volume.is_ingesting(io.clock_reading()), "a seal just landed and writes read stopped");
-    assert_eq!(records(), 0, "a record rewrite ran while writes arrived");
-    assert!(volume.picks[PickOutcome::Deferred.index()].load(Ordering::Acquire) > 0, "nothing was put off");
+    assert!(records() > 0, "no record rewrite ran under a trickle");
     cool(&store, &io);
-    assert!(records() > 0, "the record rewrite put off never ran once writes stopped");
     check_reads(&store);
     store.close().expect("close");
 }

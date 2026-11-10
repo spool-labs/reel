@@ -173,6 +173,11 @@ impl<Backend: Io> RewriteJob<Backend> {
             let volume = &self.state.volumes[self.volume];
             volume.given_up_by_phase[phase as usize].fetch_add(given_up, Ordering::Relaxed);
             volume.given_up_by_kind[kind].fetch_add(given_up, Ordering::Relaxed);
+            // a merge short of room waits a reserve period before another is picked, or a full disk retries one that can't fit
+            if kind == 1 {
+                volume.room_refused_at.store(self.state.io.now().0.max(1), Ordering::Release);
+                volume.is_room_refused.store(true, Ordering::Release);
+            }
             self.abandon();
         }
     }

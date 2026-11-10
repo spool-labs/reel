@@ -215,6 +215,7 @@ impl<Backend: Io> EngineState<Backend> {
                 merge_interval: Nanoseconds(volume.merge_interval.load(Ordering::Relaxed)),
                 ingest_left: Nanoseconds(volume.hot_until().0.saturating_sub(self.io.now().0)),
                 idle_seals: volume.idle_seals.load(Ordering::Relaxed),
+                promises_outgrown: volume.promises_outgrown.load(Ordering::Relaxed),
             });
         }
         for (id, info) in self.columns.iter().enumerate() {

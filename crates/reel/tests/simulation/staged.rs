@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::io::IoSlice;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::thread;
 
 use crate::seed_sets::seeds;
@@ -927,6 +928,9 @@ fn run_interleaving(seed: Seed) {
             },
             None => {
                 settle(&io);
+                let volume = &state.volumes[0];
+                assert_eq!(volume.promises_outgrown.load(Ordering::Acquire), 0, "a merge wrote past its estimate");
+                assert_eq!(volume.outputs_promised.load(Ordering::Acquire), 0, "a settled store kept a promise");
                 let mark = state.read_point(&state.volumes[0]).0;
                 for key in history.keys() {
                     assert_eq!(read(&store, key), newest_at(&history, key, mark));

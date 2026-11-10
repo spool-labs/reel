@@ -614,6 +614,10 @@ impl<Backend: Io> RewriteJob<Backend> {
     /// Check the merge has written past its promise, taking another step of room when the disk has it, and say whether it must
     /// give way
     pub fn outgrows_promise(&mut self) -> bool {
+        // an installed or given-up merge released its promise, and the bytes it wrote went with it
+        if self.target.is_none() {
+            return false;
+        }
         let state = Arc::clone(&self.state);
         let volume = &state.volumes[self.volume];
         let written = self.staged.iter().map(|staged| staged.facts.file_length.0).sum::<u64>() + self.records_end.0 + self.used as u64;

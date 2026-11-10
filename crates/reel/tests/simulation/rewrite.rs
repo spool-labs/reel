@@ -3244,3 +3244,111 @@ fn claims_share_the_park() {
     assert!(!start(&mut second), "a second merge claimed the park slots the first set aside");
     io.kill();
 }
+
+// overwrite a few large values and add a live one each segment, with the disk unbounded and the bound at its least
+fn pile_on_disk(seed: u64, has_live: bool) -> (SimulatedIo, Store) {
+    let io = SimulatedIo::new(Seed(seed));
+    io.add_disk(Path::new(ROOT), ByteCount(1 << 40));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    store.state.volumes[0].holds.small_bound.store(true, Ordering::Release);
+    for round in 0..OVER_THE_BOUND {
+        for key in 0..DEAD_PILE_KEYS {
+            store.put(COLUMN, format!("d-{key}").as_bytes(), &dead_pile_value(round)).expect("put");
+        }
+        if has_live {
+            store.put(COLUMN, format!("l-{round:03}").as_bytes(), &dead_pile_value(round)).expect("put");
+        }
+        seal(&store, &io);
+    }
+    (io, store)
+}
+
+fn cap_disk(io: &SimulatedIo, room: u64) {
+    let used = (1 << 40) - io.free_space(Path::new(ROOT)).expect("free").0;
+    io.add_disk(Path::new(ROOT), ByteCount(used + room));
+}
+
+// a held cue makes the merge promise all it reads, and on a disk with exactly that much room it never outgrows the promise
+#[test]
+fn held_cue_fits_an_exact_disk() {
+    let promise_of = |is_cued: bool| {
+        let (_io, store) = pile_on_disk(97, false);
+        let cue = is_cued.then(|| half_cue(&store));
+        let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+        assert!(start_merge(&mut job));
+        let promised = store.state.volumes[0].outputs_promised.load(Ordering::Acquire);
+        run_to_end(&mut job);
+        assert_eq!(store.state.volumes[0].outputs_promised.load(Ordering::Acquire), 0, "a finished merge kept its promise");
+        assert_eq!(store.state.volumes[0].promises_outgrown.load(Ordering::Acquire), 0);
+        cue.into_iter().for_each(|slot| store.state.cues.release(slot));
+        store.close().expect("close");
+        promised
+    };
+    let (plain, cued) = (promise_of(false), promise_of(true));
+    assert!(cued > plain, "the cue left the promise at {cued}, the plain one is {plain}");
+
+    let (io, store) = pile_on_disk(97, false);
+    let volume = &store.state.volumes[0];
+    let cue = Some(half_cue(&store));
+    cap_disk(&io, volume.reserve.0 + volume.segment_bytes.0 + cued);
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(start_merge(&mut job));
+    assert_eq!(volume.outputs_promised.load(Ordering::Acquire), cued);
+    run_to_end(&mut job);
+    assert_eq!(volume.promises_outgrown.load(Ordering::Acquire), 0);
+    assert_eq!(volume.given_up_by_kind.iter().map(|kind| kind.load(Ordering::Acquire)).sum::<u64>(), 0);
+    cue.into_iter().for_each(|slot| store.state.cues.release(slot));
+    check_dead_pile(&store, false);
+    store.close().expect("close");
+}
+
+// counts that charged dead rows twice promise too little: with room the merge takes more and lands, without it the merge gives way
+#[test]
+fn low_estimate_takes_more_room() {
+    let (_io, store) = pile_on_disk(98, true);
+    let volume = &store.state.volumes[0];
+    volume.holds.low_estimate.store(true, Ordering::Release);
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(start_merge(&mut job));
+    run_to_end(&mut job);
+    assert!(volume.promises_outgrown.load(Ordering::Acquire) > 0);
+    assert_eq!(volume.outputs_promised.load(Ordering::Acquire), 0);
+    check_dead_pile(&store, true);
+    store.close().expect("close");
+
+    let (io, store) = pile_on_disk(98, true);
+    let volume = &store.state.volumes[0];
+    volume.holds.low_estimate.store(true, Ordering::Release);
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(start_merge(&mut job));
+    let promised = volume.outputs_promised.load(Ordering::Acquire);
+    cap_disk(&io, volume.reserve.0 + volume.segment_bytes.0 + promised);
+    run_to_end(&mut job);
+    assert_eq!(volume.promises_outgrown.load(Ordering::Acquire), 0);
+    assert!(volume.given_up_by_kind[1].load(Ordering::Acquire) > 0, "the merge wrote on past its room");
+    assert_eq!(volume.outputs_promised.load(Ordering::Acquire), 0);
+    check_dead_pile(&store, true);
+    store.close().expect("close");
+}
+
+// a cue at half the read point sees rows the second half of the pile overwrote
+fn half_cue(store: &Store) -> usize {
+    let state = &store.state;
+    state.cues.take(0, WritePlace(state.read_point(&state.volumes[0]).0 / 2)).expect("a slot")
+}
+
+const DEAD_PILE_KEYS: u64 = 8;
+
+fn dead_pile_value(round: u64) -> Vec<u8> {
+    vec![round as u8; 4096]
+}
+
+fn check_dead_pile(store: &Store, has_live: bool) {
+    for round in (0..OVER_THE_BOUND).filter(|_round| has_live) {
+        assert_eq!(read(store, format!("l-{round:03}").as_bytes()), Some(dead_pile_value(round)));
+    }
+    for key in 0..DEAD_PILE_KEYS {
+        assert_eq!(read(store, format!("d-{key}").as_bytes()), Some(dead_pile_value(OVER_THE_BOUND - 1)));
+    }
+}

@@ -283,6 +283,8 @@ pub struct VolumeReading {
     pub ingest_left: Nanoseconds,
     /// Seals that ended a segment writes had gone quiet on
     pub idle_seals: u64,
+    /// Merges that wrote past their promise and took more room, which a right estimate never lets happen
+    pub promises_outgrown: u64,
 }
 
 /// What a rewrite lane's look for work came to. The overlap misses count beside the look's own outcome

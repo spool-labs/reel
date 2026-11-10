@@ -719,16 +719,19 @@ impl<Backend: Io> RewriteJob<Backend> {
     /// the writers' reserve, or a full disk could never free itself
     pub fn disk_room_for(&self, volume: &Volume<Backend>, length: ByteCount) -> Option<ByteCount> {
         let summary = hold(&volume.summary);
-        let (mut inputs, mut output, mut highest) = (0, 0, WritePlace(0));
+        let (mut inputs, mut output, mut lowest) = (0, 0, WritePlace(u64::MAX));
         for row in self.numbers[..self.input_count].iter().filter_map(|number| summary.get(*number)) {
             inputs += row.facts.file_length.0;
             output += output_estimate(&row);
-            highest = highest.max(row.facts.places.highest);
+            lowest = lowest.min(row.facts.places.lowest);
         }
         drop(summary);
-        // a live cue below the inputs' rows keeps the dead ones it can read, so the merge may write all it reads
-        if self.state.cues.has_cue_below(self.volume, highest) {
+        // a live cue at or above an input row keeps the dead ones it can read, so the merge may write all it reads
+        if self.state.cues.has_cue_between(self.volume, lowest, WritePlace(u64::MAX)) {
             output = length.0;
+        }
+        if volume.is_estimate_low() {
+            output /= 4;
         }
         let output = ByteCount(output.min(length.0));
         has_disk_room(&self.state, volume, output, output.0 < inputs).then_some(output)

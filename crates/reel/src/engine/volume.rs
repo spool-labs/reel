@@ -197,6 +197,8 @@ pub struct TestHolds {
     pub reclaim: AtomicBool,
     /// The overlap bound stays at its least whatever the records' size, for tests of merge mechanics with large values
     pub small_bound: AtomicBool,
+    /// A merge promises a quarter of its estimate, as counts that charged dead rows twice would
+    pub low_estimate: AtomicBool,
 }
 
 /// One volume of a store
@@ -337,8 +339,10 @@ pub struct Volume<Backend: Io> {
     pub long_park_waits: AtomicU64,
     /// Merges that wrote past their promise and took more room
     pub promises_outgrown: AtomicU64,
-    /// A merge was refused for disk room, so the planner looks again on a timer, since no write may come to wake it
+    /// The disk sat under the writers' reserve at the last pick, so overlap merges wait
     pub is_room_short: AtomicBool,
+    /// A merge was refused for disk room, so the planner looks again on a timer, since no write may come to wake it
+    pub is_room_refused: AtomicBool,
     /// Bytes of outputs the running merges claimed room for
     pub outputs_promised: AtomicU64,
     /// Seals that ended a segment writes had gone quiet on
@@ -430,6 +434,18 @@ impl<Backend: Io> Volume<Backend> {
     pub const fn is_bound_pinned(&self) -> bool {
         false
     }
+    /// Check a test cuts merge promises to a quarter of the estimate
+    #[cfg(feature = "test-hooks")]
+    pub fn is_estimate_low(&self) -> bool {
+        self.holds.low_estimate.load(Ordering::Acquire)
+    }
+
+    /// Check a test cuts merge promises, which a build without the hooks never does
+    #[cfg(not(feature = "test-hooks"))]
+    pub const fn is_estimate_low(&self) -> bool {
+        false
+    }
+
 
     /// Check a test holds quiet-time reclaim off
     #[cfg(feature = "test-hooks")]

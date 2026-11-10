@@ -707,7 +707,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             let picked = self.pick_within(volume, most)?;
             let Some(output) = self.disk_room_for(volume, picked.0.length) else {
                 self.unpick(volume);
-                volume.is_room_short.store(true, Ordering::Release);
+                volume.is_room_refused.store(true, Ordering::Release);
                 volume.note_pick(PickOutcome::Refused);
                 // fewer inputs write a smaller output, so a short disk tries a smaller merge before it gives up
                 if self.input_count < 2 {
@@ -734,7 +734,7 @@ impl<Backend: Io> RewriteJob<Backend> {
                 volume.outputs_promised.fetch_add(output.0, Ordering::AcqRel);
                 self.parks_held = self.input_count;
                 volume.parks_promised.fetch_add(self.input_count, Ordering::AcqRel);
-                volume.is_room_short.store(false, Ordering::Release);
+                volume.is_room_refused.store(false, Ordering::Release);
                 self.forced_pick = None;
                 return Some(picked);
             }

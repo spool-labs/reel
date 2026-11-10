@@ -323,7 +323,7 @@ impl<Backend: Io> CompactJob<Backend> {
         if self.should_rewrite {
             return JobStep::Worked;
         }
-        if volume.is_room_short.load(Ordering::Acquire) {
+        if volume.is_room_refused.load(Ordering::Acquire) || volume.is_room_short.load(Ordering::Acquire) {
             return JobStep::IdleUntil { deadline: Nanoseconds(now.0 + RESERVE_PERIOD.0) };
         }
         // what hot ingest or arriving writes put off starts once the window closes

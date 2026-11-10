@@ -16,6 +16,7 @@ use reel::engine::reel_store::ReelStore;
 use reel::engine::engine_sizing::CURSOR_BYTES;
 use reel::engine::dead_bits::{DECIDED_CLEAR, DECIDED_SET, DECIDED_SHORT, DECIDED_WRONG, INEXACT_SHORT};
 use reel::segment::key_cursor::KeyCursor;
+use reel::segment::row_block::ROW_BLOCK_BYTES;
 use reel_sim::simulated_file::SimulatedFile;
 use reel::engine::held_bits::HeldBits;
 use reel::fixed_list::FixedList;
@@ -48,7 +49,8 @@ const YIELD_STEPS: u64 = 200;
 const TURN_SEEDS: u64 = 8;
 const BUSY: u32 = 1_000;
 const VERSIONS: u64 = 600;
-const LONG_KEYS: u64 = 62;
+// long keys that fill all but the end of one row block, so the versions after them start the next
+const LONG_KEYS: u64 = (ROW_BLOCK_BYTES / LONG_KEY_BYTES) as u64 - 3;
 const LONG_KEY_BYTES: usize = 1_000;
 const RANGE_ROWS: u64 = 4_000;
 const ORDERS: [[usize; 3]; 6] = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];

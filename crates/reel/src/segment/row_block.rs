@@ -12,7 +12,7 @@ use crate::row_kind::RowKind;
 use crate::segment::varint::{MAX_VARINT_BYTES, read_varint, write_varint};
 
 /// Most bytes in a row block
-pub const ROW_BLOCK_BYTES: usize = 64 * 1024;
+pub const ROW_BLOCK_BYTES: usize = 16 * 1024;
 /// The room a block sets aside for a row's numbers before it takes one
 pub const ROW_ROOM_NUMBERS: usize = 5 * MAX_VARINT_BYTES;
 /// The size a complete column's row blocks stop at, so a get's first read stays small

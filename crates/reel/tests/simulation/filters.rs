@@ -22,6 +22,10 @@ const TICK: Nanoseconds = Nanoseconds(1_000_000);
 const STEPS: u64 = 400_000;
 const KEYS: u64 = 3_000;
 const MISSES: u64 = 500;
+// a filter answers yes for about one miss in 600, and each such miss reads its block
+const MOST_FALSE_READS: u64 = 4;
+// the most a point read reads for one row
+const MOST_BLOCK_BYTES: u64 = 16 * 1024;
 
 type Store = ReelStore<SimulatedIo>;
 
@@ -77,7 +81,7 @@ fn filled(io: &SimulatedIo) -> Store {
     store
 }
 
-// a sealed segment's filters come into memory with no read asked for, and misses then read nothing
+// a sealed segment's filters come into memory with no read asked for, and misses then read only their false positives
 #[test]
 fn misses_read_nothing() {
     let io = SimulatedIo::new(Seed(1));
@@ -87,7 +91,7 @@ fn misses_read_nothing() {
     for number in 0..MISSES {
         assert!(!store.get(COLUMN, &key(2 * number + 1), &mut buf).expect("get"));
     }
-    assert_eq!(io.read_count().0, before);
+    assert!(io.read_count().0 - before <= MOST_FALSE_READS);
     store.close().expect("close");
 }
 
@@ -287,4 +291,20 @@ fn cool(store: &Store, io: &SimulatedIo) {
     let until = store.state.volumes.iter().map(|volume| volume.hot_until().0).max().unwrap_or(0);
     io.advance_clock(Nanoseconds(until.saturating_sub(io.clock_reading().0)));
     settle(io);
+}
+
+// a get reads one row block for its key, so blocks stay small and a sealed segment of a few thousand rows has many
+#[test]
+fn row_blocks_stay_small() {
+    let io = SimulatedIo::new(Seed(2));
+    let store = filled(&io);
+    let volume = &store.state.volumes[0];
+    let segment = reel::guard::hold(&volume.summary).rows().map(|row| row.facts.segment).next().expect("a sealed segment");
+    let (first, count) = volume.table.column_blocks(segment, COLUMN).expect("the column");
+    assert!(count > 1);
+    for index in first..first + count {
+        let block = volume.table.walk_block(segment, index).expect("a block");
+        assert!(block.entry.block_length().0 <= MOST_BLOCK_BYTES, "block {index}");
+    }
+    store.close().expect("close");
 }

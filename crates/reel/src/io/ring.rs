@@ -201,6 +201,7 @@ pub struct ReadRing<Driver> {
     in_flight: AtomicUsize,
     is_closed: AtomicBool,
     spinners: AtomicUsize,
+    is_done: Vec<AtomicBool>,
 }
 
 /// A slot a read holds
@@ -241,6 +242,7 @@ impl<Driver> ReadRing<Driver> {
             in_flight: AtomicUsize::new(0),
             is_closed: AtomicBool::new(false),
             spinners: AtomicUsize::new(0),
+            is_done: (0..RING_SLOTS).map(|_slot| AtomicBool::new(false)).collect(),
         }
     }
 
@@ -307,6 +309,7 @@ impl<Driver> ReadRing<Driver> {
     pub fn finish(&self, slot: usize, answer: Result<usize>) {
         self.in_flight.fetch_sub(1, Ordering::AcqRel);
         let ended = hold(&self.slots[slot]).end(answer);
+        self.is_done[slot].store(true, Ordering::Release);
         match ended {
             Ended::Wake(Some(waker)) => waker.wake(),
             Ended::Wake(None) => {},
@@ -397,6 +400,7 @@ impl<Driver> RingLease<'_, Driver> {
         Driver: RingDriver<File>,
     {
         self.ring.in_flight.fetch_add(1, Ordering::AcqRel);
+        self.ring.is_done[self.slot].store(false, Ordering::Release);
         hold(&self.ring.slots[self.slot]).start();
         if let Err(error) = self.ring.driver.start(self.slot, file, offset, length) {
             hold(&self.ring.slots[self.slot]).unstart();
@@ -575,6 +579,11 @@ impl<Driver> RingLease<'_, Driver> {
         let spin = if is_seated { SEATED_SPIN } else { WAIT_SPIN };
         let spun = Instant::now();
         let answer = loop {
+            // the completion sets the flag once the answer has landed, so a spin reads it with no lock and locks once
+            if !self.ring.is_done[self.slot].load(Ordering::Acquire) && spun.elapsed() < spin {
+                std::hint::spin_loop();
+                continue;
+            }
             {
                 let mut held = hold(&self.ring.slots[self.slot]);
                 if let Some(answer) = held.take_answer() {
@@ -592,7 +601,6 @@ impl<Driver> RingLease<'_, Driver> {
                     continue;
                 }
             }
-            std::hint::spin_loop();
         };
         if is_seated {
             spinners.fetch_sub(1, Ordering::Relaxed);

@@ -488,22 +488,15 @@ thread_local! {
 pub struct RingWait<'ring, Driver>(pub &'ring ReadRing<Driver>);
 
 impl<Driver> ReadRing<Driver> {
-    /// Take a free slot, yielding until one frees
-    pub fn claim_now(&self) -> Result<RingLease<'_, Driver>> {
-        loop {
-            if let Some(lease) = self.try_claim()? {
-                return Ok(lease);
-            }
-            std::thread::yield_now();
-        }
-    }
-
-    /// Read up to a slot's bytes on this thread, and say how many came
     fn read_once_now<File>(&self, file: &File, offset: FileOffset, out: &mut [u8]) -> Result<usize>
     where
         Driver: RingDriver<File>,
+        File: IoFile,
     {
-        let lease = self.claim_now()?;
+        // with every slot taken a wait would only burn a core, so the read goes to the kernel on this thread
+        let Some(lease) = self.try_claim()? else {
+            return file.read_at(offset, out).map(|count| count.0 as usize);
+        };
         lease.start(file, offset, out.len())?;
         let length = lease.wait_now()?;
         self.driver.copy_out(lease.slot, &mut out[..length]);
@@ -550,7 +543,9 @@ impl<Driver> ReadRing<Driver> {
         if matches!(file.try_read_parts_at(offset, parts), Ok(Some(ByteCount(count))) if count == total as u64) {
             return Ok(());
         }
-        let lease = self.claim_now()?;
+        let Some(lease) = self.try_claim()? else {
+            return file.read_parts_at(offset, parts);
+        };
         lease.start(file, offset, total)?;
         if lease.wait_now()? == total {
             self.driver.copy_parts(lease.slot, parts);

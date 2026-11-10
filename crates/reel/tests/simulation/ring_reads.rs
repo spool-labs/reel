@@ -724,3 +724,22 @@ fn big_blocking_read_skips_the_ring() {
     assert_eq!(try_deltas(&io, before), (0, 0, 0));
     store.close().expect("close");
 }
+
+// a blocking read that finds every slot taken reads on its own thread, and never waits on the ring
+#[test]
+fn full_ring_reads_plainly() {
+    let (io, store) = ringed(45);
+    let path = PathBuf::from("/small-read");
+    let file = io.create_file(&path, ByteCount(0)).expect("create");
+    let bytes: Vec<u8> = (0..RING_SLOT_BYTES / 2).map(|at| (at % 251) as u8).collect();
+    file.write_at(FileOffset(0), &[IoSlice::new(&bytes)]).expect("write");
+    io.set_warm_bytes(0);
+
+    let ring = ring(&store);
+    let leases: Vec<_> = (0..RING_SLOTS).map(|_slot| ring.try_claim().expect("open").expect("a free slot")).collect();
+    let mut buf = vec![0; bytes.len()];
+    ring.read_into_now(&file, FileOffset(0), &mut buf).expect("read");
+    assert_eq!(buf, bytes);
+    drop(leases);
+    store.close().expect("close");
+}

@@ -60,7 +60,7 @@ fn wait_for_seal(store: &Store, before: u64) {
 }
 
 // every kept key comes once, in order, with a value of its own, and nothing deleted comes at all
-fn check_walk(mut scan: StoreScan<PlainIo>, direction: Direction, round: Option<u64>) {
+fn check_walk(who: &str, mut scan: StoreScan<PlainIo>, direction: Direction, round: Option<u64>) {
     let (mut key, mut value, mut last) = (Vec::new(), Vec::new(), Vec::new());
     let mut next = if direction == Direction::Ascending { 0 } else { KEPT_KEYS };
     loop {
@@ -81,7 +81,7 @@ fn check_walk(mut scan: StoreScan<PlainIo>, direction: Direction, round: Option<
                 kept(next)
             },
         };
-        assert_eq!(key, expected, "{direction:?} walk at a cue {}", round.is_some());
+        assert_eq!(key, expected, "{who}: {direction:?} walk at a cue {}", round.is_some());
         assert!(value.starts_with(&key), "{key:?} read {value:?}");
         if let Some(round) = round {
             assert_eq!(value, value_of(&key, round));
@@ -136,7 +136,7 @@ fn churn(has_cue: bool) -> JobsRun {
             let (store, is_done, walks) = (&store, &is_done, &walks);
             move || {
                 while !is_done.load(Ordering::Acquire) {
-                    check_walk(store.iter_from(META, start, direction).expect("scan"), direction, None);
+                    check_walk("live", store.iter_from(META, start, direction).expect("scan"), direction, None);
                     walks.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -146,7 +146,7 @@ fn churn(has_cue: bool) -> JobsRun {
             let config = config(&root, BUDGET);
             let mut view = ReelStore::open_read_only(PlainIo::new(), &config).expect("open read-only");
             while !is_done.load(Ordering::Acquire) && views < MOST_VIEWS {
-                check_walk(view.iter_from(META, b"", Direction::Ascending).expect("scan"), Direction::Ascending, None);
+                check_walk("view", view.iter_from(META, b"", Direction::Ascending).expect("scan"), Direction::Ascending, None);
                 view.refresh().expect("refresh");
                 views += 1;
             }
@@ -157,8 +157,8 @@ fn churn(has_cue: bool) -> JobsRun {
         let down = scope.spawn(walker(Direction::Descending, HIGH_KEY));
         let at_cue = scope.spawn(|| {
             while let Some(cue) = cue.as_ref().filter(|_cue| !is_done.load(Ordering::Acquire)) {
-                check_walk(cue.iter_from(META, b"", Direction::Ascending).expect("scan"), Direction::Ascending, Some(FIRST_ROUND));
-                check_walk(cue.iter_from(META, HIGH_KEY, Direction::Descending).expect("scan"), Direction::Descending, Some(FIRST_ROUND));
+                check_walk("cue", cue.iter_from(META, b"", Direction::Ascending).expect("scan"), Direction::Ascending, Some(FIRST_ROUND));
+                check_walk("cue", cue.iter_from(META, HIGH_KEY, Direction::Descending).expect("scan"), Direction::Descending, Some(FIRST_ROUND));
             }
         });
         for round in 1..=WRITE_ROUNDS {

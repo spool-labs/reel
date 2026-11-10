@@ -17,6 +17,7 @@ use reel::engine::planner::Planner;
 use reel::engine::unit_bounds::unit_bound;
 use reel::engine::reel_store::ReelStore;
 use reel::engine::row_job::IDLE_SEAL_AFTER;
+use reel::engine::dead_bits::DECIDED_SET;
 use reel::engine::rewrite_job::{MERGE_BUFFER_BYTES, MergeTarget, MOST_OVERLAP, MOST_PARK_WAIT, PLANNER_LANE, RewriteJob, RewritePhase, is_overlap_input, overlaps};
 use reel::lifetime::MarkRange;
 use reel::engine::volume::{MOST_PARKED, NO_SEAL, Volume};
@@ -3400,4 +3401,85 @@ fn reopened_counts_promise_whole_inputs() {
     assert_eq!(volume.promises_outgrown.load(Ordering::Acquire), 0);
     volume.holds.walk.store(false, Ordering::Release);
     store.close().expect("close");
+}
+
+const BIT_CRASH_POINTS: u64 = 60;
+const BIT_CRASH_STRIDE: u64 = 3;
+
+// one merge rewrites the segment holding newer rows and parks it, and a second drops the older rows by their bits while it sits
+// in the park: a crash at any step of either install leaves every key at its newest version
+#[test]
+fn bit_drops_beside_a_parked_replacement() {
+    let mut decided = 0;
+    let mut finished = 0;
+    for crash_at in (0..BIT_CRASH_POINTS).map(|point| point * BIT_CRASH_STRIDE) {
+        for is_power_cut in [false, true] {
+            let io = SimulatedIo::new(Seed(101));
+            let mut config = config();
+            config.threads.maintenance_workers = Some(2);
+            config.memory_budget = WORKER_BUDGET;
+            let store = ReelStore::open(io.clone(), &config).expect("open");
+            hold_compaction(&store, true);
+            for key in KEYS {
+                store.put(COLUMN, key, b"first").expect("put");
+            }
+            let older = seal(&store, &io);
+            for key in KEYS {
+                store.put(COLUMN, key, b"second").expect("put");
+            }
+            let newer = seal(&store, &io);
+            for key in &KEYS[..2] {
+                store.put(COLUMN, key, b"third").expect("put");
+            }
+            store.put(COLUMN, b"z", b"tail").expect("put");
+            seal(&store, &io);
+            store.flush().expect("flush");
+            settle(&io);
+            let state = &store.state;
+            let volume = &state.volumes[0];
+            assert!(volume.dead_bits.exact(older).is_some(), "the older segment has no exact bits");
+
+            let mut rewrite_newer = RewriteJob::new(Arc::clone(state), 0, PLANNER_LANE + 1);
+            rewrite_newer.forced = Some(newer);
+            let mut drop_older = RewriteJob::new(Arc::clone(state), 0, PLANNER_LANE + 2);
+            drop_older.forced = Some(older);
+            io.arm_crash(OperationCount(crash_at));
+            run_alone(&mut rewrite_newer, &io);
+            let was_parked = volume.segments_parked.load(Ordering::Acquire) > 0;
+            let before = volume.dead_bits.decided[DECIDED_SET].load(Ordering::Acquire);
+            run_alone(&mut drop_older, &io);
+            decided += u64::from(was_parked) * (volume.dead_bits.decided[DECIDED_SET].load(Ordering::Acquire) - before);
+            finished += u64::from(!io.is_crashed());
+            if is_power_cut {
+                io.power_cut();
+            } else {
+                io.kill();
+            }
+            drop(store);
+
+            let store = ReelStore::open(io.clone(), &config).expect("reopen");
+            for (key, value) in KEYS.iter().zip([&b"third"[..], b"third", b"second", b"second"]) {
+                assert_eq!(read(&store, key), Some(value.to_vec()), "crash at {crash_at}, power cut {is_power_cut}");
+            }
+            assert_eq!(read(&store, b"z"), Some(b"tail".to_vec()));
+            store.close().expect("close");
+        }
+    }
+    assert!(decided > 0, "no bit decided a drop while a segment was parked");
+    assert!(finished > 0, "every crash point came before both installs ended");
+}
+
+// start a forced merge and step it to its end, or until the crash comes
+fn run_alone(job: &mut RewriteJob<SimulatedIo>, io: &SimulatedIo) {
+    while !io.is_crashed() && !job.is_running() {
+        if job.start() {
+            break;
+        }
+        if !job.has_looks_left {
+            return;
+        }
+    }
+    while !io.is_crashed() && (job.is_claimed() || job.is_running()) {
+        job.step();
+    }
 }

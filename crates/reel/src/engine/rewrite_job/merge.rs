@@ -355,17 +355,17 @@ impl<Backend: Io> RewriteJob<Backend> {
     }
 
     /// Answer a key's top row by its dead bit: set, a newer row replaced it at or under the input's highest replacement; clear,
-    /// nothing outside did. Nothing when the row has to ask: an unwalked input or merge, bits that aren't exact, damage, a parked
-    /// segment, a stray output, or a live cue that could read the row
+    /// nothing outside did. Nothing when the row has to ask: an unwalked input or merge, bits that aren't exact, damage, a live cue
+    /// that could read the row, or a grave while a segment is parked or an output stray. A value row's replacement sits in a sealed
+    /// segment, and an install retires inputs only once the summary that lists its outputs is synced, so a crash leaves the
+    /// replacement in one or the other. A parked file can come back holding a row a grave hid, so graves still wait
     pub fn bit_answer(&mut self, volume: &Volume<Backend>, column: ColumnId, row: &FooterRow) -> Result<Option<Option<WritePlace>>> {
         if self.is_unwalked || !self.row_walked || volume.are_bits_held_off() {
             return Ok(None);
         }
         let state = Arc::clone(&self.state);
-        let is_clean = volume.segments_parked.load(Ordering::Acquire) == 0
-            && volume.stray_outputs.load(Ordering::Acquire) == 0
-            && volume.damage.is_empty()
-            && hold(&volume.damaged).is_empty();
+        let is_settled = volume.segments_parked.load(Ordering::Acquire) == 0 && volume.stray_outputs.load(Ordering::Acquire) == 0;
+        let is_clean = (is_settled || row.kind == RowKind::Value) && volume.damage.is_empty() && hold(&volume.damaged).is_empty();
         if !is_clean || state.cues.has_cue_between(self.volume, row.place, WritePlace(u64::MAX)) {
             return Ok(None);
         }

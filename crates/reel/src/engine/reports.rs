@@ -44,7 +44,8 @@ impl<Backend: Io> EngineState<Backend> {
     /// Count a writer's pause by its cause, and take it
     pub fn pause_for(&self, cause: PauseCause) {
         self.pauses[cause.index()].fetch_add(1, Ordering::Relaxed);
-        self.io.pause();
+        let seen = self.progress.seen();
+        self.io.pause_on(&self.progress, seen);
     }
 
     /// Count bytes a job moved

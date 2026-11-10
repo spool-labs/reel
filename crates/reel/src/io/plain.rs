@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use reel_api::maintenance_report::{PriorityClass, WorkerPriority};
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, ProcessId};
 
+use crate::io::wake_line::WakeLine;
 use crate::io::host_memory::{HostMemory, read_host_memory};
 use crate::guard::hold;
 use crate::io::{DiskSize, Io, IoFile};
@@ -233,6 +234,10 @@ impl Io for PlainIo {
         }
         // a kernel with no random source still needs a store id, and the per-thread SipHash keys are the best left
         RandomState::new().build_hasher().finish()
+    }
+
+    fn pause_on(&self, line: &WakeLine, seen: u64) {
+        line.wait(seen, PAUSE_WAIT);
     }
 
     fn pause(&self) {

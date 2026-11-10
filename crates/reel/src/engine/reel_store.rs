@@ -21,6 +21,7 @@ use crate::engine::dead_bits::{CHUNK_WORDS, DEAD_BITS_NAME, DeadBits, NEW_DEAD_B
 use crate::engine::rewrite_job::rows_of;
 use crate::segment::block_filter::BITS_PER_ROW;
 use crate::engine::caller_activity::CallerCounts;
+use crate::io::wake_line::WakeLine;
 use crate::engine::admission::Admission;
 use reel_api::maintenance_report::WorkerPriority;
 use crate::engine::column_info::ColumnInfo;
@@ -1132,7 +1133,8 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
     let mut volumes = Vec::with_capacity(config.volumes.len());
     let all_row_room = config.volumes.len() * MOST_ROW_FIXED_BYTES + config.columns.len() * MOST_ROW_COLUMN_BYTES;
     let mut summaries = summaries.into_iter();
-    let context = VolumeContext { io: &io, config, sizing, disks, scan, places: &places, planned: &planned, open_slots, all_row_room };
+    let progress = Arc::new(WakeLine::default());
+    let context = VolumeContext { io: &io, config, sizing, disks, scan, places: &places, planned: &planned, open_slots, all_row_room, progress: &progress };
     for (index, held) in locks.iter_mut().map(mem::take).enumerate() {
         let Some(summary) = summaries.next() else {
             continue;
@@ -1264,6 +1266,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         empty_rewrites: AtomicU64::new(0),
         corruption_errors: AtomicU64::new(0),
         caller_ops: CallerCounts::default(),
+        progress,
         is_arena_full: AtomicBool::new(false),
         arena_fill: AtomicU64::new(0),
         unlinks_refused: AtomicU64::new(0),
@@ -1306,11 +1309,12 @@ pub struct VolumeContext<'open, Backend: Io> {
     pub planned: &'open [TableSizing],
     pub open_slots: usize,
     pub all_row_room: usize,
+    pub progress: &'open Arc<WakeLine>,
 }
 
 /// Build one volume's state: its summary's room, its table, and every count it keeps
 pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: usize, held: Vec<Backend::Lock>, mut summary: SummaryFound) -> Volume<Backend> {
-    let VolumeContext { io, config, sizing, disks, scan, places, planned, open_slots, all_row_room } = *context;
+    let VolumeContext { io, config, sizing, disks, scan, places, planned, open_slots, all_row_room, progress } = *context;
     let volume = &config.volumes[index];
     let mut paths = Vec::with_capacity(volume.roots.len());
     for root in &volume.roots {
@@ -1409,6 +1413,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         is_sync_due: AtomicBool::new(false),
         bytes_since_sync: AtomicU64::new(0),
         idle_seals: AtomicU64::new(0),
+        progress: Arc::clone(progress),
         park_refusals: AtomicU64::new(0),
         most_in_flight: AtomicU64::new(0),
         callers_seen: AtomicU64::new(0),

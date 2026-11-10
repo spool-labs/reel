@@ -3,6 +3,7 @@
 use std::io::Result;
 use std::path::{Path, PathBuf};
 
+use reel::io::wake_line::WakeLine;
 use reel::io::plain::PlainIo;
 use reel::io::host_memory::HostMemory;
 use reel::io::{DiskSize, Io};
@@ -105,6 +106,10 @@ impl Io for HarnessIo {
 
     fn random_word(&self) -> u64 {
         self.plain.random_word()
+    }
+
+    fn pause_on(&self, line: &WakeLine, seen: u64) {
+        self.plain.pause_on(line, seen);
     }
 
     fn pause(&self) {

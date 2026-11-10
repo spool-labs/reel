@@ -3,6 +3,7 @@
 pub mod device_error;
 pub mod host_memory;
 pub mod job;
+pub mod wake_line;
 pub mod lock_outcome;
 pub mod plain;
 pub mod plain_file;
@@ -12,6 +13,7 @@ pub mod ring;
 #[cfg(target_os = "linux")]
 pub mod uring;
 
+use crate::io::wake_line::WakeLine;
 use std::future::{Future, pending, ready};
 use std::io::{IoSlice, IoSliceMut, Result};
 use std::path::{Path, PathBuf};
@@ -351,6 +353,13 @@ pub trait Io: Clone + Send + Sync + 'static {
 
     /// Let background work run while a caller waits for it
     fn pause(&self);
+
+    /// Wait for a line to move past what a caller saw, or a pause at most. A backend that runs the work a waiter waits for, as a
+    /// simulation does, pauses as before
+    fn pause_on(&self, line: &WakeLine, seen: u64) {
+        let _line = (line, seen);
+        self.pause();
+    }
 
     /// Start a job on an engine thread
     fn spawn_job<Work: Job>(&self, name: &'static str, job: Work) -> Result<Self::Task>;

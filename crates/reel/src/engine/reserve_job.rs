@@ -98,6 +98,7 @@ impl<Backend: Io> ReserveJob<Backend> {
                 if let Some(segment) = claims.open.iter_mut().find(|segment| segment.number == room.segment) {
                     segment.is_reserve_asked = false;
                     segment.is_room_holding = false;
+                    volume.progress.wake();
                     // a seal that came while the room grew waited for it
                     if segment.phase == SegmentPhase::Sealing
                         && let Some(task) = state.seal_tasks[volume.id.0 as usize].get()

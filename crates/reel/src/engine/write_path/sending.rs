@@ -75,7 +75,10 @@ impl<Backend: Io> EngineState<Backend> {
             let mut sync = hold(&volume.sync);
             sync.is_running = false;
             match outcome {
-                Ok(()) => sync.completed = covers,
+                Ok(()) => {
+                    sync.completed = covers;
+                    volume.progress.wake();
+                },
                 Err(source) => {
                     drop(sync);
                     volume.fail();
@@ -341,6 +344,7 @@ impl<Backend: Io> Drop for WritingTurn<'_, Backend> {
             }
         }
         hold(&self.state.queues[self.index]).is_writing = false;
+        self.state.progress.wake();
     }
 }
 

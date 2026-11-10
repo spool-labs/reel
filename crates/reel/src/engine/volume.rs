@@ -2,13 +2,14 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use reel_api::maintenance_report::{PICK_OUTCOMES, PickOutcome, SHARE_KINDS, SPAN_RUN_BUCKETS, SealSteps};
 use reel_api::units::{ByteCount, Nanoseconds, RowCount, VolumeId, WritePlace};
 
 use crate::config::SyncPolicy;
 use crate::engine::dead_bits::{DeadBits, SavedHead};
+use crate::io::wake_line::WakeLine;
 use crate::engine::open_segment::OpenSegment;
 use crate::engine::ration::Ration;
 use crate::engine::held_bits::HeldBits;
@@ -372,6 +373,8 @@ pub struct Volume<Backend: Io> {
     pub outputs_promised: AtomicU64,
     /// Seals that ended a segment writes had gone quiet on
     pub idle_seals: AtomicU64,
+    /// The store's line writers wait on, which anything that clears a wait moves
+    pub progress: Arc<WakeLine>,
     /// Picks refused because the park had no room for their inputs
     pub park_refusals: AtomicU64,
     /// The most merges that ran at once

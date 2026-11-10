@@ -63,6 +63,7 @@ impl<Backend: Io> EngineState<Backend> {
                 let is_late = self.io.now().0 > deadline;
                 if is_clear || has_failed || is_late {
                     volume.ration.next_in_line();
+                    volume.progress.wake();
                     self.longest_index_wait.fetch_max(self.io.now().0.saturating_sub(started.0), Ordering::Relaxed);
                     check_writable(volume)?;
                     if !is_clear {
@@ -285,6 +286,7 @@ impl<Backend: Io> EngineState<Backend> {
             let created = self.create_segment(volume, RootId(root as u8), request);
             let mut claims = hold(&volume.claims);
             claims.is_creating = false;
+            volume.progress.wake();
             match created {
                 Ok(Some(mut segment)) => {
                     segment.ceiling = pick.ceiling;
@@ -330,6 +332,7 @@ impl<Backend: Io> EngineState<Backend> {
         };
         let segment = &mut claims.open[index];
         segment.is_room_holding = false;
+        volume.progress.wake();
         if let Err(source) = reserved {
             self.seal_at(&mut claims, volume, index);
             return Err(store_error(volume, "reserving a segment's room", source));
@@ -470,6 +473,7 @@ impl<Backend: Io> EngineState<Backend> {
     pub fn finish_create(&self, volume: &Volume<Backend>, created: Result<Option<OpenSegment<Backend::File>>, StoreError>) {
         let mut claims = hold(&volume.claims);
         claims.is_creating = false;
+        volume.progress.wake();
         match created {
             Ok(Some(segment)) => {
                 claims.prepared = Some(segment);

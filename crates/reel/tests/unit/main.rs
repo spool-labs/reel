@@ -30,6 +30,7 @@ mod segment_table;
 mod segment_tail;
 mod summary;
 mod summary_orders;
+mod wake_line;
 mod superblock;
 mod varint;
 mod workers;

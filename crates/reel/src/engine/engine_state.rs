@@ -13,6 +13,7 @@ use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, SegmentCount, WritePlace};
 
 use crate::engine::caller_activity::CallerCounts;
+use crate::io::wake_line::WakeLine;
 use crate::engine::dead_bits::{CHUNK_WORDS, DEAD_BITS_SAVE_PERIOD, chunk_sum};
 use crate::engine::volume::BitsSave;
 use crate::io::replace::move_into_place;
@@ -147,6 +148,8 @@ pub struct EngineState<Backend: Io> {
     pub corruption_errors: AtomicU64,
     /// Caller operations, so maintenance can tell callers are busy
     pub caller_ops: CallerCounts,
+    /// The line writers wait on, shared with every volume
+    pub progress: Arc<WakeLine>,
     pub is_arena_full: AtomicBool,
     pub arena_fill: AtomicU64,
     pub unlinks_refused: AtomicU64,

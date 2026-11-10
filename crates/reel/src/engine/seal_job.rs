@@ -503,6 +503,8 @@ impl<Backend: Io> SealJob<Backend> {
             }
             volume.dead_bits.begin(target.number, self.writer.entries().len() as u32, totals.most_block_rows);
             volume.note_sealed(totals.head.places.highest);
+            // a seal moves the ration's line, frees index room and ends a wait for a segment to seal
+            volume.progress.wake();
             state.note_moved(JobKind::Seal, totals.file_length);
             state.note_written(WriteSource::SealFooters, ByteCount(totals.file_length.0.saturating_sub(totals.head.data_end.0)));
             if !target.marks.is_empty() {

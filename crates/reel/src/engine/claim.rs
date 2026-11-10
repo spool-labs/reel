@@ -53,6 +53,7 @@ impl<Backend: Io> Claim<'_, Backend> {
         for segment in &mut claims.open {
             if segment.slot == self.slot {
                 segment.in_flight -= 1;
+                self.volume.progress.wake();
                 if self.is_alone && segment.phase == SegmentPhase::Alone {
                     segment.phase = SegmentPhase::Taking;
                 }

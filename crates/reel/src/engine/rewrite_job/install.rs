@@ -28,7 +28,7 @@ use crate::segment::segment_table::shard_of;
 use crate::segment::segment_tail::{ColumnTail, MOST_MERGE_SEGMENTS, SegmentNumber};
 use crate::segment::summary::{ColumnFacts, SegmentFacts, SummaryRow, SummaryRows};
 
-use crate::engine::rewrite_job::{BAR_QUARTERS, EARLY_BAR_QUARTERS, MOST_PARK_WAIT, MergeTarget, OUTGROW_STEP_BYTES, RewriteJob, RewritePhase, StagedColumn, StagedOutput, rows_bytes}; use crate::engine::rewrite_job::pick::has_disk_room;
+use crate::engine::rewrite_job::{BAR_SCALE, EARLY_BAR, MOST_PARK_WAIT, MergeTarget, OUTGROW_STEP_BYTES, RewriteJob, RewritePhase, StagedColumn, StagedOutput, rows_bytes}; use crate::engine::rewrite_job::pick::has_disk_room;
 
 impl<Backend: Io> RewriteJob<Backend> {
     /// Check a lone input sits in the table shard a stuck seal waits on, so moving it to an output elsewhere frees the slot
@@ -330,9 +330,9 @@ impl<Backend: Io> RewriteJob<Backend> {
         let last = self.totals.and(self.output.as_ref()).map(|output| output.number);
         let graves = self.grave_totals.and(self.grave_output.as_ref()).map(|output| output.number);
         let written = rows_bytes(&hold(&volume.summary), staged.chain(last).chain(graves));
-        // a record rewrite counts by what its inputs won back, against the early bar's three quarters
+        // a record rewrite counts by what its inputs won back, against the early bar
         let kind = match self.picked_as {
-            Some(PickOutcome::Record) if BAR_QUARTERS * gone.dead >= EARLY_BAR_QUARTERS * gone.file => RECORD_PAST_EARLY_BAR,
+            Some(PickOutcome::Record) if BAR_SCALE * gone.dead >= EARLY_BAR * gone.file => RECORD_PAST_EARLY_BAR,
             Some(PickOutcome::Record) => RECORD_UNDER_EARLY_BAR,
             Some(PickOutcome::Overlap) => OVERLAP_MERGE,
             _other => OTHER_MERGE,

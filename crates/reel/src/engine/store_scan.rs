@@ -47,6 +47,8 @@ impl<Backend: Io> StoreScan<Backend> {
 
     /// Fill the buffers with the next row
     pub fn next_row(&mut self, key: &mut Vec<u8>, value: &mut Vec<u8>) -> Result<ScanStep, StoreError> {
+        // every step counts, so a long scan reads as a busy caller to maintenance
+        self.state.caller_ops.note();
         let Some(scan) = &mut self.scan else {
             return Ok(ScanStep::End);
         };
@@ -56,6 +58,7 @@ impl<Backend: Io> StoreScan<Backend> {
     /// Stream the next block of keys through the read workers, and say whether the walk has more. A walk dropped part way
     /// gives its buffers back when the worker ends, and a future dropped part way ends the walk
     pub async fn next_block(&mut self, keys: &mut ValueList) -> Result<bool, StoreError> {
+        self.state.caller_ops.note();
         keys.clear();
         if self.state.ring.is_some() {
             return self.next_block_on_ring(keys).await;
@@ -98,6 +101,8 @@ impl<Backend: Io> StoreScan<Backend> {
 
     /// Fill the buffer with the next key
     pub fn next_key(&mut self, key: &mut Vec<u8>) -> Result<ScanStep, StoreError> {
+        // every step counts, so a long scan reads as a busy caller to maintenance
+        self.state.caller_ops.note();
         let Some(scan) = &mut self.scan else {
             return Ok(ScanStep::End);
         };

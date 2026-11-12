@@ -29,6 +29,7 @@ pub const WRITER_YIELD: Nanoseconds = Nanoseconds(200_000);
 pub const WALK_LAG_SEGMENTS: u64 = 8;
 
 /// Planner steps in a row that may end before the walk's turn while a walk is pending, a merge's steps on a store with no workers
+#[cfg(any(test, feature = "test-hooks"))]
 pub const MOST_WALKLESS_STEPS: u64 = 64;
 
 /// Every volume's units and whose turn it is

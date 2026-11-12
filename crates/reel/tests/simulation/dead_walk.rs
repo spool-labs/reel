@@ -858,6 +858,8 @@ fn three_segments(store: &Store, io: &SimulatedIo, third: &[&[u8]]) -> (SegmentN
     }
     store.seal_now();
     settle(io);
+    // the puts read as calls, so the picks below wait out a quiet spell first
+    quiet(store, io);
     (older, newer, newest())
 }
 
@@ -1103,6 +1105,10 @@ fn cursor_arm(seed: u64, is_cursor_off: bool, is_merging: bool) -> (Vec<(u64, u6
             store.put(COLUMN, &key, &random.below(u64::MAX).to_le_bytes()).expect("put");
         }
         store.seal_now();
+        // the puts read as calls, so a merge waits out a quiet spell first
+        if is_merging {
+            quiet(&store, &io);
+        }
         // a merge claims, writes and installs a step at a time between the walk's blocks
         for _step in 0..CURSOR_MERGE_STEPS {
             if io.step_any().is_none() {
@@ -1276,6 +1282,7 @@ fn bits_survive_a_reopen() {
     let store = open_workers(&io);
     let volume = &store.state.volumes[0];
     assert!(volume.dead_bits.exact(older).is_some(), "the bits didn't come back");
+    quiet(&store, &io);
     check_dead_bits(volume);
     let mut merge = CompactJob::new(store.state.clone(), 0);
     while !merge.rewrite.start() {
@@ -1346,4 +1353,10 @@ fn damage_at_open_spoils_saved_bits() {
     assert!(!hold(&volume.damaged).is_empty(), "open found no damage");
     assert!(volume.dead_bits.exact(older).is_none(), "a bit loaded beside damage stayed exact");
     store.close().expect("close");
+}
+
+// let the clock pass a quiet spell after the last call, so a pick reads the store as quiet
+fn quiet(store: &Store, io: &SimulatedIo) {
+    let until = store.state.quiet_at(io.clock_reading());
+    io.advance_clock(Nanoseconds(until.0.saturating_sub(io.clock_reading().0)));
 }

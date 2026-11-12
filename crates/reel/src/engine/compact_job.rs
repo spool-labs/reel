@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::{JobKind, PickKind, UnitKind};
+use reel_api::maintenance_report::{JobKind, PickKind, PickOutcome, UnitKind};
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, Nanoseconds, WritePlace};
 
@@ -21,7 +21,7 @@ use crate::config::MAX_KEY_BYTES;
 use crate::engine::complete_path::{REFILL_STEP_BLOCKS, Refill};
 use crate::engine::cover_apply::is_in_range;
 use crate::engine::engine_state::EngineState;
-use crate::engine::rewrite_job::{PLANNER_LANE, RewriteJob, RewriteSeat, is_mergeable, is_reclaim_due};
+use crate::engine::rewrite_job::{PLANNER_LANE, RewriteJob, RewriteSeat, has_disk_room, is_mergeable, is_reclaim_due};
 use crate::engine::rebuild::MOST_REBUILD_TRIES;
 use crate::engine::volume::{ParkedSegment, Volume};
 use crate::engine::walk_job::{FREE_IN_PLACE_BYTES, FreeRecord, WALK_RETRY};
@@ -135,6 +135,8 @@ pub struct CompactJob<Backend: Io> {
     row_key: FixedList<u8>,
     end: FixedList<u8>,
     unit: Option<(UnitKind, u64)>,
+    /// The summary change count when a quiet pass last found nothing past the quiet bar, so the next pass waits for a change
+    quiet_looked_at: u64,
     /// The last step took a refill or a sweep step, which leaves the walk its turn
     pub did_background: bool,
     /// Planner steps in a row that ended before the walk's turn while a walk was pending
@@ -156,6 +158,7 @@ impl<Backend: Io> CompactJob<Backend> {
             should_rewrite: false,
             is_ask_held: false,
             unit: None,
+            quiet_looked_at: u64::MAX,
             did_background: false,
             walkless_steps: 0,
             held_pass: None,
@@ -336,7 +339,15 @@ impl<Backend: Io> CompactJob<Backend> {
         let is_deferring = volume.is_hot(now) && !is_short;
         let is_holding_records = volume.is_ingesting(now) && !is_short;
         let is_owed = !is_deferring && volume.is_over_bound.load(Ordering::Acquire);
-        let is_quiet_with_dead = !is_holding_records && !volume.is_reclaim_held() && is_reclaim_due(&hold(&volume.summary));
+        volume.note_callers(self.state.caller_ops.total(), now);
+        // a disk short of room frees what it can whether callers are busy or not, and a disk that fills from outside looks again
+        let has_dead = !volume.is_reclaim_held() && is_reclaim_due(&hold(&volume.summary));
+        let is_room_short = has_dead && !has_disk_room(&self.state, volume, ByteCount(0), false);
+        let look_key = summary_changes(volume) << 1 | u64::from(is_room_short);
+        let is_reclaim_due = has_dead && look_key != self.quiet_looked_at;
+        // busy callers leave dead bytes to the plain bar, and the planner comes back once a quiet spell could have begun
+        let is_busy = volume.is_caller_active(now);
+        let is_quiet_with_dead = (!is_busy || is_room_short) && is_reclaim_due;
         let mut should_rewrite = mem::take(&mut self.should_rewrite) || is_quiet_with_dead || is_owed;
         // an ask that arriving writes held back comes due once they stop
         if is_holding_records {
@@ -344,12 +355,19 @@ impl<Backend: Io> CompactJob<Backend> {
         } else {
             should_rewrite |= mem::take(&mut self.is_ask_held);
         }
+        let (refused_before, nothing_before) = (refused_picks(volume), nothing_picks(volume));
         // workers run every rewrite, so the planner stays free to pick and walk. A merge of 1 GiB segments would hold it for minutes
         if should_rewrite && (self.hand_out() || (self.seats.is_empty() && self.rewrite.start())) {
             return JobStep::Worked;
         }
         // a look takes a few segments at a time, and the rest still count. Hot ingest looks at none
         self.should_rewrite = should_rewrite && !is_deferring && self.rewrite.has_looks_left;
+        // a quiet pass that found nothing past the bar looks again only once a seal, a rewrite, an unlink or the room changes what
+        // it saw. A pass a refusal ended, for room, the park or an overlap merge owed, tries again as that refusal says
+        let has_found_nothing = refused_picks(volume) == refused_before && nothing_picks(volume) > nothing_before;
+        if is_quiet_with_dead && !self.should_rewrite && has_found_nothing {
+            self.quiet_looked_at = look_key;
+        }
         if self.should_rewrite {
             return JobStep::Worked;
         }
@@ -359,6 +377,9 @@ impl<Backend: Io> CompactJob<Backend> {
         // what hot ingest or arriving writes put off starts once the window closes
         if is_deferring || is_holding_records {
             return JobStep::IdleUntil { deadline: volume.hot_until() };
+        }
+        if is_busy && is_reclaim_due {
+            return JobStep::IdleUntil { deadline: volume.quiet_at() };
         }
         // a planner with nothing to do saves the bits that changed, so a stop after a quiet spell keeps them all
         if volume.bits_saved_at.load(Ordering::Acquire) != 0 && volume.dead_bits.is_changed.swap(false, Ordering::AcqRel) {
@@ -442,8 +463,7 @@ impl<Backend: Io> CompactJob<Backend> {
 
     /// Look for work for idle workers once something has changed that could give one a pick
     pub fn hand_out_on_change(&mut self, volume: &Volume<Backend>) {
-        let left = volume.segments_rewritten.load(Ordering::Acquire) + volume.segments_unlinked.load(Ordering::Acquire);
-        let changes = left + volume.seals_done.load(Ordering::Acquire);
+        let changes = summary_changes(volume);
         if changes != self.handed_at {
             self.handed_at = changes;
             let _handed = self.hand_out();
@@ -984,4 +1004,20 @@ pub fn is_under_applied_cover<Backend: Io>(volume: &Volume<Backend>, segment: Se
             !facts.bound.is_empty() && covers.is_inside_newer(&cover, true)
         })
     })
+}
+
+/// Count what changes the summary a pick reads: seals, rewrites and unlinks
+fn summary_changes<Backend: Io>(volume: &Volume<Backend>) -> u64 {
+    let left = volume.segments_rewritten.load(Ordering::Acquire) + volume.segments_unlinked.load(Ordering::Acquire);
+    left + volume.seals_done.load(Ordering::Acquire)
+}
+
+/// Count picks a refusal ended: refused for room, the park or stray outputs, deferred under the cap, or behind an overlap merge
+fn refused_picks<Backend: Io>(volume: &Volume<Backend>) -> u64 {
+    [PickOutcome::Refused, PickOutcome::Deferred, PickOutcome::Behind].iter().map(|kind| volume.picks[kind.index()].load(Ordering::Acquire)).sum()
+}
+
+/// Count picks that looked and found nothing past the bar
+fn nothing_picks<Backend: Io>(volume: &Volume<Backend>) -> u64 {
+    volume.picks[PickOutcome::Nothing.index()].load(Ordering::Acquire)
 }

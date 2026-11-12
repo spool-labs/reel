@@ -843,8 +843,8 @@ fn output_slots_outlast_a_rewrite_in_flight() {
 
 // the writer pauses once a seal lands, so the hot window closes and the rewrites hot ingest put off can start
 fn cool(store: &Store, io: &SimulatedIo) {
-    let until = store.state.volumes.iter().map(|volume| volume.hot_until().0).max().unwrap_or(0);
-    io.advance_clock(Nanoseconds(until.saturating_sub(io.clock_reading().0)));
+    let until = store.state.quiet_at(io.clock_reading());
+    io.advance_clock(Nanoseconds(until.0.saturating_sub(io.clock_reading().0)));
     settle(io);
 }
 

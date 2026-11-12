@@ -29,7 +29,6 @@ use crate::engine::compact_job::park;
 use crate::engine::open_segment::{data_path, output_path, rows_path};
 use crate::engine::read_pool::ReadPool;
 use crate::engine::walk_job::{FREE_BLOCK_BYTES, FreeRecord};
-#[cfg(any(test, feature = "test-hooks"))]
 use crate::segment::summary_orders::WalkList;
 use crate::engine::workers::Workers;
 use crate::engine::volume::{ParkedSegment, RewriteOutput, Volume};
@@ -388,8 +387,19 @@ impl<Backend: Io> EngineState<Backend> {
         hold(&self.free_slots).push(slot);
     }
 
-    /// Count a volume's segments waiting for the dead-byte walk
+    /// Note the callers so far on every volume, and read when the last of them could go quiet: a test cools to this time
     #[cfg(any(test, feature = "test-hooks"))]
+    pub fn quiet_at(&self, now: Nanoseconds) -> Nanoseconds {
+        let total = self.caller_ops.total();
+        let mut quiet = now;
+        for volume in self.volumes.iter() {
+            volume.note_callers(total, now);
+            quiet = quiet.max(volume.quiet_at());
+        }
+        quiet
+    }
+
+    /// Count a volume's segments waiting for the dead-byte walk
     pub fn pending_walks(&self, volume: usize) -> usize {
         let rows = hold(&self.volumes[volume].summary);
         rows.orders().walk_count(WalkList::Unwalked) + rows.orders().walk_count(WalkList::Backward)

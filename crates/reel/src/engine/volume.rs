@@ -38,8 +38,6 @@ pub const MOST_PARKED: usize = 8;
 pub const MERGE_CAP_WORKERS: usize = 4;
 /// Walk slots for each one that counts blocks while callers are busy. A starting value, tuned at the end
 pub const WALK_CAP_WORKERS: usize = 4;
-/// The call time of a volume no caller has read from yet
-pub const NO_CALL: u64 = u64::MAX;
 
 /// A segment out of every list, whose file goes once no read holds it
 #[derive(Clone, Debug)]
@@ -385,10 +383,10 @@ pub struct Volume<Backend: Io> {
     pub park_refusals: AtomicU64,
     /// The most merges that ran at once
     pub most_in_flight: AtomicU64,
-    /// The caller operations a pick last saw, and when the count last moved
+    /// The caller operations a look last saw
     pub callers_seen: AtomicU64,
+    /// When the caller count last moved, which job start stamps so a store just opened reads busy for a spell
     pub last_call_at: AtomicU64,
-    pub callers_looked_at: AtomicU64,
     /// Picks put off because callers were busy and the merges in flight had reached the cap
     pub capped_picks: AtomicU64,
     /// One bit for each row the walk charged, for segments born since open
@@ -629,19 +627,23 @@ impl<Backend: Io> Volume<Backend> {
         fill < merge && self.is_ingesting(now)
     }
 
-    /// Note the caller operations so far, and when the count last moved
+    /// Note the caller operations so far: a count that moved marks a call now, which at worst holds the quiet bar one spell long
     pub fn note_callers(&self, total: u64, now: Nanoseconds) {
-        let looked_at = self.callers_looked_at.swap(now.0, Ordering::Relaxed);
-        // a count that moved since a look older than the quiet spell can't say when, so it marks nothing recent
-        if self.callers_seen.swap(total, Ordering::Relaxed) != total && now.0.saturating_sub(looked_at) < IDLE_SEAL_AFTER.0 {
+        if self.callers_seen.swap(total, Ordering::Relaxed) != total {
             self.last_call_at.store(now.0, Ordering::Relaxed);
         }
+    }
+
+    /// Read when a quiet spell could begin: the hot window's end, or a spell past the last call
+    pub fn quiet_at(&self) -> Nanoseconds {
+        let after_call = self.last_call_at.load(Ordering::Relaxed).saturating_add(IDLE_SEAL_AFTER.0);
+        Nanoseconds(after_call.max(self.hot_until().0))
     }
 
     /// Check callers wrote within the hot window or called within the quiet spell that ends it
     pub fn is_caller_active(&self, now: Nanoseconds) -> bool {
         let last = self.last_call_at.load(Ordering::Relaxed);
-        self.is_ingesting(now) || (last != NO_CALL && now.0.saturating_sub(last) < IDLE_SEAL_AFTER.0)
+        self.is_ingesting(now) || now.0.saturating_sub(last) < IDLE_SEAL_AFTER.0
     }
 
     /// Read the cap a volume starts with: a quarter of its workers, at least one

@@ -13,9 +13,10 @@ use reel::engine::compact_job::{CompactJob, park};
 use reel::engine::cue::Cue;
 use reel::engine::open_segment::{OUTPUT_SUFFIX, data_path};
 use reel::engine::read_path::{RecordWant, WalkAsk};
-use reel::engine::planner::Planner;
+use reel::engine::planner::{MOST_WALKLESS_STEPS, Planner};
 use reel::engine::unit_bounds::unit_bound;
 use reel::engine::reel_store::ReelStore;
+use reel::engine::reserve_job::RESERVE_PERIOD;
 use reel::engine::row_job::IDLE_SEAL_AFTER;
 use reel::engine::dead_bits::DECIDED_SET;
 use reel::engine::rewrite_job::{MERGE_BUFFER_BYTES, MergeTarget, MOST_OVERLAP, MOST_PARK_WAIT, PLANNER_LANE, RewriteJob, RewritePhase, is_overlap_input, overlaps};
@@ -32,7 +33,9 @@ use reel::segment::footer_reader::FooterReader;
 use reel::segment::segment_table::{RetiredSegment, TABLE_SHARDS, shard_of};
 use reel::segment::segment_tail::{BlockCount, MOST_MERGE_SEGMENTS, SegmentNumber, TailHead};
 use reel_api::column_id::ColumnId;
+use reel_api::direction::Direction;
 use reel_api::maintenance_report::{MaintenanceReport, PickOutcome, UnitKind, WriteSource};
+use reel_api::scan::ScanStep;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RootId, VolumeId, WritePlace};
 use reel_api::write_batch::WriteBatch;
 use reel_sim::seeded_random::{Seed, SeededRandom};
@@ -2437,6 +2440,7 @@ fn first_worker_takes_overlap() {
     let volume = &store.state.volumes[0];
     volume.seal_interval.store(3_600_000_000_000, Ordering::Relaxed);
     volume.seal_started_at.store(io.clock_reading().0, Ordering::Relaxed);
+    volume.last_write_at.store(io.clock_reading().0, Ordering::Relaxed);
 
     let state = &store.state;
     let mut planner = RewriteJob::new(Arc::clone(state), 0, PLANNER_LANE);
@@ -2802,8 +2806,8 @@ fn trickle_a_merge_outpaces_reads_quiet() {
 
 // the writer pauses once a seal lands, so the hot window closes and the rewrites hot ingest put off can start
 fn cool(store: &Store, io: &SimulatedIo) {
-    let until = store.state.volumes.iter().map(|volume| volume.hot_until().0).max().unwrap_or(0);
-    io.advance_clock(Nanoseconds(until.saturating_sub(io.clock_reading().0)));
+    let until = store.state.quiet_at(io.clock_reading());
+    io.advance_clock(Nanoseconds(until.0.saturating_sub(io.clock_reading().0)));
     settle(io);
 }
 
@@ -3501,5 +3505,263 @@ fn filters_out_keep_the_least_bound() {
     assert!(start_merge(&mut job), "no merge started");
     assert!(overlaps() > 0, "no overlap merge started on {OVER_THE_BOUND} segments with their filters out");
     run_to_end(&mut job);
+    store.close().expect("close");
+}
+
+const LIGHT_KEYS: u64 = 200;
+const BUSY_SPELLS: u64 = 4;
+/// Two keys in five written again leave each segment about 40% dead: past the quiet bar, under the plain one
+const PAST_QUIET: (u64, u64) = (2, 5);
+/// Three keys in twenty leave each segment about 15% dead, under the quiet bar
+const UNDER_QUIET: (u64, u64) = (3, 20);
+
+fn light_key(number: u64) -> Vec<u8> {
+    format!("light-{number:04}").into_bytes()
+}
+
+fn is_written_again(number: u64, (dead, of): (u64, u64)) -> bool {
+    number % of < dead
+}
+
+// write every key and seal, then write a share of them again and seal, with the walk counting the dead rows
+fn partly_dead(io: &SimulatedIo, share: (u64, u64)) {
+    let store = open(io);
+    hold_compaction(&store, true);
+    for number in 0..LIGHT_KEYS {
+        store.put(COLUMN, &light_key(number), b"first").expect("put");
+    }
+    seal(&store, io);
+    for number in (0..LIGHT_KEYS).filter(|number| is_written_again(*number, share)) {
+        store.put(COLUMN, &light_key(number), b"second").expect("put");
+    }
+    seal(&store, io);
+    settle(io);
+    assert_eq!(store.state.pending_walks(0), 0, "the walk left a segment uncounted");
+    store.close().expect("close");
+}
+
+fn record_picks(store: &Store) -> u64 {
+    store.state.volumes[0].picks[PickOutcome::Record.index()].load(Ordering::Acquire)
+}
+
+// step the jobs a tick at a time until the clock passes the line, calling between ticks
+fn run_until(store: &Store, io: &SimulatedIo, until: Nanoseconds, mut call: impl FnMut()) {
+    while io.clock_reading() < until {
+        call();
+        store.state.ask_compaction();
+        for _step in 0..STEPS {
+            if io.step_any().is_none() {
+                break;
+            }
+        }
+        io.advance_clock(TICK);
+    }
+}
+
+fn spells_from_now(io: &SimulatedIo, spells: u64) -> Nanoseconds {
+    Nanoseconds(io.clock_reading().0 + spells * IDLE_SEAL_AFTER.0)
+}
+
+fn check_partly(store: &Store, share: (u64, u64)) {
+    for number in 0..LIGHT_KEYS {
+        let value: &[u8] = if is_written_again(number, share) { b"second" } else { b"first" };
+        assert_eq!(read(store, &light_key(number)).as_deref(), Some(value), "key {number}");
+    }
+}
+
+// a store just opened reads busy, so a segment past the quiet bar waits for a quiet spell with no call before the bar takes it
+#[test]
+fn open_reads_busy_until_a_quiet_spell() {
+    let io = SimulatedIo::new(Seed(120));
+    partly_dead(&io, PAST_QUIET);
+    let store = open(&io);
+    run_until(&store, &io, Nanoseconds(io.clock_reading().0 + IDLE_SEAL_AFTER.0 / 2), || {});
+    assert_eq!(record_picks(&store), 0, "a record rewrite ran at the quiet bar right after the open");
+    run_until(&store, &io, spells_from_now(&io, 2), || {});
+    assert!(record_picks(&store) > 0, "the quiet bar took nothing after a quiet spell");
+    check_partly(&store, PAST_QUIET);
+    store.close().expect("close");
+}
+
+// a scan's rows count as calls, so a long scan holds the plain bar, and the quiet bar takes the segment once it ends
+#[test]
+fn scan_holds_the_plain_bar() {
+    let io = SimulatedIo::new(Seed(121));
+    partly_dead(&io, PAST_QUIET);
+    let store = open(&io);
+    let mut scan = store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan");
+    let (mut key, mut value) = (Vec::new(), Vec::new());
+    run_until(&store, &io, spells_from_now(&io, BUSY_SPELLS), || {
+        if scan.next_row(&mut key, &mut value).expect("step") == ScanStep::End {
+            scan = store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan");
+        }
+    });
+    assert_eq!(record_picks(&store), 0, "a record rewrite ran at the quiet bar under a scan");
+    drop(scan);
+    run_until(&store, &io, spells_from_now(&io, 2), || {});
+    assert!(record_picks(&store) > 0, "the quiet bar took nothing once the scan ended");
+    check_partly(&store, PAST_QUIET);
+    store.close().expect("close");
+}
+
+// puts count as calls before their first seal, so writes after an open hold the plain bar
+#[test]
+fn puts_hold_the_plain_bar() {
+    let io = SimulatedIo::new(Seed(122));
+    partly_dead(&io, PAST_QUIET);
+    let store = open(&io);
+    let mut number = 0_u64;
+    run_until(&store, &io, spells_from_now(&io, BUSY_SPELLS), || {
+        store.put(COLUMN, format!("fresh-{number:06}").as_bytes(), b"value").expect("put");
+        number += 1;
+    });
+    assert_eq!(record_picks(&store), 0, "a record rewrite ran at the quiet bar under puts");
+    run_until(&store, &io, spells_from_now(&io, BUSY_SPELLS), || {});
+    assert!(record_picks(&store) > 0, "the quiet bar took nothing once the puts stopped");
+    check_partly(&store, PAST_QUIET);
+    store.close().expect("close");
+}
+
+// busy readers still leave a mostly dead segment to the plain bar, so a store that is never quiet holds no more than half dead
+#[test]
+fn reads_leave_the_plain_bar_working() {
+    let io = SimulatedIo::new(Seed(123));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    half_dead(&store, &io);
+    settle(&io);
+    hold_compaction(&store, false);
+    run_until(&store, &io, spells_from_now(&io, BUSY_SPELLS), || {
+        let _found = read(&store, KEYS[0]);
+    });
+    assert!(record_picks(&store) > 0, "a mostly dead segment waited out busy readers");
+    check_reads(&store);
+    store.close().expect("close");
+}
+
+// a quiet store leaves segments under the quiet bar as they are, and its planner goes idle with them
+#[test]
+fn quiet_bar_leaves_light_dead() {
+    let io = SimulatedIo::new(Seed(124));
+    partly_dead(&io, UNDER_QUIET);
+    let store = open(&io);
+    run_until(&store, &io, spells_from_now(&io, BUSY_SPELLS), || {});
+    assert_eq!(record_picks(&store), 0, "a quiet store rewrote a segment under the quiet bar");
+    let mut report = MaintenanceReport::new();
+    store.maintenance_report(&mut report);
+    assert!(report.longest_walkless_steps <= MOST_WALKLESS_STEPS, "the planner looked again and again at nothing to take");
+    check_partly(&store, UNDER_QUIET);
+    store.close().expect("close");
+}
+
+// a quiet store short of disk room takes any segment that wins a byte back
+#[test]
+fn room_short_takes_light_dead() {
+    let io = SimulatedIo::new(Seed(125));
+    let root = PathBuf::from(ROOT);
+    io.add_disk(&root, ByteCount(1 << 40));
+    partly_dead(&io, UNDER_QUIET);
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    let used = (1 << 40) - io.free_space(&root).expect("free").0;
+    io.add_disk(&root, ByteCount(used + volume.reserve.0 + volume.segment_bytes.0 - 1));
+    run_until(&store, &io, spells_from_now(&io, BUSY_SPELLS), || {});
+    assert!(record_picks(&store) > 0, "a quiet store short of room left dead bytes it could take");
+    check_partly(&store, UNDER_QUIET);
+    store.close().expect("close");
+}
+
+const BUSY_LANE_WORKERS: usize = 8;
+
+// callers reading keep overlap merges to the busy lane, one at a time under the cap, and every idle worker may take one once a
+// quiet spell passes
+#[test]
+fn busy_callers_merge_on_one_lane() {
+    let io = SimulatedIo::new(Seed(126));
+    let mut config = config();
+    config.threads.maintenance_workers = Some(BUSY_LANE_WORKERS);
+    config.memory_budget = WORKER_BUDGET;
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    hold_compaction(&store, true);
+    let volume = &store.state.volumes[0];
+    pile_up(&store, &io, 3 * OVER_THE_BOUND);
+    hold_compaction(&store, false);
+    let overlaps = || volume.picks[PickOutcome::Overlap.index()].load(Ordering::Acquire);
+    let job = CompactJob::new(Arc::clone(&store.state), 0);
+    let _found = read(&store, b"m-shared");
+    let _quiet = store.state.quiet_at(io.clock_reading());
+    for _look in 0..3 * OVER_THE_BOUND {
+        let _handed = job.hand_out();
+    }
+    assert_eq!(overlaps(), 1, "busy callers saw more than one overlap merge");
+    assert_ne!(hold(&volume.lanes[1].inputs)[0], SegmentNumber(0), "the overlap merge ran off the busy lane");
+
+    let until = store.state.quiet_at(io.clock_reading());
+    io.advance_clock(Nanoseconds(until.0.saturating_sub(io.clock_reading().0)));
+    for _look in 0..3 * OVER_THE_BOUND {
+        let _handed = job.hand_out();
+    }
+    assert!(overlaps() > 1, "no other lane took an overlap merge once callers went quiet");
+    store.close().expect("close");
+}
+
+// a disk short of room frees what it can while readers keep the store busy
+#[test]
+fn room_short_frees_under_busy_readers() {
+    let io = SimulatedIo::new(Seed(127));
+    let root = PathBuf::from(ROOT);
+    io.add_disk(&root, ByteCount(1 << 40));
+    partly_dead(&io, UNDER_QUIET);
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    let used = (1 << 40) - io.free_space(&root).expect("free").0;
+    io.add_disk(&root, ByteCount(used + volume.reserve.0 + volume.segment_bytes.0 - 1));
+    run_until(&store, &io, spells_from_now(&io, BUSY_SPELLS), || {
+        let _found = read(&store, &light_key(0));
+    });
+    assert!(record_picks(&store) > 0, "a disk short of room kept its dead bytes while readers called");
+    check_partly(&store, UNDER_QUIET);
+    store.close().expect("close");
+}
+
+fn refused_picks(store: &Store) -> u64 {
+    store.state.volumes[0].picks[PickOutcome::Refused.index()].load(Ordering::Acquire)
+}
+
+// step the jobs a tick at a time until the clock passes the line, with nothing asking for compaction
+fn step_until(io: &SimulatedIo, until: Nanoseconds) {
+    while io.clock_reading() < until {
+        for _step in 0..STEPS {
+            if io.step_any().is_none() {
+                break;
+            }
+        }
+        io.advance_clock(TICK);
+    }
+}
+
+// a quiet pass a refusal ended tries again once the refusal's wait is over, with no seal, rewrite or unlink between
+#[test]
+fn refused_pass_looks_again() {
+    let io = SimulatedIo::new(Seed(128));
+    partly_dead(&io, PAST_QUIET);
+    // with a worker the seats pick, and the planner's own job keeps no looks, as on every store a node runs
+    let mut config = config();
+    config.threads.maintenance_workers = Some(1);
+    config.memory_budget = WORKER_BUDGET;
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let volume = &store.state.volumes[0];
+    let until = store.state.quiet_at(io.clock_reading());
+    io.advance_clock(Nanoseconds(until.0.saturating_sub(io.clock_reading().0)));
+    // a merge just gave up for room, so picks back off for a reserve period
+    volume.room_refused_at.store(io.clock_reading().0, Ordering::Release);
+    volume.is_room_refused.store(true, Ordering::Release);
+    store.state.ask_compaction();
+    step_until(&io, Nanoseconds(io.clock_reading().0 + RESERVE_PERIOD.0 / 2));
+    assert_eq!(record_picks(&store), 0, "a pick ran while backing off for room");
+    assert!(refused_picks(&store) > 0, "no pick was refused while backing off");
+    step_until(&io, Nanoseconds(io.clock_reading().0 + 2 * RESERVE_PERIOD.0));
+    assert!(record_picks(&store) > 0, "the pass never looked again once the wait was over");
+    check_partly(&store, PAST_QUIET);
     store.close().expect("close");
 }

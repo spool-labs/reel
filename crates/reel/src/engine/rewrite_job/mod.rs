@@ -44,21 +44,24 @@ mod merge;
 mod pick;
 mod place;
 
-pub use pick::{CrowdAnswer, CrowdAnswers, is_mergeable, is_reclaim_due};
+pub use pick::{CrowdAnswer, CrowdAnswers, has_disk_room, is_mergeable, is_reclaim_due};
 #[cfg(any(test, feature = "test-hooks"))]
 pub use install::freed_in_place;
 #[cfg(any(test, feature = "test-hooks"))]
 pub use pick::{CROWD_ANSWERS, CrowdStamp, column_range, covers_point, has_settled_covers, is_crowded, is_overlap_input, overlap_bound, overlaps};
 
-/// A bar counts in quarters of a segment's bytes
-pub const BAR_QUARTERS: u64 = 4;
-/// A segment is rewritten once this many quarters of its bytes are dead, the plain bar: a half
-pub const PLAIN_BAR_QUARTERS: u64 = 2;
-/// A marked segment waits for this many while its highest mark stands, since it dies whole soon. A rewrite there copies at
+/// A bar counts in hundredths of a segment's bytes
+pub const BAR_SCALE: u64 = 100;
+/// A segment is rewritten once this share of its bytes is dead, the plain bar: a half
+pub const PLAIN_BAR: u64 = 50;
+/// A marked segment waits for this share while its highest mark stands, since it dies whole soon. A rewrite there copies at
 /// most a third of a byte for each byte freed, so a record freed early still comes back
-pub const EARLY_BAR_QUARTERS: u64 = 3;
-/// A quiet volume with dead bytes rewrites any segment that wins a byte back, highest share first
-pub const QUIET_BAR_QUARTERS: u64 = 0;
+pub const EARLY_BAR: u64 = 75;
+/// A quiet volume with dead bytes rewrites a segment once this share is dead, highest share first, so a rewrite copies at most
+/// about two and a third bytes for each byte freed
+pub const QUIET_BAR: u64 = 30;
+/// A quiet volume short of disk room rewrites any segment that wins a byte back
+pub const ROOM_SHORT_BAR: u64 = 0;
 /// Bytes of one job's merge buffer, which carries records and then row blocks. With a row block for each input, a job's
 /// merge buffers come to about 2 MiB
 pub const MERGE_BUFFER_BYTES: usize = 3 * 512 * 1024;

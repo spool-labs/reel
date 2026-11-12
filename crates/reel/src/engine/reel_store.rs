@@ -55,7 +55,7 @@ use crate::engine::filter_job::FilterLoader;
 use crate::engine::planner::Planner;
 use crate::engine::walk_job::{BlockCounter, WalkJob, WalkSlot, WalkWorker};
 use crate::engine::workers::Workers;
-use crate::engine::volume::{SealStepTimes, ClaimState, GaveUp, MOST_MERGE_OUTPUTS, MOST_PARKED, NO_CALL, NO_SEAL, RewriteLane, SyncState, Volume, BitsSave};
+use crate::engine::volume::{SealStepTimes, ClaimState, GaveUp, MOST_MERGE_OUTPUTS, MOST_PARKED, NO_SEAL, RewriteLane, SyncState, Volume, BitsSave};
 #[cfg(feature = "test-hooks")]
 use crate::engine::volume::TestHolds;
 use crate::guard::hold;
@@ -222,8 +222,9 @@ impl<Backend: Io> ReelStore<Backend> {
         Ok(())
     }
 
-    /// Refuse a write on a store that only looks
+    /// Count a write, which tells maintenance callers are still busy, and refuse it on a store that only looks
     pub fn check_writes(&self) -> Result<(), StoreError> {
+        self.state.caller_ops.note();
         self.check_open()?;
         if self.state.is_read_only {
             return Err(StoreError::ReadOnly);
@@ -411,7 +412,11 @@ impl<Backend: Io> ReelStore<Backend> {
 
     /// Make every write that returned before this call durable on every volume
     pub fn flush(&self) -> Result<(), StoreError> {
-        self.check_writes()?;
+        // a flush on a timer is no call, so it leaves the store free to read quiet
+        self.check_open()?;
+        if self.state.is_read_only {
+            return Err(StoreError::ReadOnly);
+        }
         for volume in &self.state.volumes {
             self.state.sync_volume(volume)?;
         }
@@ -645,6 +650,10 @@ pub fn bring_up<Backend: Io>(
 /// Start the row job, the walk workers, the planner, the reserve job, the readers and the ring's reaper
 pub fn start_jobs<Backend: Io>(state: &Arc<EngineState<Backend>>) -> Result<(), StoreError> {
     let jobs_from = state.io.now();
+    // a store reads busy from its jobs' start until a quiet spell passes with no call, so the first picks hold the plain bar
+    for volume in &state.volumes {
+        volume.last_call_at.store(jobs_from.0, Ordering::Relaxed);
+    }
     let row_job = RowJob {
         state: Arc::clone(state),
     };
@@ -1425,8 +1434,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         park_refusals: AtomicU64::new(0),
         most_in_flight: AtomicU64::new(0),
         callers_seen: AtomicU64::new(0),
-        last_call_at: AtomicU64::new(NO_CALL),
-        callers_looked_at: AtomicU64::new(0),
+        last_call_at: AtomicU64::new(0),
         capped_picks: AtomicU64::new(0),
         outputs_promised: AtomicU64::new(0),
         is_room_short: AtomicBool::new(false),

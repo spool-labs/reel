@@ -36,9 +36,10 @@ pub struct CallerCounts {
 }
 
 impl CallerCounts {
-    /// Count one operation in the calling thread's slot
+    /// Count one operation in the calling thread's slot. Only the count moving matters, so a plain store skips the locked add
     pub fn note(&self) {
-        self.slots[thread_slot()].0.fetch_add(1, Ordering::Relaxed);
+        let slot = &self.slots[thread_slot()].0;
+        slot.store(slot.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
     }
 
     /// Add up every slot

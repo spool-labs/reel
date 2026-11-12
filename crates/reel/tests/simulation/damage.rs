@@ -546,6 +546,8 @@ fn merge_meets_lost_record() {
 fn assert_merge_damages(built: &Built) {
     let store = open(&built.io);
     hold_rebuilds(&store);
+    let until = store.state.quiet_at(built.io.clock_reading());
+    built.io.advance_clock(Nanoseconds(until.0.saturating_sub(built.io.clock_reading().0)));
     settle(&built.io);
     assert_eq!(store.damaged_segments(), 1);
     for ((column, key), entry) in &built.model {

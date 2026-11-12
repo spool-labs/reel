@@ -26,7 +26,7 @@ use crate::segment::segment_tail::{MOST_MERGE_SEGMENTS, SegmentNumber};
 use crate::segment::summary::{SummaryRow, SummaryRows};
 use crate::segment::summary_orders::{COVERS_LIST, ROW_FOOTER_BYTES, SHARE_BUCKETS, SHARE_SCALE, WalkList, reclaim_share, share_bucket};
 
-use crate::engine::rewrite_job::{BAR_QUARTERS, BUCKET_LOOKS, BarsFired, CROWD_PAGES, MOST_COUNTED_CROWD, MOST_LOOK_TIME, OVERLAP_BASE_RECORD_BYTES, EARLY_BAR_QUARTERS, GATHER_LOOKS, MOST_OVERLAP, MergeInput, MergeTarget, OVERLAP_LOOKS, OVERLAP_PROBES, PLAIN_BAR_QUARTERS, PLANNER_LANE, QUIET_BAR_QUARTERS, RewriteJob, RewritePhase, rows_of};
+use crate::engine::rewrite_job::{BAR_SCALE, BUCKET_LOOKS, BarsFired, CROWD_PAGES, MOST_COUNTED_CROWD, MOST_LOOK_TIME, OVERLAP_BASE_RECORD_BYTES, EARLY_BAR, GATHER_LOOKS, MOST_OVERLAP, MergeInput, MergeTarget, OVERLAP_LOOKS, OVERLAP_PROBES, PLAIN_BAR, PLANNER_LANE, QUIET_BAR, ROOM_SHORT_BAR, RewriteJob, RewritePhase, rows_of};
 use crate::engine::rewrite_job::install::freed_in_place;
 
 impl<Backend: Io> RewriteJob<Backend> {
@@ -156,11 +156,13 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
         let is_short = volume.is_short_of_room();
         let is_deferring = volume.is_hot(now) && !is_short;
-        let is_ingesting = volume.is_ingesting(now);
-        // an overlap merge copies records, so one at a time on the first worker keeps ingest at its line while writes arrive, and
+        // callers reading, writing or scanning, or a store just opened, count as busy: the quiet bar and a merge on every lane wait
+        // for a quiet spell with no call
+        let is_busy = volume.is_caller_active(now);
+        // an overlap merge copies records, so one at a time on the first worker keeps callers at their line while they call, and
         // once they stop every idle worker takes one over segments no other merge holds. The planner runs one only with no workers
-        let ingest_lane = if volume.walk_slots.is_empty() { PLANNER_LANE } else { PLANNER_LANE + 1 };
-        if (self.lane == ingest_lane || !is_ingesting)
+        let busy_lane = if volume.walk_slots.is_empty() { PLANNER_LANE } else { PLANNER_LANE + 1 };
+        if (self.lane == busy_lane || !is_busy)
             && !is_deferring
             && !is_room_short
             && let Some(target) = self.pick_overlap(volume, &rows, room)
@@ -189,7 +191,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             return None;
         }
         let current = DeathMark(self.state.current_mark.load(Ordering::Relaxed));
-        let plain = plain_bar(is_ingesting || volume.is_reclaim_held(), &rows);
+        let plain = plain_bar(is_busy || volume.is_reclaim_held(), is_room_short && !volume.is_reclaim_held(), &rows);
         let gave_up = self.gave_up_list(volume);
         let is_ready_at = |row: &SummaryRow<'_>, plain: u64| {
             let bar = (current, plain);
@@ -318,7 +320,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             let Some(marks) = rows.get(*number).map(|row| row.facts.marks).filter(|marks| !marks.is_empty()) else {
                 continue;
             };
-            if bar_quarters(marks, current) == EARLY_BAR_QUARTERS {
+            if bar_of(marks, current) == EARLY_BAR {
                 self.bars_fired.early += 1;
             } else {
                 self.bars_fired.plain += 1;
@@ -418,7 +420,7 @@ pub fn is_rewrite_ready<Backend: Io>(volume: &Volume<Backend>, row: &SummaryRow<
         dead_bytes += column.dead_bytes.0;
     }
     let won_back = dead_bytes.saturating_sub(freed_bytes) + (dead_rows + live_graves) * ROW_FOOTER_BYTES;
-    won_back > 0 && BAR_QUARTERS * won_back >= held_bar(row.facts.marks, current, plain) * (bytes + rows * ROW_FOOTER_BYTES)
+    won_back > 0 && BAR_SCALE * won_back >= held_bar(row.facts.marks, current, plain) * (bytes + rows * ROW_FOOTER_BYTES)
 }
 
 /// Check a row's graves make up the share that would trigger a merge, so deciding first can save the copy
@@ -432,7 +434,7 @@ pub fn is_grave_heavy(row: &SummaryRow<'_>) -> bool {
         rows += column.row_count.0;
         graves += column.grave_count.0;
     }
-    BAR_QUARTERS * graves >= PLAIN_BAR_QUARTERS * rows
+    BAR_SCALE * graves >= PLAIN_BAR * rows
 }
 
 /// Take the widest segments a test passes, the smallest first among equals, whole segments included, since the output is cut to
@@ -743,26 +745,26 @@ pub fn lowest_inside<'row>(row: &SummaryRow<'row>, column: ColumnId, lowest: &[u
     None
 }
 
-/// Read a segment's bar in quarters: the early bar while its highest mark stands, and the plain one after that or with no marks
-pub fn bar_quarters(marks: MarkRange, current: DeathMark) -> u64 {
+/// Read a segment's bar in hundredths: the early bar while its highest mark stands, and the plain one after that or with no marks
+pub fn bar_of(marks: MarkRange, current: DeathMark) -> u64 {
     if marks.highest().is_some_and(|highest| current <= highest) {
-        EARLY_BAR_QUARTERS
+        EARLY_BAR
     } else {
-        PLAIN_BAR_QUARTERS
+        PLAIN_BAR
     }
 }
 
 /// Read the bar a pick holds a segment to, given the plain bar it holds unmarked ones to: a marked segment keeps the early bar,
 /// or the plain one when that is higher
 pub fn held_bar(marks: MarkRange, current: DeathMark, plain: u64) -> u64 {
-    if bar_quarters(marks, current) == EARLY_BAR_QUARTERS { EARLY_BAR_QUARTERS.max(plain) } else { plain }
+    if bar_of(marks, current) == EARLY_BAR { EARLY_BAR.max(plain) } else { plain }
 }
 
 /// Find the ready row that wins most back in the highest share bucket that has one, down to the least share the plain bar lets
 /// in, and then among the rows with covers. A pick looks at no more than the first few rows of a bucket, and of equal shares
 /// takes the last, which leaves the rows before it to other lanes
 pub fn first_ready<'rows>(rows: &'rows SummaryRows, plain: u64, is_ready: impl Fn(&SummaryRow<'_>) -> bool) -> Option<SummaryRow<'rows>> {
-    let least = share_bucket(SHARE_SCALE * plain / BAR_QUARTERS);
+    let least = share_bucket(SHARE_SCALE * plain / BAR_SCALE);
     let mut lists = (least..SHARE_BUCKETS).rev().chain(iter::once(COVERS_LIST));
     lists.find_map(|list| {
         let looked = rows.orders().share_list(list).take(BUCKET_LOOKS).filter_map(|segment| rows.get(segment));
@@ -770,10 +772,18 @@ pub fn first_ready<'rows>(rows: &'rows SummaryRows, plain: u64, is_ready: impl F
     })
 }
 
-/// Work out the plain bar a pick holds unmarked segments to: the quiet bar while the volume is quiet, walked and holds dead bytes, and the
-/// plain bar otherwise, which a volume short of room under hot ingest holds to
-pub fn plain_bar(is_hot: bool, rows: &SummaryRows) -> u64 {
-    if !is_hot && is_reclaim_due(rows) { QUIET_BAR_QUARTERS } else { PLAIN_BAR_QUARTERS }
+/// Work out the plain bar a pick holds unmarked segments to, once the volume is walked and holds dead bytes: none at all when its
+/// disk is short of room, busy callers or not, and the quiet bar while it is quiet. Otherwise the plain bar
+pub fn plain_bar(is_busy: bool, is_room_short: bool, rows: &SummaryRows) -> u64 {
+    if !is_reclaim_due(rows) {
+        PLAIN_BAR
+    } else if is_room_short {
+        ROOM_SHORT_BAR
+    } else if is_busy {
+        PLAIN_BAR
+    } else {
+        QUIET_BAR
+    }
 }
 
 /// Check a volume holds dead bytes and the walk has counted every segment, so its idle time goes to reclaiming them all with each

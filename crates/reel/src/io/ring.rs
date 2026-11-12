@@ -8,19 +8,23 @@ use std::future::{Future, poll_fn};
 use std::io::{Error, ErrorKind, IoSliceMut, Result};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::task::{Context, Poll, Waker};
 
 use reel_api::units::{ByteCount, FileOffset};
 
 use crate::guard::hold;
-use crate::io::{DeviceReads, IoFile, WalkMark}; use crate::lease::{Ended, LeaseCell};
+use crate::io::spin_clock::SpinClock;
+use crate::io::{DeviceReads, IoFile, ManyRead, WalkMark};
+use crate::lease::{Ended, LeaseCell};
 use crate::pool::touched_queue;
 
 /// Reads a ring holds in flight at once
 pub const RING_SLOTS: usize = 64;
 /// Bytes one slot takes, and a longer read goes through in turns
 pub const RING_SLOT_BYTES: usize = 64 * 1024;
+/// The most reads one call keeps out at once, a quarter of the slots so several scans and the gets still find some free
+pub const MOST_MANY_READS: usize = RING_SLOTS / 4;
 /// Async reads running at once, each with its own read buffers
 pub const RING_READS: usize = 32;
 /// Bytes of read buffers each running read holds
@@ -49,6 +53,11 @@ pub trait RingDriver<File>: Send + Sync + 'static {
 
     /// Copy a finished read out of its slot into parts
     fn copy_parts(&self, slot: usize, parts: &mut [IoSliceMut<'_>]);
+
+    /// Say whether a blocking wait reaps on its own thread, for a driver with no reaper thread to finish its reads
+    fn reaps_on_wait(&self) -> bool {
+        false
+    }
 
     /// Bring a reaper out of a wait
     fn poke(&self);
@@ -537,6 +546,42 @@ impl<Driver> ReadRing<Driver> {
         Ok(())
     }
 
+    /// Fill several buffers on this thread: the page cache answers what it holds, the rest go to the ring together, and then
+    /// each waits for its own. A read past one slot, or one that finds every slot taken, goes in one plain read
+    pub fn read_many_now<File>(&self, reads: &mut [Option<ManyRead<'_, File>>])
+    where
+        Driver: RingDriver<File>,
+        File: IoFile,
+    {
+        let mut leases: [Option<RingLease<'_, Driver>>; MOST_MANY_READS] = [const { None }; MOST_MANY_READS];
+        for (read, lease) in reads.iter_mut().zip(leases.iter_mut()).filter_map(|(read, lease)| Some((read.as_mut()?, lease))) {
+            let length = read.buf.len();
+            read.is_done = length <= RING_SLOT_BYTES
+                && matches!(read.file.try_read_at(read.offset, read.buf), Ok(Some(ByteCount(count))) if count == length as u64);
+            if read.is_done || length > RING_SLOT_BYTES {
+                continue;
+            }
+            if let Ok(Some(claimed)) = self.try_claim()
+                && claimed.start(read.file, read.offset, length).is_ok()
+            {
+                *lease = Some(claimed);
+            }
+        }
+        for (index, read) in reads.iter_mut().enumerate().filter_map(|(index, read)| Some((index, read.as_mut()?))) {
+            if read.is_done {
+                continue;
+            }
+            if let Some(lease) = leases.get_mut(index).and_then(Option::take)
+                && lease.wait_now().is_ok_and(|length| length == read.buf.len())
+            {
+                self.driver.copy_out(lease.slot, read.buf);
+                read.is_done = true;
+                continue;
+            }
+            read.is_done = self.read_into_now(read.file, read.offset, read.buf).is_ok();
+        }
+    }
+
     /// Fill parts on this thread: through the ring when they fit a slot, else in one plain read
     pub fn read_parts_now<File>(&self, file: &File, offset: FileOffset, parts: &mut [IoSliceMut<'_>]) -> Result<()>
     where
@@ -572,7 +617,10 @@ impl<Driver> ReadRing<Driver> {
 impl<Driver> RingLease<'_, Driver> {
     /// Wait on this thread for the slot's read to land, and take its answer. A reader spins while a core is free for it, then parks
     /// until the reaper's completion wakes it, so a full box keeps its cores for the submit thread and the reaper
-    pub fn wait_now(&self) -> Result<usize> {
+    pub fn wait_now<File>(&self) -> Result<usize>
+    where
+        Driver: RingDriver<File>,
+    {
         // the first wait on a thread makes its waker, so a later park allocates nothing
         THREAD_WAKER.with(|_| ());
         let spinners = &self.ring.spinners;
@@ -581,10 +629,15 @@ impl<Driver> RingLease<'_, Driver> {
             spinners.fetch_sub(1, Ordering::Relaxed);
         }
         let spin = if is_seated { SEATED_SPIN } else { WAIT_SPIN };
-        let spun = Instant::now();
+        let mut clock = SpinClock::new(spin);
         let answer = loop {
+            // a driver with no reaper of its own, as a simulated ring, reaps on the waiting thread until the answer lands
+            if !self.ring.is_done[self.slot].load(Ordering::Acquire) && self.ring.driver.reaps_on_wait() {
+                self.ring.driver.reap(&mut |slot, answer| self.ring.finish(slot, answer))?;
+                continue;
+            }
             // the completion sets the flag once the answer has landed, so a spin reads it with no lock and locks once
-            if !self.ring.is_done[self.slot].load(Ordering::Acquire) && spun.elapsed() < spin {
+            if !self.ring.is_done[self.slot].load(Ordering::Acquire) && !clock.is_over() {
                 std::hint::spin_loop();
                 continue;
             }
@@ -593,7 +646,7 @@ impl<Driver> RingLease<'_, Driver> {
                 if let Some(answer) = held.take_answer() {
                     break answer;
                 }
-                if spun.elapsed() >= spin {
+                if clock.is_over_now() {
                     THREAD_WAKER.with(|waker| held.wait_with(waker));
                     drop(held);
                     // a parked reader gives its seat to the next
@@ -626,5 +679,20 @@ impl<File: IoFile, Driver: RingDriver<File>> DeviceReads<File> for RingWait<'_, 
             Some(ring) => ring.read_parts_now(file, offset, parts),
             None => file.read_parts_at(offset, parts),
         })
+    }
+
+    fn read_many(&self, reads: &mut [Option<ManyRead<'_, File>>]) -> impl Future<Output = ()> + Send
+    where
+        File: Sync,
+    {
+        match self.0 {
+            Some(ring) => ring.read_many_now(reads),
+            None => {
+                for read in reads.iter_mut().flatten() {
+                    read.is_done = read.file.read_exact_at(read.offset, read.buf).is_ok();
+                }
+            },
+        }
+        std::future::ready(())
     }
 }

@@ -21,11 +21,11 @@ use reel::record::codec::Codec;
 use reel_api::column_id::ColumnId;
 use reel_api::direction::Direction;
 use reel_api::reads::{Reads, ValueWindow};
-use reel_api::scan::Scan;
+use reel_api::scan::{Scan, ScanStep};
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, VolumeId};
 use reel_api::value_list::{ValueAnswer, ValueList};
-use reel_sim::seeded_random::Seed;
+use reel_sim::seeded_random::{Seed, SeededRandom};
 use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_io::SimulatedIo;
 use reel_sim::simulated_ring::SimulatedRing;
@@ -741,5 +741,49 @@ fn full_ring_reads_plainly() {
     ring.read_into_now(&file, FileOffset(0), &mut buf).expect("read");
     assert_eq!(buf, bytes);
     drop(leases);
+    store.close().expect("close");
+}
+
+const SCATTERED_KEYS: u64 = 400;
+const SCATTERED_VALUE_BYTES: usize = 4_500;
+
+fn scattered_value(number: u64) -> Vec<u8> {
+    let mut value = format!("scattered-{number}-").into_bytes();
+    value.resize(SCATTERED_VALUE_BYTES, (number % 251) as u8);
+    value
+}
+
+// a blocking scan sends a batch's scattered runs to the ring together, so several reads wait at once, and every row comes back
+#[test]
+fn batch_runs_go_out_together() {
+    let io = SimulatedIo::new(Seed(41));
+    io.use_ring();
+    let store = open(&io);
+    // keys written in a shuffled order land apart in the segment, so a batch's records make many runs
+    let mut random = SeededRandom::new(Seed(41));
+    let mut numbers: Vec<u64> = (0..SCATTERED_KEYS).collect();
+    for at in (1..numbers.len()).rev() {
+        numbers.swap(at, random.below(at as u64 + 1) as usize);
+    }
+    for number in numbers {
+        store.put(COLUMN, &key(number), &scattered_value(number)).expect("put");
+    }
+    store.seal_now();
+    settle(&io);
+    store.close().expect("close");
+    drop(store);
+    let store = open(&io);
+    // nothing in the kernel's cache, so every record goes to the ring
+    io.set_warm_bytes(0);
+    let mut scan = store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan");
+    let (mut name, mut found) = (Vec::new(), Vec::new());
+    let mut rows = 0;
+    while scan.next_row(&mut name, &mut found).expect("step") == ScanStep::Found {
+        assert_eq!((name.as_slice(), found.as_slice()), (key(rows).as_slice(), scattered_value(rows).as_slice()));
+        rows += 1;
+    }
+    drop(scan);
+    assert_eq!(rows, SCATTERED_KEYS);
+    assert!(ring(&store).driver.most_waiting() > 1, "a batch's runs went to the ring one at a time: most {}", ring(&store).driver.most_waiting());
     store.close().expect("close");
 }

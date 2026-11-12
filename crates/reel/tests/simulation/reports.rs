@@ -507,3 +507,31 @@ fn past_the_floor_answers_right() {
     assert!(store.memory_report().arena_segments_left_out.0 > 0, "no segment went without filters past the floor");
     store.close().expect("close");
 }
+
+const WIDE_OPEN_KEYS: u64 = 300;
+const WIDE_OPEN_VALUE_BYTES: usize = 32 * 1024;
+
+// a reopen over wide records sizes the write index for them and gives the rest to the record cache's share
+#[test]
+fn wide_records_grow_the_record_cache() {
+    let io = SimulatedIo::new(Seed(42));
+    let store = open(&io);
+    let fresh = store.state.memory_report();
+    let value = vec![7; WIDE_OPEN_VALUE_BYTES];
+    for number in 0..WIDE_OPEN_KEYS {
+        store.put(COLUMN, format!("wide-{number:05}").as_bytes(), &value).expect("put");
+    }
+    seal(&store, &io);
+    store.close().expect("close");
+
+    let store = open(&io);
+    let wide = store.state.memory_report();
+    assert!(wide.write_index < fresh.write_index, "the write index stayed at {:?}", wide.write_index);
+    // filters come first, so the arena takes what it lacks out of the record cache's share, and the share is what grew
+    let share = |report: &reel_api::memory_report::MemoryReport| report.record_cache.0 + report.arena_room.0;
+    assert!(share(&wide) > share(&fresh), "the record cache's share stayed at {}", share(&wide));
+    let mut found = Vec::new();
+    assert!(store.get(COLUMN, b"wide-00007", &mut found).expect("get"));
+    assert_eq!(found, value);
+    store.close().expect("close");
+}

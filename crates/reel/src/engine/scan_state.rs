@@ -94,6 +94,8 @@ pub struct ShardHead {
 /// The most keys a scan locates ahead of its caller at one point, and the bytes of records it reads for them in one go
 pub const BATCH_KEYS: usize = 32;
 pub const BATCH_BYTES: usize = 64 * 1024;
+/// The largest record a batch takes: a 4 KiB value with its key and header fits, so a store of them scans in batches
+pub const MOST_BATCH_RECORD: usize = 8 * 1024;
 /// Records in one segment this close join into one read
 pub const JOIN_GAP: u64 = 4 * 1024;
 

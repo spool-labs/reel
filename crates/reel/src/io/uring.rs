@@ -7,12 +7,13 @@ use std::cell::UnsafeCell;
 use std::io::{Error, ErrorKind, IoSliceMut, Result};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use io_uring::{IoUring, opcode, types};
 use reel_api::units::{ByteCount, FileOffset};
 
 use crate::guard::hold;
+use crate::io::spin_clock::SpinClock;
 use crate::io::plain_file::PlainFile;
 use crate::io::ring::{RING_SLOT_BYTES, RING_SLOTS, RingDriver, reap_spin};
 use crate::pool::TOUCH_BYTE;
@@ -114,10 +115,10 @@ impl RingDriver<PlainFile> for UringDriver {
 
     fn reap(&self, done: &mut dyn FnMut(usize, Result<usize>)) -> Result<bool> {
         // completions land in shared memory, so a look there costs no syscall, and a wait in the kernel costs a wake
-        let spun = Instant::now();
         // SAFETY: only the one reaper reads this queue
         let spin = reap_spin(self.in_flight.load(Ordering::Acquire), REAP_SPIN);
-        while unsafe { self.ring.completion_shared() }.is_empty() && spun.elapsed() < spin {
+        let mut clock = SpinClock::new(spin);
+        while unsafe { self.ring.completion_shared() }.is_empty() && !clock.is_over() {
             std::hint::spin_loop();
         }
         // SAFETY: only the one reaper reads this queue

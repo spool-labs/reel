@@ -10,6 +10,7 @@ pub mod plain_file;
 pub mod plain_task;
 pub mod replace;
 pub mod ring;
+pub mod spin_clock;
 #[cfg(target_os = "linux")]
 pub mod uring;
 
@@ -162,10 +163,32 @@ impl WalkMark {
     }
 }
 
+/// One read of several a caller sends together, and whether it filled its buffer
+#[derive(Debug)]
+pub struct ManyRead<'reads, File> {
+    pub file: &'reads File,
+    pub offset: FileOffset,
+    pub buf: &'reads mut [u8],
+    pub is_done: bool,
+}
+
 /// How a read waits for its device, so one read path serves the blocking calls and the completion ring
 pub trait DeviceReads<File>: Sync {
     /// Fill the whole buffer from the offset
     fn read_exact(&self, file: &File, offset: FileOffset, buf: &mut [u8]) -> impl Future<Output = Result<()>> + Send;
+
+    /// Fill each read's buffer, past the empty places, and mark the ones that filled. A device that keeps several reads out at
+    /// once sends them all before it waits for any, and this one reads them in turn
+    fn read_many(&self, reads: &mut [Option<ManyRead<'_, File>>]) -> impl Future<Output = ()> + Send
+    where
+        File: Sync,
+    {
+        async move {
+            for read in reads.iter_mut().flatten() {
+                read.is_done = self.read_exact(read.file, read.offset, read.buf).await.is_ok();
+            }
+        }
+    }
 
     /// Fill every part from the offset
     fn read_parts(&self, file: &File, offset: FileOffset, parts: &mut [IoSliceMut<'_>]) -> impl Future<Output = Result<()>> + Send;

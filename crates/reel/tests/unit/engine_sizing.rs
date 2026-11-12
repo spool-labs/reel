@@ -271,3 +271,50 @@ fn box_churn_fits_the_table() {
 
     assert!(table.segments_per_shard >= BOX_CHURN_SEGMENTS, "{} entries a shard", table.segments_per_shard);
 }
+
+const SMALL_RECORD: u64 = 120;
+const WIDE_RECORD: u64 = 4_112;
+const TWO_GIB: ByteCount = ByteCount(2 * 1024 * 1024 * 1024);
+
+// a store of 4 KiB records needs a far smaller write index, and the record cache takes what it gives up, with the total held
+#[test]
+fn wide_records_shrink_the_index() {
+    let planned = EngineSizing::for_store(&shape(TWO_GIB, 1));
+    let wide = planned.for_mean_record(Some(WIDE_RECORD), 1);
+    assert!(wide.segment_rows < planned.segment_rows, "the index kept {:?} rows for wide records", wide.segment_rows);
+    let planned_rows = planned.segment_rows.0 * 8 / SEAL_ROWS_EIGHTHS;
+    let wanted = (planned.segment_bytes.0.div_ceil(WIDE_RECORD) * 8 / SEAL_ROWS_EIGHTHS * INDEX_ROWS_MARGIN).max(planned_rows / LEAST_INDEX_DIVISOR);
+    assert_eq!(wide.segment_rows.0, wanted * SEAL_ROWS_EIGHTHS / 8);
+    assert_eq!(wide.record_share.0, planned.record_share.0 + (planned_rows - wanted) * PLANNED_ROW_BYTES);
+    assert!(wide.shard.table_slots <= planned.shard.table_slots);
+}
+
+// small records, or a store with nothing on disk, keep the index as planned
+#[test]
+fn small_records_keep_the_index() {
+    let planned = EngineSizing::for_store(&shape(TWO_GIB, 1));
+    assert_eq!(planned.for_mean_record(Some(SMALL_RECORD), 1), planned);
+    assert_eq!(planned.for_mean_record(None, 1), planned);
+    assert_eq!(planned.for_mean_record(Some(0), 1), planned);
+}
+
+const HUGE_RECORD: u64 = 64 * 1024;
+
+// the seal point's floor, a quarter of the index, stays past a segment of the mean record, so the byte target seals first
+#[test]
+fn shrunk_index_seals_by_bytes() {
+    let planned = EngineSizing::for_store(&shape(TWO_GIB, 1));
+    let wide = planned.for_mean_record(Some(WIDE_RECORD), 1);
+    let index_rows = wide.segment_rows.0 * 8 / SEAL_ROWS_EIGHTHS;
+    assert!(index_rows / LEAST_SEAL_DIVISOR > planned.segment_bytes.0 / WIDE_RECORD, "the seal floor undercuts a full segment");
+}
+
+// a store of very wide records keeps a quarter of the planned index, so small rows after the open still seal at a fair size
+#[test]
+fn shrink_keeps_a_quarter() {
+    let planned = EngineSizing::for_store(&shape(TWO_GIB, 1));
+    let huge = planned.for_mean_record(Some(HUGE_RECORD), 1);
+    let planned_rows = planned.segment_rows.0 * 8 / SEAL_ROWS_EIGHTHS;
+    assert_eq!(huge.segment_rows.0, planned_rows / LEAST_INDEX_DIVISOR * SEAL_ROWS_EIGHTHS / 8);
+    assert!(huge.record_share > planned.record_share);
+}

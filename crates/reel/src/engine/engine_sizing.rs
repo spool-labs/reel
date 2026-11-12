@@ -117,6 +117,11 @@ pub const LEAST_SEAL_DIVISOR: u64 = 4;
 pub const SECOND: u64 = 1_000_000_000;
 /// Eighths of the rows the index plans for that a segment may reach
 pub const SEAL_ROWS_EIGHTHS: u64 = 5;
+/// The write index holds this many segments' worth of rows past the seal's margin when sized for a store's mean record, so the
+/// seal point's floor of a quarter of the index stays past one segment and the byte target seals first
+pub const INDEX_ROWS_MARGIN: u64 = 3;
+/// An index sized for a store's mean record keeps at least one part in this many of the planned rows
+pub const LEAST_INDEX_DIVISOR: u64 = 4;
 /// A seal starts with room for this part of a second of its own rate, or the line a ration draws on barely moves
 pub const LEAST_ROOM_DIVISOR: u128 = 10;
 /// The eighths of a segment's row block lines a complete column can fill. The rest stay free for other columns' blocks
@@ -267,22 +272,10 @@ impl EngineSizing {
         let shared = budget.0.saturating_sub(shape.fixed_bytes().0 + shape.room().0 + shape.entry_line().0);
         let index_share = share_of(shared, WRITE_INDEX_SIXTEENTHS);
         let rows_total = index_share / PLANNED_ROW_BYTES;
-        let rows_per_shard = (rows_total / SHARD_COUNT as u64).max(64);
-
-        let least_pages = (open_slots + 1) as u64;
-        let page_rows = (PAGE_BYTES / 64) as u64;
-        let pages = ((rows_per_shard / page_rows + 1) * 2).max(least_pages);
-        let nodes = (rows_per_shard / (NODE_FANOUT as u64 / 2) + 1) * 2 + 64;
-
         Self {
             segment_bytes: segment_bytes_for(budget),
             segment_rows: RowCount(rows_total * SEAL_ROWS_EIGHTHS / 8),
-            shard: ShardSizing {
-                pages: PageCount(pages as u32),
-                nodes: NodeCount(nodes as u32),
-                table_slots: (rows_per_shard as usize * 2).next_power_of_two(),
-                open_slots,
-            },
+            shard: shard_for_rows(rows_total, open_slots),
             spot_share: ByteCount(share_of(shared, SPOT_SIXTEENTHS)),
             cache_share: ByteCount(share_of(shared, BLOCK_CACHE_SIXTEENTHS)),
             record_share: ByteCount(share_of(shared, RECORD_CACHE_SIXTEENTHS)),
@@ -295,6 +288,43 @@ impl EngineSizing {
             room: shape.room(),
             entry_line: shape.entry_line(),
         }
+    }
+
+    /// Size the write index for the rows a segment of this mean record holds, with the seal's margin and twice that again for
+    /// writers in flight, and give what it no longer needs to the record cache. A store of small rows, or one with nothing on
+    /// disk, keeps the index as planned
+    pub fn for_mean_record(self, mean_record: Option<u64>, volumes: u64) -> Self {
+        let Some(mean_record) = mean_record.filter(|bytes| *bytes > 0) else {
+            return self;
+        };
+        let planned_rows = self.segment_rows.0 * 8 / SEAL_ROWS_EIGHTHS;
+        let segment_rows = self.segment_bytes.0.div_ceil(mean_record);
+        // small rows that come after this open still seal at a fair size, since the index can't grow while open
+        let wanted_rows = (segment_rows * 8 / SEAL_ROWS_EIGHTHS * INDEX_ROWS_MARGIN * volumes.max(1)).max(planned_rows / LEAST_INDEX_DIVISOR);
+        if wanted_rows >= planned_rows {
+            return self;
+        }
+        Self {
+            segment_rows: RowCount(wanted_rows * SEAL_ROWS_EIGHTHS / 8),
+            shard: shard_for_rows(wanted_rows, self.shard.open_slots),
+            record_share: ByteCount(self.record_share.0 + (planned_rows - wanted_rows) * PLANNED_ROW_BYTES),
+            ..self
+        }
+    }
+}
+
+/// Size one shard's pools for the rows the whole index holds
+pub fn shard_for_rows(rows_total: u64, open_slots: usize) -> ShardSizing {
+    let rows_per_shard = (rows_total / SHARD_COUNT as u64).max(64);
+    let least_pages = (open_slots + 1) as u64;
+    let page_rows = (PAGE_BYTES / 64) as u64;
+    let pages = ((rows_per_shard / page_rows + 1) * 2).max(least_pages);
+    let nodes = (rows_per_shard / (NODE_FANOUT as u64 / 2) + 1) * 2 + 64;
+    ShardSizing {
+        pages: PageCount(pages as u32),
+        nodes: NodeCount(nodes as u32),
+        table_slots: (rows_per_shard as usize * 2).next_power_of_two(),
+        open_slots,
     }
 }
 

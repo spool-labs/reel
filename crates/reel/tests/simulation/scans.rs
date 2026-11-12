@@ -1123,7 +1123,7 @@ fn scans_read_values_in_batches() {
     store.close().expect("close");
 }
 
-const LARGE_VALUE_BYTES: usize = 6_000;
+const LARGE_VALUE_BYTES: usize = 10_000;
 
 // a large record takes its own read when its key is answered, so a batch whose segment left seeks again from that key
 #[test]
@@ -1149,6 +1149,35 @@ fn moved_batch_seeks_again() {
     let keys: Vec<Vec<u8>> = first.iter().chain(&rest).map(|(found, _value)| found.clone()).collect();
     assert_eq!(keys, (0..BATCH_TEST_KEYS).map(key).collect::<Vec<_>>());
     assert!(rest.iter().all(|(_key, value)| value == b"newer"));
+    store.state.give_back_scan(scan);
+    store.close().expect("close");
+}
+
+const WIDE_BATCH_KEYS: u64 = 100;
+const WIDE_BATCH_VALUE_BYTES: usize = 5_000;
+
+fn wide_batch_value(number: u64) -> Vec<u8> {
+    let mut value = format!("wide-{number}-").into_bytes();
+    value.resize(WIDE_BATCH_VALUE_BYTES, (number % 251) as u8);
+    value
+}
+
+// a record past 4 KiB and under the batch's most still reads in the batch, so a store of 4 KiB values scans in batches
+#[test]
+fn wide_records_read_in_batches() {
+    let io = SimulatedIo::new(Seed(45));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    for number in 0..WIDE_BATCH_KEYS {
+        store.put(COLUMN, &key(number), &wide_batch_value(number)).expect("put");
+    }
+    seal(&store, &io);
+    let range = reel::engine::scan_state::from_key(COLUMN, b"", Direction::Ascending);
+    let mut scan = store.state.take_scan(&range, None).expect("scan");
+    let found = step_keys(&store, &mut scan, u64::MAX);
+    assert_eq!(found.len() as u64, WIDE_BATCH_KEYS);
+    assert!(found.iter().enumerate().all(|(number, (found, value))| *found == key(number as u64) && *value == wide_batch_value(number as u64)));
+    assert_eq!(scan.batched, WIDE_BATCH_KEYS, "wide records took their own reads");
     store.state.give_back_scan(scan);
     store.close().expect("close");
 }

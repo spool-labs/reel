@@ -14,12 +14,12 @@ use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
 use crate::engine::engine_state::EngineState;
 use crate::engine::read_path::{HeldPin, KeyRead, Located, MOST_READ_TRIES, RecordWant, SealedRow, newest_of};
 use crate::engine::scan_state::{
-    BATCH_KEYS, BatchEntry, BlockTake, JOIN_GAP, MOST_SCANS, MOST_WINDOW_RECORD, NO_GENERATION, ScanRange, ScanState, ScanWindows, SegmentSource, under_prefix,
+    BATCH_BYTES, BATCH_KEYS, BatchEntry, BlockTake, JOIN_GAP, MOST_BATCH_RECORD, MOST_SCANS, MOST_WINDOW_RECORD, NO_GENERATION, ScanRange, ScanState, ScanWindows, SegmentSource, under_prefix,
 };
 use crate::engine::volume::Volume;
 use crate::guard::hold;
 use crate::index::write_shard::WalkBound;
-use crate::io::{DeviceReads, InPlace, Io, ReadOn, in_place};
+use crate::io::{DeviceReads, Io, ManyRead, ReadOn, in_place};
 use crate::record::record_check::RecordIdentity;
 use crate::record::codec::Codec;
 use crate::record::record_reader::{RecordRead, form_of, open_small};
@@ -122,10 +122,10 @@ impl<Backend: Io> EngineState<Backend> {
         hold(&self.read_pool.scans).push(scan);
     }
 
-    /// Take one step of a scan, with a value buffer when it wants values. A job that crosses a try costs a seek from the last
-    /// key, and past the usual tries a pin holds the jobs off that key
+    /// Take one step of a scan on this thread, through the ring as a blocking get reads, with a value buffer when it wants values.
+    /// A job that crosses a try costs a seek from the last key, and past the usual tries a pin holds the jobs off that key
     pub fn step_scan(&self, scan: &mut ScanState, key: &mut Vec<u8>, want: ScanWant) -> Result<ScanStep, StoreError> {
-        in_place(self.step_scan_on(&InPlace, scan, key, want))
+        in_place(self.step_scan_on(&self.blocking_reads(), scan, key, want))
     }
 
     /// Take one step of a scan through a device's read path
@@ -319,9 +319,18 @@ impl<Backend: Io> EngineState<Backend> {
         scan.batch.point = point;
         let mut key = mem::take(&mut scan.out_key);
         let mut outcome = Ok(());
-        while scan.batch.entries.len() < BATCH_KEYS {
+        // a batch takes keys while the records it reads still fit its buffer, so wide records read in batches of fewer keys
+        let mut located_bytes = 0;
+        while scan.batch.entries.len() < BATCH_KEYS && located_bytes + MOST_BATCH_RECORD <= BATCH_BYTES {
+            let entries = scan.batch.entries.len();
             match self.counted(self.try_step(ReadOn::new(device, volume), directory, scan, Some(point), &mut key, ScanWant::Locate).await) {
-                Ok(StepOutcome::Answer(ScanStep::Found) | StepOutcome::Passed) => {},
+                Ok(StepOutcome::Answer(ScanStep::Found) | StepOutcome::Passed) => {
+                    if let Some(BatchEntry { located: Located::Sealed(row), .. }) = scan.batch.entries.get(entries)
+                        && row.row.length.0 as usize <= MOST_BATCH_RECORD
+                    {
+                        located_bytes += row.row.length.0 as usize;
+                    }
+                },
                 // the step that answers one key at a time takes the end, a crossed try and anything it can't locate
                 Ok(StepOutcome::Moved) => {
                     scan.generation = NO_GENERATION;
@@ -343,12 +352,12 @@ impl<Backend: Io> EngineState<Backend> {
         Ok(())
     }
 
-    /// Read the batch's small sealed records in segment and offset order, one read for each run of neighbours. A record left
-    /// out takes its own read when its key is answered
+    /// Read the batch's sealed records in segment and offset order, one read for each run of neighbours, with every run sent
+    /// before any is waited for. A record left out takes its own read when its key is answered
     pub async fn read_batch(&self, device: &impl DeviceReads<Backend::File>, volume: &Volume<Backend>, scan: &mut ScanState) {
         let batch = &mut scan.batch;
         let sealed_of = |entry: &BatchEntry| match entry.located {
-            Located::Sealed(row) if row.row.length.0 as usize <= MOST_WINDOW_RECORD => Some(row),
+            Located::Sealed(row) if row.row.length.0 as usize <= MOST_BATCH_RECORD => Some(row),
             _other => None,
         };
         batch.order.clear();
@@ -359,6 +368,11 @@ impl<Backend: Io> EngineState<Backend> {
         }
         let entries = &mut batch.entries;
         batch.order.sort_unstable_by_key(|index| sealed_of(&entries[*index as usize]).map(|row| (row.segment, row.row.offset.0)));
+        // each run: its first and last place in the order, its file offset and its length
+        let mut runs = [(0_usize, 0_usize, 0_u64, 0_u64); BATCH_KEYS];
+        let mut pins: [Option<_>; BATCH_KEYS] = std::array::from_fn(|_| None);
+        let (mut run_count, mut planned) = (0, 0_u64);
+        let room = (batch.records.capacity() - batch.records.len()) as u64;
         let mut at = 0;
         while at < batch.order.len() {
             let Some(first) = sealed_of(&entries[batch.order[at] as usize]) else {
@@ -367,36 +381,48 @@ impl<Backend: Io> EngineState<Backend> {
             let start = first.row.offset.0;
             let mut end = start + first.row.length.0;
             let mut last = at;
-            let room = (batch.records.capacity() - batch.records.len()) as u64;
+            let left = room - planned;
             while let Some(next) = batch.order.get(last + 1).and_then(|index| sealed_of(&entries[*index as usize])) {
                 let next_end = next.row.offset.0 + next.row.length.0;
-                if next.segment != first.segment || next.row.offset.0 > end + JOIN_GAP || next_end.max(end) - start > room {
+                if next.segment != first.segment || next.row.offset.0 > end + JOIN_GAP || next_end.max(end) - start > left {
                     break;
                 }
                 end = end.max(next_end);
                 last += 1;
             }
-            if end - start > room {
-                return;
+            if end - start > left {
+                break;
             }
-            let Some(pin) = volume.table.pin(first.segment) else {
-                at = last + 1;
-                continue;
-            };
-            let base = batch.records.len();
-            batch.records.resize(base + (end - start) as usize, 0);
-            if device.read_exact(&pin.file, FileOffset(start), &mut batch.records[base..]).await.is_err() {
-                batch.records.truncate(base);
-                at = last + 1;
-                continue;
-            }
-            for index in &batch.order[at..=last] {
-                let entry = &mut entries[*index as usize];
-                if let Some(row) = sealed_of(entry) {
-                    entry.record = Some((base + (row.row.offset.0 - start) as usize, row.row.length.0 as usize));
-                }
+            if let Some(pin) = volume.table.pin(first.segment) {
+                runs[run_count] = (at, last, start, end - start);
+                pins[run_count] = Some(pin);
+                run_count += 1;
+                planned += end - start;
             }
             at = last + 1;
+        }
+        let base = batch.records.len();
+        batch.records.resize(base + planned as usize, 0);
+        let mut reads: [Option<ManyRead<'_, Backend::File>>; BATCH_KEYS] = std::array::from_fn(|_| None);
+        let mut rest = &mut batch.records[base..];
+        for ((read, &(_at, _last, start, length)), pin) in reads.iter_mut().zip(&runs).zip(&pins).take(run_count) {
+            let (buf, tail) = mem::take(&mut rest).split_at_mut(length as usize);
+            rest = tail;
+            *read = pin.as_ref().map(|pin| ManyRead { file: &pin.file, offset: FileOffset(start), buf, is_done: false });
+        }
+        device.read_many(&mut reads[..run_count]).await;
+        let filled: [bool; BATCH_KEYS] = std::array::from_fn(|index| reads[index].as_ref().is_some_and(|read| read.is_done));
+        let mut from = base;
+        for (&(at, last, start, length), is_filled) in runs.iter().zip(filled).take(run_count) {
+            if is_filled {
+                for index in &batch.order[at..=last] {
+                    let entry = &mut entries[*index as usize];
+                    if let Some(row) = sealed_of(entry) {
+                        entry.record = Some((from + (row.row.offset.0 - start) as usize, row.row.length.0 as usize));
+                    }
+                }
+            }
+            from += length as usize;
         }
     }
 

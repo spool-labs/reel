@@ -18,7 +18,7 @@ use reel_api::write_batch::WriteBatch;
 
 use crate::config::{ColumnConfig, DeviceClass, StoreConfig, VolumeConfig};
 use crate::engine::dead_bits::{CHUNK_WORDS, DEAD_BITS_NAME, DeadBits, NEW_DEAD_BITS_NAME, SAVE_HEADS_PAGE};
-use crate::engine::rewrite_job::rows_of;
+use crate::engine::rewrite_job::{record_totals, rows_of};
 use crate::segment::block_filter::BITS_PER_ROW;
 use crate::engine::caller_activity::CallerCounts;
 use crate::io::wake_line::WakeLine;
@@ -1109,6 +1109,8 @@ pub struct OpenInputs<'open, Backend: Io> {
 /// Allocate and touch everything the engine will hold
 pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<Backend> {
     let OpenInputs { io, config, sizing, disks, superblock, mut locks, scan, summaries } = inputs;
+    // the write index holds what a segment of the store's mean record needs, and the record cache takes the rest
+    let sizing = &sizing.for_mean_record(mean_record(&summaries), config.volumes.len() as u64);
     let first_place = superblock.place_limit.0.saturating_sub(PLACE_RUN);
     let places = Arc::new(PlaceCount::new(WritePlace(first_place), superblock.place_limit));
     let volume_share = sizing.table_share.0 / config.volumes.len().max(1) as u64;
@@ -1547,4 +1549,17 @@ pub fn is_spinning<Backend: Io>(io: &Backend, volume: &VolumeConfig) -> bool {
         DeviceClass::Solid => false,
         DeviceClass::Detect => volume.roots.first().and_then(|root| io.is_rotational(root)).unwrap_or(false),
     }
+}
+
+/// Read the mean record the summaries hold, key and header included, or nothing for a store with no rows on disk
+pub fn mean_record(summaries: &[SummaryFound]) -> Option<u64> {
+    let (mut bytes, mut rows) = (0, 0);
+    for summary in summaries {
+        for row in summary.rows.rows() {
+            let (row_bytes, row_rows) = record_totals(&row);
+            bytes += row_bytes;
+            rows += row_rows;
+        }
+    }
+    (rows > 0).then(|| bytes / rows)
 }

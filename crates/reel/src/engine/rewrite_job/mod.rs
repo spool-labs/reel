@@ -44,7 +44,7 @@ mod merge;
 mod pick;
 mod place;
 
-pub use pick::{CrowdAnswer, CrowdAnswers, has_disk_room, is_mergeable, is_reclaim_due};
+pub use pick::{CrowdAnswer, CrowdAnswers, has_disk_room, is_mergeable, is_reclaim_due, record_totals};
 #[cfg(any(test, feature = "test-hooks"))]
 pub use install::freed_in_place;
 #[cfg(any(test, feature = "test-hooks"))]

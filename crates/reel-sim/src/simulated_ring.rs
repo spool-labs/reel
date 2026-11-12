@@ -2,6 +2,7 @@
 
 use std::io::{IoSliceMut, Result};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use reel::guard::hold;
 use reel::io::IoFile;
@@ -28,15 +29,23 @@ pub struct SimulatedRing {
     io: SimulatedIo,
     waiting: Mutex<Vec<WaitingRead>>,
     slots: Vec<Mutex<Vec<u8>>>,
+    /// The most reads that waited at once, so a test can see reads sent together
+    most_waiting: AtomicUsize,
 }
 
 impl SimulatedRing {
+    /// Read the most reads that waited at once
+    pub fn most_waiting(&self) -> usize {
+        self.most_waiting.load(Ordering::Relaxed)
+    }
+
     /// Build an empty ring
     pub fn new(io: SimulatedIo) -> Self {
         Self {
             io,
             waiting: Mutex::new(Vec::with_capacity(RING_SLOTS)),
             slots: (0..RING_SLOTS).map(|_slot| Mutex::new(vec![0; RING_SLOT_BYTES])).collect(),
+            most_waiting: AtomicUsize::new(0),
         }
     }
 }
@@ -44,7 +53,10 @@ impl SimulatedRing {
 impl RingDriver<SimulatedFile> for SimulatedRing {
     fn start(&self, slot: usize, file: &SimulatedFile, offset: FileOffset, length: usize) -> Result<()> {
         let _pause = CountPause::new();
-        hold(&self.waiting).push(WaitingRead { slot, file: file.clone(), offset, length });
+        let mut waiting = hold(&self.waiting);
+        waiting.push(WaitingRead { slot, file: file.clone(), offset, length });
+        self.most_waiting.fetch_max(waiting.len(), Ordering::Relaxed);
+        drop(waiting);
         self.io.note_ring_read();
         self.io.wake_jobs(RING_JOB);
         Ok(())
@@ -65,6 +77,10 @@ impl RingDriver<SimulatedFile> for SimulatedRing {
         drop(pause);
         done(read.slot, answer);
         Ok(true)
+    }
+
+    fn reaps_on_wait(&self) -> bool {
+        true
     }
 
     fn copy_out(&self, slot: usize, out: &mut [u8]) {

@@ -774,11 +774,17 @@ impl<Backend: Io> WalkJob<Backend> {
         }
         counts.counts.sort_unstable_by_key(|count| count.segment);
         let mut rows = hold(&volume.summary);
-        // the target's lowest place tells a charge from this walk from one a finished walk left
-        let walk_lowest = rows.get(target.segment).map_or(WritePlace(0), |row| row.facts.places.lowest);
         rows.apply_walk(target.segment, next_block, &counts.counts);
         if !target.is_backward {
             rows.note_forward(target.segment);
+        }
+        // no merge can drop a row this walk charged until the walk ends, so the pick reads it apart, noted under the same hold so no
+        // pick sees the counts land without it. A backward walk counts its own rows against finished segments, so they stand at once
+        if !target.is_backward {
+            let walk = volume.walks_finished.load(Ordering::Acquire);
+            for count in counts.counts.iter().filter(|count| count.rows > 0) {
+                volume.table.note_unbacked(count.segment, count.bytes.0 + u64::from(count.rows) * ROW_FOOTER_BYTES, walk);
+            }
         }
         drop(rows);
         volume.walk_blocks.fetch_add(1, Ordering::Relaxed);
@@ -788,11 +794,6 @@ impl<Backend: Io> WalkJob<Backend> {
         volume.pace_spilled.fetch_add(spilled, Ordering::Relaxed);
         volume.dead_counted.fetch_add(dead_bytes, Ordering::Relaxed);
         for count in counts.counts.iter().filter(|count| count.rows > 0) {
-            // no merge can drop a row this walk charged until the walk ends, so the pick reads it apart. A backward walk counts its
-            // own rows against finished segments, so its counts stand at once
-            if !target.is_backward {
-                volume.table.note_unbacked(count.segment, count.bytes.0 + u64::from(count.rows) * ROW_FOOTER_BYTES, walk_lowest);
-            }
             volume.table.drop_live(count.segment, count.block, count.rows, count.replacement);
         }
         for free in counts.slot_frees.iter() {

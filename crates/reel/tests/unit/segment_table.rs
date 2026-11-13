@@ -42,6 +42,7 @@ fn pool_compact() {
         highest_replacement: WritePlace(0),
         live_blocks: 0,
         unbacked: 0,
+        unbacked_walk: 0,
         has_held_frees: false,
         is_unproven: false,
     };
@@ -192,26 +193,24 @@ fn drop_past_the_last_block_lands_nowhere() {
     assert_eq!(table.live_rows(second), Some(5));
 }
 
-// charges from the walk in flight read apart until the segment's replacements lie below every unwalked one, and a new walk's
-// first charge drops what finished walks left
+// charges read apart only while the walk that made them is in flight, and a new walk's first charge drops what a finished
+// walk left
 #[test]
 fn unbacked_charges_follow_the_walk() {
     let table = table_with(4);
     let number = SegmentNumber(1);
     let head = TailHead { segment: number, ..TailHead::default() };
     assert!(table.install(1, RootId(0), &head, &[], &[BlockEntry { live_rows: 5, ..line(0) }]));
-    table.note_unbacked(number, 100, WritePlace(10));
-    table.drop_live(number, 0, 1, WritePlace(12));
-    assert_eq!(table.unbacked(number, Some(WritePlace(11))), 100, "the walk in flight's charge read backed");
-    assert_eq!(table.unbacked(number, Some(WritePlace(20))), 0, "a finished walk's charge read unbacked");
-    assert_eq!(table.unbacked(number, None), 0);
-    // the next walk starts past every earlier charge, so they came from walks that finished
-    table.note_unbacked(number, 40, WritePlace(30));
-    table.drop_live(number, 0, 1, WritePlace(31));
-    assert_eq!(table.unbacked(number, Some(WritePlace(25))), 40, "the new walk kept the old walk's charge");
+    table.note_unbacked(number, 100, 3);
+    assert_eq!(table.unbacked(number, Some(3)), 100, "the walk in flight's charge read backed");
+    assert_eq!(table.unbacked(number, Some(4)), 0, "a finished walk's charge read unbacked");
+    assert_eq!(table.unbacked(number, None), 0, "a charge read unbacked with no walk in flight");
+    // the next walk's first charge drops what the finished one left
+    table.note_unbacked(number, 40, 4);
+    assert_eq!(table.unbacked(number, Some(4)), 40, "the new walk kept the old walk's charge");
 }
 
-// an output's kept counts land one after another with rising replacements, and with no boundary each adds to what came before
+// an output's kept counts land one after another from the walk in flight, and each adds to what came before
 #[test]
 fn kept_counts_add_up_on_a_fresh_output() {
     let table = table_with(4);
@@ -219,8 +218,8 @@ fn kept_counts_add_up_on_a_fresh_output() {
     let head = TailHead { segment: number, ..TailHead::default() };
     assert!(table.install(1, RootId(0), &head, &[], &[BlockEntry { live_rows: 9, ..line(0) }]));
     for (bytes, place) in [(10, 20), (20, 30), (30, 40)] {
-        table.note_unbacked(number, bytes, WritePlace(0));
+        table.note_unbacked(number, bytes, 7);
         table.drop_live(number, 0, 1, WritePlace(place));
     }
-    assert_eq!(table.unbacked(number, Some(WritePlace(15))), 60, "a later kept count wiped the earlier ones");
+    assert_eq!(table.unbacked(number, Some(7)), 60, "a later kept count wiped the earlier ones");
 }

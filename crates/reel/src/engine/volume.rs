@@ -432,6 +432,8 @@ pub struct Volume<Backend: Io> {
     pub gate_in_flight: AtomicU64,
     /// Paced picks the space target put off, the volume under it
     pub gate_refusals: AtomicU64,
+    /// Asks for a rewrite look the planner heard
+    pub asks_heard: AtomicU64,
     /// Counts the turns a walk stood aside for a rewrite
     pub walks_held: AtomicU64,
     /// Counts the waits of a block whose charges land on an input a rewrite has claimed, none until the held bits come
@@ -700,6 +702,11 @@ impl<Backend: Io> Volume<Backend> {
     /// Read the most credit the pace holds: one walk of a segment of dead bytes, and the pick in hand
     pub fn pace_cap(&self) -> u64 {
         pace_cap(self.segment_bytes.0, self.pace_per_mille())
+    }
+
+    /// Read the walk in flight by the count of walks finished before it, or none with no walk target claimed
+    pub fn walk_in_flight(&self) -> Option<u64> {
+        self.has_walk_target.load(Ordering::Acquire).then(|| self.walks_finished.load(Ordering::Acquire))
     }
 
     /// Read the pace's multiplier, copy bytes for each thousand dead bytes

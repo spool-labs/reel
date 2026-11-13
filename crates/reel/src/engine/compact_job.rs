@@ -339,6 +339,7 @@ impl<Backend: Io> CompactJob<Backend> {
             return JobStep::Worked;
         }
         let is_asked = volume.wants_compaction.swap(false, Ordering::AcqRel);
+        volume.asks_heard.fetch_add(u64::from(is_asked), Ordering::Relaxed);
         if is_asked {
             let has_settled = self.settle_covers(volume);
             self.note_settled(volume);

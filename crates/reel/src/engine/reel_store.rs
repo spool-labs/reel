@@ -1526,6 +1526,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         space_target_per_mille: AtomicU64::new(SPACE_TARGET_PER_MILLE),
         gate_in_flight: AtomicU64::new(0),
         gate_refusals: AtomicU64::new(0),
+        asks_heard: AtomicU64::new(0),
         walks_held: AtomicU64::new(0),
         walk_claim_waits: AtomicU64::new(0),
         walk_claim_held: AtomicU64::new(0),

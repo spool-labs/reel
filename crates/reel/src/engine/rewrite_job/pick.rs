@@ -219,6 +219,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         let band_floor = floor;
         let floor = if is_band_shut { half.max(floor) } else { floor };
         let walked_below = self.walked_below;
+        let walk_in_flight = volume.walk_in_flight();
         let gave_up = self.gave_up_list(volume);
         let index = self.volume;
         // a wholly dead segment the unlink can take now goes by the unlink, and a rewrite of it would throw one of the two away
@@ -231,7 +232,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             }
             // what the walk in flight charged no merge can drop yet, so it wins nothing back until that walk ends, and the file is
             // asked what it freed in place only for a row past the bar on its counts alone
-            let unbacked = volume.table.unbacked(row.facts.segment, walked_below);
+            let unbacked = volume.table.unbacked(row.facts.segment, walk_in_flight);
             is_rewrite_ready(volume, row, unbacked, bar) && is_rewrite_ready(volume, row, freed_in_place(volume, row) + unbacked, bar)
         };
         // an untrusted row waits for the half bar, and a pick counts one fallback when such a row would have passed the floor
@@ -896,12 +897,13 @@ impl<Backend: Io> RewriteJob<Backend> {
         let summary = hold(&volume.summary);
         // every segment below this place has finished its walk, so a replacement under it is one the merge's ask can find
         let walked_below = self.walked_below;
+        let walk_in_flight = volume.walk_in_flight();
         let (mut inputs, mut output, mut lowest) = (0, 0, WritePlace(u64::MAX));
         self.pending_dead = 0;
         for row in self.numbers[..self.input_count].iter().filter_map(|number| summary.get(*number)) {
             inputs += row.facts.file_length.0;
             output += match is_count_trusted(volume, row.facts.segment, walked_below) {
-                true => output_estimate(&row) + volume.table.unbacked(row.facts.segment, walked_below),
+                true => output_estimate(&row) + volume.table.unbacked(row.facts.segment, walk_in_flight),
                 false => row.facts.file_length.0,
             };
             lowest = lowest.min(row.facts.places.lowest);

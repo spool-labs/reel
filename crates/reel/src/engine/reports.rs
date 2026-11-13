@@ -243,6 +243,8 @@ impl<Backend: Io> EngineState<Backend> {
                 }
             });
             let (gate_dead, gate_live) = (rows.orders().gate_dead_bytes(), rows.orders().live_bytes());
+            let walk = volume.walk_in_flight();
+            let unbacked: u64 = rows.rows().map(|row| volume.table.unbacked(row.facts.segment, walk)).sum();
             let claims = hold(&volume.claims);
             let open_bytes: u64 = claims.open.iter().map(|segment| segment.write_end.0).sum();
             let preallocated: u64 = claims.open.iter().map(|segment| segment.reserved_end.0.saturating_sub(segment.write_end.0)).sum();
@@ -303,6 +305,8 @@ impl<Backend: Io> EngineState<Backend> {
                     live: ByteCount(gate_live),
                     gate_in_flight: ByteCount(volume.gate_in_flight.load(Ordering::Acquire)),
                     spilled: ByteCount(volume.pace_spilled.load(Ordering::Acquire)),
+                    unbacked: ByteCount(unbacked),
+                    asks_heard: volume.asks_heard.load(Ordering::Acquire),
                 },
                 walk_blocks: volume.walk_blocks.load(Ordering::Acquire),
                 fill_interval: Nanoseconds(volume.seal_interval.load(Ordering::Relaxed)),

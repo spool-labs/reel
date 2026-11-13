@@ -449,6 +449,10 @@ pub struct PaceReading {
     pub spilled: ByteCount,
     /// Rows a pick held to the half bar, their counts not trusted while a segment below them was unwalked
     pub trust_fallbacks: u64,
+    /// Dead bytes the walk in flight has charged, which no merge can drop until it ends: about one target's kills at most
+    pub unbacked: ByteCount,
+    /// Asks for a rewrite look the planner heard, so a burst of picks shows whether it came from asks or from its own looping
+    pub asks_heard: u64,
 }
 
 /// The kinds a rewrite's written bytes are counted by: record rewrites under three quarters dead, at three quarters and up,

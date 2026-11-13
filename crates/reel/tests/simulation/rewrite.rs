@@ -4862,7 +4862,9 @@ fn charge_in_flight(store: &Store, segment: SegmentNumber, share: u64) {
     let volume = &store.state.volumes[0];
     let bytes = PACE_KEYS * PACE_VALUE_BYTES as u64 * share / 100;
     let place = WritePlace(u64::MAX / 2);
-    volume.table.note_unbacked(segment, bytes, place);
+    // the held walk stands for one in flight: a target claimed and not finished
+    volume.has_walk_target.store(true, Ordering::Release);
+    volume.table.note_unbacked(segment, bytes, volume.walks_finished.load(Ordering::Acquire));
     volume.table.drop_live(segment, 0, 0, place);
 }
 
@@ -4954,5 +4956,43 @@ fn idle_seat_beside_a_busy_lane_asks_once() {
     assert!(spun <= 2, "the idle seat's picks found nothing {spun} times over {STILL_STEPS} steps with no change");
     shape::abandon_rewrites(&mut job);
     io.hold_jobs("reel-planner", false);
+    store.close().expect("close");
+}
+
+/// Keys the churning load spreads its overwrites over, rounds it runs, and keys it writes each round
+const CHURN_KEYS: u64 = 400;
+const CHURN_ROUNDS: u64 = 200;
+const CHURN_ROUND_KEYS: u64 = 60;
+
+// random overwrites under busy callers charge every segment on every walk, and the charges each walk made stand once it ends,
+// so record rewrites keep starting through the run and none piles up across walks
+#[test]
+fn record_picks_go_on_under_churn() {
+    let io = SimulatedIo::new(Seed(163));
+    let mut config = config();
+    config.threads.maintenance_workers = Some(1);
+    config.memory_budget = WORKER_BUDGET;
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let volume = &store.state.volumes[0];
+    volume.holds.small_bound.store(true, Ordering::Release);
+    let mut random = SeededRandom::new(Seed(163));
+    let value = vec![4; PACE_VALUE_BYTES];
+    let records = || volume.picks[PickOutcome::Record.index()].load(Ordering::Acquire);
+    let mut half_way = 0;
+    for round in 0..CHURN_ROUNDS {
+        for _key in 0..CHURN_ROUND_KEYS {
+            let number = random.next_word() % CHURN_KEYS;
+            store.put(COLUMN, format!("churn-{number:04}").as_bytes(), &value).expect("put");
+        }
+        store.state.ask_compaction();
+        store.seal_now();
+        settle(&io);
+        if round == CHURN_ROUNDS / 2 {
+            half_way = records();
+        }
+    }
+    let overlaps = volume.picks[PickOutcome::Overlap.index()].load(Ordering::Acquire);
+    println!("record picks {} ({half_way} at half way), overlap picks {overlaps}", records());
+    assert!(records() > half_way, "record rewrites stopped in the second half of the run");
     store.close().expect("close");
 }

@@ -173,3 +173,20 @@ fn dead_at_the_last_live_block() {
     table.drop_live(number, 2, 1, WritePlace(12));
     assert_eq!(table.dead_replacement(number), Some(WritePlace(12)));
 }
+
+// a drop past a segment's last block lands nowhere: neither the segment nor the neighbour after it reads dead
+#[test]
+fn drop_past_the_last_block_lands_nowhere() {
+    let table = table_with(4);
+    let first = SegmentNumber(1);
+    let second = (2..).map(SegmentNumber).find(|number| shard_of(*number) == shard_of(first)).expect("a neighbour");
+    let live = |offset: u32| BlockEntry { live_rows: 5, ..line(offset) };
+    for number in [first, second] {
+        let head = TailHead { segment: number, ..TailHead::default() };
+        assert!(table.install(1, RootId(0), &head, &[], &[live(0)]));
+    }
+    table.drop_live(first, 1, 5, WritePlace(9));
+    assert_eq!(table.dead_replacement(first), None);
+    assert_eq!(table.dead_replacement(second), None);
+    assert_eq!(table.live_rows(second), Some(5));
+}

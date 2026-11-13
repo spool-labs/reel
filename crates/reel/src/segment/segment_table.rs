@@ -377,6 +377,10 @@ impl<File: Clone> SegmentTable<File> {
             return;
         };
         entry.highest_replacement = entry.highest_replacement.max(replacement);
+        // a block past the segment's own lines would land on a neighbour's line and count against this segment
+        if block >= entry.blocks.length {
+            return;
+        }
         let start = entry.blocks.start as usize + block as usize;
         let Some(line) = guard.blocks.get_mut(start) else {
             return;

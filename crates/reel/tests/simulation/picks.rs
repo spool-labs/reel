@@ -38,15 +38,20 @@ const BLOCKS: u32 = 64;
 // room for a row's facts, its blocks' dead counts and one column with two keys
 const ROW_ROOM: u64 = 1_024;
 const LOOKS: usize = 11;
+// the gate runs with one worker and with as many as a large node runs, since each lane adds a lock to the checks a pick makes
+const GATE_WORKERS: [usize; 2] = [1, 32];
 // no pick holds the summary longer than this, at 100,000 segments a volume, in a release build
 const HOLD_LINE: Duration = Duration::from_millis(1);
+// a record pick past a queue of wholly dead segments holds this, four times the 60 µs it takes with one count a segment and
+// under half the 584 µs a walk over every block line took
+const DEAD_QUEUE_LINE: Duration = Duration::from_micros(250);
 const WORKER_LANE: usize = 1;
 const PLANNER_LANE: usize = 0;
 
-fn config() -> StoreConfig {
+fn config(workers: usize) -> StoreConfig {
     StoreConfig {
         memory_budget: ByteCount(1 << 30),
-        threads: ThreadCounts { maintenance_workers: Some(1), ..ThreadCounts::default() },
+        threads: ThreadCounts { maintenance_workers: Some(workers), ..ThreadCounts::default() },
         volumes: vec![VolumeConfig {
             name: "picks".to_string(),
             roots: vec![PathBuf::from(ROOT)],
@@ -135,8 +140,8 @@ fn listing(number: u64, lowest: &[u8; 8], bound: &[u8; 8]) -> Listing {
     Listing { entry, range }
 }
 
-// time a pick a number of times and print the least, the median and the most
-fn time(label: &str, mut pick: impl FnMut() -> bool) {
+// time a pick a number of times against a line, print the least, the median and the most, and return how many looks found one
+fn time(label: &str, line: Duration, mut pick: impl FnMut() -> bool) -> usize {
     let mut times: Vec<Duration> = Vec::with_capacity(LOOKS);
     let mut found = 0;
     for _look in 0..LOOKS {
@@ -147,49 +152,59 @@ fn time(label: &str, mut pick: impl FnMut() -> bool) {
     times.sort();
     // a debug build runs some ten times slower, and only the release run holds the line. The median holds it, since one look
     // a parallel test preempts says nothing about the pick
-    assert!(cfg!(debug_assertions) || times[LOOKS / 2] < HOLD_LINE, "{label} held the summary {:?} at the median", times[LOOKS / 2]);
+    assert!(cfg!(debug_assertions) || times[LOOKS / 2] < line, "{label} held the summary {:?} at the median", times[LOOKS / 2]);
     println!(
         "pick {label}: least {:?} median {:?} most {:?}, found {found} of {LOOKS}",
         times[0],
         times[LOOKS / 2],
         times[LOOKS - 1]
     );
+    found
 }
 
 // each kind of pick over 100,000 segments, which CI also runs in a release build to hold the line
 #[test]
 fn picks_at_most_segments() {
-    for is_crowded in [false, true] {
+    for (workers, is_crowded) in GATE_WORKERS.into_iter().flat_map(|workers| [(workers, false), (workers, true)]) {
         let io = SimulatedIo::new(Seed(71));
         // the table plans an entry for each segment the disk can hold, and the directory takes the same room
         io.add_disk(Path::new(ROOT), DISK);
-        let store: Store = ReelStore::open(io, &config()).expect("open");
+        let store: Store = ReelStore::open(io, &config(workers)).expect("open");
         println!("room for {} rows", hold(&store.state.volumes[0].summary).index_room());
         fill(&store, is_crowded);
         let state = &store.state;
         let volume = &state.volumes[0];
-        let shape = if is_crowded { "crowded" } else { "apart" };
+        let shape = format!("{} with {workers} workers", if is_crowded { "crowded" } else { "apart" });
         println!("{shape}: {} rows, {} summary bytes", SEGMENTS, hold(&volume.summary).bytes().len());
 
+        // a record pick waits behind an owed overlap merge, so the record timings clear the flag to walk the buckets
+        let was_over_bound = volume.is_over_bound.swap(false, Ordering::AcqRel);
+        // with a worker and callers busy only the worker's lane takes an overlap merge, so the planner's lane walks the record
+        // buckets in both shapes
+        let mut planner = RewriteJob::new(Arc::clone(state), 0, PLANNER_LANE);
+        let records = || volume.picks[PickOutcome::Record as usize].load(Ordering::Relaxed);
+        let records_before = records();
+        let found = time(&format!("{shape} record"), HOLD_LINE, || planner.pick_within(volume, MOST_MERGE_SEGMENTS).is_some());
+        assert_eq!((found, records() - records_before), (LOOKS, LOOKS as u64), "{shape} record took other than a record pick each look");
+        // the worker's lane looks for an overlap merge first, which only crowded keys give it
         let mut lane = RewriteJob::new(Arc::clone(state), 0, WORKER_LANE);
-        time(&format!("{shape} record"), || lane.pick_within(volume, MOST_MERGE_SEGMENTS).is_some());
-        // a fresh planner lane each look, so each one starts its overlap looks from the oldest segment
-        let mut planners: Vec<RewriteJob<SimulatedIo>> = (0..LOOKS).map(|_lane| RewriteJob::new(Arc::clone(state), 0, PLANNER_LANE)).collect();
-        time(&format!("{shape} planner overlap then record"), || {
-            planners.pop().is_some_and(|mut planner| planner.pick_within(volume, MOST_MERGE_SEGMENTS).is_some())
-        });
-        let overlaps = volume.picks[PickOutcome::Overlap as usize].load(Ordering::Relaxed);
-        println!("{shape} planner overlap picks: {overlaps}, misses: {}", volume.picks[PickOutcome::OverlapMiss as usize].load(Ordering::Relaxed));
-        assert_eq!(overlaps > 0, is_crowded, "the planner's overlap picks went against the keys");
+        let overlaps_before = volume.picks[PickOutcome::Overlap as usize].load(Ordering::Relaxed);
+        let found = time(&format!("{shape} worker overlap then record"), HOLD_LINE, || lane.pick_within(volume, MOST_MERGE_SEGMENTS).is_some());
+        assert_eq!(found, LOOKS, "{shape} worker lane found nothing");
+        let overlaps = volume.picks[PickOutcome::Overlap as usize].load(Ordering::Relaxed) - overlaps_before;
+        println!("{shape} worker overlap picks: {overlaps}, misses: {}", volume.picks[PickOutcome::OverlapMiss as usize].load(Ordering::Relaxed));
+        assert_eq!(overlaps > 0, is_crowded, "the worker's overlap picks went against the keys");
+        volume.is_over_bound.store(was_over_bound, Ordering::Release);
+        // every row is walked and none is wholly dead, so these two find nothing, and record_pick_past_a_dead_queue times a queue
         let mut walk = WalkJob::new(Arc::clone(state), 0);
-        time(&format!("{shape} walk target"), || walk.pick_target());
+        assert_eq!(time(&format!("{shape} walk target"), HOLD_LINE, || walk.pick_target()), 0);
         let compaction = CompactJob::new(Arc::clone(state), 0);
-        time(&format!("{shape} wholly dead"), || compaction.pick_dead(volume).is_some());
+        assert_eq!(time(&format!("{shape} wholly dead"), HOLD_LINE, || compaction.pick_dead(volume).is_some()), 0);
         let mut loaders: Vec<FilterLoader<SimulatedIo>> = (0..LOOKS).map(|_loader| FilterLoader::new(Arc::clone(state), 0)).collect();
-        time(&format!("{shape} filter"), || loaders.pop().is_some_and(|mut loader| loader.pick(volume)));
+        assert_eq!(time(&format!("{shape} filter"), HOLD_LINE, || loaders.pop().is_some_and(|mut loader| loader.pick(volume))), LOOKS);
         // the holds a seal and an install take: a row added at the end, a counted block landed, and a row taken out
         let mut next = SEGMENTS;
-        time(&format!("{shape} push"), || {
+        let pushed = time(&format!("{shape} push"), HOLD_LINE, || {
             next += 1;
             let lowest = (next << 20).to_be_bytes();
             let bound = ((next + 1) << 20).to_be_bytes();
@@ -197,19 +212,20 @@ fn picks_at_most_segments() {
             hold(&volume.summary).push(&facts(next), iter::once(column), iter::empty())
         });
         let mut walked = 0;
-        time(&format!("{shape} apply walk"), || {
+        let applied = time(&format!("{shape} apply walk"), HOLD_LINE, || {
             walked += 1;
             let count = DeadCount { segment: SegmentNumber(walked), column: COLUMN, block: 0, rows: 1, ..DeadCount::default() };
             hold(&volume.summary).apply_walk(SegmentNumber(walked), BLOCKS, &[count]);
             true
         });
         let mut removed = SEGMENTS / 2;
-        time(&format!("{shape} remove"), || {
+        let taken_out = time(&format!("{shape} remove"), HOLD_LINE, || {
             removed += 1;
             hold(&volume.summary).remove(SegmentNumber(removed));
             true
         });
-        drop((lane, walk, compaction));
+        assert_eq!((pushed, applied, taken_out), (LOOKS, LOOKS, LOOKS));
+        drop((planner, lane, walk, compaction));
         store.close().expect("close");
     }
 }
@@ -226,9 +242,16 @@ fn dead_column_facts() -> ColumnFacts<'static> {
 // blocks, ahead of 100,000 segments a record pick can take: the pick passes the queue and holds the line
 #[test]
 fn record_pick_past_a_dead_queue() {
+    for workers in GATE_WORKERS {
+        dead_queue(workers);
+    }
+}
+
+// time a record pick past the dead queue with this many workers, each a lane whose inputs the unlink check reads
+fn dead_queue(workers: usize) {
     let io = SimulatedIo::new(Seed(72));
     io.add_disk(Path::new(ROOT), DISK);
-    let store: Store = ReelStore::open(io.clone(), &config()).expect("open");
+    let store: Store = ReelStore::open(io.clone(), &config(workers)).expect("open");
     let state = &store.state;
     let volume = &state.volumes[0];
     let file = io.create_file(&Path::new(ROOT).join("stand-in"), ByteCount(0)).expect("a file");
@@ -260,7 +283,8 @@ fn record_pick_past_a_dead_queue() {
     assert!(can_unlink(state, 0, volume, candidate), "the queue isn't one the unlink can take");
     // segments over keys of their own owe no overlap merge, so the record pick walks the buckets
     volume.is_over_bound.store(false, Ordering::Release);
-    time("record past a dead queue", || lane.pick_within(volume, MOST_MERGE_SEGMENTS).is_some_and(|(target, _)| target.length.0 > 0));
+    let found = time(&format!("record past a dead queue with {workers} workers"), DEAD_QUEUE_LINE, || lane.pick_within(volume, MOST_MERGE_SEGMENTS).is_some_and(|(target, _)| target.length.0 > 0));
+    assert_eq!(found, LOOKS, "the pick found nothing past the dead queue");
     drop(lane);
     store.close().expect("close");
 }

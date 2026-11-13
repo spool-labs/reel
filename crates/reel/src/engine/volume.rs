@@ -14,7 +14,7 @@ use crate::engine::open_segment::OpenSegment;
 use crate::engine::ration::Ration;
 use crate::engine::held_bits::HeldBits;
 use crate::engine::walk_job::WalkSlot;
-use crate::engine::load_state::{LoadCell, PACE_PER_MILLE, PaceCell};
+use crate::engine::load_state::{LoadCell, PaceCell};
 use crate::engine::row_job::IDLE_SEAL_AFTER;
 use crate::guard::hold;
 use crate::index::open_slots::{OpenSlot, OpenSlots};
@@ -214,10 +214,6 @@ pub struct TestHolds {
     pub no_bits: AtomicBool,
     /// Merges ask one bit decision in so many, as a release build does, so a bench measures the bits and not the check
     pub sample_bits: AtomicBool,
-    /// The pace's multiplier in copy bytes a thousand dead bytes, in place of the built-in one, for a sweep, once is_pace_set holds
-    pub pace_per_mille: AtomicU64,
-    /// The pace's multiplier above stands
-    pub is_pace_set: AtomicBool,
     /// Merges in flight while callers are busy, in place of the built-in cap, for a sweep; zero keeps the cap
     pub merge_cap: AtomicUsize,
     /// The walk lands its counts with no bits, as a missed charge would leave them
@@ -426,6 +422,8 @@ pub struct Volume<Backend: Io> {
     pub load: LoadCell,
     /// The copy bytes paced rewrites may still start
     pub pace: PaceCell,
+    /// The pace's multiplier, copy bytes for each thousand dead bytes, which the store's owner may set
+    pub pace_per_mille: AtomicU64,
     /// Counts the turns a walk stood aside for a rewrite
     pub walks_held: AtomicU64,
     /// Counts the waits of a block whose charges land on an input a rewrite has claimed, none until the held bits come
@@ -575,7 +573,6 @@ impl<Backend: Io> Volume<Backend> {
         false
     }
 
-
     /// Check a test holds quiet-time reclaim off
     #[cfg(feature = "test-hooks")]
     pub fn is_reclaim_held(&self) -> bool {
@@ -675,25 +672,15 @@ impl<Backend: Io> Volume<Backend> {
         (self.walk_slots.len() / WALK_CAP_WORKERS).max(1)
     }
 
-
     /// Read the heap a save of the dead bits copies through
     pub fn bits_save_bytes(&self) -> u64 {
         let save = hold(&self.bits_save);
         (save.heads.capacity() * size_of::<SavedHead>() + save.chunk.capacity()) as u64
     }
-    /// Read the pace's multiplier, copy bytes for each thousand dead bytes
-    #[cfg(feature = "test-hooks")]
-    pub fn pace_per_mille(&self) -> u64 {
-        match self.holds.is_pace_set.load(Ordering::Acquire) {
-            true => self.holds.pace_per_mille.load(Ordering::Acquire),
-            false => PACE_PER_MILLE,
-        }
-    }
 
     /// Read the pace's multiplier, copy bytes for each thousand dead bytes
-    #[cfg(not(feature = "test-hooks"))]
     pub fn pace_per_mille(&self) -> u64 {
-        PACE_PER_MILLE
+        self.pace_per_mille.load(Ordering::Relaxed)
     }
 
     /// Read the most merges that run while callers are busy

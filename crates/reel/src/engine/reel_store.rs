@@ -55,7 +55,7 @@ use crate::engine::filter_job::FilterLoader;
 use crate::engine::planner::Planner;
 use crate::engine::walk_job::{BlockCounter, WalkJob, WalkSlot, WalkWorker};
 use crate::engine::workers::Workers;
-use crate::engine::load_state::{LoadCell, PaceCell};
+use crate::engine::load_state::{LoadCell, PACE_PER_MILLE, PaceCell};
 use crate::engine::volume::{SealStepTimes, ClaimState, GaveUp, LookPass, MOST_MERGE_OUTPUTS, MOST_PARKED, NO_SEAL, RewriteLane, SyncState, Volume, BitsSave};
 #[cfg(feature = "test-hooks")]
 use crate::engine::volume::TestHolds;
@@ -422,6 +422,14 @@ impl<Backend: Io> ReelStore<Backend> {
             self.state.sync_volume(volume)?;
         }
         Ok(())
+    }
+
+    /// Set every volume's pace: the copy bytes busy callers' rewrites under half dead may make for each thousand dead bytes the
+    /// walk counts. Zero leaves them for quiet time
+    pub fn set_pace_per_mille(&self, per_mille: u64) {
+        for volume in &self.state.volumes {
+            volume.pace_per_mille.store(per_mille, Ordering::Relaxed);
+        }
     }
 
     /// Mark each volume's fullest taking segment to seal, as an idle volume does on its own
@@ -1480,6 +1488,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         looks: LookPass::default(),
         load: LoadCell::default(),
         pace: PaceCell::default(),
+        pace_per_mille: AtomicU64::new(PACE_PER_MILLE),
         walks_held: AtomicU64::new(0),
         walk_claim_waits: AtomicU64::new(0),
         walk_claim_held: AtomicU64::new(0),

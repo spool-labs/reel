@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use reel_api::column_id::ColumnId;
 use reel_api::maintenance_report::{UNIT_KINDS, MaintenanceMemory, 
-    CompleteReading, JOB_KINDS, JobKind, JobState, LeastValueReading, MOST_REPORTED_LANES, MaintenanceReport, PauseCause, RewriteBytes, UnitKind, VolumeReading,
+    CompleteReading, JOB_KINDS, JobKind, JobState, LeastValueReading, MOST_REPORTED_LANES, MaintenanceReport, PaceReading, PauseCause, RewriteBytes, UnitKind, VolumeReading,
     WriteSource,
 };
 use reel_api::store_error::StoreError;
@@ -288,6 +288,14 @@ impl<Backend: Io> EngineState<Backend> {
                     gone_by_share: array::from_fn(|kind| ByteCount(volume.rewrite_gone_by_share[kind].load(Ordering::Acquire))),
                     rewrites_by_share: array::from_fn(|kind| volume.rewrites_by_share[kind].load(Ordering::Acquire)),
                     unlinked: ByteCount(volume.unlinked_bytes.load(Ordering::Acquire)),
+                },
+                pace: PaceReading {
+                    per_mille: volume.pace_per_mille(),
+                    credit: volume.pace.credit(),
+                    dead_counted: ByteCount(volume.dead_counted.load(Ordering::Acquire)),
+                    paced_written: ByteCount(volume.paced_written.load(Ordering::Acquire)),
+                    refusals: volume.pace_refusals.load(Ordering::Acquire),
+                    trust_fallbacks: volume.trust_fallbacks.load(Ordering::Acquire),
                 },
                 walk_blocks: volume.walk_blocks.load(Ordering::Acquire),
                 fill_interval: Nanoseconds(volume.seal_interval.load(Ordering::Relaxed)),

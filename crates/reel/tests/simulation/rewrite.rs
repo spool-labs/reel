@@ -4393,8 +4393,7 @@ fn steady_space(seed: u64, pace_per_mille: u64, is_estimate_low: bool) -> Steady
     let io = SimulatedIo::new(Seed(seed));
     let store = open(&io);
     let volume = &store.state.volumes[0];
-    volume.holds.pace_per_mille.store(pace_per_mille, Ordering::Release);
-    volume.holds.is_pace_set.store(true, Ordering::Release);
+    store.set_pace_per_mille(pace_per_mille);
     volume.holds.low_estimate.store(is_estimate_low, Ordering::Release);
     let mut random = SeededRandom::new(Seed(seed));
     let value = vec![5; PACE_VALUE_BYTES];

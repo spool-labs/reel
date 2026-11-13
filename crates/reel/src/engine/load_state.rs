@@ -1,7 +1,7 @@
 //! What a planner step works out about a volume's load, once, and every maintenance decision as a plain function of it, so the
 //! planner, each lane's pick and the walk's cap can't read the load two ways
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering};
 
 use reel_api::units::Nanoseconds;
 
@@ -64,16 +64,16 @@ pub const fn overlap_lanes(load: Load) -> OverlapLanes {
     }
 }
 
-/// Read the bar a record rewrite holds unmarked segments to: with reclaim due, none on a short disk whatever the callers do, the
-/// quiet bar on a quiet volume, and the plain bar otherwise. Reclaim is due only once the walk has counted every segment, so a
-/// short disk under ingest, with a segment always unwalked, holds the plain bar: a walked segment past it is half dead, and
-/// one under it would cost a copy of mostly live rows while the disk fills
+/// Read the bar a record rewrite holds unmarked segments to: with reclaim due, none on a short disk whatever the callers do, and
+/// the floor otherwise, for busy callers and quiet ones alike. Busy callers' rewrites under half dead spend the pace's credit,
+/// which holds them back. Under ingest a segment is always unwalked, so reclaim isn't due, and the pick gives trusted rows the
+/// floor by its own reading
 pub const fn record_bar(load: Load, owed: Owed) -> u64 {
     if !owed.is_reclaim_due {
         PLAIN_BAR
     } else if load.is_disk_short && !owed.is_reclaim_held {
         ROOM_SHORT_BAR
-    } else if load.is_busy || owed.is_reclaim_held {
+    } else if owed.is_reclaim_held {
         PLAIN_BAR
     } else {
         QUIET_BAR
@@ -88,6 +88,53 @@ pub const fn is_capped(load: Load) -> bool {
 /// Check the planner should look for a record rewrite with nothing asked: reclaim due on a quiet volume, or on a short disk
 pub const fn is_reclaim_wanted(load: Load, owed: Owed) -> bool {
     owed.is_reclaim_due && !owed.is_reclaim_held && (!load.is_busy || load.is_disk_short)
+}
+
+/// The pace's built-in multiplier, copy bytes for each thousand dead bytes the walk counts, until the user sets it from the
+/// measured table. At a floor of d a rewrite copies (1 - d) / d bytes for each dead byte it frees, so 2,333 holds a 30% floor
+pub const PACE_PER_MILLE: u64 = 2_333;
+
+/// Read the copy bytes a walk's dead bytes allow paced rewrites
+pub const fn pace_credit(dead_bytes: u64, per_mille: u64) -> u64 {
+    dead_bytes.saturating_mul(per_mille) / 1_000
+}
+
+/// Check a record pick spends the pace's credit: while callers are busy and the disk has room, unless every input is past half
+/// dead, where a rewrite copies at most a byte for each byte it frees
+pub const fn is_paced(load: Load, is_past_half: bool) -> bool {
+    load.is_busy && !load.is_disk_short && !is_past_half
+}
+
+/// A volume's pace: the copy bytes paced rewrites may still start, which a walk's landing adds to and a paced pick spends
+#[derive(Debug, Default)]
+pub struct PaceCell {
+    credit: AtomicI64,
+}
+
+impl PaceCell {
+    /// Read the credit
+    pub fn credit(&self) -> i64 {
+        self.credit.load(Ordering::Acquire)
+    }
+
+    /// Add a landing's credit, up to one pick's worth, so quiet time banks no burst
+    pub fn add(&self, credit: u64, cap: u64) {
+        let cap = cap as i64;
+        let _moved = self.credit.fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| Some(held.saturating_add(credit as i64).min(cap)));
+    }
+
+    /// Spend a pick's estimate if the credit covers it, and say whether it did. Picks run on the planner's thread alone
+    pub fn spend(&self, estimate: u64) -> bool {
+        let estimate = estimate as i64;
+        self.credit.fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| (held >= estimate).then_some(held - estimate)).is_ok()
+    }
+
+    /// Settle a paced rewrite at its end: what it spent comes back, less what it wrote, so a wrong estimate costs no drift
+    pub fn settle(&self, spent: u64, written: u64, cap: u64) {
+        let back = spent as i64 - written as i64;
+        let cap = cap as i64;
+        let _moved = self.credit.fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| Some(held.saturating_add(back).min(cap)));
+    }
 }
 
 /// Bits of a load in one byte
@@ -227,11 +274,11 @@ mod tests {
             };
             assert_eq!(overlap_lanes(load), lanes, "{load:?}");
             for owed in every_owed() {
-                let bar = match (owed.is_reclaim_due, owed.is_reclaim_held, load.is_disk_short, load.is_busy) {
+                let bar = match (owed.is_reclaim_due, owed.is_reclaim_held, load.is_disk_short) {
                     (false, ..) => PLAIN_BAR,
-                    (true, false, true, _) => ROOM_SHORT_BAR,
-                    (true, true, ..) | (true, false, false, true) => PLAIN_BAR,
-                    (true, false, false, false) => QUIET_BAR,
+                    (true, false, true) => ROOM_SHORT_BAR,
+                    (true, true, _) => PLAIN_BAR,
+                    (true, false, false) => QUIET_BAR,
                 };
                 assert_eq!(record_bar(load, owed), bar, "{load:?} {owed:?}");
                 let is_wanted = owed.is_reclaim_due && !owed.is_reclaim_held && (!load.is_busy || load.is_disk_short);
@@ -262,12 +309,46 @@ mod tests {
     }
 
     #[test]
-    fn busy_never_gets_the_quiet_bar() {
-        for load in every_load().filter(|load| load.is_busy) {
-            for owed in every_owed() {
-                assert_ne!(record_bar(load, owed), QUIET_BAR, "{load:?} {owed:?}");
-            }
+    fn busy_gets_the_floor_and_the_pace() {
+        let owed = Owed { is_reclaim_due: true, is_reclaim_held: false };
+        for load in every_load().filter(|load| load.is_busy && !load.is_disk_short) {
+            assert_eq!(record_bar(load, owed), QUIET_BAR, "{load:?}");
+            assert!(is_paced(load, false), "{load:?}");
         }
+    }
+
+    #[test]
+    fn past_half_quiet_and_short_disks_go_unpaced() {
+        for load in every_load() {
+            assert!(!is_paced(load, true), "{load:?}");
+            assert_eq!(is_paced(load, false), load.is_busy && !load.is_disk_short, "{load:?}");
+        }
+    }
+
+    #[test]
+    fn pace_holds_the_floor() {
+        // a rewrite at a 30% floor copies seven bytes for each three it frees, which 2,333 a thousand pays for
+        let freed = 3_000_000;
+        assert!(pace_credit(freed, PACE_PER_MILLE) >= 7_000_000 - 1_000);
+        assert_eq!(pace_credit(freed, 0), 0);
+        assert_eq!(pace_credit(u64::MAX, PACE_PER_MILLE), u64::MAX / 1_000);
+    }
+
+    #[test]
+    fn pace_cell_spends_settles_and_caps() {
+        let cell = PaceCell::default();
+        let cap = 100;
+        assert!(!cell.spend(1), "an empty credit paid for a pick");
+        cell.add(250, cap);
+        assert_eq!(cell.credit(), 100, "the credit passed one pick's worth");
+        assert!(cell.spend(60));
+        assert!(!cell.spend(60), "a pick spent past the credit");
+        // a rewrite that wrote four times its estimate pays the difference
+        cell.settle(60, 240, cap);
+        assert_eq!(cell.credit(), 40 + 60 - 240);
+        assert!(!cell.spend(1), "a credit in debt paid for a pick");
+        cell.add(1_000, cap);
+        assert_eq!(cell.credit(), cap as i64);
     }
 
     #[test]

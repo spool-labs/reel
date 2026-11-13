@@ -55,7 +55,7 @@ use crate::engine::filter_job::FilterLoader;
 use crate::engine::planner::Planner;
 use crate::engine::walk_job::{BlockCounter, WalkJob, WalkSlot, WalkWorker};
 use crate::engine::workers::Workers;
-use crate::engine::load_state::LoadCell;
+use crate::engine::load_state::{LoadCell, PaceCell};
 use crate::engine::volume::{SealStepTimes, ClaimState, GaveUp, LookPass, MOST_MERGE_OUTPUTS, MOST_PARKED, NO_SEAL, RewriteLane, SyncState, Volume, BitsSave};
 #[cfg(feature = "test-hooks")]
 use crate::engine::volume::TestHolds;
@@ -1442,6 +1442,10 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         callers_seen: AtomicU64::new(0),
         last_call_at: AtomicU64::new(0),
         capped_picks: AtomicU64::new(0),
+        pace_refusals: AtomicU64::new(0),
+        trust_fallbacks: AtomicU64::new(0),
+        dead_counted: AtomicU64::new(0),
+        paced_written: AtomicU64::new(0),
         outputs_promised: AtomicU64::new(0),
         is_room_refused: AtomicBool::new(false),
         room_refused_at: AtomicU64::new(0),
@@ -1459,6 +1463,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         bytes_freed: AtomicU64::new(0),
         has_held_frees: AtomicBool::new(false),
         seals_done: AtomicU64::new(0),
+        walks_finished: AtomicU64::new(0),
         segments_unlinked: AtomicU64::new(0),
         segments_parked: AtomicU64::new(0),
         segments_leaving: AtomicU64::new(0),
@@ -1474,6 +1479,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         claims_changed: AtomicU64::new(0),
         looks: LookPass::default(),
         load: LoadCell::default(),
+        pace: PaceCell::default(),
         walks_held: AtomicU64::new(0),
         walk_claim_waits: AtomicU64::new(0),
         walk_claim_held: AtomicU64::new(0),

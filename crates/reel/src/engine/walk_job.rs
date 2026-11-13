@@ -19,7 +19,7 @@ use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, WritePlace};
 
 use crate::config::{MAX_KEY_BYTES, MOST_VOLUME_SLOTS};
-use crate::engine::load_state::is_capped;
+use crate::engine::load_state::{is_capped, pace_credit};
 use crate::engine::held_bits::HeldRow;
 use crate::engine::cover_apply::{ApplyStep, CoverApply};
 use crate::engine::engine_state::EngineState;
@@ -780,6 +780,10 @@ impl<Backend: Io> WalkJob<Backend> {
         }
         drop(rows);
         volume.walk_blocks.fetch_add(1, Ordering::Relaxed);
+        // the dead bytes a block counted pay for paced rewrites at the pace's multiplier, up to one pick's worth
+        let dead_bytes = counts.counts.iter().map(|count| count.bytes.0).sum();
+        volume.pace.add(pace_credit(dead_bytes, volume.pace_per_mille()), volume.segment_bytes.0);
+        volume.dead_counted.fetch_add(dead_bytes, Ordering::Relaxed);
         for count in counts.counts.iter().filter(|count| count.rows > 0) {
             volume.table.drop_live(count.segment, count.block, count.rows, count.replacement);
         }
@@ -865,6 +869,8 @@ impl<Backend: Io> WalkJob<Backend> {
     /// End a walk target
     pub fn finish_target(&mut self, volume: &Volume<Backend>, segment: SegmentNumber) -> Result<()> {
         volume.table.mark_walked(segment);
+        // the counts just landed, so the segment may have crossed a bar, and a pick a refusal holds back looks again
+        volume.walks_finished.fetch_add(1, Ordering::AcqRel);
         volume.has_walk_target.store(false, Ordering::Release);
         volume.walk_segment.store(NO_SEAL, Ordering::Release);
         volume.wants_compaction.store(true, Ordering::Release);

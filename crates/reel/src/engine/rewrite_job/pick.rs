@@ -27,7 +27,7 @@ use crate::segment::summary::{SummaryRow, SummaryRows};
 use crate::segment::summary_orders::{COVERS_LIST, ROW_FOOTER_BYTES, SHARE_BUCKETS, SHARE_SCALE, WalkList, is_wholly_dead, reclaim_share, share_bucket};
 
 use crate::engine::compact_job::can_unlink;
-use crate::engine::load_state::{OverlapLanes, Owed, is_capped, is_deferring, overlap_lanes, record_bar};
+use crate::engine::load_state::{Load, OverlapLanes, Owed, is_capped, is_deferring, is_paced, overlap_lanes, record_bar};
 use crate::engine::rewrite_job::{BAR_SCALE, BUCKET_LOOKS, MOST_PASSED_LOOKS, BarsFired, CROWD_PAGES, MOST_COUNTED_CROWD, MOST_LOOK_TIME, OVERLAP_BASE_RECORD_BYTES, EARLY_BAR, GATHER_LOOKS, MOST_OVERLAP, MergeInput, MergeTarget, OVERLAP_LOOKS, OVERLAP_PROBES, PLAIN_BAR, PLANNER_LANE, RewriteJob, RewritePhase, rows_of};
 use crate::engine::rewrite_job::install::freed_in_place;
 
@@ -184,9 +184,9 @@ impl<Backend: Io> RewriteJob<Backend> {
             volume.note_pick(PickOutcome::Deferred);
             return None;
         }
-        // hot ingest with room to spare in the table and on the disk leaves overlap merges and record rewrites for quiet time. A
-        // trickle a merge outpaces isn't hot, so record rewrites reclaim under it at the plain bar
-        if is_deferring(load) {
+        // record rewrites run under hot ingest at the pace, which the dead bytes the walk counts pay for. A spinning disk keeps
+        // today's rule, leaving them for quiet time, until a run on one measures the pace
+        if is_deferring(load) && volume.is_spinning {
             volume.note_pick(PickOutcome::Deferred);
             return None;
         }
@@ -197,7 +197,21 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
         let current = DeathMark(self.state.current_mark.load(Ordering::Relaxed));
         let owed = Owed { is_reclaim_due: is_reclaim_due(&rows), is_reclaim_held: volume.is_reclaim_held() };
-        let plain = record_bar(load, owed);
+        // a row's counts are trusted with every segment walked, or with every replacement charged below the unwalked ones. A
+        // trusted row goes at the floor, under ingest too, and one that isn't waits for the half bar. Under ingest a short disk
+        // holds trusted rows to the floor, since past it a copy is of mostly live rows while the disk fills
+        let (floor, half) = match owed.is_reclaim_due {
+            true => (record_bar(load, owed), PLAIN_BAR),
+            false => (record_bar(Load { is_disk_short: false, ..load }, Owed { is_reclaim_due: true, ..owed }), PLAIN_BAR),
+        };
+        let walked_below = walked_below(&rows);
+        let bar_of = |row: &SummaryRow<'_>| match is_count_trusted(volume, row.facts.segment, walked_below) {
+            true => floor,
+            false => {
+                volume.trust_fallbacks.fetch_add(1, Ordering::Relaxed);
+                half.max(floor)
+            },
+        };
         let gave_up = self.gave_up_list(volume);
         let index = self.volume;
         // a wholly dead segment the unlink can take now goes by the unlink, and a rewrite of it would throw one of the two away
@@ -207,14 +221,19 @@ impl<Backend: Io> RewriteJob<Backend> {
             let is_free = row.facts.is_walked() && row.facts.segment.0 != walking && !gave_up.holds(row.facts.segment);
             is_free && !is_for_unlink(row) && is_rewrite_ready(volume, row, 0, bar) && is_rewrite_ready(volume, row, freed_in_place(volume, row), bar)
         };
-        let is_ready = |row: &SummaryRow<'_>| is_ready_at(row, plain);
+        let is_ready = |row: &SummaryRow<'_>| is_ready_at(row, bar_of(row));
         // the most won back for the bytes read goes first, and a picked row moves to its bucket's end, so a merge that gave way
         // lets the next one up
-        if let Some(first) = first_ready(&rows, plain, is_ready, is_for_unlink) {
+        if let Some(first) = first_ready(&rows, floor.min(half), is_ready, is_for_unlink) {
             let is_grave_heavy = is_grave_heavy(&first);
             let (segment, lifetime) = (first.facts.segment, first.facts.marks);
             let is_more = |row: &SummaryRow<'_>| is_ready(row) && row.facts.segment > segment && row.facts.marks.shares_lifetime(lifetime);
             let target = self.gather(volume, &rows, &first, room, is_more);
+            // a pick goes with no pace only when every input is past half dead, so a first input past half gathers no paced rows
+            // for free
+            let mut inputs = self.numbers[..self.input_count].iter().filter_map(|number| rows.get(*number));
+            let is_past_half = inputs.all(|row| is_ready_at(&row, PLAIN_BAR));
+            self.is_paced = is_paced(load, is_past_half);
             self.note_bars(&rows, current);
             rows.rotate(segment);
             self.picked_as = Some(PickOutcome::Record);
@@ -846,7 +865,7 @@ impl<Backend: Io> RewriteJob<Backend> {
     pub fn disk_room_for(&self, volume: &Volume<Backend>, length: ByteCount) -> Option<ByteCount> {
         let summary = hold(&volume.summary);
         // every segment below this place has finished its walk, so a replacement under it is one the merge's ask can find
-        let walked_below = summary.rows().filter(|row| !row.facts.is_walked()).map(|row| row.facts.places.lowest).min();
+        let walked_below = walked_below(&summary);
         let (mut inputs, mut output, mut lowest) = (0, 0, WritePlace(u64::MAX));
         for row in self.numbers[..self.input_count].iter().filter_map(|number| summary.get(*number)) {
             inputs += row.facts.file_length.0;
@@ -867,6 +886,26 @@ impl<Backend: Io> RewriteJob<Backend> {
         let output = ByteCount(output.min(length.0));
         has_disk_room(&self.state, volume, output, output.0 < inputs).then_some(output)
     }
+}
+
+/// Most rows of the walk lists a pick reads for the lowest place not yet walked, past which it trusts no count
+pub const MOST_UNWALKED_LOOKS: usize = 1_024;
+
+/// Find the lowest place of a segment the walk hasn't finished, from the walk lists, which hold only unwalked rows. Lists past
+/// their looks give the lowest place there is, so no count is trusted
+pub fn walked_below(rows: &SummaryRows) -> Option<WritePlace> {
+    let orders = rows.orders();
+    let listed = orders.walk_list(WalkList::Unwalked).chain(orders.walk_list(WalkList::Backward));
+    let mut lowest: Option<WritePlace> = None;
+    for (looks, segment) in listed.enumerate() {
+        if looks == MOST_UNWALKED_LOOKS {
+            return Some(WritePlace(0));
+        }
+        if let Some(row) = rows.get(segment) {
+            lowest = Some(lowest.map_or(row.facts.places.lowest, |held| held.min(row.facts.places.lowest)));
+        }
+    }
+    lowest
 }
 
 /// Check a segment's dead counts stand for rows a merge drops: with no segment unwalked, or with every replacement charged since

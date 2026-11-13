@@ -412,6 +412,10 @@ pub struct RewriteJob<Backend: Io> {
     region_need: ByteCount,
     /// The forced segment a pick took, which goes back when admission turns the pick away
     forced_pick: Option<SegmentNumber>,
+    /// The record pick in hand spends the pace's credit, with an input under half dead while callers are busy
+    is_paced: bool,
+    /// What the rewrite under way spent of the pace's credit, settled at its end
+    paced_spent: u64,
     /// The mapping this run's lists are carved from, held from an admitted start to the install or the abandon
     region: Option<Region>,
     /// Holds the segments outside the merge that a step asks for newer rows
@@ -550,6 +554,8 @@ impl<Backend: Io> RewriteJob<Backend> {
             unreadable: None,
             region_need: ByteCount(0),
             forced_pick: None,
+            is_paced: false,
+            paced_spent: 0,
             region: None,
             cursor: KeyCursor::new(),
             most_grave_blocks: MOST_GRAVE_BLOCKS,
@@ -747,6 +753,18 @@ impl<Backend: Io> RewriteJob<Backend> {
                 most = self.input_count / 2;
                 continue;
             };
+            // a paced pick waits for the walk to count the dead bytes that pay for it, and a smaller one may fit the credit
+            let is_paced = self.is_paced && self.picked_as == Some(PickOutcome::Record);
+            if is_paced && volume.pace.credit() < output.0 as i64 {
+                self.unpick(volume);
+                volume.pace_refusals.fetch_add(1, Ordering::Relaxed);
+                volume.note_pick(PickOutcome::Deferred);
+                if self.input_count < 2 {
+                    return None;
+                }
+                most = self.input_count / 2;
+                continue;
+            }
             let mut bound = self.bound(volume);
             // offset order first, and the same pick in key order when its lists don't fit, which the floor alone admits
             let mut admit = None;
@@ -768,6 +786,9 @@ impl<Backend: Io> RewriteJob<Backend> {
                 volume.most_in_flight.fetch_max(in_flight, Ordering::Relaxed);
                 volume.is_room_refused.store(false, Ordering::Release);
                 self.forced_pick = None;
+                if is_paced && volume.pace.spend(output.0) {
+                    self.paced_spent = output.0;
+                }
                 return Some(picked);
             }
             self.unpick(volume);
@@ -777,6 +798,15 @@ impl<Backend: Io> RewriteJob<Backend> {
             most = self.input_count / 2;
         }
         None
+    }
+
+    /// Settle what the rewrite spent of the pace's credit against what it wrote, once it ends
+    pub fn settle_pace(&mut self, volume: &Volume<Backend>, written: u64) {
+        let spent = mem::take(&mut self.paced_spent);
+        if spent > 0 {
+            volume.pace.settle(spent, written, volume.segment_bytes.0);
+            volume.paced_written.fetch_add(written, Ordering::Relaxed);
+        }
     }
 
     /// Put back what a pick took when admission turned it away

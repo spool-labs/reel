@@ -338,6 +338,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             _other => OTHER_MERGE,
         };
         volume.note_rewrite_bytes(gone, written, kind);
+        self.settle_pace(volume, written.file);
         volume.rewrite_footers_by_share[kind].fetch_add(footers, Ordering::Relaxed);
         self.end_rebuild(volume);
         let saved = state.save_summary(volume);
@@ -559,6 +560,8 @@ impl<Backend: Io> RewriteJob<Backend> {
         let volume = &state.volumes[self.volume];
         let given_up = self.staged.iter().map(|staged| staged.facts.file_length.0).sum::<u64>() + self.records_end.0 + self.used as u64;
         state.note_written(WriteSource::GivenUp, ByteCount(given_up));
+        // what it wrote and threw away was copy all the same
+        self.settle_pace(volume, given_up);
         let slots = mem::take(&mut *hold(&volume.lanes[self.lane].partial_outputs));
         // what the table holds waits for no read, since no list ever had it, and the removes below close the files
         for staged in &self.staged {

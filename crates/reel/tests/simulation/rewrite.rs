@@ -3144,7 +3144,8 @@ fn hot_ingest_merges_once_room_runs_short() {
         // read hot
         if volume.segments_rewritten.load(Ordering::Acquire) > 0 {
             assert!(could_pass_half || short_at.is_some(), "a merge ran under hot ingest with room to spare");
-            assert!(volume.picks[PickOutcome::Deferred.index()].load(Ordering::Acquire) > 0, "nothing was put off");
+            let put_off = [PickOutcome::Deferred, PickOutcome::Behind].map(|outcome| volume.picks[outcome.index()].load(Ordering::Acquire));
+            assert!(put_off.iter().sum::<u64>() > 0, "nothing was put off");
             store.close().expect("close");
             return;
         }
@@ -3768,6 +3769,14 @@ fn partly_dead(io: &SimulatedIo, share: (u64, u64)) {
     store.close().expect("close");
 }
 
+fn rewritten(store: &Store) -> u64 {
+    store.state.volumes[0].segments_rewritten.load(Ordering::Acquire)
+}
+
+fn pace_refusals(store: &Store) -> u64 {
+    store.state.volumes[0].pace_refusals.load(Ordering::Acquire)
+}
+
 fn record_picks(store: &Store) -> u64 {
     store.state.volumes[0].picks[PickOutcome::Record.index()].load(Ordering::Acquire)
 }
@@ -3797,23 +3806,26 @@ fn check_partly(store: &Store, share: (u64, u64)) {
     }
 }
 
-// a store just opened reads busy, so a segment past the quiet bar waits for a quiet spell with no call before the bar takes it
+// a store just opened reads busy and no walk has counted since, so the pace has no credit and a segment past the floor waits
+// for a quiet spell with no call
 #[test]
 fn open_reads_busy_until_a_quiet_spell() {
     let io = SimulatedIo::new(Seed(120));
     partly_dead(&io, PAST_QUIET);
     let store = open(&io);
     run_until(&store, &io, Nanoseconds(io.clock_reading().0 + IDLE_SEAL_AFTER.0 / 2), || {});
-    assert_eq!(record_picks(&store), 0, "a record rewrite ran at the quiet bar right after the open");
+    assert_eq!(rewritten(&store), 0, "a paced rewrite ran with no credit right after the open");
+    assert!(pace_refusals(&store) > 0, "the pace refused nothing");
     run_until(&store, &io, spells_from_now(&io, 2), || {});
     assert!(record_picks(&store) > 0, "the quiet bar took nothing after a quiet spell");
     check_partly(&store, PAST_QUIET);
     store.close().expect("close");
 }
 
-// a scan's rows count as calls, so a long scan holds the plain bar, and the quiet bar takes the segment once it ends
+// a scan's rows count as calls and kill nothing, so the pace has no credit while it runs, and the floor takes the segment once
+// it ends
 #[test]
-fn scan_holds_the_plain_bar() {
+fn scan_holds_the_pace() {
     let io = SimulatedIo::new(Seed(121));
     partly_dead(&io, PAST_QUIET);
     let store = open(&io);
@@ -3824,7 +3836,7 @@ fn scan_holds_the_plain_bar() {
             scan = store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan");
         }
     });
-    assert_eq!(record_picks(&store), 0, "a record rewrite ran at the quiet bar under a scan");
+    assert_eq!(rewritten(&store), 0, "a paced rewrite ran under a scan with no credit");
     drop(scan);
     run_until(&store, &io, spells_from_now(&io, 2), || {});
     assert!(record_picks(&store) > 0, "the quiet bar took nothing once the scan ended");
@@ -3832,9 +3844,9 @@ fn scan_holds_the_plain_bar() {
     store.close().expect("close");
 }
 
-// puts count as calls before their first seal, so writes after an open hold the plain bar
+// puts of new keys count as calls and kill nothing, so the walk counts no dead bytes and the pace starts no rewrite under them
 #[test]
-fn puts_hold_the_plain_bar() {
+fn new_keys_pay_no_pace() {
     let io = SimulatedIo::new(Seed(122));
     partly_dead(&io, PAST_QUIET);
     let store = open(&io);
@@ -3843,7 +3855,7 @@ fn puts_hold_the_plain_bar() {
         store.put(COLUMN, format!("fresh-{number:06}").as_bytes(), b"value").expect("put");
         number += 1;
     });
-    assert_eq!(record_picks(&store), 0, "a record rewrite ran at the quiet bar under puts");
+    assert_eq!(rewritten(&store), 0, "a paced rewrite ran under puts of new keys");
     run_until(&store, &io, spells_from_now(&io, BUSY_SPELLS), || {});
     assert!(record_picks(&store) > 0, "the quiet bar took nothing once the puts stopped");
     check_partly(&store, PAST_QUIET);
@@ -4072,17 +4084,25 @@ fn short_disk_reclaims_under_hot_ingest() {
     store.close().expect("close");
 }
 
-// a pick put off by hot ingest waits for the window to close, and a seal stuck in that wait forces a segment that moves at once
+// a pick the pace put off waits for its credit, and a seal stuck in that wait forces a segment that moves at once
 #[test]
-fn forced_segment_ends_a_hot_wait() {
+fn forced_segment_ends_a_pace_wait() {
     let io = SimulatedIo::new(Seed(133));
     let store = open(&io);
     let volume = &store.state.volumes[0];
     hold_compaction(&store, true);
-    for number in 0..LONE_SEGMENTS {
-        store.put(COLUMN, format!("zz-lone-{number:03}").as_bytes(), b"alone").expect("put");
-        seal(&store, &io);
+    for number in 0..LIGHT_KEYS {
+        store.put(COLUMN, &light_key(number), b"first").expect("put");
     }
+    seal(&store, &io);
+    for number in (0..LIGHT_KEYS).filter(|number| is_written_again(*number, PAST_QUIET)) {
+        store.put(COLUMN, &light_key(number), b"second").expect("put");
+    }
+    seal(&store, &io);
+    // the pace owes more than a walk could pay in the test, so a pick under half dead is put off
+    volume.pace.settle(0, 1 << 40, volume.segment_bytes.0);
+    // no overlap stands, so the pick goes on to the records
+    volume.is_over_bound.store(false, Ordering::Release);
     hold_compaction(&store, false);
     io.hold_jobs("reel-planner", true);
     let forced = || volume.picks[PickOutcome::Forced.index()].load(Ordering::Acquire);
@@ -4094,7 +4114,7 @@ fn forced_segment_ends_a_hot_wait() {
     for _step in 0..MOST_FORCED_STEPS {
         let _step = job.step_unit(io.clock_reading());
     }
-    assert!(deferred() > deferred_before, "hot ingest put no pick off");
+    assert!(deferred() > deferred_before, "the pace put no pick off");
     assert_eq!(forced(), 0);
     volume.stuck_shard.store(shard_of(newest_segment(&store)), Ordering::Release);
     for _step in 0..MOST_FORCED_STEPS {
@@ -4103,7 +4123,7 @@ fn forced_segment_ends_a_hot_wait() {
             break;
         }
     }
-    assert!(forced() > 0, "the forced segment waited out the hot window");
+    assert!(forced() > 0, "the forced segment waited out the pace");
     volume.stuck_shard.store(NO_SHARD, Ordering::Release);
     run_to_end(&mut job);
     io.hold_jobs("reel-planner", false);
@@ -4185,5 +4205,356 @@ fn long_look_pass_leaves_the_walk_its_turn() {
         report.longest_walkless_steps,
         report.longest_walkless_kind
     );
+    store.close().expect("close");
+}
+
+/// Keys of each segment the pace tests build
+const PACE_KEYS: u64 = 100;
+
+// a segment of its own keys, then a share of them written again and sealed apart, so it ends that share dead
+fn segment_dead_by(store: &Store, io: &SimulatedIo, name: &str, dead_share: u64) -> SegmentNumber {
+    for number in 0..PACE_KEYS {
+        store.put(COLUMN, format!("{name}-{number:03}").as_bytes(), b"first-value").expect("put");
+    }
+    let segment = seal(store, io);
+    for number in 0..PACE_KEYS * dead_share / 100 {
+        store.put(COLUMN, format!("{name}-{number:03}").as_bytes(), b"second-value").expect("put");
+    }
+    if dead_share > 0 {
+        seal(store, io);
+    }
+    segment
+}
+
+// the pace owes more than any walk in a test could pay, so every paced pick is put off
+fn drain_pace(volume: &Volume<SimulatedIo>) {
+    volume.pace.settle(0, 1 << 40, volume.segment_bytes.0);
+}
+
+// a merge goes unpaced only when every input is past half dead: with no credit, a segment past half beside one under it under
+// busy callers goes alone, and its neighbour waits for the pace
+#[test]
+fn past_half_pick_leaves_its_paced_neighbour() {
+    let io = SimulatedIo::new(Seed(140));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let volume = &store.state.volumes[0];
+    let past_half = segment_dead_by(&store, &io, "past", 60);
+    let under_half = segment_dead_by(&store, &io, "under", 35);
+    drain_pace(volume);
+    volume.is_over_bound.store(false, Ordering::Release);
+    store.put(COLUMN, b"a-call", b"value").expect("put");
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(start_merge(&mut job), "no rewrite started");
+    assert_eq!(job.rewrite.input_numbers(), [past_half], "the pick took {under_half:?} past the pace");
+    assert!(volume.pace_refusals.load(Ordering::Acquire) > 0, "the pace refused nothing");
+    shape::abandon_rewrites(&mut job);
+    store.close().expect("close");
+}
+
+// puts of new keys over a backlog under the half bar kill nothing, so the walk counts no dead bytes and the pace starts no
+// rewrite while they last
+#[test]
+fn inserts_over_a_backlog_start_no_paced_rewrite() {
+    let io = SimulatedIo::new(Seed(141));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let volume = &store.state.volumes[0];
+    segment_dead_by(&store, &io, "backlog", 40);
+    drain_pace(volume);
+    // the drain is a debt, so the test starts the inserts from no credit
+    volume.pace.settle(0, 0, volume.segment_bytes.0);
+    let owed = -volume.pace.credit();
+    volume.pace.add(owed as u64, volume.segment_bytes.0);
+    assert_eq!(volume.pace.credit(), 0);
+    volume.is_over_bound.store(false, Ordering::Release);
+    hold_compaction(&store, false);
+    let before = rewritten(&store);
+    for round in 0..PACE_KEYS {
+        for number in 0..PACE_KEYS {
+            store.put(COLUMN, format!("new-{round:03}-{number:03}").as_bytes(), b"value").expect("put");
+        }
+        store.state.ask_compaction();
+        store.seal_now();
+        settle(&io);
+        assert_eq!(rewritten(&store), before, "a paced rewrite ran under inserts at round {round}");
+    }
+    assert_eq!(volume.pace.credit(), 0, "inserts paid the pace");
+    store.close().expect("close");
+}
+
+/// A value large enough that a segment's dead bytes, and the credit they pay, dwarf its rows' footers
+const PACE_VALUE_BYTES: usize = 1_024;
+
+// write a segment of its own keys at the pace's value size and seal it, then write a share of them again and seal that apart
+fn large_segment_dead_by(store: &Store, io: &SimulatedIo, name: &str, dead_share: u64) -> SegmentNumber {
+    let value = vec![7; PACE_VALUE_BYTES];
+    for number in 0..PACE_KEYS {
+        store.put(COLUMN, format!("{name}-{number:03}").as_bytes(), &value).expect("put");
+    }
+    let segment = seal(store, io);
+    for number in 0..PACE_KEYS * dead_share / 100 {
+        store.put(COLUMN, format!("{name}-{number:03}").as_bytes(), &value).expect("put");
+    }
+    if dead_share > 0 {
+        seal(store, io);
+    }
+    segment
+}
+
+// set the pace's credit to none, neither banked nor owed
+fn zero_pace(volume: &Volume<SimulatedIo>) {
+    let cap = volume.segment_bytes.0;
+    volume.pace.settle(0, 0, cap);
+    let held = volume.pace.credit();
+    if held > 0 {
+        assert!(volume.pace.spend(held as u64));
+    } else {
+        volume.pace.add(held.unsigned_abs(), cap);
+    }
+    assert_eq!(volume.pace.credit(), 0);
+}
+
+// under hot ingest a pick the pace refused waits, and the walk that lands the dead bytes paying for it starts it at the next step,
+// well before the hot window closes
+#[test]
+fn walk_landing_starts_a_paced_pick() {
+    let io = SimulatedIo::new(Seed(142));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    large_segment_dead_by(&store, &io, "backlog", 35);
+    let other = large_segment_dead_by(&store, &io, "other", 0);
+    zero_pace(volume);
+    volume.is_over_bound.store(false, Ordering::Release);
+    io.hold_jobs("reel-planner", true);
+    hold_compaction(&store, false);
+    make_hot(volume, &io);
+    let hot_until = volume.hot_until();
+    let mut job = CompactJob::new(Arc::clone(state), 0);
+    store.state.ask_compaction();
+    for _step in 0..MOST_FORCED_STEPS {
+        job.step_unit(io.clock_reading());
+    }
+    assert!(volume.pace_refusals.load(Ordering::Acquire) > 0, "the pace refused nothing");
+    assert!(!shape::is_rewriting(&job), "a paced rewrite ran with no credit");
+    // writes that kill a third of the other segment, sealed, and walked by hand since the planner is held
+    let value = vec![9; PACE_VALUE_BYTES];
+    for number in 0..PACE_KEYS / 3 {
+        store.put(COLUMN, format!("other-{number:03}").as_bytes(), &value).expect("put");
+    }
+    store.seal_now();
+    settle(&io);
+    let mut walk = WalkJob::new(Arc::clone(state), 0);
+    for _step in 0..MOST_LOOPS {
+        if state.pending_walks(0) == 0 {
+            break;
+        }
+        walk.step_unit(io.clock_reading());
+        // walk workers count the blocks on their own jobs, which the planner's hold leaves running
+        while io.step_any().is_some() {}
+    }
+    assert_eq!(state.pending_walks(0), 0, "the walk never ended");
+    assert!(volume.pace.credit() > 0, "the walk paid nothing for {other:?}'s dead bytes");
+    for _step in 0..MOST_FORCED_STEPS {
+        job.step_unit(io.clock_reading());
+        if shape::is_rewriting(&job) {
+            break;
+        }
+    }
+    assert!(io.clock_reading() < hot_until, "the test outlasted the hot window");
+    assert!(shape::is_rewriting(&job), "the walk's landing started no paced rewrite");
+    shape::finish_rewrites(&mut job);
+    drop(walk);
+    io.hold_jobs("reel-planner", false);
+    store.close().expect("close");
+}
+
+/// Cold keys written once in segments of their own, then a share of them written again, so each cold segment sits in the paced
+/// band with nothing more to kill it. Hot keys take the steady overwrites beside them
+const COLD_KEYS: u64 = 200;
+const COLD_SEGMENT_KEYS: u64 = 40;
+const COLD_DEAD: (u64, u64) = (2, 5);
+const HOT_KEYS: u64 = 20;
+const STEADY_ROUNDS: u64 = 300;
+const STEADY_ROUND_KEYS: u64 = 40;
+
+/// What a steady load left: record bytes over live, and the copy paced rewrites made against the dead bytes the walk counted
+struct Steady {
+    space: f64,
+    paced_written: u64,
+    dead_counted: u64,
+    segment_bytes: u64,
+}
+
+// run a steady overwrite load under busy callers at a pace, with the estimates true or a quarter of what the merges write
+fn steady_space(seed: u64, pace_per_mille: u64, is_estimate_low: bool) -> Steady {
+    let io = SimulatedIo::new(Seed(seed));
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    volume.holds.pace_per_mille.store(pace_per_mille, Ordering::Release);
+    volume.holds.is_pace_set.store(true, Ordering::Release);
+    volume.holds.low_estimate.store(is_estimate_low, Ordering::Release);
+    let mut random = SeededRandom::new(Seed(seed));
+    let value = vec![5; PACE_VALUE_BYTES];
+    for number in 0..COLD_KEYS {
+        store.put(COLUMN, format!("cold-{number:04}").as_bytes(), &value).expect("put");
+        if (number + 1) % COLD_SEGMENT_KEYS == 0 {
+            store.seal_now();
+            settle(&io);
+        }
+    }
+    for number in (0..COLD_KEYS).filter(|number| is_written_again(*number, COLD_DEAD)) {
+        store.put(COLUMN, format!("cold-{number:04}").as_bytes(), &value).expect("put");
+    }
+    store.seal_now();
+    settle(&io);
+    for _round in 0..STEADY_ROUNDS {
+        for _key in 0..STEADY_ROUND_KEYS {
+            let number = random.next_word() % HOT_KEYS;
+            store.put(COLUMN, format!("hot-{number:04}").as_bytes(), &value).expect("put");
+        }
+        store.state.ask_compaction();
+        store.seal_now();
+        settle(&io);
+    }
+    // record bytes, live and dead, over the live set: a sim's segment files hold room past their records, which says nothing of
+    // what reclaim left behind
+    let rows = hold(&volume.summary);
+    let held: u64 = rows.rows().map(|row| {
+        let mut cursor = row.cursor();
+        (0..row.column_count).filter_map(|_column| cursor.column()).map(|column| column.live_bytes.0 + column.dead_bytes.0).sum::<u64>()
+    }).sum();
+    drop(rows);
+    let live = (COLD_KEYS + HOT_KEYS) * PACE_VALUE_BYTES as u64;
+    println!("pace {pace_per_mille}: {} rewrites, {} refused", volume.segments_rewritten.load(Ordering::Acquire), volume.pace_refusals.load(Ordering::Acquire));
+    let paced_written = volume.paced_written.load(Ordering::Acquire);
+    let dead_counted = volume.dead_counted.load(Ordering::Acquire);
+    let segment_bytes = volume.segment_bytes.0;
+    store.close().expect("close");
+    Steady { space: held as f64 / live as f64, paced_written, dead_counted, segment_bytes }
+}
+
+// steady overwrites under busy callers pay the pace to reclaim a backlog sitting between the floor and half dead, which with no
+// pace stays until a quiet spell
+#[test]
+fn pace_holds_space_under_steady_overwrites() {
+    let paced = steady_space(143, reel::engine::load_state::PACE_PER_MILLE, false).space;
+    let unpaced = steady_space(143, 0, false).space;
+    println!("space over live: {paced:.2} paced, {unpaced:.2} with no pace");
+    assert!(paced < unpaced, "the pace held no less space than none: {paced:.2} against {unpaced:.2}");
+    assert!(paced < STEADY_BOUND, "the pace let space reach {paced:.2}");
+}
+
+/// Record bytes over live the pace holds the load to: the cold segments rewritten past the floor, with room for the hot ones not
+/// yet past it
+const STEADY_BOUND: f64 = 1.3;
+
+// a pace low enough to bind, with estimates true or a quarter of what the merges write, still holds paced copy to the credit the
+// walk's dead bytes earned and one pick past it, since each rewrite settles its estimate against what it wrote
+#[test]
+fn pace_settles_wrong_estimates() {
+    let pace = BINDING_PACE;
+    for is_estimate_low in [false, true] {
+        let steady = steady_space(144, pace, is_estimate_low);
+        let allowed = reel::engine::load_state::pace_credit(steady.dead_counted, pace) + steady.segment_bytes;
+        println!("low estimate {is_estimate_low}: paced copy {} against {} dead", steady.paced_written, steady.dead_counted);
+        assert!(steady.paced_written > 0, "no paced rewrite ran");
+        assert!(steady.paced_written <= allowed, "paced copy {} passed the pace's {allowed}", steady.paced_written);
+    }
+}
+
+/// A pace of a twentieth of a byte of copy a dead byte, low enough that the credit binds the steady load
+const BINDING_PACE: u64 = 50;
+
+// a spinning disk keeps today's rule: hot ingest leaves record rewrites for quiet time, and the pace isn't asked
+#[test]
+fn spinning_disk_keeps_records_for_quiet_time() {
+    let io = SimulatedIo::new(Seed(145));
+    let mut config = config();
+    config.volumes[0].device = reel::config::DeviceClass::Spinning;
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    hold_compaction(&store, true);
+    let volume = &store.state.volumes[0];
+    assert!(volume.is_spinning);
+    large_segment_dead_by(&store, &io, "spinning", 40);
+    volume.is_over_bound.store(false, Ordering::Release);
+    io.hold_jobs("reel-planner", true);
+    hold_compaction(&store, false);
+    make_hot(volume, &io);
+    let deferred = || volume.picks[PickOutcome::Deferred.index()].load(Ordering::Acquire);
+    let before = deferred();
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    store.state.ask_compaction();
+    for _step in 0..MOST_FORCED_STEPS {
+        job.step_unit(io.clock_reading());
+    }
+    assert!(deferred() > before, "hot ingest put no record pick off");
+    assert_eq!(volume.pace_refusals.load(Ordering::Acquire), 0, "the pace was asked on a spinning disk");
+    assert!(!shape::is_rewriting(&job), "a record rewrite ran under hot ingest on a spinning disk");
+    io.hold_jobs("reel-planner", false);
+    store.close().expect("close");
+}
+
+const SECOND_ROOT: &str = "/disk/second";
+const SECOND_COLUMN: ColumnId = ColumnId(2);
+
+// each volume earns its own pace: dead bytes on one pay for its rewrites and leave the other's credit where it was
+#[test]
+fn volumes_earn_their_own_pace() {
+    let io = SimulatedIo::new(Seed(146));
+    let mut config = config();
+    // two volumes plan two of every per-volume part
+    config.memory_budget = ByteCount(128 * 1024 * 1024);
+    let mut second = config.volumes[0].clone();
+    second.name = "second".to_string();
+    second.roots = vec![PathBuf::from(SECOND_ROOT)];
+    config.volumes.push(second);
+    let mut column = config.columns[0].clone();
+    column.id = SECOND_COLUMN;
+    column.name = "second".to_string();
+    column.volume = VolumeId(1);
+    config.columns.push(column);
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let value = vec![3; PACE_VALUE_BYTES];
+    for _pass in 0..2 {
+        for number in 0..PACE_KEYS {
+            store.put(COLUMN, format!("first-{number:03}").as_bytes(), &value).expect("put");
+        }
+        store.seal_now();
+        settle(&io);
+    }
+    store.put(SECOND_COLUMN, b"only", &value).expect("put");
+    store.seal_now();
+    settle(&io);
+    let [first, second] = [0, 1].map(|index| store.state.volumes[index].dead_counted.load(Ordering::Acquire));
+    assert!(first > 0, "the walk counted nothing dead on the first volume");
+    assert_eq!(second, 0, "the second volume counted the first's dead bytes");
+    assert!(store.state.volumes[1].pace.credit() <= 0, "the second volume earned credit for the first's writes");
+    store.close().expect("close");
+}
+
+// after a reopen no replacement is charged yet, so while a segment waits for its walk a pick holds rows to the half bar and
+// counts the fallback, and once the walk lands the floor takes them
+#[test]
+fn reopened_counts_wait_for_their_walk() {
+    let io = SimulatedIo::new(Seed(147));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let backlog = large_segment_dead_by(&store, &io, "reopened", 40);
+    store.close().expect("close");
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let volume = &store.state.volumes[0];
+    hold_walk(&store, true);
+    store.put(COLUMN, b"unwalked", b"value").expect("put");
+    store.seal_now();
+    settle(&io);
+    assert!(store.state.pending_walks(0) > 0, "no segment waits for its walk");
+    volume.is_over_bound.store(false, Ordering::Release);
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(!start_merge(&mut job), "a record rewrite took {backlog:?} at the floor on counts from before the open");
+    assert!(volume.trust_fallbacks.load(Ordering::Acquire) > 0, "no fallback was counted");
     store.close().expect("close");
 }

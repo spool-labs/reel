@@ -186,6 +186,15 @@ fn picks_at_most_segments() {
         let records_before = records();
         let found = time(&format!("{shape} record"), HOLD_LINE, || planner.pick_within(volume, MOST_MERGE_SEGMENTS).is_some());
         assert_eq!((found, records() - records_before), (LOOKS, LOOKS as u64), "{shape} record took other than a record pick each look");
+        // an admitted pick adds the merge's disk room and output estimate, which read the walk lists for counts they can trust
+        let mut admitted = RewriteJob::new(Arc::clone(state), 0, PLANNER_LANE);
+        let found = time(&format!("{shape} record admitted"), HOLD_LINE, || {
+            let is_found = admitted.pick_admitted(volume).is_some();
+            admitted.abandon();
+            is_found
+        });
+        assert_eq!(found, LOOKS, "{shape} admitted no record pick");
+        drop(admitted);
         // the worker's lane looks for an overlap merge first, which only crowded keys give it
         let mut lane = RewriteJob::new(Arc::clone(state), 0, WORKER_LANE);
         let overlaps_before = volume.picks[PickOutcome::Overlap as usize].load(Ordering::Relaxed);

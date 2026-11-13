@@ -1063,10 +1063,10 @@ pub fn can_unlink<Backend: Io>(state: &EngineState<Backend>, index: usize, volum
         && volume.table.dead_replacement(segment).is_some_and(|place| !state.cues.has_cue_below(index, place))
 }
 
-/// Count what changes the summary a pick reads: seals, rewrites and unlinks
+/// Count what changes the summary a pick reads: seals, rewrites, unlinks and finished walks
 fn summary_changes<Backend: Io>(volume: &Volume<Backend>) -> u64 {
     let left = volume.segments_rewritten.load(Ordering::Acquire) + volume.segments_unlinked.load(Ordering::Acquire);
-    left + volume.seals_done.load(Ordering::Acquire)
+    left + volume.seals_done.load(Ordering::Acquire) + volume.walks_finished.load(Ordering::Acquire)
 }
 
 /// The pick outcomes a step reads before and after its hand-out, to tell what ended a pick that started nothing

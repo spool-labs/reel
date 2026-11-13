@@ -6,8 +6,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use reel_api::maintenance_report::UnitKind;
-use reel_api::units::ByteCount;
+use reel_api::units::{ByteCount, WritePlace};
 
+use crate::segment::summary_orders::ROW_FOOTER_BYTES;
 use crate::engine::dead_bits::INEXACT_KEPT;
 use crate::engine::volume::Volume;
 use crate::engine::walk_job::add_count;
@@ -186,6 +187,8 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
         drop(rows);
         for count in self.drained.iter().filter(|count| count.rows > 0) {
+            // a walk that charged the input while the merge ran may still be in flight, so the output reads these apart until it ends
+            volume.table.note_unbacked(count.segment, count.bytes.0 + u64::from(count.rows) * ROW_FOOTER_BYTES, WritePlace(0));
             volume.table.drop_live(count.segment, count.block, count.rows, count.replacement);
         }
         self.drained.clear();

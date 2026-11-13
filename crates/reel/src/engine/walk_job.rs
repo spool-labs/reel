@@ -788,8 +788,11 @@ impl<Backend: Io> WalkJob<Backend> {
         volume.pace_spilled.fetch_add(spilled, Ordering::Relaxed);
         volume.dead_counted.fetch_add(dead_bytes, Ordering::Relaxed);
         for count in counts.counts.iter().filter(|count| count.rows > 0) {
-            // no merge can drop a row this walk charged until the walk ends, so the pick reads it apart
-            volume.table.note_unbacked(count.segment, count.bytes.0 + u64::from(count.rows) * ROW_FOOTER_BYTES, walk_lowest);
+            // no merge can drop a row this walk charged until the walk ends, so the pick reads it apart. A backward walk counts its
+            // own rows against finished segments, so its counts stand at once
+            if !target.is_backward {
+                volume.table.note_unbacked(count.segment, count.bytes.0 + u64::from(count.rows) * ROW_FOOTER_BYTES, walk_lowest);
+            }
             volume.table.drop_live(count.segment, count.block, count.rows, count.replacement);
         }
         for free in counts.slot_frees.iter() {

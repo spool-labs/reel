@@ -450,7 +450,8 @@ impl<Backend: Io> RewriteJob<Backend> {
         drop(rows);
         for count in self.kept_dead.iter().filter(|count| count.rows > 0) {
             // a row the merge kept for the walk in flight stays undroppable on the output until that walk ends
-            volume.table.note_unbacked(count.segment, count.bytes.0 + u64::from(count.rows) * ROW_FOOTER_BYTES, count.replacement);
+            // a fresh output has no charge from a finished walk, so nothing resets as the counts land one after another
+            volume.table.note_unbacked(count.segment, count.bytes.0 + u64::from(count.rows) * ROW_FOOTER_BYTES, WritePlace(0));
             volume.table.drop_live(count.segment, count.block, count.rows, count.replacement);
         }
         // the rows the walk held land with the outputs, before the release lets a waiting walk count again

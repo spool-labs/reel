@@ -4914,3 +4914,45 @@ fn unbacked_counts_wait_for_the_walk() {
     shape::abandon_rewrites(&mut job);
     store.close().expect("close");
 }
+
+// with callers busy only the busy lane may take an overlap merge. While its seat holds one, an idle seat's pick skips the look,
+// finds nothing on the record path and ends Nothing, and a pass whose look can't move asks once and waits for a change
+#[test]
+fn idle_seat_beside_a_busy_lane_asks_once() {
+    let io = SimulatedIo::new(Seed(162));
+    let mut config = config();
+    config.threads.maintenance_workers = Some(2);
+    config.memory_budget = WORKER_BUDGET;
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    hold_compaction(&store, true);
+    let volume = &store.state.volumes[0];
+    volume.holds.merge_cap.store(2, Ordering::Release);
+    pile_up(&store, &io, OVER_THE_BOUND);
+    io.hold_jobs("reel-planner", true);
+    hold_compaction(&store, false);
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    store.state.ask_compaction();
+    for _step in 0..MOST_LOOPS {
+        job.step_unit(io.clock_reading());
+        if shape::is_rewriting(&job) {
+            break;
+        }
+    }
+    assert!(shape::is_rewriting(&job), "the busy lane took no overlap merge");
+    volume.looks.set_left(true);
+    volume.is_over_bound.store(false, Ordering::Release);
+    let nothing = || volume.picks[PickOutcome::Nothing.index()].load(Ordering::Acquire);
+    // reads keep callers busy with no seal, so hot ingest defers nothing
+    assert!(read(&store, b"m-shared").is_some() || read(&store, b"a-000").is_none());
+    let before = nothing();
+    store.state.ask_compaction();
+    for _step in 0..STILL_STEPS {
+        job.step_unit(io.clock_reading());
+        let _found = read(&store, b"a-000");
+    }
+    let spun = nothing() - before;
+    assert!(spun <= 2, "the idle seat's picks found nothing {spun} times over {STILL_STEPS} steps with no change");
+    shape::abandon_rewrites(&mut job);
+    io.hold_jobs("reel-planner", false);
+    store.close().expect("close");
+}

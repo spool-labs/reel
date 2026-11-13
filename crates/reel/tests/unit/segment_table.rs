@@ -210,3 +210,17 @@ fn unbacked_charges_follow_the_walk() {
     table.drop_live(number, 0, 1, WritePlace(31));
     assert_eq!(table.unbacked(number, Some(WritePlace(25))), 40, "the new walk kept the old walk's charge");
 }
+
+// an output's kept counts land one after another with rising replacements, and with no boundary each adds to what came before
+#[test]
+fn kept_counts_add_up_on_a_fresh_output() {
+    let table = table_with(4);
+    let number = SegmentNumber(1);
+    let head = TailHead { segment: number, ..TailHead::default() };
+    assert!(table.install(1, RootId(0), &head, &[], &[BlockEntry { live_rows: 9, ..line(0) }]));
+    for (bytes, place) in [(10, 20), (20, 30), (30, 40)] {
+        table.note_unbacked(number, bytes, WritePlace(0));
+        table.drop_live(number, 0, 1, WritePlace(place));
+    }
+    assert_eq!(table.unbacked(number, Some(WritePlace(15))), 60, "a later kept count wiped the earlier ones");
+}

@@ -226,10 +226,13 @@ impl<Backend: Io> RewriteJob<Backend> {
         let is_ready_at = |row: &SummaryRow<'_>, plain: u64| {
             let bar = (current, plain);
             let is_free = row.facts.is_walked() && row.facts.segment.0 != walking && !gave_up.holds(row.facts.segment);
-            // what the walk in flight charged no merge can drop yet, so it wins nothing back until that walk ends
+            if !is_free || is_for_unlink(row) {
+                return false;
+            }
+            // what the walk in flight charged no merge can drop yet, so it wins nothing back until that walk ends, and the file is
+            // asked what it freed in place only for a row past the bar on its counts alone
             let unbacked = volume.table.unbacked(row.facts.segment, walked_below);
-            let freed = freed_in_place(volume, row) + unbacked;
-            is_free && !is_for_unlink(row) && is_rewrite_ready(volume, row, unbacked, bar) && is_rewrite_ready(volume, row, freed, bar)
+            is_rewrite_ready(volume, row, unbacked, bar) && is_rewrite_ready(volume, row, freed_in_place(volume, row) + unbacked, bar)
         };
         // an untrusted row waits for the half bar, and a pick counts one fallback when such a row would have passed the floor
         let has_fallen_back = Cell::new(false);

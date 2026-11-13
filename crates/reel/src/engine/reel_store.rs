@@ -55,7 +55,7 @@ use crate::engine::filter_job::FilterLoader;
 use crate::engine::planner::Planner;
 use crate::engine::walk_job::{BlockCounter, WalkJob, WalkSlot, WalkWorker};
 use crate::engine::workers::Workers;
-use crate::engine::volume::{SealStepTimes, ClaimState, GaveUp, MOST_MERGE_OUTPUTS, MOST_PARKED, NO_SEAL, RewriteLane, SyncState, Volume, BitsSave};
+use crate::engine::volume::{SealStepTimes, ClaimState, GaveUp, LookPass, MOST_MERGE_OUTPUTS, MOST_PARKED, NO_SEAL, RewriteLane, SyncState, Volume, BitsSave};
 #[cfg(feature = "test-hooks")]
 use crate::engine::volume::TestHolds;
 use crate::guard::hold;
@@ -1472,6 +1472,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         is_applying: AtomicBool::new(false),
         claim_lock: Mutex::new(()),
         claims_changed: AtomicU64::new(0),
+        looks: LookPass::default(),
         walks_held: AtomicU64::new(0),
         walk_claim_waits: AtomicU64::new(0),
         walk_claim_held: AtomicU64::new(0),

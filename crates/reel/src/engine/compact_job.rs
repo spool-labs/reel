@@ -372,14 +372,18 @@ impl<Backend: Io> CompactJob<Backend> {
             return JobStep::Worked;
         }
         // a look takes a few segments at a time, and the rest still count. Hot ingest looks at none
-        self.should_rewrite = should_rewrite && !is_deferring && self.rewrite.has_looks_left;
+        // a step whose picks were refused looks no further, and waits as the refusal says
+        let is_refused = refused_picks(volume) != refused_before;
+        self.should_rewrite = should_rewrite && !is_deferring && !is_refused && volume.looks.has_left();
         // a quiet pass that found nothing past the bar looks again only once a seal, a rewrite, an unlink or the room changes what
         // it saw. A pass a refusal ended, for room, the park or an overlap merge owed, tries again as that refusal says
-        let has_found_nothing = refused_picks(volume) == refused_before && nothing_picks(volume) > nothing_before;
+        let has_found_nothing = !is_refused && nothing_picks(volume) > nothing_before;
         if is_quiet_with_dead && !self.should_rewrite && has_found_nothing {
             self.quiet_looked_at = look_key;
         }
+        // only a look ran, so the walk takes its turn in the same step, however many looks the pass has left
         if self.should_rewrite {
+            self.did_background = true;
             return JobStep::Worked;
         }
         if volume.is_room_refused.load(Ordering::Acquire) || volume.is_room_short.load(Ordering::Acquire) {

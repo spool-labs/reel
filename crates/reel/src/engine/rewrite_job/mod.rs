@@ -469,10 +469,7 @@ pub struct RewriteJob<Backend: Io> {
     listed: FixedList<SegmentNumber>,
     crowd: FixedList<SegmentNumber>,
     pub crowd_answers: CrowdAnswers,
-    pub has_looks_left: bool,
     pub picked_as: Option<PickOutcome>,
-    /// The overlap look's current pass began at the oldest segment, with no merge started since
-    is_whole_pass: bool,
     /// When the job began, for the merge time hot ingest is judged by
     begun_at: Nanoseconds,
     held_words: FixedList<u64>,
@@ -484,7 +481,6 @@ pub struct RewriteJob<Backend: Io> {
     home_outputs: [SegmentNumber; MOST_MERGE_OUTPUTS + 1],
     home_count: usize,
     is_holding: bool,
-    looked_up_to: SegmentNumber,
 }
 
 impl<Backend: Io> RewriteJob<Backend> {
@@ -588,11 +584,9 @@ impl<Backend: Io> RewriteJob<Backend> {
             listed: FixedList::on_heap(OVERLAP_LISTED),
             crowd: FixedList::on_heap(OVERLAP_LISTED),
             crowd_answers: CrowdAnswers::new(),
-            has_looks_left: false,
             picked_as: None,
             promised: ByteCount(0),
             parks_held: 0,
-            is_whole_pass: true,
             begun_at: Nanoseconds(0),
             held_words: FixedList::empty(),
             row_home: FixedList::empty(),
@@ -603,7 +597,6 @@ impl<Backend: Io> RewriteJob<Backend> {
             home_outputs: [SegmentNumber(0); MOST_MERGE_OUTPUTS + 1],
             home_count: 0,
             is_holding: false,
-            looked_up_to: SegmentNumber(0),
         }
     }
 
@@ -745,7 +738,7 @@ impl<Backend: Io> RewriteJob<Backend> {
                 volume.note_pick(PickOutcome::Refused);
                 // fewer inputs write a smaller output, so a short disk tries a smaller merge before it gives up
                 if self.input_count < 2 {
-                    self.has_looks_left = false;
+                    volume.looks.set_left(false);
                     return None;
                 }
                 most = self.input_count / 2;
@@ -809,10 +802,15 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.staged.len()
     }
 
+    /// Check the volume's overlap pass has segments left to look at
+    pub fn has_looks_left(&self) -> bool {
+        self.state.volumes[self.volume].looks.has_left()
+    }
+
     /// Read the newest segment a look for an overlap has passed
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn looked_up_to(&self) -> SegmentNumber {
-        self.looked_up_to
+        self.state.volumes[self.volume].looks.up_to()
     }
 
     /// Read the segments going in

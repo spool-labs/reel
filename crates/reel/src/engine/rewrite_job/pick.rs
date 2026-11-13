@@ -220,16 +220,16 @@ impl<Backend: Io> RewriteJob<Backend> {
     /// it passed while a walk or a seal held it can merge now. A pass that saw every segment and found nothing clears the flag,
     /// since overlap only rises at a seal
     pub fn end_pass(&mut self, volume: &Volume<Backend>) {
-        if self.has_looks_left {
+        if volume.looks.has_left() {
             return;
         }
-        self.looked_up_to = SegmentNumber(0);
-        if self.is_whole_pass {
+        volume.looks.set_up_to(SegmentNumber(0));
+        if volume.looks.is_whole() {
             volume.is_over_bound.store(false, Ordering::Release);
         } else {
-            self.has_looks_left = true;
+            volume.looks.set_left(true);
         }
-        self.is_whole_pass = true;
+        volume.looks.set_whole(true);
     }
 
     /// Pick a run of segments over the overlap bound, all walked or all unwalked: a walked input's rows are counted and an
@@ -255,12 +255,14 @@ impl<Backend: Io> RewriteJob<Backend> {
         // a crowd answer holds while no filter came or went, and holding the filters out changes every answer
         let filters = 2 * arena.changes() + u64::from(volume.are_filters_held_out());
         let answers = (&mut self.crowd_answers, filters);
-        let found = overlap_start(rows, directory_of, &mut self.looked_up_to, can_merge, &mut self.crowded_key, lists, !volume.is_bound_pinned(), &is_resident, is_late, answers);
-        self.has_looks_left = !rows.orders().after(self.looked_up_to).is_empty();
+        let mut looked_up_to = volume.looks.up_to();
+        let found = overlap_start(rows, directory_of, &mut looked_up_to, can_merge, &mut self.crowded_key, lists, !volume.is_bound_pinned(), &is_resident, is_late, answers);
+        volume.looks.set_up_to(looked_up_to);
+        volume.looks.set_left(!rows.orders().after(looked_up_to).is_empty());
         let Some((crowded, column)) = found else {
             // a look stopped for time has more to see, so it ends no pass and finds no miss
             if is_late() {
-                self.has_looks_left = true;
+                volume.looks.set_left(true);
                 return None;
             }
             self.end_pass(volume);
@@ -288,7 +290,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         let target = gather_widest(volume, (rows, &self.listed), room, picks, &mut self.inputs, &mut self.numbers, &mut self.input_count);
         // a point whose segments running rewrites hold merges once they end, so record rewrites start no more and the look stays
         if self.input_count < 2 && self.listed.iter().any(|segment| volume.is_taken(*segment)) {
-            self.has_looks_left = false;
+            volume.looks.set_left(false);
             volume.is_over_bound.store(true, Ordering::Release);
             volume.note_pick(PickOutcome::OverlapLone);
             return None;
@@ -296,14 +298,14 @@ impl<Backend: Io> RewriteJob<Backend> {
         // one segment alone wins back no overlap, and the next look starts past it. A point no merge can start holds no record
         // rewrite back
         if self.input_count < 2 {
-            self.looked_up_to = crowded.facts.segment;
-            self.has_looks_left = !rows.orders().after(self.looked_up_to).is_empty();
+            volume.looks.set_up_to(crowded.facts.segment);
+            volume.looks.set_left(!rows.orders().after(volume.looks.up_to()).is_empty());
             self.end_pass(volume);
             volume.note_pick(PickOutcome::OverlapLone);
             return None;
         }
         // the look resumes past this point after the merge, so the pass it's part of no longer saw every segment
-        self.is_whole_pass = false;
+        volume.looks.set_whole(false);
         self.is_unwalked = is_unwalked;
         if is_unwalked {
             let mut merging = hold(&volume.lanes[self.lane].merging);

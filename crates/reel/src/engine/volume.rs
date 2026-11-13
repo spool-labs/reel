@@ -407,6 +407,8 @@ pub struct Volume<Backend: Io> {
     pub claim_lock: Mutex<()>,
     /// Moves each time a rewrite begins or ends holding, so a block counted before it counts again
     pub claims_changed: AtomicU64,
+    /// The overlap look's pass, which every lane's pick shares
+    pub looks: LookPass,
     /// Counts the turns a walk stood aside for a rewrite
     pub walks_held: AtomicU64,
     /// Counts the waits of a block whose charges land on an input a rewrite has claimed, none until the held bits come
@@ -807,4 +809,54 @@ impl SealStepTimes {
 pub struct BitsSave {
     pub heads: Vec<SavedHead>,
     pub chunk: Vec<u8>,
+}
+
+/// The overlap look's pass over a volume's segments, which every lane's pick shares, so the lanes walk one pass between them and
+/// the planner reads the same state they set. A pick changes it under the summary lock it holds
+#[derive(Debug)]
+pub struct LookPass {
+    /// The newest segment the pass has passed
+    looked_up_to: AtomicU64,
+    /// The pass has segments left to look at
+    has_left: AtomicBool,
+    /// The pass began at the oldest segment, with no merge started since
+    is_whole: AtomicBool,
+}
+
+impl Default for LookPass {
+    fn default() -> Self {
+        Self { looked_up_to: AtomicU64::new(0), has_left: AtomicBool::new(false), is_whole: AtomicBool::new(true) }
+    }
+}
+
+impl LookPass {
+    /// Read the newest segment the pass has passed
+    pub fn up_to(&self) -> SegmentNumber {
+        SegmentNumber(self.looked_up_to.load(Ordering::Acquire))
+    }
+
+    /// Move the pass to past this segment
+    pub fn set_up_to(&self, segment: SegmentNumber) {
+        self.looked_up_to.store(segment.0, Ordering::Release);
+    }
+
+    /// Check the pass has segments left to look at
+    pub fn has_left(&self) -> bool {
+        self.has_left.load(Ordering::Acquire)
+    }
+
+    /// Say whether the pass has segments left to look at
+    pub fn set_left(&self, has_left: bool) {
+        self.has_left.store(has_left, Ordering::Release);
+    }
+
+    /// Check the pass began at the oldest segment with no merge since
+    pub fn is_whole(&self) -> bool {
+        self.is_whole.load(Ordering::Acquire)
+    }
+
+    /// Say whether the pass began at the oldest segment with no merge since
+    pub fn set_whole(&self, is_whole: bool) {
+        self.is_whole.store(is_whole, Ordering::Release);
+    }
 }

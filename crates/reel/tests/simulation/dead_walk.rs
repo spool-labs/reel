@@ -920,7 +920,7 @@ fn recounted_block_lands_once() {
     count_slots(&io);
     let mut merge = CompactJob::new(state.clone(), 0);
     while !merge.rewrite.start() {
-        assert!(merge.rewrite.has_looks_left, "no rewrite started");
+        assert!(merge.rewrite.has_looks_left(), "no rewrite started");
     }
     assert_eq!(merge.rewrite.input_numbers(), [older]);
     let blocks = volume.walk_blocks.load(Ordering::Relaxed);
@@ -993,7 +993,7 @@ fn claim_waits_for_a_landing_block() {
     let (older, _newer, _third) = three_segments(&store, &io, &[b"d"]);
     let mut merge = CompactJob::new(state.clone(), 0);
     while !merge.rewrite.claim() {
-        assert!(merge.rewrite.has_looks_left, "no rewrite claimed");
+        assert!(merge.rewrite.has_looks_left(), "no rewrite claimed");
     }
     assert_eq!(merge.rewrite.input_numbers(), [older]);
     let blocks = volume.walk_blocks.load(Ordering::Relaxed);
@@ -1184,7 +1184,7 @@ fn set_bits_drop_with_no_ask() {
 
     let mut merge = CompactJob::new(state.clone(), 0);
     while !merge.rewrite.start() {
-        assert!(merge.rewrite.has_looks_left, "no rewrite started");
+        assert!(merge.rewrite.has_looks_left(), "no rewrite started");
     }
     assert_eq!(merge.rewrite.input_numbers(), [older]);
     while merge.rewrite.is_running() {
@@ -1224,7 +1224,7 @@ fn healed_volume_keeps_bits_spoiled() {
 
     let mut merge = CompactJob::new(state.clone(), 0);
     while !merge.rewrite.start() {
-        assert!(merge.rewrite.has_looks_left, "no rewrite started");
+        assert!(merge.rewrite.has_looks_left(), "no rewrite started");
     }
     while merge.rewrite.is_running() {
         merge.rewrite.step();
@@ -1252,7 +1252,7 @@ fn missed_charge_spoils_and_asks() {
 
     let mut merge = CompactJob::new(state.clone(), 0);
     while !merge.rewrite.start() {
-        assert!(merge.rewrite.has_looks_left, "no rewrite started");
+        assert!(merge.rewrite.has_looks_left(), "no rewrite started");
     }
     assert_eq!(merge.rewrite.input_numbers(), [older]);
     while merge.rewrite.is_running() {
@@ -1286,7 +1286,7 @@ fn bits_survive_a_reopen() {
     check_dead_bits(volume);
     let mut merge = CompactJob::new(store.state.clone(), 0);
     while !merge.rewrite.start() {
-        assert!(merge.rewrite.has_looks_left, "no rewrite started");
+        assert!(merge.rewrite.has_looks_left(), "no rewrite started");
     }
     assert_eq!(merge.rewrite.input_numbers(), [older]);
     while merge.rewrite.is_running() {

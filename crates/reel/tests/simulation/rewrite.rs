@@ -158,14 +158,15 @@ fn newest_segment(store: &Store) -> SegmentNumber {
 
 // a pick looks at a few segments at a time, so a test that wants a merge goes on until the looks run out
 fn start_merge(job: &mut CompactJob<SimulatedIo>) -> bool {
-    loop {
+    for _look in 0..MOST_LOOPS {
         if job.rewrite.start() {
             return true;
         }
-        if !job.rewrite.has_looks_left {
+        if !job.rewrite.has_looks_left() {
             return false;
         }
     }
+    false
 }
 
 fn hold_compaction(store: &Store, is_held: bool) {
@@ -3233,13 +3234,17 @@ fn claims_share_the_park() {
     let park = hold(&store.state.volumes[0].parked).len();
     fill_park(&store, &stand_in, park - MOST_MERGE_SEGMENTS);
 
-    let start = |job: &mut RewriteJob<SimulatedIo>| loop {
-        if job.start() {
-            return true;
+    // a refused pick moves the look no further, so the looks are bounded
+    let start = |job: &mut RewriteJob<SimulatedIo>| {
+        for _look in 0..MOST_LOOPS {
+            if job.start() {
+                return true;
+            }
+            if !job.has_looks_left() {
+                return false;
+            }
         }
-        if !job.has_looks_left {
-            return false;
-        }
+        false
     };
     let mut first = RewriteJob::new(Arc::clone(&store.state), 0, PLANNER_LANE + 1);
     let mut second = RewriteJob::new(Arc::clone(&store.state), 0, PLANNER_LANE + 2);
@@ -3476,7 +3481,7 @@ fn run_alone(job: &mut RewriteJob<SimulatedIo>, io: &SimulatedIo) {
         if job.start() {
             break;
         }
-        if !job.has_looks_left {
+        if !job.has_looks_left() {
             return;
         }
     }
@@ -3725,6 +3730,9 @@ fn room_short_frees_under_busy_readers() {
     store.close().expect("close");
 }
 
+/// Refused picks a back-off of half a reserve period may see, a few looks and no spin
+const MOST_REFUSED_IN_BACK_OFF: u64 = 16;
+
 fn refused_picks(store: &Store) -> u64 {
     store.state.volumes[0].picks[PickOutcome::Refused.index()].load(Ordering::Acquire)
 }
@@ -3761,8 +3769,87 @@ fn refused_pass_looks_again() {
     step_until(&io, Nanoseconds(io.clock_reading().0 + RESERVE_PERIOD.0 / 2));
     assert_eq!(record_picks(&store), 0, "a pick ran while backing off for room");
     assert!(refused_picks(&store) > 0, "no pick was refused while backing off");
+    assert!(refused_picks(&store) < MOST_REFUSED_IN_BACK_OFF, "the planner spun on refused picks: {}", refused_picks(&store));
     step_until(&io, Nanoseconds(io.clock_reading().0 + 2 * RESERVE_PERIOD.0));
     assert!(record_picks(&store) > 0, "the pass never looked again once the wait was over");
     check_partly(&store, PAST_QUIET);
+    store.close().expect("close");
+}
+
+const LONE_SEGMENTS: u64 = 2 * reel::engine::rewrite_job::OVERLAP_LOOKS as u64;
+
+// with workers the seats look and the planner reads the volume's pass, so one ask keeps looking past the first look's segments
+// until it reaches a crowd beyond them
+#[test]
+fn seats_carry_one_look_pass() {
+    let io = SimulatedIo::new(Seed(129));
+    let mut config = config();
+    config.threads.maintenance_workers = Some(1);
+    config.memory_budget = WORKER_BUDGET;
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    hold_compaction(&store, true);
+    let volume = &store.state.volumes[0];
+    // segments over keys no other holds come first, so the crowd sits past what one look reaches
+    for number in 0..LONE_SEGMENTS {
+        store.put(COLUMN, format!("zz-lone-{number:03}").as_bytes(), b"alone").expect("put");
+        seal(&store, &io);
+    }
+    pile_up(&store, &io, OVER_THE_BOUND);
+    let overlaps = || volume.picks[PickOutcome::Overlap.index()].load(Ordering::Acquire);
+    let before = overlaps();
+    hold_compaction(&store, false);
+    let until = store.state.quiet_at(io.clock_reading());
+    io.advance_clock(Nanoseconds(until.0.saturating_sub(io.clock_reading().0)));
+    // dead rows would keep the planner asking for picks on their own, so reclaim is held and only the look's own pass goes on
+    hold_reclaim(&store);
+    // only the look finds the crowd, with no seal's word that the volume is over the bound
+    volume.is_over_bound.store(false, Ordering::Release);
+    store.state.ask_compaction();
+    settle(&io);
+    assert!(overlaps() > before, "the pass stopped after its first look with a crowd past it");
+    check_pile(&store, OVER_THE_BOUND);
+    store.close().expect("close");
+}
+
+const MANY_LONE_SEGMENTS: u64 = 1_100;
+
+// a look pass over many segments steps beside the walk, so a pass of more looks than the bound never holds a waiting walk past it
+#[test]
+fn long_look_pass_leaves_the_walk_its_turn() {
+    let io = SimulatedIo::new(Seed(130));
+    let mut config = config();
+    config.threads.maintenance_workers = Some(1);
+    config.memory_budget = WORKER_BUDGET;
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    hold_compaction(&store, true);
+    let volume = &store.state.volumes[0];
+    for number in 0..MANY_LONE_SEGMENTS {
+        store.put(COLUMN, format!("zz-lone-{number:05}").as_bytes(), b"alone").expect("put");
+        store.seal_now();
+        settle(&io);
+    }
+    // a segment sealed with the walk held leaves it a target while the pass looks
+    volume.holds.walk.store(true, Ordering::Release);
+    store.put(COLUMN, b"waiting", b"value").expect("put");
+    seal(&store, &io);
+    assert!(store.state.pending_walks(0) > 0, "no walk waited");
+    hold_reclaim(&store);
+    volume.is_over_bound.store(false, Ordering::Release);
+    volume.holds.walk.store(false, Ordering::Release);
+    hold_compaction(&store, false);
+    let until = store.state.quiet_at(io.clock_reading());
+    io.advance_clock(Nanoseconds(until.0.saturating_sub(io.clock_reading().0)));
+    store.state.ask_compaction();
+    settle(&io);
+    let mut report = MaintenanceReport::new();
+    store.maintenance_report(&mut report);
+    assert_eq!(store.state.pending_walks(0), 0, "the walk never ended");
+    assert!(!volume.looks.has_left(), "the pass never ended");
+    assert!(
+        report.longest_walkless_steps <= MOST_WALKLESS_STEPS,
+        "the planner held the walk back {} steps, last {:?}",
+        report.longest_walkless_steps,
+        report.longest_walkless_kind
+    );
     store.close().expect("close");
 }

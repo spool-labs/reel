@@ -625,7 +625,7 @@ fn rewrite_beside_a_newer_original() {
 
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
     while !job.rewrite.start() {
-        assert!(job.rewrite.has_looks_left, "no merge to run");
+        assert!(job.rewrite.has_looks_left(), "no merge to run");
     }
     while job.rewrite.phase != RewritePhase::Installing {
         job.rewrite.step();
@@ -812,7 +812,7 @@ fn output_slots_outlast_a_rewrite_in_flight() {
 
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
     while !job.rewrite.start() {
-        assert!(job.rewrite.has_looks_left, "no merge to run");
+        assert!(job.rewrite.has_looks_left(), "no merge to run");
     }
     while job.rewrite.phase != RewritePhase::Copying {
         job.rewrite.step();

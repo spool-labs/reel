@@ -426,6 +426,12 @@ pub struct Volume<Backend: Io> {
     pub pace: PaceCell,
     /// The pace's multiplier, copy bytes for each thousand dead bytes, which the store's owner may set
     pub pace_per_mille: AtomicU64,
+    /// The space target, dead bytes a rewrite must win back as thousandths of the live bytes, which the store's owner may set
+    pub space_target_per_mille: AtomicU64,
+    /// Dead bytes the record rewrites in flight will win back, which the space target counts as gone
+    pub gate_in_flight: AtomicU64,
+    /// Paced picks the space target put off, the volume under it
+    pub gate_refusals: AtomicU64,
     /// Counts the turns a walk stood aside for a rewrite
     pub walks_held: AtomicU64,
     /// Counts the waits of a block whose charges land on an input a rewrite has claimed, none until the held bits come
@@ -439,6 +445,9 @@ pub struct Volume<Backend: Io> {
     /// The bytes those reads took
     pub held_drain_bytes: AtomicU64,
     pub summary: Mutex<SummaryRows>,
+    /// The highest place any segment held at open. A count from before the open, with no replacement charged since, is trusted
+    /// once every segment below this place has walked again
+    pub open_place: WritePlace,
     pub summary_paths: SummaryPaths,
     /// The dead bits file and the name a save writes first, in the summary's root
     pub bits_path: PathBuf,

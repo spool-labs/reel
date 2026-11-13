@@ -242,6 +242,7 @@ impl<Backend: Io> EngineState<Backend> {
                     split.cue_held += column.dead_bytes.0;
                 }
             });
+            let (gate_dead, gate_live) = (rows.orders().gate_dead_bytes(), rows.orders().live_bytes());
             let claims = hold(&volume.claims);
             let open_bytes: u64 = claims.open.iter().map(|segment| segment.write_end.0).sum();
             let preallocated: u64 = claims.open.iter().map(|segment| segment.reserved_end.0.saturating_sub(segment.write_end.0)).sum();
@@ -296,6 +297,12 @@ impl<Backend: Io> EngineState<Backend> {
                     paced_written: ByteCount(volume.paced_written.load(Ordering::Acquire)),
                     refusals: volume.pace_refusals.load(Ordering::Acquire),
                     trust_fallbacks: volume.trust_fallbacks.load(Ordering::Acquire),
+                    gate_refusals: volume.gate_refusals.load(Ordering::Acquire),
+                    target_per_mille: volume.space_target_per_mille.load(Ordering::Relaxed),
+                    gate_dead: ByteCount(gate_dead),
+                    live: ByteCount(gate_live),
+                    gate_in_flight: ByteCount(volume.gate_in_flight.load(Ordering::Acquire)),
+                    spilled: ByteCount(volume.pace_spilled.load(Ordering::Acquire)),
                 },
                 walk_blocks: volume.walk_blocks.load(Ordering::Acquire),
                 fill_interval: Nanoseconds(volume.seal_interval.load(Ordering::Relaxed)),

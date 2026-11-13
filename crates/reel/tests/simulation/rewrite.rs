@@ -3599,8 +3599,8 @@ fn footers_by_kind_match_the_total() {
     store.close().expect("close");
 }
 
-// a count from before a reopen may rest on a segment that walks again, so while any segment is unwalked a pick promises its
-// inputs' whole length, and the merge never writes past it
+// a count from before a reopen may rest on a segment that walks again, so while a segment from before the open is unwalked a
+// pick promises its inputs' whole length, and the merge never writes past it
 #[test]
 fn reopened_counts_promise_whole_inputs() {
     let io = SimulatedIo::new(Seed(99));
@@ -3608,14 +3608,16 @@ fn reopened_counts_promise_whole_inputs() {
     hold_compaction(&store, true);
     let (_older, _newer) = half_dead(&store, &io);
     settle(&io);
+    // a segment from before the open waits for its walk across the reopen
+    store.state.volumes[0].holds.walk.store(true, Ordering::Release);
+    store.put(COLUMN, b"z", b"before the reopen").expect("put");
+    seal(&store, &io);
     store.close().expect("close");
 
     let store = open(&io);
     let volume = &store.state.volumes[0];
     hold_compaction(&store, true);
     volume.holds.walk.store(true, Ordering::Release);
-    store.put(COLUMN, b"z", b"after the reopen").expect("put");
-    seal(&store, &io);
     hold_compaction(&store, true);
     // writes stop, so record rewrites may run
     io.advance_clock(Nanoseconds(IDLE_SEAL_AFTER.0 * 4));
@@ -4387,15 +4389,24 @@ struct Steady {
     dead_counted: u64,
     segment_bytes: u64,
     spilled: u64,
+    gate_dead: u64,
+    gate_live: u64,
+    gate_refusals: u64,
     cap: u64,
 }
 
 // run a steady overwrite load under busy callers at a pace, with the estimates true or a quarter of what the merges write
 fn steady_space(seed: u64, pace_per_mille: u64, is_estimate_low: bool) -> Steady {
+    steady_at(seed, pace_per_mille, is_estimate_low, reel::engine::load_state::SPACE_TARGET_PER_MILLE)
+}
+
+// the steady load at a pace and a space target
+fn steady_at(seed: u64, pace_per_mille: u64, is_estimate_low: bool, target_per_mille: u64) -> Steady {
     let io = SimulatedIo::new(Seed(seed));
     let store = open(&io);
     let volume = &store.state.volumes[0];
     store.set_pace_per_mille(pace_per_mille);
+    store.set_space_target_per_mille(target_per_mille);
     volume.holds.low_estimate.store(is_estimate_low, Ordering::Release);
     let mut random = SeededRandom::new(Seed(seed));
     let value = vec![5; PACE_VALUE_BYTES];
@@ -4435,8 +4446,23 @@ fn steady_space(seed: u64, pace_per_mille: u64, is_estimate_low: bool) -> Steady
     let segment_bytes = volume.segment_bytes.0;
     let spilled = volume.pace_spilled.load(Ordering::Acquire);
     let cap = volume.pace_cap();
+    let (gate_dead, gate_live) = {
+        let rows = hold(&volume.summary);
+        (rows.orders().gate_dead_bytes(), rows.orders().live_bytes())
+    };
+    let gate_refusals = volume.gate_refusals.load(Ordering::Acquire);
     store.close().expect("close");
-    Steady { space: held as f64 / live as f64, paced_written, dead_counted, segment_bytes, spilled, cap }
+    Steady {
+        space: held as f64 / live as f64,
+        paced_written,
+        dead_counted,
+        segment_bytes,
+        spilled,
+        cap,
+        gate_dead,
+        gate_live,
+        gate_refusals,
+    }
 }
 
 // steady overwrites under busy callers pay the pace to reclaim a backlog sitting between the floor and half dead, which with no
@@ -4542,28 +4568,47 @@ fn volumes_earn_their_own_pace() {
     store.close().expect("close");
 }
 
-// after a reopen no replacement is charged yet, so while a segment waits for its walk a pick holds rows to the half bar and
-// counts the fallback, and once the walk lands the floor takes them
+// a count from before a reopen stands once every segment from before the open has walked again: while one waits, a pick holds
+// the backlog to the half bar and counts one fallback, and once its walk ends the floor takes the backlog, with a segment written
+// after the open still unwalked
 #[test]
 fn reopened_counts_wait_for_their_walk() {
     let io = SimulatedIo::new(Seed(147));
     let store = open(&io);
     hold_compaction(&store, true);
     let backlog = large_segment_dead_by(&store, &io, "reopened", 40);
+    hold_walk(&store, true);
+    store.put(COLUMN, b"before-open", b"value").expect("put");
+    store.seal_now();
+    settle(&io);
+    assert!(store.state.pending_walks(0) > 0, "no segment from before the open waits for its walk");
     store.close().expect("close");
     let store = open(&io);
     hold_compaction(&store, true);
-    let volume = &store.state.volumes[0];
     hold_walk(&store, true);
-    store.put(COLUMN, b"unwalked", b"value").expect("put");
-    store.seal_now();
-    settle(&io);
-    assert!(store.state.pending_walks(0) > 0, "no segment waits for its walk");
+    let volume = &store.state.volumes[0];
+    let cap = volume.pace_cap();
+    volume.pace.add(cap, cap);
     volume.is_over_bound.store(false, Ordering::Release);
+    store.put(COLUMN, b"a-call", b"value").expect("put");
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
     let fallbacks = volume.trust_fallbacks.load(Ordering::Acquire);
-    assert!(!job.rewrite.start(), "a record rewrite took {backlog:?} at the floor on counts from before the open");
+    assert!(!job.rewrite.start(), "a record rewrite took {backlog:?} at the floor with a segment from before the open unwalked");
     assert_eq!(volume.trust_fallbacks.load(Ordering::Acquire) - fallbacks, 1, "one pick counted other than one fallback");
+    // the walk from before the open ends, and a segment written after it stays unwalked
+    hold_walk(&store, false);
+    settle(&io);
+    assert_eq!(store.state.pending_walks(0), 0, "the walk from before the open never ended");
+    hold_walk(&store, true);
+    store.put(COLUMN, b"after-open", b"value").expect("put");
+    store.seal_now();
+    settle(&io);
+    assert!(store.state.pending_walks(0) > 0, "no segment from after the open waits for its walk");
+    volume.is_over_bound.store(false, Ordering::Release);
+    store.put(COLUMN, b"a-call", b"value").expect("put");
+    assert!(start_merge(&mut job), "the floor took nothing once the walks from before the open ended");
+    assert!(job.rewrite.input_numbers().contains(&backlog) || shape::any_rewrite(&job, |seated| seated.input_numbers().contains(&backlog)), "the floor took another segment");
+    shape::abandon_rewrites(&mut job);
     store.close().expect("close");
 }
 
@@ -4607,5 +4652,104 @@ fn pace_refusal_counts_once() {
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
     assert!(!job.rewrite.start(), "a paced rewrite started with no credit");
     assert_eq!(volume.pace_refusals.load(Ordering::Acquire) - before, 1, "one pick counted other than one refusal");
+    store.close().expect("close");
+}
+
+// a segment a walk in flight has charged, past what the table can trust, still goes at the floor while its dead bits are exact,
+// since a merge drops its rows by those bits, and falls back to the half bar once the bits are held off
+#[test]
+fn exact_bits_keep_a_charged_segment_trusted() {
+    let io = SimulatedIo::new(Seed(150));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let volume = &store.state.volumes[0];
+    let band = large_segment_dead_by(&store, &io, "charged", 40);
+    assert!(volume.dead_bits.exact(band).is_some(), "the walk left the band segment's bits inexact");
+    hold_walk(&store, true);
+    store.put(COLUMN, b"in-flight", b"value").expect("put");
+    store.seal_now();
+    settle(&io);
+    assert!(store.state.pending_walks(0) > 0, "no segment waits for its walk");
+    // a walk in flight charged the band segment from a place past the unwalked one
+    volume.table.drop_live(band, 0, 0, WritePlace(u64::MAX / 2));
+    let cap = volume.pace_cap();
+    volume.pace.add(cap, cap);
+    volume.is_over_bound.store(false, Ordering::Release);
+    store.put(COLUMN, b"a-call", b"value").expect("put");
+    volume.holds.no_bits.store(true, Ordering::Release);
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    let fallbacks = volume.trust_fallbacks.load(Ordering::Acquire);
+    assert!(!job.rewrite.start(), "a rewrite took a segment with untrusted counts and its bits held off at the floor");
+    assert_eq!(volume.trust_fallbacks.load(Ordering::Acquire) - fallbacks, 1);
+    volume.holds.no_bits.store(false, Ordering::Release);
+    assert!(start_merge(&mut job), "exact bits left the charged segment untrusted");
+    assert!(shape::any_rewrite(&job, |seated| seated.input_numbers().contains(&band)), "the floor took another segment");
+    shape::finish_rewrites(&mut job);
+    assert_eq!(volume.promises_outgrown.load(Ordering::Acquire), 0, "the merge wrote past what its counts promised");
+    store.close().expect("close");
+}
+
+/// Space targets the gate sims hold the steady load to, in thousandths of the live bytes
+const TARGETS: [u64; 2] = [150, 300];
+/// A target past what the half bar alone leaves, so no band rewrite is wanted
+const MET_TARGET: u64 = 1_000;
+
+// the gate holds the dead bytes only a rewrite can win back near the space target, each target in turn: the backlog over it
+// drains at the pace and stops there, within a segment's dead bytes
+#[test]
+fn gate_holds_dead_bytes_at_the_target() {
+    let pace = reel::engine::load_state::PACE_PER_MILLE;
+    for target in TARGETS {
+        let steady = steady_at(151, pace, false, target);
+        let share = 1_000 * steady.gate_dead / steady.gate_live.max(1);
+        println!("target {target}: dead over live {share} a thousand, {} paced copy, {} gate refusals", steady.paced_written, steady.gate_refusals);
+        assert!(steady.paced_written > 0, "the backlog over target {target} never drained");
+        let slack = 1_000 * steady.segment_bytes / steady.gate_live.max(1);
+        assert!(share <= target + slack, "dead over live {share} sat past target {target} and a segment's {slack}");
+    }
+}
+
+// a target the half bar already meets starts no band rewrite, and the backlog stays for a quiet spell
+#[test]
+fn met_target_starts_no_band_rewrite() {
+    let steady = steady_at(152, reel::engine::load_state::PACE_PER_MILLE, false, MET_TARGET);
+    assert_eq!(steady.paced_written, 0, "a band rewrite ran with the target met");
+    assert!(steady.gate_refusals > 0, "the gate put nothing off");
+}
+
+// a target of none can never be met, so the gate never holds a pick back and the pace alone sets the copy
+#[test]
+fn unreachable_target_runs_at_the_pace() {
+    let steady = steady_at(153, reel::engine::load_state::PACE_PER_MILLE, false, 0);
+    assert_eq!(steady.gate_refusals, 0, "the gate put a pick off under a target of none");
+    assert!(steady.paced_written > 0);
+}
+
+/// A value past what the walk frees in place, so its dead bytes leave the disk before any rewrite
+const FREED_VALUE_BYTES: usize = 128 * 1024;
+
+// overwrites of values the walk frees in place leave no dead bytes a rewrite needs, so the gate counts none and no band rewrite
+// starts
+#[test]
+fn freed_values_leave_the_gate_shut() {
+    let io = SimulatedIo::new(Seed(154));
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    let value = vec![6; FREED_VALUE_BYTES];
+    for round in 0..PACE_KEYS / 4 {
+        for number in 0..8 {
+            store.put(COLUMN, format!("large-{number:02}").as_bytes(), &value).expect("put");
+        }
+        store.state.ask_compaction();
+        store.seal_now();
+        settle(&io);
+        let (gate_dead, live) = {
+            let rows = hold(&volume.summary);
+            (rows.orders().gate_dead_bytes(), rows.orders().live_bytes())
+        };
+        assert!(gate_dead <= live / 10, "round {round}: the gate counted {gate_dead} freed bytes against {live} live");
+    }
+    assert!(volume.bytes_freed.load(Ordering::Acquire) > 0, "the walk freed nothing in place");
+    assert_eq!(volume.paced_written.load(Ordering::Acquire), 0, "a band rewrite copied what the walk had freed");
     store.close().expect("close");
 }

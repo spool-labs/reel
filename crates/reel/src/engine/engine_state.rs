@@ -565,7 +565,9 @@ impl<Backend: Io> EngineState<Backend> {
             if pin.file.free_range(FileOffset(start), length).is_ok()
                 && let (Ok(before), Ok(after)) = (held, pin.file.held_bytes())
             {
-                volume.bytes_freed.fetch_add(before.0.saturating_sub(after.0), Ordering::AcqRel);
+                let freed = before.0.saturating_sub(after.0);
+                volume.bytes_freed.fetch_add(freed, Ordering::AcqRel);
+                hold(&volume.summary).note_freed(free.segment, freed);
             }
         }
         true

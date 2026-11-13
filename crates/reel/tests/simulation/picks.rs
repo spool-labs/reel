@@ -330,3 +330,34 @@ fn walk_pick_over_unwalked_rows() {
         store.close().expect("close");
     }
 }
+
+/// Rows of the ingest shape the walk hasn't counted, past the looks a pick reads them for
+const UNWALKED_ROWS: u64 = 2_000;
+
+// a row the walk hasn't counted among the first of the summary, and a counted one past them, as under steady ingest
+fn ingest_facts(number: u64) -> SegmentFacts {
+    if number <= UNWALKED_ROWS { unwalked_facts(number) } else { facts(number) }
+}
+
+// an admitted record pick under ingest: the lowest unwalked place read from walk lists past their looks, the trust each row's
+// counts get, and the output estimate, at both worker counts
+#[test]
+fn record_admitted_under_ingest() {
+    for workers in GATE_WORKERS {
+        let io = SimulatedIo::new(Seed(74));
+        io.add_disk(Path::new(ROOT), DISK);
+        let store: Store = ReelStore::open(io, &config(workers)).expect("open");
+        fill(&store, false, ingest_facts);
+        let volume = &store.state.volumes[0];
+        volume.is_over_bound.store(false, Ordering::Release);
+        let mut admitted = RewriteJob::new(Arc::clone(&store.state), 0, PLANNER_LANE);
+        let found = time(&format!("record admitted under ingest with {workers} workers"), HOLD_LINE, || {
+            let is_found = admitted.pick_admitted(volume).is_some();
+            admitted.abandon();
+            is_found
+        });
+        assert_eq!(found, LOOKS, "no record pick was admitted under ingest");
+        drop(admitted);
+        store.close().expect("close");
+    }
+}

@@ -133,6 +133,8 @@ impl<Backend: Io> RewriteJob<Backend> {
         let now = self.state.io.now();
         let load = state.load_of(volume, now);
         let mut rows = state.hold_for_pick(self.volume, kind);
+        // every pick reads the lowest unwalked place once, which the record bar and the output estimate both ask
+        self.walked_below = walked_below(&rows);
         self.is_unwalked = false;
         self.bars_fired = BarsFired::default();
         // its rows counted for nothing a walk can trust, so the output goes through the forward walk they owe
@@ -207,7 +209,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         };
         // a spinning disk keeps the half bar while callers are busy, as it did before the pace, until a run on one measures it
         let floor = if volume.is_spinning && load.is_busy { half } else { floor };
-        let walked_below = walked_below(&rows);
+        let walked_below = self.walked_below;
         let gave_up = self.gave_up_list(volume);
         let index = self.volume;
         // a wholly dead segment the unlink can take now goes by the unlink, and a rewrite of it would throw one of the two away
@@ -874,7 +876,7 @@ impl<Backend: Io> RewriteJob<Backend> {
     pub fn disk_room_for(&self, volume: &Volume<Backend>, length: ByteCount) -> Option<ByteCount> {
         let summary = hold(&volume.summary);
         // every segment below this place has finished its walk, so a replacement under it is one the merge's ask can find
-        let walked_below = walked_below(&summary);
+        let walked_below = self.walked_below;
         let (mut inputs, mut output, mut lowest) = (0, 0, WritePlace(u64::MAX));
         for row in self.numbers[..self.input_count].iter().filter_map(|number| summary.get(*number)) {
             inputs += row.facts.file_length.0;
@@ -917,13 +919,18 @@ pub fn walked_below(rows: &SummaryRows) -> Option<WritePlace> {
     lowest
 }
 
-/// Check a segment's dead counts stand for rows a merge drops: with no segment unwalked, or with every replacement charged since
-/// open below the unwalked ones. A count from before a reopen may rest on a segment that walks again, which keeps its rows
+/// Check a segment's dead counts stand for rows a merge drops: with no segment unwalked, with every replacement charged since
+/// open below the unwalked ones, or with exact dead bits, which a merge drops rows by mid-walk too. A count from before a reopen
+/// may rest on a segment that walks again, so it stands once every segment from before the open has walked again
 pub fn is_count_trusted<Backend: Io>(volume: &Volume<Backend>, segment: SegmentNumber, walked_below: Option<WritePlace>) -> bool {
     let Some(unwalked) = walked_below else {
         return true;
     };
-    volume.table.highest_replacement(segment).is_some_and(|place| place.0 > 0 && place < unwalked)
+    let is_charged = volume.table.highest_replacement(segment).is_some_and(|place| match place.0 {
+        0 => volume.open_place < unwalked,
+        _ => place < unwalked,
+    });
+    is_charged || (!volume.are_bits_held_off() && volume.damage.is_empty() && volume.dead_bits.exact(segment).is_some())
 }
 
 /// Add up a segment's record bytes and rows over every column, since a merge copies the whole segment

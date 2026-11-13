@@ -55,7 +55,7 @@ use crate::engine::filter_job::FilterLoader;
 use crate::engine::planner::Planner;
 use crate::engine::walk_job::{BlockCounter, WalkJob, WalkSlot, WalkWorker};
 use crate::engine::workers::Workers;
-use crate::engine::load_state::{LoadCell, PACE_PER_MILLE, PaceCell};
+use crate::engine::load_state::{LoadCell, PACE_PER_MILLE, PaceCell, SPACE_TARGET_PER_MILLE};
 use crate::engine::volume::{SealStepTimes, ClaimState, GaveUp, LookPass, MOST_MERGE_OUTPUTS, MOST_PARKED, NO_SEAL, RewriteLane, SyncState, Volume, BitsSave};
 #[cfg(feature = "test-hooks")]
 use crate::engine::volume::TestHolds;
@@ -429,6 +429,14 @@ impl<Backend: Io> ReelStore<Backend> {
     pub fn set_pace_per_mille(&self, per_mille: u64) {
         for volume in &self.state.volumes {
             volume.pace_per_mille.store(per_mille, Ordering::Relaxed);
+        }
+    }
+
+    /// Set every volume's space target: the dead bytes a rewrite must win back, as thousandths of the live bytes, before busy
+    /// callers' rewrites under half dead start
+    pub fn set_space_target_per_mille(&self, per_mille: u64) {
+        for volume in &self.state.volumes {
+            volume.space_target_per_mille.store(per_mille, Ordering::Relaxed);
         }
     }
 
@@ -1364,6 +1372,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
     // the bits are sized from this volume's rows on disk with room to grow, and never past half the record cache's share
     let rows_here: u64 = summary.rows.rows().map(|row| rows_of(&row)).sum();
     let dead_share = ByteCount(dead_bits_bytes(rows_here).min(sizing.record_share.0 / 2 / config.volumes.len() as u64));
+    let open_place = summary.rows.rows().map(|row| row.facts.places.highest).max().unwrap_or(WritePlace(0));
     Volume {
         dead_bits: DeadBits::new(dead_share, room.segments_per_shard * TABLE_SHARDS),
         id: VolumeId(index as u8),
@@ -1490,6 +1499,9 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         load: LoadCell::default(),
         pace: PaceCell::default(),
         pace_per_mille: AtomicU64::new(PACE_PER_MILLE),
+        space_target_per_mille: AtomicU64::new(SPACE_TARGET_PER_MILLE),
+        gate_in_flight: AtomicU64::new(0),
+        gate_refusals: AtomicU64::new(0),
         walks_held: AtomicU64::new(0),
         walk_claim_waits: AtomicU64::new(0),
         walk_claim_held: AtomicU64::new(0),
@@ -1498,6 +1510,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         held_drain_bytes: AtomicU64::new(0),
         reserve: ByteCount(sizing.segment_bytes.0 * 2),
         summary: Mutex::new(summary.rows),
+        open_place,
         bits_path: summary.paths.root.join(DEAD_BITS_NAME),
         new_bits_path: summary.paths.root.join(NEW_DEAD_BITS_NAME),
         bits_save: Mutex::new(BitsSave { heads: touched_room(SAVE_HEADS_PAGE), chunk: touched_capacity(CHUNK_WORDS * size_of::<u64>(), 0) }),

@@ -64,6 +64,12 @@ struct OrderEntry {
     walk_links: [u32; 2],
     /// The dead bytes its row counts
     dead_bytes: u64,
+    /// The record bytes its row counts, live and dead
+    record_bytes: u64,
+    /// The dead bytes the walk has already given back in place
+    freed: u64,
+    /// Every row of it is dead, so an unlink frees it with no copy
+    is_wholly_dead: bool,
 }
 
 /// The lists and the segment order, with room fixed when the summary sizes its lookup
@@ -87,6 +93,10 @@ pub struct SummaryOrders {
     left_out: u64,
     /// The dead bytes every row counts, for the quiet volume's line
     dead_total: u64,
+    /// The record bytes every row counts, live and dead
+    record_total: u64,
+    /// The dead bytes only a rewrite can win back: those the walk hasn't freed in place, in segments not wholly dead
+    gate_dead_total: u64,
 }
 
 /// The segments on one list, first to last
@@ -121,7 +131,7 @@ impl WalkList {
 impl SummaryOrders {
     /// Allocate room for a number of rows
     pub fn new(room: usize) -> Self {
-        let empty = OrderEntry { segment: SegmentNumber(0), share_list: NO_LIST, walk_list: NO_LIST, share_links: [NO_ENTRY; 2], walk_links: [NO_ENTRY; 2], dead_bytes: 0 };
+        let empty = OrderEntry { segment: SegmentNumber(0), share_list: NO_LIST, walk_list: NO_LIST, share_links: [NO_ENTRY; 2], walk_links: [NO_ENTRY; 2], dead_bytes: 0, record_bytes: 0, freed: 0, is_wholly_dead: false };
         Self {
             entries: touched_filled(room, empty),
             free: (0..room as u32).rev().collect(),
@@ -132,6 +142,8 @@ impl SummaryOrders {
             walk_counts: [0; WALK_LISTS],
             left_out: 0,
             dead_total: 0,
+            record_total: 0,
+            gate_dead_total: 0,
         }
     }
 
@@ -146,6 +158,8 @@ impl SummaryOrders {
         self.walk_counts = [0; WALK_LISTS];
         self.left_out = 0;
         self.dead_total = 0;
+        self.record_total = 0;
+        self.gate_dead_total = 0;
     }
 
     /// Read the heap the orders hold
@@ -160,6 +174,32 @@ impl SummaryOrders {
     /// sees it: no walk, rewrite or unlink takes its segment
     pub fn left_out(&self) -> u64 {
         self.left_out
+    }
+
+    /// Note dead bytes the walk gave back in place in a row's segment, which no rewrite needs to win back
+    pub fn note_freed(&mut self, segment: SegmentNumber, bytes: u64) {
+        let Some(slot) = self.slots.get(segment) else {
+            return;
+        };
+        let entry = &mut self.entries[slot as usize];
+        self.gate_dead_total -= gate_dead_of(entry);
+        entry.freed += bytes;
+        self.gate_dead_total += gate_dead_of(entry);
+    }
+
+    /// Read the dead bytes only a rewrite can win back, which the space target holds to a share of the live ones
+    pub fn gate_dead_bytes(&self) -> u64 {
+        self.gate_dead_total
+    }
+
+    /// Read one row's dead bytes only a rewrite can win back, or none for a row the orders don't hold
+    pub fn gate_dead_of(&self, segment: SegmentNumber) -> u64 {
+        self.slots.get(segment).map_or(0, |slot| gate_dead_of(&self.entries[slot as usize]))
+    }
+
+    /// Read the live record bytes every row counts. A row the walk hasn't counted reads all live
+    pub fn live_bytes(&self) -> u64 {
+        self.record_total.saturating_sub(self.dead_total)
     }
 
     /// Read the dead bytes every row counts
@@ -196,13 +236,20 @@ impl SummaryOrders {
                 let at = self.present.partition_point(|present| *present < segment);
                 self.present.insert(at, segment);
                 self.entries[slot as usize] =
-                    OrderEntry { segment, share_list: NO_LIST, walk_list: NO_LIST, share_links: [NO_ENTRY; 2], walk_links: [NO_ENTRY; 2], dead_bytes: 0 };
+                    OrderEntry { segment, share_list: NO_LIST, walk_list: NO_LIST, share_links: [NO_ENTRY; 2], walk_links: [NO_ENTRY; 2], dead_bytes: 0, record_bytes: 0, freed: 0, is_wholly_dead: false };
                 slot
             },
         };
-        let dead = row_dead_bytes(row);
-        self.dead_total = self.dead_total - self.entries[slot as usize].dead_bytes + dead;
-        self.entries[slot as usize].dead_bytes = dead;
+        let (dead, record) = (row_dead_bytes(row), row_record_bytes(row));
+        let entry = &mut self.entries[slot as usize];
+        // the entry's old share comes off every total before its new counts go on
+        self.gate_dead_total -= gate_dead_of(entry);
+        self.dead_total = self.dead_total - entry.dead_bytes + dead;
+        self.record_total = self.record_total - entry.record_bytes + record;
+        entry.dead_bytes = dead;
+        entry.record_bytes = record;
+        entry.is_wholly_dead = is_wholly_dead(row);
+        self.gate_dead_total += gate_dead_of(entry);
         let entry = self.entries[slot as usize];
         if entry.share_list != share_list {
             self.unlink(Links::Share, slot);
@@ -224,7 +271,10 @@ impl SummaryOrders {
             return;
         };
         self.dead_total -= self.entries[slot as usize].dead_bytes;
-        self.entries[slot as usize].dead_bytes = 0;
+        self.record_total -= self.entries[slot as usize].record_bytes;
+        self.gate_dead_total -= gate_dead_of(&self.entries[slot as usize]);
+        let cleared = OrderEntry { dead_bytes: 0, record_bytes: 0, freed: 0, is_wholly_dead: false, ..self.entries[slot as usize] };
+        self.entries[slot as usize] = cleared;
         self.unlink(Links::Share, slot);
         self.unlink(Links::Walk, slot);
         self.slots.remove(segment);
@@ -418,4 +468,18 @@ pub fn is_wholly_dead(row: &SummaryRow<'_>) -> bool {
 pub fn row_dead_bytes(row: &SummaryRow<'_>) -> u64 {
     let mut cursor = row.cursor();
     (0..row.column_count).filter_map(|_column| cursor.column()).map(|column| column.dead_bytes.0).sum()
+}
+
+/// Read an entry's dead bytes only a rewrite can win back: none in a segment an unlink frees whole, and none the walk freed in place
+fn gate_dead_of(entry: &OrderEntry) -> u64 {
+    if entry.is_wholly_dead {
+        return 0;
+    }
+    entry.dead_bytes.saturating_sub(entry.freed)
+}
+
+/// Add up the record bytes a row's columns count, live and dead
+pub fn row_record_bytes(row: &SummaryRow<'_>) -> u64 {
+    let mut cursor = row.cursor();
+    (0..row.column_count).filter_map(|_column| cursor.column()).map(|column| column.live_bytes.0 + column.dead_bytes.0).sum()
 }

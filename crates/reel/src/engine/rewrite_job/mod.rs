@@ -27,7 +27,7 @@ use crate::io::{Io, IoFile};
 use crate::fixed_list::{FixedList, ListFull};
 use crate::region::{LIST_ALIGN_ROOM, REGION_HEAD_BYTES, Region, list_bytes};
 use crate::engine::held_bits::HeldBits;
-use crate::engine::load_state::can_start;
+use crate::engine::load_state::{can_start, is_over_target};
 use crate::engine::admission::{Admit, JobRole, PICK_HALVINGS};
 use crate::engine::dead_bits::BitsExtent;
 use crate::segment::key_cursor::KeyCursor;
@@ -417,6 +417,10 @@ pub struct RewriteJob<Backend: Io> {
     is_paced: bool,
     /// What the rewrite under way spent of the pace's credit, settled at its end
     paced_spent: u64,
+    /// Dead bytes the record rewrite under way will win back, which the space target counts as gone until it ends
+    dead_in_flight: u64,
+    /// The lowest unwalked place the last pick read, which the output estimate reuses: a stale one only moves an estimate
+    walked_below: Option<WritePlace>,
     /// The mapping this run's lists are carved from, held from an admitted start to the install or the abandon
     region: Option<Region>,
     /// Holds the segments outside the merge that a step asks for newer rows
@@ -557,6 +561,8 @@ impl<Backend: Io> RewriteJob<Backend> {
             forced_pick: None,
             is_paced: false,
             paced_spent: 0,
+            dead_in_flight: 0,
+            walked_below: None,
             region: None,
             cursor: KeyCursor::new(),
             most_grave_blocks: MOST_GRAVE_BLOCKS,
@@ -761,6 +767,14 @@ impl<Backend: Io> RewriteJob<Backend> {
             };
             // a paced pick waits for the walk to count the dead bytes that pay for it, and a smaller one may fit the credit
             let is_paced = self.is_paced && self.picked_as == Some(PickOutcome::Record);
+            // a paced pick waits while the volume holds no more dead bytes than its space target allows, and the walk landing more
+            // ends the wait
+            if is_paced && !self.is_over_target(volume) {
+                self.unpick(volume);
+                volume.gate_refusals.fetch_add(1, Ordering::Relaxed);
+                volume.note_pick(PickOutcome::Deferred);
+                return None;
+            }
             if is_paced && !can_start(volume.pace.credit(), output.0, volume.pace_cap()) {
                 self.unpick(volume);
                 is_pace_refused = true;
@@ -793,6 +807,9 @@ impl<Backend: Io> RewriteJob<Backend> {
                 volume.is_room_refused.store(false, Ordering::Release);
                 self.forced_pick = None;
                 // the charge goes in whole whatever the credit reads now, since a seat's install may have settled a debt since the check
+                if self.picked_as == Some(PickOutcome::Record) {
+                    self.note_in_flight(volume);
+                }
                 if is_paced {
                     volume.pace.charge(output.0);
                     self.paced_spent = output.0;
@@ -817,8 +834,26 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
     }
 
-    /// Settle what the rewrite spent of the pace's credit against what it wrote, once it ends
+    /// Read whether the volume holds more dead bytes than its space target allows, past what the rewrites in flight free
+    pub fn is_over_target(&self, volume: &Volume<Backend>) -> bool {
+        let rows = hold(&volume.summary);
+        let orders = rows.orders();
+        let in_flight = volume.gate_in_flight.load(Ordering::Acquire);
+        is_over_target(orders.gate_dead_bytes(), in_flight, orders.live_bytes(), volume.space_target_per_mille.load(Ordering::Relaxed))
+    }
+
+    /// Count the dead bytes this record rewrite will win back as gone, until it ends
+    pub fn note_in_flight(&mut self, volume: &Volume<Backend>) {
+        let rows = hold(&volume.summary);
+        self.dead_in_flight = self.numbers[..self.input_count].iter().map(|number| rows.orders().gate_dead_of(*number)).sum();
+        volume.gate_in_flight.fetch_add(self.dead_in_flight, Ordering::AcqRel);
+    }
+
+    /// Settle what the rewrite spent of the pace's credit against what it wrote, and give back the dead bytes it held in flight,
+    /// once it ends
     pub fn settle_pace(&mut self, volume: &Volume<Backend>, written: u64) {
+        let in_flight = mem::take(&mut self.dead_in_flight);
+        volume.gate_in_flight.fetch_sub(in_flight, Ordering::AcqRel);
         let spent = mem::take(&mut self.paced_spent);
         if spent > 0 {
             volume.pace.settle(spent, written, volume.pace_cap());

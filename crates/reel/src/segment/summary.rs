@@ -266,6 +266,11 @@ impl SummaryRows {
         &self.orders
     }
 
+    /// Note dead bytes the walk gave back in place in a segment, which no rewrite needs to win back
+    pub fn note_freed(&mut self, segment: SegmentNumber, bytes: u64) {
+        self.orders.note_freed(segment, bytes);
+    }
+
     /// Move a row to the end of its share list after a pick, so the next pick there starts with another
     pub fn rotate(&mut self, segment: SegmentNumber) {
         self.orders.rotate(segment);

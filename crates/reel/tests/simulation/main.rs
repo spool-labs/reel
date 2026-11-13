@@ -28,6 +28,7 @@ mod records;
 mod reports;
 mod ring_reads;
 mod seed_sets;
+mod shape;
 mod volume_marks;
 mod writeback;
 mod write_index;

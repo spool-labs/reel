@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
+use crate::shape;
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, ThreadCounts, VolumeConfig};
 use reel::engine::engine_sizing::{ENTRY_LINE_DIVISOR, ENTRY_MARGIN, floor_entries};
 use reel::engine::job_tally::STALL_AFTER;
@@ -42,7 +43,7 @@ fn open(io: &SimulatedIo) -> Store {
 }
 
 fn open_at(io: &SimulatedIo, budget: ByteCount) -> Store {
-    open_with(io, budget, reel::config::NO_WORKERS)
+    open_with(io, budget, shape::threads())
 }
 
 fn open_with(io: &SimulatedIo, budget: ByteCount, threads: ThreadCounts) -> Store {
@@ -332,7 +333,8 @@ fn rewrite_bytes_and_picks() {
 fn undeclared_column_on_a_big_disk() {
     let io = SimulatedIo::new(Seed(9));
     io.add_disk(Path::new(ROOT), BIG_DISK);
-    let store = open(&io);
+    // a worker takes a share of the budget the table would cover the disk with, and this size of budget holds the table alone
+    let store = open_with(&io, BUDGET, reel::config::NO_WORKERS);
     let per_segment = store.state.sizing.segment_bytes.0 / REAL_RECORD.len() as u64;
     for segment in 0..REAL_SEGMENTS {
         for number in 0..per_segment {

@@ -44,8 +44,9 @@ mod tests {
 
     #[test]
     fn spin_ends_past_its_limit() {
-        let mut clock = SpinClock::new(Duration::from_micros(50));
+        // the test's start comes first, so its span is never shorter than the clock's
         let started = Instant::now();
+        let mut clock = SpinClock::new(Duration::from_micros(50));
         while !clock.is_over() {
             std::hint::spin_loop();
         }

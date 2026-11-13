@@ -8,6 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::shape;
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::compact_job::{CompactJob, park};
 use reel::engine::cue::Cue;
@@ -22,7 +23,7 @@ use reel::engine::row_job::IDLE_SEAL_AFTER;
 use reel::engine::dead_bits::DECIDED_SET;
 use reel::engine::rewrite_job::{MERGE_BUFFER_BYTES, MergeTarget, MOST_OVERLAP, MOST_PARK_WAIT, PLANNER_LANE, RewriteJob, RewritePhase, is_overlap_input, overlaps};
 use reel::lifetime::MarkRange;
-use reel::engine::volume::{MOST_PARKED, NO_SEAL, Volume};
+use reel::engine::volume::{NO_SEAL, Volume};
 use reel::engine::walk_job::{BlockCounter, WalkJob, WalkWorker};
 use reel::guard::hold;
 use reel::io::{DeviceReads, InPlace, Io, IoFile, in_place};
@@ -84,7 +85,7 @@ type Store = ReelStore<SimulatedIo>;
 fn config() -> StoreConfig {
     StoreConfig {
         memory_budget: BUDGET,
-        threads: reel::config::NO_WORKERS,
+        threads: shape::threads(),
         volumes: vec![VolumeConfig {
             name: "rewrite".to_string(),
             roots: vec![PathBuf::from(ROOT)],
@@ -105,6 +106,12 @@ fn config() -> StoreConfig {
 
 fn open(io: &SimulatedIo) -> Store {
     let config = config();
+    ReelStore::open(io.clone(), &config).expect("open")
+}
+
+fn open_planner_only(io: &SimulatedIo) -> Store {
+    let mut config = config();
+    config.threads = reel::config::NO_WORKERS;
     ReelStore::open(io.clone(), &config).expect("open")
 }
 
@@ -1254,7 +1261,7 @@ fn overlap_needs_two() {
     let state = &store.state;
     let volume = &state.volumes[0];
     let stand_in = stand_in_parked(&store);
-    fill_park(&store, &stand_in, MOST_PARKED - 1);
+    fill_park(&store, &stand_in, park_size(&store) - 1);
     let mut job = CompactJob::new(Arc::clone(state), 0);
     assert!(!job.rewrite.start());
     assert!(!job.rewrite.is_running());
@@ -1286,7 +1293,7 @@ fn park_wait_lasts_until_a_stop() {
     }
     let inputs = job.rewrite.input_numbers().to_vec();
     let stand_in = stand_in_parked(&store);
-    fill_park(&store, &stand_in, MOST_PARKED);
+    fill_park(&store, &stand_in, park_size(&store));
 
     for _round in 0..10_000 {
         job.rewrite.step();
@@ -1343,6 +1350,11 @@ fn graves_past_the_output() {
 
 fn stand_in_parked(store: &Store) -> SegmentNumber {
     hold(&store.state.volumes[0].summary).rows().map(|row| row.facts.segment).min().expect("a row")
+}
+
+// the park holds a few slots for each lane, so a store with workers parks more
+fn park_size(store: &Store) -> usize {
+    hold(&store.state.volumes[0].parked).len()
 }
 
 // fill the park with retired stand-ins, which only a kill may leave behind
@@ -1642,14 +1654,23 @@ fn merge_ahead_of_a_walk_target() {
     };
     assert!(planner.walks[0].pick_target());
     state.volumes[0].wants_compaction.store(true, Ordering::Release);
+    // with workers the merge starts in a seat, which no worker steps here
+    let is_unwalked = |job: &CompactJob<SimulatedIo>| {
+        job.rewrite.is_unwalked_merge() || job.seats.iter().any(|seat| hold(&seat.job).as_ref().is_some_and(RewriteJob::is_unwalked_merge))
+    };
     for _step in 0..OVER_THE_BOUND {
         planner.step();
-        if planner.compactions[0].rewrite.is_unwalked_merge() {
+        if is_unwalked(&planner.compactions[0]) {
             break;
         }
     }
-    assert!(planner.compactions[0].rewrite.is_unwalked_merge());
+    assert!(is_unwalked(&planner.compactions[0]));
     planner.compactions[0].rewrite.abandon();
+    for seat in planner.compactions[0].seats.iter() {
+        if let Some(seated) = hold(&seat.job).as_mut().filter(|seated| seated.is_running()) {
+            seated.abandon();
+        }
+    }
     state.volumes[0].has_walk_target.store(false, Ordering::Release);
     state.volumes[0].walk_segment.store(NO_SEAL, Ordering::Release);
     drop(planner);
@@ -1866,7 +1887,7 @@ fn full_park_excuses_an_empty_file() {
     hold_compaction(&store, true);
     half_dead(&store, &io);
     let volume = &store.state.volumes[0];
-    fill_park(&store, &stand_in_parked(&store), MOST_PARKED);
+    fill_park(&store, &stand_in_parked(&store), park_size(&store));
     plant(&io, PLANTED, &[]);
 
     assert!(store.state.unlisted_segments(volume).expect("list").is_empty());
@@ -1884,7 +1905,7 @@ fn full_park_excuses_no_record() {
     hold_compaction(&store, true);
     half_dead(&store, &io);
     let volume = &store.state.volumes[0];
-    fill_park(&store, &stand_in_parked(&store), MOST_PARKED);
+    fill_park(&store, &stand_in_parked(&store), park_size(&store));
     plant(&io, PLANTED, b"a record");
 
     assert_eq!(store.state.unlisted_segments(volume).expect("list"), vec![PLANTED]);
@@ -2709,7 +2730,9 @@ fn dropped_held_row_lands_nothing() {
 #[test]
 fn ask_outlives_an_unlink() {
     let io = SimulatedIo::new(Seed(79));
-    let store = open(&io);
+    // with workers a seat's hand-out runs ahead of the unlink and may take the wholly dead segment as a record rewrite, an open
+    // item, so this order holds on the planner alone
+    let store = open_planner_only(&io);
     hold_compaction(&store, true);
     let state = &store.state;
     let volume = &state.volumes[0];

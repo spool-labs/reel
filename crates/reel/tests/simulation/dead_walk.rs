@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use crate::shape;
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::compact_job::CompactJob;
 use reel::engine::engine_state::IndexWait;
@@ -63,7 +64,7 @@ type Store = ReelStore<SimulatedIo>;
 fn config(budget: ByteCount) -> StoreConfig {
     StoreConfig {
         memory_budget: budget,
-        threads: reel::config::NO_WORKERS,
+        threads: shape::threads(),
         volumes: vec![VolumeConfig {
             name: "walk".to_string(),
             roots: vec![PathBuf::from(ROOT)],
@@ -90,6 +91,13 @@ fn open(io: &SimulatedIo) -> Store {
 fn open_workers(io: &SimulatedIo) -> Store {
     let mut config = config(BUDGET);
     config.threads.maintenance_workers = Some(WALK_WORKERS);
+    held(ReelStore::open(io.clone(), &config).expect("open"))
+}
+
+// the walk charges a claimed segment on the planner itself only with no workers, which count blocks on their own threads
+fn open_planner_only(io: &SimulatedIo) -> Store {
+    let mut config = config(BUDGET);
+    config.threads = reel::config::NO_WORKERS;
     held(ReelStore::open(io.clone(), &config).expect("open"))
 }
 
@@ -1035,7 +1043,7 @@ fn claim_waits_for_a_landing_block() {
 #[test]
 fn free_on_a_claimed_segment_is_dropped() {
     let io = SimulatedIo::new(Seed(65));
-    let store = open(&io);
+    let store = open_planner_only(&io);
     let state = &store.state;
     let volume = &state.volumes[0];
     let large = vec![7; FREE_IN_PLACE_BYTES.0 as usize * 2];

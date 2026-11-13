@@ -4,17 +4,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use crate::shape;
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::compact_job::{CompactJob, ConfirmPass, RowsProof, is_under_applied_cover};
 use reel::segment::summary_orders::is_wholly_dead;
 use reel::engine::cue::MOST_CUES;
-use reel::engine::engine_sizing::COMPACT_JOB_BYTES;
+use reel::engine::engine_sizing::{COMPACT_JOB_BYTES, LANE_JOB_BYTES};
 use reel::engine::open_segment::data_path;
 use reel::io::job::JobStep;
 use reel::engine::read_path::RecordWant;
 use reel::engine::reel_store::ReelStore;
 use reel::engine::walk_job::WALK_RETRY;
-use reel::engine::volume::MOST_PARKED;
 use reel::engine::reserve_job::RESERVE_PERIOD;
 use reel::guard::hold;
 use reel::io::{InPlace, Io, in_place};
@@ -46,7 +46,7 @@ type Store = ReelStore<SimulatedIo>;
 fn open(io: &SimulatedIo) -> Store {
     let config = StoreConfig {
         memory_budget: BUDGET,
-        threads: reel::config::NO_WORKERS,
+        threads: shape::threads(),
         volumes: vec![VolumeConfig {
             name: "compact".to_string(),
             roots: vec![PathBuf::from(ROOT)],
@@ -586,8 +586,14 @@ fn lost_row_once() {
 fn job_sized() {
     let io = SimulatedIo::new(Seed(23));
     let store = open(&io);
-    let bytes = job(&store).heap_bytes();
-    assert!(bytes.0 <= COMPACT_JOB_BYTES);
+    let job = job(&store);
+    // a worker's seat has a line of its own in the plan
+    for seat in job.seats.iter() {
+        assert!(seat.heap_bytes() <= LANE_JOB_BYTES, "a seat holds {} bytes", seat.heap_bytes());
+    }
+    let seats: u64 = job.seats.iter().map(|seat| seat.heap_bytes()).sum();
+    let bytes = job.heap_bytes();
+    assert!(bytes.0 - seats <= COMPACT_JOB_BYTES);
     assert_eq!(store.state.memory_report().compaction, bytes);
     store.close().expect("close");
 }
@@ -633,15 +639,16 @@ fn park_full() {
     let state = &store.state;
     let volume = &state.volumes[0];
     let mut numbers = Vec::new();
-    for _segment in 0..=MOST_PARKED {
+    let park = hold(&volume.parked).len();
+    for _segment in 0..=park {
         numbers.push(sealed_put(&store, &io, b"value"));
     }
     sealed_put(&store, &io, b"newest");
 
     let job = job(&store);
-    let last = numbers[MOST_PARKED];
-    let pins: Vec<_> = numbers[..MOST_PARKED].iter().map(|number| volume.table.pin(*number).expect("a pin")).collect();
-    for number in &numbers[..MOST_PARKED] {
+    let last = numbers[park];
+    let pins: Vec<_> = numbers[..park].iter().map(|number| volume.table.pin(*number).expect("a pin")).collect();
+    for number in &numbers[..park] {
         job.unlink(volume, *number, state.read_point(&state.volumes[0])).expect("unlink");
     }
     job.unlink(volume, last, state.read_point(&state.volumes[0])).expect("unlink");

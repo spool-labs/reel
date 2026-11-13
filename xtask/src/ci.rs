@@ -28,6 +28,26 @@ pub const PICK_GATE_ARGUMENTS: [&str; 12] =
     ["test", "--release", "--locked", "-p", "reel", "--features", TEST_HOOKS, "--test", "simulation", "picks::", "--", "--nocapture"];
 /// The feature that lets the sims set a volume's worker count, which no node build turns on
 pub const TEST_HOOKS: &str = "reel/test-hooks";
+/// Cargo arguments for the workers pass: the planner-facing sims again, with a worker beside each planner as a node runs
+pub const WORKERS_PASS_ARGUMENTS: [&str; 13] = [
+    "test",
+    "--locked",
+    "-p",
+    "reel",
+    "--features",
+    TEST_HOOKS,
+    "--test",
+    "simulation",
+    "--",
+    "rewrite::",
+    "compaction::",
+    "dead_walk::",
+    "reports::",
+];
+/// The sims read this variable for the worker count their default store opens with, in tests/simulation/shape.rs
+pub const WORKERS_VARIABLE: &str = "REEL_SIM_WORKERS";
+/// Workers the pass opens beside each planner: one fits every sim's budget and takes the seats' path
+pub const PASS_WORKERS: &str = "1";
 
 /// What one cargo run printed and how it ended
 #[derive(Debug, Default)]
@@ -64,6 +84,12 @@ pub fn run_ci() -> Result<(), TaskError> {
         failures.push("a test failed or a test binary stopped early".to_string());
     }
     check_lines(&tests.lines, &harnesses, &mut failures);
+
+    let workers = [Variable { name: WORKERS_VARIABLE.to_string(), value: PASS_WORKERS.to_string() }];
+    let pass = run_cargo_with(&root, &WORKERS_PASS_ARGUMENTS, &workers)?;
+    if !pass.is_success {
+        failures.push("a planner-facing sim failed with a worker beside the planner".to_string());
+    }
 
     let picks = run_cargo(&root, &PICK_GATE_ARGUMENTS)?;
     if !picks.is_success {

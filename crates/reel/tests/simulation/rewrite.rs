@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::compact_job::{CompactJob, park};
 use reel::engine::cue::Cue;
+use reel::engine::load_state::DISK_CHECK_PERIOD;
 use reel::engine::open_segment::{OUTPUT_SUFFIX, data_path};
 use reel::engine::read_path::{RecordWant, WalkAsk};
 use reel::engine::planner::{MOST_WALKLESS_STEPS, Planner};
@@ -30,7 +31,7 @@ use reel::record::codec::Codec;
 use reel::segment::column_directory::ColumnDirectory;
 use reel::segment::damage_list::DamagedRange;
 use reel::segment::footer_reader::FooterReader;
-use reel::segment::segment_table::{RetiredSegment, TABLE_SHARDS, shard_of};
+use reel::segment::segment_table::{NO_SHARD, RetiredSegment, TABLE_SHARDS, shard_of};
 use reel::segment::segment_tail::{BlockCount, MOST_MERGE_SEGMENTS, SegmentNumber, TailHead};
 use reel_api::column_id::ColumnId;
 use reel_api::direction::Direction;
@@ -3188,7 +3189,9 @@ fn merge_waits_for_disk_room() {
     }
     assert_eq!(overlaps(), before, "an overlap merge started with no room for its output");
 
+    // a disk reading lasts a period, so the room shows once that period is over
     io.add_disk(&root, ByteCount(1 << 40));
+    io.advance_clock(DISK_CHECK_PERIOD);
     assert!(start_merge(&mut job));
     assert!(overlaps() > before);
     run_to_end(&mut job);
@@ -3811,6 +3814,80 @@ fn refused_ask_ends_once_room_returns() {
     assert!(refused < MOST_REFUSED_IN_BACK_OFF, "refused picks kept coming after room came back: {refused}");
     assert_eq!(newest_segment(&store), newest, "a seal ran during the wait");
     assert_eq!(record_picks(&store), 0, "a record rewrite ran with nothing dead");
+    store.close().expect("close");
+}
+
+/// Three keys in five written again leave each segment past half dead, over the plain bar
+const PAST_HALF: (u64, u64) = (3, 5);
+/// Planner steps a forced segment may wait before its pick
+const MOST_FORCED_STEPS: u64 = 4;
+
+// seals a second apart outrun a merge a minute long, and the last write and seal were just now, so the volume reads hot for
+// the next two fill times
+fn make_hot(volume: &Volume<SimulatedIo>, io: &SimulatedIo) {
+    let now = io.clock_reading().0;
+    volume.seal_interval.store(1_000_000_000, Ordering::Relaxed);
+    volume.merge_interval.store(60_000_000_000, Ordering::Relaxed);
+    volume.seal_started_at.store(now, Ordering::Relaxed);
+    volume.last_write_at.store(now, Ordering::Relaxed);
+    assert!(volume.is_hot(io.clock_reading()), "the volume read quiet");
+}
+
+// a disk short of room reclaims under hot ingest, since waiting out the ingest would fill it with dead rows still on it
+#[test]
+fn short_disk_reclaims_under_hot_ingest() {
+    let io = SimulatedIo::new(Seed(132));
+    let root = PathBuf::from(ROOT);
+    io.add_disk(&root, ByteCount(1 << 40));
+    partly_dead(&io, PAST_HALF);
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    let used = (1 << 40) - io.free_space(&root).expect("free").0;
+    io.add_disk(&root, ByteCount(used + volume.reserve.0 + volume.segment_bytes.0 - 1));
+    make_hot(volume, &io);
+    store.state.ask_compaction();
+    step_until(&io, Nanoseconds(io.clock_reading().0 + 20 * TICK.0));
+    assert!(volume.is_hot(io.clock_reading()), "the hot window closed during the test");
+    assert!(record_picks(&store) > 0, "hot ingest held a short disk's dead rows back");
+    check_partly(&store, PAST_HALF);
+    store.close().expect("close");
+}
+
+// a pick put off by hot ingest waits for the window to close, and a seal stuck in that wait forces a segment that moves at once
+#[test]
+fn forced_segment_ends_a_hot_wait() {
+    let io = SimulatedIo::new(Seed(133));
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    hold_compaction(&store, true);
+    for number in 0..LONE_SEGMENTS {
+        store.put(COLUMN, format!("zz-lone-{number:03}").as_bytes(), b"alone").expect("put");
+        seal(&store, &io);
+    }
+    hold_compaction(&store, false);
+    io.hold_jobs("reel-planner", true);
+    let forced = || volume.picks[PickOutcome::Forced.index()].load(Ordering::Acquire);
+    let deferred = || volume.picks[PickOutcome::Deferred.index()].load(Ordering::Acquire);
+    make_hot(volume, &io);
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    let deferred_before = deferred();
+    store.state.ask_compaction();
+    for _step in 0..MOST_FORCED_STEPS {
+        let _step = job.step_unit(io.clock_reading());
+    }
+    assert!(deferred() > deferred_before, "hot ingest put no pick off");
+    assert_eq!(forced(), 0);
+    volume.stuck_shard.store(shard_of(newest_segment(&store)), Ordering::Release);
+    for _step in 0..MOST_FORCED_STEPS {
+        let _step = job.step_unit(io.clock_reading());
+        if forced() > 0 {
+            break;
+        }
+    }
+    assert!(forced() > 0, "the forced segment waited out the hot window");
+    volume.stuck_shard.store(NO_SHARD, Ordering::Release);
+    run_to_end(&mut job);
+    io.hold_jobs("reel-planner", false);
     store.close().expect("close");
 }
 

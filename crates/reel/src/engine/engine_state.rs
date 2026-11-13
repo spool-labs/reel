@@ -411,14 +411,17 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Work out a volume's load once for a planner step: callers, the hot window, the table and park, and the disk's room. Every
-    /// decision in the step, the lanes' picks and the walk's cap read what this keeps
+    /// decision in the step, the lanes' picks and the walk's cap read what this keeps. The disk's room is read once a period
     pub fn refresh_load(&self, volume: &Volume<Backend>, now: Nanoseconds) {
         volume.note_callers(self.caller_ops.total(), now);
+        let is_disk_short =
+            if volume.load.is_disk_check_due(now) { !has_disk_room(self, volume, ByteCount(0), false) } else { volume.load.get().is_disk_short };
         let load = Load {
             is_busy: volume.is_caller_active(now),
             is_hot: volume.is_hot(now),
+            is_ingesting: volume.is_ingesting(now),
             is_table_short: volume.is_short_of_room(),
-            is_disk_short: !has_disk_room(self, volume, ByteCount(0), false),
+            is_disk_short,
         };
         volume.load.set(load, volume.quiet_at(), volume.hot_until());
     }

@@ -21,7 +21,7 @@ use crate::config::MAX_KEY_BYTES;
 use crate::engine::complete_path::{REFILL_STEP_BLOCKS, Refill};
 use crate::engine::cover_apply::is_in_range;
 use crate::engine::engine_state::EngineState;
-use crate::engine::load_state::{Owed, Refusal, is_deferring, is_reclaim_wanted, refusal_wait};
+use crate::engine::load_state::{Load, Owed, Refusal, is_deferring, is_holding_asks, is_reclaim_wanted, refusal_wait};
 use crate::engine::rewrite_job::{PLANNER_LANE, RewriteJob, RewriteSeat, is_mergeable, is_reclaim_due};
 use crate::engine::rebuild::MOST_REBUILD_TRIES;
 use crate::engine::volume::{ParkedSegment, Volume};
@@ -120,8 +120,11 @@ pub struct CompactJob<Backend: Io> {
     held_pass: Option<HeldPass>,
     confirm_pass: Option<ConfirmPass>,
     should_rewrite: bool,
-    /// When a pick a refusal ended tries again, with the ask still standing
-    pick_retry_at: Option<Nanoseconds>,
+    /// An ask arriving writes held back, which comes due once they stop
+    is_ask_held: bool,
+    /// When a pick a refusal ended tries again, with the ask still standing, and the load the refusal saw. A step with another
+    /// load tries at once
+    pick_retry: Option<(Nanoseconds, Load)>,
     refill: Option<Refill>,
     refill_key: FixedList<u8>,
     refill_below: u64,
@@ -160,7 +163,8 @@ impl<Backend: Io> CompactJob<Backend> {
             seats: Arc::new(seats),
             handed_at: 0,
             should_rewrite: false,
-            pick_retry_at: None,
+            is_ask_held: false,
+            pick_retry: None,
             unit: None,
             quiet_looked_at: u64::MAX,
             did_background: false,
@@ -356,13 +360,19 @@ impl<Backend: Io> CompactJob<Backend> {
         let look_key = summary_changes(volume) << 1 | u64::from(load.is_disk_short);
         let owed = Owed { is_reclaim_due: has_dead && look_key != self.quiet_looked_at, is_reclaim_held: false };
         let is_quiet_with_dead = is_reclaim_wanted(load, owed);
-        let should_rewrite = mem::take(&mut self.should_rewrite) || is_quiet_with_dead || is_owed;
-        // a refused pick waits as its refusal said before the next try, with the ask still standing
-        if let Some(at) = self.pick_retry_at.filter(|at| at.0 > now.0) {
+        let mut should_rewrite = mem::take(&mut self.should_rewrite) || is_quiet_with_dead || is_owed;
+        // an ask that arriving writes held back comes due once they stop
+        if is_holding_asks(load) {
+            self.is_ask_held |= should_rewrite;
+        } else {
+            should_rewrite |= mem::take(&mut self.is_ask_held);
+        }
+        // a refused pick waits as its refusal said before the next try, with the ask still standing, until the load it saw changes
+        if let Some((at, _seen)) = self.pick_retry.filter(|(at, seen)| at.0 > now.0 && *seen == load) {
             self.should_rewrite = should_rewrite;
             return JobStep::IdleUntil { deadline: at };
         }
-        self.pick_retry_at = None;
+        self.pick_retry = None;
         let before = PickCounts::of(volume);
         // workers run every rewrite, so the planner stays free to pick and walk. A merge of 1 GiB segments would hold it for minutes
         if should_rewrite && (self.hand_out() || (self.seats.is_empty() && self.rewrite.start())) {
@@ -373,7 +383,7 @@ impl<Backend: Io> CompactJob<Backend> {
         let wait = refusal.and_then(|refusal| refusal_wait(refusal, load, now, volume.load.quiet_at(), volume.load.hot_until()));
         if let Some(wait) = wait {
             self.should_rewrite = should_rewrite;
-            self.pick_retry_at = Some(wait);
+            self.pick_retry = Some((wait, load));
             return JobStep::IdleUntil { deadline: wait };
         }
         // a look takes a few segments at a time, and the rest still count. Hot ingest looks at none, and a pick behind an overlap
@@ -392,8 +402,8 @@ impl<Backend: Io> CompactJob<Backend> {
         if volume.is_room_refused.load(Ordering::Acquire) || load.is_disk_short {
             return JobStep::IdleUntil { deadline: Nanoseconds(now.0 + RESERVE_PERIOD.0) };
         }
-        // what hot ingest puts off starts once the window closes
-        if is_deferring {
+        // what hot ingest or arriving writes put off starts once the window closes
+        if is_deferring || is_holding_asks(load) {
             return JobStep::IdleUntil { deadline: volume.load.hot_until() };
         }
         if load.is_busy && owed.is_reclaim_due {
@@ -485,7 +495,7 @@ impl<Backend: Io> CompactJob<Backend> {
         if changes != self.handed_at {
             self.handed_at = changes;
             // a seal, a rewrite or an unlink may clear what a refusal waited for
-            self.pick_retry_at = None;
+            self.pick_retry = None;
             let _handed = self.hand_out();
         }
     }
@@ -805,6 +815,8 @@ impl<Backend: Io> CompactJob<Backend> {
         if let Some(segment) = smallest {
             self.rewrite.forced = Some(segment);
             self.should_rewrite = true;
+            // a stuck seal sends no change to end a refusal's wait, and the forced segment goes past what the refusal waited for
+            self.pick_retry = None;
         }
     }
 
@@ -819,6 +831,7 @@ impl<Backend: Io> CompactJob<Backend> {
         if let Blocker::Segment(other) = self.blocker(volume, column, place, segment) {
             self.rewrite.forced = Some(other);
             self.should_rewrite = true;
+            self.pick_retry = None;
         }
     }
 

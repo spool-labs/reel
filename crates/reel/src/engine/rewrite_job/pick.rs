@@ -147,7 +147,10 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
         // busy callers keep their cores: a few merges run while they call, and every worker may merge once they go quiet
         let in_flight = volume.lanes.iter().filter(|lane| lane.is_rewriting.load(Ordering::Acquire)).count();
-        if is_capped(load) && in_flight >= volume.merge_cap() {
+        let is_over_cap = is_capped(load) && in_flight >= volume.merge_cap();
+        // a forced segment frees a stuck seal or the cover pool, so writers wait on it and it goes past the cap, as it goes past
+        // hot ingest
+        if is_over_cap && self.forced.is_none() {
             volume.capped_picks.fetch_add(1, Ordering::Relaxed);
             volume.note_pick(PickOutcome::Deferred);
             return None;
@@ -155,11 +158,12 @@ impl<Backend: Io> RewriteJob<Backend> {
         // an overlap merge copies records, so one at a time on the first worker keeps callers at their line while they call, and
         // once they stop every idle worker takes one over segments no other merge holds. The planner runs one only with no workers
         let busy_lane = if volume.walk_slots.is_empty() { PLANNER_LANE } else { PLANNER_LANE + 1 };
-        let may_overlap = match overlap_lanes(load) {
-            OverlapLanes::None => false,
-            OverlapLanes::One => self.lane == busy_lane,
-            OverlapLanes::All => true,
-        };
+        let may_overlap = !is_over_cap
+            && match overlap_lanes(load) {
+                OverlapLanes::None => false,
+                OverlapLanes::One => self.lane == busy_lane,
+                OverlapLanes::All => true,
+            };
         if may_overlap && let Some(target) = self.pick_overlap(volume, &rows, room) {
             self.picked_as = Some(PickOutcome::Overlap);
             volume.note_pick(PickOutcome::Overlap);
@@ -173,8 +177,14 @@ impl<Backend: Io> RewriteJob<Backend> {
             volume.note_pick(PickOutcome::Forced);
             return Some((target, false));
         }
-        // hot ingest with room to spare leaves overlap merges and record rewrites for quiet time. A trickle a merge outpaces
-        // isn't hot, so record rewrites reclaim under it at the plain bar
+        // a forced segment that can't merge leaves the cap as it was
+        if is_over_cap {
+            volume.capped_picks.fetch_add(1, Ordering::Relaxed);
+            volume.note_pick(PickOutcome::Deferred);
+            return None;
+        }
+        // hot ingest with room to spare in the table and on the disk leaves overlap merges and record rewrites for quiet time. A
+        // trickle a merge outpaces isn't hot, so record rewrites reclaim under it at the plain bar
         if is_deferring(load) {
             volume.note_pick(PickOutcome::Deferred);
             return None;

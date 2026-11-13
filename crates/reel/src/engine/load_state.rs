@@ -13,6 +13,8 @@ use crate::engine::rewrite_job::{PLAIN_BAR, QUIET_BAR, ROOM_SHORT_BAR};
 pub struct Load {
     /// Callers called within the quiet spell, or writes still arrive
     pub is_busy: bool,
+    /// Writes still arrive: the last seal started within two fill times
+    pub is_ingesting: bool,
     /// The volume fills faster than a merge runs, while writes arrive
     pub is_hot: bool,
     /// The segment table or the park is past half
@@ -38,9 +40,16 @@ pub enum OverlapLanes {
     All,
 }
 
-/// Check hot ingest puts merges and record rewrites off: only while the table has room to spare
+/// Check an ask waits for arriving writes to stop before it comes due again: a pick under ingest finds segments whose rows are
+/// still dying, and the ask comes back once they settle. A short table or disk takes what it can at once
+pub const fn is_holding_asks(load: Load) -> bool {
+    load.is_ingesting && !load.is_table_short && !load.is_disk_short
+}
+
+/// Check hot ingest puts merges and record rewrites off: only while the table and the disk have room to spare, since a short disk
+/// that waited out the ingest would run out of room with its dead rows still on it
 pub const fn is_deferring(load: Load) -> bool {
-    load.is_hot && !load.is_table_short
+    load.is_hot && !load.is_table_short && !load.is_disk_short
 }
 
 /// Read how many lanes may take an overlap merge: none while merges wait for ingest or the disk is short, since an overlap merge
@@ -56,7 +65,9 @@ pub const fn overlap_lanes(load: Load) -> OverlapLanes {
 }
 
 /// Read the bar a record rewrite holds unmarked segments to: with reclaim due, none on a short disk whatever the callers do, the
-/// quiet bar on a quiet volume, and the plain bar otherwise
+/// quiet bar on a quiet volume, and the plain bar otherwise. Reclaim is due only once the walk has counted every segment, so a
+/// short disk under ingest, with a segment always unwalked, holds the plain bar: a walked segment past it is half dead, and
+/// one under it would cost a copy of mostly live rows while the disk fills
 pub const fn record_bar(load: Load, owed: Owed) -> u64 {
     if !owed.is_reclaim_due {
         PLAIN_BAR
@@ -84,6 +95,7 @@ const BUSY: u8 = 1;
 const HOT: u8 = 2;
 const TABLE_SHORT: u8 = 4;
 const DISK_SHORT: u8 = 8;
+const INGESTING: u8 = 16;
 
 /// A volume's load as the planner's last step worked it out, which every lane's pick and the walk read
 #[derive(Debug, Default)]
@@ -92,13 +104,32 @@ pub struct LoadCell {
     is_current: AtomicBool,
     quiet_at: AtomicU64,
     hot_until: AtomicU64,
+    /// When the disk's room is next read
+    disk_check_at: AtomicU64,
 }
 
+/// How long a disk room reading lasts. A walk of small rows runs tens of thousands of planner steps a second, and a free space
+/// call each would cost more than the step, while a merge's own claim reads the disk again before it writes
+pub const DISK_CHECK_PERIOD: Nanoseconds = Nanoseconds(1_000_000);
+
 impl LoadCell {
+    /// Check the disk's room is due a fresh reading, and start the next period if so
+    pub fn is_disk_check_due(&self, now: Nanoseconds) -> bool {
+        if now.0 < self.disk_check_at.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.disk_check_at.store(now.0 + DISK_CHECK_PERIOD.0, Ordering::Relaxed);
+        true
+    }
+
     /// Keep a step's load and the times it ends at
     pub fn set(&self, load: Load, quiet_at: Nanoseconds, hot_until: Nanoseconds) {
         let bit = |is_set: bool, bit: u8| if is_set { bit } else { 0 };
-        let bits = bit(load.is_busy, BUSY) | bit(load.is_hot, HOT) | bit(load.is_table_short, TABLE_SHORT) | bit(load.is_disk_short, DISK_SHORT);
+        let bits = bit(load.is_busy, BUSY)
+            | bit(load.is_hot, HOT)
+            | bit(load.is_table_short, TABLE_SHORT)
+            | bit(load.is_disk_short, DISK_SHORT)
+            | bit(load.is_ingesting, INGESTING);
         self.quiet_at.store(quiet_at.0, Ordering::Relaxed);
         self.hot_until.store(hot_until.0, Ordering::Relaxed);
         self.bits.store(bits, Ordering::Release);
@@ -122,6 +153,7 @@ impl LoadCell {
             is_hot: bits & HOT != 0,
             is_table_short: bits & TABLE_SHORT != 0,
             is_disk_short: bits & DISK_SHORT != 0,
+            is_ingesting: bits & INGESTING != 0,
         }
     }
 
@@ -166,11 +198,12 @@ mod tests {
 
     /// Every load a step can work out
     fn every_load() -> impl Iterator<Item = Load> {
-        (0..16u8).map(|bits| Load {
+        (0..32u8).map(|bits| Load {
             is_busy: bits & BUSY != 0,
             is_hot: bits & HOT != 0,
             is_table_short: bits & TABLE_SHORT != 0,
             is_disk_short: bits & DISK_SHORT != 0,
+            is_ingesting: bits & INGESTING != 0,
         })
     }
 
@@ -182,9 +215,11 @@ mod tests {
     #[test]
     fn decisions_follow_the_load_table() {
         for load in every_load() {
-            let is_deferred = load.is_hot && !load.is_table_short;
+            let is_deferred = load.is_hot && !load.is_table_short && !load.is_disk_short;
             assert_eq!(is_deferring(load), is_deferred, "{load:?}");
             assert_eq!(is_capped(load), load.is_busy, "{load:?}");
+            let is_holding = load.is_ingesting && !load.is_table_short && !load.is_disk_short;
+            assert_eq!(is_holding_asks(load), is_holding, "{load:?}");
             let lanes = match (is_deferred || load.is_disk_short, load.is_busy) {
                 (true, _) => OverlapLanes::None,
                 (false, true) => OverlapLanes::One,
@@ -201,12 +236,65 @@ mod tests {
                 assert_eq!(record_bar(load, owed), bar, "{load:?} {owed:?}");
                 let is_wanted = owed.is_reclaim_due && !owed.is_reclaim_held && (!load.is_busy || load.is_disk_short);
                 assert_eq!(is_reclaim_wanted(load, owed), is_wanted, "{load:?} {owed:?}");
-                // a wanted reclaim always gets a bar below the plain one, so it can pick a segment the plain bar would pass over
-                if is_wanted {
-                    assert!(record_bar(load, owed) < PLAIN_BAR, "{load:?} {owed:?}");
-                }
             }
         }
+    }
+
+    #[test]
+    fn short_disk_never_defers_a_record_pick() {
+        for load in every_load().filter(|load| load.is_disk_short) {
+            assert!(!is_deferring(load), "{load:?}");
+        }
+    }
+
+    #[test]
+    fn short_disk_never_takes_an_overlap_merge() {
+        for load in every_load().filter(|load| load.is_disk_short) {
+            assert_eq!(overlap_lanes(load), OverlapLanes::None, "{load:?}");
+        }
+    }
+
+    #[test]
+    fn short_disk_never_holds_an_ask() {
+        for load in every_load().filter(|load| load.is_disk_short) {
+            assert!(!is_holding_asks(load), "{load:?}");
+        }
+    }
+
+    #[test]
+    fn busy_never_gets_the_quiet_bar() {
+        for load in every_load().filter(|load| load.is_busy) {
+            for owed in every_owed() {
+                assert_ne!(record_bar(load, owed), QUIET_BAR, "{load:?} {owed:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn held_reclaim_never_lowers_the_bar() {
+        for load in every_load() {
+            for owed in every_owed().filter(|owed| owed.is_reclaim_held) {
+                assert_eq!(record_bar(load, owed), PLAIN_BAR, "{load:?} {owed:?}");
+                assert!(!is_reclaim_wanted(load, owed), "{load:?} {owed:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn wanted_reclaim_gets_a_bar_under_the_plain_one() {
+        for load in every_load() {
+            for owed in every_owed().filter(|owed| is_reclaim_wanted(load, *owed)) {
+                assert!(record_bar(load, owed) < PLAIN_BAR, "{load:?} {owed:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn disk_reading_lasts_a_period() {
+        let cell = LoadCell::default();
+        assert!(cell.is_disk_check_due(Nanoseconds(5)));
+        assert!(!cell.is_disk_check_due(Nanoseconds(5 + DISK_CHECK_PERIOD.0 - 1)));
+        assert!(cell.is_disk_check_due(Nanoseconds(5 + DISK_CHECK_PERIOD.0)));
     }
 
     #[test]

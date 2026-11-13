@@ -3776,6 +3776,44 @@ fn refused_pass_looks_again() {
     store.close().expect("close");
 }
 
+// an asked pass on a quiet store under the bound, with nothing dead, waits out a refusal for room and then ends once room comes
+// back, with no seal to wake it and no spin while it waits
+#[test]
+fn refused_ask_ends_once_room_returns() {
+    let io = SimulatedIo::new(Seed(131));
+    let mut config = config();
+    config.threads.maintenance_workers = Some(1);
+    config.memory_budget = WORKER_BUDGET;
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let volume = &store.state.volumes[0];
+    hold_compaction(&store, true);
+    // segments over keys no other holds, so nothing is dead and nothing overlaps, and the pass needs more than one look
+    for number in 0..LONE_SEGMENTS {
+        store.put(COLUMN, format!("zz-lone-{number:03}").as_bytes(), b"alone").expect("put");
+        seal(&store, &io);
+    }
+    hold_compaction(&store, false);
+    settle(&io);
+    let until = store.state.quiet_at(io.clock_reading());
+    io.advance_clock(Nanoseconds(until.0.saturating_sub(io.clock_reading().0)));
+    let newest = newest_segment(&store);
+    let refused_before = refused_picks(&store);
+    volume.room_refused_at.store(io.clock_reading().0, Ordering::Release);
+    volume.is_room_refused.store(true, Ordering::Release);
+    store.state.ask_compaction();
+    step_until(&io, Nanoseconds(io.clock_reading().0 + RESERVE_PERIOD.0 / 2));
+    let refused = refused_picks(&store) - refused_before;
+    assert!(refused > 0, "no pick was refused while room was short");
+    assert!(refused < MOST_REFUSED_IN_BACK_OFF, "the planner spun on refused picks: {refused}");
+    step_until(&io, Nanoseconds(io.clock_reading().0 + 2 * RESERVE_PERIOD.0));
+    assert!(!volume.looks.has_left(), "the pass never ended once room came back");
+    let refused = refused_picks(&store) - refused_before;
+    assert!(refused < MOST_REFUSED_IN_BACK_OFF, "refused picks kept coming after room came back: {refused}");
+    assert_eq!(newest_segment(&store), newest, "a seal ran during the wait");
+    assert_eq!(record_picks(&store), 0, "a record rewrite ran with nothing dead");
+    store.close().expect("close");
+}
+
 const LONE_SEGMENTS: u64 = 2 * reel::engine::rewrite_job::OVERLAP_LOOKS as u64;
 
 // with workers the seats look and the planner reads the volume's pass, so one ask keeps looking past the first look's segments

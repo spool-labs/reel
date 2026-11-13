@@ -19,6 +19,7 @@ use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, WritePlace};
 
 use crate::config::{MAX_KEY_BYTES, MOST_VOLUME_SLOTS};
+use crate::engine::load_state::is_capped;
 use crate::engine::held_bits::HeldRow;
 use crate::engine::cover_apply::{ApplyStep, CoverApply};
 use crate::engine::engine_state::EngineState;
@@ -890,8 +891,7 @@ impl<Backend: Io> WalkJob<Backend> {
         self.next_handed_out = self.next_handed_out.max(target.next_block);
         // busy callers keep their cores: a few workers count blocks while they call, and every worker may once they go quiet
         let now = self.state.io.now();
-        volume.note_callers(self.state.caller_ops.total(), now);
-        let cap = if volume.is_caller_active(now) { volume.walk_cap() } else { usize::MAX };
+        let cap = if is_capped(self.state.load_of(volume, now)) { volume.walk_cap() } else { usize::MAX };
         let mut busy = volume.walk_slots.iter().filter(|slot| slot.phase.load(Ordering::Acquire) != SLOT_FREE).count();
         for (index, slot) in volume.walk_slots.iter().enumerate() {
             if self.next_handed_out >= target.block_count || busy >= cap {

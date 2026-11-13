@@ -108,6 +108,13 @@ pub fn is_sealing<File>(segment: &OpenSegment<File>) -> bool {
 impl<Backend: Io> Job for Planner<Backend> {
     fn step(&mut self) -> JobStep {
         let now = self.state.io.now();
+        // every decision this step makes, each lane's pick and the walk's cap among them, reads the load worked out here once
+        let state = Arc::clone(&self.state);
+        for volume in state.volumes.iter() {
+            state.refresh_load(volume, now);
+            volume.load.set_current(true);
+        }
+        let _loads = CurrentLoads(&state.volumes);
         let is_stuck = self.is_seal_stuck();
         let is_index_wait = !is_stuck && self.state.index_waiters.load(Ordering::Acquire) > 0;
         if is_index_wait || (!is_stuck && self.is_seal_first()) {
@@ -149,6 +156,17 @@ impl<Backend: Io> Job for Planner<Backend> {
         match soonest {
             Some(deadline) => JobStep::IdleUntil { deadline },
             None => JobStep::Idle,
+        }
+    }
+}
+
+/// The volumes whose load a planner step marked current, which the step's end marks stale on every way out
+struct CurrentLoads<'volumes, Backend: Io>(&'volumes [Volume<Backend>]);
+
+impl<Backend: Io> Drop for CurrentLoads<'_, Backend> {
+    fn drop(&mut self) {
+        for volume in self.0 {
+            volume.load.set_current(false);
         }
     }
 }

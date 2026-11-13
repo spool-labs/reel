@@ -17,7 +17,8 @@ use crate::io::wake_line::WakeLine;
 use crate::engine::dead_bits::{CHUNK_WORDS, DEAD_BITS_SAVE_PERIOD, chunk_sum};
 use crate::engine::volume::BitsSave;
 use crate::io::replace::move_into_place;
-use crate::engine::rewrite_job::rows_of;
+use crate::engine::load_state::Load;
+use crate::engine::rewrite_job::{has_disk_room, rows_of};
 use crate::engine::admission::{Admission, Admit, Decision, JobRole, reserve_for, room_for};
 use reel_api::maintenance_report::WorkerPriority;
 use crate::engine::column_info::ColumnInfo;
@@ -399,6 +400,27 @@ impl<Backend: Io> EngineState<Backend> {
             quiet = quiet.max(volume.quiet_at());
         }
         quiet
+    }
+
+    /// Read a volume's load: what the planner step under way worked out, or worked out now for a caller outside a step
+    pub fn load_of(&self, volume: &Volume<Backend>, now: Nanoseconds) -> Load {
+        if !volume.load.is_current() {
+            self.refresh_load(volume, now);
+        }
+        volume.load.get()
+    }
+
+    /// Work out a volume's load once for a planner step: callers, the hot window, the table and park, and the disk's room. Every
+    /// decision in the step, the lanes' picks and the walk's cap read what this keeps
+    pub fn refresh_load(&self, volume: &Volume<Backend>, now: Nanoseconds) {
+        volume.note_callers(self.caller_ops.total(), now);
+        let load = Load {
+            is_busy: volume.is_caller_active(now),
+            is_hot: volume.is_hot(now),
+            is_table_short: volume.is_short_of_room(),
+            is_disk_short: !has_disk_room(self, volume, ByteCount(0), false),
+        };
+        volume.load.set(load, volume.quiet_at(), volume.hot_until());
     }
 
     /// Count a volume's segments waiting for the dead-byte walk

@@ -21,7 +21,8 @@ use crate::config::MAX_KEY_BYTES;
 use crate::engine::complete_path::{REFILL_STEP_BLOCKS, Refill};
 use crate::engine::cover_apply::is_in_range;
 use crate::engine::engine_state::EngineState;
-use crate::engine::rewrite_job::{PLANNER_LANE, RewriteJob, RewriteSeat, has_disk_room, is_mergeable, is_reclaim_due};
+use crate::engine::load_state::{Owed, Refusal, is_deferring, is_reclaim_wanted, refusal_wait};
+use crate::engine::rewrite_job::{PLANNER_LANE, RewriteJob, RewriteSeat, is_mergeable, is_reclaim_due};
 use crate::engine::rebuild::MOST_REBUILD_TRIES;
 use crate::engine::volume::{ParkedSegment, Volume};
 use crate::engine::walk_job::{FREE_IN_PLACE_BYTES, FreeRecord, WALK_RETRY};
@@ -119,7 +120,8 @@ pub struct CompactJob<Backend: Io> {
     held_pass: Option<HeldPass>,
     confirm_pass: Option<ConfirmPass>,
     should_rewrite: bool,
-    is_ask_held: bool,
+    /// When a pick a refusal ended tries again, with the ask still standing
+    pick_retry_at: Option<Nanoseconds>,
     refill: Option<Refill>,
     refill_key: FixedList<u8>,
     refill_below: u64,
@@ -158,7 +160,7 @@ impl<Backend: Io> CompactJob<Backend> {
             seats: Arc::new(seats),
             handed_at: 0,
             should_rewrite: false,
-            is_ask_held: false,
+            pick_retry_at: None,
             unit: None,
             quiet_looked_at: u64::MAX,
             did_background: false,
@@ -346,39 +348,40 @@ impl<Backend: Io> CompactJob<Backend> {
             }
         }
         // a quiet volume with dead bytes fills its idle time with reclaiming them, and one past the bound merges back first
-        let is_short = volume.is_short_of_room();
-        let is_deferring = volume.is_hot(now) && !is_short;
-        let is_holding_records = volume.is_ingesting(now) && !is_short;
+        let load = self.state.load_of(volume, now);
+        let is_deferring = is_deferring(load);
         let is_owed = !is_deferring && volume.is_over_bound.load(Ordering::Acquire);
-        volume.note_callers(self.state.caller_ops.total(), now);
         // a disk short of room frees what it can whether callers are busy or not, and a disk that fills from outside looks again
         let has_dead = !volume.is_reclaim_held() && is_reclaim_due(&hold(&volume.summary));
-        let is_room_short = has_dead && !has_disk_room(&self.state, volume, ByteCount(0), false);
-        let look_key = summary_changes(volume) << 1 | u64::from(is_room_short);
-        let is_reclaim_due = has_dead && look_key != self.quiet_looked_at;
-        // busy callers leave dead bytes to the plain bar, and the planner comes back once a quiet spell could have begun
-        let is_busy = volume.is_caller_active(now);
-        let is_quiet_with_dead = (!is_busy || is_room_short) && is_reclaim_due;
-        let mut should_rewrite = mem::take(&mut self.should_rewrite) || is_quiet_with_dead || is_owed;
-        // an ask that arriving writes held back comes due once they stop
-        if is_holding_records {
-            self.is_ask_held |= should_rewrite;
-        } else {
-            should_rewrite |= mem::take(&mut self.is_ask_held);
+        let look_key = summary_changes(volume) << 1 | u64::from(load.is_disk_short);
+        let owed = Owed { is_reclaim_due: has_dead && look_key != self.quiet_looked_at, is_reclaim_held: false };
+        let is_quiet_with_dead = is_reclaim_wanted(load, owed);
+        let should_rewrite = mem::take(&mut self.should_rewrite) || is_quiet_with_dead || is_owed;
+        // a refused pick waits as its refusal said before the next try, with the ask still standing
+        if let Some(at) = self.pick_retry_at.filter(|at| at.0 > now.0) {
+            self.should_rewrite = should_rewrite;
+            return JobStep::IdleUntil { deadline: at };
         }
-        let (refused_before, nothing_before) = (refused_picks(volume), nothing_picks(volume));
+        self.pick_retry_at = None;
+        let before = PickCounts::of(volume);
         // workers run every rewrite, so the planner stays free to pick and walk. A merge of 1 GiB segments would hold it for minutes
         if should_rewrite && (self.hand_out() || (self.seats.is_empty() && self.rewrite.start())) {
             return JobStep::Worked;
         }
-        // a look takes a few segments at a time, and the rest still count. Hot ingest looks at none
-        // a step whose picks were refused looks no further, and waits as the refusal says
-        let is_refused = refused_picks(volume) != refused_before;
-        self.should_rewrite = should_rewrite && !is_deferring && !is_refused && volume.looks.has_left();
+        let after = PickCounts::of(volume);
+        let refusal = after.refusal_since(before);
+        let wait = refusal.and_then(|refusal| refusal_wait(refusal, load, now, volume.load.quiet_at(), volume.load.hot_until()));
+        if let Some(wait) = wait {
+            self.should_rewrite = should_rewrite;
+            self.pick_retry_at = Some(wait);
+            return JobStep::IdleUntil { deadline: wait };
+        }
+        // a look takes a few segments at a time, and the rest still count. Hot ingest looks at none, and a pick behind an overlap
+        // merge stops this pass, since the overlap owed brings the next step back to it
+        self.should_rewrite = should_rewrite && !is_deferring && refusal.is_none() && volume.looks.has_left();
         // a quiet pass that found nothing past the bar looks again only once a seal, a rewrite, an unlink or the room changes what
-        // it saw. A pass a refusal ended, for room, the park or an overlap merge owed, tries again as that refusal says
-        let has_found_nothing = !is_refused && nothing_picks(volume) > nothing_before;
-        if is_quiet_with_dead && !self.should_rewrite && has_found_nothing {
+        // it saw
+        if is_quiet_with_dead && !self.should_rewrite && refusal.is_none() && after.nothing > before.nothing {
             self.quiet_looked_at = look_key;
         }
         // only a look ran, so the walk takes its turn in the same step, however many looks the pass has left
@@ -386,15 +389,15 @@ impl<Backend: Io> CompactJob<Backend> {
             self.did_background = true;
             return JobStep::Worked;
         }
-        if volume.is_room_refused.load(Ordering::Acquire) || volume.is_room_short.load(Ordering::Acquire) {
+        if volume.is_room_refused.load(Ordering::Acquire) || load.is_disk_short {
             return JobStep::IdleUntil { deadline: Nanoseconds(now.0 + RESERVE_PERIOD.0) };
         }
-        // what hot ingest or arriving writes put off starts once the window closes
-        if is_deferring || is_holding_records {
-            return JobStep::IdleUntil { deadline: volume.hot_until() };
+        // what hot ingest puts off starts once the window closes
+        if is_deferring {
+            return JobStep::IdleUntil { deadline: volume.load.hot_until() };
         }
-        if is_busy && is_reclaim_due {
-            return JobStep::IdleUntil { deadline: volume.quiet_at() };
+        if load.is_busy && owed.is_reclaim_due {
+            return JobStep::IdleUntil { deadline: volume.load.quiet_at() };
         }
         // a planner with nothing to do saves the bits that changed, so a stop after a quiet spell keeps them all
         if volume.bits_saved_at.load(Ordering::Acquire) != 0 && volume.dead_bits.is_changed.swap(false, Ordering::AcqRel) {
@@ -481,6 +484,8 @@ impl<Backend: Io> CompactJob<Backend> {
         let changes = summary_changes(volume);
         if changes != self.handed_at {
             self.handed_at = changes;
+            // a seal, a rewrite or an unlink may clear what a refusal waited for
+            self.pick_retry_at = None;
             let _handed = self.hand_out();
         }
     }
@@ -1030,12 +1035,37 @@ fn summary_changes<Backend: Io>(volume: &Volume<Backend>) -> u64 {
     left + volume.seals_done.load(Ordering::Acquire)
 }
 
-/// Count picks a refusal ended: refused for room, the park or stray outputs, deferred under the cap, or behind an overlap merge
-fn refused_picks<Backend: Io>(volume: &Volume<Backend>) -> u64 {
-    [PickOutcome::Refused, PickOutcome::Deferred, PickOutcome::Behind].iter().map(|kind| volume.picks[kind.index()].load(Ordering::Acquire)).sum()
+/// The pick outcomes a step reads before and after its hand-out, to tell what ended a pick that started nothing
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PickCounts {
+    refused: u64,
+    deferred: u64,
+    behind: u64,
+    nothing: u64,
 }
 
-/// Count picks that looked and found nothing past the bar
-fn nothing_picks<Backend: Io>(volume: &Volume<Backend>) -> u64 {
-    volume.picks[PickOutcome::Nothing.index()].load(Ordering::Acquire)
+impl PickCounts {
+    /// Read a volume's counts
+    fn of<Backend: Io>(volume: &Volume<Backend>) -> Self {
+        let count = |outcome: PickOutcome| volume.picks[outcome.index()].load(Ordering::Acquire);
+        Self {
+            refused: count(PickOutcome::Refused),
+            deferred: count(PickOutcome::Deferred),
+            behind: count(PickOutcome::Behind),
+            nothing: count(PickOutcome::Nothing),
+        }
+    }
+
+    /// Read the refusal that moved since the counts before, the first of refused, deferred and behind
+    fn refusal_since(self, before: Self) -> Option<Refusal> {
+        if self.refused != before.refused {
+            Some(Refusal::Refused)
+        } else if self.deferred != before.deferred {
+            Some(Refusal::Deferred)
+        } else if self.behind != before.behind {
+            Some(Refusal::Behind)
+        } else {
+            None
+        }
+    }
 }

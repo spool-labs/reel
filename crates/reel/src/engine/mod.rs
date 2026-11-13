@@ -14,6 +14,7 @@ pub mod engine_state;
 pub mod held_bits;
 pub mod filter_job;
 pub mod job_tally;
+pub mod load_state;
 pub mod reports;
 pub mod open_segment;
 pub mod pick_hold;

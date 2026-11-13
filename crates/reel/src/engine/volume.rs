@@ -14,6 +14,7 @@ use crate::engine::open_segment::OpenSegment;
 use crate::engine::ration::Ration;
 use crate::engine::held_bits::HeldBits;
 use crate::engine::walk_job::WalkSlot;
+use crate::engine::load_state::LoadCell;
 use crate::engine::row_job::IDLE_SEAL_AFTER;
 use crate::guard::hold;
 use crate::index::open_slots::{OpenSlot, OpenSlots};
@@ -365,8 +366,6 @@ pub struct Volume<Backend: Io> {
     pub long_park_waits: AtomicU64,
     /// Merges that wrote past their promise and took more room
     pub promises_outgrown: AtomicU64,
-    /// The disk sat under the writers' reserve at the last pick, so overlap merges wait
-    pub is_room_short: AtomicBool,
     /// A merge was refused for disk room, so the planner looks again on a timer, since no write may come to wake it
     pub is_room_refused: AtomicBool,
     /// When the last merge gave up for room, so picks wait a reserve period after it
@@ -409,6 +408,8 @@ pub struct Volume<Backend: Io> {
     pub claims_changed: AtomicU64,
     /// The overlap look's pass, which every lane's pick shares
     pub looks: LookPass,
+    /// The load the planner's last step worked out, which every lane's pick and the walk read
+    pub load: LoadCell,
     /// Counts the turns a walk stood aside for a rewrite
     pub walks_held: AtomicU64,
     /// Counts the waits of a block whose charges land on an input a rewrite has claimed, none until the held bits come

@@ -26,7 +26,8 @@ use crate::segment::segment_tail::{MOST_MERGE_SEGMENTS, SegmentNumber};
 use crate::segment::summary::{SummaryRow, SummaryRows};
 use crate::segment::summary_orders::{COVERS_LIST, ROW_FOOTER_BYTES, SHARE_BUCKETS, SHARE_SCALE, WalkList, reclaim_share, share_bucket};
 
-use crate::engine::rewrite_job::{BAR_SCALE, BUCKET_LOOKS, BarsFired, CROWD_PAGES, MOST_COUNTED_CROWD, MOST_LOOK_TIME, OVERLAP_BASE_RECORD_BYTES, EARLY_BAR, GATHER_LOOKS, MOST_OVERLAP, MergeInput, MergeTarget, OVERLAP_LOOKS, OVERLAP_PROBES, PLAIN_BAR, PLANNER_LANE, QUIET_BAR, ROOM_SHORT_BAR, RewriteJob, RewritePhase, rows_of};
+use crate::engine::load_state::{OverlapLanes, Owed, is_capped, is_deferring, overlap_lanes, record_bar};
+use crate::engine::rewrite_job::{BAR_SCALE, BUCKET_LOOKS, BarsFired, CROWD_PAGES, MOST_COUNTED_CROWD, MOST_LOOK_TIME, OVERLAP_BASE_RECORD_BYTES, EARLY_BAR, GATHER_LOOKS, MOST_OVERLAP, MergeInput, MergeTarget, OVERLAP_LOOKS, OVERLAP_PROBES, PLAIN_BAR, PLANNER_LANE, RewriteJob, RewritePhase, rows_of};
 use crate::engine::rewrite_job::install::freed_in_place;
 
 impl<Backend: Io> RewriteJob<Backend> {
@@ -127,9 +128,8 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
         let state = Arc::clone(&self.state);
         let kind = if self.lane == PLANNER_LANE { PickKind::Overlap } else { PickKind::Rewrite };
-        // a disk short of room frees space first, so overlap merges, which write what they read, wait for it
-        let is_room_short = !has_disk_room(&state, volume, ByteCount(0), false);
-        volume.is_room_short.store(is_room_short, Ordering::Release);
+        let now = self.state.io.now();
+        let load = state.load_of(volume, now);
         let mut rows = state.hold_for_pick(self.volume, kind);
         self.is_unwalked = false;
         self.bars_fired = BarsFired::default();
@@ -145,28 +145,22 @@ impl<Backend: Io> RewriteJob<Backend> {
             volume.note_pick(PickOutcome::Rebuild);
             return Some((target, false));
         }
-        let now = self.state.io.now();
         // busy callers keep their cores: a few merges run while they call, and every worker may merge once they go quiet
-        volume.note_callers(self.state.caller_ops.total(), now);
         let in_flight = volume.lanes.iter().filter(|lane| lane.is_rewriting.load(Ordering::Acquire)).count();
-        if volume.is_caller_active(now) && in_flight >= volume.merge_cap() {
+        if is_capped(load) && in_flight >= volume.merge_cap() {
             volume.capped_picks.fetch_add(1, Ordering::Relaxed);
             volume.note_pick(PickOutcome::Deferred);
             return None;
         }
-        let is_short = volume.is_short_of_room();
-        let is_deferring = volume.is_hot(now) && !is_short;
-        // callers reading, writing or scanning, or a store just opened, count as busy: the quiet bar and a merge on every lane wait
-        // for a quiet spell with no call
-        let is_busy = volume.is_caller_active(now);
         // an overlap merge copies records, so one at a time on the first worker keeps callers at their line while they call, and
         // once they stop every idle worker takes one over segments no other merge holds. The planner runs one only with no workers
         let busy_lane = if volume.walk_slots.is_empty() { PLANNER_LANE } else { PLANNER_LANE + 1 };
-        if (self.lane == busy_lane || !is_busy)
-            && !is_deferring
-            && !is_room_short
-            && let Some(target) = self.pick_overlap(volume, &rows, room)
-        {
+        let may_overlap = match overlap_lanes(load) {
+            OverlapLanes::None => false,
+            OverlapLanes::One => self.lane == busy_lane,
+            OverlapLanes::All => true,
+        };
+        if may_overlap && let Some(target) = self.pick_overlap(volume, &rows, room) {
             self.picked_as = Some(PickOutcome::Overlap);
             volume.note_pick(PickOutcome::Overlap);
             return Some((target, false));
@@ -181,17 +175,18 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
         // hot ingest with room to spare leaves overlap merges and record rewrites for quiet time. A trickle a merge outpaces
         // isn't hot, so record rewrites reclaim under it at the plain bar
-        if is_deferring {
+        if is_deferring(load) {
             volume.note_pick(PickOutcome::Deferred);
             return None;
         }
         // a volume merges back to the bound before it reclaims, so record rewrites wait while an overlap merge runs or can start
-        if volume.is_over_bound.load(Ordering::Acquire) && !is_room_short {
+        if volume.is_over_bound.load(Ordering::Acquire) && !load.is_disk_short {
             volume.note_pick(PickOutcome::Behind);
             return None;
         }
         let current = DeathMark(self.state.current_mark.load(Ordering::Relaxed));
-        let plain = plain_bar(is_busy || volume.is_reclaim_held(), is_room_short && !volume.is_reclaim_held(), &rows);
+        let owed = Owed { is_reclaim_due: is_reclaim_due(&rows), is_reclaim_held: volume.is_reclaim_held() };
+        let plain = record_bar(load, owed);
         let gave_up = self.gave_up_list(volume);
         let is_ready_at = |row: &SummaryRow<'_>, plain: u64| {
             let bar = (current, plain);
@@ -772,20 +767,6 @@ pub fn first_ready<'rows>(rows: &'rows SummaryRows, plain: u64, is_ready: impl F
         let looked = rows.orders().share_list(list).take(BUCKET_LOOKS).filter_map(|segment| rows.get(segment));
         looked.filter(|row| is_ready(row)).max_by_key(reclaim_share)
     })
-}
-
-/// Work out the plain bar a pick holds unmarked segments to, once the volume is walked and holds dead bytes: none at all when its
-/// disk is short of room, busy callers or not, and the quiet bar while it is quiet. Otherwise the plain bar
-pub fn plain_bar(is_busy: bool, is_room_short: bool, rows: &SummaryRows) -> u64 {
-    if !is_reclaim_due(rows) {
-        PLAIN_BAR
-    } else if is_room_short {
-        ROOM_SHORT_BAR
-    } else if is_busy {
-        PLAIN_BAR
-    } else {
-        QUIET_BAR
-    }
 }
 
 /// Check a volume holds dead bytes and the walk has counted every segment, so its idle time goes to reclaiming them all with each

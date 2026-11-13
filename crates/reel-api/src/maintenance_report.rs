@@ -322,6 +322,8 @@ pub struct VolumeReading {
     pub picks: [u64; PICK_OUTCOMES],
     /// What finished rewrites took off the disk and wrote back
     pub rewrite_bytes: RewriteBytes,
+    /// What the pace earned, spent and refused
+    pub pace: PaceReading,
     /// Walk blocks whose counts landed
     pub walk_blocks: u64,
     /// How long the writes took to fill the last sealed segment
@@ -418,6 +420,35 @@ pub struct RewriteBytes {
     pub rewrites_by_share: [u64; SHARE_KINDS],
     /// File bytes whole unlinks took off the disk, which write nothing
     pub unlinked: ByteCount,
+}
+
+/// The pace that holds busy callers' record rewrites under half dead to the dead bytes the walk counts
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PaceReading {
+    /// Copy bytes for each thousand dead bytes
+    pub per_mille: u64,
+    /// Copy bytes paced rewrites may still start, below zero while a rewrite wrote past its estimate
+    pub credit: i64,
+    /// Dead bytes the walk counted, which earn the credit
+    pub dead_counted: ByteCount,
+    /// Bytes paced rewrites wrote
+    pub paced_written: ByteCount,
+    /// Record picks the pace put off
+    pub refusals: u64,
+    /// Paced picks the space target put off, the volume under it
+    pub gate_refusals: u64,
+    /// The space target, dead bytes a rewrite must win back as thousandths of the live bytes
+    pub target_per_mille: u64,
+    /// Dead bytes only a rewrite can win back: walked, not freed in place, in segments not wholly dead
+    pub gate_dead: ByteCount,
+    /// Live record bytes, an unwalked segment's all counted live
+    pub live: ByteCount,
+    /// Dead bytes the record rewrites in flight will win back
+    pub gate_in_flight: ByteCount,
+    /// Credit the cap turned away
+    pub spilled: ByteCount,
+    /// Rows a pick held to the half bar, their counts not trusted while a segment below them was unwalked
+    pub trust_fallbacks: u64,
 }
 
 /// The kinds a rewrite's written bytes are counted by: record rewrites under three quarters dead, at three quarters and up,

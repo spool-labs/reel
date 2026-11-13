@@ -40,6 +40,7 @@ fn pool_compact() {
         blocks: Extent { start, length },
         is_walked: false,
         highest_replacement: WritePlace(0),
+        live_blocks: 0,
         has_held_frees: false,
         is_unproven: false,
     };
@@ -151,4 +152,24 @@ fn past_half_follows_the_slots() {
         table.free_retired(&retired);
     }
     assert!(!table.is_past_half());
+}
+
+// a segment reads wholly dead at the drop that empties its last live block, and not one row before
+#[test]
+fn dead_at_the_last_live_block() {
+    let table = table_with(4);
+    let number = SegmentNumber(1);
+    let head = TailHead { segment: number, ..TailHead::default() };
+    let live = |offset: u32| BlockEntry { live_rows: 5, ..line(offset) };
+    assert!(table.install(1, RootId(0), &head, &[], &[live(0), live(10), live(20)]));
+    for block in 0..2 {
+        table.drop_live(number, block, 5, WritePlace(9));
+        assert_eq!(table.dead_replacement(number), None, "block {block}");
+    }
+    // a drop on a block already dead takes nothing more off
+    table.drop_live(number, 0, 5, WritePlace(9));
+    table.drop_live(number, 2, 4, WritePlace(9));
+    assert_eq!(table.dead_replacement(number), None, "one row left");
+    table.drop_live(number, 2, 1, WritePlace(12));
+    assert_eq!(table.dead_replacement(number), Some(WritePlace(12)));
 }

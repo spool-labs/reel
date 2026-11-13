@@ -28,7 +28,7 @@ use crate::segment::summary_orders::{COVERS_LIST, ROW_FOOTER_BYTES, SHARE_BUCKET
 
 use crate::engine::compact_job::can_unlink;
 use crate::engine::load_state::{OverlapLanes, Owed, is_capped, is_deferring, overlap_lanes, record_bar};
-use crate::engine::rewrite_job::{BAR_SCALE, BUCKET_LOOKS, BarsFired, CROWD_PAGES, MOST_COUNTED_CROWD, MOST_LOOK_TIME, OVERLAP_BASE_RECORD_BYTES, EARLY_BAR, GATHER_LOOKS, MOST_OVERLAP, MergeInput, MergeTarget, OVERLAP_LOOKS, OVERLAP_PROBES, PLAIN_BAR, PLANNER_LANE, RewriteJob, RewritePhase, rows_of};
+use crate::engine::rewrite_job::{BAR_SCALE, BUCKET_LOOKS, MOST_PASSED_LOOKS, BarsFired, CROWD_PAGES, MOST_COUNTED_CROWD, MOST_LOOK_TIME, OVERLAP_BASE_RECORD_BYTES, EARLY_BAR, GATHER_LOOKS, MOST_OVERLAP, MergeInput, MergeTarget, OVERLAP_LOOKS, OVERLAP_PROBES, PLAIN_BAR, PLANNER_LANE, RewriteJob, RewritePhase, rows_of};
 use crate::engine::rewrite_job::install::freed_in_place;
 
 impl<Backend: Io> RewriteJob<Backend> {
@@ -200,17 +200,17 @@ impl<Backend: Io> RewriteJob<Backend> {
         let plain = record_bar(load, owed);
         let gave_up = self.gave_up_list(volume);
         let index = self.volume;
+        // a wholly dead segment the unlink can take now goes by the unlink, and a rewrite of it would throw one of the two away
+        let is_for_unlink = |row: &SummaryRow<'_>| is_wholly_dead(row) && can_unlink(&state, index, volume, row.facts.segment);
         let is_ready_at = |row: &SummaryRow<'_>, plain: u64| {
             let bar = (current, plain);
             let is_free = row.facts.is_walked() && row.facts.segment.0 != walking && !gave_up.holds(row.facts.segment);
-            // a wholly dead segment the unlink can take now goes by the unlink, and a rewrite of it would throw one of the two away
-            let is_for_unlink = || is_wholly_dead(row) && can_unlink(&state, index, volume, row.facts.segment);
-            is_free && !is_for_unlink() && is_rewrite_ready(volume, row, 0, bar) && is_rewrite_ready(volume, row, freed_in_place(volume, row), bar)
+            is_free && !is_for_unlink(row) && is_rewrite_ready(volume, row, 0, bar) && is_rewrite_ready(volume, row, freed_in_place(volume, row), bar)
         };
         let is_ready = |row: &SummaryRow<'_>| is_ready_at(row, plain);
         // the most won back for the bytes read goes first, and a picked row moves to its bucket's end, so a merge that gave way
         // lets the next one up
-        if let Some(first) = first_ready(&rows, plain, is_ready) {
+        if let Some(first) = first_ready(&rows, plain, is_ready, is_for_unlink) {
             let is_grave_heavy = is_grave_heavy(&first);
             let (segment, lifetime) = (first.facts.segment, first.facts.marks);
             let is_more = |row: &SummaryRow<'_>| is_ready(row) && row.facts.segment > segment && row.facts.marks.shares_lifetime(lifetime);
@@ -773,13 +773,37 @@ pub fn held_bar(marks: MarkRange, current: DeathMark, plain: u64) -> u64 {
 
 /// Find the ready row that wins most back in the highest share bucket that has one, down to the least share the plain bar lets
 /// in, and then among the rows with covers. A pick looks at no more than the first few rows of a bucket, and of equal shares
-/// takes the last, which leaves the rows before it to other lanes
-pub fn first_ready<'rows>(rows: &'rows SummaryRows, plain: u64, is_ready: impl Fn(&SummaryRow<'_>) -> bool) -> Option<SummaryRow<'rows>> {
+/// takes the last, which leaves the rows before it to other lanes. Rows it passes over for the unlink count for none of those
+/// looks, up to MOST_PASSED_LOOKS a bucket, so a queue of dead segments ahead of a proof hides no ready row behind it
+pub fn first_ready<'rows>(
+    rows: &'rows SummaryRows,
+    plain: u64,
+    is_ready: impl Fn(&SummaryRow<'_>) -> bool,
+    is_passed: impl Fn(&SummaryRow<'_>) -> bool,
+) -> Option<SummaryRow<'rows>> {
     let least = share_bucket(SHARE_SCALE * plain / BAR_SCALE);
     let mut lists = (least..SHARE_BUCKETS).rev().chain(iter::once(COVERS_LIST));
     lists.find_map(|list| {
-        let looked = rows.orders().share_list(list).take(BUCKET_LOOKS).filter_map(|segment| rows.get(segment));
-        looked.filter(|row| is_ready(row)).max_by_key(reclaim_share)
+        let (mut looks, mut passed) = (0, 0);
+        let mut best: Option<SummaryRow<'rows>> = None;
+        for segment in rows.orders().share_list(list) {
+            if looks == BUCKET_LOOKS {
+                break;
+            }
+            let Some(row) = rows.get(segment) else {
+                looks += 1;
+                continue;
+            };
+            if passed < MOST_PASSED_LOOKS && is_passed(&row) {
+                passed += 1;
+                continue;
+            }
+            looks += 1;
+            if is_ready(&row) && best.as_ref().is_none_or(|kept| reclaim_share(&row) >= reclaim_share(kept)) {
+                best = Some(row);
+            }
+        }
+        best
     })
 }
 

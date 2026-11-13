@@ -107,6 +107,9 @@ pub const OVERLAP_PROBES: usize = 16;
 pub const OVERLAP_LOOKS: usize = 16;
 /// Most rows of one share bucket a pick looks at before it moves down to the next
 pub const BUCKET_LOOKS: usize = 64;
+/// Most rows of one share bucket a pick passes over for the unlink before they count as looks: four times a bucket's looks, so a
+/// long queue of dead segments costs a pick a bounded walk
+pub const MOST_PASSED_LOOKS: usize = 4 * BUCKET_LOOKS;
 /// Most rows a merge looks along the segment order for each input past its first
 pub const GATHER_LOOKS: usize = 64;
 /// Most segments one directory listing of an overlap look holds

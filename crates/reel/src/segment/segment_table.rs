@@ -43,6 +43,8 @@ pub struct TableEntry<File> {
     pub blocks: Extent,
     pub is_walked: bool,
     pub highest_replacement: WritePlace,
+    /// Blocks with a live row left, so a check for a wholly dead segment reads one count
+    pub live_blocks: u32,
     pub has_held_frees: bool,
     pub is_unproven: bool,
 }
@@ -303,6 +305,7 @@ impl<File: Clone> SegmentTable<File> {
             blocks: block_extent,
             is_walked: false,
             highest_replacement: WritePlace(0),
+            live_blocks: blocks.iter().filter(|line| line.live_rows > 0).count() as u32,
             has_held_frees: false,
             is_unproven: false,
         });
@@ -374,9 +377,15 @@ impl<File: Clone> SegmentTable<File> {
             return;
         };
         entry.highest_replacement = entry.highest_replacement.max(replacement);
-        let start = entry.blocks.start;
-        if let Some(line) = guard.blocks.get_mut(start as usize + block as usize) {
-            line.live_rows = line.live_rows.saturating_sub(rows);
+        let start = entry.blocks.start as usize + block as usize;
+        let Some(line) = guard.blocks.get_mut(start) else {
+            return;
+        };
+        let was_live = line.live_rows > 0;
+        line.live_rows = line.live_rows.saturating_sub(rows);
+        let is_dead = was_live && line.live_rows == 0;
+        if is_dead && let Some(entry) = guard.segments[slot as usize].as_mut() {
+            entry.live_blocks = entry.live_blocks.saturating_sub(1);
         }
     }
 
@@ -441,9 +450,7 @@ impl<File: Clone> SegmentTable<File> {
         let guard = self.shards.read(shard_of(number));
         let slot = guard.map.get(number)?;
         let entry = guard.segments[slot as usize].as_ref()?;
-        let first = entry.blocks.start as usize;
-        let lines = guard.blocks.get(first..first + entry.blocks.length as usize)?;
-        lines.iter().all(|line| line.live_rows == 0).then_some(entry.highest_replacement)
+        (entry.live_blocks == 0).then_some(entry.highest_replacement)
     }
 
     /// Add up a segment's live rows, block by block

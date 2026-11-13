@@ -7,22 +7,23 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, ThreadCounts, VolumeConfig};
-use reel::engine::compact_job::CompactJob;
+use reel::engine::compact_job::{CompactJob, can_unlink};
 use reel::engine::filter_job::FilterLoader;
 use reel::engine::reel_store::ReelStore;
-use reel::engine::rewrite_job::RewriteJob;
+use reel::engine::rewrite_job::{MOST_PASSED_LOOKS, RewriteJob};
 use reel::engine::walk_job::WalkJob;
 use reel::guard::hold;
+use reel::io::Io;
 use reel::lifetime::MarkRange;
 use reel::record::codec::Codec;
 use reel::record::record_check::{Checksum, checksum};
-use reel::segment::block_entry::{KeyBound, KeyPrefix};
+use reel::segment::block_entry::{BlockEntry, KeyBound, KeyPrefix};
 use reel::segment::column_directory::{DirectoryEntry, Listing, RangeEntry};
-use reel::segment::segment_tail::{MOST_MERGE_SEGMENTS, PlaceRange, SegmentNumber};
+use reel::segment::segment_tail::{MOST_MERGE_SEGMENTS, PlaceRange, SegmentNumber, TailHead};
 use reel::segment::summary::{ColumnFacts, DeadCount, SegmentFacts};
 use reel_api::column_id::ColumnId;
 use reel_api::maintenance_report::PickOutcome;
-use reel_api::units::{ByteCount, DeathMark, FileOffset, RowCount, VolumeId, WritePlace};
+use reel_api::units::{ByteCount, DeathMark, FileOffset, RootId, RowCount, VolumeId, WritePlace};
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_io::SimulatedIo;
 
@@ -211,4 +212,55 @@ fn picks_at_most_segments() {
         drop((lane, walk, compaction));
         store.close().expect("close");
     }
+}
+
+/// Blocks each wholly dead segment's table entry holds, as many as a segment can have, halved until the table has room
+const DEAD_BLOCKS: u32 = 64 * 1024;
+
+// a row whose counts say nothing in its segment is live
+fn dead_column_facts() -> ColumnFacts<'static> {
+    ColumnFacts { dead_rows: RowCount(10_000), live_bytes: ByteCount(0), dead_bytes: ByteCount(3_000_000), ..column_facts() }
+}
+
+// a queue of wholly dead segments the unlink can take, at the head of the top share bucket with real table entries of many
+// blocks, ahead of 100,000 segments a record pick can take: the pick passes the queue and holds the line
+#[test]
+fn record_pick_past_a_dead_queue() {
+    let io = SimulatedIo::new(Seed(72));
+    io.add_disk(Path::new(ROOT), DISK);
+    let store: Store = ReelStore::open(io.clone(), &config()).expect("open");
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    let file = io.create_file(&Path::new(ROOT).join("stand-in"), ByteCount(0)).expect("a file");
+    let ahead = MOST_PASSED_LOOKS as u64;
+    let mut total = 0;
+    let lines = vec![BlockEntry::default(); DEAD_BLOCKS as usize];
+    for number in SEGMENTS + 1..=SEGMENTS + ahead {
+        let head = TailHead { segment: SegmentNumber(number), ..TailHead::default() };
+        let mut blocks = DEAD_BLOCKS as usize;
+        while !volume.table.install(file.clone(), RootId(0), &head, &[], &lines[..blocks]) {
+            assert!(blocks > 0, "the table has no slot for segment {number}");
+            blocks /= 2;
+        }
+        total += blocks;
+    }
+    println!("{ahead} dead segments over {total} blocks");
+    let mut rows = hold(&volume.summary);
+    rows.make_room(ByteCount((SEGMENTS + ahead) * ROW_ROOM));
+    rows.make_index((SEGMENTS + ahead) as usize);
+    for number in SEGMENTS + 1..=SEGMENTS + ahead {
+        let (lowest, bound) = ((number << 20).to_be_bytes(), ((number + 1) << 20).to_be_bytes());
+        let column = ColumnFacts { column: COLUMN, lowest: &lowest, bound: &bound, ..dead_column_facts() };
+        assert!(rows.push(&facts(number), iter::once(column), iter::empty()), "the summary filled at {number}");
+    }
+    drop(rows);
+    fill(&store, false);
+    let mut lane = RewriteJob::new(Arc::clone(state), 0, WORKER_LANE);
+    let candidate = SegmentNumber(SEGMENTS + 1);
+    assert!(can_unlink(state, 0, volume, candidate), "the queue isn't one the unlink can take");
+    // segments over keys of their own owe no overlap merge, so the record pick walks the buckets
+    volume.is_over_bound.store(false, Ordering::Release);
+    time("record past a dead queue", || lane.pick_within(volume, MOST_MERGE_SEGMENTS).is_some_and(|(target, _)| target.length.0 > 0));
+    drop(lane);
+    store.close().expect("close");
 }

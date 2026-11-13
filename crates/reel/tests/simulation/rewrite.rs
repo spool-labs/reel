@@ -21,7 +21,7 @@ use reel::engine::reel_store::ReelStore;
 use reel::engine::reserve_job::RESERVE_PERIOD;
 use reel::engine::row_job::IDLE_SEAL_AFTER;
 use reel::engine::dead_bits::DECIDED_SET;
-use reel::engine::rewrite_job::{MERGE_BUFFER_BYTES, MergeTarget, MOST_OVERLAP, MOST_PARK_WAIT, PLANNER_LANE, RewriteJob, RewritePhase, is_overlap_input, overlaps};
+use reel::engine::rewrite_job::{MERGE_BUFFER_BYTES, MergeTarget, MOST_OVERLAP, MOST_PARK_WAIT, PLANNER_LANE, RewriteJob, RewritePhase, is_overlap_input, overlaps, rows_of};
 use reel::lifetime::MarkRange;
 use reel::engine::volume::{NO_SEAL, Volume};
 use reel::engine::walk_job::{BlockCounter, WalkJob, WalkWorker};
@@ -2852,14 +2852,14 @@ fn seal_during_a_proof_leaves_the_segment_to_the_unlink() {
     hold_compaction(&store, true);
     let volume = &store.state.volumes[0];
     let dead = many_block_dead_segment(&store, &io);
-    let blocks = hold(&volume.summary).get(dead).expect("a row").facts.block_count;
+    let rows = rows_of(&hold(&volume.summary).get(dead).expect("a row"));
+    let proven = || store.state.units[UnitKind::UnlinkCheck.index()].reading().work_sum;
     io.hold_jobs("reel-planner", true);
     hold_compaction(&store, false);
     let records = || volume.picks[PickOutcome::Record.index()].load(Ordering::Acquire);
-    let (records_before, unlinked_before) = (records(), volume.segments_unlinked.load(Ordering::Acquire));
+    let (records_before, unlinked_before, proven_before) = (records(), volume.segments_unlinked.load(Ordering::Acquire), proven());
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
     volume.wants_compaction.store(true, Ordering::Release);
-    let mut proof_steps = 0;
     let mut is_sealed = false;
     for _step in 0..MOST_LOOPS {
         if !volume.table.holds(dead) {
@@ -2867,7 +2867,6 @@ fn seal_during_a_proof_leaves_the_segment_to_the_unlink() {
         }
         let is_proving = job.is_confirming();
         job.step_unit(io.clock_reading());
-        proof_steps += u64::from(is_proving);
         // a seal lands after the proof's first block, and the next step hands out what it changed
         if is_proving && !is_sealed {
             store.put(COLUMN, b"mid-proof", b"value").expect("put");
@@ -2880,9 +2879,48 @@ fn seal_during_a_proof_leaves_the_segment_to_the_unlink() {
     assert!(!volume.table.holds(dead), "the segment never went");
     assert_eq!(volume.segments_unlinked.load(Ordering::Acquire), unlinked_before + 1);
     assert_eq!(records(), records_before, "a record rewrite took the segment under proof");
-    assert!(proof_steps <= u64::from(blocks) + 1, "{proof_steps} proof steps for {blocks} blocks");
+    assert_eq!(proven() - proven_before, rows, "the proof asked other than each row once");
     shape::finish_rewrites(&mut job);
     io.hold_jobs("reel-planner", false);
+    store.close().expect("close");
+}
+
+/// Wholly dead segments ahead of a nearly dead one in the top share bucket, one more than a bucket's looks
+const DEAD_AHEAD: u64 = reel::engine::rewrite_job::BUCKET_LOOKS as u64 + 1;
+/// Rows of the nearly dead segment, all but one written again, so its share falls in the top bucket
+const NEARLY_DEAD_ROWS: u64 = 200;
+
+// segments the unlink can take count for none of a pick's looks, so a queue of them at the head of the top bucket hides no
+// nearly dead segment behind it
+#[test]
+fn record_pick_passes_unlink_candidates() {
+    let io = SimulatedIo::new(Seed(139));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    for number in 0..DEAD_AHEAD {
+        store.put(COLUMN, format!("dead-{number:03}").as_bytes(), b"first").expect("put");
+        seal(&store, &io);
+    }
+    for number in 0..DEAD_AHEAD {
+        store.put(COLUMN, format!("dead-{number:03}").as_bytes(), b"second").expect("put");
+    }
+    seal(&store, &io);
+    for number in 0..NEARLY_DEAD_ROWS {
+        store.put(COLUMN, format!("near-{number:03}").as_bytes(), b"first").expect("put");
+    }
+    let nearly_dead = seal(&store, &io);
+    for number in 1..NEARLY_DEAD_ROWS {
+        store.put(COLUMN, format!("near-{number:03}").as_bytes(), b"second").expect("put");
+    }
+    seal(&store, &io);
+    let volume = &store.state.volumes[0];
+    let top = hold(&volume.summary).orders().share_list(reel::segment::summary_orders::SHARE_BUCKETS - 1).collect::<Vec<_>>();
+    assert!(top.len() as u64 > DEAD_AHEAD && top.last() == Some(&nearly_dead), "the shape is off: {top:?}");
+
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(start_merge(&mut job), "no rewrite started");
+    assert_eq!(job.rewrite.input_numbers(), [nearly_dead], "the pick missed the nearly dead segment");
+    shape::abandon_rewrites(&mut job);
     store.close().expect("close");
 }
 

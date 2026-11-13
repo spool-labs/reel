@@ -2476,10 +2476,11 @@ fn seat_lock_is_held_for_a_swap() {
 
     // no overlap stands, so the record rewrite needs no look ahead of it
     state.volumes[0].is_over_bound.store(false, Ordering::Release);
-    let job = CompactJob::new(Arc::clone(state), 0);
+    let mut job = CompactJob::new(Arc::clone(state), 0);
     assert_eq!(job.seats.len(), 1);
     assert!(job.hand_out(), "no rewrite started");
-    let seat = &job.seats[0];
+    let seats = Arc::clone(&job.seats);
+    let seat = &seats[0];
     let mut worker = WalkWorker {
         state: Arc::clone(state),
         index: 0,
@@ -2509,7 +2510,7 @@ fn seat_lock_is_held_for_a_swap() {
         let stepping = scope.spawn(|| worker.step_rewrite());
         is_parked.recv_timeout(PARK_WAIT).expect("the step never read");
         let (done, is_done) = mpsc::channel();
-        let job = &job;
+        let job = &mut job;
         scope.spawn(move || {
             let started = Instant::now();
             let has_started = job.hand_out();
@@ -3046,7 +3047,7 @@ fn workers_merge_back_once_writes_stop() {
     pile_up(&store, &io, 2 * OVER_THE_BOUND);
     assert!(!volume.is_ingesting(io.clock_reading()), "writes read as still arriving");
     hold_compaction(&store, false);
-    let job = CompactJob::new(Arc::clone(&store.state), 0);
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
     // a look takes a few segments at a time, and this pile is first crowded past the bound's count of them
     let handed = (0..2 * OVER_THE_BOUND).any(|_look| job.hand_out());
     assert!(handed, "no worker took an overlap merge once writes stopped");
@@ -3687,7 +3688,7 @@ fn busy_callers_merge_on_one_lane() {
     pile_up(&store, &io, 3 * OVER_THE_BOUND);
     hold_compaction(&store, false);
     let overlaps = || volume.picks[PickOutcome::Overlap.index()].load(Ordering::Acquire);
-    let job = CompactJob::new(Arc::clone(&store.state), 0);
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
     let _found = read(&store, b"m-shared");
     let _quiet = store.state.quiet_at(io.clock_reading());
     for _look in 0..3 * OVER_THE_BOUND {

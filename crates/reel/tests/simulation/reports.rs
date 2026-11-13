@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
-use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, ThreadCounts, VolumeConfig};
 use reel::engine::engine_sizing::{ENTRY_LINE_DIVISOR, ENTRY_MARGIN, floor_entries};
 use reel::engine::job_tally::STALL_AFTER;
 use reel::engine::reel_store::ReelStore;
@@ -42,9 +42,13 @@ fn open(io: &SimulatedIo) -> Store {
 }
 
 fn open_at(io: &SimulatedIo, budget: ByteCount) -> Store {
+    open_with(io, budget, reel::config::NO_WORKERS)
+}
+
+fn open_with(io: &SimulatedIo, budget: ByteCount, threads: ThreadCounts) -> Store {
     let config = StoreConfig {
         memory_budget: budget,
-        threads: reel::config::NO_WORKERS,
+        threads,
         volumes: vec![VolumeConfig {
             name: "reports".to_string(),
             roots: vec![PathBuf::from(ROOT)],
@@ -399,12 +403,8 @@ fn arena_takes_room_for_rows_on_disk() {
 const ARENA_ROWS: u64 = 1_000_000;
 const PAGE_SLACK: u64 = 64 * 1024;
 
-// a seal stuck on one full shard comes free once compaction runs, with every segment live and none overlapping another
-#[test]
-fn stuck_shard_comes_free() {
-    let io = SimulatedIo::new(Seed(5));
-    io.add_disk(Path::new(ROOT), SMALL_DISK);
-    let store = open(&io);
+// fill one shard until the seal stops, then let compaction run: the seal comes free, with every segment live and none overlapping
+fn stuck_shard_frees(io: &SimulatedIo, store: Store) {
     store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
     let mut report = MaintenanceReport::new();
     store.maintenance_report(&mut report);
@@ -413,15 +413,15 @@ fn stuck_shard_comes_free() {
     while report.volumes[0].seal_stops == 0 && number < room.0 * 2 {
         store.put(COLUMN, format!("key-{number:05}").as_bytes(), VALUE).expect("put");
         store.seal_now();
-        run(&io);
+        run(io);
         store.maintenance_report(&mut report);
         number += 1;
     }
     assert!(store.state.volumes[0].is_seal_stuck.load(Ordering::Acquire));
     store.state.volumes[0].holds.compaction.store(false, Ordering::Release);
     store.state.ask_compaction();
-    run(&io);
-    run(&io);
+    run(io);
+    run(io);
     assert!(!store.state.volumes[0].is_seal_stuck.load(Ordering::Acquire), "the seal stayed stuck on a full shard");
     store.put(COLUMN, b"past-the-stop", VALUE).expect("put");
     let mut value = Vec::new();
@@ -429,6 +429,24 @@ fn stuck_shard_comes_free() {
         assert!(store.get(COLUMN, format!("key-{key:05}").as_bytes(), &mut value).expect("get"), "key {key}");
     }
     store.close().expect("close");
+}
+
+// a seal stuck on one full shard comes free once compaction runs
+#[test]
+fn stuck_shard_comes_free() {
+    let io = SimulatedIo::new(Seed(5));
+    io.add_disk(Path::new(ROOT), SMALL_DISK);
+    let store = open(&io);
+    stuck_shard_frees(&io, store);
+}
+
+// with workers the forced pick goes to a seat, so a store a node runs frees a stuck shard too
+#[test]
+fn stuck_shard_comes_free_with_workers() {
+    let io = SimulatedIo::new(Seed(5));
+    io.add_disk(Path::new(ROOT), SMALL_DISK);
+    let store = open_with(&io, BUDGET, ThreadCounts { maintenance_workers: Some(1), ..reel::config::NO_WORKERS });
+    stuck_shard_frees(&io, store);
 }
 
 const SPLIT_KEYS: u64 = 500;
@@ -534,4 +552,128 @@ fn wide_records_grow_the_record_cache() {
     assert!(store.get(COLUMN, b"wide-00007", &mut found).expect("get"));
     assert_eq!(found, value);
     store.close().expect("close");
+}
+
+// the report counts the record cache's misses, the admit on a record's second miss, the hit after it and the values it holds
+#[test]
+fn record_cache_counts_show() {
+    let io = SimulatedIo::new(Seed(43));
+    let store = open(&io);
+    store.put(COLUMN, b"counted", b"value").expect("put");
+    seal(&store, &io);
+    let mut report = MaintenanceReport::new();
+    store.maintenance_report(&mut report);
+    let (hits, misses, admits) = (report.record_cache_hits, report.record_cache_misses, report.record_cache_admits);
+    let mut found = Vec::new();
+    for _read in 0..3 {
+        assert!(store.get(COLUMN, b"counted", &mut found).expect("get"));
+        assert_eq!(found, b"value");
+    }
+    store.maintenance_report(&mut report);
+    assert_eq!(report.record_cache_misses - misses, 2);
+    assert_eq!(report.record_cache_admits - admits, 1);
+    assert_eq!(report.record_cache_hits - hits, 1);
+    assert!(report.record_cache_values >= 1);
+    store.close().expect("close");
+}
+
+const DEAD_BLOCK_KEYS: u64 = 40_000;
+const DEAD_BLOCK_BUDGET: ByteCount = ByteCount(256 * 1024 * 1024);
+
+fn dead_key(number: u64) -> Vec<u8> {
+    format!("dead-{number:06}-{:0>52}", number).into_bytes()
+}
+
+// an unlink proves a wholly dead segment of a couple of hundred blocks a block a step beside the walk, so a walk waiting meanwhile
+// is never held past the bound, the segment goes, and the walk ends
+#[test]
+fn unlink_proof_steps_beside_the_walk() {
+    let io = SimulatedIo::new(Seed(44));
+    let store = open_at(&io, DEAD_BLOCK_BUDGET);
+    let volume = &store.state.volumes[0];
+    volume.holds.compaction.store(true, Ordering::Release);
+    for number in 0..DEAD_BLOCK_KEYS {
+        store.put(COLUMN, &dead_key(number), b"old").expect("put");
+    }
+    seal(&store, &io);
+    let dead = reel::guard::hold(&volume.summary).rows().map(|row| row.facts.segment).next().expect("a segment");
+    for number in 0..DEAD_BLOCK_KEYS {
+        store.put(COLUMN, &dead_key(number), b"new").expect("put");
+    }
+    seal(&store, &io);
+    settle(&io);
+    // a segment sealed with the walk held leaves it a target to take while the unlink proves the dead one
+    volume.holds.walk.store(true, Ordering::Release);
+    store.put(COLUMN, b"waiting", b"value").expect("put");
+    seal(&store, &io);
+    assert!(store.state.pending_walks(0) > 0, "no walk waited");
+    volume.holds.walk.store(false, Ordering::Release);
+    volume.holds.compaction.store(false, Ordering::Release);
+    store.state.ask_compaction();
+    settle(&io);
+    let mut report = MaintenanceReport::new();
+    store.maintenance_report(&mut report);
+    assert!(!volume.table.holds(dead), "the dead segment stayed");
+    assert_eq!(store.state.pending_walks(0), 0, "the walk never ended");
+    assert!(
+        report.longest_walkless_steps <= reel::engine::planner::MOST_WALKLESS_STEPS,
+        "the planner held the walk back {} steps, last {:?}",
+        report.longest_walkless_steps,
+        report.longest_walkless_kind
+    );
+    let mut value = Vec::new();
+    assert!(store.get(COLUMN, &dead_key(7), &mut value).expect("get"));
+    assert_eq!(value, b"new");
+    store.close().expect("close");
+}
+
+const WIDE_COLUMN: ColumnId = ColumnId(2);
+const MIXED_SMALL_KEYS: u64 = 900;
+const MIXED_WIDE_KEYS: u64 = 100;
+const MIXED_SMALL_VALUE_BYTES: usize = 150;
+const MIXED_WIDE_VALUE_BYTES: usize = 64 * 1024;
+
+// a store with a column of small rows, and when asked a column of values too wide to cache
+fn open_mixed(io: &SimulatedIo) -> Store {
+    let column = |id: ColumnId| ColumnConfig {
+        id,
+        name: format!("column-{}", id.0),
+        key_shape: KeyShape::Variable { most: 64 },
+        codec: Codec::None,
+        volume: VolumeId(0),
+        complete_rows: None,
+        least_value: None,
+    };
+    let config = StoreConfig {
+        memory_budget: BUDGET,
+        threads: reel::config::NO_WORKERS,
+        volumes: vec![VolumeConfig { name: "mixed".to_string(), roots: vec![PathBuf::from(ROOT)], sync: SyncPolicy::Never, device: Default::default() }],
+        columns: vec![column(COLUMN), column(WIDE_COLUMN)],
+    };
+    ReelStore::open(io.clone(), &config).expect("open")
+}
+
+fn reopened_slots(has_wide: bool) -> usize {
+    let io = SimulatedIo::new(Seed(46));
+    let store = open_mixed(&io);
+    for number in 0..MIXED_SMALL_KEYS {
+        store.put(COLUMN, format!("small-{number:05}").as_bytes(), &[3; MIXED_SMALL_VALUE_BYTES]).expect("put");
+    }
+    if has_wide {
+        for number in 0..MIXED_WIDE_KEYS {
+            store.put(WIDE_COLUMN, format!("wide-{number:05}").as_bytes(), &[4; MIXED_WIDE_VALUE_BYTES]).expect("put");
+        }
+    }
+    seal(&store, &io);
+    store.close().expect("close");
+    let store = open_mixed(&io);
+    let slots = store.state.record_cache.index_slots();
+    store.close().expect("close");
+    slots
+}
+
+// a column of values too wide to cache leaves the record cache planned for the small rows beside it
+#[test]
+fn wide_column_leaves_the_cache_plan() {
+    assert_eq!(reopened_slots(true), reopened_slots(false));
 }

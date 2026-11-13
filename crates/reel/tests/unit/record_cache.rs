@@ -36,7 +36,7 @@ fn read_twice(cache: &RecordCache, offset: u64, bytes: &[u8]) {
 // a value goes in on its second miss, and a get copies it back whole or in a window
 #[test]
 fn second_miss_admits() {
-    let cache = RecordCache::new(CACHE_BYTES);
+    let cache = RecordCache::new(CACHE_BYTES, None);
     let bytes = value(1, 300);
     let mut out = Vec::new();
     assert!(!read(&cache, 1, &bytes, &mut out));
@@ -51,7 +51,7 @@ fn second_miss_admits() {
 // values past the cap stay out
 #[test]
 fn big_values_stay_out() {
-    let cache = RecordCache::new(CACHE_BYTES);
+    let cache = RecordCache::new(CACHE_BYTES, None);
     let bytes = value(2, MOST_CACHED_BYTES + 1);
     read_twice(&cache, 2, &bytes);
     assert_ne!(cache.get(SEGMENT, FileOffset(2), KEY, &mut Vec::new()), CacheLookup::Hit);
@@ -60,7 +60,7 @@ fn big_values_stay_out() {
 // every value the cache answers with is the one read for that place, through any number of wraps of every shard's log
 #[test]
 fn wraps_keep_every_answer_right() {
-    let cache = RecordCache::new(CACHE_BYTES);
+    let cache = RecordCache::new(CACHE_BYTES, None);
     let mut offered = BTreeMap::new();
     let mut out = Vec::new();
     let mut state = 0x2545_F491_4F6C_DD1D_u64;
@@ -83,7 +83,7 @@ fn wraps_keep_every_answer_right() {
 // a hot set read between a scan's reads stays, since the scan's values each miss once and never go in
 #[test]
 fn scan_leaves_the_hot_set() {
-    let cache = RecordCache::new(CACHE_BYTES);
+    let cache = RecordCache::new(CACHE_BYTES, None);
     let mut out = Vec::new();
     for offset in 0..HOT {
         read_twice(&cache, offset, &value(offset, 200));
@@ -101,7 +101,7 @@ fn scan_leaves_the_hot_set() {
 // places read once each go in only when two share an admission byte and its fingerprint
 #[test]
 fn single_misses_stay_out() {
-    let cache = RecordCache::new(CACHE_BYTES);
+    let cache = RecordCache::new(CACHE_BYTES, None);
     let mut out = Vec::new();
     for offset in 0..VALUES {
         read(&cache, offset, &value(offset, 100), &mut out);
@@ -112,7 +112,7 @@ fn single_misses_stay_out() {
 // a place answers only for the key whose record sits there, so a lookup another key's hash led to it misses
 #[test]
 fn another_key_misses() {
-    let cache = RecordCache::new(CACHE_BYTES);
+    let cache = RecordCache::new(CACHE_BYTES, None);
     let bytes = value(3, 100);
     read_twice(&cache, 3, &bytes);
     let mut out = Vec::new();
@@ -127,4 +127,29 @@ fn even_sizes_spread() {
         let slots: BTreeSet<u64> = (0..4096).map(|record| place_hash(SEGMENT.0, record * size) & 1023).collect();
         assert!(slots.len() > 1000, "records of {size} bytes fell on {} of 1024 slots", slots.len());
     }
+}
+
+const WIDE_MEAN_RECORD: u64 = 4_112;
+const WIDE_VALUE_BYTES: usize = 4_096;
+
+fn values_held(cache: &RecordCache) -> usize {
+    let value = vec![9; WIDE_VALUE_BYTES];
+    for number in 0..(CACHE_BYTES.0 / WIDE_VALUE_BYTES as u64) * 2 {
+        cache.admit(SegmentNumber(1), FileOffset(number * 8_192), &number.to_le_bytes(), &value);
+    }
+    cache.value_count()
+}
+
+// a cache planned for wide records spends its bytes on values in place of index slots for 48 B ones, so it holds more of them
+#[test]
+fn wide_mean_holds_more_wide_values() {
+    let planned = values_held(&RecordCache::new(CACHE_BYTES, None));
+    let wide = values_held(&RecordCache::new(CACHE_BYTES, Some(WIDE_MEAN_RECORD)));
+    assert!(wide > planned, "a cache sized for wide records held {wide} values, the plain one {planned}");
+}
+
+// small records keep the plain layout
+#[test]
+fn small_mean_keeps_the_plan() {
+    assert_eq!(RecordCache::new(CACHE_BYTES, Some(64)).heap_bytes(), RecordCache::new(CACHE_BYTES, None).heap_bytes());
 }

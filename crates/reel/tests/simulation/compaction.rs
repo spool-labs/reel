@@ -843,9 +843,11 @@ fn place_after_open() {
     store.close().expect("close");
 }
 
-// a ready unlink runs ahead of the next walk target, so ingest that keeps walks waiting still frees segments
+const UNLINK_STEPS: u64 = 400;
+
+// a ready unlink proves its segment beside the walks waiting, so ingest that keeps walks waiting still frees segments
 #[test]
-fn unlink_before_walk() {
+fn unlink_beside_walks() {
     let io = SimulatedIo::new(Seed(36));
     let store = open(&io);
     hold_compaction(&store);
@@ -865,10 +867,13 @@ fn unlink_before_walk() {
     state.ask_compaction();
     io.hold_jobs("reel-planner", false);
 
-    while volume.table.holds(older) {
-        assert!(io.step_any().is_some());
+    for _step in 0..UNLINK_STEPS {
+        if !volume.table.holds(older) {
+            break;
+        }
+        assert!(io.step_any().is_some(), "the jobs stopped with the segment still there");
     }
-    assert_eq!(state.pending_walks(0), 2);
+    assert!(!volume.table.holds(older), "the unlink waited behind the walks");
     settle(&io);
     assert_eq!(state.pending_walks(0), 0);
     store.close().expect("close");

@@ -141,6 +141,8 @@ pub struct CompactJob<Backend: Io> {
     pub did_background: bool,
     /// Planner steps in a row that ended before the walk's turn while a walk was pending
     pub walkless_steps: u64,
+    /// The kind of the unit the last step ran, which a walkless run keeps
+    pub last_unit: Option<UnitKind>,
 }
 
 impl<Backend: Io> CompactJob<Backend> {
@@ -161,6 +163,7 @@ impl<Backend: Io> CompactJob<Backend> {
             quiet_looked_at: u64::MAX,
             did_background: false,
             walkless_steps: 0,
+            last_unit: None,
             held_pass: None,
             confirm_pass: None,
             state,
@@ -200,6 +203,7 @@ impl<Backend: Io> CompactJob<Backend> {
             step => step,
         };
         // a rewrite's step notes its own unit, the same on the planner and on a worker
+        self.last_unit = self.unit.map(|(kind, _work)| kind);
         if let Some((kind, work)) = self.unit.take() {
             self.state.note_unit(kind, work, started);
         }
@@ -219,6 +223,11 @@ impl<Backend: Io> CompactJob<Backend> {
         let volume = &self.state.volumes[self.volume];
         let is_stepping = !volume.has_failed() && !volume.is_compaction_held();
         is_stepping && volume.segments_parked.load(Ordering::Acquire) > 0
+    }
+
+    /// Check an unlink's proof is under way, which steps beside the walk
+    pub fn is_confirming(&self) -> bool {
+        self.confirm_pass.is_some()
     }
 
     /// Check a merge beside the walk is running, or a seal or a reclaim has asked for a look at the overlap
@@ -296,9 +305,11 @@ impl<Backend: Io> CompactJob<Backend> {
             };
         }
         if self.confirm_pass.is_some() {
-            // a ready unlink runs ahead of the next walk target, so ingest that keeps walks waiting still frees segments
+            // an unlink proves a block a step beside the walk, so a large dead segment frees while walks still land
             self.unit = Some((UnitKind::UnlinkCheck, 0));
-            return match self.step_confirm(volume) {
+            let step = self.step_confirm(volume);
+            self.did_background |= step.is_ok();
+            return match step {
                 Ok(()) => JobStep::Worked,
                 Err(_) => self.wait_for_retry(now),
             };
@@ -472,7 +483,7 @@ impl<Backend: Io> CompactJob<Backend> {
 
     /// Start a rewrite in each idle seat while picks last, waking a worker for each, and say whether one started. The planner picks
     /// and a worker runs, so more workers means more rewrites at once
-    pub fn hand_out(&self) -> bool {
+    pub fn hand_out(&mut self) -> bool {
         let mut has_started = false;
         for seat in self.seats.iter() {
             let mut held = hold(&seat.job);
@@ -480,7 +491,10 @@ impl<Backend: Io> CompactJob<Backend> {
             let Some(job) = held.as_mut().filter(|job| !job.is_running()) else {
                 continue;
             };
+            // a forced segment goes to the first idle seat's pick, and comes back when that claim starts nothing
+            job.forced = job.forced.or(self.rewrite.forced.take());
             if !job.claim() {
+                self.rewrite.forced = job.forced.take();
                 return has_started;
             }
             has_started = true;

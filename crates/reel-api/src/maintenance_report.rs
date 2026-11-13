@@ -524,6 +524,16 @@ pub struct MaintenanceReport {
     pub longest_room_step: Nanoseconds,
     /// The most planner steps in a row that ended before the walk's turn while a walk was pending
     pub longest_walkless_steps: u64,
+    /// The kind of unit behind that longest run, so a long one names its cause
+    pub longest_walkless_kind: Option<UnitKind>,
+    /// Reads the record cache answered
+    pub record_cache_hits: u64,
+    /// Reads it missed
+    pub record_cache_misses: u64,
+    /// Values it took in on a miss
+    pub record_cache_admits: u64,
+    /// Values it holds now
+    pub record_cache_values: u64,
     /// Walk lookups through the cursor: segments it pinned, runs it copied again, rows it answered, rows it sent to the table
     pub cursor_lookups: [u64; 4],
     /// Merge lookups through the cursor, as above, then merge rows asked outside the merge and rows an unwalked merge settled alone
@@ -615,6 +625,11 @@ impl MaintenanceReport {
             pauses: [0; PAUSE_CAUSES.len()],
             longest_room_step: Nanoseconds(0),
             longest_walkless_steps: 0,
+            longest_walkless_kind: None,
+            record_cache_hits: 0,
+            record_cache_misses: 0,
+            record_cache_admits: 0,
+            record_cache_values: 0,
             cursor_lookups: [0; 4],
             merge_lookups: [0; 6],
             dead_bits: [0; 14],

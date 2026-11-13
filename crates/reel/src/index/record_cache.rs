@@ -9,6 +9,7 @@ use std::sync::Mutex;
 
 use reel_api::units::{ByteCount, FileOffset};
 
+use crate::engine::caller_activity::CallerCounts;
 use crate::guard::hold;
 use crate::pool::touched_filled;
 use crate::segment::segment_tail::SegmentNumber;
@@ -27,6 +28,10 @@ pub const KEY_LENGTH_BITS: u32 = 16;
 pub const KEY_LENGTH_MASK: u64 = (1 << KEY_LENGTH_BITS) - 1;
 /// Arena bytes a shard plans an index slot for
 pub const BYTES_PER_INDEX_SLOT: usize = 48;
+/// Index slots a shard plans for each mean value its arena holds, a margin past the load at which it evicts
+pub const SLOTS_PER_VALUE: usize = 4;
+/// The fewest admission counts a shard keeps
+pub const LEAST_SEEN_COUNTS: usize = 64;
 /// A segment number no record has, which marks an empty index slot or a skip in the arena
 pub const NO_RECORD: u64 = u64::MAX;
 /// A value read in the last part in this many of the log moves back to the head
@@ -73,6 +78,12 @@ pub enum CacheLookup {
 #[derive(Debug)]
 pub struct RecordCache {
     shards: Vec<Mutex<CacheShard>>,
+    /// Reads the cache answered, in a slot for each thread
+    pub hits: CallerCounts,
+    /// Reads it missed
+    pub misses: CallerCounts,
+    /// Values it took in on a miss
+    pub admits: CallerCounts,
 }
 
 /// Mix a record's place into a hash
@@ -96,20 +107,28 @@ impl CacheEntry {
 }
 
 impl CacheShard {
-    /// Allocate and touch a shard whose arena and index together take some bytes
-    pub fn new(bytes: usize) -> Self {
+    /// Allocate and touch a shard whose arena, index and admission counts together take some bytes. A store of wide records
+    /// plans its index for the values its arena holds and keeps a count a value, so a first miss is soon forgotten and only a
+    /// record missed twice close together comes in. Small records, or a store with none on disk, plan a slot for each stretch
+    pub fn new(bytes: usize, mean_record: Option<u64>) -> Self {
+        let entry = mean_record.map_or(0, |bytes| padded(ENTRY_HEADER_BYTES + bytes as usize));
+        let stretch = (entry / SLOTS_PER_VALUE).max(BYTES_PER_INDEX_SLOT);
+        let is_wide = stretch > BYTES_PER_INDEX_SLOT;
+        let seen_per_slot = if is_wide { 0 } else { 1 };
         // the index and its counts come out of the shard's bytes, one slot planned for each stretch of arena
-        let slot_cost = size_of::<CacheEntry>() + 1;
-        let planned = bytes / (BYTES_PER_INDEX_SLOT + slot_cost);
+        let slot_cost = size_of::<CacheEntry>() + seen_per_slot;
+        let planned = bytes / (stretch + slot_cost);
         let slots = if planned < 16 { 16 } else { 1 << planned.ilog2() };
-        let arena = bytes.saturating_sub(slots * slot_cost).max(LEAST_SHARD_BYTES) / 8 * 8;
+        let values = bytes / entry.max(1);
+        let seen = if is_wide { values.next_power_of_two().max(LEAST_SEEN_COUNTS) } else { slots };
+        let arena = bytes.saturating_sub(slots * size_of::<CacheEntry>() + seen).max(LEAST_SHARD_BYTES) / 8 * 8;
         Self {
             arena: touched_filled(arena, 0),
             head: 0,
             tail: 0,
             slots: touched_filled(slots, CacheEntry::empty()),
             used: 0,
-            seen: touched_filled(slots, 0),
+            seen: touched_filled(seen, 0),
         }
     }
 
@@ -294,14 +313,14 @@ impl RecordCache {
         (CACHE_SHARDS * 2 * LEAST_SHARD_BYTES) as u64
     }
 
-    pub fn new(bytes: ByteCount) -> Self {
+    pub fn new(bytes: ByteCount, mean_record: Option<u64>) -> Self {
         let shard_bytes = (bytes.0 as usize / CACHE_SHARDS).max(2 * LEAST_SHARD_BYTES);
-        let shards: Vec<_> = (0..CACHE_SHARDS).map(|_shard| Mutex::new(CacheShard::new(shard_bytes))).collect();
+        let shards: Vec<_> = (0..CACHE_SHARDS).map(|_shard| Mutex::new(CacheShard::new(shard_bytes, mean_record))).collect();
         // a lock can build its state on first use, so each takes it here, at open
         for shard in &shards {
             drop(hold(shard));
         }
-        Self { shards }
+        Self { shards, hits: CallerCounts::default(), misses: CallerCounts::default(), admits: CallerCounts::default() }
     }
 
     /// Pick a record's shard
@@ -312,17 +331,30 @@ impl RecordCache {
 
     /// Copy a key's cached value into a buffer, or note the miss
     pub fn get(&self, segment: SegmentNumber, offset: FileOffset, key: &[u8], out: &mut Vec<u8>) -> CacheLookup {
-        hold(self.shard(segment, offset)).read(segment.0, offset.0, key, 0, None, out)
+        let lookup = hold(self.shard(segment, offset)).read(segment.0, offset.0, key, 0, None, out);
+        self.count(lookup);
+        lookup
     }
 
     /// Copy a window of a key's cached value into a buffer, and say whether the cache held it
     pub fn get_window(&self, segment: SegmentNumber, offset: FileOffset, key: &[u8], start: ByteCount, length: ByteCount, out: &mut Vec<u8>) -> CacheLookup {
-        hold(self.shard(segment, offset)).read(segment.0, offset.0, key, start.0 as usize, Some(length.0 as usize), out)
+        let lookup = hold(self.shard(segment, offset)).read(segment.0, offset.0, key, start.0 as usize, Some(length.0 as usize), out);
+        self.count(lookup);
+        lookup
     }
 
     /// Take in a value its read's miss admitted
     pub fn admit(&self, segment: SegmentNumber, offset: FileOffset, key: &[u8], value: &[u8]) {
         hold(self.shard(segment, offset)).admit(segment.0, offset.0, key, value);
+        self.admits.note();
+    }
+
+    /// Count a lookup as a hit or a miss
+    fn count(&self, lookup: CacheLookup) {
+        match lookup {
+            CacheLookup::Hit => self.hits.note(),
+            CacheLookup::Miss { .. } => self.misses.note(),
+        }
     }
 
     /// Read the heap the cache holds
@@ -332,6 +364,11 @@ impl RecordCache {
             shard.arena.len() + shard.slots.len() * size_of::<CacheEntry>() + shard.seen.len()
         });
         ByteCount((shard * CACHE_SHARDS) as u64)
+    }
+
+    /// Count the index slots every shard planned, which shows the layout its mean gave
+    pub fn index_slots(&self) -> usize {
+        self.shards.iter().map(|shard| hold(shard).slots.len()).sum()
     }
 
     /// Count the values the cache holds

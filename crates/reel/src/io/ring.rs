@@ -632,8 +632,14 @@ impl<Driver> RingLease<'_, Driver> {
         let mut clock = SpinClock::new(spin);
         let answer = loop {
             // a driver with no reaper of its own, as a simulated ring, reaps on the waiting thread until the answer lands
-            if !self.ring.is_done[self.slot].load(Ordering::Acquire) && self.ring.driver.reaps_on_wait() {
-                self.ring.driver.reap(&mut |slot, answer| self.ring.finish(slot, answer))?;
+            if self.ring.driver.reaps_on_wait() && !self.ring.is_done[self.slot].load(Ordering::Acquire) {
+                if let Err(error) = self.ring.driver.reap(&mut |slot, answer| self.ring.finish(slot, answer)) {
+                    // a failed reap ends the wait, and the seat goes back for the next reader
+                    if is_seated {
+                        spinners.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    return Err(error);
+                }
                 continue;
             }
             // the completion sets the flag once the answer has landed, so a spin reads it with no lock and locks once

@@ -304,10 +304,13 @@ impl EngineSizing {
         if wanted_rows >= planned_rows {
             return self;
         }
+        // the record cache takes what the index really frees, so the budget holds the same
+        let shard = shard_for_rows(wanted_rows, self.shard.open_slots);
+        let freed = (self.shard.heap_bytes().0.saturating_sub(shard.heap_bytes().0)) * SHARD_COUNT as u64;
         Self {
             segment_rows: RowCount(wanted_rows * SEAL_ROWS_EIGHTHS / 8),
-            shard: shard_for_rows(wanted_rows, self.shard.open_slots),
-            record_share: ByteCount(self.record_share.0 + (planned_rows - wanted_rows) * PLANNED_ROW_BYTES),
+            shard,
+            record_share: ByteCount(self.record_share.0 + freed),
             ..self
         }
     }

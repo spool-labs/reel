@@ -7,10 +7,10 @@ use reel_api::column_id::ColumnId;
 use reel_api::direction::Direction;
 use reel_api::units::{ByteCount, RowCount, WritePlace};
 
-use crate::index::entry_slab::{ENTRY_ALIGNMENT, EntryAddress, EntrySlab, NO_ENTRY, PAGE_BYTES, PageCount, entry_size};
+use crate::index::entry_slab::{ENTRY_ALIGNMENT, EntryAddress, EntrySlab, NO_ENTRY, PAGE_BYTES, PageCount, PageIndex, entry_size};
 use crate::index::key_hash::{KeyHash, hash_key};
-use crate::index::key_table::KeyTable;
-use crate::index::node_pool::{NODE_FANOUT, NodeCount, NodePool};
+use crate::index::key_table::{KeyTable, TableSlot};
+use crate::index::node_pool::{NODE_FANOUT, NodeCount, NodePool, TreeNode};
 use crate::index::open_slots::{OpenSlot, OpenSlots};
 use crate::index::seek_target::SeekTarget;
 use crate::index::shard_cursor::{MAX_CURSOR_STEPS, ShardCursor, TreeCursor};
@@ -28,6 +28,17 @@ pub struct ShardSizing {
     pub nodes: NodeCount,
     pub table_slots: usize,
     pub open_slots: usize,
+}
+
+impl ShardSizing {
+    /// Read the heap a shard of this sizing allocates, as heap_bytes reads it once built
+    pub fn heap_bytes(&self) -> ByteCount {
+        let pages = u64::from(self.pages.0) * (PAGE_BYTES + size_of::<PageIndex>()) as u64;
+        let nodes = u64::from(self.nodes.0) * size_of::<TreeNode>() as u64;
+        let table = (self.table_slots.next_power_of_two() * size_of::<TableSlot>()) as u64;
+        let trees = (self.open_slots * size_of::<WriteTree>()) as u64;
+        ByteCount(pages + nodes + table + trees)
+    }
 }
 
 /// What a batch asks of one shard

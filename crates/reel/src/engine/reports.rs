@@ -5,7 +5,7 @@ use std::io::Error;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::{MaintenanceMemory, 
+use reel_api::maintenance_report::{UNIT_KINDS, MaintenanceMemory, 
     CompleteReading, JOB_KINDS, JobKind, JobState, LeastValueReading, MOST_REPORTED_LANES, MaintenanceReport, PauseCause, RewriteBytes, UnitKind, VolumeReading,
     WriteSource,
 };
@@ -160,6 +160,12 @@ impl<Backend: Io> EngineState<Backend> {
         }
         report.longest_room_step = Nanoseconds(self.longest_room_step.load(Ordering::Relaxed));
         report.longest_walkless_steps = self.longest_walkless_steps.load(Ordering::Relaxed);
+        let kind = self.longest_walkless_kind.load(Ordering::Relaxed) as usize;
+        report.longest_walkless_kind = kind.checked_sub(1).and_then(|at| UNIT_KINDS.get(at)).copied();
+        report.record_cache_hits = self.record_cache.hits.total();
+        report.record_cache_misses = self.record_cache.misses.total();
+        report.record_cache_admits = self.record_cache.admits.total();
+        report.record_cache_values = self.record_cache.value_count() as u64;
         report.cursor_lookups = array::from_fn(|kind| self.cursor_lookups[kind].load(Ordering::Relaxed));
         report.merge_lookups = array::from_fn(|kind| self.merge_lookups[kind].load(Ordering::Relaxed));
         report.dead_bits = [0; 14];

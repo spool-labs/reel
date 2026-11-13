@@ -72,7 +72,7 @@ use crate::record::record_check::RecordKey;
 use crate::record::record_encoder::{RecordEncoder, SHARE_BYTES};
 use crate::record::record_reader::RecordReader;
 use crate::rows::row_group::RowGroupBuffer;
-use crate::index::record_cache::RecordCache;
+use crate::index::record_cache::{MOST_CACHED_BYTES, RecordCache};
 use crate::segment::block_cache::{BlockCache, CACHE_SHARDS, CACHE_WAYS};
 use crate::segment::filter_arena::FilterArena;
 use crate::segment::segment_table::NO_SHARD;
@@ -1110,7 +1110,9 @@ pub struct OpenInputs<'open, Backend: Io> {
 pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<Backend> {
     let OpenInputs { io, config, sizing, disks, superblock, mut locks, scan, summaries } = inputs;
     // the write index holds what a segment of the store's mean record needs, and the record cache takes the rest
-    let sizing = &sizing.for_mean_record(mean_record(&summaries), config.volumes.len() as u64);
+    let mean = mean_record(&summaries);
+    let cache_mean = cacheable_mean(&summaries);
+    let sizing = &sizing.for_mean_record(mean, config.volumes.len() as u64);
     let first_place = superblock.place_limit.0.saturating_sub(PLACE_RUN);
     let places = Arc::new(PlaceCount::new(WritePlace(first_place), superblock.place_limit));
     let volume_share = sizing.table_share.0 / config.volumes.len().max(1) as u64;
@@ -1229,7 +1231,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         filter_cache: BlockCache::new(ByteCount(filter_share.0 - base_arena), FILTER_SLOT_BYTES),
         filter_arena: FilterArena::new(arena_share, planned.iter().map(|table| table.segments_per_shard * TABLE_SHARDS).sum()),
         row_cache: BlockCache::new(row_share, ROW_BLOCK_BYTES),
-        record_cache: RecordCache::new(ByteCount(record_room - arena_taken)),
+        record_cache: RecordCache::new(ByteCount(record_room - arena_taken), cache_mean),
         complete_cache: is_complete.then(|| BlockCache::new(complete_share, COMPLETE_BLOCK_BYTES)),
         complete_line_bytes: ByteCount(complete_lines(config) * size_of::<BlockEntry>() as u64),
         queues,
@@ -1270,6 +1272,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         pauses: Default::default(),
         longest_room_step: AtomicU64::new(0),
         longest_walkless_steps: AtomicU64::new(0),
+        longest_walkless_kind: AtomicU64::new(0),
         cursor_lookups: Default::default(),
         merge_lookups: Default::default(),
         block_lookups: Default::default(),
@@ -1561,5 +1564,27 @@ pub fn mean_record(summaries: &[SummaryFound]) -> Option<u64> {
             rows += row_rows;
         }
     }
+    (rows > 0).then(|| bytes / rows)
+}
+
+/// Read the mean record over the columns whose records the record cache can take, weighted by rows, so a column of values too
+/// wide to cache leaves the cache's plan alone. Nothing when no such column has rows on disk
+pub fn cacheable_mean(summaries: &[SummaryFound]) -> Option<u64> {
+    let mut columns = [(0_u64, 0_u64); MAX_COLUMNS];
+    for summary in summaries {
+        for row in summary.rows.rows() {
+            let mut cursor = row.cursor();
+            for _column in 0..row.column_count {
+                let Some(column) = cursor.column() else {
+                    break;
+                };
+                let (bytes, rows) = &mut columns[column.column.0 as usize];
+                *bytes += column.live_bytes.0 + column.dead_bytes.0;
+                *rows += column.row_count.0;
+            }
+        }
+    }
+    let held = columns.iter().filter(|(bytes, rows)| *rows > 0 && bytes / rows <= MOST_CACHED_BYTES as u64);
+    let (bytes, rows) = held.fold((0, 0), |(bytes, rows), (column_bytes, column_rows)| (bytes + column_bytes, rows + column_rows));
     (rows > 0).then(|| bytes / rows)
 }

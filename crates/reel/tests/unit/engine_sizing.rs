@@ -285,7 +285,8 @@ fn wide_records_shrink_the_index() {
     let planned_rows = planned.segment_rows.0 * 8 / SEAL_ROWS_EIGHTHS;
     let wanted = (planned.segment_bytes.0.div_ceil(WIDE_RECORD) * 8 / SEAL_ROWS_EIGHTHS * INDEX_ROWS_MARGIN).max(planned_rows / LEAST_INDEX_DIVISOR);
     assert_eq!(wide.segment_rows.0, wanted * SEAL_ROWS_EIGHTHS / 8);
-    assert_eq!(wide.record_share.0, planned.record_share.0 + (planned_rows - wanted) * PLANNED_ROW_BYTES);
+    let freed = (planned.shard.heap_bytes().0 - wide.shard.heap_bytes().0) * reel::index::write_index::SHARD_COUNT as u64;
+    assert_eq!(wide.record_share.0, planned.record_share.0 + freed, "the record cache took other than what the index freed");
     assert!(wide.shard.table_slots <= planned.shard.table_slots);
 }
 
@@ -317,4 +318,12 @@ fn shrink_keeps_a_quarter() {
     let planned_rows = planned.segment_rows.0 * 8 / SEAL_ROWS_EIGHTHS;
     assert_eq!(huge.segment_rows.0, planned_rows / LEAST_INDEX_DIVISOR * SEAL_ROWS_EIGHTHS / 8);
     assert!(huge.record_share > planned.record_share);
+}
+
+// a shard's sizing reads the heap the built shard holds, so what the index frees is what it really gave up
+#[test]
+fn shard_sizing_reads_the_built_heap() {
+    let planned = EngineSizing::for_store(&shape(ByteCount(256 * 1024 * 1024), 1));
+    let built = reel::index::write_shard::WriteShard::new(&planned.shard);
+    assert_eq!(planned.shard.heap_bytes(), built.heap_bytes());
 }

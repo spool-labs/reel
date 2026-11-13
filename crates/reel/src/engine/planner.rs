@@ -70,7 +70,11 @@ impl<Backend: Io> Planner<Backend> {
             return;
         }
         self.compactions[index].walkless_steps += 1;
-        self.state.longest_walkless_steps.fetch_max(self.compactions[index].walkless_steps, Ordering::Relaxed);
+        let steps = self.compactions[index].walkless_steps;
+        if self.state.longest_walkless_steps.fetch_max(steps, Ordering::Relaxed) < steps {
+            let kind = self.compactions[index].last_unit.map_or(0, |kind| kind.index() as u64 + 1);
+            self.state.longest_walkless_kind.store(kind, Ordering::Relaxed);
+        }
     }
 
     /// Note what a unit's step found, and say whether it worked
@@ -118,7 +122,7 @@ impl<Backend: Io> Job for Planner<Backend> {
             // a ready reclaim runs ahead of the next walk target, and each segment it frees is one that walk won't probe. A
             // merge of unwalked segments needs nothing from a walk, so an overlap past the bound doesn't wait for one to end
             let mut did_background = false;
-            if self.walks[index].target.is_none() || self.compactions[index].has_overlap_work() {
+            if self.walks[index].target.is_none() || self.compactions[index].has_overlap_work() || self.compactions[index].is_confirming() {
                 let step = self.compactions[index].step_unit(now);
                 // a refill or a sweep step leaves the walk its turn, so a long pass never holds the walk back
                 did_background = self.compactions[index].did_background;

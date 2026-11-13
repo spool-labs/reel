@@ -788,7 +788,7 @@ fn check_units(store: &Store) -> u64 {
             failures += 1;
         }
     }
-    println!("planner: {} steps in a row before the walk's turn", report.longest_walkless_steps);
+    println!("planner: {} steps in a row before the walk's turn, last {:?}", report.longest_walkless_steps, report.longest_walkless_kind);
     if report.longest_walkless_steps > MOST_WALKLESS_STEPS {
         println!("the planner held the walk back past {MOST_WALKLESS_STEPS} steps");
         failures += 1;

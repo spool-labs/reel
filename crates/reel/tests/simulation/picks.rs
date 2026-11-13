@@ -107,7 +107,7 @@ fn column_facts() -> ColumnFacts<'static> {
 }
 
 // fill the volume's summary with a row a segment, each over its own keys or all over the same ones
-fn fill(store: &Store, is_crowded: bool) {
+fn fill(store: &Store, is_crowded: bool, facts_of: fn(u64) -> SegmentFacts) {
     let mut listings = Vec::with_capacity(SEGMENTS as usize);
     let mut rows = hold(&store.state.volumes[0].summary);
     rows.make_room(ByteCount(SEGMENTS * ROW_ROOM));
@@ -116,7 +116,7 @@ fn fill(store: &Store, is_crowded: bool) {
         let (lowest, bound) = if is_crowded { (0u64, u64::MAX) } else { (number << 20, (number + 1) << 20) };
         let (lowest, bound) = (lowest.to_be_bytes(), bound.to_be_bytes());
         let column = ColumnFacts { column: COLUMN, lowest: &lowest, bound: &bound, ..column_facts() };
-        assert!(rows.push(&facts(number), iter::once(column), iter::empty()), "the summary filled at {number}");
+        assert!(rows.push(&facts_of(number), iter::once(column), iter::empty()), "the summary filled at {number}");
         listings.push(listing(number, &lowest, &bound));
     }
     drop(rows);
@@ -171,7 +171,7 @@ fn picks_at_most_segments() {
         io.add_disk(Path::new(ROOT), DISK);
         let store: Store = ReelStore::open(io, &config(workers)).expect("open");
         println!("room for {} rows", hold(&store.state.volumes[0].summary).index_room());
-        fill(&store, is_crowded);
+        fill(&store, is_crowded, facts);
         let state = &store.state;
         let volume = &state.volumes[0];
         let shape = format!("{} with {workers} workers", if is_crowded { "crowded" } else { "apart" });
@@ -277,7 +277,7 @@ fn dead_queue(workers: usize) {
         assert!(rows.push(&facts(number), iter::once(column), iter::empty()), "the summary filled at {number}");
     }
     drop(rows);
-    fill(&store, false);
+    fill(&store, false, facts);
     let mut lane = RewriteJob::new(Arc::clone(state), 0, WORKER_LANE);
     let candidate = SegmentNumber(SEGMENTS + 1);
     assert!(can_unlink(state, 0, volume, candidate), "the queue isn't one the unlink can take");
@@ -285,6 +285,39 @@ fn dead_queue(workers: usize) {
     volume.is_over_bound.store(false, Ordering::Release);
     let found = time(&format!("record past a dead queue with {workers} workers"), DEAD_QUEUE_LINE, || lane.pick_within(volume, MOST_MERGE_SEGMENTS).is_some_and(|(target, _)| target.length.0 > 0));
     assert_eq!(found, LOOKS, "the pick found nothing past the dead queue");
+    // the unlink's own pick takes the first of the queue, and once every candidate but the last is unproven it walks the queue to
+    // its end, with a shard lock and the lanes' locks a row
+    let compaction = CompactJob::new(Arc::clone(state), 0);
+    assert_eq!(time(&format!("wholly dead with {workers} workers"), HOLD_LINE, || compaction.pick_dead(volume).is_some()), LOOKS);
+    for number in SEGMENTS + 1..SEGMENTS + ahead {
+        volume.table.flag_unproven(SegmentNumber(number));
+    }
+    let last = Some(SegmentNumber(SEGMENTS + ahead));
+    let label = format!("wholly dead past an unproven queue with {workers} workers");
+    assert_eq!(time(&label, HOLD_LINE, || compaction.pick_dead(volume) == last), LOOKS);
+    drop(compaction);
     drop(lane);
     store.close().expect("close");
+}
+
+// a row the walk hasn't counted
+fn unwalked_facts(number: u64) -> SegmentFacts {
+    SegmentFacts { walked_blocks: 0, ..facts(number) }
+}
+
+// the walk's pick over 100,000 rows it hasn't counted, in segment order. Rows walked from their ends stand only after an open
+// that rebuilt the summary
+#[test]
+fn walk_pick_over_unwalked_rows() {
+    for workers in GATE_WORKERS {
+        let io = SimulatedIo::new(Seed(73));
+        io.add_disk(Path::new(ROOT), DISK);
+        let store: Store = ReelStore::open(io, &config(workers)).expect("open");
+        fill(&store, false, unwalked_facts);
+        let mut walk = WalkJob::new(Arc::clone(&store.state), 0);
+        let label = format!("walk target over forward rows with {workers} workers");
+        assert_eq!(time(&label, HOLD_LINE, || walk.pick_target()), LOOKS);
+        drop(walk);
+        store.close().expect("close");
+    }
 }

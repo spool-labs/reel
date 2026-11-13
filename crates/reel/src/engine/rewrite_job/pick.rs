@@ -24,8 +24,9 @@ use crate::segment::block_entry::KeyBound;
 use crate::segment::column_directory::ColumnDirectory;
 use crate::segment::segment_tail::{MOST_MERGE_SEGMENTS, SegmentNumber};
 use crate::segment::summary::{SummaryRow, SummaryRows};
-use crate::segment::summary_orders::{COVERS_LIST, ROW_FOOTER_BYTES, SHARE_BUCKETS, SHARE_SCALE, WalkList, reclaim_share, share_bucket};
+use crate::segment::summary_orders::{COVERS_LIST, ROW_FOOTER_BYTES, SHARE_BUCKETS, SHARE_SCALE, WalkList, is_wholly_dead, reclaim_share, share_bucket};
 
+use crate::engine::compact_job::can_unlink;
 use crate::engine::load_state::{OverlapLanes, Owed, is_capped, is_deferring, overlap_lanes, record_bar};
 use crate::engine::rewrite_job::{BAR_SCALE, BUCKET_LOOKS, BarsFired, CROWD_PAGES, MOST_COUNTED_CROWD, MOST_LOOK_TIME, OVERLAP_BASE_RECORD_BYTES, EARLY_BAR, GATHER_LOOKS, MOST_OVERLAP, MergeInput, MergeTarget, OVERLAP_LOOKS, OVERLAP_PROBES, PLAIN_BAR, PLANNER_LANE, RewriteJob, RewritePhase, rows_of};
 use crate::engine::rewrite_job::install::freed_in_place;
@@ -198,10 +199,13 @@ impl<Backend: Io> RewriteJob<Backend> {
         let owed = Owed { is_reclaim_due: is_reclaim_due(&rows), is_reclaim_held: volume.is_reclaim_held() };
         let plain = record_bar(load, owed);
         let gave_up = self.gave_up_list(volume);
+        let index = self.volume;
         let is_ready_at = |row: &SummaryRow<'_>, plain: u64| {
             let bar = (current, plain);
             let is_free = row.facts.is_walked() && row.facts.segment.0 != walking && !gave_up.holds(row.facts.segment);
-            is_free && is_rewrite_ready(volume, row, 0, bar) && is_rewrite_ready(volume, row, freed_in_place(volume, row), bar)
+            // a wholly dead segment the unlink can take now goes by the unlink, and a rewrite of it would throw one of the two away
+            let is_for_unlink = || is_wholly_dead(row) && can_unlink(&state, index, volume, row.facts.segment);
+            is_free && !is_for_unlink() && is_rewrite_ready(volume, row, 0, bar) && is_rewrite_ready(volume, row, freed_in_place(volume, row), bar)
         };
         let is_ready = |row: &SummaryRow<'_>| is_ready_at(row, plain);
         // the most won back for the bytes read goes first, and a picked row moves to its bucket's end, so a merge that gave way

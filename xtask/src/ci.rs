@@ -48,6 +48,8 @@ pub const WORKERS_PASS_ARGUMENTS: [&str; 13] = [
 pub const WORKERS_VARIABLE: &str = "REEL_SIM_WORKERS";
 /// Workers the pass opens beside each planner: one fits every sim's budget and takes the seats' path
 pub const PASS_WORKERS: &str = "1";
+/// Tests the workers pass runs at least: the four modules held 211 when the pass began
+pub const LEAST_PASS_TESTS: u64 = 200;
 
 /// What one cargo run printed and how it ended
 #[derive(Debug, Default)]
@@ -90,6 +92,7 @@ pub fn run_ci() -> Result<(), TaskError> {
     if !pass.is_success {
         failures.push("a planner-facing sim failed with a worker beside the planner".to_string());
     }
+    check_workers_pass(&pass.lines, &mut failures);
 
     let picks = run_cargo(&root, &PICK_GATE_ARGUMENTS)?;
     if !picks.is_success {
@@ -232,6 +235,14 @@ pub fn check_lines(lines: &[String], harnesses: &[String], failures: &mut Vec<St
     }
 }
 
+/// Check the workers pass ran its tests: a filter that matches nothing after a rename passes with no test run
+pub fn check_workers_pass(lines: &[String], failures: &mut Vec<String>) {
+    let passed: u64 = lines.iter().filter_map(|line| parse_summary(line)).map(|summary| summary.passed.0).sum();
+    if passed < LEAST_PASS_TESTS {
+        failures.push(format!("the workers pass ran {passed} tests, under its floor of {LEAST_PASS_TESTS}"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,6 +258,28 @@ mod tests {
         let mut failures = Vec::new();
 
         check_lines(&lines, &harnesses, &mut failures);
+
+        assert!(failures.is_empty());
+    }
+
+    // a workers pass whose filter matched nothing passes with no test run, and the floor fails it
+    #[test]
+    fn empty_workers_pass() {
+        let lines = vec!["test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 790 filtered out; finished in 0.00s".to_string()];
+        let mut failures = Vec::new();
+
+        check_workers_pass(&lines, &mut failures);
+
+        assert_eq!(failures.len(), 1);
+    }
+
+    // a workers pass at its full count adds no failure
+    #[test]
+    fn full_workers_pass() {
+        let lines = vec!["test result: ok. 215 passed; 0 failed; 0 ignored; 0 measured; 579 filtered out; finished in 230.00s".to_string()];
+        let mut failures = Vec::new();
+
+        check_workers_pass(&lines, &mut failures);
 
         assert!(failures.is_empty());
     }

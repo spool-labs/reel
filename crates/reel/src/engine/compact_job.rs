@@ -236,6 +236,12 @@ impl<Backend: Io> CompactJob<Backend> {
         self.confirm_pass.is_some()
     }
 
+    /// Read the segment an unlink's proof is under way on
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn confirming(&self) -> Option<SegmentNumber> {
+        self.confirm_pass.map(|pass| pass.segment)
+    }
+
     /// Check a merge beside the walk is running, or a seal or a reclaim has asked for a look at the overlap
     pub fn has_overlap_work(&self) -> bool {
         let volume = &self.state.volumes[self.volume];
@@ -247,6 +253,10 @@ impl<Backend: Io> CompactJob<Backend> {
         self.did_background = false;
         let state = Arc::clone(&self.state);
         let volume = &state.volumes[self.volume];
+        // a rewrite that took the segment since the proof began removes it, so the rest of the proof would be thrown away
+        if self.confirm_pass.is_some_and(|pass| volume.is_taken(pass.segment)) {
+            self.confirm_pass = None;
+        }
         if volume.has_failed() || volume.is_compaction_held() {
             return JobStep::Idle;
         }
@@ -841,7 +851,8 @@ impl<Backend: Io> CompactJob<Backend> {
             return None;
         }
         let rows = self.state.hold_for_pick(self.volume, PickKind::Dead);
-        let is_proven = |segment: &SegmentNumber| !volume.table.is_unproven(*segment);
+        // a segment a rewrite holds goes with that rewrite, so a proof of it would be thrown away
+        let is_proven = |segment: &SegmentNumber| !volume.table.is_unproven(*segment) && !volume.is_taken(*segment);
         // the dead list holds the wholly dead rows in segment order
         let dead = rows.orders().walk_list(WalkList::Dead);
         let (mut after, mut all) = (dead.filter(|segment| *segment > self.last_tried), dead);
@@ -1040,6 +1051,16 @@ pub fn is_under_applied_cover<Backend: Io>(volume: &Volume<Backend>, segment: Se
             !facts.bound.is_empty() && covers.is_inside_newer(&cover, true)
         })
     })
+}
+
+/// Check an unlink can take a wholly dead segment now: no cover applies, the table hasn't flagged it unproven, no rewrite holds
+/// it, and every block is dead with no live cue reading below the place that replaced its rows. A record pick leaves such a
+/// segment to the unlink, which frees it with no output. Confirm asks the cue the counting way, so a cue's going asks again
+pub fn can_unlink<Backend: Io>(state: &EngineState<Backend>, index: usize, volume: &Volume<Backend>, segment: SegmentNumber) -> bool {
+    !volume.is_applying.load(Ordering::Acquire)
+        && !volume.table.is_unproven(segment)
+        && !volume.is_taken(segment)
+        && volume.table.dead_replacement(segment).is_some_and(|place| !state.cues.has_cue_below(index, place))
 }
 
 /// Count what changes the summary a pick reads: seals, rewrites and unlinks

@@ -842,6 +842,11 @@ fn newer_value_sealed_first() {
     store.close().expect("close");
 }
 
+// a wholly dead segment goes by the unlink, and one a proof flagged unproven goes to a rewrite, which these tests watch decide
+fn to_rewrite(store: &Store, segment: SegmentNumber) {
+    store.state.volumes[0].table.flag_unproven(segment);
+}
+
 // an older segment of a..d and a newer one of a..c, both walked, so the older is ready for a rewrite and d stays live in it,
 // then a third segment of some keys again, sealed with the walk held. Returns the three
 fn three_segments(store: &Store, io: &SimulatedIo, third: &[&[u8]]) -> (SegmentNumber, SegmentNumber, SegmentNumber) {
@@ -926,6 +931,7 @@ fn recounted_block_lands_once() {
     let mut job = WalkJob::new(state.clone(), 0);
     job.step_unit(io.clock_reading());
     count_slots(&io);
+    to_rewrite(&store, older);
     let mut merge = CompactJob::new(state.clone(), 0);
     while !merge.rewrite.start() {
         assert!(merge.rewrite.has_looks_left(), "no rewrite started");
@@ -1069,6 +1075,47 @@ fn free_on_a_claimed_segment_is_dropped() {
     store.close().expect("close");
 }
 
+// with walk workers a free on a segment a rewrite has claimed is dropped too: the workers count the block and the landing drops
+// the free, so the record stays whole for the rewrite's copy
+#[test]
+fn free_on_a_claimed_segment_is_dropped_with_workers() {
+    let io = SimulatedIo::new(Seed(68));
+    let store = open_workers(&io);
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    let large = vec![7; FREE_IN_PLACE_BYTES.0 as usize * 2];
+    store.put(COLUMN, b"large", &large).expect("put");
+    store.seal_now();
+    settle(&io);
+    let older = *hold(&volume.summary).orders().present().last().expect("a segment");
+    io.hold_jobs(WALK_JOB, true);
+    io.hold_jobs("reel-walk", true);
+    store.put(COLUMN, b"large", b"small").expect("put");
+    store.seal_now();
+    settle(&io);
+    hold(&volume.lanes[0].inputs)[0] = older;
+    let freed = volume.bytes_freed.load(Ordering::Acquire);
+
+    let mut job = WalkJob::new(state.clone(), 0);
+    for _step in 0..MOST_LANDING_STEPS {
+        if dead_rows_of(&store, older) == 1 {
+            break;
+        }
+        job.step_unit(io.clock_reading());
+        count_slots(&io);
+    }
+    assert_eq!(dead_rows_of(&store, older), 1, "the workers' count never landed");
+    assert_eq!(volume.bytes_freed.load(Ordering::Acquire), freed, "a free cut a record a rewrite claimed");
+    hold(&volume.lanes[0].inputs)[0] = SegmentNumber(0);
+    drop(job);
+    io.hold_jobs(WALK_JOB, false);
+    io.hold_jobs("reel-walk", false);
+    store.close().expect("close");
+}
+
+/// Walk steps a block's count may take to land with workers counting it
+const MOST_LANDING_STEPS: u64 = 16;
+
 const CURSOR_SEEDS: u64 = 6;
 const CURSOR_SEGMENTS_WRITTEN: u64 = 40;
 const CURSOR_PUTS: u64 = 3_000;
@@ -1190,6 +1237,7 @@ fn set_bits_drop_with_no_ask() {
     settle(&io);
     assert_eq!(dead_rows_of(&store, older), 4, "the walk left a row of the older segment uncounted");
 
+    to_rewrite(&store, older);
     let mut merge = CompactJob::new(state.clone(), 0);
     while !merge.rewrite.start() {
         assert!(merge.rewrite.has_looks_left(), "no rewrite started");
@@ -1230,6 +1278,7 @@ fn healed_volume_keeps_bits_spoiled() {
     assert!(volume.damage.is_empty() && hold(&volume.damaged).is_empty(), "the volume still reads damaged");
     assert!(volume.dead_bits.exact(older).is_none(), "the damage left the bits exact");
 
+    to_rewrite(&store, older);
     let mut merge = CompactJob::new(state.clone(), 0);
     while !merge.rewrite.start() {
         assert!(merge.rewrite.has_looks_left(), "no rewrite started");
@@ -1258,6 +1307,7 @@ fn missed_charge_spoils_and_asks() {
     assert!(volume.dead_bits.exact(older).is_some());
     assert_eq!(dead_rows_of(&store, older), 4, "the walk left a row uncounted");
 
+    to_rewrite(&store, older);
     let mut merge = CompactJob::new(state.clone(), 0);
     while !merge.rewrite.start() {
         assert!(merge.rewrite.has_looks_left(), "no rewrite started");
@@ -1292,6 +1342,7 @@ fn bits_survive_a_reopen() {
     assert!(volume.dead_bits.exact(older).is_some(), "the bits didn't come back");
     quiet(&store, &io);
     check_dead_bits(volume);
+    to_rewrite(&store, older);
     let mut merge = CompactJob::new(store.state.clone(), 0);
     while !merge.rewrite.start() {
         assert!(merge.rewrite.has_looks_left(), "no rewrite started");

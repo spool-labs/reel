@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::shape;
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
-use reel::engine::compact_job::{CompactJob, park};
+use reel::engine::compact_job::{CompactJob, can_unlink, park};
 use reel::engine::cue::Cue;
 use reel::engine::load_state::DISK_CHECK_PERIOD;
 use reel::engine::open_segment::{OUTPUT_SUFFIX, data_path};
@@ -106,12 +106,6 @@ fn config() -> StoreConfig {
 
 fn open(io: &SimulatedIo) -> Store {
     let config = config();
-    ReelStore::open(io.clone(), &config).expect("open")
-}
-
-fn open_planner_only(io: &SimulatedIo) -> Store {
-    let mut config = config();
-    config.threads = reel::config::NO_WORKERS;
     ReelStore::open(io.clone(), &config).expect("open")
 }
 
@@ -1654,10 +1648,7 @@ fn merge_ahead_of_a_walk_target() {
     };
     assert!(planner.walks[0].pick_target());
     state.volumes[0].wants_compaction.store(true, Ordering::Release);
-    // with workers the merge starts in a seat, which no worker steps here
-    let is_unwalked = |job: &CompactJob<SimulatedIo>| {
-        job.rewrite.is_unwalked_merge() || job.seats.iter().any(|seat| hold(&seat.job).as_ref().is_some_and(RewriteJob::is_unwalked_merge))
-    };
+    let is_unwalked = |job: &CompactJob<SimulatedIo>| shape::any_rewrite(job, RewriteJob::is_unwalked_merge);
     for _step in 0..OVER_THE_BOUND {
         planner.step();
         if is_unwalked(&planner.compactions[0]) {
@@ -1665,12 +1656,7 @@ fn merge_ahead_of_a_walk_target() {
         }
     }
     assert!(is_unwalked(&planner.compactions[0]));
-    planner.compactions[0].rewrite.abandon();
-    for seat in planner.compactions[0].seats.iter() {
-        if let Some(seated) = hold(&seat.job).as_mut().filter(|seated| seated.is_running()) {
-            seated.abandon();
-        }
-    }
+    shape::abandon_rewrites(&mut planner.compactions[0]);
     state.volumes[0].has_walk_target.store(false, Ordering::Release);
     state.volumes[0].walk_segment.store(NO_SEAL, Ordering::Release);
     drop(planner);
@@ -2326,7 +2312,8 @@ fn hiding_graves_get_one_look() {
     store.close().expect("close");
 }
 
-// a segment a cue keeps whole writes no second output: the copy that found nothing to drop counts for as long as the cue lives
+// a segment a cue keeps whole writes no second output: the copy that found nothing to drop counts for as long as the cue lives,
+// and the unlink takes the segment once the cue goes
 #[test]
 fn cue_held_rows_copy_once() {
     let io = SimulatedIo::new(Seed(80));
@@ -2336,7 +2323,7 @@ fn cue_held_rows_copy_once() {
     for number in 0..IDLE_KEYS {
         store.put(COLUMN, format!("key-{number:04}").as_bytes(), &value).expect("put");
     }
-    seal(&store, &io);
+    let older = seal(&store, &io);
     let cue = store.cue().expect("cue");
     for number in 0..IDLE_KEYS {
         store.put(COLUMN, format!("key-{number:04}").as_bytes(), b"newer").expect("put");
@@ -2350,9 +2337,14 @@ fn cue_held_rows_copy_once() {
     assert_eq!(volume.segments_rewritten.load(Ordering::Acquire), 0);
     assert!(!job.rewrite.start(), "the copy would run again");
 
+    // with the cue gone the unlink takes the wholly dead segment, so no copy runs again
     drop(cue);
-    assert!(start_merge(&mut job));
-    job.rewrite.abandon();
+    assert!(!start_merge(&mut job), "a copy took a segment the unlink frees");
+    hold_compaction(&store, false);
+    store.state.ask_compaction();
+    settle(&io);
+    assert!(!volume.table.holds(older), "the unlink never took the segment");
+    assert_eq!(volume.segments_rewritten.load(Ordering::Acquire), 0);
     store.close().expect("close");
 }
 
@@ -2726,13 +2718,179 @@ fn dropped_held_row_lands_nothing() {
     store.close().expect("close");
 }
 
+// the default store opens with the workers the run asks for, so the workers pass runs with a worker beside each planner
+#[test]
+fn default_store_has_the_asked_workers() {
+    let io = SimulatedIo::new(Seed(138));
+    let store = open(&io);
+    assert_eq!(store.state.volumes[0].lanes.len(), shape::workers() + 1, "the store opened without the asked workers");
+    store.close().expect("close");
+}
+
+// one key written twice, sealed after each write: the first segment is wholly dead, counted and replaced by the second
+fn one_dead_segment(store: &Store, io: &SimulatedIo) -> (SegmentNumber, SegmentNumber) {
+    store.put(COLUMN, b"w", b"first").expect("put");
+    let dead = seal(store, io);
+    store.put(COLUMN, b"w", b"second").expect("put");
+    (dead, seal(store, io))
+}
+
+// many keys written twice, sealed after each pass: the first segment is wholly dead over several row blocks
+fn many_block_dead_segment(store: &Store, io: &SimulatedIo) -> SegmentNumber {
+    for number in 0..TWO_BLOCK_ROWS {
+        store.put(COLUMN, format!("dead-{number:06}").as_bytes(), b"first").expect("put");
+    }
+    let dead = seal(store, io);
+    for number in 0..TWO_BLOCK_ROWS {
+        store.put(COLUMN, format!("dead-{number:06}").as_bytes(), b"second").expect("put");
+    }
+    seal(store, io);
+    assert!(hold(&store.state.volumes[0].summary).get(dead).expect("a row").facts.block_count > 1);
+    dead
+}
+
+// the unlink takes a wholly dead segment only when nothing stands in its way, and each thing that does leaves it to a rewrite
+#[test]
+fn unlink_gate_leaves_held_segments_to_a_rewrite() {
+    let io = SimulatedIo::new(Seed(134));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    store.put(COLUMN, b"w", b"first").expect("put");
+    let cue = store.cue().expect("cue");
+    let dead = seal(&store, &io);
+    store.put(COLUMN, b"w", b"second").expect("put");
+    let live = seal(&store, &io);
+    let can = |segment| can_unlink(state, 0, volume, segment);
+    assert!(!can(dead), "a cue below the replacement left the segment to the unlink");
+    drop(cue);
+    assert!(can(dead));
+    assert!(!can(live), "a segment with a live row went to the unlink");
+    volume.is_applying.store(true, Ordering::Release);
+    assert!(!can(dead), "a segment under a cover being applied went to the unlink");
+    volume.is_applying.store(false, Ordering::Release);
+    hold(&volume.lanes[PLANNER_LANE].inputs)[0] = dead;
+    assert!(!can(dead), "a segment a rewrite holds went to the unlink");
+    hold(&volume.lanes[PLANNER_LANE].inputs)[0] = SegmentNumber(0);
+    assert!(can(dead));
+    volume.table.flag_unproven(dead);
+    assert!(!can(dead), "a segment a proof found live went to the unlink");
+    store.close().expect("close");
+}
+
+// a segment a rewrite holds starts no proof, which the rewrite would throw away, and the unlink takes it once the rewrite lets go
+#[test]
+fn held_segment_starts_no_proof() {
+    let io = SimulatedIo::new(Seed(135));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let volume = &store.state.volumes[0];
+    let (dead, _live) = one_dead_segment(&store, &io);
+    io.hold_jobs("reel-planner", true);
+    hold_compaction(&store, false);
+    hold(&volume.lanes[PLANNER_LANE].inputs)[0] = dead;
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    volume.wants_compaction.store(true, Ordering::Release);
+    for _step in 0..MOST_FORCED_STEPS {
+        job.step_unit(io.clock_reading());
+        assert!(!job.is_confirming(), "a proof began on a segment a rewrite holds");
+    }
+    assert!(volume.table.holds(dead));
+    hold(&volume.lanes[PLANNER_LANE].inputs)[0] = SegmentNumber(0);
+    volume.wants_compaction.store(true, Ordering::Release);
+    for _step in 0..MOST_LOOPS {
+        if !volume.table.holds(dead) {
+            break;
+        }
+        job.step_unit(io.clock_reading());
+    }
+    assert!(!volume.table.holds(dead), "the unlink never took the segment once the rewrite let go");
+    shape::finish_rewrites(&mut job);
+    io.hold_jobs("reel-planner", false);
+    store.close().expect("close");
+}
+
+// a proof stops at its next step once a rewrite takes its segment, so it proves no block the rewrite will remove anyway
+#[test]
+fn proof_stops_once_a_rewrite_takes_its_segment() {
+    let io = SimulatedIo::new(Seed(136));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let volume = &store.state.volumes[0];
+    many_block_dead_segment(&store, &io);
+    io.hold_jobs("reel-planner", true);
+    hold_compaction(&store, false);
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    volume.wants_compaction.store(true, Ordering::Release);
+    for _step in 0..MOST_LOOPS {
+        if job.is_confirming() {
+            break;
+        }
+        job.step_unit(io.clock_reading());
+    }
+    let dead = job.confirming().expect("no proof began");
+    hold(&volume.lanes[PLANNER_LANE].inputs)[0] = dead;
+    job.step_unit(io.clock_reading());
+    assert_ne!(job.confirming(), Some(dead), "the proof went on under a rewrite");
+    assert!(volume.table.holds(dead));
+    hold(&volume.lanes[PLANNER_LANE].inputs)[0] = SegmentNumber(0);
+    shape::finish_rewrites(&mut job);
+    io.hold_jobs("reel-planner", false);
+    store.close().expect("close");
+}
+
+// with a worker, a seal that lands between two proof steps hands the seat a pick, and the pick leaves the segment under proof to
+// the unlink: the segment goes once, by the unlink, with each block proven once and no record rewrite
+#[test]
+fn seal_during_a_proof_leaves_the_segment_to_the_unlink() {
+    let io = SimulatedIo::new(Seed(137));
+    let mut config = config();
+    config.threads.maintenance_workers = Some(1);
+    config.memory_budget = WORKER_BUDGET;
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    hold_compaction(&store, true);
+    let volume = &store.state.volumes[0];
+    let dead = many_block_dead_segment(&store, &io);
+    let blocks = hold(&volume.summary).get(dead).expect("a row").facts.block_count;
+    io.hold_jobs("reel-planner", true);
+    hold_compaction(&store, false);
+    let records = || volume.picks[PickOutcome::Record.index()].load(Ordering::Acquire);
+    let (records_before, unlinked_before) = (records(), volume.segments_unlinked.load(Ordering::Acquire));
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    volume.wants_compaction.store(true, Ordering::Release);
+    let mut proof_steps = 0;
+    let mut is_sealed = false;
+    for _step in 0..MOST_LOOPS {
+        if !volume.table.holds(dead) {
+            break;
+        }
+        let is_proving = job.is_confirming();
+        job.step_unit(io.clock_reading());
+        proof_steps += u64::from(is_proving);
+        // a seal lands after the proof's first block, and the next step hands out what it changed
+        if is_proving && !is_sealed {
+            store.put(COLUMN, b"mid-proof", b"value").expect("put");
+            store.seal_now();
+            settle(&io);
+            is_sealed = true;
+        }
+    }
+    assert!(is_sealed, "no proof began");
+    assert!(!volume.table.holds(dead), "the segment never went");
+    assert_eq!(volume.segments_unlinked.load(Ordering::Acquire), unlinked_before + 1);
+    assert_eq!(records(), records_before, "a record rewrite took the segment under proof");
+    assert!(proof_steps <= u64::from(blocks) + 1, "{proof_steps} proof steps for {blocks} blocks");
+    shape::finish_rewrites(&mut job);
+    io.hold_jobs("reel-planner", false);
+    store.close().expect("close");
+}
+
 // a rewrite starts once the steps an unlink takes ahead of it are done, and the wholly dead segment goes first
 #[test]
 fn ask_outlives_an_unlink() {
     let io = SimulatedIo::new(Seed(79));
-    // with workers a seat's hand-out runs ahead of the unlink and may take the wholly dead segment as a record rewrite, an open
-    // item, so this order holds on the planner alone
-    let store = open_planner_only(&io);
+    let store = open(&io);
     hold_compaction(&store, true);
     let state = &store.state;
     let volume = &state.volumes[0];
@@ -2757,16 +2915,16 @@ fn ask_outlives_an_unlink() {
     let mut is_started = false;
     for _step in 0..MOST_LOOPS {
         job.step_unit(io.clock_reading());
-        if job.rewrite.is_running() {
-            is_started = true;
+        // with workers a seat may start its rewrite before the unlink, but never on the wholly dead segment
+        assert!(!volume.is_taken(gone), "a rewrite took the wholly dead segment");
+        is_started |= shape::is_rewriting(&job);
+        if is_started && !volume.table.holds(gone) {
             break;
         }
     }
-    assert!(!volume.table.holds(gone), "the wholly dead segment didn't go first");
+    assert!(!volume.table.holds(gone), "the wholly dead segment never went");
     assert!(is_started, "the ask went with the unlink");
-    while job.rewrite.is_running() {
-        job.rewrite.step();
-    }
+    shape::finish_rewrites(&mut job);
     io.hold_jobs("reel-planner", false);
     store.close().expect("close");
 }

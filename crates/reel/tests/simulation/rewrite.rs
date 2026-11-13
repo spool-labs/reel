@@ -4655,40 +4655,6 @@ fn pace_refusal_counts_once() {
     store.close().expect("close");
 }
 
-// a segment a walk in flight has charged, past what the table can trust, still goes at the floor while its dead bits are exact,
-// since a merge drops its rows by those bits, and falls back to the half bar once the bits are held off
-#[test]
-fn exact_bits_keep_a_charged_segment_trusted() {
-    let io = SimulatedIo::new(Seed(150));
-    let store = open(&io);
-    hold_compaction(&store, true);
-    let volume = &store.state.volumes[0];
-    let band = large_segment_dead_by(&store, &io, "charged", 40);
-    assert!(volume.dead_bits.exact(band).is_some(), "the walk left the band segment's bits inexact");
-    hold_walk(&store, true);
-    store.put(COLUMN, b"in-flight", b"value").expect("put");
-    store.seal_now();
-    settle(&io);
-    assert!(store.state.pending_walks(0) > 0, "no segment waits for its walk");
-    // a walk in flight charged the band segment from a place past the unwalked one
-    volume.table.drop_live(band, 0, 0, WritePlace(u64::MAX / 2));
-    let cap = volume.pace_cap();
-    volume.pace.add(cap, cap);
-    volume.is_over_bound.store(false, Ordering::Release);
-    store.put(COLUMN, b"a-call", b"value").expect("put");
-    volume.holds.no_bits.store(true, Ordering::Release);
-    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
-    let fallbacks = volume.trust_fallbacks.load(Ordering::Acquire);
-    assert!(!job.rewrite.start(), "a rewrite took a segment with untrusted counts and its bits held off at the floor");
-    assert_eq!(volume.trust_fallbacks.load(Ordering::Acquire) - fallbacks, 1);
-    volume.holds.no_bits.store(false, Ordering::Release);
-    assert!(start_merge(&mut job), "exact bits left the charged segment untrusted");
-    assert!(shape::any_rewrite(&job, |seated| seated.input_numbers().contains(&band)), "the floor took another segment");
-    shape::finish_rewrites(&mut job);
-    assert_eq!(volume.promises_outgrown.load(Ordering::Acquire), 0, "the merge wrote past what its counts promised");
-    store.close().expect("close");
-}
-
 /// Space targets the gate sims hold the steady load to, in thousandths of the live bytes
 const TARGETS: [u64; 2] = [150, 300];
 /// A target past what the half bar alone leaves, so no band rewrite is wanted
@@ -4836,28 +4802,115 @@ fn freed_bytes_survive_a_reopen() {
     store.close().expect("close");
 }
 
-// a volume with damage has bits that answer for no row, so a charged segment its walk hasn't finished stays untrusted
+/// Planner steps the churn test takes with nothing changing
+const STILL_STEPS: u64 = 200;
+
+// with callers busy only the busy lane may take an overlap merge, so while its seat holds one the look can't move. A pass that
+// stops moving waits for the next change, and the picks don't spin
 #[test]
-fn damage_leaves_a_charged_segment_untrusted() {
-    let io = SimulatedIo::new(Seed(158));
+fn stuck_look_pass_waits_for_a_change() {
+    let io = SimulatedIo::new(Seed(159));
+    let mut config = config();
+    // a second seat is idle beside the busy lane's, and picks while the first holds its merge
+    config.threads.maintenance_workers = Some(2);
+    config.memory_budget = WORKER_BUDGET;
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    hold_compaction(&store, true);
+    let volume = &store.state.volumes[0];
+    pile_up(&store, &io, OVER_THE_BOUND);
+    io.hold_jobs("reel-planner", true);
+    hold_compaction(&store, false);
+    store.put(COLUMN, b"a-call", b"value").expect("put");
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    store.state.ask_compaction();
+    // the busy lane's seat takes an overlap merge, which no worker steps here
+    for _step in 0..MOST_LOOPS {
+        job.step_unit(io.clock_reading());
+        if shape::is_rewriting(&job) {
+            break;
+        }
+    }
+    assert!(shape::is_rewriting(&job), "the busy lane took no overlap merge");
+    volume.looks.set_left(true);
+    // the merge in flight answers the bound, so record picks find nothing past the bar in place of waiting behind it
+    volume.is_over_bound.store(false, Ordering::Release);
+    let picks = || volume.picks.iter().map(|count| count.load(Ordering::Acquire)).sum::<u64>();
+    let before = picks();
+    for _step in 0..STILL_STEPS {
+        job.step_unit(io.clock_reading());
+        store.put(COLUMN, b"a-call", b"value").expect("put");
+    }
+    let spun = picks() - before;
+    assert!(spun <= 2, "the planner picked {spun} times over {STILL_STEPS} steps with nothing changing");
+    shape::abandon_rewrites(&mut job);
+    io.hold_jobs("reel-planner", false);
+    store.close().expect("close");
+}
+
+// put a segment of its own keys a share dead, hold the walk, and seal an unwalked segment past it, as under ingest
+fn band_with_walk_in_flight(store: &Store, io: &SimulatedIo, dead_share: u64) -> SegmentNumber {
+    let band = large_segment_dead_by(store, io, "band", dead_share);
+    hold_walk(store, true);
+    store.put(COLUMN, b"in-flight", b"value").expect("put");
+    seal(store, io);
+    assert!(store.state.pending_walks(0) > 0, "no segment waits for its walk");
+    band
+}
+
+// charge a share of a segment's record bytes as the walk in flight would, from a place past every unwalked segment
+fn charge_in_flight(store: &Store, segment: SegmentNumber, share: u64) {
+    let volume = &store.state.volumes[0];
+    let bytes = PACE_KEYS * PACE_VALUE_BYTES as u64 * share / 100;
+    let place = WritePlace(u64::MAX / 2);
+    volume.table.note_unbacked(segment, bytes, place);
+    volume.table.drop_live(segment, 0, 0, place);
+}
+
+// a segment finished walks left 40% dead, which the walk in flight charged another tenth, goes at the floor on its backed
+// counts, and its merge writes no more than the estimate promised
+#[test]
+fn backed_counts_go_at_the_floor_mid_walk() {
+    let io = SimulatedIo::new(Seed(160));
     let store = open(&io);
     hold_compaction(&store, true);
     let volume = &store.state.volumes[0];
-    let band = large_segment_dead_by(&store, &io, "damaged", 40);
-    assert!(volume.dead_bits.exact(band).is_some(), "the walk left the band segment's bits inexact");
-    hold_walk(&store, true);
-    store.put(COLUMN, b"in-flight", b"value").expect("put");
-    let in_flight = seal(&store, &io);
-    volume.table.drop_live(band, 0, 0, WritePlace(u64::MAX / 2));
-    store.state.damage_unread(0, in_flight);
-    assert!(!volume.are_bits_answering(), "the volume's bits answer with damage on it");
+    let band = band_with_walk_in_flight(&store, &io, 40);
+    charge_in_flight(&store, band, 10);
     let cap = volume.pace_cap();
     volume.pace.add(cap, cap);
     volume.is_over_bound.store(false, Ordering::Release);
     store.put(COLUMN, b"a-call", b"value").expect("put");
-    let fallbacks = volume.trust_fallbacks.load(Ordering::Acquire);
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
-    assert!(!job.rewrite.start(), "a rewrite took a charged segment at the floor on bits that answer for nothing");
-    assert_eq!(volume.trust_fallbacks.load(Ordering::Acquire) - fallbacks, 1);
+    assert!(start_merge(&mut job), "the walk in flight left a segment with 40% backed dead untaken");
+    assert!(shape::any_rewrite(&job, |seated| seated.input_numbers().contains(&band)), "the floor took another segment");
+    shape::finish_rewrites(&mut job);
+    assert_eq!(volume.promises_outgrown.load(Ordering::Acquire), 0, "the merge wrote past what its estimate promised");
+    store.close().expect("close");
+}
+
+// a segment whose counts read past half, most of it charged by the walk in flight, waits: only the backed share counts, and it
+// sits under the floor until that walk ends
+#[test]
+fn unbacked_counts_wait_for_the_walk() {
+    let io = SimulatedIo::new(Seed(161));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let volume = &store.state.volumes[0];
+    let band = band_with_walk_in_flight(&store, &io, 50);
+    charge_in_flight(&store, band, 30);
+    let cap = volume.pace_cap();
+    volume.pace.add(cap, cap);
+    volume.is_over_bound.store(false, Ordering::Release);
+    store.put(COLUMN, b"a-call", b"value").expect("put");
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(!job.rewrite.start(), "a rewrite took a segment on dead bytes no merge can drop yet");
+    // the walk ends, and every replacement now lies below the unwalked segments
+    hold_walk(&store, false);
+    settle(&io);
+    assert_eq!(store.state.pending_walks(0), 0);
+    volume.is_over_bound.store(false, Ordering::Release);
+    store.put(COLUMN, b"a-call", b"value").expect("put");
+    assert!(start_merge(&mut job), "the segment stayed untaken once the walk ended");
+    shape::abandon_rewrites(&mut job);
     store.close().expect("close");
 }

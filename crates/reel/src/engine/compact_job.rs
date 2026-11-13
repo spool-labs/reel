@@ -384,6 +384,7 @@ impl<Backend: Io> CompactJob<Backend> {
         }
         self.pick_retry = None;
         let before = PickCounts::of(volume);
+        let looked_before = volume.looks.up_to();
         // workers run every rewrite, so the planner stays free to pick and walk. A merge of 1 GiB segments would hold it for minutes
         if should_rewrite && (self.hand_out() || (self.seats.is_empty() && self.rewrite.start())) {
             return JobStep::Worked;
@@ -397,8 +398,10 @@ impl<Backend: Io> CompactJob<Backend> {
             return JobStep::IdleUntil { deadline: wait };
         }
         // a look takes a few segments at a time, and the rest still count. Hot ingest looks at none, and a pick behind an overlap
-        // merge stops this pass, since the overlap owed brings the next step back to it
-        self.should_rewrite = should_rewrite && !is_deferring && refusal.is_none() && volume.looks.has_left();
+        // merge stops this pass, since the overlap owed brings the next step back to it. A look that didn't move, as when only a busy
+        // lane may overlap and its seat holds a merge, stops the pass too, and the next ask or change brings it back
+        let has_looked = volume.looks.up_to() != looked_before;
+        self.should_rewrite = should_rewrite && !is_deferring && refusal.is_none() && volume.looks.has_left() && has_looked;
         // a quiet pass that found nothing past the bar looks again only once a seal, a rewrite, an unlink or the room changes what
         // it saw
         if is_quiet_with_dead && !self.should_rewrite && refusal.is_none() && after.nothing > before.nothing {

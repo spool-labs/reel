@@ -448,6 +448,8 @@ pub struct Volume<Backend: Io> {
     /// The highest place any segment held at open. A count from before the open, with no replacement charged since, is trusted
     /// once every segment below this place has walked again
     pub open_place: WritePlace,
+    /// The highest segment number the summary held at open: a segment at or under it has counts from before the open
+    pub open_segment: SegmentNumber,
     pub summary_paths: SummaryPaths,
     /// The dead bits file and the name a save writes first, in the summary's root
     pub bits_path: PathBuf,

@@ -41,6 +41,7 @@ fn pool_compact() {
         is_walked: false,
         highest_replacement: WritePlace(0),
         live_blocks: 0,
+        unbacked: 0,
         has_held_frees: false,
         is_unproven: false,
     };
@@ -189,4 +190,23 @@ fn drop_past_the_last_block_lands_nowhere() {
     assert_eq!(table.dead_replacement(first), None);
     assert_eq!(table.dead_replacement(second), None);
     assert_eq!(table.live_rows(second), Some(5));
+}
+
+// charges from the walk in flight read apart until the segment's replacements lie below every unwalked one, and a new walk's
+// first charge drops what finished walks left
+#[test]
+fn unbacked_charges_follow_the_walk() {
+    let table = table_with(4);
+    let number = SegmentNumber(1);
+    let head = TailHead { segment: number, ..TailHead::default() };
+    assert!(table.install(1, RootId(0), &head, &[], &[BlockEntry { live_rows: 5, ..line(0) }]));
+    table.note_unbacked(number, 100, WritePlace(10));
+    table.drop_live(number, 0, 1, WritePlace(12));
+    assert_eq!(table.unbacked(number, Some(WritePlace(11))), 100, "the walk in flight's charge read backed");
+    assert_eq!(table.unbacked(number, Some(WritePlace(20))), 0, "a finished walk's charge read unbacked");
+    assert_eq!(table.unbacked(number, None), 0);
+    // the next walk starts past every earlier charge, so they came from walks that finished
+    table.note_unbacked(number, 40, WritePlace(30));
+    table.drop_live(number, 0, 1, WritePlace(31));
+    assert_eq!(table.unbacked(number, Some(WritePlace(25))), 40, "the new walk kept the old walk's charge");
 }

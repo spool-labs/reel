@@ -1396,6 +1396,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
     let rows_here: u64 = summary.rows.rows().map(|row| rows_of(&row)).sum();
     let dead_share = ByteCount(dead_bits_bytes(rows_here).min(sizing.record_share.0 / 2 / config.volumes.len() as u64));
     let open_place = summary.rows.rows().map(|row| row.facts.places.highest).max().unwrap_or(WritePlace(0));
+    let open_segment = summary.rows.rows().map(|row| row.facts.segment).max().unwrap_or(SegmentNumber(0));
     Volume {
         dead_bits: DeadBits::new(dead_share, room.segments_per_shard * TABLE_SHARDS),
         id: VolumeId(index as u8),
@@ -1534,6 +1535,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         reserve: ByteCount(sizing.segment_bytes.0 * 2),
         summary: Mutex::new(summary.rows),
         open_place,
+        open_segment,
         bits_path: summary.paths.root.join(DEAD_BITS_NAME),
         new_bits_path: summary.paths.root.join(NEW_DEAD_BITS_NAME),
         bits_save: Mutex::new(BitsSave { heads: touched_room(SAVE_HEADS_PAGE), chunk: touched_capacity(CHUNK_WORDS * size_of::<u64>(), 0) }),

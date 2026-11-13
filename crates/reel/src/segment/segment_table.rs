@@ -45,6 +45,8 @@ pub struct TableEntry<File> {
     pub highest_replacement: WritePlace,
     /// Blocks with a live row left, so a check for a wholly dead segment reads one count
     pub live_blocks: u32,
+    /// Dead bytes, with their rows' footers, the walk in flight charged, which no merge can drop until that walk ends
+    pub unbacked: u64,
     pub has_held_frees: bool,
     pub is_unproven: bool,
 }
@@ -306,6 +308,7 @@ impl<File: Clone> SegmentTable<File> {
             is_walked: false,
             highest_replacement: WritePlace(0),
             live_blocks: blocks.iter().filter(|line| line.live_rows > 0).count() as u32,
+            unbacked: 0,
             has_held_frees: false,
             is_unproven: false,
         });
@@ -390,6 +393,33 @@ impl<File: Clone> SegmentTable<File> {
         let is_dead = was_live && line.live_rows == 0;
         if is_dead && let Some(entry) = guard.segments[slot as usize].as_mut() {
             entry.live_blocks = entry.live_blocks.saturating_sub(1);
+        }
+    }
+
+    /// Note dead bytes the walk in flight charged a segment, which no merge can drop until that walk ends. Charges from before
+    /// the walk began came from walks that finished, since a volume walks one target at a time, so they go first
+    pub fn note_unbacked(&self, number: SegmentNumber, bytes: u64, walk_lowest: WritePlace) {
+        let mut guard = self.shards.write(shard_of(number));
+        let Some(slot) = guard.map.get(number) else {
+            return;
+        };
+        if let Some(entry) = guard.segments[slot as usize].as_mut() {
+            if entry.highest_replacement < walk_lowest {
+                entry.unbacked = 0;
+            }
+            entry.unbacked += bytes;
+        }
+    }
+
+    /// Read a segment's dead bytes the walk in flight charged, none once every replacement lies below the unwalked segments
+    pub fn unbacked(&self, number: SegmentNumber, walked_below: Option<WritePlace>) -> u64 {
+        let guard = self.shards.read(shard_of(number));
+        let Some(entry) = guard.map.get(number).and_then(|slot| guard.segments[slot as usize].as_ref()) else {
+            return 0;
+        };
+        match walked_below {
+            Some(unwalked) if entry.highest_replacement >= unwalked => entry.unbacked,
+            _ => 0,
         }
     }
 

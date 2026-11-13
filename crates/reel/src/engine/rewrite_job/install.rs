@@ -11,6 +11,7 @@ use reel_api::maintenance_report::{
 };
 use reel_api::units::{ByteCount, FileOffset, RootId, RowCount, WritePlace};
 
+use crate::segment::summary_orders::ROW_FOOTER_BYTES;
 use crate::engine::dead_bits::INEXACT_KEPT;
 use crate::engine::compact_job::park;
 use crate::engine::engine_state::EngineState;
@@ -448,6 +449,8 @@ impl<Backend: Io> RewriteJob<Backend> {
         rows.apply_walk(number, self.writer.entries().len() as u32, &self.kept_dead);
         drop(rows);
         for count in self.kept_dead.iter().filter(|count| count.rows > 0) {
+            // a row the merge kept for the walk in flight stays undroppable on the output until that walk ends
+            volume.table.note_unbacked(count.segment, count.bytes.0 + u64::from(count.rows) * ROW_FOOTER_BYTES, count.replacement);
             volume.table.drop_live(count.segment, count.block, count.rows, count.replacement);
         }
         // the rows the walk held land with the outputs, before the release lets a waiting walk count again

@@ -95,6 +95,8 @@ pub struct SummaryOrders {
     dead_total: u64,
     /// The record bytes every row counts, live and dead
     record_total: u64,
+    /// The record bytes of the rows the walk hasn't counted, which the space target leaves out of the live ones
+    unwalked_record_total: u64,
     /// The dead bytes only a rewrite can win back: those the walk hasn't freed in place, in segments not wholly dead
     gate_dead_total: u64,
 }
@@ -143,6 +145,7 @@ impl SummaryOrders {
             left_out: 0,
             dead_total: 0,
             record_total: 0,
+            unwalked_record_total: 0,
             gate_dead_total: 0,
         }
     }
@@ -159,6 +162,7 @@ impl SummaryOrders {
         self.left_out = 0;
         self.dead_total = 0;
         self.record_total = 0;
+        self.unwalked_record_total = 0;
         self.gate_dead_total = 0;
     }
 
@@ -197,9 +201,10 @@ impl SummaryOrders {
         self.slots.get(segment).map_or(0, |slot| gate_dead_of(&self.entries[slot as usize]))
     }
 
-    /// Read the live record bytes every row counts. A row the walk hasn't counted reads all live
+    /// Read the live record bytes the walked rows count. A row the walk hasn't counted is left out: under overwrites each of its
+    /// bytes stands for a dead one still counted live in an older segment
     pub fn live_bytes(&self) -> u64 {
-        self.record_total.saturating_sub(self.dead_total)
+        self.record_total.saturating_sub(self.dead_total).saturating_sub(self.unwalked_record_total)
     }
 
     /// Read the dead bytes every row counts
@@ -246,6 +251,12 @@ impl SummaryOrders {
         self.gate_dead_total -= gate_dead_of(entry);
         self.dead_total = self.dead_total - entry.dead_bytes + dead;
         self.record_total = self.record_total - entry.record_bytes + record;
+        if is_unwalked_list(entry.walk_list) {
+            self.unwalked_record_total -= entry.record_bytes;
+        }
+        if is_unwalked_list(walk_list) {
+            self.unwalked_record_total += record;
+        }
         entry.dead_bytes = dead;
         entry.record_bytes = record;
         entry.is_wholly_dead = is_wholly_dead(row);
@@ -272,6 +283,9 @@ impl SummaryOrders {
         };
         self.dead_total -= self.entries[slot as usize].dead_bytes;
         self.record_total -= self.entries[slot as usize].record_bytes;
+        if is_unwalked_list(self.entries[slot as usize].walk_list) {
+            self.unwalked_record_total -= self.entries[slot as usize].record_bytes;
+        }
         self.gate_dead_total -= gate_dead_of(&self.entries[slot as usize]);
         let cleared = OrderEntry { dead_bytes: 0, record_bytes: 0, freed: 0, is_wholly_dead: false, ..self.entries[slot as usize] };
         self.entries[slot as usize] = cleared;
@@ -482,4 +496,9 @@ fn gate_dead_of(entry: &OrderEntry) -> u64 {
 pub fn row_record_bytes(row: &SummaryRow<'_>) -> u64 {
     let mut cursor = row.cursor();
     (0..row.column_count).filter_map(|_column| cursor.column()).map(|column| column.live_bytes.0 + column.dead_bytes.0).sum()
+}
+
+/// Check a walk list holds rows the walk hasn't counted
+fn is_unwalked_list(list: u8) -> bool {
+    list == WalkList::Unwalked.index() as u8 || list == WalkList::Backward.index() as u8
 }

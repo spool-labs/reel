@@ -782,7 +782,8 @@ impl<Backend: Io> WalkJob<Backend> {
         volume.walk_blocks.fetch_add(1, Ordering::Relaxed);
         // the dead bytes a block counted pay for paced rewrites at the pace's multiplier, up to one pick's worth
         let dead_bytes = counts.counts.iter().map(|count| count.bytes.0).sum();
-        volume.pace.add(pace_credit(dead_bytes, volume.pace_per_mille()), volume.segment_bytes.0);
+        let spilled = volume.pace.add(pace_credit(dead_bytes, volume.pace_per_mille()), volume.pace_cap());
+        volume.pace_spilled.fetch_add(spilled, Ordering::Relaxed);
         volume.dead_counted.fetch_add(dead_bytes, Ordering::Relaxed);
         for count in counts.counts.iter().filter(|count| count.rows > 0) {
             volume.table.drop_live(count.segment, count.block, count.rows, count.replacement);

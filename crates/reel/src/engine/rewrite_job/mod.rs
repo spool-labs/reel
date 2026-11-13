@@ -27,6 +27,7 @@ use crate::io::{Io, IoFile};
 use crate::fixed_list::{FixedList, ListFull};
 use crate::region::{LIST_ALIGN_ROOM, REGION_HEAD_BYTES, Region, list_bytes};
 use crate::engine::held_bits::HeldBits;
+use crate::engine::load_state::can_start;
 use crate::engine::admission::{Admit, JobRole, PICK_HALVINGS};
 use crate::engine::dead_bits::BitsExtent;
 use crate::segment::key_cursor::KeyCursor;
@@ -58,8 +59,8 @@ pub const PLAIN_BAR: u64 = 50;
 /// most a third of a byte for each byte freed, so a record freed early still comes back
 pub const EARLY_BAR: u64 = 75;
 /// A quiet volume with dead bytes rewrites a segment once this share is dead, highest share first, so a rewrite copies at most
-/// about two and a third bytes for each byte freed
-pub const QUIET_BAR: u64 = 30;
+/// three bytes for each byte freed
+pub const QUIET_BAR: u64 = 25;
 /// A quiet volume short of disk room rewrites any segment that wins a byte back
 pub const ROOM_SHORT_BAR: u64 = 0;
 /// Bytes of one job's merge buffer, which carries records and then row blocks. With a row block for each input, a job's
@@ -739,8 +740,13 @@ impl<Backend: Io> RewriteJob<Backend> {
     /// Pick, and halve the inputs while the need is past what admission gives, up to a few times before the lane waits
     pub fn pick_admitted(&mut self, volume: &Volume<Backend>) -> Option<(MergeTarget, bool)> {
         let mut most = MOST_MERGE_SEGMENTS;
+        // a pick the pace turns away counts once, when it gives up, whatever halvings it tried
+        let mut is_pace_refused = false;
         for _halving in 0..=PICK_HALVINGS {
-            let picked = self.pick_within(volume, most)?;
+            let Some(picked) = self.pick_within(volume, most) else {
+                self.note_pace_refusal(volume, is_pace_refused);
+                return None;
+            };
             let Some(output) = self.disk_room_for(volume, picked.0.length) else {
                 self.unpick(volume);
                 volume.is_room_refused.store(true, Ordering::Release);
@@ -755,11 +761,11 @@ impl<Backend: Io> RewriteJob<Backend> {
             };
             // a paced pick waits for the walk to count the dead bytes that pay for it, and a smaller one may fit the credit
             let is_paced = self.is_paced && self.picked_as == Some(PickOutcome::Record);
-            if is_paced && volume.pace.credit() < output.0 as i64 {
+            if is_paced && !can_start(volume.pace.credit(), output.0, volume.pace_cap()) {
                 self.unpick(volume);
-                volume.pace_refusals.fetch_add(1, Ordering::Relaxed);
-                volume.note_pick(PickOutcome::Deferred);
+                is_pace_refused = true;
                 if self.input_count < 2 {
+                    self.note_pace_refusal(volume, is_pace_refused);
                     return None;
                 }
                 most = self.input_count / 2;
@@ -786,7 +792,9 @@ impl<Backend: Io> RewriteJob<Backend> {
                 volume.most_in_flight.fetch_max(in_flight, Ordering::Relaxed);
                 volume.is_room_refused.store(false, Ordering::Release);
                 self.forced_pick = None;
-                if is_paced && volume.pace.spend(output.0) {
+                // the charge goes in whole whatever the credit reads now, since a seat's install may have settled a debt since the check
+                if is_paced {
+                    volume.pace.charge(output.0);
                     self.paced_spent = output.0;
                 }
                 return Some(picked);
@@ -797,14 +805,23 @@ impl<Backend: Io> RewriteJob<Backend> {
             }
             most = self.input_count / 2;
         }
+        self.note_pace_refusal(volume, is_pace_refused);
         None
+    }
+
+    /// Count a pick the pace turned away, once, as put off: the walk landing the dead bytes that pay for it ends the wait
+    pub fn note_pace_refusal(&self, volume: &Volume<Backend>, is_refused: bool) {
+        if is_refused {
+            volume.pace_refusals.fetch_add(1, Ordering::Relaxed);
+            volume.note_pick(PickOutcome::Deferred);
+        }
     }
 
     /// Settle what the rewrite spent of the pace's credit against what it wrote, once it ends
     pub fn settle_pace(&mut self, volume: &Volume<Backend>, written: u64) {
         let spent = mem::take(&mut self.paced_spent);
         if spent > 0 {
-            volume.pace.settle(spent, written, volume.segment_bytes.0);
+            volume.pace.settle(spent, written, volume.pace_cap());
             volume.paced_written.fetch_add(written, Ordering::Relaxed);
         }
     }

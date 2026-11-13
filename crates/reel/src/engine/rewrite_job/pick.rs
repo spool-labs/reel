@@ -1,5 +1,6 @@
 //! Picking a rewrite's inputs: the overlap runs, the ready segments, and the bars a segment's dead share is held to
 
+use std::cell::Cell;
 use std::cmp::Reverse;
 use std::iter;
 use std::sync::Arc;
@@ -204,14 +205,9 @@ impl<Backend: Io> RewriteJob<Backend> {
             true => (record_bar(load, owed), PLAIN_BAR),
             false => (record_bar(Load { is_disk_short: false, ..load }, Owed { is_reclaim_due: true, ..owed }), PLAIN_BAR),
         };
+        // a spinning disk keeps the half bar while callers are busy, as it did before the pace, until a run on one measures it
+        let floor = if volume.is_spinning && load.is_busy { half } else { floor };
         let walked_below = walked_below(&rows);
-        let bar_of = |row: &SummaryRow<'_>| match is_count_trusted(volume, row.facts.segment, walked_below) {
-            true => floor,
-            false => {
-                volume.trust_fallbacks.fetch_add(1, Ordering::Relaxed);
-                half.max(floor)
-            },
-        };
         let gave_up = self.gave_up_list(volume);
         let index = self.volume;
         // a wholly dead segment the unlink can take now goes by the unlink, and a rewrite of it would throw one of the two away
@@ -221,10 +217,23 @@ impl<Backend: Io> RewriteJob<Backend> {
             let is_free = row.facts.is_walked() && row.facts.segment.0 != walking && !gave_up.holds(row.facts.segment);
             is_free && !is_for_unlink(row) && is_rewrite_ready(volume, row, 0, bar) && is_rewrite_ready(volume, row, freed_in_place(volume, row), bar)
         };
+        // an untrusted row waits for the half bar, and a pick counts one fallback when such a row would have passed the floor
+        let has_fallen_back = Cell::new(false);
+        let bar_of = |row: &SummaryRow<'_>| match is_count_trusted(volume, row.facts.segment, walked_below) {
+            true => floor,
+            false => {
+                if !has_fallen_back.get() && is_ready_at(row, floor) && !is_ready_at(row, half) {
+                    has_fallen_back.set(true);
+                }
+                half.max(floor)
+            },
+        };
         let is_ready = |row: &SummaryRow<'_>| is_ready_at(row, bar_of(row));
         // the most won back for the bytes read goes first, and a picked row moves to its bucket's end, so a merge that gave way
         // lets the next one up
-        if let Some(first) = first_ready(&rows, floor.min(half), is_ready, is_for_unlink) {
+        let first = first_ready(&rows, floor.min(half), is_ready, is_for_unlink);
+        volume.trust_fallbacks.fetch_add(u64::from(has_fallen_back.get()), Ordering::Relaxed);
+        if let Some(first) = first {
             let is_grave_heavy = is_grave_heavy(&first);
             let (segment, lifetime) = (first.facts.segment, first.facts.marks);
             let is_more = |row: &SummaryRow<'_>| is_ready(row) && row.facts.segment > segment && row.facts.marks.shares_lifetime(lifetime);

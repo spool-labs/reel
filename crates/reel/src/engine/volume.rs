@@ -14,7 +14,7 @@ use crate::engine::open_segment::OpenSegment;
 use crate::engine::ration::Ration;
 use crate::engine::held_bits::HeldBits;
 use crate::engine::walk_job::WalkSlot;
-use crate::engine::load_state::{LoadCell, PaceCell};
+use crate::engine::load_state::{LoadCell, PaceCell, pace_cap};
 use crate::engine::row_job::IDLE_SEAL_AFTER;
 use crate::guard::hold;
 use crate::index::open_slots::{OpenSlot, OpenSlots};
@@ -398,6 +398,8 @@ pub struct Volume<Backend: Io> {
     pub dead_counted: AtomicU64,
     /// Bytes paced rewrites wrote, which their credit paid for
     pub paced_written: AtomicU64,
+    /// Credit the cap turned away, earned while the bank was full
+    pub pace_spilled: AtomicU64,
     /// One bit for each row the walk charged, for segments born since open
     pub dead_bits: DeadBits,
     /// Nanoseconds from the last sealed segment's first row to its seal start, the time the writes took to fill it, or 0 before a
@@ -676,6 +678,11 @@ impl<Backend: Io> Volume<Backend> {
     pub fn bits_save_bytes(&self) -> u64 {
         let save = hold(&self.bits_save);
         (save.heads.capacity() * size_of::<SavedHead>() + save.chunk.capacity()) as u64
+    }
+
+    /// Read the most credit the pace holds: one walk of a segment of dead bytes, and the pick in hand
+    pub fn pace_cap(&self) -> u64 {
+        pace_cap(self.segment_bytes.0, self.pace_per_mille())
     }
 
     /// Read the pace's multiplier, copy bytes for each thousand dead bytes

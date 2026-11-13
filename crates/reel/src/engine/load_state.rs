@@ -90,13 +90,25 @@ pub const fn is_reclaim_wanted(load: Load, owed: Owed) -> bool {
     owed.is_reclaim_due && !owed.is_reclaim_held && (!load.is_busy || load.is_disk_short)
 }
 
-/// The pace's built-in multiplier, copy bytes for each thousand dead bytes the walk counts, until the user sets it from the
-/// measured table. At a floor of d a rewrite copies (1 - d) / d bytes for each dead byte it frees, so 2,333 holds a 30% floor
-pub const PACE_PER_MILLE: u64 = 2_333;
+/// The pace's multiplier, copy bytes for each thousand dead bytes the walk counts: the cost at the floor. At a floor of d a rewrite
+/// copies (1 - d) / d bytes for each dead byte it frees, so 3,000 keeps up with a 25% floor
+pub const PACE_PER_MILLE: u64 = 3_000;
 
 /// Read the copy bytes a walk's dead bytes allow paced rewrites
 pub const fn pace_credit(dead_bytes: u64, per_mille: u64) -> u64 {
     dead_bytes.saturating_mul(per_mille) / 1_000
+}
+
+/// Read the most credit a volume holds: what one walk of a segment of dead bytes earns, and the pick in hand, so a walk pays in
+/// full for the picks its dead bytes allow
+pub const fn pace_cap(segment_bytes: u64, per_mille: u64) -> u64 {
+    pace_credit(segment_bytes, per_mille).saturating_add(segment_bytes)
+}
+
+/// Check the credit lets a paced pick start: it covers the estimate, or holds the cap for a pick larger than the cap
+pub const fn can_start(credit: i64, estimate: u64, cap: u64) -> bool {
+    let needed = if estimate < cap { estimate } else { cap };
+    credit >= needed as i64
 }
 
 /// Check a record pick spends the pace's credit: while callers are busy and the disk has room, unless every input is past half
@@ -117,16 +129,18 @@ impl PaceCell {
         self.credit.load(Ordering::Acquire)
     }
 
-    /// Add a landing's credit, up to one pick's worth, so quiet time banks no burst
-    pub fn add(&self, credit: u64, cap: u64) {
+    /// Add a landing's credit up to the cap, and return what the cap turned away
+    pub fn add(&self, credit: u64, cap: u64) -> u64 {
         let cap = cap as i64;
-        let _moved = self.credit.fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| Some(held.saturating_add(credit as i64).min(cap)));
+        let held = self.credit.fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| Some(held.saturating_add(credit as i64).min(cap)));
+        let held = held.unwrap_or_else(|held| held);
+        (held.saturating_add(credit as i64) - cap).max(0) as u64
     }
 
-    /// Spend a pick's estimate if the credit covers it, and say whether it did. Picks run on the planner's thread alone
-    pub fn spend(&self, estimate: u64) -> bool {
-        let estimate = estimate as i64;
-        self.credit.fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| (held >= estimate).then_some(held - estimate)).is_ok()
+    /// Charge a paced rewrite its whole estimate when it starts, past zero if it must, so a pick larger than the cap still
+    /// starts once the credit is full and the long-run rate holds
+    pub fn charge(&self, estimate: u64) {
+        self.credit.fetch_sub(estimate as i64, Ordering::AcqRel);
     }
 
     /// Settle a paced rewrite at its end: what it spent comes back, less what it wrote, so a wrong estimate costs no drift
@@ -327,28 +341,51 @@ mod tests {
 
     #[test]
     fn pace_holds_the_floor() {
-        // a rewrite at a 30% floor copies seven bytes for each three it frees, which 2,333 a thousand pays for
-        let freed = 3_000_000;
-        assert!(pace_credit(freed, PACE_PER_MILLE) >= 7_000_000 - 1_000);
+        // a rewrite at a 25% floor copies three bytes for each one it frees, which 3,000 a thousand pays for
+        let freed = 1_000_000;
+        assert_eq!(pace_credit(freed, PACE_PER_MILLE), 3_000_000);
         assert_eq!(pace_credit(freed, 0), 0);
         assert_eq!(pace_credit(u64::MAX, PACE_PER_MILLE), u64::MAX / 1_000);
     }
 
     #[test]
-    fn pace_cell_spends_settles_and_caps() {
+    fn pace_cell_charges_settles_and_caps() {
         let cell = PaceCell::default();
         let cap = 100;
-        assert!(!cell.spend(1), "an empty credit paid for a pick");
-        cell.add(250, cap);
-        assert_eq!(cell.credit(), 100, "the credit passed one pick's worth");
-        assert!(cell.spend(60));
-        assert!(!cell.spend(60), "a pick spent past the credit");
+        assert!(!can_start(cell.credit(), 1, cap), "an empty credit paid for a pick");
+        assert_eq!(cell.add(250, cap), 150, "the cap turned away other than the excess");
+        assert_eq!(cell.credit(), 100);
+        assert!(can_start(cell.credit(), 60, cap));
+        cell.charge(60);
+        assert!(!can_start(cell.credit(), 60, cap), "a pick started past the credit");
         // a rewrite that wrote four times its estimate pays the difference
         cell.settle(60, 240, cap);
         assert_eq!(cell.credit(), 40 + 60 - 240);
-        assert!(!cell.spend(1), "a credit in debt paid for a pick");
-        cell.add(1_000, cap);
+        assert!(!can_start(cell.credit(), 1, cap), "a credit in debt paid for a pick");
+        assert_eq!(cell.add(1_000, cap), 1_000 - 100 - 140);
         assert_eq!(cell.credit(), cap as i64);
+    }
+
+    #[test]
+    fn full_bank_starts_a_pick_past_the_cap() {
+        let cell = PaceCell::default();
+        let cap = 100;
+        cell.add(cap, cap);
+        assert!(can_start(cell.credit(), 150, cap), "a pick past the cap never starts");
+        cell.charge(150);
+        assert_eq!(cell.credit(), -50, "the charge left other than half a cap of debt");
+    }
+
+    #[test]
+    fn charge_after_a_settle_still_counts() {
+        // a seat settles a debt between the planner's check and its charge, and the charge still goes in whole
+        let cell = PaceCell::default();
+        let cap = 100;
+        cell.add(80, cap);
+        assert!(can_start(cell.credit(), 70, cap));
+        cell.settle(0, 60, cap);
+        cell.charge(70);
+        assert_eq!(cell.credit(), 80 - 60 - 70);
     }
 
     #[test]

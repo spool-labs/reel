@@ -28,7 +28,7 @@ use crate::segment::summary::{SummaryRow, SummaryRows};
 use crate::segment::summary_orders::{COVERS_LIST, ROW_FOOTER_BYTES, SHARE_BUCKETS, SHARE_SCALE, WalkList, is_wholly_dead, reclaim_share, share_bucket};
 
 use crate::engine::compact_job::can_unlink;
-use crate::engine::load_state::{Load, OverlapLanes, Owed, is_capped, is_deferring, is_paced, overlap_lanes, record_bar};
+use crate::engine::load_state::{Load, OverlapLanes, Owed, is_capped, is_deferring, is_over_target, is_paced, overlap_lanes, record_bar};
 use crate::engine::rewrite_job::{BAR_SCALE, BUCKET_LOOKS, MOST_PASSED_LOOKS, BarsFired, CROWD_PAGES, MOST_COUNTED_CROWD, MOST_LOOK_TIME, OVERLAP_BASE_RECORD_BYTES, EARLY_BAR, GATHER_LOOKS, MOST_OVERLAP, MergeInput, MergeTarget, OVERLAP_LOOKS, OVERLAP_PROBES, PLAIN_BAR, PLANNER_LANE, RewriteJob, RewritePhase, rows_of};
 use crate::engine::rewrite_job::install::freed_in_place;
 
@@ -207,8 +207,17 @@ impl<Backend: Io> RewriteJob<Backend> {
             true => (record_bar(load, owed), PLAIN_BAR),
             false => (record_bar(Load { is_disk_short: false, ..load }, Owed { is_reclaim_due: true, ..owed }), PLAIN_BAR),
         };
-        // a spinning disk keeps the half bar while callers are busy, as it did before the pace, until a run on one measures it
-        let floor = if volume.is_spinning && load.is_busy { half } else { floor };
+        // busy callers' rewrites under half dead run only while the volume holds more dead bytes than its space target allows, past
+        // what the rewrites in flight free. A spinning disk keeps them for quiet time until a run on one measures it, and a short
+        // disk keeps the band open. A shut band holds the pick to half, so a segment past half still goes, alone of band rows
+        let orders = rows.orders();
+        let in_flight = volume.gate_in_flight.load(Ordering::Acquire);
+        let target = volume.space_target_per_mille.load(Ordering::Relaxed);
+        let is_over = is_over_target(orders.gate_dead_bytes(), in_flight, orders.live_bytes(), target);
+        let is_band_shut = load.is_busy && !load.is_disk_short && (volume.is_spinning || !is_over);
+        let is_target_shut = is_band_shut && !volume.is_spinning;
+        let band_floor = floor;
+        let floor = if is_band_shut { half.max(floor) } else { floor };
         let walked_below = self.walked_below;
         let gave_up = self.gave_up_list(volume);
         let index = self.volume;
@@ -235,6 +244,10 @@ impl<Backend: Io> RewriteJob<Backend> {
         // lets the next one up
         let first = first_ready(&rows, floor.min(half), is_ready, is_for_unlink);
         volume.trust_fallbacks.fetch_add(u64::from(has_fallen_back.get()), Ordering::Relaxed);
+        // a band the target shut counts one refusal a pick while a band bucket holds a row, without looking at the rows themselves
+        let band = share_bucket(SHARE_SCALE * band_floor / BAR_SCALE)..share_bucket(SHARE_SCALE * half / BAR_SCALE);
+        let has_band_rows = || band.clone().any(|bucket| rows.orders().share_list(bucket).next().is_some());
+        volume.gate_refusals.fetch_add(u64::from(is_target_shut && has_band_rows()), Ordering::Relaxed);
         if let Some(first) = first {
             let is_grave_heavy = is_grave_heavy(&first);
             let (segment, lifetime) = (first.facts.segment, first.facts.marks);
@@ -872,12 +885,13 @@ pub fn output_estimate(row: &SummaryRow<'_>) -> u64 {
 
 impl<Backend: Io> RewriteJob<Backend> {
     /// Find the output a pick would write, when every root has room for it. A merge that gives back more than it writes may use
-    /// the writers' reserve, or a full disk could never free itself
-    pub fn disk_room_for(&self, volume: &Volume<Backend>, length: ByteCount) -> Option<ByteCount> {
+    /// the writers' reserve, or a full disk could never free itself. It notes the inputs' dead bytes, which admission counts in flight
+    pub fn disk_room_for(&mut self, volume: &Volume<Backend>, length: ByteCount) -> Option<ByteCount> {
         let summary = hold(&volume.summary);
         // every segment below this place has finished its walk, so a replacement under it is one the merge's ask can find
         let walked_below = self.walked_below;
         let (mut inputs, mut output, mut lowest) = (0, 0, WritePlace(u64::MAX));
+        self.pending_dead = 0;
         for row in self.numbers[..self.input_count].iter().filter_map(|number| summary.get(*number)) {
             inputs += row.facts.file_length.0;
             output += match is_count_trusted(volume, row.facts.segment, walked_below) {
@@ -885,6 +899,7 @@ impl<Backend: Io> RewriteJob<Backend> {
                 false => row.facts.file_length.0,
             };
             lowest = lowest.min(row.facts.places.lowest);
+            self.pending_dead += summary.orders().gate_dead_of(row.facts.segment);
         }
         drop(summary);
         // a live cue at or above an input row keeps the dead ones it can read, so the merge may write all it reads
@@ -930,7 +945,7 @@ pub fn is_count_trusted<Backend: Io>(volume: &Volume<Backend>, segment: SegmentN
         0 => volume.open_place < unwalked,
         _ => place < unwalked,
     });
-    is_charged || (!volume.are_bits_held_off() && volume.damage.is_empty() && volume.dead_bits.exact(segment).is_some())
+    is_charged || (volume.are_bits_answering() && volume.dead_bits.exact(segment).is_some())
 }
 
 /// Add up a segment's record bytes and rows over every column, since a merge copies the whole segment

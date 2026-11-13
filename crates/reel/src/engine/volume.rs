@@ -560,6 +560,12 @@ impl<Backend: Io> Volume<Backend> {
         false
     }
 
+    /// Check the dead bits may answer for a segment's rows: not held off, and no damage, since a bit can't say whether the row that
+    /// set it was among what was lost. A merge asks every row when they can't, and a pick trusts no count by them
+    pub fn are_bits_answering(&self) -> bool {
+        !self.are_bits_held_off() && self.damage.is_empty() && hold(&self.damaged).is_empty()
+    }
+
     /// Check a test has merges ask every row
     #[cfg(feature = "test-hooks")]
     pub fn are_bits_held_off(&self) -> bool {

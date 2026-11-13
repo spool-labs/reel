@@ -374,12 +374,12 @@ impl<Backend: Io> RewriteJob<Backend> {
     /// segment, and an install retires inputs only once the summary that lists its outputs is synced, so a crash leaves the
     /// replacement in one or the other. A parked file can come back holding a row a grave hid, so graves still wait
     pub fn bit_answer(&mut self, volume: &Volume<Backend>, column: ColumnId, row: &FooterRow) -> Result<Option<Option<WritePlace>>> {
-        if self.is_unwalked || !self.row_walked || volume.are_bits_held_off() {
+        if self.is_unwalked || !self.row_walked || !volume.are_bits_answering() {
             return Ok(None);
         }
         let state = Arc::clone(&self.state);
         let is_settled = !volume.is_parking() && volume.stray_outputs.load(Ordering::Acquire) == 0;
-        let is_clean = (is_settled || row.kind == RowKind::Value) && volume.damage.is_empty() && hold(&volume.damaged).is_empty();
+        let is_clean = is_settled || row.kind == RowKind::Value;
         if !is_clean || state.cues.has_cue_between(self.volume, row.place, WritePlace(u64::MAX)) {
             return Ok(None);
         }

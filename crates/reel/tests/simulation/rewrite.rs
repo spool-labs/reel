@@ -4699,13 +4699,19 @@ const MET_TARGET: u64 = 1_000;
 #[test]
 fn gate_holds_dead_bytes_at_the_target() {
     let pace = reel::engine::load_state::PACE_PER_MILLE;
+    // a higher target leaves more for the gate to hold back, so the copy falls as it rises, from a target of none upward
+    let mut copied = steady_at(151, pace, false, 0).paced_written;
     for target in TARGETS {
         let steady = steady_at(151, pace, false, target);
         let share = 1_000 * steady.gate_dead / steady.gate_live.max(1);
         println!("target {target}: dead over live {share} a thousand, {} paced copy, {} gate refusals", steady.paced_written, steady.gate_refusals);
         assert!(steady.paced_written > 0, "the backlog over target {target} never drained");
+        assert!(steady.paced_written < copied, "target {target} copied {} against {copied} for a lower one", steady.paced_written);
+        copied = steady.paced_written;
+        // the gate stops near the target, neither past it nor far short, within two segments' dead bytes either way
         let slack = 1_000 * steady.segment_bytes / steady.gate_live.max(1);
         assert!(share <= target + slack, "dead over live {share} sat past target {target} and a segment's {slack}");
+        assert!(share + 2 * slack >= target, "dead over live {share} fell far short of target {target}");
     }
 }
 
@@ -4751,5 +4757,107 @@ fn freed_values_leave_the_gate_shut() {
     }
     assert!(volume.bytes_freed.load(Ordering::Acquire) > 0, "the walk freed nothing in place");
     assert_eq!(volume.paced_written.load(Ordering::Acquire), 0, "a band rewrite copied what the walk had freed");
+    store.close().expect("close");
+}
+
+// a store under its target keeps the band shut as a bar: a segment past half that could gather a band neighbour goes alone,
+// with one gate refusal counted, where an admission gate would have turned the whole pick away
+#[test]
+fn shut_band_lets_a_past_half_segment_go_alone() {
+    let io = SimulatedIo::new(Seed(155));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    store.set_space_target_per_mille(MET_TARGET);
+    let volume = &store.state.volumes[0];
+    let past_half = segment_dead_by(&store, &io, "past", 60);
+    segment_dead_by(&store, &io, "band", 35);
+    let cap = volume.pace_cap();
+    volume.pace.add(cap, cap);
+    volume.is_over_bound.store(false, Ordering::Release);
+    store.put(COLUMN, b"a-call", b"value").expect("put");
+    let before = volume.gate_refusals.load(Ordering::Acquire);
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(start_merge(&mut job), "the shut band held back a segment past half");
+    assert_eq!(job.rewrite.input_numbers(), [past_half], "the pick gathered a band row past the shut band");
+    assert!(volume.gate_refusals.load(Ordering::Acquire) > before, "the shut band counted no refusal");
+    shape::abandon_rewrites(&mut job);
+    store.close().expect("close");
+}
+
+// a spinning disk short of room frees what it can while callers are busy, as it did before the pace
+#[test]
+fn short_spinning_disk_frees_under_busy_callers() {
+    let io = SimulatedIo::new(Seed(156));
+    let root = PathBuf::from(ROOT);
+    io.add_disk(&root, ByteCount(1 << 40));
+    let mut config = config();
+    config.volumes[0].device = reel::config::DeviceClass::Spinning;
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    hold_compaction(&store, true);
+    let volume = &store.state.volumes[0];
+    large_segment_dead_by(&store, &io, "short", 10);
+    let used = (1 << 40) - io.free_space(&root).expect("free").0;
+    io.add_disk(&root, ByteCount(used + volume.reserve.0 + volume.segment_bytes.0 - 1));
+    io.advance_clock(reel::engine::load_state::DISK_CHECK_PERIOD);
+    volume.is_over_bound.store(false, Ordering::Release);
+    // a read keeps callers busy, since the short disk refuses a put
+    assert!(read(&store, b"short-000").is_some());
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(start_merge(&mut job), "a short spinning disk kept its dead bytes while callers were busy");
+    shape::abandon_rewrites(&mut job);
+    store.close().expect("close");
+}
+
+// what the walk freed in place before a stop stays counted as freed after the reopen, so the gate stays shut
+#[test]
+fn freed_bytes_survive_a_reopen() {
+    let io = SimulatedIo::new(Seed(157));
+    let store = open(&io);
+    let value = vec![6; FREED_VALUE_BYTES];
+    for _round in 0..PACE_KEYS / 4 {
+        for number in 0..8 {
+            store.put(COLUMN, format!("large-{number:02}").as_bytes(), &value).expect("put");
+        }
+        store.seal_now();
+        settle(&io);
+    }
+    assert!(store.state.volumes[0].bytes_freed.load(Ordering::Acquire) > 0, "the walk freed nothing in place");
+    store.close().expect("close");
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    let (gate_dead, live) = {
+        let rows = hold(&volume.summary);
+        (rows.orders().gate_dead_bytes(), rows.orders().live_bytes())
+    };
+    assert!(gate_dead <= live / 10, "the reopen counted {gate_dead} freed bytes as dead against {live} live");
+    store.state.ask_compaction();
+    settle(&io);
+    assert_eq!(volume.paced_written.load(Ordering::Acquire), 0, "a band rewrite copied what the walk had freed");
+    store.close().expect("close");
+}
+
+// a volume with damage has bits that answer for no row, so a charged segment its walk hasn't finished stays untrusted
+#[test]
+fn damage_leaves_a_charged_segment_untrusted() {
+    let io = SimulatedIo::new(Seed(158));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let volume = &store.state.volumes[0];
+    let band = large_segment_dead_by(&store, &io, "damaged", 40);
+    assert!(volume.dead_bits.exact(band).is_some(), "the walk left the band segment's bits inexact");
+    hold_walk(&store, true);
+    store.put(COLUMN, b"in-flight", b"value").expect("put");
+    let in_flight = seal(&store, &io);
+    volume.table.drop_live(band, 0, 0, WritePlace(u64::MAX / 2));
+    store.state.damage_unread(0, in_flight);
+    assert!(!volume.are_bits_answering(), "the volume's bits answer with damage on it");
+    let cap = volume.pace_cap();
+    volume.pace.add(cap, cap);
+    volume.is_over_bound.store(false, Ordering::Release);
+    store.put(COLUMN, b"a-call", b"value").expect("put");
+    let fallbacks = volume.trust_fallbacks.load(Ordering::Acquire);
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(!job.rewrite.start(), "a rewrite took a charged segment at the floor on bits that answer for nothing");
+    assert_eq!(volume.trust_fallbacks.load(Ordering::Acquire) - fallbacks, 1);
     store.close().expect("close");
 }

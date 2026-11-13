@@ -56,6 +56,7 @@ use crate::engine::planner::Planner;
 use crate::engine::walk_job::{BlockCounter, WalkJob, WalkSlot, WalkWorker};
 use crate::engine::workers::Workers;
 use crate::engine::load_state::{LoadCell, PACE_PER_MILLE, PaceCell, SPACE_TARGET_PER_MILLE};
+use crate::segment::summary_orders::row_dead_bytes;
 use crate::engine::volume::{SealStepTimes, ClaimState, GaveUp, LookPass, MOST_MERGE_OUTPUTS, MOST_PARKED, NO_SEAL, RewriteLane, SyncState, Volume, BitsSave};
 #[cfg(feature = "test-hooks")]
 use crate::engine::volume::TestHolds;
@@ -66,7 +67,7 @@ use crate::index::complete_table::CompleteTable;
 use crate::index::spot_index::SpotIndex;
 use crate::index::write_index::WriteIndex;
 use crate::io::lock_outcome::LockOutcome;
-use crate::io::{Io, IoTask};
+use crate::io::{Io, IoFile, IoTask};
 use crate::pool::{Pool, touched_buffer, touched_capacity, touched_filled, touched_room, touched_zeroes};
 use crate::record::codec::Codec;
 use crate::record::record_check::RecordKey;
@@ -661,7 +662,29 @@ pub fn bring_up<Backend: Io>(
         state.mark_full_segments(&mut claims, volume);
     }
 
+    // what the walk freed in place before the stop stays off the disk, so the space target counts it gone from the open on
+    for volume in &state.volumes {
+        seed_freed(volume);
+    }
+
     start_jobs(state)
+}
+
+/// Note each segment's bytes freed in place at open: what its file no longer holds, up to its dead bytes, since the counts in
+/// memory start at none
+pub fn seed_freed<Backend: Io>(volume: &Volume<Backend>) {
+    let mut rows = hold(&volume.summary);
+    let numbers: Vec<(SegmentNumber, u64, u64)> = rows
+        .rows()
+        .map(|row| (row.facts.segment, row_dead_bytes(&row), row.facts.file_length.0))
+        .filter(|(_segment, dead, _length)| *dead > 0)
+        .collect();
+    for (segment, dead, length) in numbers.iter().copied() {
+        let held = volume.table.pin(segment).and_then(|pin| pin.file.held_bytes().ok());
+        if let Some(held) = held {
+            rows.note_freed(segment, dead.min(length.saturating_sub(held.0)));
+        }
+    }
 }
 
 /// Start the row job, the walk workers, the planner, the reserve job, the readers and the ring's reaper

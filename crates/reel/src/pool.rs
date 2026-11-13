@@ -117,6 +117,7 @@ impl<Item> Pool<Item> {
             drop(hold(&slot.item));
         }
         drop(hold(&pool.line));
+        pool.freed.notify_all();
         pool
     }
 

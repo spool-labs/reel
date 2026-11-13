@@ -8,7 +8,7 @@ use std::time::Duration;
 use crate::guard::hold;
 
 /// The line
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct WakeLine {
     count: AtomicU64,
     sleepers: AtomicU32,
@@ -17,6 +17,15 @@ pub struct WakeLine {
 }
 
 impl WakeLine {
+    /// Build a line with its lock and its condition set up, since on some targets the standard library builds them at their
+    /// first use, and a first wait under load would allocate where the store promises none
+    pub fn new() -> Self {
+        let line = Self { count: AtomicU64::new(0), sleepers: AtomicU32::new(0), lock: Mutex::new(()), moved: Condvar::new() };
+        drop(hold(&line.lock));
+        line.moved.notify_all();
+        line
+    }
+
     /// Read the count, before a waiter checks what it waits for
     pub fn seen(&self) -> u64 {
         self.count.load(Ordering::Acquire)
@@ -40,5 +49,11 @@ impl WakeLine {
             let _woke = self.moved.wait_timeout(guard, most);
         }
         self.sleepers.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl Default for WakeLine {
+    fn default() -> Self {
+        Self::new()
     }
 }

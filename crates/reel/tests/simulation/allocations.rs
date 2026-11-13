@@ -1,6 +1,7 @@
 //! The zero-allocation gate on the simulated disk: every call of a warm store allocates and frees nothing
 
 use std::hint::black_box;
+use std::time::Duration;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
@@ -9,6 +10,7 @@ use reel::engine::open_segment::SegmentPhase;
 use reel::engine::reel_store::ReelStore;
 use reel::guard::hold;
 use reel::io::job::{Job, JobStep};
+use reel::io::wake_line::WakeLine;
 use reel::io::{Io, IoFile};
 use reel::record::codec::Codec;
 use reel::segment::range_covers::MOST_RANGE_COVERS;
@@ -296,4 +298,16 @@ fn first_reservation() {
     assert!(is_held);
     assert_eq!((allocations, frees), (0, 0));
     store.close().expect("close");
+}
+
+// a writer's first wait and wake on the progress line allocate nothing: on a target whose standard library builds a lock and a
+// condition at their first use, the line builds them at open
+#[test]
+fn first_wait_on_the_progress_line() {
+    let line = WakeLine::new();
+    let ((), allocations, frees) = counted(|| {
+        line.wait(line.seen(), Duration::ZERO);
+        line.wake();
+    });
+    assert_eq!((allocations, frees), (0, 0));
 }

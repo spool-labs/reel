@@ -1148,7 +1148,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
     let mut volumes = Vec::with_capacity(config.volumes.len());
     let all_row_room = config.volumes.len() * MOST_ROW_FIXED_BYTES + config.columns.len() * MOST_ROW_COLUMN_BYTES;
     let mut summaries = summaries.into_iter();
-    let progress = Arc::new(WakeLine::default());
+    let progress = Arc::new(WakeLine::new());
     let context = VolumeContext { io: &io, config, sizing, disks, scan, places: &places, planned: &planned, open_slots, all_row_room, progress: &progress };
     for (index, held) in locks.iter_mut().map(mem::take).enumerate() {
         let Some(summary) = summaries.next() else {

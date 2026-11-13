@@ -111,7 +111,7 @@ impl WriteOrder {
     /// Start an order with nothing in flight, on the store's count
     pub fn new(places: Arc<PlaceCount>) -> Self {
         let mark = places.last_given();
-        Self {
+        let order = Self {
             places,
             ring: Mutex::new(TicketRing {
                 is_in_flight: vec![false; MOST_IN_FLIGHT],
@@ -123,7 +123,11 @@ impl WriteOrder {
             mark: AtomicU64::new(mark.0),
             moved: Condvar::new(),
             wakes: AtomicU64::new(0),
-        }
+        };
+        // some platforms set a lock and a condition up at their first use, and that is a job for open
+        drop(hold(&order.ring));
+        order.moved.notify_all();
+        order
     }
 
     /// Count the wake-ups so far, each a system call

@@ -356,6 +356,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.target = None;
         volume.lanes[self.lane].output_floor.store(NO_SEAL, Ordering::Release);
         volume.lanes[self.lane].is_rewriting.store(false, Ordering::Release);
+        volume.lanes[self.lane].is_overlap.store(false, Ordering::Release);
         self.release_promise(volume);
         *hold(&volume.lanes[self.lane].merging) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
         *hold(&volume.lanes[self.lane].inputs) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
@@ -587,6 +588,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.drain_to_inputs(volume);
         self.release_hold(volume);
         volume.lanes[self.lane].is_rewriting.store(false, Ordering::Release);
+        volume.lanes[self.lane].is_overlap.store(false, Ordering::Release);
         self.release_promise(volume);
         *hold(&volume.lanes[self.lane].merging) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
         *hold(&volume.lanes[self.lane].inputs) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];

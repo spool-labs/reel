@@ -51,6 +51,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         // an output takes its disk before its inputs give theirs back, so a merge starts only with room beside the writers'
         self.clear(target);
         volume.lanes[self.lane].is_rewriting.store(!self.is_unwalked, Ordering::Release);
+        volume.lanes[self.lane].is_overlap.store(self.picked_as == Some(PickOutcome::Overlap), Ordering::Release);
         let mut inputs = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
         inputs[..self.input_count].copy_from_slice(&self.numbers[..self.input_count]);
         *hold(&volume.lanes[self.lane].inputs) = inputs;
@@ -193,8 +194,10 @@ impl<Backend: Io> RewriteJob<Backend> {
             volume.note_pick(PickOutcome::Deferred);
             return None;
         }
-        // a volume merges back to the bound before it reclaims, so record rewrites wait while an overlap merge runs or can start
-        if volume.is_over_bound.load(Ordering::Acquire) && !load.is_disk_short {
+        // a volume merges back to the bound before it reclaims, so record rewrites wait while an overlap merge runs or can start.
+        // Hot ingest starts none, and a seal raises the bound again before any look can clear it, so the wait would last the ingest
+        let can_overlap = !matches!(overlap_lanes(load), OverlapLanes::None) || volume.is_overlap_running();
+        if volume.is_over_bound.load(Ordering::Acquire) && !load.is_disk_short && can_overlap {
             volume.note_pick(PickOutcome::Behind);
             return None;
         }

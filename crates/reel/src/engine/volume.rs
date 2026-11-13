@@ -139,6 +139,8 @@ pub const HOT_PERIODS: u64 = 2;
 #[derive(Debug)]
 pub struct RewriteLane<File> {
     pub is_rewriting: AtomicBool,
+    /// Whether the rewrite running here is an overlap merge, walked or unwalked
+    pub is_overlap: AtomicBool,
     /// The lowest segment this rewrite is writing, or `NO_SEAL`
     pub output_floor: AtomicU64,
     /// The inputs of a merge running beside the walk, which the walk leaves alone
@@ -161,6 +163,7 @@ impl<File> RewriteLane<File> {
     pub fn new() -> Self {
         let lane = Self {
             is_rewriting: AtomicBool::new(false),
+            is_overlap: AtomicBool::new(false),
             output_floor: AtomicU64::new(NO_SEAL),
             merging: Mutex::new([SegmentNumber(0); MOST_MERGE_SEGMENTS]),
             inputs: Mutex::new([SegmentNumber(0); MOST_MERGE_SEGMENTS]),
@@ -686,6 +689,11 @@ impl<Backend: Io> Volume<Backend> {
     /// Read the cap a volume starts with: a quarter of its workers, at least one
     pub fn default_merge_cap(&self) -> usize {
         (self.lanes.len().saturating_sub(1) / MERGE_CAP_WORKERS).max(1)
+    }
+
+    /// Check an overlap merge runs on any lane
+    pub fn is_overlap_running(&self) -> bool {
+        self.lanes.iter().any(|lane| lane.is_overlap.load(Ordering::Acquire))
     }
 
     /// Read the most walk slots that count blocks at once while callers are busy: a quarter of them, at least one

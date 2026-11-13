@@ -4996,3 +4996,49 @@ fn record_picks_go_on_under_churn() {
     assert!(records() > half_way, "record rewrites stopped in the second half of the run");
     store.close().expect("close");
 }
+
+// fills of quiet past the last seal, well past the two that end the hot window
+const QUIET_FILLS: u64 = 100;
+
+// hot ingest starts no overlap merge, and each seal puts overlap past the bound again before a look can clear it, so record
+// rewrites that waited for the bound would wait out the whole ingest. They run under it, and the overlap merges once it stops
+#[test]
+fn records_run_under_hot_ingest_past_the_bound() {
+    let io = SimulatedIo::new(Seed(164));
+    let mut config = config();
+    config.threads.maintenance_workers = Some(1);
+    config.memory_budget = WORKER_BUDGET;
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let volume = &store.state.volumes[0];
+    volume.holds.small_bound.store(true, Ordering::Release);
+    // the last merge took an hour a segment, so every fill outruns it and the volume reads hot
+    volume.merge_interval.store(3_600_000_000_000, Ordering::Relaxed);
+    let mut random = SeededRandom::new(Seed(164));
+    let value = vec![4; PACE_VALUE_BYTES];
+    let picks = |outcome: PickOutcome| volume.picks[outcome.index()].load(Ordering::Acquire);
+    for round in 0..CHURN_ROUNDS {
+        for _key in 0..CHURN_ROUND_KEYS {
+            let number = random.next_word() % CHURN_KEYS;
+            store.put(COLUMN, format!("churn-{number:04}").as_bytes(), &value).expect("put");
+        }
+        io.advance_clock(HOT_FILL);
+        store.state.ask_compaction();
+        store.seal_now();
+        settle(&io);
+        assert!(volume.is_hot(io.clock_reading()), "round {round} read quiet");
+    }
+    let (records, behind, overlaps) = (picks(PickOutcome::Record), picks(PickOutcome::Behind), picks(PickOutcome::Overlap));
+    println!("record picks {records}, behind {behind}, overlap picks {overlaps}");
+    assert!(records > 0, "no record rewrite ran under hot ingest, {behind} picks waited behind the bound");
+    // the last seal left the bound standing, and once the ingest stops an overlap look runs and settles it
+    assert!(volume.is_over_bound.load(Ordering::Acquire), "the last seal left no bound to settle");
+    let looks = || picks(PickOutcome::Overlap) + picks(PickOutcome::OverlapMiss) + picks(PickOutcome::OverlapLone);
+    let looks_hot = looks();
+    io.advance_clock(Nanoseconds(QUIET_FILLS * HOT_FILL.0));
+    assert!(!volume.is_hot(io.clock_reading()), "the volume read hot after the ingest stopped");
+    store.state.ask_compaction();
+    settle(&io);
+    assert!(looks() > looks_hot, "no overlap look ran once the ingest stopped");
+    assert!(!volume.is_over_bound.load(Ordering::Acquire), "overlap stood past the bound once the ingest stopped");
+    store.close().expect("close");
+}

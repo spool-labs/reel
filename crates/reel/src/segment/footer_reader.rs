@@ -523,6 +523,17 @@ impl FooterReader {
         Ok(RowBlockWalk::open(&self.block[..length], place_base).is_some())
     }
 
+    /// Call on every row of the block `hold_block` loaded, with its key, in the reader's own key buffer
+    pub fn visit_loaded(&mut self, entry: &BlockEntry, place_base: WritePlace, mut visit: impl FnMut(&[u8], &FooterRow)) {
+        let length = entry.block_length().0 as usize;
+        let Some(mut walk) = RowBlockWalk::open(&self.block[..length], place_base) else {
+            return;
+        };
+        while let Some(row) = walk.next_row(&mut self.key) {
+            visit(&self.key, &row);
+        }
+    }
+
     /// Find a key's newest row at a read point in the block `hold_block` loaded
     pub fn search_loaded(&mut self, entry: &BlockEntry, place_base: WritePlace, query: &FooterQuery<'_>) -> FooterAnswer {
         let length = entry.block_length().0 as usize;

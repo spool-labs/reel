@@ -166,6 +166,8 @@ pub struct EngineState<Backend: Io> {
     /// Gets a sorted index answered, and gets on a sorted column that asked the footers
     pub sorted_answers: AtomicU64,
     pub sorted_footer_asks: AtomicU64,
+    /// Row blocks a merge's install couldn't read to move sorted entries, whose keys ask the footers once the inputs go
+    pub sorted_moves_missed: AtomicU64,
     /// Caller operations, so maintenance can tell callers are busy
     pub caller_ops: CallerCounts,
     /// The line writers wait on, shared with every volume

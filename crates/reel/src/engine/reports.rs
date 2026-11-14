@@ -191,6 +191,7 @@ impl<Backend: Io> EngineState<Backend> {
         report.cache_inserts_skipped = caches.into_iter().flatten().map(BlockCache::skipped_inserts).sum();
         report.sorted_answers = self.sorted_answers.load(Ordering::Relaxed);
         report.sorted_footer_asks = self.sorted_footer_asks.load(Ordering::Relaxed);
+        report.sorted_moves_missed = self.sorted_moves_missed.load(Ordering::Relaxed);
         report.sorted_past_capacity = self.sorted.iter().flatten().map(|index| index.past_capacity().0).sum();
         report.sorted_entries = self.sorted.iter().flatten().map(|index| index.entry_count().0).sum();
         for volume in &self.volumes {

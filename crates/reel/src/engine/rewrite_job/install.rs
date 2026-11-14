@@ -293,7 +293,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         let outputs = self.staged.iter().map(|staged| staged.facts.segment).chain([self.output.as_ref(), self.grave_output.as_ref()].into_iter().flatten().map(|output| output.number));
         for number in outputs {
             volume.table.mark_output(number);
-            state.move_sorted_entries(volume, number)?;
+            state.move_sorted_entries(volume, number);
         }
         between();
         // an unwalked merge's outputs owe a walk, and reads of finished segments leave them out until it's done

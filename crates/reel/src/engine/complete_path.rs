@@ -365,9 +365,11 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Point the sorted entries of a merge output's rows at it, each where the entry is that row. The install calls this once the
-    /// output is listed and before the inputs retire, so an entry points at a listed segment at every moment. A block that can't be
-    /// read leaves its entries on the inputs, and a get of those keys asks the footers once the inputs go
-    pub fn move_sorted_entries(&self, volume: &Volume<Backend>, number: SegmentNumber) -> IoResult<()> {
+    /// output is listed and before the inputs retire, so an entry points at a listed segment at every moment. The blocks go through
+    /// the reader with nothing added to the row cache, since no get or scan of a sorted column reads them. A block that can't be
+    /// read leaves its entries on the inputs, counted, and a get of those keys asks the footers once the inputs go. Nothing here
+    /// fails the install
+    pub fn move_sorted_entries(&self, volume: &Volume<Backend>, number: SegmentNumber) {
         for (id, index) in self.sorted.iter().enumerate() {
             let (Some(index), Some(info)) = (index, self.columns[id]) else {
                 continue;
@@ -379,32 +381,30 @@ impl<Backend: Io> EngineState<Backend> {
             let (Some((first, count)), Some(pin)) = (volume.table.column_blocks(number, column), volume.table.pin(number)) else {
                 continue;
             };
+            let caches = FooterCaches {
+                resident: &self.filter_arena,
+                filters: &self.filter_cache,
+                rows: &self.row_cache,
+            };
+            let place_base = WritePlace(pin.head.place_base.0);
             self.job_footer_readers.with(|reader| {
-                let mut key = Vec::with_capacity(index.width());
                 for block_index in first..first + count {
                     let Some((entry, _replacement)) = volume.table.block_line(number, block_index) else {
-                        return Ok(());
+                        self.sorted_moves_missed.fetch_add(1, Ordering::Relaxed);
+                        continue;
                     };
-                    let block_key = BlockKey { segment: number, offset: entry.block_offset };
-                    let block = match in_place(reader.load_block(&InPlace, &pin.file, block_key, &entry, &self.row_cache)) {
-                        Ok(Some(block)) => block,
-                        Ok(None) => return Ok(()),
-                        Err(error) if is_device_error(&error) => return Ok(()),
-                        Err(error) => return Err(error),
-                    };
-                    let Some(mut walk) = RowBlockWalk::open(block, WritePlace(pin.head.place_base.0)) else {
-                        return Ok(());
-                    };
-                    while let Some(row) = walk.next_row(&mut key) {
-                        if row.kind != RowKind::RangeDelete {
-                            index.move_entry(&key, row.place, number, row.offset);
-                        }
+                    if !matches!(in_place(reader.hold_block(&InPlace, &pin.file, (number, place_base), &entry, &caches)), Ok(true)) {
+                        self.sorted_moves_missed.fetch_add(1, Ordering::Relaxed);
+                        continue;
                     }
+                    reader.visit_loaded(&entry, place_base, |key, row| {
+                        if row.kind != RowKind::RangeDelete {
+                            index.move_entry(key, row.place, number, row.offset);
+                        }
+                    });
                 }
-                Ok(())
-            })?;
+            });
         }
-        Ok(())
     }
 
     /// Damage a segment with a row block open or a merge couldn't read. The block's keys have no slot, so they would otherwise read

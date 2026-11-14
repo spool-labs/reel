@@ -100,8 +100,9 @@ pub const fn pace_credit(dead_bytes: u64, per_mille: u64) -> u64 {
 }
 
 /// The space target's built-in value: dead bytes a rewrite must win back, as thousandths of the live bytes, before a busy caller's
-/// rewrite under half dead starts. 150 matches what RocksDB holds
-pub const SPACE_TARGET_PER_MILLE: u64 = 150;
+/// rewrite under half dead starts. At 250 it meets the floor, which even churn settles at anyway, and the copy uneven churn pays
+/// past a shut gate is a third of what 150 cost
+pub const SPACE_TARGET_PER_MILLE: u64 = 250;
 
 /// Check a volume holds more dead bytes than its target allows, once the rewrites in flight have freed theirs: only then does a
 /// paced rewrite start. The paced band's multiplier then settles wherever the target holds, from none to the pace's ceiling

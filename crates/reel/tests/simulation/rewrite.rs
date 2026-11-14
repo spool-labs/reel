@@ -4329,6 +4329,7 @@ fn walk_landing_starts_a_paced_pick() {
     large_segment_dead_by(&store, &io, "backlog", 35);
     let other = large_segment_dead_by(&store, &io, "other", 0);
     zero_pace(volume);
+    store.set_space_target_per_mille(PACE_SIM_TARGET);
     volume.is_over_bound.store(false, Ordering::Release);
     io.hold_jobs("reel-planner", true);
     hold_compaction(&store, false);
@@ -4395,9 +4396,13 @@ struct Steady {
     cap: u64,
 }
 
+// the space target the pace sims run at: their loads hold the store between 15% and 25% dead, so the gate stays open and the pace
+// decides
+const PACE_SIM_TARGET: u64 = 150;
+
 // run a steady overwrite load under busy callers at a pace, with the estimates true or a quarter of what the merges write
 fn steady_space(seed: u64, pace_per_mille: u64, is_estimate_low: bool) -> Steady {
-    steady_at(seed, pace_per_mille, is_estimate_low, reel::engine::load_state::SPACE_TARGET_PER_MILLE)
+    steady_at(seed, pace_per_mille, is_estimate_low, PACE_SIM_TARGET)
 }
 
 // the steady load at a pace and a space target

@@ -177,3 +177,63 @@ fn quiet_beside_busy() {
     assert_eq!(holding_deletes(&store), 0);
     store.close().expect("close");
 }
+
+fn open_bytes(store: &Store) -> u64 {
+    hold(&store.state.volumes[0].claims).open.iter().map(|open| open.write_end.0).sum()
+}
+
+fn reads_back(store: &Store, bytes: u64) {
+    let mut value = Vec::new();
+    for number in 0..bytes.div_ceil(VALUE_BYTES as u64) {
+        assert!(store.get(COLUMN, format!("key-{number:04}").as_bytes(), &mut value).expect("get"), "key {number}");
+        assert_eq!(value.len(), VALUE_BYTES);
+    }
+}
+
+// a small segment that came back at open seals once it sits idle, after a close or a kill, and its rows read from the footer
+#[test]
+fn replayed_small_seals() {
+    for is_killed in [false, true] {
+        let io = SimulatedIo::new(Seed(20));
+        let store = open(&io);
+        put_bytes(&store, IDLE_SEAL_BYTES.0 / 2);
+        settle(&io);
+        if is_killed {
+            store.flush().expect("flush");
+            io.kill();
+        } else {
+            store.close().expect("close");
+        }
+        drop(store);
+
+        let store = open(&io);
+        assert!(open_bytes(&store) > 0, "the segment came back open");
+        settle(&io);
+        io.advance_clock(IDLE_SEAL_AFTER);
+        settle(&io);
+        assert_eq!(seals(&store), 1);
+        assert_eq!(open_bytes(&store), 0);
+        reads_back(&store, IDLE_SEAL_BYTES.0 / 2);
+        store.close().expect("close");
+    }
+}
+
+// a segment that came back at open and took a write since stays open under the size
+#[test]
+fn replayed_then_written_stays() {
+    let io = SimulatedIo::new(Seed(21));
+    let store = open(&io);
+    put_bytes(&store, IDLE_SEAL_BYTES.0 / 2);
+    settle(&io);
+    store.close().expect("close");
+    drop(store);
+
+    let store = open(&io);
+    store.put(COLUMN, b"after-open", b"value").expect("put");
+    settle(&io);
+    io.advance_clock(Nanoseconds(IDLE_SEAL_AFTER.0 * 10));
+    settle(&io);
+    assert_eq!(seals(&store), 0);
+    reads_back(&store, IDLE_SEAL_BYTES.0 / 2);
+    store.close().expect("close");
+}

@@ -64,6 +64,9 @@ pub struct OpenSegment<File> {
     pub quiet_since: Nanoseconds,
     pub first_row_at: Option<Nanoseconds>,
     pub delete_seen: Option<Nanoseconds>,
+    /// Its rows came back from its rows file at open and no write has landed in it since, so it seals at the idle wait
+    /// whatever its size: nothing trickles into it
+    pub is_replayed: bool,
 }
 
 /// Bytes an open segment holds on its disk ahead of its writes. It holds this much at create and gains it again a step at a

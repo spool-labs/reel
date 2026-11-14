@@ -178,6 +178,7 @@ impl<Backend: Io> EngineState<Backend> {
             quiet_since: Nanoseconds(0),
             first_row_at: None,
             delete_seen: None,
+            is_replayed: false,
         });
         Ok(())
     }

@@ -372,6 +372,7 @@ impl<Backend: Io> EngineState<Backend> {
         segment.cover_rows += request.covers;
         segment.has_deletes |= request.has_deletes;
         segment.lowest_place = segment.lowest_place.min(ticket.first);
+        segment.is_replayed = false;
         segment.highest_place = segment.highest_place.max(ticket.last);
         if let Some(mark) = request.mark {
             segment.marks.add(mark);
@@ -687,6 +688,7 @@ impl<Backend: Io> EngineState<Backend> {
             quiet_since: Nanoseconds(0),
             first_row_at: None,
             delete_seen: None,
+            is_replayed: false,
         })
     }
 }

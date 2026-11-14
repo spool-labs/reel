@@ -61,7 +61,8 @@ impl<Backend: Io> RowJob<Backend> {
     /// Seal what has sat with no write long enough, and say when to look at what hasn't yet. A segment goes by its own last
     /// write, so a quiet group seals beside a busy one. A segment under the size stays, since sealing it would only leave a
     /// small one to merge, unless it holds a delete: nothing a delete hides comes back until its segment seals, so one of those
-    /// also seals on its oldest delete's age
+    /// also seals on its oldest delete's age. One that came back at open and took no write since seals too: its rows would sit in the
+    /// write index through every read until the next write, and a restart leaves one such segment a lane at most
     pub fn seal_idle_segments(&self) -> Option<Nanoseconds> {
         let now = self.state.io.now();
         let mut deadline: Option<Nanoseconds> = None;
@@ -90,7 +91,7 @@ impl<Backend: Io> RowJob<Backend> {
                 if segment.has_deletes && segment.delete_seen.is_none() {
                     segment.delete_seen = Some(now);
                 }
-                if !segment.has_deletes && segment.write_end.0 < IDLE_SEAL_BYTES.0 {
+                if !segment.has_deletes && !segment.is_replayed && segment.write_end.0 < IDLE_SEAL_BYTES.0 {
                     continue;
                 }
                 let quiet_due = Nanoseconds(segment.quiet_since.0 + IDLE_SEAL_AFTER.0);

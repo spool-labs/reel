@@ -1,6 +1,6 @@
 //! Records read back whole through the simulated disk, and every damaged byte is caught
 
-use std::path::{Path, PathBuf};
+use std::io::IoSlice; use std::path::{Path, PathBuf};
 
 use reel_sim::file_image::BitMask;
 use reel_sim::seeded_random::Seed;
@@ -11,7 +11,7 @@ use reel::record::codec::{CHUNK_BYTES, Codec};
 use reel::record::record_check::{Checksum, RecordIdentity, RecordKey, checksum};
 use reel::pool::Pool;
 use reel::record::record_encoder::{MOST_RECORD_RUNS, PlainRecord, RecordEncoder, SHARE_BYTES};
-use reel::record::record_head::{SMALL_HEAD_BYTES, chunk_count, chunked_head_bytes, plain_length};
+use reel::record::record_head::{ PIECE_BYTES, PIECE_SUM_BYTES, PIECES_PER_CHUNK, SMALL_HEAD_BYTES, chunk_count, chunked_head_bytes, plain_length, };
 use reel::record::record_reader::{FIRST_READ_BYTES, RecordLocation, RecordRead, RecordReader, written_shape};
 use reel::row_kind::RowKind;
 use reel_api::column_id::ColumnId;
@@ -223,8 +223,8 @@ fn small_window() {
     assert_eq!(bytes, &value[100..150]);
 }
 
-// a window of a large value is two reads, whatever the value's size. A value stored as written sends both together and reads
-// only its head and table up front
+// a window of a large value is a few reads sent together, whatever the value's size. A value stored as written reads its head
+// and table, the touched chunks' sums and the touched 4 KiB pieces, and a compressed one its front and one chunk
 #[test]
 fn window_cost() {
     let value = vec![9; LARGEST.0 as usize];
@@ -233,16 +233,16 @@ fn window_cost() {
         let (reads, bytes, buf) = window_totals(&stored, codec, window(5 * CHUNK_BYTES + 10, 4_096));
 
         assert_eq!(buf, &value[5 * CHUNK_BYTES + 10..5 * CHUNK_BYTES + 10 + 4_096]);
-        assert_eq!(reads, 2);
-        let front = match codec {
-            Codec::None => written_front(&stored),
-            Codec::Lz4 => FIRST_READ_BYTES as u64,
+        let most = match codec {
+            Codec::None => written_head(&stored) + CHUNK_SUMS + 2 * PIECE_BYTES as u64,
+            Codec::Lz4 => (FIRST_READ_BYTES + CHUNK_BYTES) as u64,
         };
-        assert!(bytes <= front + CHUNK_BYTES as u64, "{codec:?} read {bytes} B");
+        assert!(reads <= 3, "{codec:?} took {reads} reads");
+        assert!(bytes <= most, "{codec:?} read {bytes} B");
     }
 }
 
-// a window over two chunks of a value stored as written reads both chunks in one read beside the head
+// a window over two chunks of a value stored as written reads both chunks' sums and only the pieces it touches
 #[test]
 fn window_over_two_chunks() {
     let value = noise(LARGEST.0 as usize);
@@ -252,11 +252,53 @@ fn window_over_two_chunks() {
     let (reads, bytes, buf) = window_totals(&stored, Codec::None, window(start, 4_096));
 
     assert_eq!(buf, &value[start..start + 4_096]);
-    assert_eq!(reads, 2);
-    assert!(bytes <= written_front(&stored) + 2 * CHUNK_BYTES as u64, "read {bytes} B");
+    assert_eq!(reads, 3);
+    assert!(bytes <= written_head(&stored) + 2 * CHUNK_SUMS + 2 * PIECE_BYTES as u64, "read {bytes} B");
 }
 
-// a rotten chunk under a window of a value stored as written fails its check, as the long way finds it
+// a 4 KiB window of a 1 MiB value reads its front and one or two pieces, under 12 KiB
+#[test]
+fn window_reads_its_pieces() {
+    let value = noise(1024 * 1024);
+    let stored = store(Codec::None, &value);
+
+    let (_reads, bytes, buf) = window_totals(&stored, Codec::None, window(300_000, 4_096));
+
+    assert_eq!(buf, &value[300_000..304_096]);
+    assert!(bytes < 12 * 1024, "read {bytes} B");
+}
+
+// windows at every edge give the value's bytes: inside a piece, across pieces and chunks, the short last piece and chunk,
+// and past the end
+#[test]
+fn window_piece_edges() {
+    let value = noise(3 * CHUNK_BYTES + PIECE_BYTES + 100);
+    let stored = store(Codec::None, &value);
+    let end = value.len();
+    let edges = [
+        (10, 100),
+        (PIECE_BYTES - 1, 2),
+        (PIECE_BYTES, PIECE_BYTES),
+        (CHUNK_BYTES - 5, 10),
+        (CHUNK_BYTES - PIECE_BYTES, 3 * PIECE_BYTES),
+        (end - 50, 50),
+        (end - 50, 500),
+        (end - PIECE_BYTES - 100, PIECE_BYTES + 100),
+        (0, end),
+        (end, 10),
+        (end + 10, 10),
+    ];
+    for (offset, length) in edges {
+        let (read, bytes) = read_window(&stored, window(offset, length));
+        let from = offset.min(end);
+        let to = offset.saturating_add(length).min(end);
+        assert_eq!(read, RecordRead::Valid, "window {offset} + {length}");
+        assert_eq!(bytes, &value[from..to], "window {offset} + {length}");
+    }
+}
+
+// a rotten byte fails the windows that read it: in a touched piece, or in the touched chunk's sums. One in a piece the
+// window didn't read leaves the window whole, and the whole read finds it
 #[test]
 fn window_rotten_chunk() {
     let value = noise(LARGEST.0 as usize);
@@ -265,16 +307,59 @@ fn window_rotten_chunk() {
     rot_at(&stored, &stored.path, (shape.front_length + 2 * CHUNK_BYTES + 7) as u64);
 
     let (read, _bytes) = read_window(&stored, window(2 * CHUNK_BYTES, 100));
-    let (clean, bytes) = read_window(&stored, window(CHUNK_BYTES, 100));
+    let (beside, bytes) = read_window(&stored, window(2 * CHUNK_BYTES + PIECE_BYTES, 100));
+    let (whole, _value) = read_all(&stored, &identity());
 
     assert_eq!(read, RecordRead::Failed);
-    assert_eq!(clean, RecordRead::Valid);
-    assert_eq!(bytes, &value[CHUNK_BYTES..CHUNK_BYTES + 100]);
+    assert_eq!(beside, RecordRead::Valid);
+    assert_eq!(bytes, &value[2 * CHUNK_BYTES + PIECE_BYTES..2 * CHUNK_BYTES + PIECE_BYTES + 100]);
+    assert_eq!(whole, RecordRead::Failed);
 }
 
-// the head and table of a value stored as written, all a window reads ahead of its chunks
-fn written_front(stored: &Stored) -> u64 {
-    written_shape(stored.location.length).expect("stored as written").front_length as u64
+// a rotten byte in a chunk's sums fails a window over that chunk and the whole read, and leaves windows over other chunks whole
+#[test]
+fn window_rotten_sums() {
+    let value = noise(4 * CHUNK_BYTES);
+    let stored = store(Codec::None, &value);
+    let shape = written_shape(stored.location.length).expect("stored as written");
+    rot_at(&stored, &stored.path, (shape.sums_at + CHUNK_SUMS as usize + 3) as u64);
+
+    let (read, _bytes) = read_window(&stored, window(CHUNK_BYTES + 10, 100));
+    let (beside, bytes) = read_window(&stored, window(2 * CHUNK_BYTES + 10, 100));
+
+    assert_eq!(read, RecordRead::Failed);
+    assert_eq!(beside, RecordRead::Valid);
+    assert_eq!(bytes, &value[2 * CHUNK_BYTES + 10..2 * CHUNK_BYTES + 110]);
+    let (whole, _value) = read_all(&stored, &identity());
+    assert_eq!(whole, RecordRead::Failed);
+}
+
+// a record a merge copies as stored reads back whole and by window
+#[test]
+fn copied_record_reads_back() {
+    let value = noise(2 * CHUNK_BYTES + 777);
+    let stored = store(Codec::None, &value);
+    let file = open(&stored);
+    let mut copied = vec![0; stored.location.length.0 as usize];
+    file.read_exact_at(stored.location.offset, &mut copied).expect("read");
+    let copy_path = PathBuf::from(format!("{ROOT}/copy"));
+    let copy = stored.io.create_file(&copy_path, ByteCount(0)).expect("create");
+    copy.write_at(FileOffset(LEADING_BYTES), &[IoSlice::new(&copied)]).expect("write");
+    let moved = Stored { io: stored.io.clone(), path: copy_path, location: stored.location };
+
+    let (whole, bytes) = read_all(&moved, &identity());
+    let (part, window_bytes) = read_window(&moved, window(CHUNK_BYTES + 5, 9_000));
+
+    assert_eq!((whole, bytes.as_slice()), (RecordRead::Valid, value.as_slice()));
+    assert_eq!((part, window_bytes.as_slice()), (RecordRead::Valid, &value[CHUNK_BYTES + 5..CHUNK_BYTES + 9_005]));
+}
+
+/// The sums of one full chunk's pieces
+const CHUNK_SUMS: u64 = (PIECES_PER_CHUNK * PIECE_SUM_BYTES) as u64;
+
+// the head and table of a value stored as written, all a window reads ahead of the sums it needs
+fn written_head(stored: &Stored) -> u64 {
+    written_shape(stored.location.length).expect("stored as written").sums_at as u64
 }
 
 // the reads and bytes one window takes, and what it gave back

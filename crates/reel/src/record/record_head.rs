@@ -5,7 +5,7 @@ use reel_api::units::ByteCount;
 use crate::little_endian::read_word;
 use crate::record::chunk_table::{ChunkCount, TablePageIndex, page_count, table_bytes};
 use crate::record::codec::{CHUNK_BYTES, Codec};
-use crate::record::record_check::{Checksum, RecordCheck};
+use crate::record::record_check::{Checksum, RecordCheck, checksum};
 
 /// Bytes of the check
 pub const CHECK_BYTES: usize = 8;
@@ -75,11 +75,47 @@ pub fn read_page_sum(bytes: &[u8], page: TablePageIndex) -> Option<Checksum> {
     Some(Checksum(read_word(bytes, PAGE_SUMS_AT + page.0 as usize * PAGE_SUM_BYTES)?))
 }
 
+/// Bytes of one piece of a chunk stored as written. Each piece has its own sum, so a window reads and checks only the pieces
+/// it touches
+pub const PIECE_BYTES: usize = 4 * 1024;
+/// Bytes of one piece's sum
+pub const PIECE_SUM_BYTES: usize = size_of::<u64>();
+/// Pieces in a full chunk
+pub const PIECES_PER_CHUNK: usize = CHUNK_BYTES / PIECE_BYTES;
+
+/// Count the pieces of a value stored as written
+pub fn piece_count(value_length: ByteCount) -> u64 {
+    value_length.0.div_ceil(PIECE_BYTES as u64)
+}
+
+/// Count the bytes of the piece sums a chunked record stored as written keeps between its table and its payload
+pub fn sums_bytes(value_length: ByteCount) -> u64 {
+    piece_count(value_length) * PIECE_SUM_BYTES as u64
+}
+
+/// Write a chunk's piece sums into a buffer and return their length
+pub fn put_piece_sums(chunk: &[u8], sums: &mut [u8]) -> usize {
+    let mut length = 0;
+    for piece in chunk.chunks(PIECE_BYTES) {
+        sums[length..length + PIECE_SUM_BYTES].copy_from_slice(&checksum(piece).0.to_le_bytes());
+        length += PIECE_SUM_BYTES;
+    }
+    length
+}
+
+/// Sum a chunk stored as written: the sum over its pieces' sums, which its table entry keeps, so a whole read checks a chunk
+/// from its bytes alone and a window checks the stored piece sums against it
+pub fn chunk_sum(chunk: &[u8]) -> Checksum {
+    let mut sums = [0; PIECES_PER_CHUNK * PIECE_SUM_BYTES];
+    let length = put_piece_sums(chunk, &mut sums);
+    checksum(&sums[..length])
+}
+
 /// Count the bytes of a record stored as written, with no need to hash the value
 pub fn plain_length(value_length: ByteCount) -> ByteCount {
     if value_length.0 <= CHUNK_BYTES as u64 {
         return ByteCount(SMALL_HEAD_BYTES as u64 + value_length.0);
     }
     let head = chunked_head_bytes(value_length) as u64;
-    ByteCount(head + table_bytes(chunk_count(value_length)).0 + value_length.0)
+    ByteCount(head + table_bytes(chunk_count(value_length)).0 + sums_bytes(value_length) + value_length.0)
 }

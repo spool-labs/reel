@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 reel = { path = "../crates/reel", features = ["test-hooks"] }
 reel-api = { path = "../crates/reel-api" }
+reel-sim = { path = "../crates/reel-sim" }
 
 # its own workspace, so the fuzz build's sanitizer flags stay out of the store's
 [workspace]
@@ -54,6 +55,13 @@ bench = false
 [[bin]]
 name = "superblock"
 path = "fuzz_targets/superblock.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunked_record"
+path = "fuzz_targets/chunked_record.rs"
 test = false
 doc = false
 bench = false

@@ -9,14 +9,14 @@ use reel_api::units::{ByteCount, FileOffset};
 use crate::pool::{HollowItem, touched_zeroes};
 use crate::io::{DeviceReads, IoFile, ManyRead, ReadOn};
 use crate::record::chunk_table::{
-    ChunkCount, ChunkIndex, ChunkSpan, ENTRIES_PER_PAGE, TABLE_PAGE_BYTES, TablePageIndex, chunk_span, page_bytes,
+    ChunkCount, ChunkIndex, ChunkSpan, ENTRIES_PER_PAGE, TABLE_ENTRY_BYTES, TABLE_PAGE_BYTES, TablePageIndex, chunk_span, page_bytes,
     page_count, page_of, table_bytes,
 };
 use crate::record::codec::{CHUNK_BYTES, Codec};
 use crate::record::lz4_block::decompress;
-use crate::record::record_check::{RecordIdentity, checksum, place_check, record_check};
+use crate::little_endian::read_word; use crate::record::record_check::{Checksum, RecordIdentity, checksum, place_check, record_check};
 use crate::record::record_head::{
-    FORM_AT, RecordForm, SMALL_HEAD_BYTES, chunk_count, chunked_head_bytes, head_bytes_for, read_check, read_page_sum,
+    FORM_AT, PIECE_BYTES, PIECE_SUM_BYTES, PIECES_PER_CHUNK, RecordForm, SMALL_HEAD_BYTES, chunk_count, chunk_sum, chunked_head_bytes, head_bytes_for, piece_count, read_check, read_page_sum, sums_bytes,
     read_value_length,
 };
 
@@ -53,6 +53,7 @@ pub struct ChunkedHead {
 /// The split a record stored as written has, worked out from its length alone
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WrittenShape {
+    pub sums_at: usize,
     pub front_length: usize,
     pub value_length: ByteCount,
 }
@@ -188,9 +189,12 @@ impl RecordReader {
         self.read_chunks(device, file, location, &head, window, buf).await
     }
 
-    /// Fill the buffer with a window of a value stored as written, sending the head and the window's chunks to the device
-    /// together, since the record's length says where both sit. Nothing when the record turns out other than its length
-    /// says, or a read comes back short, and the window then takes the long way, which gives the answer that counts
+    /// Fill the buffer with a window of a value stored as written, sending the head and the window's 4 KiB pieces to the device
+    /// together, since the record's length says where both sit. Each touched chunk's entry checks its pieces' sums, and each
+    /// sum checks its piece, so the window checks what it returns and the head, table and sums on the way. Damage in a piece
+    /// it didn't read goes unseen by this read, and a whole read or a rewrite finds it. Nothing when the record turns out other
+    /// than its length says, or a read comes back short, and the window then takes the long way, which gives the answer that
+    /// counts
     pub async fn read_written_window<File: IoFile>(
         &mut self,
         device: &impl DeviceReads<File>,
@@ -200,24 +204,32 @@ impl RecordReader {
         window: ValueWindow,
         buf: &mut Vec<u8>,
     ) -> Option<RecordRead> {
-        let shape = written_shape(location.length).filter(|shape| shape.front_length <= FIRST_READ_BYTES)?;
+        let shape = written_shape(location.length).filter(|shape| shape.sums_at <= FIRST_READ_BYTES)?;
         let value_end = shape.value_length.0;
         let start = window.offset.0.min(value_end);
         let end = start.saturating_add(window.length.0).min(value_end);
         if start == end {
             return None;
         }
-        let chunk_bytes = CHUNK_BYTES as u64;
-        let (first_chunk, last_chunk) = (start / chunk_bytes, (end - 1) / chunk_bytes);
-        let span_start = first_chunk * chunk_bytes;
-        let span_end = ((last_chunk + 1) * chunk_bytes).min(value_end);
-        buf.clear();
+        let (piece_bytes, chunk_bytes) = (PIECE_BYTES as u64, CHUNK_BYTES as u64);
+        let span_start = start / piece_bytes * piece_bytes;
+        let span_end = end.div_ceil(piece_bytes).saturating_mul(piece_bytes).min(value_end);
+        let (first_chunk, last_chunk) = (span_start / chunk_bytes, (span_end - 1) / chunk_bytes);
+        // the touched chunks' slice of the sums, which their entries check, so the rest of the sums is never read
+        let chunk_sums = (PIECES_PER_CHUNK * PIECE_SUM_BYTES) as u64;
+        let sums_from = shape.sums_at as u64 + first_chunk * chunk_sums;
+        let sums_to = (shape.sums_at as u64 + (last_chunk + 1) * chunk_sums).min(shape.front_length as u64);
+        let sums_length = (sums_to - sums_from) as usize;
+        if sums_length > self.chunk.len() {
+            return None;
+        }
+        // the read fills every byte, so a buffer long enough already is cut to size and only new room is zeroed
         buf.resize((span_end - span_start) as usize, 0);
-        let front = shape.front_length;
-        let chunks_at = FileOffset(location.offset.0 + front as u64 + span_start);
+        let (front, pieces_at) = (shape.sums_at, FileOffset(location.offset.0 + shape.front_length as u64 + span_start));
         let mut reads = [
             Some(ManyRead { file, offset: location.offset, buf: &mut self.first[..front], is_done: false }),
-            Some(ManyRead { file, offset: chunks_at, buf: &mut buf[..], is_done: false }),
+            Some(ManyRead { file, offset: FileOffset(location.offset.0 + sums_from), buf: &mut self.chunk[..sums_length], is_done: false }),
+            Some(ManyRead { file, offset: pieces_at, buf: &mut buf[..], is_done: false }),
         ];
         device.read_many(&mut reads).await;
         if !reads.iter().flatten().all(|read| read.is_done) {
@@ -235,8 +247,27 @@ impl RecordReader {
                 return None;
             }
             let span = self.span_of(location, &head, chunk, page)?;
-            if !is_chunk_in_span(&span, chunk, payload, buf, span_start) {
+            let chunk_start = chunk.0 * chunk_bytes;
+            if span.entry.stored_offset.0 != payload + chunk_start || span.stored_length != span.entry.value_length {
                 return None;
+            }
+            let sums_from = ((chunk.0 - first_chunk) * chunk_sums) as usize;
+            let sums = self.chunk.get(sums_from..sums_from + piece_count(span.entry.value_length) as usize * PIECE_SUM_BYTES)?;
+            if checksum(sums) != span.entry.checksum {
+                // the head and table checked out, so sums that don't match their entry are damaged
+                return Some(RecordRead::Failed);
+            }
+            // the pieces of this chunk the window read, each against its own sum
+            let from = span_start.max(chunk_start);
+            let to = span_end.min(chunk_start + span.entry.value_length.0);
+            for piece_start in (from..to).step_by(PIECE_BYTES) {
+                let piece_end = (piece_start + piece_bytes).min(to);
+                let at = ((piece_start - chunk_start) / piece_bytes) as usize * PIECE_SUM_BYTES;
+                let stored = Checksum(read_word(sums, at)?);
+                let piece = buf.get((piece_start - span_start) as usize..(piece_end - span_start) as usize)?;
+                if checksum(piece) != stored {
+                    return Some(RecordRead::Failed);
+                }
             }
         }
         buf.copy_within((start - span_start) as usize..(end - span_start) as usize, 0);
@@ -308,7 +339,8 @@ impl RecordReader {
         self.check_payload(device, file, location, head, buf).await
     }
 
-    /// Check each chunk of a value stored as written where it sits in the buffer
+    /// Check each chunk of a value stored as written where it sits in the buffer, and its stored pieces' sums when the first
+    /// read brought them in, so damage there fails the read as damage in the value does
     pub async fn check_payload<File: IoFile>(
         &mut self,
         device: &impl DeviceReads<File>,
@@ -318,6 +350,8 @@ impl RecordReader {
         buf: &[u8],
     ) -> Result<RecordRead> {
         let start = payload_start(head);
+        let has_sums = head.codec == Codec::None && start as usize <= FIRST_READ_BYTES.min(location.length.0 as usize);
+        let sums_at = sums_start(head) as usize;
         for page in 0..page_count(head.chunks).0 {
             let page = TablePageIndex(page);
             if !self.load_page(device, file, location, head, page).await? {
@@ -332,6 +366,11 @@ impl RecordReader {
                     return Ok(RecordRead::Failed);
                 };
                 if !is_chunk_in_span(&span, chunk, start, buf, 0) {
+                    return Ok(RecordRead::Failed);
+                }
+                let from = sums_at + chunk.0 as usize * PIECES_PER_CHUNK * PIECE_SUM_BYTES;
+                let to = from + piece_count(span.entry.value_length) as usize * PIECE_SUM_BYTES;
+                if has_sums && self.first.get(from..to).is_none_or(|sums| checksum(sums) != span.entry.checksum) {
                     return Ok(RecordRead::Failed);
                 }
             }
@@ -440,7 +479,9 @@ impl RecordReader {
 
         let offset = FileOffset(location.offset.0 + span.entry.stored_offset.0);
         device.read_exact(file, offset, &mut self.chunk[..stored]).await?;
-        if checksum(&self.chunk[..stored]) != span.entry.checksum {
+        // a record stored as written sums a chunk over its pieces' sums, and a compressed one over its stored bytes
+        let sum = if head.codec == Codec::None { chunk_sum(&self.chunk[..stored]) } else { checksum(&self.chunk[..stored]) };
+        if sum != span.entry.checksum {
             return Ok(false);
         }
 
@@ -469,12 +510,19 @@ impl Default for RecordReader {
     }
 }
 
-/// Find where a chunked record's payload starts
-pub fn payload_start(head: &ChunkedHead) -> u64 {
+/// Find where a chunked record's piece sums start: right after its table. Only a record stored as written has them
+pub fn sums_start(head: &ChunkedHead) -> u64 {
     head.head_length as u64 + table_bytes(head.chunks).0
 }
 
-/// Check one chunk of a value stored as written: its span, then its bytes, in a buffer that starts at a value byte
+/// Find where a chunked record's payload starts, past the piece sums of a record stored as written
+pub fn payload_start(head: &ChunkedHead) -> u64 {
+    let sums = if head.codec == Codec::None { sums_bytes(head.value_length) } else { 0 };
+    sums_start(head) + sums
+}
+
+/// Check one chunk of a value stored as written: its span, then its bytes against the sum over its pieces' sums, in a buffer
+/// that starts at a value byte
 pub fn is_chunk_in_span(span: &ChunkSpan, chunk: ChunkIndex, payload_start: u64, buf: &[u8], buf_start: u64) -> bool {
     let start = chunk.0 * CHUNK_BYTES as u64;
     let is_where_expected = span.entry.stored_offset.0 == payload_start + start;
@@ -484,27 +532,36 @@ pub fn is_chunk_in_span(span: &ChunkSpan, chunk: ChunkIndex, payload_start: u64,
 
     let (from, to) = (start - buf_start, start - buf_start + span.entry.value_length.0);
     match buf.get(from as usize..to as usize) {
-        Some(bytes) => checksum(bytes) == span.entry.checksum,
+        Some(bytes) => chunk_sum(bytes) == span.entry.checksum,
         None => false,
     }
 }
 
-/// Work out how a record stored as written splits, from its length alone
+/// Work out how a record stored as written splits, from its length alone: a head, a table, the pieces' sums and the value
 pub fn written_shape(length: ByteCount) -> Option<WrittenShape> {
     if length.0 as usize <= SMALL_RECORD_BYTES {
         return None;
     }
 
-    let estimate = length.0 / CHUNK_BYTES as u64;
-    for chunks in estimate.saturating_sub(1)..=estimate + 1 {
+    // a chunk stores its bytes, its pieces' sums and its table entry, so the estimate is off by a chunk at most
+    let estimate = length.0 / (CHUNK_BYTES + PIECES_PER_CHUNK * PIECE_SUM_BYTES + TABLE_ENTRY_BYTES) as u64;
+    for chunks in estimate.saturating_sub(1)..=estimate + 2 {
         let chunks = ChunkCount(chunks);
-        let front = head_bytes_for(chunks) as u64 + table_bytes(chunks).0;
-        let value_length = ByteCount(length.0.checked_sub(front)?);
-        if chunk_count(value_length) == chunks {
-            return Some(WrittenShape {
-                front_length: front as usize,
-                value_length,
-            });
+        let sums_at = head_bytes_for(chunks) as u64 + table_bytes(chunks).0;
+        let rest = length.0.checked_sub(sums_at)?;
+        // the value and its sums take the rest, and the value grows with the rest, so one piece count fits
+        let pieces = rest / (PIECE_BYTES + PIECE_SUM_BYTES) as u64;
+        for pieces in pieces.saturating_sub(1)..=pieces + 1 {
+            let Some(value_length) = rest.checked_sub(pieces * PIECE_SUM_BYTES as u64).map(ByteCount) else {
+                continue;
+            };
+            if piece_count(value_length) == pieces && chunk_count(value_length) == chunks {
+                return Some(WrittenShape {
+                    sums_at: sums_at as usize,
+                    front_length: (sums_at + pieces * PIECE_SUM_BYTES as u64) as usize,
+                    value_length,
+                });
+            }
         }
     }
     None

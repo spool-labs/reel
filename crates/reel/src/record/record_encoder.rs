@@ -15,7 +15,7 @@ use crate::record::lz4_block::Lz4State;
 use crate::record::record_check::{RecordCheck, RecordIdentity, RecordKey, checksum, place_check, record_check};
 use crate::record::record_head::{
     CHECK_BYTES, FORM_AT, PAGE_SUM_BYTES, PAGE_SUMS_AT, RecordForm, SMALL_HEAD_BYTES, VALUE_LENGTH_AT, chunk_count,
-    chunked_head_bytes,
+    chunked_head_bytes, put_piece_sums, sums_bytes,
 };
 
 /// Bytes of one share of the compress pool
@@ -26,14 +26,15 @@ pub const CHUNKS_PER_SHARE: usize = SHARE_BYTES / CHUNK_BYTES;
 pub const MOST_WRITE_PARTS: usize = 1_024;
 /// Runs a chunked record's payload can use, beside its head and table, and still go out in one write call
 pub const MOST_RECORD_RUNS: usize = MOST_WRITE_PARTS - 2;
-/// Parts of a record: head, table and payload
-pub const RECORD_PARTS: usize = 3;
+/// Parts of a record: head, table, piece sums and payload
+pub const RECORD_PARTS: usize = 4;
 
 /// The lengths of a laid-out record
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecordShape {
     pub head_length: usize,
     pub table_length: usize,
+    pub sums_length: usize,
     pub payload_length: usize,
     pub is_payload_stored: bool,
 }
@@ -81,6 +82,7 @@ impl PlainRecord {
 pub struct RecordEncoder {
     head: Vec<u8>,
     table: Vec<u8>,
+    sums: Vec<u8>,
     stored: Vec<u8>,
     shares: Vec<Vec<u8>>,
     runs: Vec<StoredRun>,
@@ -91,7 +93,7 @@ pub struct RecordEncoder {
 impl RecordShape {
     /// Read the record's whole length
     pub fn total_length(&self) -> ByteCount {
-        ByteCount((self.head_length + self.table_length + self.payload_length) as u64)
+        ByteCount((self.head_length + self.table_length + self.sums_length + self.payload_length) as u64)
     }
 }
 
@@ -102,6 +104,7 @@ impl RecordEncoder {
         Self {
             head: touched_zeroes(chunked_head_bytes(largest_value)),
             table: touched_zeroes(page_count(chunks).0 as usize * TABLE_PAGE_BYTES),
+            sums: touched_zeroes(sums_bytes(largest_value) as usize),
             stored: touched_zeroes(CHUNK_BYTES),
             shares: touched_room(most_shares),
             runs: touched_room(MOST_RECORD_RUNS),
@@ -114,7 +117,8 @@ impl RecordEncoder {
     pub fn heap_bytes(&self) -> ByteCount {
         let runs = self.runs.capacity() * size_of::<StoredRun>();
         let shares = self.shares.capacity() * size_of::<Vec<u8>>();
-        ByteCount((self.head.capacity() + self.table.capacity() + self.stored.capacity() + runs + shares) as u64)
+        let buffers = self.head.capacity() + self.table.capacity() + self.sums.capacity() + self.stored.capacity();
+        ByteCount((buffers + runs + shares) as u64)
     }
 
     /// Take the shares a value could need, all at once so two large values can't each hold what the other waits
@@ -172,45 +176,62 @@ impl RecordEncoder {
         RecordShape {
             head_length: SMALL_HEAD_BYTES,
             table_length: 0,
+            sums_length: 0,
             payload_length,
             is_payload_stored: compressed.is_some(),
         }
     }
 
-    /// Lay out a value of many chunks: a head, a table, then the chunks
+    /// Lay out a value of many chunks: a head, a table, then the chunks. A record stored as written keeps its pieces' sums
+    /// between the table and the chunks
     pub fn encode_chunked(&mut self, identity: &RecordIdentity, codec: Codec, value: &[u8]) -> Option<RecordShape> {
         let value_length = ByteCount(value.len() as u64);
         let chunks = chunk_count(value_length);
         let head_length = chunked_head_bytes(value_length);
         let table_length = table_bytes(chunks).0 as usize;
-        if head_length > self.head.len() || table_length > self.table.len() {
+        let written_sums = sums_bytes(value_length) as usize;
+        if head_length > self.head.len() || table_length > self.table.len() || written_sums > self.sums.len() {
             return None;
         }
 
-        let payload_start = (head_length + table_length) as u64;
-        let payload_length = match codec {
-            Codec::None => self.table_as_written(value, payload_start),
-            Codec::Lz4 => self.table_compressed(value, payload_start)?,
+        let front = (head_length + table_length) as u64;
+        let mut sums_length = 0;
+        let mut payload_length = match codec {
+            Codec::None => 0,
+            Codec::Lz4 => self.table_compressed(value, front)?,
         };
-
-        // a record nothing shrank in reads as one run, like a none column's
-        let stored_codec = if payload_length == value.len() { Codec::None } else { codec };
-        self.seal_table(chunks, payload_start + payload_length as u64);
+        // a record nothing shrank in is laid out as written, like a none column's, with its pieces' sums
+        if codec == Codec::None || payload_length == value.len() {
+            self.runs.clear();
+            sums_length = written_sums;
+            payload_length = self.table_as_written(value, front + sums_length as u64);
+        }
+        let stored_codec = if sums_length > 0 { Codec::None } else { codec };
+        self.seal_table(chunks, front + (sums_length + payload_length) as u64);
         self.write_chunked_head(identity, stored_codec, value_length, chunks, head_length);
 
         Some(RecordShape {
             head_length,
             table_length,
+            sums_length,
             payload_length,
             is_payload_stored: false,
         })
     }
 
-    /// List chunks stored as written, and return the payload length
+    /// List chunks stored as written with their pieces' sums, and return the payload length
     pub fn table_as_written(&mut self, value: &[u8], payload_start: u64) -> usize {
         let mut offset = payload_start;
+        let mut sums_at = 0;
         for (index, chunk) in value.chunks(CHUNK_BYTES).enumerate() {
-            self.put_entry(index, offset, chunk);
+            let length = put_piece_sums(chunk, &mut self.sums[sums_at..]);
+            let entry = ChunkEntry {
+                stored_offset: FileOffset(offset),
+                value_length: ByteCount(chunk.len() as u64),
+                checksum: checksum(&self.sums[sums_at..sums_at + length]),
+            };
+            self.write_table_entry(index, &entry);
+            sums_at += length;
             offset += chunk.len() as u64;
         }
         value.len()
@@ -318,16 +339,6 @@ impl RecordEncoder {
         file.write_at(at, &parts[..2 + self.runs.len()])
     }
 
-    /// Write the entry of a chunk stored as written
-    pub fn put_entry(&mut self, index: usize, offset: u64, chunk: &[u8]) {
-        let entry = ChunkEntry {
-            stored_offset: FileOffset(offset),
-            value_length: ByteCount(chunk.len() as u64),
-            checksum: checksum(chunk),
-        };
-        self.write_table_entry(index, &entry);
-    }
-
     /// Put an entry at its place in the table's pages
     pub fn write_table_entry(&mut self, index: usize, entry: &ChunkEntry) {
         let page = index / ENTRIES_PER_PAGE;
@@ -398,6 +409,7 @@ impl RecordEncoder {
         [
             IoSlice::new(&self.head[..shape.head_length]),
             IoSlice::new(&self.table[..shape.table_length]),
+            IoSlice::new(&self.sums[..shape.sums_length]),
             IoSlice::new(payload),
         ]
     }

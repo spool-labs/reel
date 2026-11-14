@@ -441,6 +441,22 @@ impl WriteShard {
         }
     }
 
+    /// Answer a bound outside a tree's span with no descent: when the tree's last row in the walk's direction isn't past the
+    /// bound no row is, and when its first row is past the bound that row is the answer. Nothing when the bound falls inside
+    pub fn edge_of(&self, tree: &WriteTree, bound: &WalkBound) -> Option<Option<TreePosition>> {
+        let (near, far) = match bound.direction {
+            Direction::Ascending => (tree.first_position(&self.nodes), tree.last_position(&self.nodes)),
+            Direction::Descending => (tree.last_position(&self.nodes), tree.first_position(&self.nodes)),
+        };
+        let (Some(near), Some(far)) = (near, far) else {
+            return Some(None);
+        };
+        if !self.is_past_bound(entry_at(&self.nodes, far), bound) {
+            return Some(None);
+        }
+        self.is_past_bound(entry_at(&self.nodes, near), bound).then_some(Some(near))
+    }
+
     /// Bring one tree's cursor to its first row past the bound
     pub fn place_cursor(&self, cursor: &mut TreeCursor, tree: &WriteTree, bound: &WalkBound) -> Option<EntryAddress> {
         if cursor.is_placed && self.is_cursor_standing(cursor) {
@@ -464,7 +480,7 @@ impl WriteShard {
             }
         }
 
-        let position = seek_bound(tree, &self.nodes, &self.slab, bound);
+        let position = self.edge_of(tree, bound).unwrap_or_else(|| seek_bound(tree, &self.nodes, &self.slab, bound));
         cursor.is_placed = true;
         cursor.position = position;
         let position = position?;

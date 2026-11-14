@@ -504,6 +504,42 @@ fn walk_keys() {
     assert_eq!(walked, descending);
 }
 
+// a fresh cursor finds the first key past any bound, below, inside or above each tree's span and in either direction, with
+// other columns' rows on both sides, as the plain model does
+#[test]
+fn bound_at_every_edge() {
+    for seed in seeds(0..SEED_COUNT) {
+        let mut random = SeededRandom::new(Seed(seed));
+        let index = WriteIndex::new(&SIZING);
+        let mut expected: BTreeSet<Vec<u8>> = BTreeSet::new();
+        for place in 1..=ROWS / 4 {
+            let key = key_of(KEY_SPACE / 4 + random.below(KEY_SPACE / 2));
+            let slot = if random.one_in(2) { SEALED } else { STAYING };
+            add(&index, &key, row(place, slot, RowKind::Value));
+            expected.insert(key);
+        }
+        for (other, place) in [(ColumnId(COLUMN.0 - 1), ROWS + 1), (ColumnId(COLUMN.0 + 1), ROWS + 2)] {
+            assert!(index.insert(other, &key_of(KEY_SPACE / 2), &row(place, SEALED, RowKind::Value)));
+        }
+        for _ask in 0..KEY_SPACE {
+            let start = key_of(random.below(KEY_SPACE));
+            let is_inclusive = random.one_in(2);
+            for direction in [Direction::Ascending, Direction::Descending] {
+                let bound = WalkBound { column: COLUMN, key: &start, is_inclusive, direction };
+                let mut cursors = vec![ShardCursor::new(SIZING.open_slots); SHARD_COUNT];
+                let found = next_across_shards(&index, &mut cursors, &bound, both());
+                let want = match (direction, is_inclusive) {
+                    (Direction::Ascending, true) => expected.range(start.clone()..).next(),
+                    (Direction::Ascending, false) => expected.range((std::ops::Bound::Excluded(start.clone()), std::ops::Bound::Unbounded)).next(),
+                    (Direction::Descending, true) => expected.range(..=start.clone()).next_back(),
+                    (Direction::Descending, false) => expected.range(..start.clone()).next_back(),
+                };
+                assert_eq!(found.as_ref(), want, "seed {seed} {direction:?} from {start:?} inclusive {is_inclusive}");
+            }
+        }
+    }
+}
+
 // a shard refuses a row when its table is near full, and never spins in a probe
 #[test]
 fn table_limit() {

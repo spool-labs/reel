@@ -15,7 +15,8 @@ use crate::engine::engine_state::EngineState;
 use crate::engine::read_path::{HeldPin, KeyRead, Located, MOST_READ_TRIES, RecordWant, SealedRow, newest_of};
 use crate::engine::scan_state::{
     BATCH_BYTES, BATCH_KEYS, BatchEntry, BlockTake, JOIN_GAP, MOST_BATCH_RECORD, MOST_SCANS, MOST_WINDOW_RECORD, NO_GENERATION,
-    SEAT_BATCH, ScanRange, ScanState, ScanWindows, SegmentSource, ShardHead, seek_together, under_prefix,
+    SCAN_CACHE_PARTS, SCAN_CACHE_WEIGH_EVERY, SEAT_BATCH, ScanRange, ScanState, ScanWindows, SegmentSource, ShardHead,
+    seek_together, under_prefix,
 };
 use crate::engine::volume::Volume;
 use crate::guard::hold;
@@ -26,6 +27,7 @@ use crate::record::codec::Codec;
 use crate::record::record_reader::{RecordRead, form_of, open_small};
 use crate::row_kind::RowKind;
 use crate::segment::footer_reader::RowAt;
+use crate::index::record_cache::CacheLookup;
 use crate::segment::block_cache::{BlockKey, NO_BLOCK};
 use crate::segment::block_entry::{BlockEntry, KeyBound, SHARED_HEAD_BYTES};
 use crate::segment::segment_table::Seat;
@@ -293,7 +295,7 @@ impl<Backend: Io> EngineState<Backend> {
             ScanWant::Locate => {
                 let key_at = scan.batch.keys.len();
                 scan.batch.keys.extend_from_slice(candidate);
-                scan.batch.entries.push(BatchEntry { key_at, key_length: candidate.len(), located, record: None });
+                scan.batch.entries.push(BatchEntry { key_at, key_length: candidate.len(), located, record: None, is_value: false });
                 Ok(true)
             },
             ScanWant::Bytes => {
@@ -364,14 +366,48 @@ impl<Backend: Io> EngineState<Backend> {
         Ok(())
     }
 
-    /// Read the batch's sealed records together. A record left out takes its own read when its key is answered
+    /// Say whether the record cache can hold most of a volume's live records, weighed again at most once a period. Scans read
+    /// values from it and keep what they read only then: at a smaller cache a lookup a key mostly misses, and what scans keep
+    /// would push out what gets need
+    pub fn scans_use_cache(&self, volume: &Volume<Backend>) -> bool {
+        let now = self.io.now().0.max(1);
+        let weighed = volume.scans_weighed_at.load(Ordering::Relaxed);
+        if now.saturating_sub(weighed) >= SCAN_CACHE_WEIGH_EVERY.0
+            && volume.scans_weighed_at.compare_exchange(weighed, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            let live = hold(&volume.summary).orders().live_bytes();
+            let room = self.record_cache.heap_bytes().0;
+            let is_most = live > 0 && room.saturating_mul(SCAN_CACHE_PARTS) >= live.saturating_mul(SCAN_CACHE_PARTS - 1);
+            volume.scans_use_cache.store(is_most, Ordering::Relaxed);
+        }
+        volume.scans_use_cache.load(Ordering::Relaxed)
+    }
+
+    /// Read the batch's sealed records together. When the record cache can hold most of the volume, a value it holds comes from
+    /// there with no read. A record left out takes its own read when its key is answered
     pub async fn read_batch(&self, device: &impl DeviceReads<Backend::File>, volume: &Volume<Backend>, scan: &mut ScanState) {
+        let is_cached = self.scans_use_cache(volume);
         let batch = &mut scan.batch;
         let mut rows = [None; BATCH_KEYS];
-        for (row, entry) in rows.iter_mut().zip(&batch.entries) {
-            if let Located::Sealed(sealed) = entry.located {
-                *row = Some(sealed);
+        let mut hits = 0;
+        for (row, entry) in rows.iter_mut().zip(batch.entries.iter_mut()) {
+            let Located::Sealed(sealed) = entry.located else {
+                continue;
+            };
+            // a value is no longer than its record, so a record's room in the buffer holds it with no allocation
+            let at = batch.records.len();
+            let is_room = at + sealed.row.length.0 as usize <= batch.records.capacity();
+            let key = &batch.keys[entry.key_at..entry.key_at + entry.key_length];
+            if is_cached && is_room && self.record_cache.get_onto(sealed.segment, sealed.row.offset, key, &mut batch.records) == CacheLookup::Hit {
+                entry.record = Some((at, batch.records.len() - at));
+                entry.is_value = true;
+                hits += 1;
+                continue;
             }
+            *row = Some(sealed);
+        }
+        if hits > 0 {
+            self.scan_cache_hits.fetch_add(hits, Ordering::Relaxed);
         }
         let mut spans = [None; BATCH_KEYS];
         let count = batch.entries.len();
@@ -476,7 +512,20 @@ impl<Backend: Io> EngineState<Backend> {
         };
         let read = self.key_read(*column, batch.key_of(&entry), batch.point, true)?;
         let held = match (entry.record, entry.located) {
-            (Some((at, length)), Located::Sealed(row)) => self.open_batched(on.device, &read, &row, &batch.records[at..at + length], value),
+            // the cache holds a value with its key, so a value from it answers as it stands
+            (Some((at, length)), Located::Sealed(_row)) if entry.is_value => {
+                value.clear();
+                value.extend_from_slice(&batch.records[at..at + length]);
+                true
+            },
+            (Some((at, length)), Located::Sealed(row)) => {
+                let is_open = self.open_batched(on.device, &read, &row, &batch.records[at..at + length], value);
+                // a scan keeps what it read only while the cache can hold most of the volume, so gets keep theirs otherwise
+                if is_open && on.target.scans_use_cache.load(Ordering::Relaxed) {
+                    self.record_cache.admit(row.segment, row.row.offset, read.key, value);
+                }
+                is_open
+            },
             _other => false,
         };
         let is_found = held

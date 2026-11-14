@@ -950,6 +950,41 @@ fn seats_together_agree() {
     }
 }
 
+// a scan over a column the record cache can hold takes the values it holds from it, keeps what it read, and gives the model's
+// rows, and a column too large for the cache leaves the cache to gets
+#[test]
+fn scans_use_the_cache_that_holds_the_column() {
+    for (seed, is_small) in [(51, true), (52, false)] {
+        let io = SimulatedIo::new(Seed(seed));
+        let store = open(&io);
+        hold_compaction(&store, true);
+        let room = store.state.record_cache.heap_bytes().0;
+        // a small column takes a tenth of the cache, and a large one twice the cache
+        let (count, value_bytes) = if is_small { (room / 10 / CACHE_TEST_VALUE, CACHE_TEST_VALUE) } else { (room * 2 / CACHE_TEST_VALUE, CACHE_TEST_VALUE) };
+        let mut model = Model::new();
+        for number in 0..count {
+            let value = vec![number as u8; value_bytes as usize];
+            store.put(COLUMN, &key(number), &value).expect("put");
+            model.insert(key(number), value);
+        }
+        seal(&store, &io);
+        io.advance_clock(Nanoseconds(2_000_000_000));
+        let before = store.state.scan_cache_hits.load(Ordering::Relaxed);
+        for _walk in 0..3 {
+            let start = key(count / 3);
+            let want: Vec<(Vec<u8>, Vec<u8>)> = model.range(start.clone()..).take(TOGETHER_STEPS).map(|(name, value)| (name.clone(), value.clone())).collect();
+            assert_eq!(walk_from(&store, &start, Direction::Ascending, None), want, "seed {seed}");
+        }
+        let hits = store.state.scan_cache_hits.load(Ordering::Relaxed) - before;
+        assert_eq!(store.state.volumes[0].scans_use_cache.load(Ordering::Relaxed), is_small, "seed {seed}: {count} values of {value_bytes} B against {room} B of cache");
+        assert_eq!(hits > 0, is_small, "seed {seed}: {hits} values came from the cache");
+        store.close().expect("close");
+    }
+}
+
+/// Bytes of each value the cache sims write
+const CACHE_TEST_VALUE: u64 = 400;
+
 // put and delete a round of keys the model follows
 fn churn(store: &Store, model: &mut Model, random: &mut SeededRandom) {
     for _put in 0..TOGETHER_PUTS {

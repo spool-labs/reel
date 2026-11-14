@@ -381,6 +381,10 @@ pub struct Volume<Backend: Io> {
     pub idle_seals: AtomicU64,
     /// Bytes claims took and gave up without landing: a gap in the segment, or a record with no row
     pub unlanded_bytes: AtomicU64,
+    /// Whether the record cache can hold most of the volume's live records, so scans read values from it and keep what they
+    /// read, and when that was last weighed
+    pub scans_use_cache: AtomicBool,
+    pub scans_weighed_at: AtomicU64,
     /// Quiet open segments that gave their room ahead back
     pub rooms_given_back: AtomicU64,
     /// The store's line writers wait on, which anything that clears a wait moves

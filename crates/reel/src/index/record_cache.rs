@@ -251,6 +251,12 @@ impl CacheShard {
 
     /// Copy a cached value into a buffer, or note a whole read's miss
     pub fn read(&mut self, segment: u64, offset: u64, key: &[u8], start: usize, length: Option<usize>, out: &mut Vec<u8>) -> CacheLookup {
+        self.read_onto(segment, offset, key, start, length, out, 0)
+    }
+
+    /// Copy a cached value into a buffer from a place in it on, keeping what comes before, or note a whole read's miss
+    #[allow(clippy::too_many_arguments, reason = "a record's place and key, the part of its value, and where in the buffer it goes")]
+    pub fn read_onto(&mut self, segment: u64, offset: u64, key: &[u8], start: usize, length: Option<usize>, out: &mut Vec<u8>, at: usize) -> CacheLookup {
         let Some((slot, entry)) = self.find(segment, offset).map(|slot| (slot, self.slots[slot])) else {
             return self.note_miss(segment, offset, length);
         };
@@ -265,12 +271,12 @@ impl CacheShard {
         let end = entry.length as usize;
         let from = start.min(end);
         let to = length.map_or(end, |length| (from + length).min(end));
-        out.clear();
+        out.truncate(at);
         out.extend_from_slice(&self.arena[value_at + from..value_at + to]);
         // a whole read near the tail moves to the head from the caller's copy, since making room can evict the source
         if length.is_none() && from == 0 && entry.at - self.tail < capacity / PROMOTE_PART {
             self.remove_slot(slot);
-            self.append(segment, offset, key, out);
+            self.append(segment, offset, key, &out[at..]);
         }
         CacheLookup::Hit
     }
@@ -332,6 +338,14 @@ impl RecordCache {
     /// Copy a key's cached value into a buffer, or note the miss
     pub fn get(&self, segment: SegmentNumber, offset: FileOffset, key: &[u8], out: &mut Vec<u8>) -> CacheLookup {
         let lookup = hold(self.shard(segment, offset)).read(segment.0, offset.0, key, 0, None, out);
+        self.count(lookup);
+        lookup
+    }
+
+    /// Add a key's cached value onto the end of a buffer, or note the miss and leave the buffer as it was
+    pub fn get_onto(&self, segment: SegmentNumber, offset: FileOffset, key: &[u8], out: &mut Vec<u8>) -> CacheLookup {
+        let at = out.len();
+        let lookup = hold(self.shard(segment, offset)).read_onto(segment.0, offset.0, key, 0, None, out, at);
         self.count(lookup);
         lookup
     }

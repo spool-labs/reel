@@ -160,6 +160,8 @@ pub struct EngineState<Backend: Io> {
     pub seats_together: AtomicU64,
     /// Open trees a scan's heads descended together
     pub heads_together: AtomicU64,
+    /// Values scans took from the record cache with no record read
+    pub scan_cache_hits: AtomicU64,
     /// Caller operations, so maintenance can tell callers are busy
     pub caller_ops: CallerCounts,
     /// The line writers wait on, shared with every volume

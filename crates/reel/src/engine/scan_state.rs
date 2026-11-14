@@ -4,7 +4,7 @@ use std::mem;
 
 use reel_api::column_id::ColumnId;
 use reel_api::direction::Direction;
-use reel_api::units::{ByteCount, FileOffset, WritePlace};
+use reel_api::units::{ByteCount, FileOffset, Nanoseconds, WritePlace};
 
 use crate::index::shard_cursor::{ShardCursor, TreeCursor};
 use crate::engine::read_path::Located;
@@ -108,6 +108,8 @@ pub struct BatchEntry {
     pub key_length: usize,
     pub located: Located,
     pub record: Option<(usize, usize)>,
+    /// The span in the batch's buffer holds the value itself, from the record cache, where it would hold the record
+    pub is_value: bool,
 }
 
 /// Keys a scan located ahead at one point, answered in order. Each answer stands as of that point, so a write that lands
@@ -294,6 +296,11 @@ impl SegmentSource {
         walk.row_in_run(run, self.rows_left, &mut self.key)
     }
 }
+
+/// How often a volume weighs whether the record cache can hold most of its live records for scans
+pub const SCAN_CACHE_WEIGH_EVERY: Nanoseconds = Nanoseconds(1_000_000_000);
+/// The cache holds most of a volume when it holds all but one of these parts of its live records
+pub const SCAN_CACHE_PARTS: u64 = 4;
 
 /// The most sources one batch seats together
 pub const SEAT_BATCH: usize = MOST_MANY_BLOCKS;

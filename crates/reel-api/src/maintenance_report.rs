@@ -597,6 +597,8 @@ pub struct MaintenanceReport {
     pub seats_together: u64,
     /// Open trees a scan's heads descended together, their cache misses overlapped
     pub heads_together: u64,
+    /// Values scans took from the record cache with no record read, while it could hold most of a volume
+    pub scan_cache_hits: u64,
     /// Walk block lookups run together: blocks, candidates asked, candidates whose range held the whole block, per-key checks
     pub block_lookups: [u64; 4],
     pub volumes: Vec<VolumeReading>,
@@ -695,6 +697,7 @@ impl MaintenanceReport {
             scan_seats: 0,
             seats_together: 0,
             heads_together: 0,
+            scan_cache_hits: 0,
             block_lookups: [0; 4],
             volumes: Vec::new(),
             complete_columns: Vec::new(),

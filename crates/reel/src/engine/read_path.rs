@@ -845,7 +845,7 @@ impl<Backend: Io> EngineState<Backend> {
         let mut reader = self.record_reader_for(device);
         let outcome = match want {
             RecordWant::Whole => reader.read_value(device, file, location, &identity, read.info.codec, buf).await,
-            RecordWant::Window(window) => reader.read_window(device, file, location, &identity, window, buf).await,
+            RecordWant::Window(window) => reader.read_window(device, file, location, &identity, read.info.codec, window, buf).await,
         };
         drop(reader);
         // a bad sector comes back as a read error, and it means what a failed check means

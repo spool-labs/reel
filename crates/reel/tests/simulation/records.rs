@@ -12,7 +12,7 @@ use reel::record::record_check::{Checksum, RecordIdentity, RecordKey, checksum};
 use reel::pool::Pool;
 use reel::record::record_encoder::{MOST_RECORD_RUNS, PlainRecord, RecordEncoder, SHARE_BYTES};
 use reel::record::record_head::{SMALL_HEAD_BYTES, chunk_count, chunked_head_bytes, plain_length};
-use reel::record::record_reader::{FIRST_READ_BYTES, RecordLocation, RecordRead, RecordReader};
+use reel::record::record_reader::{FIRST_READ_BYTES, RecordLocation, RecordRead, RecordReader, written_shape};
 use reel::row_kind::RowKind;
 use reel_api::column_id::ColumnId;
 use reel_api::reads::ValueWindow;
@@ -106,7 +106,7 @@ fn read_window(stored: &Stored, window: ValueWindow) -> (RecordRead, Vec<u8>) {
     let file = open(stored);
     let mut reader = RecordReader::new();
     let mut buf = Vec::new();
-    let read = in_place(reader.read_window(&InPlace, &file, stored.location, &identity(), window, &mut buf)).expect("read");
+    let read = in_place(reader.read_window(&InPlace, &file, stored.location, &identity(), Codec::None, window, &mut buf)).expect("read");
     (read, buf)
 }
 
@@ -223,24 +223,70 @@ fn small_window() {
     assert_eq!(bytes, &value[100..150]);
 }
 
-// a window of a large value is two reads, whatever the value's size
+// a window of a large value is two reads, whatever the value's size. A value stored as written sends both together and reads
+// only its head and table up front
 #[test]
 fn window_cost() {
     let value = vec![9; LARGEST.0 as usize];
     for codec in [Codec::None, Codec::Lz4] {
         let stored = store(codec, &value);
-        let file = open(&stored);
-        let mut reader = RecordReader::new();
-        let mut buf = Vec::new();
-        let (reads_before, bytes_before) = stored.io.read_totals();
+        let (reads, bytes, buf) = window_totals(&stored, codec, window(5 * CHUNK_BYTES + 10, 4_096));
 
-        let read = in_place(reader.read_window(&InPlace, &file, stored.location, &identity(), window(5 * CHUNK_BYTES + 10, 4_096), &mut buf)).expect("read");
-
-        let (reads_after, bytes_after) = stored.io.read_totals();
-        assert_eq!(read, RecordRead::Valid);
-        assert_eq!(reads_after.0 - reads_before.0, 2);
-        assert!(bytes_after.0 - bytes_before.0 <= (FIRST_READ_BYTES + CHUNK_BYTES) as u64);
+        assert_eq!(buf, &value[5 * CHUNK_BYTES + 10..5 * CHUNK_BYTES + 10 + 4_096]);
+        assert_eq!(reads, 2);
+        let front = match codec {
+            Codec::None => written_front(&stored),
+            Codec::Lz4 => FIRST_READ_BYTES as u64,
+        };
+        assert!(bytes <= front + CHUNK_BYTES as u64, "{codec:?} read {bytes} B");
     }
+}
+
+// a window over two chunks of a value stored as written reads both chunks in one read beside the head
+#[test]
+fn window_over_two_chunks() {
+    let value = noise(LARGEST.0 as usize);
+    let stored = store(Codec::None, &value);
+    let start = 3 * CHUNK_BYTES - 100;
+
+    let (reads, bytes, buf) = window_totals(&stored, Codec::None, window(start, 4_096));
+
+    assert_eq!(buf, &value[start..start + 4_096]);
+    assert_eq!(reads, 2);
+    assert!(bytes <= written_front(&stored) + 2 * CHUNK_BYTES as u64, "read {bytes} B");
+}
+
+// a rotten chunk under a window of a value stored as written fails its check, as the long way finds it
+#[test]
+fn window_rotten_chunk() {
+    let value = noise(LARGEST.0 as usize);
+    let stored = store(Codec::None, &value);
+    let shape = written_shape(stored.location.length).expect("stored as written");
+    rot_at(&stored, &stored.path, (shape.front_length + 2 * CHUNK_BYTES + 7) as u64);
+
+    let (read, _bytes) = read_window(&stored, window(2 * CHUNK_BYTES, 100));
+    let (clean, bytes) = read_window(&stored, window(CHUNK_BYTES, 100));
+
+    assert_eq!(read, RecordRead::Failed);
+    assert_eq!(clean, RecordRead::Valid);
+    assert_eq!(bytes, &value[CHUNK_BYTES..CHUNK_BYTES + 100]);
+}
+
+// the head and table of a value stored as written, all a window reads ahead of its chunks
+fn written_front(stored: &Stored) -> u64 {
+    written_shape(stored.location.length).expect("stored as written").front_length as u64
+}
+
+// the reads and bytes one window takes, and what it gave back
+fn window_totals(stored: &Stored, declared: Codec, window: ValueWindow) -> (u64, u64, Vec<u8>) {
+    let file = open(stored);
+    let mut reader = RecordReader::new();
+    let mut buf = Vec::new();
+    let (reads_before, bytes_before) = stored.io.read_totals();
+    let read = in_place(reader.read_window(&InPlace, &file, stored.location, &identity(), declared, window, &mut buf)).expect("read");
+    let (reads_after, bytes_after) = stored.io.read_totals();
+    assert_eq!(read, RecordRead::Valid);
+    (reads_after.0 - reads_before.0, bytes_after.0 - bytes_before.0, buf)
 }
 
 // a record read under another key, kind, column or store is refused

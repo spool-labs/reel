@@ -7,7 +7,7 @@ use reel_api::reads::ValueWindow;
 use reel_api::units::{ByteCount, FileOffset};
 
 use crate::pool::{HollowItem, touched_zeroes};
-use crate::io::{DeviceReads, IoFile, ReadOn};
+use crate::io::{DeviceReads, IoFile, ManyRead, ReadOn};
 use crate::record::chunk_table::{
     ChunkCount, ChunkIndex, ChunkSpan, ENTRIES_PER_PAGE, TABLE_PAGE_BYTES, TablePageIndex, chunk_span, page_bytes,
     page_count, page_of, table_bytes,
@@ -156,15 +156,22 @@ impl RecordReader {
     }
 
     /// Fill the buffer with a window of the value, cut at the value's end
+    #[allow(clippy::too_many_arguments, reason = "a record's place and identity, its column's codec, and the window it fills")]
     pub async fn read_window<File: IoFile>(
         &mut self,
         device: &impl DeviceReads<File>,
         file: &File,
         location: RecordLocation,
         identity: &RecordIdentity<'_>,
+        declared: Codec,
         window: ValueWindow,
         buf: &mut Vec<u8>,
     ) -> Result<RecordRead> {
+        if declared == Codec::None
+            && let Some(read) = self.read_written_window(device, file, location, identity, window, buf).await
+        {
+            return Ok(read);
+        }
         let length = self.read_front(device, file, location).await?;
         let Some(form) = self.form() else {
             return Ok(RecordRead::Failed);
@@ -179,6 +186,62 @@ impl RecordReader {
             return Ok(RecordRead::Failed);
         };
         self.read_chunks(device, file, location, &head, window, buf).await
+    }
+
+    /// Fill the buffer with a window of a value stored as written, sending the head and the window's chunks to the device
+    /// together, since the record's length says where both sit. Nothing when the record turns out other than its length
+    /// says, or a read comes back short, and the window then takes the long way, which gives the answer that counts
+    pub async fn read_written_window<File: IoFile>(
+        &mut self,
+        device: &impl DeviceReads<File>,
+        file: &File,
+        location: RecordLocation,
+        identity: &RecordIdentity<'_>,
+        window: ValueWindow,
+        buf: &mut Vec<u8>,
+    ) -> Option<RecordRead> {
+        let shape = written_shape(location.length).filter(|shape| shape.front_length <= FIRST_READ_BYTES)?;
+        let value_end = shape.value_length.0;
+        let start = window.offset.0.min(value_end);
+        let end = start.saturating_add(window.length.0).min(value_end);
+        if start == end {
+            return None;
+        }
+        let chunk_bytes = CHUNK_BYTES as u64;
+        let (first_chunk, last_chunk) = (start / chunk_bytes, (end - 1) / chunk_bytes);
+        let span_start = first_chunk * chunk_bytes;
+        let span_end = ((last_chunk + 1) * chunk_bytes).min(value_end);
+        buf.clear();
+        buf.resize((span_end - span_start) as usize, 0);
+        let front = shape.front_length;
+        let chunks_at = FileOffset(location.offset.0 + front as u64 + span_start);
+        let mut reads = [
+            Some(ManyRead { file, offset: location.offset, buf: &mut self.first[..front], is_done: false }),
+            Some(ManyRead { file, offset: chunks_at, buf: &mut buf[..], is_done: false }),
+        ];
+        device.read_many(&mut reads).await;
+        if !reads.iter().flatten().all(|read| read.is_done) {
+            return None;
+        }
+
+        let form = self.form().filter(|form| form.is_chunked && form.codec == Codec::None)?;
+        let head = self.check_chunked(form, front, identity).filter(|head| head.value_length == shape.value_length)?;
+        let payload = payload_start(&head);
+        for chunk in first_chunk..=last_chunk {
+            let chunk = ChunkIndex(chunk);
+            let page = page_of(chunk);
+            // the first page sits in the head read and loads with no read. A value long enough for a second page takes the long way
+            if page.0 != 0 || !self.load_page(device, file, location, &head, page).await.ok()? {
+                return None;
+            }
+            let span = self.span_of(location, &head, chunk, page)?;
+            if !is_chunk_in_span(&span, chunk, payload, buf, span_start) {
+                return None;
+            }
+        }
+        buf.copy_within((start - span_start) as usize..(end - span_start) as usize, 0);
+        buf.truncate((end - start) as usize);
+        Some(RecordRead::Valid)
     }
 
     /// Read the head and the first table page, or all of a small record, in one read
@@ -268,7 +331,7 @@ impl RecordReader {
                 let Some(span) = self.span_of(location, head, chunk, page) else {
                     return Ok(RecordRead::Failed);
                 };
-                if !is_chunk_in_place(&span, chunk, start, buf) {
+                if !is_chunk_in_span(&span, chunk, start, buf, 0) {
                     return Ok(RecordRead::Failed);
                 }
             }
@@ -411,16 +474,16 @@ pub fn payload_start(head: &ChunkedHead) -> u64 {
     head.head_length as u64 + table_bytes(head.chunks).0
 }
 
-/// Check one chunk of a value stored as written: its span, then its bytes
-pub fn is_chunk_in_place(span: &ChunkSpan, chunk: ChunkIndex, payload_start: u64, buf: &[u8]) -> bool {
+/// Check one chunk of a value stored as written: its span, then its bytes, in a buffer that starts at a value byte
+pub fn is_chunk_in_span(span: &ChunkSpan, chunk: ChunkIndex, payload_start: u64, buf: &[u8], buf_start: u64) -> bool {
     let start = chunk.0 * CHUNK_BYTES as u64;
     let is_where_expected = span.entry.stored_offset.0 == payload_start + start;
-    if !is_where_expected || span.stored_length != span.entry.value_length {
+    if !is_where_expected || span.stored_length != span.entry.value_length || start < buf_start {
         return false;
     }
 
-    let end = start + span.entry.value_length.0;
-    match buf.get(start as usize..end as usize) {
+    let (from, to) = (start - buf_start, start - buf_start + span.entry.value_length.0);
+    match buf.get(from as usize..to as usize) {
         Some(bytes) => checksum(bytes) == span.entry.checksum,
         None => false,
     }

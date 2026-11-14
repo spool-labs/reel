@@ -1070,6 +1070,34 @@ fn batch_value(number: u64) -> Vec<u8> {
     format!("first-{number}").into_bytes()
 }
 
+// a walk's first batch locates a few keys and each later batch twice as many up to a full one, so a short scan reads few
+// records it never returns
+#[test]
+fn first_batch_is_small() {
+    use reel::engine::scan_state::{BATCH_KEYS, FIRST_BATCH_KEYS};
+    let io = SimulatedIo::new(Seed(45));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    for number in 0..BATCH_TEST_KEYS {
+        store.put(COLUMN, &key(number), &batch_value(number)).expect("put");
+    }
+    seal(&store, &io);
+    let range = reel::engine::scan_state::from_key(COLUMN, b"", Direction::Ascending);
+
+    let mut scan = store.state.take_scan(&range, None).expect("scan");
+    // each step past the end of a batch fills the next one, and the step takes the first key of it
+    let mut sizes = Vec::new();
+    for _batch in 0..4 {
+        let left = (scan.batch.entries.len() - scan.batch.next) as u64;
+        assert_eq!(step_keys(&store, &mut scan, left + 1).len() as u64, left + 1);
+        sizes.push(scan.batch.entries.len());
+    }
+
+    assert_eq!(sizes, [FIRST_BATCH_KEYS, 2 * FIRST_BATCH_KEYS, BATCH_KEYS, BATCH_KEYS]);
+    store.state.give_back_scan(scan);
+    store.close().expect("close");
+}
+
 // a walk for values reads its small sealed records in batches, answers a batch as of the point it located it, and seeks
 // again from the key it stands on when the batch's segment leaves under it
 #[test]

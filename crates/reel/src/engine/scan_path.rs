@@ -321,7 +321,7 @@ impl<Backend: Io> EngineState<Backend> {
         let mut outcome = Ok(());
         // a batch takes keys while the records it reads still fit its buffer, so wide records read in batches of fewer keys
         let mut located_bytes = 0;
-        while scan.batch.entries.len() < BATCH_KEYS && located_bytes + MOST_BATCH_RECORD <= BATCH_BYTES {
+        while scan.batch.entries.len() < scan.batch_keys && located_bytes + MOST_BATCH_RECORD <= BATCH_BYTES {
             let entries = scan.batch.entries.len();
             match self.counted(self.try_step(ReadOn::new(device, volume), directory, scan, Some(point), &mut key, ScanWant::Locate).await) {
                 Ok(StepOutcome::Answer(ScanStep::Found) | StepOutcome::Passed) => {
@@ -349,6 +349,8 @@ impl<Backend: Io> EngineState<Backend> {
             outcome?;
         }
         self.read_batch(device, volume, scan).await;
+        // a walk that wants more keys takes more a batch, up to a full one
+        scan.batch_keys = (scan.batch_keys * 2).min(BATCH_KEYS);
         Ok(())
     }
 

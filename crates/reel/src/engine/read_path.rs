@@ -412,13 +412,13 @@ impl<Backend: Io> EngineState<Backend> {
         for ((key, plan), row) in keys.iter().zip(&mut plans).zip(&mut rows) {
             let read = self.key_read(column, key, at.point, true)?;
             *plan = match self.locate(device, volume, &read).await {
-                // a cached record needs no read, and its key's own read answers from the cache
-                Ok(KeyPlace::Spot(sealed)) => match self.record_cache.get(sealed.segment, sealed.row.offset, read.key, scratch) {
-                    CacheLookup::Hit => KeyPlan::Own,
-                    lookup => {
+                // a cached record needs no read: the answer loop takes it from the cache
+                Ok(KeyPlace::Spot(sealed)) => {
+                    let lookup = self.record_cache.get(sealed.segment, sealed.row.offset, read.key, scratch);
+                    if lookup != CacheLookup::Hit {
                         *row = Some(sealed);
-                        KeyPlan::Spot(sealed, lookup)
-                    },
+                    }
+                    KeyPlan::Spot(sealed, lookup)
                 },
                 Ok(KeyPlace::Row(Located::Sealed(sealed))) => {
                     if sealed.row.kind != RowKind::Value || read.cover.is_some_and(|cover| cover > sealed.row.place) {
@@ -468,8 +468,14 @@ impl<Backend: Io> EngineState<Backend> {
                 batched += 1;
                 continue;
             }
-            // a cached or wide sealed record reads on its own. A spot's record that fails its check may have moved, and so
-            // may a batched one, and the key's own read settles both
+            // the cache holds the value with its key, so a hit at plan time answers with no second locate, and one evicted since
+            // takes the key's own read below
+            if lookup == CacheLookup::Hit && self.record_cache.get(sealed.segment, sealed.row.offset, read.key, scratch) == CacheLookup::Hit {
+                values.push_found(scratch);
+                continue;
+            }
+            // a wide sealed record reads on its own. A spot's record that fails its check may have moved, and so may a
+            // batched one, and the key's own read settles both
             if span.is_none() && matches!(plan, KeyPlan::Sealed(..)) {
                 match self.read_sealed(device, volume, &read, &sealed, RecordWant::Whole, scratch).await {
                     Ok(true) => {

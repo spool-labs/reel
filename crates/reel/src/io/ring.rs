@@ -409,6 +409,15 @@ impl<Driver> ReadRing<Driver> {
     }
 }
 
+/// One slot's piece of a read sent with others: the read it fills, where in that read's buffer it starts, its length, and its
+/// lease
+pub struct ReadPiece<'ring, Driver> {
+    pub index: usize,
+    pub at: usize,
+    pub part: usize,
+    pub lease: RingLease<'ring, Driver>,
+}
+
 impl<Driver> RingLease<'_, Driver> {
     /// Hand the slot to the device, and leave it held when the start fails
     pub fn start<File>(&self, file: &File, offset: FileOffset, length: usize) -> Result<()>
@@ -546,39 +555,52 @@ impl<Driver> ReadRing<Driver> {
         Ok(())
     }
 
-    /// Fill several buffers on this thread: the page cache answers what it holds, the rest go to the ring together, and then
-    /// each waits for its own. A read past one slot, or one that finds every slot taken, goes in one plain read
+    /// Fill several buffers on this thread: the page cache answers what it holds, the rest go to the ring together in pieces
+    /// of a slot each, and then each piece waits for its own. A read whose pieces found no slot, or came back short, goes in
+    /// one plain read
     pub fn read_many_now<File>(&self, reads: &mut [Option<ManyRead<'_, File>>])
     where
         Driver: RingDriver<File>,
         File: IoFile,
     {
-        let mut leases: [Option<RingLease<'_, Driver>>; MOST_MANY_READS] = [const { None }; MOST_MANY_READS];
-        for (read, lease) in reads.iter_mut().zip(leases.iter_mut()).filter_map(|(read, lease)| Some((read.as_mut()?, lease))) {
+        let mut pieces: [Option<ReadPiece<'_, Driver>>; MOST_MANY_READS] = [const { None }; MOST_MANY_READS];
+        let mut piece_count = 0;
+        for (index, read) in reads.iter_mut().enumerate().filter_map(|(index, read)| Some((index, read.as_mut()?))) {
             let length = read.buf.len();
-            read.is_done = length <= RING_SLOT_BYTES
-                && matches!(read.file.try_read_at(read.offset, read.buf), Ok(Some(ByteCount(count))) if count == length as u64);
-            if read.is_done || length > RING_SLOT_BYTES {
-                continue;
+            read.is_done = matches!(read.file.try_read_at(read.offset, read.buf), Ok(Some(ByteCount(count))) if count == length as u64);
+            let mut at = 0;
+            while !read.is_done && at < length && piece_count < MOST_MANY_READS {
+                let part = (length - at).min(RING_SLOT_BYTES);
+                let Ok(Some(claimed)) = self.try_claim() else {
+                    break;
+                };
+                if claimed.start(read.file, FileOffset(read.offset.0 + at as u64), part).is_err() {
+                    break;
+                }
+                pieces[piece_count] = Some(ReadPiece { index, at, part, lease: claimed });
+                piece_count += 1;
+                at += part;
             }
-            if let Ok(Some(claimed)) = self.try_claim()
-                && claimed.start(read.file, read.offset, length).is_ok()
+        }
+        // the read and length of each piece that came back whole, so a read is whole once its pieces cover it
+        let mut landed = [(usize::MAX, 0_usize); MOST_MANY_READS];
+        for (piece, landing) in pieces.iter_mut().take(piece_count).zip(landed.iter_mut()) {
+            let Some(ReadPiece { index, at, part, lease }) = piece.take() else {
+                continue;
+            };
+            if let Some(read) = reads[index].as_mut()
+                && lease.wait_now().is_ok_and(|length| length == part)
             {
-                *lease = Some(claimed);
+                self.driver.copy_out(lease.slot, &mut read.buf[at..at + part]);
+                *landing = (index, part);
             }
         }
         for (index, read) in reads.iter_mut().enumerate().filter_map(|(index, read)| Some((index, read.as_mut()?))) {
             if read.is_done {
                 continue;
             }
-            if let Some(lease) = leases.get_mut(index).and_then(Option::take)
-                && lease.wait_now().is_ok_and(|length| length == read.buf.len())
-            {
-                self.driver.copy_out(lease.slot, read.buf);
-                read.is_done = true;
-                continue;
-            }
-            read.is_done = self.read_into_now(read.file, read.offset, read.buf).is_ok();
+            let covered: usize = landed.iter().filter(|(owner, _part)| *owner == index).map(|(_owner, part)| part).sum();
+            read.is_done = covered == read.buf.len() || self.read_into_now(read.file, read.offset, read.buf).is_ok();
         }
     }
 

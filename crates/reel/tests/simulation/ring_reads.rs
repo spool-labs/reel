@@ -185,6 +185,31 @@ fn large_value_in_turns() {
     store.close().expect("close");
 }
 
+// a window over two chunks of a cold value sends its head and both chunks to the ring before it waits for any, the wide
+// read in pieces of a slot each
+#[test]
+fn wide_window_in_pieces() {
+    let io = SimulatedIo::new(Seed(13));
+    io.use_ring();
+    let store = open(&io);
+    let large: Vec<u8> = (0..4 * RING_SLOT_BYTES + 17).map(|at| (at % 251) as u8).collect();
+    store.put(COLUMN, b"large", &large).expect("put");
+    store.seal_now();
+    settle(&io);
+    store.close().expect("close");
+    drop(store);
+    let store = open(&io);
+    let start = 2 * RING_SLOT_BYTES - 100;
+    let window = ValueWindow { offset: ByteCount(start as u64), length: ByteCount(4_096) };
+
+    let mut buf = Vec::new();
+    assert!(store.get_range(COLUMN, b"large", window, &mut buf).expect("window"));
+
+    assert_eq!(buf, &large[start..start + 4_096]);
+    assert!(ring(&store).driver.most_waiting() >= 3, "{} reads waited at once", ring(&store).driver.most_waiting());
+    store.close().expect("close");
+}
+
 // a read dropped with the device working leaves its slot to the completion, and every slot comes back
 #[test]
 fn dropped_read_frees_its_slot() {

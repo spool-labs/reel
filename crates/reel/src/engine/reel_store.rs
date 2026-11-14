@@ -26,7 +26,7 @@ use crate::engine::admission::Admission;
 use reel_api::maintenance_report::WorkerPriority;
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::engine_sizing::{
-    complete_block_rows, complete_row_limit,
+    complete_block_rows, complete_row_limit, split_idle_room,
     EngineSizing, FILTER_CACHE_QUARTERS, FILTER_SLOT_BYTES, GROUP_BYTES, LEAST_LZ4_BUDGET, LEAST_SHARD_ENTRIES, PLANNED_LINE_BYTES,
     SHARED_JOBS, StoreShape, GATHER_BYTES, WRITE_BUFFERS, read_buffers, assumed_segment_bytes, capped_entries, disk_entries, entry_cost, entry_cover, floor_entries,
     dead_bits_bytes, segment_bytes_for, target_rows,
@@ -1259,7 +1259,11 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
     let block_share = ByteCount(sizing.cache_share.0 - filter_share.0);
     // complete columns read small blocks, and a slot sized for a full block would hold a sixteenth of what it could
     let complete_share = ByteCount(if is_complete { block_share.0 / 2 } else { 0 });
-    let row_share = ByteCount(block_share.0 - complete_share.0);
+    let base_rows = block_share.0 - complete_share.0;
+    let row_blocks: u64 = volumes.iter().map(|volume| hold(&volume.summary).rows().map(|row| u64::from(row.facts.block_count)).sum::<u64>()).sum();
+    let split = split_idle_room(cache_room, stripe, base_rows, row_blocks * ROW_BLOCK_BYTES as u64);
+    let row_share = ByteCount(base_rows + split.to_rows);
+    let record_share = ByteCount(record_room - arena_taken + split.to_records);
     let reserved = superblock.next_segment.0;
     let first_number = reserved.saturating_sub(SEGMENT_NUMBER_BATCH);
 
@@ -1274,10 +1278,10 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         places,
         index: WriteIndex::new(&sizing.shard),
         spot: SpotIndex::new(sizing.spot_share),
-        filter_cache: BlockCache::new(ByteCount(filter_share.0 - base_arena), FILTER_SLOT_BYTES),
+        filter_cache: BlockCache::new(ByteCount(split.filter_cache), FILTER_SLOT_BYTES),
         filter_arena: FilterArena::new(arena_share, planned.iter().map(|table| table.segments_per_shard * TABLE_SHARDS).sum()),
         row_cache: BlockCache::new(row_share, ROW_BLOCK_BYTES),
-        record_cache: RecordCache::new(ByteCount(record_room - arena_taken), cache_mean),
+        record_cache: RecordCache::new(record_share, cache_mean),
         complete_cache: is_complete.then(|| BlockCache::new(complete_share, COMPLETE_BLOCK_BYTES)),
         complete_line_bytes: ByteCount(complete_lines(config) * size_of::<BlockEntry>() as u64),
         queues,

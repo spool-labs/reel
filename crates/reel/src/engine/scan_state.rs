@@ -94,8 +94,6 @@ pub struct ShardHead {
 /// The most keys a scan locates ahead of its caller at one point, and the bytes of records it reads for them in one go
 pub const BATCH_KEYS: usize = 32;
 pub const BATCH_BYTES: usize = 64 * 1024;
-/// The keys a walk's first batch locates, so a short scan reads few records it never returns
-pub const FIRST_BATCH_KEYS: usize = 8;
 /// The largest record a batch takes: a 4 KiB value with its key and header fits, so a store of them scans in batches
 pub const MOST_BATCH_RECORD: usize = 8 * 1024;
 /// Records in one segment this close join into one read
@@ -195,8 +193,6 @@ pub struct ScanState {
     pub lookups: u64,
     /// Keys answered from a record the batch read in a joined run
     pub batched: u64,
-    /// The keys the next batch locates: a few for a walk that may stop early, doubling to `BATCH_KEYS` as it goes on
-    pub batch_keys: usize,
     pub window: ScanWindows,
     pub batch: ScanBatch,
 }
@@ -345,7 +341,6 @@ impl ScanState {
             taken: 0,
             lookups: 0,
             batched: 0,
-            batch_keys: FIRST_BATCH_KEYS,
             window: ScanWindows::new(),
             batch: ScanBatch::new(widest_key),
         }
@@ -365,7 +360,6 @@ impl ScanState {
         self.taken = 0;
         self.lookups = 0;
         self.batched = 0;
-        self.batch_keys = FIRST_BATCH_KEYS;
         for source in &mut self.sources {
             source.fills = 0;
             source.cache_steps = 0;

@@ -453,3 +453,25 @@ pub fn floor_rows() -> u64 {
 pub const fn floor_rows() -> u64 {
     FLOOR_ROWS
 }
+
+/// How the filter cache's room splits at open: what it keeps, and what the row and record caches take from it
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IdleSplit {
+    pub filter_cache: u64,
+    pub to_rows: u64,
+    pub to_records: u64,
+}
+
+/// Split the filter cache's room. It holds only filters the arena has no room for, so its room past one stripe sits idle
+/// while the arena holds every filter, and none is left over once it doesn't. The row cache takes the idle room in whole
+/// stripes, up to the row blocks on disk with the arena's margin past its own share, and the record cache takes the rest
+pub fn split_idle_room(cache_room: u64, stripe: u64, base_rows: u64, row_block_bytes: u64) -> IdleSplit {
+    let idle = cache_room.saturating_sub(stripe);
+    let wanted = row_block_bytes.saturating_mul(ARENA_GROWTH);
+    let to_rows = idle.min(wanted.saturating_sub(base_rows)) / stripe * stripe;
+    IdleSplit {
+        filter_cache: cache_room - idle,
+        to_rows,
+        to_records: idle - to_rows,
+    }
+}

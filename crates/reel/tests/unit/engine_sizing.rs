@@ -328,3 +328,25 @@ fn shard_sizing_reads_the_built_heap() {
     let built = reel::index::write_shard::WriteShard::new(&planned.shard);
     assert_eq!(planned.shard.heap_bytes(), built.heap_bytes());
 }
+
+// with every filter in the arena, the filter cache keeps one stripe and the row cache takes the rest, up to the row blocks on
+// disk with the arena's margin, and the record cache takes what the row cache doesn't need
+#[test]
+fn idle_filter_room_goes_to_rows() {
+    let stripe = 1_000;
+    let small_rows = split_idle_room(10 * stripe, stripe, 2 * stripe, stripe);
+    let large_rows = split_idle_room(10 * stripe, stripe, 2 * stripe, 100 * stripe);
+
+    assert_eq!(small_rows, IdleSplit { filter_cache: stripe, to_rows: 0, to_records: 9 * stripe });
+    assert_eq!(large_rows, IdleSplit { filter_cache: stripe, to_rows: 9 * stripe, to_records: 0 });
+    let some_rows = split_idle_room(10 * stripe, stripe, 2 * stripe, 3 * stripe + stripe / 2);
+    assert_eq!(some_rows.to_rows, 5 * stripe);
+    assert_eq!(some_rows.filter_cache + some_rows.to_rows + some_rows.to_records, 10 * stripe);
+}
+
+// a filter cache the arena overflows into keeps its room, and nothing moves
+#[test]
+fn full_filter_room_stays() {
+    let stripe = 1_000;
+    assert_eq!(split_idle_room(stripe, stripe, 2 * stripe, 100 * stripe), IdleSplit { filter_cache: stripe, to_rows: 0, to_records: 0 });
+}

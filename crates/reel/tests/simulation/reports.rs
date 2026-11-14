@@ -375,14 +375,15 @@ fn written_by_source() {
     store.close().expect("close");
 }
 
-// filters come before the record cache: a reopen with rows on disk past the floor grows the arena out of the filter share first,
-// and the record cache gives the dead bits and what the filter share lacks
+// filters come before the record cache: a reopen with rows on disk past the floor grows the arena into the filter share, whose
+// idle room the record cache gives back, and the record cache gives no more than the dead bits and the arena
 #[test]
 fn arena_takes_room_for_rows_on_disk() {
     reel::engine::engine_sizing::TEST_FLOOR_ROWS.with(|floor| floor.set(FLOOR_TEST_ROWS));
     let io = SimulatedIo::new(Seed(41));
     let store = open(&io);
     let fresh = store.state.memory_report();
+    let filter_cache = store.state.filter_cache.heap_bytes();
     for number in 0..ARENA_ROWS {
         store.put(COLUMN, format!("key-{number:06}").as_bytes(), b"value").expect("put");
     }
@@ -398,7 +399,8 @@ fn arena_takes_room_for_rows_on_disk() {
     let arena_grew = grown.arena_room.0 - fresh.arena_room.0;
     let cache_gave = fresh.record_cache.0 - grown.record_cache.0;
     assert!(cache_gave <= bits_grew + arena_grew + PAGE_SLACK, "the record cache gave past the dead bits and the arena");
-    assert!(arena_grew > cache_gave - bits_grew, "the filter share gave the arena nothing");
+    // the filter cache's idle room went to the other caches on both opens, so the arena grew into room they gave back
+    assert_eq!(store.state.filter_cache.heap_bytes(), filter_cache, "the filter cache kept more than its stripe");
     store.close().expect("close");
 }
 

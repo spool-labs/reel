@@ -9,7 +9,7 @@ use crate::config::MAX_KEY_BYTES;
 use crate::region::{Region, list_bytes};
 use crate::little_endian::{read_half, read_word};
 use crate::row_kind::RowKind;
-use crate::segment::varint::{MAX_VARINT_BYTES, read_varint, write_varint};
+use crate::segment::varint::{MAX_VARINT_BYTES, read_varint, skip_varint, write_varint};
 
 /// Most bytes in a row block
 pub const ROW_BLOCK_BYTES: usize = 16 * 1024;
@@ -412,7 +412,9 @@ impl<'block> RowBlockWalk<'block> {
         self.next_row(key)
     }
 
-    /// Move to the first row at or after a key, return its row, and leave its key in the buffer
+    /// Move to the first row at or after a key, return its row, and leave its key in the buffer. A restart's key shares
+    /// nothing with the row before, so the search compares it where it lies, and the walk from there builds keys and reads
+    /// a row's numbers only for the row it stops on
     pub fn seek(&mut self, target: &[u8], key: &mut impl ListOut<u8>) -> Option<FooterRow> {
         if self.restart_count() == 0 {
             return None;
@@ -422,19 +424,67 @@ impl<'block> RowBlockWalk<'block> {
         let mut high = self.restart_count();
         while low + 1 < high {
             let middle = (low + high) / 2;
-            self.key_at_restart(middle, key)?;
-            if **key < *target {
+            if self.restart_key(middle)? < target {
                 low = middle;
             } else {
                 high = middle;
             }
         }
 
-        let mut row = self.key_at_restart(low, key)?;
-        while **key < *target {
-            row = self.next_row(key)?;
+        self.position = self.restart_at(low);
+        self.next_index = low * RESTART_INTERVAL as usize;
+        key.clear();
+        loop {
+            let (kind, numbers_at) = self.next_key(key)?;
+            if **key >= *target {
+                return self.row_numbers(kind, numbers_at);
+            }
         }
-        Some(row)
+    }
+
+    /// Read a restart's whole key where it lies in the block
+    pub fn restart_key(&self, index: usize) -> Option<&'block [u8]> {
+        let bytes = self.rows.get(self.restart_at(index)..)?;
+        let (first, shared_bytes) = read_varint(bytes)?;
+        if first >> KIND_BITS != 0 {
+            return None;
+        }
+        let (suffix_length, suffix_bytes) = read_varint(bytes.get(shared_bytes..)?)?;
+        let suffix_at = shared_bytes + suffix_bytes;
+        bytes.get(suffix_at..suffix_at.checked_add(usize::try_from(suffix_length).ok()?)?)
+    }
+
+    /// Fill the key buffer with the next row's key and step past the row, returning its kind and where its numbers start
+    pub fn next_key(&mut self, key: &mut impl ListOut<u8>) -> Option<(RowKind, usize)> {
+        let bytes = self.rows.get(self.position..)?;
+        let (first, shared_bytes) = read_varint(bytes)?;
+        let kind = RowKind::from_byte((first & KIND_MASK) as u8)?;
+        let (suffix_length, suffix_bytes) = read_varint(bytes.get(shared_bytes..)?)?;
+        let suffix_at = shared_bytes + suffix_bytes;
+        let numbers_at = suffix_at.checked_add(usize::try_from(suffix_length).ok()?)?;
+        key.truncate((first >> KIND_BITS) as usize);
+        key.extend_from_slice(bytes.get(suffix_at..numbers_at)?).ok()?;
+        let place_bytes = skip_varint(bytes.get(numbers_at..)?)?;
+        let offset_bytes = skip_varint(bytes.get(numbers_at + place_bytes..)?)?;
+        let length_bytes = skip_varint(bytes.get(numbers_at + place_bytes + offset_bytes..)?)?;
+        let numbers_at = self.position + numbers_at;
+        self.position = numbers_at + place_bytes + offset_bytes + length_bytes;
+        self.next_index += 1;
+        Some((kind, numbers_at))
+    }
+
+    /// Read a row's place, offset and length from where its numbers start
+    pub fn row_numbers(&self, kind: RowKind, numbers_at: usize) -> Option<FooterRow> {
+        let bytes = self.rows.get(numbers_at..)?;
+        let (place, place_bytes) = read_varint(bytes)?;
+        let (offset, offset_bytes) = read_varint(bytes.get(place_bytes..)?)?;
+        let (length, _length_bytes) = read_varint(bytes.get(place_bytes + offset_bytes..)?)?;
+        Some(FooterRow {
+            place: WritePlace(self.place_base.0.checked_add(place)?),
+            offset: FileOffset(offset),
+            length: ByteCount(length),
+            kind,
+        })
     }
 }
 

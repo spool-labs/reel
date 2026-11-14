@@ -63,6 +63,34 @@ fn block_seek() {
     }
 }
 
+// a seek leaves the walk on the row after the one it found, over keys of mixed lengths that share long prefixes, and a seek
+// before the first key lands on it
+#[test]
+fn walk_after_seek() {
+    let keys: Vec<Vec<u8>> = (0..ROWS).map(|number| format!("k{}{number:05}", "x".repeat((number % 7) as usize)).into_bytes()).collect();
+    let mut sorted = keys.clone();
+    sorted.sort();
+    let mut builder = RowBlockBuilder::new();
+    for (number, key) in sorted.iter().enumerate() {
+        assert!(builder.push(key, &row_of(number as u64)));
+    }
+    let block = builder.finish();
+    let mut key = Vec::new();
+
+    for (number, target) in sorted.iter().enumerate().step_by(13) {
+        let mut walk = RowBlockWalk::open(block, WritePlace(0)).expect("whole block");
+        assert_eq!(walk.seek(target, &mut key), Some(row_of(number as u64)));
+        assert_eq!(&key, target);
+        for (after, expected) in sorted.iter().enumerate().skip(number + 1).take(19) {
+            assert_eq!(walk.next_row(&mut key), Some(row_of(after as u64)));
+            assert_eq!(&key, expected);
+        }
+    }
+    let mut walk = RowBlockWalk::open(block, WritePlace(0)).expect("whole block");
+    assert_eq!(walk.seek(b"a", &mut key), Some(row_of(0)));
+    assert_eq!(key, sorted[0]);
+}
+
 // a block stays inside its size and refuses the row that would overflow it
 #[test]
 fn block_limit() {

@@ -26,6 +26,11 @@ pub fn write_varint(out: &mut [u8], number: u64) -> Option<usize> {
 
 /// Read a number and how many bytes it took, or nothing when the bytes end early
 pub fn read_varint(bytes: &[u8]) -> Option<(u64, usize)> {
+    // most numbers in a row block fit one byte
+    let first = *bytes.first()?;
+    if first & CONTINUE_BIT == 0 {
+        return Some((u64::from(first), 1));
+    }
     let mut number: u64 = 0;
     for index in 0..MAX_VARINT_BYTES {
         let byte = *bytes.get(index)?;
@@ -35,4 +40,10 @@ pub fn read_varint(bytes: &[u8]) -> Option<(u64, usize)> {
         }
     }
     None
+}
+
+/// Count the bytes of the number at the front, without reading it, or nothing when the bytes end early
+pub fn skip_varint(bytes: &[u8]) -> Option<usize> {
+    let length = bytes.iter().take(MAX_VARINT_BYTES).position(|byte| byte & CONTINUE_BIT == 0)?;
+    Some(length + 1)
 }

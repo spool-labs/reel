@@ -398,11 +398,12 @@ impl<Backend: Io> CompactJob<Backend> {
             self.pick_retry = Some((wait, load));
             return JobStep::IdleUntil { deadline: wait };
         }
-        // a look takes a few segments at a time, and the rest still count. Hot ingest looks at none, and a pick behind an overlap
-        // merge stops this pass, since the overlap owed brings the next step back to it. A look that didn't move, as when only a busy
-        // lane may overlap and its seat holds a merge, stops the pass too, and the next ask or change brings it back
+        // a look takes a few segments at a time, and the rest still count. Hot ingest looks at none. A pick behind an overlap merge
+        // goes on while the look moved and has segments left, since only the pass end clears the bound. A look that didn't move, as
+        // when only a busy lane may overlap and its seat holds a merge, stops the pass, and the next ask or change brings it back
         let has_looked = volume.looks.up_to() != looked_before;
-        self.should_rewrite = should_rewrite && !is_deferring && refusal.is_none() && volume.looks.has_left() && has_looked;
+        let may_go_on = matches!(refusal, None | Some(Refusal::Behind));
+        self.should_rewrite = should_rewrite && !is_deferring && may_go_on && volume.looks.has_left() && has_looked;
         // a quiet pass that found nothing past the bar looks again only once a seal, a rewrite, an unlink or the room changes what
         // it saw
         if is_quiet_with_dead && !self.should_rewrite && refusal.is_none() && after.nothing > before.nothing {

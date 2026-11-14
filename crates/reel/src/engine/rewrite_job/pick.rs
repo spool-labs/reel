@@ -322,8 +322,8 @@ impl<Backend: Io> RewriteJob<Backend> {
         volume.looks.set_up_to(looked_up_to);
         volume.looks.set_left(!rows.orders().after(looked_up_to).is_empty());
         let Some((crowded, column)) = found else {
-            // a look stopped for time has more to see, so it ends no pass and finds no miss
-            if is_late() {
+            // a look stopped for time or at its few segments has more to see, so it ends no pass and finds no miss
+            if is_late() || volume.looks.has_left() {
                 volume.looks.set_left(true);
                 return None;
             }

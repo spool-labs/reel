@@ -21,7 +21,7 @@ use reel::engine::reel_store::ReelStore;
 use reel::engine::reserve_job::RESERVE_PERIOD;
 use reel::engine::row_job::IDLE_SEAL_AFTER;
 use reel::engine::dead_bits::DECIDED_SET;
-use reel::engine::rewrite_job::{MERGE_BUFFER_BYTES, MergeTarget, MOST_OVERLAP, MOST_PARK_WAIT, PLANNER_LANE, RewriteJob, RewritePhase, is_overlap_input, overlaps, rows_of};
+use reel::engine::rewrite_job::{MERGE_BUFFER_BYTES, MergeTarget, MOST_OVERLAP, MOST_PARK_WAIT, OVERLAP_LOOKS, PLANNER_LANE, RewriteJob, RewritePhase, is_overlap_input, overlaps, rows_of};
 use reel::lifetime::MarkRange;
 use reel::engine::volume::{NO_SEAL, Volume};
 use reel::engine::walk_job::{BlockCounter, WalkJob, WalkWorker};
@@ -5040,5 +5040,112 @@ fn records_run_under_hot_ingest_past_the_bound() {
     settle(&io);
     assert!(looks() > looks_hot, "no overlap look ran once the ingest stopped");
     assert!(!volume.is_over_bound.load(Ordering::Acquire), "overlap stood past the bound once the ingest stopped");
+    store.close().expect("close");
+}
+
+// segments past the few one look takes, so the pass needs several looks
+const PASS_SEGMENTS: u64 = 5 * OVERLAP_LOOKS as u64 / 2;
+const PASS_ROWS: u64 = 8;
+
+// a seal puts the bound up and a look takes a few segments at a time. A record pick behind the bound keeps the planner stepping
+// through the pass, so the pass ends and the record rewrite starts in back-to-back steps, and a look stopped at its few segments
+// counts no miss
+#[test]
+fn records_follow_a_whole_look_pass() {
+    let io = SimulatedIo::new(Seed(165));
+    let mut config = config();
+    config.threads.maintenance_workers = Some(1);
+    config.memory_budget = WORKER_BUDGET;
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    hold_compaction(&store, true);
+    let volume = &store.state.volumes[0];
+    for number in 0..PASS_SEGMENTS {
+        for row in 0..PASS_ROWS {
+            store.put(COLUMN, format!("s-{number:03}-{row}").as_bytes(), b"first").expect("put");
+        }
+        seal(&store, &io);
+    }
+    // the first segment keeps one live row
+    for row in 1..PASS_ROWS {
+        store.put(COLUMN, format!("s-000-{row}").as_bytes(), b"second").expect("put");
+    }
+    seal(&store, &io);
+    assert!(volume.is_over_bound.load(Ordering::Acquire), "the seal left no bound to settle");
+    let picks = |outcome: PickOutcome| volume.picks[outcome.index()].load(Ordering::Acquire);
+    let misses = picks(PickOutcome::OverlapMiss);
+    io.hold_jobs("reel-planner", true);
+    hold_compaction(&store, false);
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    let mut steps = 0;
+    while picks(PickOutcome::Record) == 0 && steps < PLANNER_STEPS {
+        let step = job.step_unit(io.clock_reading());
+        steps += 1;
+        let behind = picks(PickOutcome::Behind);
+        assert!(matches!(step, JobStep::Worked), "the planner stopped at step {steps} with the pass unfinished, {behind} picks behind");
+        step_seats(&job);
+    }
+    println!("record after {steps} steps, behind {}, misses {}", picks(PickOutcome::Behind), picks(PickOutcome::OverlapMiss) - misses);
+    assert!(picks(PickOutcome::Record) > 0, "no record rewrite started");
+    assert!(!volume.is_over_bound.load(Ordering::Acquire), "a record rewrite started with the bound standing");
+    assert_eq!(picks(PickOutcome::OverlapMiss) - misses, 1, "a look stopped at its few segments counted as a miss");
+    while job.rewrite.is_running() {
+        job.rewrite.step();
+    }
+    for seat in job.seats.iter() {
+        if let Some(rewrite) = hold(&seat.job).as_mut() {
+            while rewrite.is_running() {
+                rewrite.step();
+            }
+        }
+    }
+    io.hold_jobs("reel-planner", false);
+    store.close().expect("close");
+}
+
+// a crowded point past the first look still goes first: the pass that holds a record pick behind the bound reaches it, and
+// no record rewrite starts before the overlap merge
+#[test]
+fn records_wait_for_a_point_past_the_first_look() {
+    let io = SimulatedIo::new(Seed(166));
+    let mut config = config();
+    config.threads.maintenance_workers = Some(1);
+    config.memory_budget = WORKER_BUDGET;
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    hold_compaction(&store, true);
+    let volume = &store.state.volumes[0];
+    half_dead(&store, &io);
+    for number in 0..PASS_SEGMENTS {
+        for row in 0..PASS_ROWS {
+            store.put(COLUMN, format!("s-{number:03}-{row}").as_bytes(), b"first").expect("put");
+        }
+        seal(&store, &io);
+    }
+    pile_up(&store, &io, OVER_THE_BOUND);
+    let picks = |outcome: PickOutcome| volume.picks[outcome.index()].load(Ordering::Acquire);
+    io.hold_jobs("reel-planner", true);
+    hold_compaction(&store, false);
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    for _step in 0..PLANNER_STEPS {
+        job.step_unit(io.clock_reading());
+        step_seats(&job);
+        assert!(picks(PickOutcome::Record) == 0 || picks(PickOutcome::Overlap) > 0, "a record rewrite started ahead of the overlap merge");
+        if picks(PickOutcome::Record) > 0 {
+            break;
+        }
+    }
+    assert!(picks(PickOutcome::Overlap) > 0, "no overlap merge ran");
+    assert!(picks(PickOutcome::Record) > 0, "the record rewrite never ran once overlap was back at the bound");
+    while job.rewrite.is_running() {
+        job.rewrite.step();
+    }
+    for seat in job.seats.iter() {
+        if let Some(rewrite) = hold(&seat.job).as_mut() {
+            while rewrite.is_running() {
+                rewrite.step();
+            }
+        }
+    }
+    io.hold_jobs("reel-planner", false);
+    check_reads(&store);
     store.close().expect("close");
 }

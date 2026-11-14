@@ -63,6 +63,7 @@ fn open_with(io: &SimulatedIo, budget: ByteCount, threads: ThreadCounts) -> Stor
             codec: Codec::None,
             volume: VolumeId(0),
             complete_rows: None,
+            sorted_rows: None,
             least_value: None,
         }],
     };
@@ -646,6 +647,7 @@ fn open_mixed(io: &SimulatedIo) -> Store {
         codec: Codec::None,
         volume: VolumeId(0),
         complete_rows: None,
+        sorted_rows: None,
         least_value: None,
     };
     let config = StoreConfig {

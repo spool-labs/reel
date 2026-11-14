@@ -215,6 +215,7 @@ fn config(policy: SyncPolicy, complete_rows: Option<RowCount>) -> StoreConfig {
         codec: Codec::None,
         volume: VolumeId(volume),
         complete_rows,
+        sorted_rows: None,
         least_value: None,
     };
     StoreConfig {

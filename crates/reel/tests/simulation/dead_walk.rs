@@ -78,6 +78,7 @@ fn config(budget: ByteCount) -> StoreConfig {
             codec: Codec::None,
             volume: VolumeId(0),
             complete_rows: None,
+            sorted_rows: None,
             least_value: None,
         }],
     }
@@ -526,6 +527,7 @@ fn turn_with(seed: Seed) {
         codec: Codec::None,
         volume: VolumeId(1),
         complete_rows: None,
+        sorted_rows: None,
         least_value: None,
     });
     let store = held(ReelStore::open(io.clone(), &config).expect("open"));

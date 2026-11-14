@@ -49,6 +49,7 @@ fn main() {
             codec: Codec::None,
             volume: VolumeId(0),
             complete_rows: None,
+            sorted_rows: None,
             least_value: None,
         }],
     };

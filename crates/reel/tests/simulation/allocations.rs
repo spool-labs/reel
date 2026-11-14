@@ -72,6 +72,7 @@ fn config() -> StoreConfig {
         codec,
         volume: VolumeId(0),
         complete_rows,
+        sorted_rows: None,
         least_value: None,
     };
     StoreConfig {

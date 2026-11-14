@@ -46,6 +46,7 @@ fn config() -> StoreConfig {
             codec: Codec::None,
             volume: VolumeId(0),
             complete_rows: None,
+            sorted_rows: None,
             least_value: None,
         }],
     }
@@ -192,6 +193,7 @@ fn passes_a_segment_without_filters() {
         codec: Codec::None,
         volume: VolumeId(0),
         complete_rows: Some(RowCount(KEYS)),
+        sorted_rows: None,
         least_value: None,
     });
     let store = ReelStore::open(io.clone(), &config).expect("open");

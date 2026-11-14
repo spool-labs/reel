@@ -69,6 +69,9 @@ pub struct ColumnConfig {
     pub volume: VolumeId,
     /// The rows a complete table holds, for a column that declares one. A get on it reads no footers
     pub complete_rows: Option<RowCount>,
+    /// The rows a sorted index holds, for a column of fixed-width keys that declares one. A get on it reads no footers, and a
+    /// scan steps one sorted list. A column declares this or a complete table, never both
+    pub sorted_rows: Option<RowCount>,
     /// The fewest value bytes a record of this column holds, when it declares them, which raises its volume's row floor
     pub least_value: Option<ByteCount>,
 }

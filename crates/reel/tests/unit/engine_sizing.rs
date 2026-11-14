@@ -257,6 +257,7 @@ fn box_churn_fits_the_table() {
         codec,
         volume: VolumeId(0),
         complete_rows: None,
+        sorted_rows: None,
         least_value: None,
     };
     let config = StoreConfig {

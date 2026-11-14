@@ -517,6 +517,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.output_last_key.set_from(&self.key)?;
         let block = self.writer.entries().len() as u32;
         self.give_slot(volume, output.number, column, block);
+        self.move_sorted(column, output.number, &kept);
         self.note_home(output.number, block);
         self.note_kept_dead(output.number, column, block, &kept, replacement)
     }
@@ -562,8 +563,17 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.grave_last_key.set_from(&self.key)?;
         let block = self.grave_writer.entries().len() as u32;
         self.give_slot(volume, output.number, column, block);
+        self.move_sorted(column, output.number, &kept);
         self.note_home(output.number, block);
         self.note_kept_dead(output.number, column, block, &kept, replacement)
+    }
+
+    /// Point a kept row's sorted entry at the output, when the entry is that row. A get that meets an output not installed yet,
+    /// or never installed, finds no pin there and asks the footers
+    pub fn move_sorted(&self, column: ColumnId, number: SegmentNumber, kept: &FooterRow) {
+        if let Some(index) = self.state.sorted_index(column) {
+            index.move_entry(&self.key, kept.place, number, kept.offset);
+        }
     }
 
     /// Give a kept row a slot in its column's table, before the inputs go, so a read that meets the change finds it twice

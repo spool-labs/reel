@@ -507,7 +507,7 @@ impl<Backend: Io> EngineState<Backend> {
             return Ok(KeyPlace::Row(Located::Open(row)));
         }
         let newest_below = found.row.map(|row| row.place).max(read.cover);
-        if self.complete_table(read.column).is_none()
+        if self.uses_spot(read.column)
             && let Some(spot) = self.newest_spot(read, newest_below)
         {
             let row = FooterRow { place: spot.place, offset: spot.offset, length: spot.length, kind: RowKind::Value };
@@ -553,7 +553,7 @@ impl<Backend: Io> EngineState<Backend> {
             }
 
             let newest_below = found.row.map(|row| row.place).max(cover);
-            if self.complete_table(read.column).is_none()
+            if self.uses_spot(read.column)
                 && let Some(answer) = self.try_spot(device, volume, read, newest_below, want, buf).await?
             {
                 return Ok(answer);
@@ -576,7 +576,7 @@ impl<Backend: Io> EngineState<Backend> {
                         return Ok(false);
                     }
                     if self.read_sealed(device, volume, read, &row, want, buf).await? {
-                        if self.complete_table(read.column).is_none() {
+                        if self.uses_spot(read.column) {
                             self.fill_spot(volume, read, &row, handovers);
                         }
                         return Ok(true);

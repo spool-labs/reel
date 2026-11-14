@@ -80,6 +80,7 @@ fn config(capacity: RowCount) -> StoreConfig {
             codec: Codec::None,
             volume: VolumeId(0),
             complete_rows: Some(capacity),
+            sorted_rows: None,
             least_value: None,
         }],
     }

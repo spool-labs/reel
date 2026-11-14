@@ -56,6 +56,7 @@ fn config_on(threads: ThreadCounts, device: DeviceClass) -> StoreConfig {
             codec: Codec::None,
             volume: VolumeId(0),
             complete_rows: None,
+            sorted_rows: None,
             least_value: None,
         }],
     }
@@ -283,6 +284,7 @@ fn two_volumes(threads: ThreadCounts) -> StoreConfig {
         codec: Codec::None,
         volume: VolumeId(volume),
         complete_rows: None,
+        sorted_rows: None,
         least_value: None,
     };
     StoreConfig {

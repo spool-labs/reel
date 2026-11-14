@@ -18,8 +18,6 @@ use crate::segment::segment_tail::SegmentNumber;
 
 /// Words of one page
 pub const PAGE_WORDS: usize = 1024;
-/// Bytes of one page
-pub const PAGE_BYTES: usize = PAGE_WORDS * size_of::<u32>();
 /// Parts of an index, one for each first byte of a key
 pub const PARTS: usize = 256;
 /// Words at the head of a page: the count, the next leaf, the previous leaf, and one spare
@@ -48,7 +46,7 @@ pub const HOLD_ROWS: usize = 256;
 pub const MOST_LOOKED: usize = 256;
 
 /// Where a key's newest sealed row sits
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct KeyEntry {
     pub place: WritePlace,
     pub segment: SegmentNumber,
@@ -233,8 +231,8 @@ impl SortedKeys {
         let leaf_capacity = (PAGE_WORDS - HEAD_WORDS) / leaf_stride;
         let inner_capacity = (PAGE_WORDS - HEAD_WORDS) / inner_stride;
         let leaves = (rows.0 as usize).div_ceil((leaf_capacity * FILL_THIRDS / 3).max(1));
-        // inner pages fill half at least, and each part can hold a spine of its own however few rows it has
-        let pages = leaves + leaves.div_ceil(inner_capacity / 2) * 2 + PARTS * MAX_DEPTH;
+        // inner pages fill half at least, and each part can hold a leaf of its own however few rows it has
+        let pages = leaves + leaves.div_ceil(inner_capacity / 2) * 2 + PARTS;
         // page numbers below the missing link's number are all a pool can have
         let pages = pages.min(NO_PAGE as usize - 1) as u32;
         Self {
@@ -592,6 +590,16 @@ impl SortedKeys {
         }
         self.entries.fetch_sub(removed, Memory::AcqRel);
         removed
+    }
+
+    /// Remove the entries a cover hides: keys from its start up to its end, the end out, with rows older than its place. A start
+    /// wider than the keys can't be packed without taking in a key it leaves out, so those entries stay, and a read's own cover
+    /// check hides them. An end wider than the keys cuts to their width, which leaves a few in. Say how many went
+    pub fn remove_covered(&self, start: &[u8], end: &[u8], place: WritePlace) -> u64 {
+        if start.len() > self.width {
+            return 0;
+        }
+        self.remove_range(start, Some(&end[..end.len().min(self.width)]), place)
     }
 
     /// Remove a range's older entries from one part, a leaf a descent

@@ -23,6 +23,7 @@ mod ration;
 mod range_apply;
 mod rewrite;
 mod scans;
+mod sorted;
 mod read_only;
 mod records;
 mod reports;

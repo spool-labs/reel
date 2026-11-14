@@ -127,6 +127,7 @@ fn sized_config(budget: ByteCount) -> StoreConfig {
                 codec: Codec::None,
                 volume: VolumeId(0),
                 complete_rows: None,
+                sorted_rows: None,
                 least_value: None,
             },
             ColumnConfig {
@@ -136,6 +137,7 @@ fn sized_config(budget: ByteCount) -> StoreConfig {
                 codec: Codec::None,
                 volume: VolumeId(0),
                 complete_rows: None,
+                sorted_rows: None,
                 least_value: None,
             },
         ],
@@ -1587,6 +1589,7 @@ fn wide_config(budget: ByteCount) -> StoreConfig {
             codec: Codec::None,
             volume: VolumeId(0),
             complete_rows: None,
+            sorted_rows: None,
             least_value: None,
         })
         .collect();

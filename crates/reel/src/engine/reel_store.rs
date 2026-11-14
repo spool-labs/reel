@@ -16,7 +16,7 @@ use reel_api::units::{ByteCount, DeathMark, Nanoseconds, RowCount, VolumeId, Wri
 use reel_api::usage::{ColumnUsage, UsageReport};
 use reel_api::write_batch::WriteBatch;
 
-use crate::config::{ColumnConfig, DeviceClass, StoreConfig, VolumeConfig};
+use crate::config::{ColumnConfig, DeviceClass, KeyShape, StoreConfig, VolumeConfig};
 use crate::engine::dead_bits::{CHUNK_WORDS, DEAD_BITS_NAME, DeadBits, NEW_DEAD_BITS_NAME, SAVE_HEADS_PAGE};
 use crate::engine::rewrite_job::{record_totals, rows_of};
 use crate::segment::block_filter::BITS_PER_ROW;
@@ -64,6 +64,7 @@ use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
 use crate::engine::complete_image::ImageFiles;
 use crate::index::complete_table::CompleteTable;
+use crate::index::sorted_keys::{MOST_KEY_BYTES, SortedKeys};
 use crate::index::spot_index::SpotIndex;
 use crate::index::write_index::WriteIndex;
 use crate::io::lock_outcome::LockOutcome;
@@ -137,6 +138,7 @@ impl<Backend: Io> ReelStore<Backend> {
         let touched_from = io.now();
         let mut state = build_state(OpenInputs { io, config, sizing: &sizing, disks: &disks, superblock, locks, scan: &scan, summaries });
         state.complete = complete_tables(config);
+        state.sorted = sorted_indexes(config);
         state.complete_images = complete_images(config);
         state.attach_ring(ring);
         state.prefault_time.store(state.io.now().0.saturating_sub(touched_from.0), Ordering::Release);
@@ -652,6 +654,7 @@ pub fn bring_up<Backend: Io>(
         let _loaded = state.load_dead_bits(volume);
     }
     state.fill_complete_tables().map_err(open_error("filling a complete table"))?;
+    state.fill_sorted_indexes().map_err(open_error("filling a sorted index"))?;
     let damaged: usize = state.volumes.iter().map(|volume| hold(&volume.damaged).len()).sum();
     state.damaged_segments.store(damaged as u64, Ordering::Release);
 
@@ -892,7 +895,11 @@ pub fn check_config(config: &StoreConfig) -> Result<(), StoreError> {
     let mut has_lz4 = false;
     let mut seen = [false; MAX_COLUMNS];
     for column in &config.columns {
-        if seen[column.id.0 as usize] || !column.key_shape.is_valid() {
+        // a sorted index holds keys of one width, and a column takes it or a complete table
+        let is_sorted_valid = column.sorted_rows.is_none()
+            || (column.complete_rows.is_none()
+                && matches!(column.key_shape, KeyShape::Fixed { width } if (1..=MOST_KEY_BYTES).contains(&usize::from(width))));
+        if seen[column.id.0 as usize] || !column.key_shape.is_valid() || !is_sorted_valid {
             return Err(column_changed(&column.name, "declaration"));
         }
         seen[column.id.0 as usize] = true;
@@ -1341,6 +1348,8 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         seats_together: AtomicU64::new(0),
         heads_together: AtomicU64::new(0),
         scan_cache_hits: AtomicU64::new(0),
+        sorted_answers: AtomicU64::new(0),
+        sorted_footer_asks: AtomicU64::new(0),
         caller_ops: CallerCounts::default(),
         progress,
         is_arena_full: AtomicBool::new(false),
@@ -1365,6 +1374,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         ring_footer_readers: Pool::new(Vec::new()),
         is_read_only: false,
         complete: Vec::new(),
+        sorted: Vec::new(),
         complete_images: Vec::new(),
         seal_tasks,
         planner_task: OnceLock::new(),
@@ -1613,6 +1623,15 @@ pub fn complete_lines(config: &StoreConfig) -> u64 {
 pub fn column_lines(column: &ColumnConfig) -> u64 {
     let rows_per_block = complete_block_rows(column.key_shape.widest()) as u64;
     column.complete_rows.map_or(0, |rows| rows.0.div_ceil(rows_per_block))
+}
+
+/// Allocate and touch each sorted column's index
+pub fn sorted_indexes(config: &StoreConfig) -> Vec<Option<SortedKeys>> {
+    let mut indexes: Vec<Option<SortedKeys>> = (0..MAX_COLUMNS).map(|_column| None).collect();
+    for column in &config.columns {
+        indexes[column.id.0 as usize] = column.sorted_rows.map(|rows| SortedKeys::new(column.key_shape.widest(), rows));
+    }
+    indexes
 }
 
 /// Name each complete column's image files and allocate its buffer

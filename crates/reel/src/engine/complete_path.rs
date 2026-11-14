@@ -14,14 +14,17 @@ use crate::engine::volume::{NO_SEAL, Volume};
 use crate::fixed_list::{FixedList, ListOut};
 use crate::guard::hold;
 use crate::index::complete_table::{CompleteSlot, CompleteTable, TagMatches};
+use crate::index::open_slots::OpenSlot;
+use crate::engine::seal_job::SortedRun;
+use crate::index::sorted_keys::{HOLD_ROWS, SortedKeys};
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::io::{DeviceReads, InPlace, Io, in_place};
 use crate::io::device_error::is_device_error;
 use crate::pool::Pool;
 use crate::row_kind::RowKind;
 use crate::segment::block_cache::BlockKey;
-use crate::segment::footer_reader::{FooterAnswer, FooterCaches, FooterQuery, FooterReader};
-use crate::segment::row_block::RowBlockWalk;
+use crate::segment::footer_reader::{FooterAnswer, FooterCaches, FooterQuery, FooterReader, RowAt};
+use crate::segment::row_block::{FooterRow, RowBlockWalk};
 use crate::segment::segment_tail::SegmentNumber;
 
 /// Row blocks a refill step gives slots, so a unit stays near a walk block's work
@@ -56,6 +59,29 @@ impl<Backend: Io> EngineState<Backend> {
         self.complete.get(column.0 as usize).and_then(Option::as_ref)
     }
 
+    /// Check a column's gets go by the spot cache: a complete table or a sorted index answers them with no footer search
+    pub fn uses_spot(&self, column: ColumnId) -> bool {
+        self.complete_table(column).is_none() && self.sorted_index(column).is_none()
+    }
+
+    /// Find a column's sorted index, if it declares one
+    pub fn sorted_index(&self, column: ColumnId) -> Option<&SortedKeys> {
+        self.sorted.get(column.0 as usize).and_then(Option::as_ref)
+    }
+
+    /// Read the floor a seal gives a sorted index: the lowest place of any row not in it yet. A seal hands the index one row a
+    /// key, the key's newest in its segment, so an older row of a key in the sealing segment never comes, and only the other open
+    /// segments can hold one. Past a mark, sealed rows are out of the index too, so nothing drops
+    pub fn sorted_floor(&self, volume: &Volume<Backend>, index: &SortedKeys, sealing: OpenSlot) -> WritePlace {
+        if index.mark().is_some() {
+            return WritePlace(0);
+        }
+        let claims = hold(&volume.claims);
+        let open = claims.open.iter().filter(|segment| segment.slot != sealing && segment.row_count.0 > 0);
+        let next = WritePlace(self.places.last_given().0.saturating_add(1));
+        open.map(|segment| segment.lowest_place).min().unwrap_or(next).min(next)
+    }
+
     /// Find a key's newest sealed row: through the table on a complete column, and through the footers on any other
     pub async fn search_sealed(
         &self,
@@ -63,10 +89,54 @@ impl<Backend: Io> EngineState<Backend> {
         volume: &Volume<Backend>,
         read: &KeyRead<'_>,
     ) -> Result<Option<SealedRow>, StoreError> {
+        if let Some(index) = self.sorted_index(read.column) {
+            return self.search_sorted(device, volume, read, index).await;
+        }
         match self.complete_table(read.column) {
             Some(table) => self.search_complete(device, volume, read, table).await,
             None => self.search_footers(device, volume, read).await,
         }
+    }
+
+    /// Answer a key from its column's sorted index with no footer read, then the footers from the mark on, where rows have no
+    /// entry. A read behind the newest sealed row may need a row the index holds no more, and an entry newer than the read point
+    /// or in a segment with no pin can't answer, so those reads ask the footers
+    pub async fn search_sorted(
+        &self,
+        device: &impl DeviceReads<Backend::File>,
+        volume: &Volume<Backend>,
+        read: &KeyRead<'_>,
+        index: &SortedKeys,
+    ) -> Result<Option<SealedRow>, StoreError> {
+        let entry = index.find(read.key);
+        let is_behind = volume.may_hide_under_sealed(read.read_point);
+        if is_behind || entry.is_some_and(|entry| entry.place > read.read_point || volume.table.pin(entry.segment).is_none()) {
+            self.sorted_footer_asks.fetch_add(1, Ordering::Relaxed);
+            return self.search_footers(device, volume, read).await;
+        }
+        let found = entry.map(|entry| SealedRow {
+            segment: entry.segment,
+            row: FooterRow {
+                place: entry.place,
+                offset: entry.offset,
+                length: entry.length,
+                kind: if entry.is_grave { RowKind::Grave } else { RowKind::Value },
+            },
+            block_offset: 0,
+            at: RowAt::UNKNOWN,
+        });
+        let Some(mark) = index.mark() else {
+            self.sorted_answers.fetch_add(1, Ordering::Relaxed);
+            return Ok(found);
+        };
+        self.sorted_footer_asks.fetch_add(1, Ordering::Relaxed);
+        let Some(directory) = &self.directories[read.column.0 as usize] else {
+            return Ok(found);
+        };
+        let mut reader = self.footer_reader_for(device);
+        let ask = WalkAsk { first: mark, ..WalkAsk::EVERY };
+        let marked = self.walk_candidates(device, volume, directory, read, &mut reader, ask).await?;
+        Ok(newest_sealed(found, marked))
     }
 
     /// Ask each block a key's tag points at and take the highest place, then the footers from the mark on, where rows found
@@ -219,6 +289,78 @@ impl<Backend: Io> EngineState<Backend> {
             }
         }
         Ok(())
+    }
+
+    /// Fill every sorted index from the row blocks of every segment, in any order, since the newest place wins and a grave stays
+    /// while nothing is dropped at open. Then take out what each live cover hides. A block that can't be read damages its segment
+    pub fn fill_sorted_indexes(&self) -> IoResult<()> {
+        for (id, index) in self.sorted.iter().enumerate() {
+            let (Some(index), Some(info)) = (index, self.columns[id]) else {
+                continue;
+            };
+            let column = ColumnId(id as u8);
+            let volume_index = info.volume.0 as usize;
+            let volume = &self.volumes[volume_index];
+            let mut numbers = Vec::new();
+            volume.table.for_each_segment(|number, _root, _file| numbers.push(number));
+            let mut run = SortedRun::new(index.width());
+            for number in numbers {
+                if !self.fill_sorted_segment(volume, (column, index), number, &mut run)? {
+                    self.damage_unread(volume_index, number);
+                }
+            }
+            volume.covers.read().visit(|cover, start, end| {
+                if cover.column == column {
+                    index.remove_covered(start, end, cover.place);
+                }
+            });
+        }
+        Ok(())
+    }
+
+    /// Give one segment's rows of a sorted column their entries, a block at a time, and say whether every block read clean
+    pub fn fill_sorted_segment(
+        &self,
+        volume: &Volume<Backend>,
+        (column, index): (ColumnId, &SortedKeys),
+        number: SegmentNumber,
+        run: &mut SortedRun,
+    ) -> IoResult<bool> {
+        let (Some((first, count)), Some(pin)) = (volume.table.column_blocks(number, column), volume.table.pin(number)) else {
+            return Ok(true);
+        };
+        self.footer_readers.with(|reader| {
+            let mut key = Vec::with_capacity(index.width());
+            for block_index in first..first + count {
+                let Some((entry, _replacement)) = volume.table.block_line(number, block_index) else {
+                    return Ok(false);
+                };
+                let block_key = BlockKey { segment: number, offset: entry.block_offset };
+                let block = match in_place(reader.load_block(&InPlace, &pin.file, block_key, &entry, &self.row_cache)) {
+                    Ok(Some(block)) => block,
+                    Ok(None) => return Ok(false),
+                    Err(error) if is_device_error(&error) => return Ok(false),
+                    Err(error) => return Err(error),
+                };
+                let Some(mut walk) = RowBlockWalk::open(block, WritePlace(pin.head.place_base.0)) else {
+                    return Ok(false);
+                };
+                // a key's versions sort newest first, so its first row in the block is the one that can win
+                while let Some(row) = walk.next_row(&mut key) {
+                    if row.kind == RowKind::RangeDelete || run.is_last(&key) {
+                        continue;
+                    }
+                    if run.entries.len() == HOLD_ROWS {
+                        index.upsert_many(&run.keys, &run.entries, WritePlace(0), |_row, _upserted| {});
+                        run.clear();
+                    }
+                    run.push(column, &key, number, &row);
+                }
+                index.upsert_many(&run.keys, &run.entries, WritePlace(0), |_row, _upserted| {});
+                run.clear();
+            }
+            Ok(true)
+        })
     }
 
     /// Damage a segment with a row block open or a merge couldn't read. The block's keys have no slot, so they would otherwise read

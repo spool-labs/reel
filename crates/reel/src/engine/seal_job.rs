@@ -20,6 +20,7 @@ use crate::index::key_hash::{KeyHash, hash_key};
 use crate::index::open_slots::OpenSlot;
 use crate::index::seal_walk::SealWalk;
 use crate::index::spot_index::SpotLocation;
+use crate::index::sorted_keys::{HOLD_ROWS, KeyEntry};
 use crate::io::job::{Job, JobStep};
 use crate::io::{InPlace, Io, IoTask, in_place};
 use crate::io::device_error::{is_device_error, is_sync_failure};
@@ -103,12 +104,15 @@ pub struct SealJob<Backend: Io> {
     pub is_in_table: bool,
     pub columns_listed: usize,
     pub is_summarized: bool,
+    /// Rows of a sorted column waiting to go into its index together, a key's newest in this segment each
+    pub sorted_run: SortedRun,
 }
 
 impl<Backend: Io> SealJob<Backend> {
     /// Build a job with its buffers
     pub fn new(state: Arc<EngineState<Backend>>, volume: usize) -> Self {
         let ranges_room = state.volumes[volume].covers.footer_room();
+        let sorted_width = state.sorted.iter().enumerate().filter(|(id, index)| index.is_some() && state.columns[*id].is_some_and(|info| info.volume.0 as usize == volume)).flat_map(|(_id, index)| index.as_ref().map(|index| index.width())).max().unwrap_or(0);
         Self {
             state,
             volume,
@@ -132,6 +136,7 @@ impl<Backend: Io> SealJob<Backend> {
             is_in_table: false,
             columns_listed: 0,
             is_summarized: false,
+            sorted_run: SortedRun::new(sorted_width),
         }
     }
 
@@ -332,6 +337,10 @@ impl<Backend: Io> SealJob<Backend> {
                 if !self.state.volumes[self.volume].covers.has_newer_in_segment(&cover) {
                     put_cover(&mut self.ranges, &cover);
                 }
+                // entries under the cover that sealed before it go now, and a row under it that seals later gets none
+                if let Some(index) = self.state.sorted_index(head.column) {
+                    index.remove_covered(head.key, end, row.place);
+                }
             }
 
             let footer_row = FooterRow {
@@ -347,8 +356,9 @@ impl<Backend: Io> SealJob<Backend> {
                 self.last_column = Some(head.column);
                 self.last_key.clear();
                 self.last_key.extend_from_slice(head.key);
-                // a complete column has its slots already, and reads no spot cache
-                if self.state.complete_table(head.column).is_none() {
+                self.sorted_run.note(&self.state, self.volume, (target.number, target.slot), (head.column, head.key), &footer_row);
+                // a complete or sorted column answers its gets in memory, and reads no spot cache
+                if self.state.uses_spot(head.column) {
                     let hash = hash_key(head.column, head.key);
                     if row.kind == RowKind::Value && head.is_newest {
                         let location = SpotLocation {
@@ -385,6 +395,7 @@ impl<Backend: Io> SealJob<Backend> {
 
     /// Finish the footer, which syncs it, then discard the rows file
     pub fn finish_footer(&mut self, target: &SealTarget<Backend::File>) -> Result<()> {
+        self.sorted_run.flush(&self.state, self.volume, target.slot);
         self.end_step(|steps| &steps.walk_step);
         self.volume().ration.note_walk_end(self.step_started);
         let state = Arc::clone(&self.state);
@@ -578,7 +589,8 @@ impl<Backend: Io> SealJob<Backend> {
 
     /// Read the heap the job's own buffers hold
     pub fn heap_bytes(&self) -> ByteCount {
-        let keys = self.highest.capacity() + self.last_key.capacity() + self.ranges.capacity();
+        let run = self.sorted_run.keys.capacity() + self.sorted_run.entries.capacity() * size_of::<KeyEntry>();
+        let keys = self.highest.capacity() + self.last_key.capacity() + self.ranges.capacity() + run;
         ByteCount(self.writer.heap_bytes().0 + self.walk.heap_bytes().0 + keys as u64)
     }
 
@@ -697,3 +709,81 @@ impl<Backend: Io> Job for SealJob<Backend> {
         }
     }
 }
+
+/// Rows of one sorted column a seal hands its index together
+#[derive(Debug)]
+pub struct SortedRun {
+    pub column: Option<ColumnId>,
+    pub keys: Vec<u8>,
+    pub entries: Vec<KeyEntry>,
+}
+
+impl SortedRun {
+    /// Allocate a run's room for keys this wide. A volume with no sorted column gives it none
+    pub fn new(width: usize) -> Self {
+        Self {
+            column: None,
+            keys: touched_capacity(HOLD_ROWS * width, 0),
+            entries: touched_capacity(if width == 0 { 0 } else { HOLD_ROWS }, KeyEntry::default()),
+        }
+    }
+
+    /// Take a key's newest row in a sealing segment for its column's sorted index. A value under a newer cover gets no entry,
+    /// since a read never returns it and a merge drops it
+    pub fn note<Backend: Io>(
+        &mut self,
+        state: &EngineState<Backend>,
+        volume: usize,
+        (number, slot): (SegmentNumber, OpenSlot),
+        (column, key): (ColumnId, &[u8]),
+        row: &FooterRow,
+    ) {
+        if row.kind == RowKind::RangeDelete || state.sorted_index(column).is_none() {
+            return;
+        }
+        let covers = &state.volumes[volume].covers;
+        if row.kind == RowKind::Value && covers.newest_over(column, key, WritePlace(u64::MAX)).is_some_and(|cover| cover > row.place) {
+            return;
+        }
+        if self.column != Some(column) || self.entries.len() == HOLD_ROWS {
+            self.flush(state, volume, slot);
+        }
+        self.push(column, key, number, row);
+    }
+
+    /// Put the waiting rows into their column's sorted index. The seal does this before its switch, so a key is in the write
+    /// index or the sorted index at every moment
+    pub fn flush<Backend: Io>(&mut self, state: &EngineState<Backend>, volume: usize, slot: OpenSlot) {
+        if let Some(index) = self.column.and_then(|column| state.sorted_index(column)) {
+            let floor = state.sorted_floor(&state.volumes[volume], index, slot);
+            index.upsert_many(&self.keys, &self.entries, floor, |_row, _upserted| {});
+        }
+        self.clear();
+    }
+
+    /// Add a row to the run
+    pub fn push(&mut self, column: ColumnId, key: &[u8], number: SegmentNumber, row: &FooterRow) {
+        self.column = Some(column);
+        self.keys.extend_from_slice(key);
+        self.entries.push(KeyEntry {
+            place: row.place,
+            segment: number,
+            offset: row.offset,
+            length: row.length,
+            is_grave: row.kind == RowKind::Grave,
+        });
+    }
+
+    /// Check the run's last row is of this key
+    pub fn is_last(&self, key: &[u8]) -> bool {
+        !self.entries.is_empty() && self.keys.len() >= key.len() && self.keys.ends_with(key)
+    }
+
+    /// Empty the run and keep its room
+    pub fn clear(&mut self) {
+        self.column = None;
+        self.keys.clear();
+        self.entries.clear();
+    }
+}
+

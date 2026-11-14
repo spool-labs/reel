@@ -48,6 +48,7 @@ use crate::record::record_reader::RecordReader;
 use crate::rows::row_group::RowGroupBuffer;
 use crate::engine::complete_image::ImageFiles;
 use crate::index::complete_table::CompleteTable;
+use crate::index::sorted_keys::SortedKeys;
 use crate::index::record_cache::RecordCache;
 use crate::segment::block_cache::BlockCache;
 use crate::segment::filter_arena::FilterArena;
@@ -162,6 +163,9 @@ pub struct EngineState<Backend: Io> {
     pub heads_together: AtomicU64,
     /// Values scans took from the record cache with no record read
     pub scan_cache_hits: AtomicU64,
+    /// Gets a sorted index answered, and gets on a sorted column that asked the footers
+    pub sorted_answers: AtomicU64,
+    pub sorted_footer_asks: AtomicU64,
     /// Caller operations, so maintenance can tell callers are busy
     pub caller_ops: CallerCounts,
     /// The line writers wait on, shared with every volume
@@ -188,6 +192,8 @@ pub struct EngineState<Backend: Io> {
     pub ring_footer_readers: Pool<FooterReader>,
     pub is_read_only: bool,
     pub complete: Vec<Option<CompleteTable>>,
+    /// Each column's sorted index, for a column that declares one
+    pub sorted: Vec<Option<SortedKeys>>,
     pub complete_images: Vec<Option<Mutex<ImageFiles>>>,
     pub complete_cache: Option<BlockCache>,
     pub complete_line_bytes: ByteCount,
@@ -707,6 +713,7 @@ impl<Backend: Io> EngineState<Backend> {
             record_cache: self.record_cache.heap_bytes(),
             dead_bits: ByteCount(self.volumes.iter().map(|volume| volume.dead_bits.heap_bytes().0 + volume.bits_save_bytes()).sum()),
             complete_tables: ByteCount(self.complete.iter().flatten().map(|table| table.heap_bytes().0).sum()),
+            sorted_indexes: ByteCount(self.sorted.iter().flatten().map(|index| index.heap_bytes().0).sum()),
             block_cache: ByteCount(self.filter_arena.heap_bytes().0 + self.filter_cache.heap_bytes().0 + self.row_cache.heap_bytes().0 + self.complete_cache_bytes()),
             footer_space: ByteCount(self.seal_heap.load(Ordering::Acquire) + self.walk_heap.load(Ordering::Acquire)),
             compaction: ByteCount(self.compaction_heap.load(Ordering::Acquire)),
@@ -749,7 +756,7 @@ impl<Backend: Io> EngineState<Backend> {
         report.read_buffers = ByteCount(readers.0 + footers.0 + self.job_footer_readers.heap_bytes(FooterReader::heap_bytes).0);
         report.scans = self.scan_heap;
         // the tables and their block lines come on top of the budget
-        report.budget = ByteCount(report.budget.0 + report.complete_tables.0 + self.complete_line_bytes.0);
+        report.budget = ByteCount(report.budget.0 + report.complete_tables.0 + report.sorted_indexes.0 + self.complete_line_bytes.0);
         let ring_readers = self.ring_record_readers.heap_bytes(RecordReader::heap_bytes).0 + self.ring_footer_readers.heap_bytes(FooterReader::heap_bytes).0;
         let ring = self.ring.as_ref().map_or(0, |ring| ring.heap_bytes().0 + ring.driver.heap_bytes().0);
         report.read_buffers = ByteCount(report.read_buffers.0 + self.read_pool.heap_bytes().0 + ring + ring_readers);

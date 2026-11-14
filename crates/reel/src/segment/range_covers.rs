@@ -105,6 +105,13 @@ impl CoverPool {
         &self.keys[at..at + self.slots[slot as usize].end_length as usize]
     }
 
+    /// Call on every cover with its start and end keys, in key order
+    pub fn visit(&self, mut visit: impl FnMut(&CoverSlot, &[u8], &[u8])) {
+        for &slot in &self.order {
+            visit(&self.slots[slot as usize], self.start(slot), self.end(slot));
+        }
+    }
+
     /// Order a position's cover against a column and key
     pub fn compare(&self, position: usize, column: ColumnId, key: &[u8]) -> KeyOrder {
         let slot = self.order[position];

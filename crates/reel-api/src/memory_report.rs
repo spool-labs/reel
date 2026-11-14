@@ -9,6 +9,8 @@ pub struct MemoryReport {
     pub write_index: ByteCount,
     pub spot_cache: ByteCount,
     pub complete_tables: ByteCount,
+    /// Bytes the sorted indexes hold, on top of the budget as complete tables are
+    pub sorted_indexes: ByteCount,
     pub block_cache: ByteCount,
     pub record_cache: ByteCount,
     /// Bytes the dead bits' pools hold, one bit for each charged row
@@ -65,6 +67,7 @@ impl MemoryReport {
             self.write_index.0
                 + self.spot_cache.0
                 + self.complete_tables.0
+                + self.sorted_indexes.0
                 + self.block_cache.0
                 + self.record_cache.0 + self.dead_bits.0
                 + self.block_indexes.0

@@ -643,6 +643,16 @@ impl SortedKeys {
         removed
     }
 
+    /// Say whether a scan takes the stored key a start packs to. A short start packs with zeros to a key that sorts above it, so
+    /// a scan going up takes it and one going down doesn't. A long start cuts to a key that sorts below it, the other way round
+    pub fn start_inclusion(&self, start: &[u8], is_inclusive: bool, is_ascending: bool) -> bool {
+        match start.len().cmp(&self.width) {
+            Ordering::Less => is_ascending,
+            Ordering::Greater => !is_ascending,
+            Ordering::Equal => is_inclusive,
+        }
+    }
+
     /// Find a key's entry, a grave or a value
     pub fn find(&self, key: &[u8]) -> Option<KeyEntry> {
         let tree = self.parts.read(self.part_of(key));
@@ -663,7 +673,7 @@ impl SortedKeys {
         batch.clear();
         let (first_part, mut start) = match from {
             ScanFrom::Edge => (0, None),
-            ScanFrom::Key { key, is_inclusive } => (self.part_of(key), Some((PackedKey::new(key), is_inclusive))),
+            ScanFrom::Key { key, is_inclusive } => (self.part_of(key), Some((PackedKey::new(key), self.start_inclusion(key, is_inclusive, true)))),
         };
         let mut looked = 0;
         for part in first_part..PARTS {
@@ -708,7 +718,7 @@ impl SortedKeys {
         batch.clear();
         let (first_part, mut start) = match from {
             ScanFrom::Edge => (PARTS - 1, None),
-            ScanFrom::Key { key, is_inclusive } => (self.part_of(key), Some((PackedKey::new(key), is_inclusive))),
+            ScanFrom::Key { key, is_inclusive } => (self.part_of(key), Some((PackedKey::new(key), self.start_inclusion(key, is_inclusive, false)))),
         };
         let mut looked = 0;
         for part in (0..=first_part).rev() {

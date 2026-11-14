@@ -388,3 +388,31 @@ fn a_run_with_two_versions_of_a_key_keeps_one_entry() {
         assert_eq!(index.find(&ordered_key(key)).map(|entry| entry.place), Some(WritePlace(1_000 + key)));
     }
 }
+
+// a start of another width takes the stored key it packs to only where that key sorts on the scan's side of the start, either
+// flag, both ways
+#[test]
+fn starts_of_another_width() {
+    let index = SortedKeys::new(4, RowCount(100));
+    let stored = [[1, 2, 0, 0], [1, 2, 3, 4], [1, 2, 3, 5]];
+    for (place, key) in stored.iter().enumerate() {
+        index.upsert(key, entry(place as u64 + 1, false), WritePlace(0));
+    }
+    let scan = |start: &[u8], is_inclusive: bool, is_ascending: bool| {
+        let mut batch = KeyBatch::new(4, 10);
+        let from = ScanFrom::Key { key: start, is_inclusive };
+        let is_done = if is_ascending { index.read_after(from, 10, &mut batch) } else { index.read_before(from, 10, &mut batch) };
+        assert!(is_done);
+        (0..batch.len()).map(|at| batch.key(at).to_vec()).collect::<Vec<_>>()
+    };
+    for is_inclusive in [false, true] {
+        // [1, 2] sorts below [1, 2, 0, 0], so going up takes it and going down doesn't
+        assert_eq!(scan(&[1, 2], is_inclusive, true), stored.iter().map(|key| key.to_vec()).collect::<Vec<_>>());
+        assert_eq!(scan(&[1, 2], is_inclusive, false), Vec::<Vec<u8>>::new());
+        // [1, 2, 3, 4, 9] sorts above [1, 2, 3, 4], so going up skips it and going down takes it
+        assert_eq!(scan(&[1, 2, 3, 4, 9], is_inclusive, true), vec![vec![1, 2, 3, 5]]);
+        assert_eq!(scan(&[1, 2, 3, 4, 9], is_inclusive, false), vec![vec![1, 2, 3, 4], vec![1, 2, 0, 0]]);
+    }
+    assert_eq!(scan(&[1, 2, 3, 4], false, true), vec![vec![1, 2, 3, 5]]);
+    assert_eq!(scan(&[1, 2, 3, 4], true, false), vec![vec![1, 2, 3, 4], vec![1, 2, 0, 0]]);
+}

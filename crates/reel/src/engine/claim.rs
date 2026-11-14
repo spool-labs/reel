@@ -2,7 +2,7 @@
 
 use std::sync::atomic::Ordering;
 
-use reel_api::units::{FileOffset, WritePlace};
+use reel_api::units::{FileOffset, RowCount, WritePlace};
 
 use crate::engine::engine_state::EngineState;
 use crate::engine::open_segment::SegmentPhase;
@@ -22,6 +22,9 @@ pub struct Claim<'state, Backend: Io> {
     pub data: Backend::File,
     pub offset: FileOffset,
     pub ticket: Ticket,
+    /// The rows and covers the claim added to its segment, which a claim that ends without landing gives back
+    pub rows: RowCount,
+    pub covers: usize,
     pub is_landed: bool,
     pub is_alone: bool,
 }
@@ -53,6 +56,11 @@ impl<Backend: Io> Claim<'_, Backend> {
         for segment in &mut claims.open {
             if segment.slot == self.slot {
                 segment.in_flight -= 1;
+                if !self.is_landed {
+                    segment.row_count = RowCount(segment.row_count.0 - self.rows.0);
+                    segment.cover_rows -= self.covers;
+                    self.volume.rows_in_index.fetch_sub(self.rows.0, Ordering::Relaxed);
+                }
                 self.volume.progress.wake();
                 if self.is_alone && segment.phase == SegmentPhase::Alone {
                     segment.phase = SegmentPhase::Taking;

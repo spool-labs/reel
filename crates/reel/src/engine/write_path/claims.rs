@@ -394,6 +394,8 @@ impl<Backend: Io> EngineState<Backend> {
             data,
             offset,
             ticket,
+            rows: request.rows,
+            covers: request.covers,
             is_landed: false,
             is_alone: request.is_alone,
         }

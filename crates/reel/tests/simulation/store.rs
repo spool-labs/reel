@@ -1336,3 +1336,39 @@ fn room_skips_a_sealing_segment() {
     }
     store.close().expect("close");
 }
+
+// read each open segment's number and rows
+fn open_rows(store: &Store) -> Vec<(u64, u64)> {
+    hold(&store.state.volumes[0].claims).open.iter().map(|open| (open.number.0, open.row_count.0)).collect()
+}
+
+// a clean close leaves the open segment as it stood, and the reopen fills it on from where it stopped with nothing copied
+#[test]
+fn reopen_keeps_the_open_segment() {
+    let io = SimulatedIo::new(Seed(4_101));
+    let store = open(&io);
+    store.put(COLUMN, b"first", b"value").expect("put");
+    assert_eq!(open_rows(&store).iter().map(|(_number, rows)| rows).sum::<u64>(), 1, "the first put counted rows it never wrote");
+    for number in 0..QUIET_ROWS {
+        store.put(COLUMN, format!("key-{number:04}").as_bytes(), b"value").expect("put");
+    }
+    let segments = store.state.volumes[0].table.segment_count();
+    let before = open_rows(&store);
+    assert!(before.iter().any(|(_number, rows)| *rows > 0), "no row went to an open segment");
+    store.close().expect("close");
+    drop(store);
+
+    let store = open(&io);
+    assert_eq!(store.state.volumes[0].table.segment_count(), segments, "the reopen sealed or copied a segment");
+    assert_eq!(open_rows(&store), before, "the reopen moved the open segment");
+    store.put(COLUMN, b"after", b"value").expect("put");
+    let after = open_rows(&store);
+    let rows = |open: &[(u64, u64)]| open.iter().map(|(_number, rows)| rows).sum::<u64>();
+    assert_eq!(after.iter().map(|(number, _rows)| *number).collect::<Vec<_>>(), before.iter().map(|(number, _rows)| *number).collect::<Vec<_>>());
+    assert_eq!(rows(&after), rows(&before) + 1, "the new row went somewhere else");
+    for number in 0..QUIET_ROWS {
+        assert_eq!(read(&store, format!("key-{number:04}").as_bytes()), Some(b"value".to_vec()));
+    }
+    assert_eq!(read(&store, b"after"), Some(b"value".to_vec()));
+    store.close().expect("close");
+}

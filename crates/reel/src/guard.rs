@@ -1,7 +1,7 @@
 //! Locking that survives a poisoned mutex, and marks the store failed when it does
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 
 /// Set once a lock reel holds was poisoned. The holder panicked part way through a change, so the state behind any lock may be
 /// half written, and every volume in the process refuses writes from then on
@@ -44,6 +44,15 @@ impl<Shard> Shards<Shard> {
         match self.0[index].write() {
             Ok(guard) => guard,
             Err(poisoned) => recover(poisoned),
+        }
+    }
+
+    /// Change a shard if no one holds it, or say it's held
+    pub fn try_write(&self, index: usize) -> Option<RwLockWriteGuard<'_, Shard>> {
+        match self.0[index].try_write() {
+            Ok(guard) => Some(guard),
+            Err(TryLockError::Poisoned(poisoned)) => Some(recover(poisoned)),
+            Err(TryLockError::WouldBlock) => None,
         }
     }
 

@@ -23,6 +23,7 @@ use crate::index::complete_table::CompleteTable;
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
 use crate::io::{Io, IoFile};
+use crate::segment::block_cache::BlockCache;
 use crate::segment::key_cursor::CursorCounts;
 use crate::segment::segment_tail::SegmentNumber;
 use crate::segment::summary::{ColumnFacts, SummaryRows};
@@ -186,6 +187,8 @@ impl<Backend: Io> EngineState<Backend> {
         report.seats_together = self.seats_together.load(Ordering::Relaxed);
         report.heads_together = self.heads_together.load(Ordering::Relaxed);
         report.scan_cache_hits = self.scan_cache_hits.load(Ordering::Relaxed);
+        let caches = [Some(&self.row_cache), Some(&self.filter_cache), self.complete_cache.as_ref()];
+        report.cache_inserts_skipped = caches.into_iter().flatten().map(BlockCache::skipped_inserts).sum();
         for volume in &self.volumes {
             for row in hold(&volume.summary).rows() {
                 let rows = rows_of(&row);

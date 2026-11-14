@@ -9,8 +9,13 @@ use crate::pool::touched_filled;
 use crate::guard::Shards;
 use crate::segment::segment_tail::SegmentNumber;
 
-/// Shards of a cache
+/// The fewest shards a cache has
 pub const CACHE_SHARDS: usize = 16;
+/// The most shards a cache has. A visit over several blocks holds a shard for each, so a large cache splits finer and a visit
+/// holds a small share of it
+pub const MOST_CACHE_SHARDS: usize = 256;
+/// Buckets a shard keeps at least before a cache splits into more shards
+pub const LEAST_SHARD_BUCKETS: usize = 16;
 /// Slots a block can land in
 pub const CACHE_WAYS: usize = 4;
 /// The most blocks one visit over several takes
@@ -43,6 +48,8 @@ pub struct CacheShard {
 pub struct BlockCache {
     pub shards: Shards<CacheShard>,
     touched: Vec<Vec<AtomicU64>>,
+    /// Inserts that found their shard locked and kept nothing, since a reader would otherwise queue behind the wait
+    skipped: AtomicU64,
     slot_bytes: usize,
     buckets: usize,
 }
@@ -50,13 +57,15 @@ pub struct BlockCache {
 impl BlockCache {
     /// Allocate and touch slots that fill a share of the budget
     pub fn new(share: ByteCount, slot_bytes: usize) -> Self {
-        let per_shard = share.0 as usize / CACHE_SHARDS;
+        let fits = share.0 as usize / (slot_bytes * CACHE_WAYS * LEAST_SHARD_BUCKETS);
+        let shard_count = (1_usize << fits.max(1).ilog2()).clamp(CACHE_SHARDS, MOST_CACHE_SHARDS);
+        let per_shard = share.0 as usize / shard_count;
         let buckets = (per_shard / (slot_bytes * CACHE_WAYS)).max(1);
         let slots = buckets * CACHE_WAYS;
 
-        let mut shards = Vec::with_capacity(CACHE_SHARDS);
-        let mut touched = Vec::with_capacity(CACHE_SHARDS);
-        for _shard in 0..CACHE_SHARDS {
+        let mut shards = Vec::with_capacity(shard_count);
+        let mut touched = Vec::with_capacity(shard_count);
+        for _shard in 0..shard_count {
             shards.push(RwLock::new(CacheShard {
                 keys: touched_filled(slots, NO_BLOCK),
                 lengths: touched_filled(slots, 0),
@@ -71,9 +80,15 @@ impl BlockCache {
         Self {
             shards: Shards(shards),
             touched,
+            skipped: AtomicU64::new(0),
             slot_bytes,
             buckets,
         }
+    }
+
+    /// Count the inserts that found their shard locked
+    pub fn skipped_inserts(&self) -> u64 {
+        self.skipped.load(Ordering::Relaxed)
     }
 
     /// Read the most bytes a block can have
@@ -92,7 +107,7 @@ impl BlockCache {
     /// Read the heap the cache holds
     pub fn heap_bytes(&self) -> ByteCount {
         let mut total = 0;
-        for shard in 0..CACHE_SHARDS {
+        for shard in 0..self.shards.len() {
             let guard = self.shards.read(shard);
             total += guard.bytes.capacity() + guard.keys.capacity() * size_of::<BlockKey>();
             total += guard.lengths.capacity() * size_of::<u32>();
@@ -104,7 +119,7 @@ impl BlockCache {
     /// Find a block's shard and first slot
     pub fn place_of(&self, key: BlockKey) -> (usize, usize) {
         let mixed = key.segment.0.wrapping_add(u64::from(key.offset)).wrapping_mul(OFFSET_MIX);
-        let shard = (mixed >> 60) as usize % CACHE_SHARDS;
+        let shard = (mixed >> 56) as usize % self.shards.len();
         let bucket = (mixed >> 20) as usize % self.buckets;
         (shard, bucket * CACHE_WAYS)
     }
@@ -129,21 +144,26 @@ impl BlockCache {
     /// the cache doesn't hold comes as nothing
     pub fn with_many<Answer>(&self, keys: &[BlockKey], visit: impl FnOnce(&[Option<&[u8]>]) -> Answer) -> Answer {
         let count = keys.len().min(MOST_MANY_BLOCKS);
-        let mut wanted = [false; CACHE_SHARDS];
         let mut places = [(0_usize, 0_usize); MOST_MANY_BLOCKS];
+        // the shards the keys fall in, each once, in shard order
+        let mut wanted = [0_usize; MOST_MANY_BLOCKS];
+        let mut wanted_count = 0;
         for (key, place) in keys.iter().zip(&mut places).take(count) {
             *place = self.place_of(*key);
-            wanted[place.0] = true;
-        }
-        let mut guards: [Option<RwLockReadGuard<'_, CacheShard>>; CACHE_SHARDS] = [const { None }; CACHE_SHARDS];
-        for (shard, guard) in guards.iter_mut().enumerate() {
-            if wanted[shard] {
-                *guard = Some(self.shards.read(shard));
+            if !wanted[..wanted_count].contains(&place.0) {
+                wanted[wanted_count] = place.0;
+                wanted_count += 1;
             }
+        }
+        let wanted = &mut wanted[..wanted_count];
+        wanted.sort_unstable();
+        let mut guards: [Option<RwLockReadGuard<'_, CacheShard>>; MOST_MANY_BLOCKS] = [const { None }; MOST_MANY_BLOCKS];
+        for (shard, guard) in wanted.iter().zip(&mut guards) {
+            *guard = Some(self.shards.read(*shard));
         }
         let mut blocks: [Option<&[u8]>; MOST_MANY_BLOCKS] = [None; MOST_MANY_BLOCKS];
         for ((key, &(shard, first)), block) in keys.iter().zip(&places).zip(&mut blocks).take(count) {
-            let Some(guard) = guards[shard].as_ref() else {
+            let Some(guard) = wanted.iter().position(|held| *held == shard).and_then(|at| guards[at].as_ref()) else {
                 continue;
             };
             if let Some(slot) = (first..first + CACHE_WAYS).find(|slot| guard.keys[*slot] == *key) {
@@ -162,7 +182,11 @@ impl BlockCache {
         }
 
         let (shard, first) = self.place_of(key);
-        let mut guard = self.shards.write(shard);
+        // a cache can go without a block, so an insert never waits for a shard a visit holds
+        let Some(mut guard) = self.shards.try_write(shard) else {
+            self.skipped.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
         let slot = self.pick_slot(shard, &guard, first, key);
         guard.keys[slot] = key;
         guard.lengths[slot] = block.len() as u32;

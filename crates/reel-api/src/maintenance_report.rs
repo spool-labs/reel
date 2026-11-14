@@ -599,6 +599,8 @@ pub struct MaintenanceReport {
     pub heads_together: u64,
     /// Values scans took from the record cache with no record read, while it could hold most of a volume
     pub scan_cache_hits: u64,
+    /// Block cache inserts that found their shard held by a visit and kept nothing
+    pub cache_inserts_skipped: u64,
     /// Walk block lookups run together: blocks, candidates asked, candidates whose range held the whole block, per-key checks
     pub block_lookups: [u64; 4],
     pub volumes: Vec<VolumeReading>,
@@ -698,6 +700,7 @@ impl MaintenanceReport {
             seats_together: 0,
             heads_together: 0,
             scan_cache_hits: 0,
+            cache_inserts_skipped: 0,
             block_lookups: [0; 4],
             volumes: Vec::new(),
             complete_columns: Vec::new(),

@@ -87,10 +87,18 @@ fn settle(io: &SimulatedIo) {
     panic!("jobs never settled");
 }
 
+// the volume's count of open rows, which lets a scan's heads skip the write index, is the rows its open segments hold
+fn check_open_rows(store: &Store) {
+    let volume = &store.state.volumes[0];
+    let open: u64 = hold(&volume.claims).open.iter().map(|open| open.row_count.0).sum();
+    assert_eq!(volume.rows_in_index.load(Ordering::Acquire), open, "the open row count drifted");
+}
+
 fn cool(store: &Store, io: &SimulatedIo) {
     let until = store.state.quiet_at(io.clock_reading());
     io.advance_clock(Nanoseconds(until.0.saturating_sub(io.clock_reading().0)));
     settle(io);
+    check_open_rows(store);
 }
 
 fn seal(store: &Store, io: &SimulatedIo) {

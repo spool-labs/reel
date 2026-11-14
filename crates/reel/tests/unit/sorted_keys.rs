@@ -416,3 +416,25 @@ fn starts_of_another_width() {
     assert_eq!(scan(&[1, 2, 3, 4], false, true), vec![vec![1, 2, 3, 5]]);
     assert_eq!(scan(&[1, 2, 3, 4], true, false), vec![vec![1, 2, 3, 4], vec![1, 2, 0, 0]]);
 }
+
+// a width that fills no whole word packs a long start's extra bytes into the last word's padding, and orders it all the same
+#[test]
+fn starts_past_a_part_word() {
+    let index = SortedKeys::new(6, RowCount(100));
+    let stored = [[1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 7]];
+    for (place, key) in stored.iter().enumerate() {
+        index.upsert(key, entry(place as u64 + 1, false), WritePlace(0));
+    }
+    let scan = |start: &[u8], is_ascending: bool| {
+        let mut batch = KeyBatch::new(6, 10);
+        let from = ScanFrom::Key { key: start, is_inclusive: true };
+        let is_done = if is_ascending { index.read_after(from, 10, &mut batch) } else { index.read_before(from, 10, &mut batch) };
+        assert!(is_done);
+        (0..batch.len()).map(|at| batch.key(at).to_vec()).collect::<Vec<_>>()
+    };
+    // both seven-byte starts sort above [1, 2, 3, 4, 5, 6] and below [1, 2, 3, 4, 5, 7]
+    for start in [[1, 2, 3, 4, 5, 6, 0], [1, 2, 3, 4, 5, 6, 9]] {
+        assert_eq!(scan(&start, true), vec![vec![1, 2, 3, 4, 5, 7]]);
+        assert_eq!(scan(&start, false), vec![vec![1, 2, 3, 4, 5, 6]]);
+    }
+}

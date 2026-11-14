@@ -2,11 +2,14 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::engine::compact_job::CompactJob;
 use reel::engine::open_segment::SegmentPhase;
 use reel::engine::reel_store::ReelStore;
+use reel::engine::rewrite_job::RewritePhase;
 use reel::guard::hold;
 use reel::index::sorted_keys::KeyEntry;
 use reel::record::codec::Codec;
@@ -33,6 +36,7 @@ const CHURN_WRITES: u64 = 600;
 const CHURN_KEYS: u64 = 1_500;
 const COVER_ONE_IN: u64 = 40;
 const MARK: DeathMark = DeathMark(1_000_000);
+const MERGE_KEYS: u64 = 15_000;
 
 type Store = ReelStore<SimulatedIo>;
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -40,7 +44,7 @@ type Model = BTreeMap<Vec<u8>, Vec<u8>>;
 fn config(capacity: RowCount) -> StoreConfig {
     StoreConfig {
         memory_budget: BUDGET,
-        threads: reel::config::NO_WORKERS,
+        threads: crate::shape::threads(),
         volumes: vec![VolumeConfig {
             name: "sorted".to_string(),
             roots: vec![PathBuf::from(ROOT)],
@@ -259,6 +263,10 @@ fn past_capacity_stays_right() {
     let written: Vec<Vec<u8>> = (0..KEYS * 20).map(key).collect();
     for round in 0..3 {
         for number in 0..KEYS * 20 {
+            // two keys in three take a new row a round, so each segment keeps live rows and a merge has some to carry
+            if round > 0 && number % 3 == round % 3 {
+                continue;
+            }
             let value = format!("{round}-{number}").into_bytes();
             store.put(COLUMN, &key(number), &value).expect("put");
             model.insert(key(number), value);
@@ -401,5 +409,58 @@ fn graves_stay_while_a_mark_stands() {
         assert_eq!(read(&store, &key(number)), None);
     }
     assert_eq!(index().check(), Ok(()));
+    store.close().expect("close");
+}
+
+// merges move each kept row's entry to the listed output before the inputs go: mid-copy and after, every get answers from the
+// index with no footer ask, a deleted key's grave among them
+#[test]
+fn merges_keep_gets_on_the_index() {
+    let io = SimulatedIo::new(Seed(6));
+    let store = open(&io, CAPACITY);
+    let volume = &store.state.volumes[0];
+    volume.holds.compaction.store(true, Ordering::Release);
+    volume.holds.reclaim.store(true, Ordering::Release);
+    let mut model = Model::new();
+    let written: Vec<Vec<u8>> = (0..MERGE_KEYS).map(key).collect();
+    for number in 0..MERGE_KEYS {
+        store.put(COLUMN, &key(number), b"first").expect("put");
+        model.insert(key(number), b"first".to_vec());
+    }
+    seal(&store, &io);
+    // two keys in three take a newer row and one in five a grave, so the first segment is mostly dead and a merge carries the rest
+    for number in (0..MERGE_KEYS).filter(|number| number % 3 != 2) {
+        store.put(COLUMN, &key(number), b"second").expect("put");
+        model.insert(key(number), b"second".to_vec());
+    }
+    for number in (0..MERGE_KEYS).step_by(5) {
+        store.delete(COLUMN, &key(number)).expect("delete");
+        model.remove(&key(number));
+    }
+    seal(&store, &io);
+
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    while !job.rewrite.start() {
+        assert!(job.rewrite.has_looks_left(), "no merge to run");
+    }
+    while job.rewrite.phase != RewritePhase::Copying {
+        job.rewrite.step();
+    }
+    job.rewrite.step();
+    assert!(job.rewrite.is_running());
+    // part of the rows are in an output that isn't listed yet, and the entries still point at the inputs
+    let before = report(&store);
+    check(&store, &model, &written);
+    assert_eq!(report(&store).sorted_footer_asks, before.sorted_footer_asks, "a get mid-copy asked the footers");
+    while job.rewrite.is_running() {
+        job.rewrite.step();
+    }
+    assert!(volume.segments_rewritten.load(Ordering::Acquire) > 0, "no merge ran");
+    let before = report(&store);
+    check(&store, &model, &written);
+    let after = report(&store);
+    assert_eq!(after.sorted_footer_asks, before.sorted_footer_asks, "a get after the merge asked the footers");
+    assert!(after.sorted_answers >= before.sorted_answers + MERGE_KEYS);
+    check_entries(&store, &model);
     store.close().expect("close");
 }

@@ -1349,6 +1349,8 @@ fn reopen_keeps_the_open_segment() {
     let store = open(&io);
     store.put(COLUMN, b"first", b"value").expect("put");
     assert_eq!(open_rows(&store).iter().map(|(_number, rows)| rows).sum::<u64>(), 1, "the first put counted rows it never wrote");
+    // the claim the window missed took no bytes, so it left no gap
+    assert_eq!(store.state.volumes[0].unlanded_bytes.load(Ordering::Acquire), 0, "a window miss left a gap");
     for number in 0..QUIET_ROWS {
         store.put(COLUMN, format!("key-{number:04}").as_bytes(), b"value").expect("put");
     }

@@ -5149,3 +5149,61 @@ fn records_wait_for_a_point_past_the_first_look() {
     check_reads(&store);
     store.close().expect("close");
 }
+
+// step the planner until the look pass ends and the bound clears, and say how many steps it took
+fn steps_to_clear(job: &mut CompactJob<SimulatedIo>, io: &SimulatedIo, volume: &Volume<SimulatedIo>) -> usize {
+    for step in 1..=PLANNER_STEPS {
+        job.step_unit(io.clock_reading());
+        step_seats(job);
+        if !volume.is_over_bound.load(Ordering::Acquire) {
+            return step;
+        }
+    }
+    panic!("the bound never cleared");
+}
+
+// a clean pass leaves the look at its end, so after a seal the next pass looks at the new segment alone, and holding the
+// filters out changes every answer, so the pass after it looks at every segment again
+#[test]
+fn clean_pass_looks_on_from_its_end() {
+    let io = SimulatedIo::new(Seed(167));
+    let mut config = config();
+    config.threads.maintenance_workers = Some(1);
+    config.memory_budget = WORKER_BUDGET;
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    hold_compaction(&store, true);
+    let volume = &store.state.volumes[0];
+    for number in 0..PASS_SEGMENTS {
+        for row in 0..PASS_ROWS {
+            store.put(COLUMN, format!("s-{number:03}-{row}").as_bytes(), b"first").expect("put");
+        }
+        seal(&store, &io);
+    }
+    io.hold_jobs("reel-planner", true);
+    hold_compaction(&store, false);
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    steps_to_clear(&mut job, &io, volume);
+    let end = volume.looks.up_to();
+    assert_eq!(end, newest_segment(&store), "a clean pass went back to the oldest segment");
+
+    // a seal puts the bound up, and one look over the new segment settles it
+    hold_compaction(&store, true);
+    store.put(COLUMN, b"s-new", b"first").expect("put");
+    seal(&store, &io);
+    hold_compaction(&store, false);
+    let looked_from = volume.looks.up_to();
+    assert_eq!(looked_from, end, "the seal moved the look");
+    assert_eq!(steps_to_clear(&mut job, &io, volume), 1, "the pass after a seal looked past the new segment");
+
+    // filters held out change every answer, so the look starts over from the oldest segment
+    hold_compaction(&store, true);
+    store.put(COLUMN, b"s-newer", b"first").expect("put");
+    seal(&store, &io);
+    volume.holds.filters_out.store(true, Ordering::Release);
+    hold_compaction(&store, false);
+    let steps = steps_to_clear(&mut job, &io, volume);
+    assert!(steps > 1, "a change of filters looked at the new segment alone");
+    volume.holds.filters_out.store(false, Ordering::Release);
+    io.hold_jobs("reel-planner", false);
+    store.close().expect("close");
+}

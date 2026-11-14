@@ -313,6 +313,7 @@ impl<Backend: Io> EngineState<Backend> {
                 merge_interval: Nanoseconds(volume.merge_interval.load(Ordering::Relaxed)),
                 ingest_left: Nanoseconds(volume.hot_until().0.saturating_sub(self.io.now().0)),
                 idle_seals: volume.idle_seals.load(Ordering::Relaxed),
+                unlanded_bytes: volume.unlanded_bytes.load(Ordering::Relaxed),
                 rooms_given_back: volume.rooms_given_back.load(Ordering::Relaxed),
                 is_compaction_held: volume.is_compaction_held(),
                 live_bytes: ByteCount(live),

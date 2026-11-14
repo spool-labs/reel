@@ -396,6 +396,7 @@ impl<Backend: Io> EngineState<Backend> {
             ticket,
             rows: request.rows,
             covers: request.covers,
+            bytes: request.bytes,
             is_landed: false,
             is_alone: request.is_alone,
         }

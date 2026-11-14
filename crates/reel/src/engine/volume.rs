@@ -379,6 +379,8 @@ pub struct Volume<Backend: Io> {
     pub outputs_promised: AtomicU64,
     /// Seals that ended a segment writes had gone quiet on
     pub idle_seals: AtomicU64,
+    /// Bytes claims took and gave up without landing: a gap in the segment, or a record with no row
+    pub unlanded_bytes: AtomicU64,
     /// Quiet open segments that gave their room ahead back
     pub rooms_given_back: AtomicU64,
     /// The store's line writers wait on, which anything that clears a wait moves
@@ -877,13 +879,23 @@ pub struct LookPass {
     looked_up_to: AtomicU64,
     /// The pass has segments left to look at
     has_left: AtomicBool,
-    /// The pass began at the oldest segment, with no merge started since
+    /// The pass began at the oldest segment or past a clean pass end, with no merge started since
     is_whole: AtomicBool,
+    /// The pass passed a crowded point no merge could take
+    has_passed: AtomicBool,
+    /// The filters and the sizing at the last pass end, which the crowd answers depend on
+    stamp: AtomicU64,
 }
 
 impl Default for LookPass {
     fn default() -> Self {
-        Self { looked_up_to: AtomicU64::new(0), has_left: AtomicBool::new(false), is_whole: AtomicBool::new(true) }
+        Self {
+            looked_up_to: AtomicU64::new(0),
+            has_left: AtomicBool::new(false),
+            is_whole: AtomicBool::new(true),
+            has_passed: AtomicBool::new(false),
+            stamp: AtomicU64::new(u64::MAX),
+        }
     }
 }
 
@@ -916,5 +928,20 @@ impl LookPass {
     /// Say whether the pass began at the oldest segment with no merge since
     pub fn set_whole(&self, is_whole: bool) {
         self.is_whole.store(is_whole, Ordering::Release);
+    }
+
+    /// Note the pass passed a crowded point no merge could take, so the next pass starts from the oldest
+    pub fn note_passed(&self) {
+        self.has_passed.store(true, Ordering::Release);
+    }
+
+    /// Read and clear whether the pass passed a crowded point
+    pub fn take_passed(&self) -> bool {
+        self.has_passed.swap(false, Ordering::AcqRel)
+    }
+
+    /// Keep the stamp of this pass end, and read the last one's
+    pub fn swap_stamp(&self, stamp: u64) -> u64 {
+        self.stamp.swap(stamp, Ordering::AcqRel)
     }
 }

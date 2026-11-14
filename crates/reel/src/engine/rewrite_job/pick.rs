@@ -280,15 +280,20 @@ impl<Backend: Io> RewriteJob<Backend> {
 
     /// End a look that reached the newest segment. A pass that began past the oldest looks again from the start, since a segment
     /// it passed while a walk or a seal held it can merge now. A pass that saw every segment and found nothing clears the flag,
-    /// since overlap only rises at a seal
+    /// since overlap only rises at a seal, and the next pass starts past its end, unless it passed a crowded point no merge could
+    /// take
     pub fn end_pass(&mut self, volume: &Volume<Backend>) {
         if volume.looks.has_left() {
             return;
         }
-        volume.looks.set_up_to(SegmentNumber(0));
+        let has_passed = volume.looks.take_passed();
         if volume.looks.is_whole() {
             volume.is_over_bound.store(false, Ordering::Release);
+            if has_passed {
+                volume.looks.set_up_to(SegmentNumber(0));
+            }
         } else {
+            volume.looks.set_up_to(SegmentNumber(0));
             volume.looks.set_left(true);
         }
         volume.looks.set_whole(true);
@@ -317,8 +322,14 @@ impl<Backend: Io> RewriteJob<Backend> {
         // a crowd answer holds while no filter came or went, and holding the filters out changes every answer
         let filters = 2 * arena.changes() + u64::from(volume.are_filters_held_out());
         let answers = (&mut self.crowd_answers, filters);
+        // the answers a pass saw hold while the filters and the sizing stay as they were, and a change looks at every segment again
+        let pass_stamp = 2 * filters + u64::from(!volume.is_bound_pinned());
+        if volume.looks.swap_stamp(pass_stamp) != pass_stamp {
+            volume.looks.set_up_to(SegmentNumber(0));
+            volume.looks.set_whole(true);
+        }
         let mut looked_up_to = volume.looks.up_to();
-        let found = overlap_start(rows, directory_of, &mut looked_up_to, can_merge, &mut self.crowded_key, lists, !volume.is_bound_pinned(), &is_resident, is_late, answers);
+        let found = overlap_start(rows, directory_of, &mut looked_up_to, can_merge, &mut self.crowded_key, lists, !volume.is_bound_pinned(), &is_resident, is_late, || volume.looks.note_passed(), answers);
         volume.looks.set_up_to(looked_up_to);
         volume.looks.set_left(!rows.orders().after(looked_up_to).is_empty());
         let Some((crowded, column)) = found else {
@@ -647,7 +658,7 @@ pub fn overlaps(left: &SummaryRow<'_>, right: &SummaryRow<'_>) -> bool {
 /// Find a point more segments cover than the bound allows, in a segment no look has passed, and fill in the key. Overlap only
 /// grows when a segment arrives, so each one takes one look, and with none new a look costs nothing. It rises at a segment's
 /// lowest key, so the points worth trying are the new segment's own and those of a few that begin inside it
-#[allow(clippy::too_many_arguments, reason = "the summary rows, the directories, the look-up mark and the crowd answers")]
+#[allow(clippy::too_many_arguments, reason = "the summary rows, the directories, the look-up mark, the passed note and the crowd answers")]
 pub fn overlap_start<'rows, 'state>(
     rows: &'rows SummaryRows,
     directory_of: impl Fn(ColumnId) -> Option<&'state ColumnDirectory>,
@@ -658,6 +669,7 @@ pub fn overlap_start<'rows, 'state>(
     is_sized: bool,
     is_resident: &dyn Fn(SegmentNumber) -> bool,
     is_late: impl Fn() -> bool,
+    note_passed: impl Fn(),
     (answers, filters): (&mut CrowdAnswers, u64),
 ) -> Option<(SummaryRow<'rows>, ColumnId)> {
     let (listed, crowd) = lists;
@@ -681,9 +693,12 @@ pub fn overlap_start<'rows, 'state>(
             let mut probes = iter::once(facts.lowest).chain(inside.take(OVERLAP_PROBES));
             let stamp = CrowdStamp { directory: directory.generation(), filters, is_sized };
             let found = probes.find(|key| answers.answer(facts.column, key, stamp, || is_crowded(rows, directory, (facts.column, key), crowd, is_sized, is_resident)));
-            if let Some(key) = found.filter(|_key| can_merge(&row)) {
-                point.set_from(key).ok()?;
-                return Some((row, facts.column));
+            if let Some(key) = found {
+                if can_merge(&row) {
+                    point.set_from(key).ok()?;
+                    return Some((row, facts.column));
+                }
+                note_passed();
             }
         }
         *looked_up_to = segment;

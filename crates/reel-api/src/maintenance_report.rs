@@ -334,6 +334,8 @@ pub struct VolumeReading {
     pub ingest_left: Nanoseconds,
     /// Seals that ended a segment writes had gone quiet on
     pub idle_seals: u64,
+    /// Bytes claims took and gave up without landing: a gap in the segment, or a record with no row
+    pub unlanded_bytes: u64,
     /// Quiet open segments that gave their room ahead back
     pub rooms_given_back: u64,
     /// A test holds compaction off, which only a build with the test hooks can, so a bench run held by accident shows it

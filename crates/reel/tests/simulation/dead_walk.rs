@@ -1419,3 +1419,27 @@ fn quiet(store: &Store, io: &SimulatedIo) {
     let until = store.state.quiet_at(io.clock_reading());
     io.advance_clock(Nanoseconds(until.0.saturating_sub(io.clock_reading().0)));
 }
+
+// a close saves the bits that changed since the last save, whatever its period, so a reopen keeps every walked segment's bits
+#[test]
+fn close_keeps_changed_bits() {
+    let io = SimulatedIo::new(Seed(170));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"older").expect("put");
+    let older = hold(&store.state.volumes[0].claims).open[0].number;
+    seal_segment(&store, &io, older);
+    fill_block(&store);
+    let newer = hold(&store.state.volumes[0].claims).open[0].number;
+    seal_segment(&store, &io, newer);
+    settle(&io);
+    let volume = &store.state.volumes[0];
+    assert!(volume.dead_bits.exact(older).is_some(), "the walk left the older segment's bits unset");
+    store.close().expect("close");
+    drop(store);
+
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    assert!(volume.dead_bits.exact(older).is_some(), "the reopen dropped bits the close should have saved");
+    assert_eq!(check_dead_bits(volume), 2);
+    store.close().expect("close");
+}

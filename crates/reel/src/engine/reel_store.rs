@@ -469,6 +469,11 @@ impl<Backend: Io> ReelStore<Backend> {
             if !volume.has_failed() {
                 outcome = outcome.and(self.state.save_summary(volume).map_err(open_error("saving a summary")));
             }
+            // the bits that changed since the last save go with the summary, or the next open drops every segment they touched. A
+            // failed save costs the walk's work and no more
+            if !volume.has_failed() && volume.bits_saved_at.load(Ordering::Acquire) != 0 && volume.dead_bits.is_changed.swap(false, Ordering::AcqRel) {
+                let _saved = self.state.save_dead_bits(volume);
+            }
             // writes that returned on a failed volume may not be durable, and the caller hears it
             if volume.has_failed() {
                 outcome = outcome.and(Err(StoreError::VolumeFailed { volume: volume.id }));
@@ -1476,6 +1481,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         is_sync_due: AtomicBool::new(false),
         bytes_since_sync: AtomicU64::new(0),
         idle_seals: AtomicU64::new(0),
+        unlanded_bytes: AtomicU64::new(0),
         rooms_given_back: AtomicU64::new(0),
         progress: Arc::clone(progress),
         park_refusals: AtomicU64::new(0),

@@ -205,18 +205,18 @@ impl<Backend: Io> EngineState<Backend> {
         let generation = directory.map_or(0, ColumnDirectory::generation);
         let fixed_point = scan.point.or(pin_point);
         let point = fixed_point.unwrap_or_else(|| self.read_point(volume));
-        if generation != scan.generation {
+        // a sorted column with no mark, read at a point no sealed row hides, takes its sealed keys from the index and seats no
+        // segment. A count takes whole blocks by their lines, so it keeps to the segments. A walk that changes path between steps
+        // starts its places over, as one that meets a new list does
+        let index = self.sorted_index(scan.column)
+            .filter(|index| !scan.is_counting && index.mark().is_none() && !volume.may_hide_under_sealed(point));
+        let is_path_changed = index.is_some() != scan.is_on_index;
+        scan.is_on_index = index.is_some();
+        if generation != scan.generation || is_path_changed {
             // a block taken by its line has no key to seek from, so a count that took one starts over and steps every row
-            if scan.taken > 0 {
+            if generation != scan.generation && scan.taken > 0 {
                 scan.restart_count();
             }
-            scan.reseat(generation);
-        }
-        // a sorted column with no mark, read at a point no sealed row hides, takes its sealed keys from the index and seats no
-        // segment. A walk that changes path between steps starts its places over
-        let index = self.sorted_index(scan.column).filter(|index| index.mark().is_none() && !volume.may_hide_under_sealed(point));
-        if index.is_some() != scan.is_on_index {
-            scan.is_on_index = index.is_some();
             scan.reseat(generation);
         }
         self.place_heads(volume, scan);

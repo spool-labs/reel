@@ -209,6 +209,10 @@ fn reads_through_the_index() {
     check(&store, &model, &written);
     assert!(report(&store).sorted_answers >= before + KEYS, "gets went by the footers");
     check_entries(&store, &model);
+    // with no cover a count takes whole blocks by their lines and steps nothing through the index
+    let scan_keys = store.state.sorted_scan_keys.load(Ordering::Relaxed);
+    assert_eq!(store.count_prefix(COLUMN, b"").expect("count").0, model.len() as u64);
+    assert_eq!(store.state.sorted_scan_keys.load(Ordering::Relaxed), scan_keys, "a count stepped the index");
     assert_eq!(read(&store, &[7; WIDTH as usize]), None);
     store.close().expect("close");
 
@@ -383,6 +387,16 @@ fn churn_matches_the_model() {
             }
             check(&store, &model, &written);
             check_scans(&store, &model, &mut random);
+            // a count keeps to the segments and takes nothing from the index, and counts what the model holds
+            let prefix = [random.below(256) as u8];
+            let scan_keys = store.state.sorted_scan_keys.load(Ordering::Relaxed);
+            let counted = store.count_prefix(COLUMN, &prefix).expect("count");
+            assert_eq!(counted.0, model.keys().filter(|name| name.starts_with(&prefix)).count() as u64);
+            // with no cover and no damage a count takes whole blocks, and otherwise it steps keys as any walk does
+            let volume = &store.state.volumes[0];
+            if volume.covers.is_empty() && volume.damage.is_empty() {
+                assert_eq!(store.state.sorted_scan_keys.load(Ordering::Relaxed), scan_keys, "a count stepped the index");
+            }
         }
         seal_all(&store, &io);
         for _round in 0..3 {

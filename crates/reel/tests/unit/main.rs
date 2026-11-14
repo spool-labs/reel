@@ -31,6 +31,7 @@ mod scan_tree;
 mod scan_window;
 mod segment_table;
 mod segment_tail;
+mod sorted_keys;
 mod summary;
 mod summary_orders;
 mod wake_line;

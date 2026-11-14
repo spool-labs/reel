@@ -26,7 +26,7 @@ use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
 use reel_api::maintenance_report::MaintenanceReport;
 use reel_api::units::{ByteCount, Nanoseconds, SegmentCount, VolumeId, WritePlace};
-use reel_api::value_list::{ValueAnswer, ValueList};
+use reel_api::value_list::{ReadBuffers, ValueAnswer, ValueList};
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_io::SimulatedIo;
@@ -293,8 +293,8 @@ fn many_crossed() {
     assert!(!volume.table.holds(older));
 
     let mut values = ValueList::new();
-    let mut scratch = Vec::new();
-    assert!(in_place(state.answer_many(&InPlace, &many, COLUMN, &[b"key"], &mut values, &mut scratch)).is_none());
+    let mut buffers = ReadBuffers::default();
+    assert!(in_place(state.answer_many(&InPlace, &many, COLUMN, &[b"key"], &mut values, &mut buffers)).is_none());
     for slot in slots {
         state.cues.release(slot);
     }
@@ -316,8 +316,8 @@ fn many_pinned() {
     assert!(volume.table.holds(older));
 
     let mut values = ValueList::new();
-    let mut scratch = Vec::new();
-    let answer = in_place(state.answer_many(&InPlace, &many, COLUMN, &[b"key"], &mut values, &mut scratch)).expect("an answer");
+    let mut buffers = ReadBuffers::default();
+    let answer = in_place(state.answer_many(&InPlace, &many, COLUMN, &[b"key"], &mut values, &mut buffers)).expect("an answer");
     answer.expect("read");
     assert_eq!(values.answer(0), Some(ValueAnswer::Found(b"older")));
     settle(&io);

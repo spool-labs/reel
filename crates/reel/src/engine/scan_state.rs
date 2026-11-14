@@ -117,7 +117,6 @@ pub struct ScanBatch {
     pub point: WritePlace,
     pub keys: Vec<u8>,
     pub records: Vec<u8>,
-    pub order: Vec<u16>,
 }
 
 impl ScanBatch {
@@ -129,7 +128,6 @@ impl ScanBatch {
             point: WritePlace(0),
             keys: touched_capacity(BATCH_KEYS * widest_key, 0),
             records: touched_capacity(BATCH_BYTES, 0),
-            order: touched_capacity(BATCH_KEYS, 0),
         }
     }
 
@@ -153,7 +151,7 @@ impl ScanBatch {
 
     /// Read the heap the batch holds
     pub fn heap_bytes(&self) -> usize {
-        self.entries.capacity() * size_of::<BatchEntry>() + self.keys.capacity() + self.records.capacity() + self.order.capacity() * size_of::<u16>()
+        self.entries.capacity() * size_of::<BatchEntry>() + self.keys.capacity() + self.records.capacity()
     }
 }
 
@@ -633,7 +631,7 @@ pub fn planned_scan_bytes(widest_key: u64, open_slots: usize) -> u64 {
     let heads = SHARD_COUNT * (size_of::<ShardHead>() + open_slots * size_of::<TreeCursor>());
     let held = HELD_SOURCE_BLOCKS * ROW_BLOCK_BYTES;
     let tree = 2 * MOST_SCAN_SOURCES * size_of::<u16>();
-    let batch = BATCH_KEYS * (widest_key as usize + size_of::<BatchEntry>() + size_of::<u16>()) + BATCH_BYTES;
+    let batch = BATCH_KEYS * (widest_key as usize + size_of::<BatchEntry>()) + BATCH_BYTES;
     keys + (sources + heads + held + tree + batch + MOST_SCAN_SOURCES * size_of::<SegmentNumber>() + SCAN_WINDOWS * SCAN_WINDOW_BYTES) as u64
 }
 

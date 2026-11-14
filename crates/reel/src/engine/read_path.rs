@@ -7,13 +7,13 @@ use std::sync::atomic::Ordering;
 use reel_api::column_id::ColumnId;
 use reel_api::reads::ValueWindow;
 use reel_api::store_error::StoreError;
-use reel_api::value_list::ValueList;
+use reel_api::value_list::{ReadBuffers, ValueList};
 use reel_api::units::{ByteCount, FileOffset, WritePlace};
 
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::cue::JobCounts;
 use crate::engine::engine_state::EngineState;
-use crate::engine::open_segment::MOST_WINDOW_RECORD_BYTES;
+use crate::engine::open_segment::MOST_WINDOW_RECORD_BYTES; use crate::engine::scan_state::{BATCH_BYTES, BATCH_KEYS};
 use crate::engine::volume::Volume;
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::index::record_cache::CacheLookup;
@@ -54,6 +54,28 @@ pub enum Located {
     Open(WriteRow),
     /// The row is in a sealed segment
     Sealed(SealedRow),
+}
+
+/// Where a batched read found a key's newest row: the spot cache's guess, which its record check confirms, or the row itself
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyPlace {
+    Spot(SealedRow),
+    Row(Located),
+}
+
+/// How a batched read answers one key once it has located it
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyPlan {
+    /// The key has no value at the point
+    Missing,
+    /// The key's newest row could be in a damaged segment
+    Corrupt,
+    /// The key takes its own read
+    Own,
+    /// The spot cache's record, which the batch reads
+    Spot(SealedRow, CacheLookup),
+    /// A sealed record, which the batch reads unless the record cache holds it or it is too wide
+    Sealed(SealedRow, CacheLookup),
 }
 
 /// What a read does with a record once it has found it
@@ -275,18 +297,18 @@ impl<Backend: Io> EngineState<Backend> {
     ) -> Result<(), StoreError> {
         let info = self.column(column)?;
         let volume = &self.volumes[info.volume.0 as usize];
-        let mut scratch = values.take_scratch();
+        let mut buffers = values.take_buffers();
         let mut outcome = None;
         for _try in 0..MOST_READ_TRIES {
             let Some(many) = self.many_read(volume) else {
                 continue;
             };
-            if let Some(answer) = self.answer_many(device, &many, column, keys, values, &mut scratch).await {
+            if let Some(answer) = self.answer_many(device, &many, column, keys, values, &mut buffers).await {
                 outcome = Some(answer);
                 break;
             }
         }
-        values.put_scratch(scratch);
+        values.put_buffers(buffers);
         outcome.unwrap_or_else(|| self.refuse_read())
     }
 
@@ -316,11 +338,11 @@ impl<Backend: Io> EngineState<Backend> {
         column: ColumnId,
         keys: &[&[u8]],
         values: &mut ValueList,
-        scratch: &mut Vec<u8>,
+        buffers: &mut ReadBuffers,
     ) -> Option<Result<(), StoreError>> {
         values.clear();
         let held = many.pin.map(|slot| HeldPin { state: self, slot, counts: many.counts });
-        let answer = self.read_keys(device, column, keys, ReadAt { point: many.point, handovers: many.handovers }, values, scratch).await;
+        let answer = self.read_keys(device, column, keys, ReadAt { point: many.point, handovers: many.handovers }, values, buffers).await;
         if held.is_none() {
             return self.has_outlived(many.counts, values.has_corrupt()).then_some(answer);
         }
@@ -328,7 +350,8 @@ impl<Backend: Io> EngineState<Backend> {
         Some(answer)
     }
 
-    /// Answer keys in order at a read point, with a bad record as that key's answer
+    /// Answer keys in order at a read point, with a bad record as that key's answer. Keys go a batch at a time: the batch
+    /// locates every key, then reads its small sealed records together
     pub async fn read_keys(
         &self,
         device: &impl DeviceReads<Backend::File>,
@@ -336,20 +359,163 @@ impl<Backend: Io> EngineState<Backend> {
         keys: &[&[u8]],
         at: ReadAt,
         values: &mut ValueList,
-        scratch: &mut Vec<u8>,
+        buffers: &mut ReadBuffers,
     ) -> Result<(), StoreError> {
-        let ReadAt { point, handovers } = at;
-        for key in keys {
+        let ReadBuffers { value, records } = buffers;
+        if let [key] = keys {
             // a value read below the newest must stay out of the spot cache, as a cue's does
-            let read = self.key_read(column, key, point, true)?;
-            match self.get_at(device, &read, handovers, RecordWant::Whole, scratch).await {
-                Ok(true) => values.push_found(scratch),
-                Ok(false) => values.push_missing(),
-                Err(StoreError::Corruption { .. }) => values.push_corrupt(),
-                Err(error) => return Err(error),
-            }
+            let read = self.key_read(column, key, at.point, true)?;
+            return self.read_key(device, &read, at.handovers, values, value).await;
+        }
+        for batch in keys.chunks(BATCH_KEYS) {
+            records.clear();
+            records.reserve_exact(BATCH_BYTES);
+            self.read_key_batch(device, column, batch, at, values, value, records).await?;
         }
         Ok(())
+    }
+
+    /// Answer one key by its own read
+    pub async fn read_key(
+        &self,
+        device: &impl DeviceReads<Backend::File>,
+        read: &KeyRead<'_>,
+        handovers: u64,
+        values: &mut ValueList,
+        scratch: &mut Vec<u8>,
+    ) -> Result<(), StoreError> {
+        match self.get_at(device, read, handovers, RecordWant::Whole, scratch).await {
+            Ok(true) => values.push_found(scratch),
+            Ok(false) => values.push_missing(),
+            Err(StoreError::Corruption { .. }) => values.push_corrupt(),
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    /// Answer up to a batch of keys: locate each, read the small sealed records together, then open them in key order. A key
+    /// the batch can't settle takes its own read
+    #[allow(clippy::too_many_arguments, reason = "a batch of keys, its read point, and the buffers it fills")]
+    pub async fn read_key_batch(
+        &self,
+        device: &impl DeviceReads<Backend::File>,
+        column: ColumnId,
+        keys: &[&[u8]],
+        at: ReadAt,
+        values: &mut ValueList,
+        scratch: &mut Vec<u8>,
+        records: &mut Vec<u8>,
+    ) -> Result<(), StoreError> {
+        let volume = &self.volumes[self.column(column)?.volume.0 as usize];
+        let mut plans = [KeyPlan::Own; BATCH_KEYS];
+        let mut rows = [None; BATCH_KEYS];
+        for ((key, plan), row) in keys.iter().zip(&mut plans).zip(&mut rows) {
+            let read = self.key_read(column, key, at.point, true)?;
+            *plan = match self.locate(device, volume, &read).await {
+                // a cached record needs no read, and its key's own read answers from the cache
+                Ok(KeyPlace::Spot(sealed)) => match self.record_cache.get(sealed.segment, sealed.row.offset, read.key, scratch) {
+                    CacheLookup::Hit => KeyPlan::Own,
+                    lookup => {
+                        *row = Some(sealed);
+                        KeyPlan::Spot(sealed, lookup)
+                    },
+                },
+                Ok(KeyPlace::Row(Located::Sealed(sealed))) => {
+                    if sealed.row.kind != RowKind::Value || read.cover.is_some_and(|cover| cover > sealed.row.place) {
+                        KeyPlan::Missing
+                    } else {
+                        let lookup = self.record_cache.get(sealed.segment, sealed.row.offset, read.key, scratch);
+                        if lookup != CacheLookup::Hit {
+                            *row = Some(sealed);
+                        }
+                        KeyPlan::Sealed(sealed, lookup)
+                    }
+                },
+                Ok(KeyPlace::Row(Located::Absent)) => KeyPlan::Missing,
+                Ok(KeyPlace::Row(Located::Open(_row))) => KeyPlan::Own,
+                Err(StoreError::Corruption { .. }) => KeyPlan::Corrupt,
+                Err(error) => return Err(error),
+            };
+        }
+        let mut spans = [None; BATCH_KEYS];
+        self.read_records(device, volume, &rows[..keys.len()], records, &mut spans).await;
+
+        let mut batched = 0;
+        for ((key, plan), span) in keys.iter().zip(plans).zip(spans) {
+            let read = self.key_read(column, key, at.point, true)?;
+            let (sealed, lookup) = match plan {
+                KeyPlan::Missing => {
+                    values.push_missing();
+                    continue;
+                },
+                KeyPlan::Corrupt => {
+                    values.push_corrupt();
+                    continue;
+                },
+                KeyPlan::Own => {
+                    self.read_key(device, &read, at.handovers, values, scratch).await?;
+                    continue;
+                },
+                KeyPlan::Spot(sealed, lookup) | KeyPlan::Sealed(sealed, lookup) => (sealed, lookup),
+            };
+            if let Some((start, length)) = span
+                && self.open_batched(device, &read, &sealed, &records[start..start + length], scratch)
+            {
+                if lookup == (CacheLookup::Miss { is_admitted: true }) {
+                    self.record_cache.admit(sealed.segment, sealed.row.offset, read.key, scratch);
+                }
+                values.push_found(scratch);
+                batched += 1;
+                continue;
+            }
+            // a cached or wide sealed record reads on its own. A spot's record that fails its check may have moved, and so
+            // may a batched one, and the key's own read settles both
+            if span.is_none() && matches!(plan, KeyPlan::Sealed(..)) {
+                match self.read_sealed(device, volume, &read, &sealed, RecordWant::Whole, scratch).await {
+                    Ok(true) => {
+                        values.push_found(scratch);
+                        continue;
+                    },
+                    Ok(false) => {},
+                    Err(StoreError::Corruption { .. }) => {
+                        values.push_corrupt();
+                        continue;
+                    },
+                    Err(error) => return Err(error),
+                }
+            }
+            self.read_key(device, &read, at.handovers, values, scratch).await?;
+        }
+        self.batched_gets.fetch_add(batched, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Find where a key's newest row sits at its read point, with no value read. The spot cache answers first when its row
+    /// is the newest the index knows of, as it does for a get
+    pub async fn locate(&self, device: &impl DeviceReads<Backend::File>, volume: &Volume<Backend>, read: &KeyRead<'_>) -> Result<KeyPlace, StoreError> {
+        self.check_damage(volume, read, read.cover)?;
+        let found = self.index.lookup(read.column, read.key, read.read_point, volume.view());
+        if let Some(row) = found.row
+            && !found.should_ask_footers
+        {
+            return Ok(KeyPlace::Row(Located::Open(row)));
+        }
+        let newest_below = found.row.map(|row| row.place).max(read.cover);
+        if self.complete_table(read.column).is_none()
+            && let Some(spot) = self.newest_spot(read, newest_below)
+        {
+            let row = FooterRow { place: spot.place, offset: spot.offset, length: spot.length, kind: RowKind::Value };
+            return Ok(KeyPlace::Spot(SealedRow { segment: spot.segment, row, block_offset: 0, at: RowAt::UNKNOWN }));
+        }
+        let sealed = self.search_sealed(device, volume, read).await?;
+        Ok(KeyPlace::Row(newest_of(found.row, sealed)))
+    }
+
+    /// Read the spot cache's location for a key when it is at or under the read point and newer than every row below it
+    pub fn newest_spot(&self, read: &KeyRead<'_>, newest_below: Option<WritePlace>) -> Option<SpotLocation> {
+        let spot = self.spot.lookup(read.hash)?;
+        let is_newest = spot.place <= read.read_point && newest_below.is_none_or(|place| place < spot.place);
+        is_newest.then_some(spot)
     }
 
     /// Fill a buffer with a key's newest value at a read point, and say whether it has one
@@ -522,13 +688,9 @@ impl<Backend: Io> EngineState<Backend> {
         want: RecordWant,
         buf: &mut Vec<u8>,
     ) -> Result<Option<bool>, StoreError> {
-        let Some(spot) = self.spot.lookup(read.hash) else {
+        let Some(spot) = self.newest_spot(read, newest_below) else {
             return Ok(None);
         };
-        let is_newest = spot.place <= read.read_point && newest_below.is_none_or(|place| place < spot.place);
-        if !is_newest {
-            return Ok(None);
-        }
 
         let Some(pin) = volume.table.pin(spot.segment) else {
             return Ok(None);

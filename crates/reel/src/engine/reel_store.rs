@@ -1329,6 +1329,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         graves_carried: AtomicU64::new(0),
         empty_rewrites: AtomicU64::new(0),
         corruption_errors: AtomicU64::new(0),
+        batched_gets: AtomicU64::new(0),
         caller_ops: CallerCounts::default(),
         progress,
         is_arena_full: AtomicBool::new(false),

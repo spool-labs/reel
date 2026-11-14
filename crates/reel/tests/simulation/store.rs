@@ -25,7 +25,7 @@ use reel_api::column_id::ColumnId;
 use reel_api::reads::ValueWindow;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, Nanoseconds, RootId, RowCount, VolumeId};
-use reel_api::value_list::{ValueAnswer, ValueList};
+use reel_api::value_list::{ReadBuffers, ValueAnswer, ValueList};
 use reel_api::write_batch::WriteBatch;
 use reel_sim::wait::wait_until;
 
@@ -52,6 +52,11 @@ const FAILED_OPEN_POINTS: u64 = 40;
 const QUIET_ROWS: u64 = 100;
 const WINDOW_ROWS: u64 = 500;
 const WINDOW_VALUE: usize = 300;
+const MANY_KEYS: u64 = 150;
+const MANY_ROUNDS: u64 = 3;
+const MANY_ABSENT: u64 = 10;
+/// Past the largest record a batch reads, so some records read on their own
+const MANY_WIDEST: u64 = 12 * 1024;
 const SEND_CRASH_POINTS: u64 = 8;
 const LARGE_ENOUGH: usize = 100_000;
 const RACE_RECORD_BYTES: usize = 4_000;
@@ -1157,9 +1162,9 @@ fn many_old_point() {
     settle(&io);
 
     let mut values = ValueList::new();
-    let mut scratch = Vec::new();
+    let mut buffers = ReadBuffers::default();
     let handovers = store.state.volumes[0].handover_count();
-    in_place(store.state.read_keys(&InPlace, COLUMN, &[b"key"], ReadAt { point, handovers }, &mut values, &mut scratch)).expect("read");
+    in_place(store.state.read_keys(&InPlace, COLUMN, &[b"key"], ReadAt { point, handovers }, &mut values, &mut buffers)).expect("read");
 
     assert_eq!(values.answer(0), Some(ValueAnswer::Found(b"older")));
     let mut buf = Vec::new();
@@ -1196,6 +1201,69 @@ fn many_batch_whole() {
         }
     });
     store.close().expect("close");
+}
+
+// get_many gives every key the answer get gives it over batches of sealed, open, deleted, cached and wide records, in any
+// order and with keys that were never written, and it reads the small sealed ones together
+#[test]
+fn many_agrees_over_batches() {
+    for seed in seeds(0..SEED_COUNT) {
+        let io = SimulatedIo::new(Seed(seed));
+        let store = open(&io);
+        let mut random = SeededRandom::new(Seed(seed));
+        let mut model = BTreeMap::new();
+        for round in 0..MANY_ROUNDS {
+            for number in 0..MANY_KEYS {
+                let key = key_of(number);
+                match random.below(10) {
+                    0..7 => {
+                        let mut value = (round * MANY_KEYS + number).to_le_bytes().to_vec();
+                        value.resize(value.len() + random.below(MANY_WIDEST) as usize, number as u8);
+                        store.put(COLUMN, &key, &value).expect("put");
+                        model.insert(key, value);
+                    },
+                    7 => {
+                        store.delete(COLUMN, &key).expect("delete");
+                        model.remove(&key);
+                    },
+                    _ => {},
+                }
+            }
+            // the last round stays open
+            if round + 1 < MANY_ROUNDS {
+                store.seal_now();
+                settle(&io);
+            }
+        }
+        // a third of the keys go through get first, so the spot and record caches hold them
+        for number in 0..MANY_KEYS {
+            if random.below(3) == 0 {
+                read(&store, &key_of(number));
+            }
+        }
+        let mut keys: Vec<Vec<u8>> = (0..MANY_KEYS).map(key_of).chain((0..MANY_ABSENT).map(|number| format!("absent-{number}").into_bytes())).collect();
+        for index in (1..keys.len()).rev() {
+            keys.swap(index, random.below(index as u64 + 1) as usize);
+        }
+        let asked: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+
+        let before = store.state.batched_gets.load(Ordering::Relaxed);
+        let mut values = ValueList::new();
+        store.get_many(COLUMN, &asked, &mut values).expect("get_many");
+
+        assert_eq!(values.len(), asked.len());
+        for (index, key) in asked.iter().enumerate() {
+            let want = model.get(*key).map(Vec::as_slice);
+            assert_eq!(read(&store, key).as_deref(), want, "seed {seed}: get of {key:?}");
+            let answer = values.answer(index).expect("an answer");
+            match want {
+                Some(value) => assert_eq!(answer, ValueAnswer::Found(value), "seed {seed}: key {key:?}"),
+                None => assert_eq!(answer, ValueAnswer::Missing, "seed {seed}: key {key:?}"),
+            }
+        }
+        assert!(store.state.batched_gets.load(Ordering::Relaxed) > before, "seed {seed}: no key came from a batch read");
+        store.close().expect("close");
+    }
 }
 
 // an open segment holds a step of disk at create and gains the next step as its writes pass it, so a store never holds a whole

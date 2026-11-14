@@ -150,6 +150,8 @@ pub struct EngineState<Backend: Io> {
     pub graves_carried: AtomicU64,
     pub empty_rewrites: AtomicU64,
     pub corruption_errors: AtomicU64,
+    /// Keys a get_many answered from records its batch read together
+    pub batched_gets: AtomicU64,
     /// Caller operations, so maintenance can tell callers are busy
     pub caller_ops: CallerCounts,
     /// The line writers wait on, shared with every volume

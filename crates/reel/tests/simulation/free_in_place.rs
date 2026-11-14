@@ -17,7 +17,7 @@ use reel::record::codec::Codec;
 use reel::segment::segment_tail::SegmentNumber;
 use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, VolumeId, WritePlace};
-use reel_api::value_list::ValueList;
+use reel_api::value_list::{ReadBuffers, ValueList};
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_io::SimulatedIo;
@@ -333,8 +333,8 @@ fn many_crossed_by_a_free() {
     assert!(volume.bytes_freed.load(Ordering::Acquire) > 0);
 
     let mut values = ValueList::new();
-    let mut scratch = Vec::new();
-    assert!(in_place(state.answer_many(&InPlace, &many, COLUMN, &[b"key"], &mut values, &mut scratch)).is_none());
+    let mut buffers = ReadBuffers::default();
+    assert!(in_place(state.answer_many(&InPlace, &many, COLUMN, &[b"key"], &mut values, &mut buffers)).is_none());
     for slot in slots {
         state.cues.release(slot);
     }

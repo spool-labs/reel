@@ -234,9 +234,9 @@ impl<Backend: Io> Cue<Backend> {
         let info = self.state.column(column)?;
         let handovers = self.state.volumes[info.volume.0 as usize].handover_count();
         values.clear();
-        let mut scratch = values.take_scratch();
-        let read = in_place(self.state.read_keys(&InPlace, column, keys, ReadAt { point: self.point_of(column)?, handovers }, values, &mut scratch));
-        values.put_scratch(scratch);
+        let mut buffers = values.take_buffers();
+        let read = in_place(self.state.read_keys(&InPlace, column, keys, ReadAt { point: self.point_of(column)?, handovers }, values, &mut buffers));
+        values.put_buffers(buffers);
         self.state.corruption_errors.fetch_add(values.corrupt_count(), Ordering::Relaxed);
         read
     }

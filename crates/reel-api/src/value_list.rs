@@ -31,12 +31,19 @@ pub enum ValueAnswer<'list> {
     Corrupt,
 }
 
+/// The buffers a read lends from its list: one a value lands in on its way to the list, and one a batch reads records into
+#[derive(Debug, Default)]
+pub struct ReadBuffers {
+    pub value: Vec<u8>,
+    pub records: Vec<u8>,
+}
+
 /// One answer per key, in the order of the keys asked for
 #[derive(Debug, Default)]
 pub struct ValueList {
     bytes: Vec<u8>,
     answers: Vec<StoredAnswer>,
-    scratch: Vec<u8>,
+    buffers: ReadBuffers,
 }
 
 impl ValueList {
@@ -71,14 +78,14 @@ impl ValueList {
         self.answers.push(StoredAnswer::Found(span));
     }
 
-    /// Lend out the buffer a value is read into on its way here, which `put_scratch` hands back so it's kept for next time
-    pub fn take_scratch(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.scratch)
+    /// Lend out the buffers a read fills on its way here, which `put_buffers` hands back so they're kept for next time
+    pub fn take_buffers(&mut self) -> ReadBuffers {
+        std::mem::take(&mut self.buffers)
     }
 
-    /// Keep a lent buffer
-    pub fn put_scratch(&mut self, scratch: Vec<u8>) {
-        self.scratch = scratch;
+    /// Keep lent buffers
+    pub fn put_buffers(&mut self, buffers: ReadBuffers) {
+        self.buffers = buffers;
     }
 
     /// Count the answers

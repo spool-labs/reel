@@ -950,6 +950,33 @@ fn seats_together_agree() {
     }
 }
 
+// a list one past a batch's room seats in two even batches, so every segment over the key seats together and none alone
+#[test]
+fn seats_split_evenly() {
+    let io = SimulatedIo::new(Seed(61));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let segments = reel::engine::scan_state::SEAT_BATCH as u64 + 1;
+    for round in 0..segments {
+        // keys of their own, so every segment keeps live rows across the whole range
+        for number in [round, EVEN_KEYS / 2 + round, EVEN_KEYS - 1 - round] {
+            store.put(COLUMN, &key(number), format!("{round}").as_bytes()).expect("put");
+        }
+        seal(&store, &io);
+    }
+    // every segment starts below the walk's first key, so one list holds them all
+    let start = key(EVEN_KEYS / 2);
+    // the first walk puts the blocks in the cache, and the second seats every segment from it
+    let _warm = walk_from(&store, &start, Direction::Ascending, None);
+    let (seats, together) = (&store.state.scan_seats, &store.state.seats_together);
+    let (seats_before, together_before) = (seats.load(Ordering::Relaxed), together.load(Ordering::Relaxed));
+    let found = walk_from(&store, &start, Direction::Ascending, None);
+    assert_eq!(found.len(), TOGETHER_STEPS);
+    assert_eq!(seats.load(Ordering::Relaxed) - seats_before, segments);
+    assert_eq!(together.load(Ordering::Relaxed) - together_before, segments, "a seat went alone");
+    store.close().expect("close");
+}
+
 // a scan over a column the record cache can hold takes the values it holds from it, keeps what it read, and gives the model's
 // rows, and a column too large for the cache leaves the cache to gets
 #[test]
@@ -1015,6 +1042,7 @@ fn walk_from(store: &Store, start: &[u8], direction: Direction, halfway: Option<
     found
 }
 
+const EVEN_KEYS: u64 = 1_000;
 const TOGETHER_SEEDS: u64 = 6;
 const TOGETHER_SEALS: u64 = 24;
 const TOGETHER_PUTS: u64 = 80;

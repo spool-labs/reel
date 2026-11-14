@@ -757,6 +757,9 @@ impl<Backend: Io> EngineState<Backend> {
         loop {
             let page = directory.overlapping(low, high, skip, &mut scan.found);
             skip += scan.found.len();
+            // the page's seats go in even batches, so a list one past a batch's room seats two halves and none alone
+            let seats = scan.found.iter().filter(|segment| !scan.holds(**segment)).count();
+            let batch_size = seats.div_ceil(seats.div_ceil(SEAT_BATCH).max(1)).max(1);
             let mut count = 0;
             for index in 0..scan.found.len() {
                 let segment = scan.found[index];
@@ -769,7 +772,7 @@ impl<Backend: Io> EngineState<Backend> {
                 }
                 batch[count] = segment;
                 count += 1;
-                if count == SEAT_BATCH {
+                if count == batch_size {
                     self.seat_together(ReadOn::new(device, volume), scan, &batch[..count], point).await?;
                     count = 0;
                 }

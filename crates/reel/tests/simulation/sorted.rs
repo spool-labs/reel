@@ -415,6 +415,8 @@ fn churn_matches_the_model() {
         }
         check(&store, &model, &written);
         check_entries(&store, &model);
+        // a seed whose rounds all end in a reopen seals nothing until here, so the walks run once more over sealed keys
+        check_scans(&store, &model, &mut random);
         assert!(store.state.sorted_answers.load(Ordering::Relaxed) > 0);
         assert!(store.state.sorted_scan_keys.load(Ordering::Relaxed) > 0, "no scan key came from the index");
         store.close().expect("close");

@@ -463,6 +463,13 @@ impl<Backend: Io> ReelStore<Backend> {
             return Ok(());
         }
         self.state.stop_jobs().map_err(open_error("stopping a job"))?;
+        // a scan's heads skip the write index while a volume counts no open row, so a count under the rows its open segments hold
+        // would hide rows. The jobs have stopped, and a seal that stopped part way keeps the count above the sum, never under
+        #[cfg(feature = "test-hooks")]
+        for volume in &self.state.volumes {
+            let open: u64 = hold(&volume.claims).open.iter().map(|open| open.row_count.0).sum();
+            assert!(volume.rows_in_index.load(Ordering::Acquire) >= open, "a volume counts fewer open rows than its open segments hold");
+        }
 
         let mut outcome = Ok(());
         for volume in &self.state.volumes {

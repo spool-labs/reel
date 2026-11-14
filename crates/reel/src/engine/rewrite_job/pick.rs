@@ -322,8 +322,9 @@ impl<Backend: Io> RewriteJob<Backend> {
         // a crowd answer holds while no filter came or went, and holding the filters out changes every answer
         let filters = 2 * arena.changes() + u64::from(volume.are_filters_held_out());
         let answers = (&mut self.crowd_answers, filters);
-        // the answers a pass saw hold while the filters and the sizing stay as they were, and a change looks at every segment again
-        let pass_stamp = 2 * filters + u64::from(!volume.is_bound_pinned());
+        // a filter that arrives only loosens a bound, and one that leaves with its segment takes the segment out of the crowd too, so
+        // a pass holds until a segment that stays loses its filters, or the filters are held out or the sizing changes
+        let pass_stamp = 4 * arena.losses() + 2 * u64::from(volume.are_filters_held_out()) + u64::from(!volume.is_bound_pinned());
         if volume.looks.swap_stamp(pass_stamp) != pass_stamp {
             volume.looks.set_up_to(SegmentNumber(0));
             volume.looks.set_whole(true);

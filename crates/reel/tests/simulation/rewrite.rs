@@ -12,6 +12,7 @@ use crate::shape;
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::compact_job::{CompactJob, can_unlink, park};
 use reel::engine::cue::Cue;
+use reel::engine::filter_job::FilterLoader;
 use reel::engine::load_state::DISK_CHECK_PERIOD;
 use reel::engine::open_segment::{OUTPUT_SUFFIX, data_path};
 use reel::engine::read_path::{RecordWant, WalkAsk};
@@ -5193,14 +5194,20 @@ fn clean_pass_looks_on_from_its_end() {
     let end = volume.looks.up_to();
     assert_eq!(end, newest_segment(&store), "a clean pass went back to the oldest segment");
 
-    // a seal puts the bound up, and one look over the new segment settles it
-    hold_compaction(&store, true);
-    store.put(COLUMN, b"s-new", b"first").expect("put");
-    seal(&store, &io);
-    hold_compaction(&store, false);
-    let looked_from = volume.looks.up_to();
-    assert_eq!(looked_from, end, "the seal moved the look");
-    assert_eq!(steps_to_clear(&mut job, &io, volume), 1, "the pass after a seal looked past the new segment");
+    // a seal puts the bound up, and one look over the new segment settles it, with the planner's filter loads between seals as a
+    // live store has them
+    for name in [b"s-new".as_slice(), b"s-next"] {
+        hold_compaction(&store, true);
+        store.put(COLUMN, name, b"first").expect("put");
+        seal(&store, &io);
+        hold_compaction(&store, false);
+        let mut loader = FilterLoader::new(Arc::clone(&store.state), 0);
+        let changes = store.state.filter_arena.changes();
+        while loader.step() {}
+        assert!(store.state.filter_arena.changes() > changes, "the new segment's filters never loaded");
+        assert_eq!(steps_to_clear(&mut job, &io, volume), 1, "the pass after a seal looked past the new segment");
+    }
+    assert!(volume.looks.up_to() > end, "the look went back to the oldest segment");
 
     // filters held out change every answer, so the look starts over from the oldest segment
     hold_compaction(&store, true);

@@ -803,9 +803,20 @@ impl<Backend: Io> EngineState<Backend> {
 }
 
 impl<Backend: Io> EngineState<Backend> {
-    /// Save a volume's exact dead bits beside its summary, a chunk at a time under its own checksum, through a fresh file moved
-    /// into place, so a crash leaves the old file or the new one
+    /// Save a volume's exact dead bits, and clear the changed flag first, so a change made during the save saves again and a
+    /// failed save leaves the flag as it found it
     pub fn save_dead_bits(&self, volume: &Volume<Backend>) -> Result<(), Error> {
+        let was_changed = volume.dead_bits.is_changed.swap(false, Ordering::AcqRel);
+        let saved = self.write_dead_bits(volume);
+        if saved.is_err() && was_changed {
+            volume.dead_bits.is_changed.store(true, Ordering::Release);
+        }
+        saved
+    }
+
+    /// Write a volume's exact dead bits beside its summary, a chunk at a time under its own checksum, through a fresh file moved
+    /// into place, so a crash leaves the old file or the new one
+    pub fn write_dead_bits(&self, volume: &Volume<Backend>) -> Result<(), Error> {
         let mut save = hold(&volume.bits_save);
         let BitsSave { heads, chunk } = &mut *save;
         match self.io.remove_file(&volume.new_bits_path) {

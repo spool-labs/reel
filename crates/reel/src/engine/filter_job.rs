@@ -73,6 +73,7 @@ impl<Backend: Io> FilterLoader<Backend> {
         state.note_unit(UnitKind::FilterLoad, self.loaded, started);
         if !loaded {
             state.filter_arena.drop_segment(segment);
+            state.filter_arena.note_loss();
             // an empty extent says the arena tried, so the look moves on and the block cache answers for this segment
             if !state.filter_arena.begin(segment, 0, 0) {
                 self.looked_at = self.changes(volume);

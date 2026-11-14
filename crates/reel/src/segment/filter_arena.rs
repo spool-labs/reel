@@ -80,6 +80,8 @@ pub struct FilterArena {
     extents: Vec<FilterExtent>,
     /// Moves at every change to any segment's filters, so an answer worked out from which filters were resident can tell it still holds
     changes: AtomicU64,
+    /// Moves only when a segment that stays loses its filters, the one change that can crowd a point a look already passed
+    losses: AtomicU64,
     books: Mutex<ArenaBooks>,
 }
 
@@ -150,6 +152,7 @@ impl FilterArena {
             mask: size - 1,
             extents: touched_extents(most_segments),
             changes: AtomicU64::new(0),
+            losses: AtomicU64::new(0),
             books: Mutex::new(ArenaBooks {
                 extents: touched_filled(most_segments, ExtentBook::default()),
                 free_extents: (0..most_segments as u32).rev().collect(),
@@ -161,6 +164,16 @@ impl FilterArena {
     /// Read how many times any segment's filters changed
     pub fn changes(&self) -> u64 {
         self.changes.load(Ordering::Acquire)
+    }
+
+    /// Read how many times a segment that stays lost its filters
+    pub fn losses(&self) -> u64 {
+        self.losses.load(Ordering::Acquire)
+    }
+
+    /// Note a segment that stays lost its filters
+    pub fn note_loss(&self) {
+        self.losses.fetch_add(1, Ordering::Release);
     }
 
     /// Read the heap the arena holds

@@ -180,3 +180,35 @@ fn waiters_past_the_lines() {
     });
     assert_eq!(pool.waiting(), 0);
 }
+
+// a caller asleep in line gets an item soon, while another caller takes and gives one back with no pause
+#[test]
+fn sleeper_is_not_passed_over() {
+    const RUN: Duration = Duration::from_secs(1);
+    const MOST_WAIT: Duration = Duration::from_millis(50);
+    const HOLD: Duration = Duration::from_micros(50);
+    let pool = Pool::new(vec![0_u32]);
+    let is_done = std::sync::atomic::AtomicBool::new(false);
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            let start = std::time::Instant::now();
+            while start.elapsed() < RUN && !is_done.load(std::sync::atomic::Ordering::Relaxed) {
+                let item = pool.take();
+                // a busy reader holds its item a while, so the item is free only between its give and its next take
+                let held = std::time::Instant::now();
+                while held.elapsed() < HOLD {
+                    std::hint::spin_loop();
+                }
+                pool.give_back(item);
+            }
+        });
+        thread::sleep(Duration::from_millis(10));
+        let start = std::time::Instant::now();
+        let item = pool.take();
+        let waited = start.elapsed();
+        pool.give_back(item);
+        is_done.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(waited < MOST_WAIT, "the sleeper waited {waited:?} behind a busy caller");
+        assert!(pool.passes() <= 1, "the sleeper was passed over {} times", pool.passes());
+    });
+}

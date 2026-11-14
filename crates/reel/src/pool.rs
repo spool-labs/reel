@@ -49,6 +49,9 @@ pub struct Pool<Item> {
     freed: Vec<Condvar>,
     free: AtomicUsize,
     many_waiting: AtomicU64,
+    /// Heads of the line that woke and found every item taken ahead of them, which shut the fast path until they are served
+    passed_heads: AtomicU64,
+    passes: AtomicU64,
     wakes: AtomicU64,
     waits: AtomicU64,
 }
@@ -118,6 +121,8 @@ impl<Item> Pool<Item> {
             freed: (0..WAKE_LINES).map(|_line| Condvar::new()).collect(),
             free: AtomicUsize::new(count),
             many_waiting: AtomicU64::new(0),
+            passed_heads: AtomicU64::new(0),
+            passes: AtomicU64::new(0),
             wakes: AtomicU64::new(0),
             waits: AtomicU64::new(0),
         };
@@ -151,6 +156,11 @@ impl<Item> Pool<Item> {
     /// Count the wake-ups so far, each a system call
     pub fn wakes(&self) -> u64 {
         self.wakes.load(Ordering::Relaxed)
+    }
+
+    /// Count the times a head of the line woke and found every item taken ahead of it
+    pub fn passes(&self) -> u64 {
+        self.passes.load(Ordering::Relaxed)
     }
 
     /// Wake the caller the line is serving. Passing through the line's lock means a caller past its last look is asleep before
@@ -234,22 +244,27 @@ impl<Item> Pool<Item> {
 
     /// Take a free item, waiting in line when all are out. A running caller takes a free item ahead of the sleepers, so a line
     /// that stands costs no sleep a take, and it waits its turn only while a caller who needs several is in line, who would
-    /// otherwise never see enough free at once
+    /// otherwise never see enough free at once. A head that wakes to find its item taken ahead shuts that way until it is
+    /// served, so a sleeper is passed over once and never for as long as others keep taking
     pub fn take(&self) -> Item {
         if self.many_waiting.load(Ordering::Acquire) == 0
+            && self.passed_heads.load(Ordering::Acquire) == 0
             && let Some(item) = self.grab()
         {
             return item;
         }
-        let mut line = self.wait_for(1);
+        let mut was_passed = false;
+        let mut line = self.wait_for(1, &mut was_passed);
         let ticket = line.serving;
         // the head keeps its place until it has an item, so callers who take ahead never push it back
         let item = loop {
             if let Some(item) = self.grab() {
                 break item;
             }
+            self.mark_passed(&mut was_passed);
             line = self.sleep(line, ticket);
         };
+        self.clear_passed(was_passed);
         self.leave_line(line);
         item
     }
@@ -260,7 +275,8 @@ impl<Item> Pool<Item> {
             return;
         }
         self.many_waiting.fetch_add(1, Ordering::AcqRel);
-        let mut line = self.wait_for(count);
+        let mut was_passed = false;
+        let mut line = self.wait_for(count, &mut was_passed);
         let ticket = line.serving;
         let wanted = items.len() + count;
         while items.len() < wanted {
@@ -269,12 +285,14 @@ impl<Item> Pool<Item> {
                 None => line = self.sleep(line, ticket),
             }
         }
+        self.clear_passed(was_passed);
         self.leave_line(line);
         self.many_waiting.fetch_sub(1, Ordering::AcqRel);
     }
 
-    /// Wait until these items are free and nobody who came first is still waiting
-    pub fn wait_for(&self, count: usize) -> MutexGuard<'_, PoolLine> {
+    /// Wait until these items are free and nobody who came first is still waiting. A head that wakes to find too few free
+    /// was passed over by callers who took ahead, and it marks that once, so they queue behind it until it is served
+    pub fn wait_for(&self, count: usize, was_passed: &mut bool) -> MutexGuard<'_, PoolLine> {
         let mut line = hold(&self.line);
         let ticket = line.next_ticket;
         line.next_ticket += 1;
@@ -284,9 +302,29 @@ impl<Item> Pool<Item> {
         fence(Ordering::SeqCst);
         while line.serving != ticket || self.free_count() < count {
             line = self.sleep(line, ticket);
+            if line.serving == ticket && self.free_count() < count {
+                self.mark_passed(was_passed);
+            }
         }
         line
     }
+
+    /// Shut the way past the line once for a head that found its items taken ahead of it
+    pub fn mark_passed(&self, was_passed: &mut bool) {
+        if !*was_passed {
+            *was_passed = true;
+            self.passes.fetch_add(1, Ordering::Relaxed);
+            self.passed_heads.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Open the way past the line again once a passed head has what it waited for
+    pub fn clear_passed(&self, was_passed: bool) {
+        if was_passed {
+            self.passed_heads.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
 
     /// Sleep on the ticket's wake line until the next wake
     pub fn sleep<'pool>(&'pool self, line: MutexGuard<'pool, PoolLine>, ticket: u64) -> MutexGuard<'pool, PoolLine> {

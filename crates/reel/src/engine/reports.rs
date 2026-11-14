@@ -179,6 +179,7 @@ impl<Backend: Io> EngineState<Backend> {
         report.bit_rows = [0; 2];
         report.reader_waits = self.record_readers.waits() + self.footer_readers.waits();
         report.reader_wakes = self.record_readers.wakes() + self.footer_readers.wakes();
+        report.reader_passes = self.record_readers.passes() + self.footer_readers.passes();
         report.batched_gets = self.batched_gets.load(Ordering::Relaxed);
         for volume in &self.volumes {
             for row in hold(&volume.summary).rows() {

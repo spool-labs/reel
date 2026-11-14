@@ -586,6 +586,8 @@ pub struct MaintenanceReport {
     /// Takes from the record and footer reader pools that queued, and the wakes their lines sent
     pub reader_waits: u64,
     pub reader_wakes: u64,
+    /// Heads of the reader pools' lines that woke to find their item taken ahead of them
+    pub reader_passes: u64,
     /// Keys a get_many answered from records its batch read together
     pub batched_gets: u64,
     /// Walk block lookups run together: blocks, candidates asked, candidates whose range held the whole block, per-key checks
@@ -680,6 +682,7 @@ impl MaintenanceReport {
             bit_rows: [0; 2],
             reader_waits: 0,
             reader_wakes: 0,
+            reader_passes: 0,
             batched_gets: 0,
             block_lookups: [0; 4],
             volumes: Vec::new(),

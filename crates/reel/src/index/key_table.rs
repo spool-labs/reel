@@ -3,6 +3,7 @@
 use reel_api::column_id::ColumnId;
 use reel_api::units::ByteCount;
 
+use crate::pool::touched_filled;
 use crate::index::entry_slab::{EntryAddress, EntrySlab, NO_ENTRY};
 use crate::index::key_hash::KeyHash;
 
@@ -35,7 +36,7 @@ impl KeyTable {
             head: NO_ENTRY,
         };
         Self {
-            slots: vec![empty; size],
+            slots: touched_filled(size, empty),
             mask: size - 1,
             used: 0,
         }

@@ -114,6 +114,7 @@ pub struct EngineState<Backend: Io> {
     pub values_under_least: Vec<AtomicU64>,
     pub open_time: AtomicU64,
     pub prefault_time: AtomicU64,
+    pub huge_pages: AtomicU64,
     pub record_readers: Pool<RecordReader>,
     pub footer_readers: Pool<FooterReader>,
     pub job_footer_readers: Pool<FooterReader>,
@@ -157,6 +158,8 @@ pub struct EngineState<Backend: Io> {
     /// Scan sources seated, and those seated together in their cached blocks
     pub scan_seats: AtomicU64,
     pub seats_together: AtomicU64,
+    /// Open trees a scan's heads descended together
+    pub heads_together: AtomicU64,
     /// Caller operations, so maintenance can tell callers are busy
     pub caller_ops: CallerCounts,
     /// The line writers wait on, shared with every volume
@@ -712,6 +715,7 @@ impl<Backend: Io> EngineState<Backend> {
             room: self.sizing.room,
             open_time: Nanoseconds(self.open_time.load(Ordering::Acquire)),
             prefault_time: Nanoseconds(self.prefault_time.load(Ordering::Acquire)),
+            huge_pages: ByteCount(self.huge_pages.load(Ordering::Acquire)),
             is_arena_full: self.is_arena_full.load(Ordering::Acquire),
             arena_segments_left_out,
             arena_columns_left_out,

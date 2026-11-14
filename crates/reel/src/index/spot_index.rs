@@ -5,6 +5,7 @@ use std::sync::RwLock;
 
 use reel_api::units::{ByteCount, FileOffset, WritePlace};
 
+use crate::pool::touched_filled;
 use crate::index::key_hash::KeyHash;
 use crate::guard::Shards;
 use crate::index::write_index::{SHARD_COUNT, shard_of};
@@ -87,7 +88,7 @@ impl SpotShard {
     /// Allocate and touch a whole number of buckets
     pub fn new(buckets: usize) -> Self {
         Self {
-            slots: vec![SpotSlot::empty(); buckets * BUCKET_SLOTS],
+            slots: touched_filled(buckets * BUCKET_SLOTS, SpotSlot::empty()),
             bucket_mask: buckets - 1,
         }
     }

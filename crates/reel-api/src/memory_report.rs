@@ -38,6 +38,8 @@ pub struct MemoryReport {
     pub open_time: Nanoseconds,
     /// The part of that open spent building and touching the pools, the jobs' included
     pub prefault_time: Nanoseconds,
+    /// The process's anonymous memory the kernel backed with huge pages once the store had opened, which its arenas ask for
+    pub huge_pages: ByteCount,
     /// The filter arena holds every filter it can, and gets search the footers' own filters until it does
     pub is_arena_full: bool,
     /// Segments with filters the arena lacks, which a full arena left out for want of room

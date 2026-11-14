@@ -151,6 +151,7 @@ impl<Backend: Io> ReelStore<Backend> {
             return Err(error);
         }
         state.open_time.store(state.io.now().0.saturating_sub(opened_from.0), Ordering::Release);
+        state.huge_pages.store(crate::pool::huge_page_bytes().map_or(0, |bytes| bytes.0), Ordering::Release);
 
         Ok(Self {
             state,
@@ -1302,6 +1303,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         values_under_least: (0..MAX_COLUMNS).map(|_column| AtomicU64::new(0)).collect(),
         open_time: AtomicU64::new(0),
         prefault_time: AtomicU64::new(0),
+        huge_pages: AtomicU64::new(0),
         record_readers: Pool::new(record_readers),
         footer_readers: Pool::new(footer_readers),
         // each volume's planner and each of the store's workers, each holding one at a time
@@ -1337,6 +1339,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         damaged_sums: AtomicU64::new(0),
         scan_seats: AtomicU64::new(0),
         seats_together: AtomicU64::new(0),
+        heads_together: AtomicU64::new(0),
         caller_ops: CallerCounts::default(),
         progress,
         is_arena_full: AtomicBool::new(false),

@@ -2,6 +2,7 @@
 
 use reel_api::units::ByteCount;
 
+use crate::pool::touched_filled;
 use crate::index::entry_slab::{EntryAddress, NO_ENTRY};
 use crate::index::seek_target::RowPrefix;
 
@@ -61,7 +62,7 @@ impl TreeNode {
 impl NodePool {
     /// Allocate and touch every node
     pub fn new(capacity: NodeCount) -> Self {
-        let mut nodes = vec![TreeNode::empty(); capacity.0 as usize];
+        let mut nodes = touched_filled(capacity.0 as usize, TreeNode::empty());
         for (index, node) in nodes.iter_mut().enumerate() {
             let next = index as u32 + 1;
             node.chain = if next == capacity.0 { NO_NODE } else { NodeIndex(next) };

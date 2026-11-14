@@ -58,9 +58,9 @@ impl BlockCache {
         let mut touched = Vec::with_capacity(CACHE_SHARDS);
         for _shard in 0..CACHE_SHARDS {
             shards.push(RwLock::new(CacheShard {
-                keys: vec![NO_BLOCK; slots],
+                keys: touched_filled(slots, NO_BLOCK),
                 lengths: touched_filled(slots, 0),
-                bytes: vec![1; slots * slot_bytes],
+                bytes: touched_filled(slots * slot_bytes, 1),
             }));
             let mut bits = Vec::with_capacity(slots);
             for _slot in 0..slots {

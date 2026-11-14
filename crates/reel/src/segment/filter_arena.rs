@@ -392,6 +392,7 @@ pub fn home_of(number: u64, mask: usize) -> usize {
 /// Allocate zeroed words with every page written
 pub fn touched_words(length: usize) -> Vec<AtomicU32> {
     let mut words: Vec<AtomicU32> = Vec::with_capacity(length);
+    crate::pool::ask_huge_pages(words.as_mut_ptr(), length);
     black_box(words.as_mut_ptr());
     words.resize_with(length, || AtomicU32::new(u32::MAX));
     for word in &words {

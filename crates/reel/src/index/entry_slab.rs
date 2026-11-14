@@ -5,7 +5,7 @@ use reel_api::units::{ByteCount, FileOffset, WritePlace};
 
 use crate::index::open_slots::OpenSlot;
 use crate::index::write_row::WriteRow;
-use crate::pool::TOUCH_BYTE;
+use crate::pool::{TOUCH_BYTE, touched_filled};
 use crate::row_kind::RowKind;
 use crate::segment::segment_tail::SegmentNumber;
 
@@ -94,7 +94,7 @@ impl EntrySlab {
         }
 
         Self {
-            bytes: vec![TOUCH_BYTE; pages.0 as usize * PAGE_BYTES],
+            bytes: touched_filled(pages.0 as usize * PAGE_BYTES, TOUCH_BYTE),
             next_page,
             free_head: if pages.0 == 0 { NO_PAGE } else { PageIndex(0) },
             free_pages: pages,

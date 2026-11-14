@@ -160,7 +160,7 @@ impl NumberMap {
         let size = (capacity.max(1) * 2).next_power_of_two();
         Self {
             numbers: touched_filled(size, SegmentNumber(0)),
-            slots: vec![NO_SLOT; size],
+            slots: touched_filled(size, NO_SLOT),
             mask: size - 1,
         }
     }

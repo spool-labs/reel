@@ -361,16 +361,12 @@ impl<Item> Pool<Item> {
 
 /// Allocate a buffer with every page written, since zeroed memory from the allocator is mapped on first use
 pub fn touched_buffer(capacity: usize) -> Vec<u8> {
-    let mut buffer = vec![TOUCH_BYTE; capacity];
-    black_box(buffer.as_mut_slice());
-    buffer.clear();
-    buffer
+    touched_capacity(capacity, TOUCH_BYTE)
 }
 
 /// Allocate zeroed bytes with every page written
 pub fn touched_zeroes(length: usize) -> Vec<u8> {
-    let mut bytes = vec![TOUCH_BYTE; length];
-    black_box(bytes.as_mut_slice());
+    let mut bytes = touched_filled(length, TOUCH_BYTE);
     bytes.fill(0);
     bytes
 }
@@ -387,6 +383,7 @@ pub fn touched_queue<Item: Clone>(capacity: usize, filler: Item) -> VecDeque<Ite
 /// Allocate an empty list with room for its items and every page of that room written
 pub fn touched_capacity<Item: Clone>(capacity: usize, filler: Item) -> Vec<Item> {
     let mut items: Vec<Item> = Vec::with_capacity(capacity);
+    ask_huge_pages(items.as_mut_ptr(), capacity);
     // the room has to count as seen, or a compiler can turn the writes into a zeroed allocation
     black_box(items.as_mut_ptr());
     items.resize(capacity, filler);
@@ -398,6 +395,7 @@ pub fn touched_capacity<Item: Clone>(capacity: usize, filler: Item) -> Vec<Item>
 /// Allocate an empty list of items that have no plain value yet, with every page of its room written
 pub fn touched_room<Item>(capacity: usize) -> Vec<Item> {
     let mut items: Vec<Item> = Vec::with_capacity(capacity);
+    ask_huge_pages(items.as_mut_ptr(), capacity);
     // the pointer counts as seen before the writes, or a compiler can turn them into a zeroed allocation
     black_box(items.as_mut_ptr());
     for slot in items.spare_capacity_mut() {
@@ -425,4 +423,36 @@ pub fn touched_atomics(length: usize) -> Vec<AtomicU64> {
     }
     black_box(words.as_ptr());
     words
+}
+
+/// Bytes of one huge page, and the least room worth asking huge pages for
+pub const HUGE_PAGE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Ask the kernel to back a buffer's room with huge pages before anything touches it, so a cache's random reads miss the TLB
+/// less. Only whole huge pages inside the room can be huge, and on a system set to never the ask does nothing. A hint: it
+/// never fails a buffer
+pub fn ask_huge_pages<Item>(room: *mut Item, items: usize) {
+    let bytes = items.saturating_mul(size_of::<Item>());
+    if bytes < 2 * HUGE_PAGE_BYTES {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let start = (room as usize).next_multiple_of(HUGE_PAGE_BYTES);
+        let end = (room as usize + bytes) / HUGE_PAGE_BYTES * HUGE_PAGE_BYTES;
+        if end > start {
+            // SAFETY: the range lies inside the room the caller owns, and the advice changes how pages back it, never its bytes
+            let _answer = unsafe { libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_HUGEPAGE) };
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _hint = room;
+}
+
+/// Read the anonymous memory of this process the kernel backs with huge pages, or nothing where the system doesn't say
+pub fn huge_page_bytes() -> Option<ByteCount> {
+    let rollup = std::fs::read_to_string("/proc/self/smaps_rollup").ok()?;
+    let line = rollup.lines().find(|line| line.starts_with("AnonHugePages:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(ByteCount(kib * 1024))
 }

@@ -46,6 +46,7 @@ pub struct UnitTally {
     time: AtomicU64,
     work_sum: AtomicU64,
     time_sum: AtomicU64,
+    cpu: AtomicU64,
 }
 
 /// Every kind's tally, in the order of `UNIT_KINDS`
@@ -54,8 +55,15 @@ pub type UnitTallies = [UnitTally; UNIT_KINDS.len()];
 impl UnitTally {
     /// Note one unit's work and how long it ran
     pub fn note(&self, work: u64, time: Nanoseconds) {
+        self.note_cpu(work, time, Nanoseconds(0));
+    }
+
+    /// Note one unit's work, how long it ran and the thread's CPU time in it, kept for the longest unit
+    pub fn note_cpu(&self, work: u64, time: Nanoseconds, cpu: Nanoseconds) {
         self.work.fetch_max(work, Ordering::Relaxed);
-        self.time.fetch_max(time.0, Ordering::Relaxed);
+        if self.time.fetch_max(time.0, Ordering::Relaxed) < time.0 {
+            self.cpu.store(cpu.0, Ordering::Relaxed);
+        }
         self.work_sum.fetch_add(work, Ordering::Relaxed);
         self.time_sum.fetch_add(time.0, Ordering::Relaxed);
     }
@@ -67,6 +75,7 @@ impl UnitTally {
             time: Nanoseconds(self.time.load(Ordering::Relaxed)),
             work_sum: self.work_sum.load(Ordering::Relaxed),
             time_sum: Nanoseconds(self.time_sum.load(Ordering::Relaxed)),
+            cpu: Nanoseconds(self.cpu.load(Ordering::Relaxed)),
         }
     }
 }

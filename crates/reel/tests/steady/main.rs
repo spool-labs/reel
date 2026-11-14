@@ -782,7 +782,7 @@ fn check_units(store: &Store) -> u64 {
     let mut failures = 0;
     for (kind, reading) in UNIT_KINDS.iter().zip(&report.longest_units) {
         let bound = unit_bound(*kind);
-        println!("unit {kind:?}: {} work, {} us", reading.work, reading.time.0 / 1_000);
+        println!("unit {kind:?}: {} work, {} us, {} us of thread CPU", reading.work, reading.time.0 / 1_000, reading.cpu.0 / 1_000);
         if bound.is_some_and(|bound| reading.work > bound) || (bound.is_some() && reading.time > UNIT_TIME_LINE) {
             println!("unit {kind:?} is past its bound {bound:?} or the {} ms line", UNIT_TIME_LINE.0 / 1_000_000);
             failures += 1;

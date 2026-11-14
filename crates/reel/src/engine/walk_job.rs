@@ -24,6 +24,7 @@ use crate::engine::held_bits::HeldRow;
 use crate::engine::cover_apply::{ApplyStep, CoverApply};
 use crate::engine::engine_state::EngineState;
 use crate::engine::rewrite_job::{RewriteJob, RewriteSeat};
+use crate::engine::reports::thread_cpu;
 use crate::engine::workers::Workers;
 use crate::engine::volume::{NO_SEAL, Volume};
 use crate::guard::hold;
@@ -719,8 +720,9 @@ impl<Backend: Io> WalkJob<Backend> {
         let volume = &state.volumes[self.volume];
         let mut counts = mem::take(&mut self.counts);
         let started = state.io.now();
+        let cpu_started = thread_cpu();
         let outcome = self.counter.count(volume, target, &mut counts);
-        state.note_unit(UnitKind::WalkBlock, counts.rows, started);
+        state.note_unit_cpu(UnitKind::WalkBlock, counts.rows, started, cpu_started);
         let landing = outcome.and_then(|next_block| self.land(volume, target, next_block, &mut counts));
         self.counts = counts;
         match landing? {
@@ -1090,8 +1092,9 @@ impl<Backend: Io> WalkWorker<Backend> {
         self.counter.last_column = None;
         self.counter.is_next_key_unknown = false;
         let started = state.io.now();
+        let cpu_started = thread_cpu();
         let counted = self.counter.count(volume, *target, counts);
-        state.note_unit(UnitKind::WalkBlock, counts.rows, started);
+        state.note_unit_cpu(UnitKind::WalkBlock, counts.rows, started, cpu_started);
         let phase = match counted {
             Ok(position) => {
                 *next_block = position;

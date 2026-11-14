@@ -471,7 +471,7 @@ impl<Backend: Io> ReelStore<Backend> {
             }
             // the bits that changed since the last save go with the summary, or the next open drops every segment they touched. A
             // failed save costs the walk's work and no more
-            if !volume.has_failed() && volume.bits_saved_at.load(Ordering::Acquire) != 0 && volume.dead_bits.is_changed.swap(false, Ordering::AcqRel) {
+            if !volume.has_failed() && volume.bits_saved_at.load(Ordering::Acquire) != 0 && volume.dead_bits.is_changed.load(Ordering::Acquire) {
                 let _saved = self.state.save_dead_bits(volume);
             }
             // writes that returned on a failed volume may not be durable, and the caller hears it

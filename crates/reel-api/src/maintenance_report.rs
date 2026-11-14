@@ -238,6 +238,8 @@ pub struct UnitReading {
     pub work_sum: u64,
     /// The time every unit ran
     pub time_sum: Nanoseconds,
+    /// The thread's CPU time in the longest unit, where a test build reads it, so a long unit shows whether it worked or waited
+    pub cpu: Nanoseconds,
 }
 
 /// What a job is doing
@@ -581,6 +583,9 @@ pub struct MaintenanceReport {
     pub dead_bits: [u64; 14],
     /// Rows on disk in segments whose bits are exact, and all rows on disk
     pub bit_rows: [u64; 2],
+    /// Takes from the record and footer reader pools that queued, and the wakes their lines sent
+    pub reader_waits: u64,
+    pub reader_wakes: u64,
     /// Walk block lookups run together: blocks, candidates asked, candidates whose range held the whole block, per-key checks
     pub block_lookups: [u64; 4],
     pub volumes: Vec<VolumeReading>,
@@ -671,6 +676,8 @@ impl MaintenanceReport {
             merge_lookups: [0; 6],
             dead_bits: [0; 14],
             bit_rows: [0; 2],
+            reader_waits: 0,
+            reader_wakes: 0,
             block_lookups: [0; 4],
             volumes: Vec::new(),
             complete_columns: Vec::new(),

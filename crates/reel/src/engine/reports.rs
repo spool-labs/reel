@@ -59,6 +59,13 @@ impl<Backend: Io> EngineState<Backend> {
         self.units[kind.index()].note(work, time);
     }
 
+    /// Note one unit's work, how long it ran and the thread's CPU time in it, from a start read with `thread_cpu`
+    pub fn note_unit_cpu(&self, kind: UnitKind, work: u64, started: Nanoseconds, cpu_started: Nanoseconds) {
+        let time = Nanoseconds(self.io.now().0.saturating_sub(started.0));
+        let cpu = Nanoseconds(thread_cpu().0.saturating_sub(cpu_started.0));
+        self.units[kind.index()].note_cpu(work, time, cpu);
+    }
+
     /// Count a corruption error on its way to a caller
     pub fn counted<Answer>(&self, answer: Result<Answer, StoreError>) -> Result<Answer, StoreError> {
         if matches!(answer, Err(StoreError::Corruption { .. })) {
@@ -170,6 +177,8 @@ impl<Backend: Io> EngineState<Backend> {
         report.merge_lookups = array::from_fn(|kind| self.merge_lookups[kind].load(Ordering::Relaxed));
         report.dead_bits = [0; 14];
         report.bit_rows = [0; 2];
+        report.reader_waits = self.record_readers.waits() + self.footer_readers.waits();
+        report.reader_wakes = self.record_readers.wakes() + self.footer_readers.wakes();
         for volume in &self.volumes {
             for row in hold(&volume.summary).rows() {
                 let rows = rows_of(&row);
@@ -474,4 +483,22 @@ pub struct DeadSplit {
     pub cue_held: u64,
     pub rows_with_bits: u64,
     pub rows_without_bits: u64,
+}
+
+/// Read the calling thread's CPU time. A test build reads the clock, and a node build reads zero and pays nothing
+#[cfg(feature = "test-hooks")]
+pub fn thread_cpu() -> Nanoseconds {
+    let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: the clock writes one timespec the call owns
+    let status = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &raw mut now) };
+    match status {
+        0 => Nanoseconds(now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64),
+        _failed => Nanoseconds(0),
+    }
+}
+
+/// Read the calling thread's CPU time, which a node build skips
+#[cfg(not(feature = "test-hooks"))]
+pub const fn thread_cpu() -> Nanoseconds {
+    Nanoseconds(0)
 }

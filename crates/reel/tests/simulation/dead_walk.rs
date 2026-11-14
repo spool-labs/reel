@@ -1443,3 +1443,26 @@ fn close_keeps_changed_bits() {
     assert_eq!(check_dead_bits(volume), 2);
     store.close().expect("close");
 }
+
+// a bits save that fails leaves the changed flag set, so the next save tries again, and one that lands clears it
+#[test]
+fn failed_bits_save_keeps_the_changed_flag() {
+    let io = SimulatedIo::new(Seed(171));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"older").expect("put");
+    let older = hold(&store.state.volumes[0].claims).open[0].number;
+    seal_segment(&store, &io, older);
+    fill_block(&store);
+    let newer = hold(&store.state.volumes[0].claims).open[0].number;
+    seal_segment(&store, &io, newer);
+    settle(&io);
+    let volume = &store.state.volumes[0];
+    volume.dead_bits.is_changed.store(true, Ordering::Release);
+    io.fail_writes(OperationCount(1));
+    assert!(store.state.save_dead_bits(volume).is_err(), "the save wrote through a failing write");
+    assert!(volume.dead_bits.is_changed.load(Ordering::Acquire), "a failed save cleared the changed flag");
+    io.fail_writes(OperationCount(0));
+    store.state.save_dead_bits(volume).expect("save");
+    assert!(!volume.dead_bits.is_changed.load(Ordering::Acquire), "a save that landed left the flag set");
+    store.close().expect("close");
+}

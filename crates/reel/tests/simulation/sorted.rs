@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use crate::seed_sets::seeds;
+
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::compact_job::CompactJob;
 use reel::engine::open_segment::SegmentPhase;
@@ -336,7 +338,7 @@ fn past_capacity_stays_right() {
 // random puts, deletes and range deletes over many seals, merges, reopens and kills read as a model does
 #[test]
 fn churn_matches_the_model() {
-    for seed in 0..CHURN_SEEDS {
+    for seed in seeds(0..CHURN_SEEDS) {
         let io = SimulatedIo::new(Seed(100 + seed));
         let mut random = SeededRandom::new(Seed(200 + seed));
         let mut store = open(&io, CAPACITY);

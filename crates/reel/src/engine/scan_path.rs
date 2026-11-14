@@ -263,20 +263,21 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Take a key's newest sealed row from the index batch, when the batch stands on the key. An entry newer than the read point,
-    /// or a value whose segment left, sends the key to the footers
+    /// or a value whose segment left when the step reads the value itself, sends the key to the footers. A located batch meets a
+    /// segment that left at its own read, and sends that key back through a step that reads it
     pub async fn sorted_sealed(
         &self,
         device: &impl DeviceReads<Backend::File>,
         volume: &Volume<Backend>,
         scan: &ScanState,
-        candidate: &[u8],
+        (candidate, is_reading): (&[u8], bool),
         read: &KeyRead<'_>,
     ) -> Result<Option<SealedRow>, StoreError> {
         if scan.sorted_key() != Some(candidate) {
             return Ok(None);
         }
         let entry = scan.sorted.entries[scan.sorted_next];
-        if entry.place > read.read_point || (!entry.is_grave && volume.table.pin(entry.segment).is_none()) {
+        if entry.place > read.read_point || (is_reading && !entry.is_grave && volume.table.pin(entry.segment).is_none()) {
             self.sorted_footer_asks.fetch_add(1, Ordering::Relaxed);
             return self.search_sealed(device, volume, read).await;
         }
@@ -311,7 +312,7 @@ impl<Backend: Io> EngineState<Backend> {
             },
         };
         let sealed = if scan.is_on_index {
-            self.sorted_sealed(device, volume, scan, candidate, &read).await?
+            self.sorted_sealed(device, volume, scan, (candidate, matches!(want, ScanWant::Value(_))), &read).await?
         } else {
             let taken = self.take_rows(device, volume, scan, candidate, read.read_point).await?;
             if scan.is_spilled { self.search_sealed(device, volume, &read).await? } else { taken }
@@ -717,6 +718,18 @@ impl<Backend: Io> EngineState<Backend> {
         let is_new_view = view != scan.heads_view;
         scan.heads_view = view;
         let mut has_moved = false;
+        // a volume with no row in the write index gives a head nothing to stand on, so the heads take no shard lock. A read-only
+        // store keeps no such count, since its open rows come from a writer it follows
+        if !self.is_read_only && volume.rows_in_index.load(Ordering::Acquire) == 0 {
+            for head in scan.heads.iter_mut().filter(|head| !head.is_placed || is_new_view) {
+                head.cursor.reset();
+                head.has_key = false;
+                head.is_placed = true;
+                head.placed_at = mark;
+            }
+            scan.find_closest_head();
+            return;
+        }
         let mut wanted = scan.heads.iter_mut().enumerate().filter(|(_shard, head)| !head.is_placed || is_new_view).peekable();
         // a few shards a batch, so their tree descents overlap and writers wait on no more than those shards' locks
         while wanted.peek().is_some() {

@@ -7,6 +7,7 @@ use reel_api::direction::Direction;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, WritePlace};
 
 use crate::index::shard_cursor::{ShardCursor, TreeCursor};
+use crate::index::sorted_keys::{KeyBatch, KeyEntry, MOST_KEY_BYTES};
 use crate::engine::read_path::Located;
 use crate::index::open_slots::OpenSlots;
 use crate::index::write_index::SHARD_COUNT;
@@ -198,6 +199,13 @@ pub struct ScanState {
     /// Keys answered from a record the batch read in a joined run
     pub batched: u64,
     pub window: ScanWindows,
+    /// A sorted column's sealed keys from its index, graves among them, the next at `sorted_next`
+    pub sorted: KeyBatch,
+    pub sorted_next: usize,
+    /// The index holds nothing past the batch
+    pub is_sorted_done: bool,
+    /// The walk takes its sealed keys from the column's sorted index, and seats no segment
+    pub is_on_index: bool,
     pub batch: ScanBatch,
 }
 
@@ -462,6 +470,10 @@ impl ScanState {
             batched: 0,
             window: ScanWindows::new(),
             batch: ScanBatch::new(widest_key),
+            sorted: sorted_batch(widest_key),
+            sorted_next: 0,
+            is_sorted_done: false,
+            is_on_index: false,
         }
     }
 
@@ -486,6 +498,8 @@ impl ScanState {
         self.forget_held();
         self.window.clear();
         self.batch.clear();
+        self.forget_sorted();
+        self.is_on_index = false;
         self.limit.clear();
         self.has_limit = match range.limit {
             ScanLimit::None => false,
@@ -529,12 +543,30 @@ impl ScanState {
         self.is_tree_stale = true;
         self.is_spilled = false;
         self.frontier = Some(KeyBound::of_key(&self.position));
+        self.forget_sorted();
         self.forget_held();
         for head in &mut self.heads {
             head.cursor.reset();
             head.is_placed = false;
             head.has_key = false;
         }
+    }
+
+    /// Drop the index's batch, so the next step reads it again from the walk's position
+    pub fn forget_sorted(&mut self) {
+        self.sorted.clear();
+        self.sorted_next = 0;
+        self.is_sorted_done = false;
+    }
+
+    /// Read the index batch's next key the walk hasn't passed, if the batch holds one
+    pub fn sorted_key(&self) -> Option<&[u8]> {
+        (self.sorted_next < self.sorted.len()).then(|| self.sorted.key(self.sorted_next))
+    }
+
+    /// Check a key lies past the walk's position, the position itself in when the walk hasn't passed it
+    pub fn is_ahead(&self, key: &[u8]) -> bool {
+        key == self.position.as_slice() && self.is_inclusive || self.is_before(&self.position, key)
     }
 
     /// Drop what each source held, so its next block comes through the cache
@@ -690,7 +722,8 @@ impl ScanState {
         let own = self.position.capacity() + self.limit.capacity() + self.key.capacity() + self.spill.key.capacity() + self.origin.capacity() + self.out_key.capacity();
         let found = self.found.capacity() * size_of::<SegmentNumber>() + (self.losers.capacity() + self.winners.capacity()) * size_of::<u16>();
         let head = self.heads.capacity() * size_of::<ShardHead>();
-        ByteCount(self.sources.capacity() as u64 * source + (keys + heads + own + found + head + self.window.heap_bytes() + self.batch.heap_bytes()) as u64)
+        let batches = self.batch.heap_bytes() + self.sorted.heap_bytes();
+        ByteCount(self.sources.capacity() as u64 * source + (keys + heads + own + found + head + self.window.heap_bytes() + batches) as u64)
     }
 }
 
@@ -750,7 +783,8 @@ pub fn planned_scan_bytes(widest_key: u64, open_slots: usize) -> u64 {
     let heads = SHARD_COUNT * (size_of::<ShardHead>() + open_slots * size_of::<TreeCursor>());
     let held = HELD_SOURCE_BLOCKS * ROW_BLOCK_BYTES;
     let tree = 2 * MOST_SCAN_SOURCES * size_of::<u16>();
-    let batch = BATCH_KEYS * (widest_key as usize + size_of::<BatchEntry>()) + BATCH_BYTES;
+    let sorted = BATCH_KEYS * ((widest_key as usize).clamp(1, MOST_KEY_BYTES) + size_of::<KeyEntry>());
+    let batch = BATCH_KEYS * (widest_key as usize + size_of::<BatchEntry>()) + BATCH_BYTES + sorted;
     keys + (sources + heads + held + tree + batch + MOST_SCAN_SOURCES * size_of::<SegmentNumber>() + SCAN_WINDOWS * SCAN_WINDOW_BYTES) as u64
 }
 
@@ -910,4 +944,11 @@ impl Default for ScanWindows {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Allocate a scan's batch of sorted index entries, for the widest key a sorted column can have
+pub fn sorted_batch(widest_key: usize) -> KeyBatch {
+    let mut batch = KeyBatch::new(widest_key.clamp(1, MOST_KEY_BYTES), BATCH_KEYS);
+    batch.is_with_graves = true;
+    batch
 }

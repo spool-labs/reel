@@ -12,6 +12,7 @@ use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
 use crate::engine::engine_state::EngineState;
+use crate::engine::complete_path::sealed_of;
 use crate::engine::read_path::{HeldPin, KeyRead, Located, MOST_READ_TRIES, RecordWant, SealedRow, newest_of};
 use crate::engine::scan_state::{
     BATCH_BYTES, BATCH_KEYS, BatchEntry, BlockTake, JOIN_GAP, MOST_BATCH_RECORD, MOST_SCANS, MOST_WINDOW_RECORD, NO_GENERATION,
@@ -20,6 +21,7 @@ use crate::engine::scan_state::{
 };
 use crate::engine::volume::Volume;
 use crate::guard::hold;
+use crate::index::sorted_keys::{ScanFrom, SortedKeys};
 use crate::index::write_shard::{HEAD_GROUP, HeadPlace, WalkBound, WriteShard, place_heads_together};
 use crate::io::{DeviceReads, Io, ManyRead, ReadOn, in_place};
 use crate::record::record_check::RecordIdentity;
@@ -210,9 +212,18 @@ impl<Backend: Io> EngineState<Backend> {
             }
             scan.reseat(generation);
         }
+        // a sorted column with no mark, read at a point no sealed row hides, takes its sealed keys from the index and seats no
+        // segment. A walk that changes path between steps starts its places over
+        let index = self.sorted_index(scan.column).filter(|index| index.mark().is_none() && !volume.may_hide_under_sealed(point));
+        if index.is_some() != scan.is_on_index {
+            scan.is_on_index = index.is_some();
+            scan.reseat(generation);
+        }
         self.place_heads(volume, scan);
-        if let Some(directory) = directory {
-            self.join_segments(device, volume, directory, scan, point).await?;
+        match (index, directory) {
+            (Some(index), _directory) => fill_sorted(index, scan),
+            (None, Some(directory)) => self.join_segments(device, volume, directory, scan, point).await?,
+            (None, None) => {},
         }
 
         let mut candidate = mem::take(&mut scan.key);
@@ -221,6 +232,12 @@ impl<Backend: Io> EngineState<Backend> {
             candidate.extend_from_slice(closest);
             true
         });
+        // the index's next key stands beside the heads', and the nearer one goes first
+        if let Some(sorted) = scan.sorted_key().filter(|sorted| !has_key || scan.is_before(sorted, &candidate)) {
+            candidate.clear();
+            candidate.extend_from_slice(sorted);
+            has_key = true;
+        }
         let spilled = match directory.filter(|_directory| scan.is_spilled) {
             Some(directory) => self.spilled_key(on, directory, scan, point, has_key, &mut candidate).await,
             None => Ok(has_key),
@@ -243,6 +260,28 @@ impl<Backend: Io> EngineState<Backend> {
         };
         scan.key = candidate;
         outcome
+    }
+
+    /// Take a key's newest sealed row from the index batch, when the batch stands on the key. An entry newer than the read point,
+    /// or a value whose segment left, sends the key to the footers
+    pub async fn sorted_sealed(
+        &self,
+        device: &impl DeviceReads<Backend::File>,
+        volume: &Volume<Backend>,
+        scan: &ScanState,
+        candidate: &[u8],
+        read: &KeyRead<'_>,
+    ) -> Result<Option<SealedRow>, StoreError> {
+        if scan.sorted_key() != Some(candidate) {
+            return Ok(None);
+        }
+        let entry = scan.sorted.entries[scan.sorted_next];
+        if entry.place > read.read_point || (!entry.is_grave && volume.table.pin(entry.segment).is_none()) {
+            self.sorted_footer_asks.fetch_add(1, Ordering::Relaxed);
+            return self.search_sealed(device, volume, read).await;
+        }
+        self.sorted_scan_keys.fetch_add(1, Ordering::Relaxed);
+        Ok(Some(sealed_of(&entry)))
     }
 
     /// Answer the walk's next key at a point
@@ -271,8 +310,12 @@ impl<Backend: Io> EngineState<Backend> {
                 self.index.lookup(scan.column, candidate, read.read_point, volume.view()).row
             },
         };
-        let taken = self.take_rows(device, volume, scan, candidate, read.read_point).await?;
-        let sealed = if scan.is_spilled { self.search_sealed(device, volume, &read).await? } else { taken };
+        let sealed = if scan.is_on_index {
+            self.sorted_sealed(device, volume, scan, candidate, &read).await?
+        } else {
+            let taken = self.take_rows(device, volume, scan, candidate, read.read_point).await?;
+            if scan.is_spilled { self.search_sealed(device, volume, &read).await? } else { taken }
+        };
         // a seal moves rows from the index to a segment this walk hasn't seated, and both of its looks must see one list
         let is_same_list = at.directory.is_none_or(|directory| directory.generation() == at.generation);
         if !is_same_list {
@@ -1303,5 +1346,38 @@ pub fn read_error(source: Error) -> StoreError {
     StoreError::Io {
         action: "reading a row block",
         source,
+    }
+}
+
+/// Bring a walk's batch of index entries to the first key it hasn't passed, reading the next batch from its position when the
+/// batch runs out and the index holds more
+pub fn fill_sorted(index: &SortedKeys, scan: &mut ScanState) {
+    if scan.sorted.width() != index.width() {
+        scan.sorted.set_width(index.width());
+        scan.sorted_next = 0;
+        scan.is_sorted_done = false;
+    }
+    loop {
+        while let Some(key) = scan.sorted_key() {
+            if scan.is_ahead(key) {
+                return;
+            }
+            scan.sorted_next += 1;
+        }
+        if scan.is_sorted_done {
+            return;
+        }
+        let ScanState { sorted, position, is_inclusive, direction, .. } = scan;
+        let from = ScanFrom::Key { key: position, is_inclusive: *is_inclusive };
+        let is_done = match direction {
+            Direction::Ascending => index.read_after(from, BATCH_KEYS, sorted),
+            Direction::Descending => index.read_before(from, BATCH_KEYS, sorted),
+        };
+        scan.sorted_next = 0;
+        scan.is_sorted_done = is_done;
+        // a batch with graves in it fills before the entries a call looks at run out, so an empty batch has nothing left
+        if scan.sorted.is_empty() {
+            scan.is_sorted_done = true;
+        }
     }
 }

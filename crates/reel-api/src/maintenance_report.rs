@@ -610,6 +610,8 @@ pub struct MaintenanceReport {
     /// newest sealed row, at an entry with no pinned segment, or past the index's mark
     pub sorted_answers: u64,
     pub sorted_footer_asks: u64,
+    /// Scan keys whose sealed row came from a sorted index's batch
+    pub sorted_scan_keys: u64,
     /// Output row blocks a merge's install couldn't read to move sorted entries
     pub sorted_moves_missed: u64,
     /// Rows past a sorted index's room, and its entries, graves among them
@@ -717,6 +719,7 @@ impl MaintenanceReport {
             cache_inserts_skipped: 0,
             sorted_answers: 0,
             sorted_footer_asks: 0,
+            sorted_scan_keys: 0,
             sorted_moves_missed: 0,
             sorted_past_capacity: 0,
             sorted_entries: 0,

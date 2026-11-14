@@ -16,7 +16,7 @@ use crate::guard::hold;
 use crate::index::complete_table::{CompleteSlot, CompleteTable, TagMatches};
 use crate::index::open_slots::OpenSlot;
 use crate::engine::seal_job::SortedRun;
-use crate::index::sorted_keys::{HOLD_ROWS, SortedKeys};
+use crate::index::sorted_keys::{HOLD_ROWS, KeyEntry, SortedKeys};
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::io::{DeviceReads, InPlace, Io, in_place};
 use crate::io::device_error::is_device_error;
@@ -115,17 +115,7 @@ impl<Backend: Io> EngineState<Backend> {
             self.sorted_footer_asks.fetch_add(1, Ordering::Relaxed);
             return self.search_footers(device, volume, read).await;
         }
-        let found = entry.map(|entry| SealedRow {
-            segment: entry.segment,
-            row: FooterRow {
-                place: entry.place,
-                offset: entry.offset,
-                length: entry.length,
-                kind: if entry.is_grave { RowKind::Grave } else { RowKind::Value },
-            },
-            block_offset: 0,
-            at: RowAt::UNKNOWN,
-        });
+        let found = entry.as_ref().map(sealed_of);
         let Some(mark) = index.mark() else {
             self.sorted_answers.fetch_add(1, Ordering::Relaxed);
             return Ok(found);
@@ -567,5 +557,20 @@ pub fn newest_sealed(left: Option<SealedRow>, right: Option<SealedRow>) -> Optio
         (Some(left), Some(right)) if right.row.place > left.row.place => Some(right),
         (Some(left), _right) => Some(left),
         (None, right) => right,
+    }
+}
+
+/// Build the sealed row an index entry stands for. Its block is unknown, so a reader of it reads the record by place
+pub fn sealed_of(entry: &KeyEntry) -> SealedRow {
+    SealedRow {
+        segment: entry.segment,
+        row: FooterRow {
+            place: entry.place,
+            offset: entry.offset,
+            length: entry.length,
+            kind: if entry.is_grave { RowKind::Grave } else { RowKind::Value },
+        },
+        block_offset: 0,
+        at: RowAt::UNKNOWN,
     }
 }

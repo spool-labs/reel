@@ -112,12 +112,14 @@ pub enum ScanFrom<'key> {
 }
 
 /// A batch of live entries a scan copied out under a part's lock, in scan order
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct KeyBatch {
     pub keys: Vec<u8>,
     pub entries: Vec<KeyEntry>,
     /// The last key a call looked at, which the next call starts after
     resume: [u8; MOST_KEY_BYTES],
+    /// The batch takes graves too, as a scan does: a grave hides an older open row of its key
+    pub is_with_graves: bool,
     width: usize,
 }
 
@@ -190,8 +192,25 @@ impl KeyBatch {
             keys: Vec::with_capacity(width * most),
             entries: Vec::with_capacity(most),
             resume: [0; MOST_KEY_BYTES],
+            is_with_graves: false,
             width,
         }
+    }
+
+    /// Read the width of the batch's keys
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    /// Read the heap the batch holds
+    pub fn heap_bytes(&self) -> usize {
+        self.keys.capacity() + self.entries.capacity() * size_of::<KeyEntry>()
+    }
+
+    /// Empty the batch for keys of another width, which its room holds
+    pub fn set_width(&mut self, width: usize) {
+        self.clear();
+        self.width = width;
     }
 
     /// Read the key a scan that isn't done goes on after
@@ -1058,10 +1077,10 @@ impl SortedKeys {
         }
     }
 
-    /// Copy a live entry into a batch, and skip a grave
+    /// Copy an entry into a batch, and skip a grave unless the batch takes them
     fn copy_live(&self, leaf: u32, index: usize, batch: &mut KeyBatch) {
         let entry = self.read_entry(leaf, index);
-        if entry.is_grave {
+        if entry.is_grave && !batch.is_with_graves {
             return;
         }
         let mut key = [0; MOST_KEY_BYTES];

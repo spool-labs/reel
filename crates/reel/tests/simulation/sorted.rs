@@ -13,7 +13,10 @@ use reel::engine::rewrite_job::RewritePhase;
 use reel::guard::hold;
 use reel::index::sorted_keys::KeyEntry;
 use reel::record::codec::Codec;
+use reel::engine::store_scan::StoreScan;
 use reel_api::column_id::ColumnId;
+use reel_api::direction::Direction;
+use reel_api::scan::ScanStep;
 use reel_api::maintenance_report::MaintenanceReport;
 use reel::segment::segment_tail::SegmentNumber;
 use reel_api::units::{ByteCount, DeathMark, Nanoseconds, RowCount, VolumeId};
@@ -36,6 +39,8 @@ const CHURN_WRITES: u64 = 600;
 const CHURN_KEYS: u64 = 1_500;
 const COVER_ONE_IN: u64 = 40;
 const MARK: DeathMark = DeathMark(1_000_000);
+const SCAN_STARTS: u64 = 12;
+const SCAN_TAKE: usize = 40;
 const MERGE_KEYS: u64 = 15_000;
 
 type Store = ReelStore<SimulatedIo>;
@@ -137,6 +142,44 @@ fn check_entries(store: &Store, model: &Model) {
         }
     });
     assert_eq!(live, model.keys().cloned().collect::<Vec<_>>());
+}
+
+fn rows(mut scan: StoreScan<SimulatedIo>) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let (mut key, mut value, mut found) = (Vec::new(), Vec::new(), Vec::new());
+    loop {
+        match scan.next_row(&mut key, &mut value).expect("step") {
+            ScanStep::Found => found.push((key.clone(), value.clone())),
+            ScanStep::Corrupt => panic!("a corrupt record"),
+            ScanStep::End => return found,
+        }
+    }
+}
+
+// whole walks both ways and walks from keys of every width, against the model
+fn check_scans(store: &Store, model: &Model, random: &mut SeededRandom) {
+    let forward: Vec<(Vec<u8>, Vec<u8>)> = model.iter().map(|(key, value)| (key.clone(), value.clone())).collect();
+    assert_eq!(rows(store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan")), forward);
+    let top = vec![0xFF; WIDTH as usize + 1];
+    let mut backward = forward.clone();
+    backward.reverse();
+    assert_eq!(rows(store.iter_from(COLUMN, &top, Direction::Descending).expect("scan")), backward);
+    for _start in 0..SCAN_STARTS {
+        let mut start = key(random.below(CHURN_KEYS));
+        // a start a byte short or a byte long sorts beside the stored keys of its leading bytes
+        match random.below(3) {
+            0 => {
+                start.pop();
+            },
+            1 => start.push(random.below(256) as u8),
+            _ => {},
+        }
+        let up: Vec<_> = forward.iter().filter(|(name, _value)| *name >= start).take(SCAN_TAKE).cloned().collect();
+        let found: Vec<_> = rows(store.iter_from(COLUMN, &start, Direction::Ascending).expect("scan")).into_iter().take(SCAN_TAKE).collect();
+        assert_eq!(found, up, "up from {start:?}");
+        let down: Vec<_> = backward.iter().filter(|(name, _value)| *name <= start).take(SCAN_TAKE).cloned().collect();
+        let found: Vec<_> = rows(store.iter_from(COLUMN, &start, Direction::Descending).expect("scan")).into_iter().take(SCAN_TAKE).collect();
+        assert_eq!(found, down, "down from {start:?}");
+    }
 }
 
 // sealed keys read back through the index, with overwrites and deletes across seals, through a clean reopen and a kill
@@ -339,6 +382,7 @@ fn churn_matches_the_model() {
                 },
             }
             check(&store, &model, &written);
+            check_scans(&store, &model, &mut random);
         }
         seal_all(&store, &io);
         for _round in 0..3 {
@@ -347,6 +391,7 @@ fn churn_matches_the_model() {
         check(&store, &model, &written);
         check_entries(&store, &model);
         assert!(store.state.sorted_answers.load(Ordering::Relaxed) > 0);
+        assert!(store.state.sorted_scan_keys.load(Ordering::Relaxed) > 0, "no scan key came from the index");
         store.close().expect("close");
     }
 }
@@ -462,5 +507,47 @@ fn merges_keep_gets_on_the_index() {
     assert_eq!(after.sorted_footer_asks, before.sorted_footer_asks, "a get after the merge asked the footers");
     assert!(after.sorted_answers >= before.sorted_answers + MERGE_KEYS);
     check_entries(&store, &model);
+    store.close().expect("close");
+}
+
+// an entry whose segment is gone: a grave answers absent from the index, and a value goes to the footers for its row, in a get
+// and in a scan
+#[test]
+fn entries_whose_segment_left() {
+    let io = SimulatedIo::new(Seed(8));
+    let store = open(&io, CAPACITY);
+    let (deleted, kept) = (key(1), key(2));
+    store.put(COLUMN, &deleted, b"value").expect("put");
+    store.put(COLUMN, &kept, b"value").expect("put");
+    seal_all(&store, &io);
+    // an older row stays open beside the grave's segment, so the floor keeps the grave as an entry
+    store.put_marked(COLUMN, &key(3), b"open", MARK).expect("put");
+    store.delete(COLUMN, &deleted).expect("delete");
+    let volume = &store.state.volumes[0];
+    {
+        let mut claims = hold(&volume.claims);
+        let unmarked = claims.open.iter().position(|open| open.ceiling.is_none() && open.row_count.0 > 0).expect("the grave's segment");
+        store.state.seal_at(&mut claims, volume, unmarked);
+    }
+    settle(&io);
+    let index = store.state.sorted_index(COLUMN).expect("an index");
+    // a number an entry can hold and no segment has
+    let gone = SegmentNumber(u64::from(u32::MAX - 2));
+    assert!(store.state.volumes[0].table.pin(gone).is_none());
+    for name in [&deleted, &kept] {
+        let held = index.find(name).expect("an entry");
+        assert!(index.move_entry(name, held.place, gone, held.offset));
+    }
+    assert!(entry(&store, &deleted).is_some_and(|entry| entry.is_grave));
+
+    let before = report(&store).sorted_footer_asks;
+    assert_eq!(read(&store, &deleted), None);
+    assert_eq!(report(&store).sorted_footer_asks, before, "the grave asked the footers");
+    assert_eq!(read(&store, &kept).as_deref(), Some(&b"value"[..]));
+    assert_eq!(report(&store).sorted_footer_asks, before + 1, "the value didn't ask the footers");
+
+    let found = rows(store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan"));
+    assert_eq!(found, vec![(kept.clone(), b"value".to_vec()), (key(3), b"open".to_vec())]);
+    assert!(report(&store).sorted_footer_asks > before + 1, "the scan's value didn't ask the footers");
     store.close().expect("close");
 }

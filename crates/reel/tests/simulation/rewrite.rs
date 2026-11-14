@@ -3914,6 +3914,8 @@ fn room_short_takes_light_dead() {
 }
 
 const BUSY_LANE_WORKERS: usize = 8;
+/// Eight workers keep four read buffers each, past what the shared worker budget holds
+const BUSY_LANE_BUDGET: ByteCount = ByteCount(128 * 1024 * 1024);
 
 // callers reading keep overlap merges to the busy lane, one at a time under the cap, and every idle worker may take one once a
 // quiet spell passes
@@ -3922,7 +3924,7 @@ fn busy_callers_merge_on_one_lane() {
     let io = SimulatedIo::new(Seed(126));
     let mut config = config();
     config.threads.maintenance_workers = Some(BUSY_LANE_WORKERS);
-    config.memory_budget = WORKER_BUDGET;
+    config.memory_budget = BUSY_LANE_BUDGET;
     let store = ReelStore::open(io.clone(), &config).expect("open");
     hold_compaction(&store, true);
     let volume = &store.state.volumes[0];

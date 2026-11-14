@@ -28,7 +28,7 @@ use crate::engine::column_info::ColumnInfo;
 use crate::engine::engine_sizing::{
     complete_block_rows, complete_row_limit,
     EngineSizing, FILTER_CACHE_QUARTERS, FILTER_SLOT_BYTES, GROUP_BYTES, LEAST_LZ4_BUDGET, LEAST_SHARD_ENTRIES, PLANNED_LINE_BYTES,
-    SHARED_JOBS, StoreShape, GATHER_BYTES, READ_BUFFERS, WRITE_BUFFERS, assumed_segment_bytes, capped_entries, disk_entries, entry_cost, entry_cover, floor_entries,
+    SHARED_JOBS, StoreShape, GATHER_BYTES, WRITE_BUFFERS, read_buffers, assumed_segment_bytes, capped_entries, disk_entries, entry_cost, entry_cover, floor_entries,
     dead_bits_bytes, segment_bytes_for, target_rows,
 };
 use crate::engine::engine_state::{EngineState, PLACE_RUN, SEGMENT_NUMBER_BATCH, SlotFile};
@@ -1224,12 +1224,13 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
     }
     let shares = (0..most_shares).map(|_share| touched_zeroes(SHARE_BYTES)).collect();
 
-    let mut record_readers = Vec::with_capacity(READ_BUFFERS);
+    let readers = read_buffers(sizing.workers);
+    let mut record_readers = Vec::with_capacity(readers);
     let widest_key = (0..config.volumes.len()).map(|volume| config.widest_key(volume)).max().unwrap_or(0);
     let scans: Vec<ScanState> = (0..MOST_SCANS).map(|_scan| ScanState::new(widest_key, open_slots)).collect();
     let scan_heap = ByteCount(scans.iter().map(|scan| scan.heap_bytes().0).sum());
-    let mut footer_readers = Vec::with_capacity(READ_BUFFERS);
-    for _reader in 0..READ_BUFFERS {
+    let mut footer_readers = Vec::with_capacity(readers);
+    for _reader in 0..readers {
         record_readers.push(RecordReader::new());
         footer_readers.push(FooterReader::new());
     }

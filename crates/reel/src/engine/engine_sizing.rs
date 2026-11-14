@@ -141,8 +141,16 @@ pub const FILTER_CACHE_QUARTERS: u64 = 3;
 /// Bytes of a filter cache slot, which holds the filter of a full block of typical rows
 pub const FILTER_SLOT_BYTES: usize = 4 * 1024;
 /// Eighths of the filters' share that stay resident, and the rest cache what the arena has no room for
-/// Read buffers a store keeps
+/// The fewest read buffers a store keeps
 pub const READ_BUFFERS: usize = 8;
+/// Read buffers a store keeps for each maintenance worker, one a CPU, so callers past the CPUs still each find one
+pub const READERS_PER_WORKER: usize = 4;
+
+/// Count the read buffers a store keeps for this many workers
+pub const fn read_buffers(workers: usize) -> usize {
+    let readers = READERS_PER_WORKER * workers;
+    if readers > READ_BUFFERS { readers } else { READ_BUFFERS }
+}
 /// Bytes of the buffer a batch gathers its records in, which holds the largest one-chunk record
 pub const GATHER_BYTES: usize = CHUNK_BYTES + SMALL_HEAD_BYTES;
 /// Write buffers a store keeps
@@ -215,7 +223,7 @@ impl StoreShape {
         let gathers = WRITE_BUFFERS as u64 * GATHER_BYTES as u64;
         let windows = self.open_slots() as u64 * 3 * RECORD_WINDOW_BYTES as u64;
         let ring = if self.has_ring { (RING_SLOTS * RING_SLOT_BYTES) as u64 + RING_READS as u64 * RING_READ_BYTES } else { 0 };
-        let reads = READ_BUFFERS as u64 * READ_BUFFER_BYTES + ring;
+        let reads = read_buffers(self.workers()) as u64 * READ_BUFFER_BYTES + ring;
         // each planner and each worker holds one footer reader of the job pool at a time, so none waits on a caller's
         let workers = self.workers() as u64;
         let job_reads = (volumes + workers) * JOB_READER_BYTES;

@@ -14,9 +14,11 @@ use crate::record::chunk_table::{
 };
 use crate::record::codec::{CHUNK_BYTES, Codec};
 use crate::record::lz4_block::decompress;
-use crate::little_endian::read_word; use crate::record::record_check::{Checksum, RecordIdentity, checksum, place_check, record_check};
+use crate::little_endian::read_word;
+use crate::record::record_check::{Checksum, RecordIdentity, checksum, place_check, record_check};
 use crate::record::record_head::{
-    FORM_AT, PIECE_BYTES, PIECE_SUM_BYTES, PIECES_PER_CHUNK, RecordForm, SMALL_HEAD_BYTES, chunk_count, chunk_sum, chunked_head_bytes, head_bytes_for, piece_count, read_check, read_page_sum, sums_bytes,
+    FORM_AT, PIECE_BYTES, PIECE_SUM_BYTES, PIECES_PER_CHUNK, RecordForm, SMALL_HEAD_BYTES, chunk_count, chunked_head_bytes,
+    head_bytes_for, piece_count, read_check, read_page_sum, sums_bytes, written_chunk_sum,
     read_value_length,
 };
 
@@ -65,6 +67,8 @@ pub struct RecordReader {
     page: Vec<u8>,
     chunk: Vec<u8>,
     decoded: Vec<u8>,
+    /// Chunks whose stored piece sums didn't match their entry while the chunk's bytes did, since the engine last took the count
+    damaged_sums: u64,
 }
 
 impl RecordReader {
@@ -75,7 +79,13 @@ impl RecordReader {
             page: touched_zeroes(TABLE_PAGE_BYTES),
             chunk: touched_zeroes(CHUNK_BYTES),
             decoded: touched_zeroes(CHUNK_BYTES),
+            damaged_sums: 0,
         }
+    }
+
+    /// Take the count of damaged sums this reader met since the last take
+    pub fn take_damaged_sums(&mut self) -> u64 {
+        std::mem::take(&mut self.damaged_sums)
     }
 
     /// Read the heap these buffers hold
@@ -254,8 +264,9 @@ impl RecordReader {
             let sums_from = ((chunk.0 - first_chunk) * chunk_sums) as usize;
             let sums = self.chunk.get(sums_from..sums_from + piece_count(span.entry.value_length) as usize * PIECE_SUM_BYTES)?;
             if checksum(sums) != span.entry.checksum {
-                // the head and table checked out, so sums that don't match their entry are damaged
-                return Some(RecordRead::Failed);
+                // the sums are damaged, and the long way checks the chunk from its own bytes, which can still be whole
+                self.damaged_sums += 1;
+                return None;
             }
             // the pieces of this chunk the window read, each against its own sum
             let from = span_start.max(chunk_start);
@@ -340,7 +351,7 @@ impl RecordReader {
     }
 
     /// Check each chunk of a value stored as written where it sits in the buffer, and its stored pieces' sums when the first
-    /// read brought them in, so damage there fails the read as damage in the value does
+    /// read brought them in. Sums that don't match an entry whose chunk passed are counted, and the read goes on
     pub async fn check_payload<File: IoFile>(
         &mut self,
         device: &impl DeviceReads<File>,
@@ -370,8 +381,10 @@ impl RecordReader {
                 }
                 let from = sums_at + chunk.0 as usize * PIECES_PER_CHUNK * PIECE_SUM_BYTES;
                 let to = from + piece_count(span.entry.value_length) as usize * PIECE_SUM_BYTES;
+                // the chunk's bytes passed its entry, so damaged sums cost a window its fast way and nothing more: counted, and
+                // the read goes on
                 if has_sums && self.first.get(from..to).is_none_or(|sums| checksum(sums) != span.entry.checksum) {
-                    return Ok(RecordRead::Failed);
+                    self.damaged_sums += 1;
                 }
             }
         }
@@ -480,7 +493,7 @@ impl RecordReader {
         let offset = FileOffset(location.offset.0 + span.entry.stored_offset.0);
         device.read_exact(file, offset, &mut self.chunk[..stored]).await?;
         // a record stored as written sums a chunk over its pieces' sums, and a compressed one over its stored bytes
-        let sum = if head.codec == Codec::None { chunk_sum(&self.chunk[..stored]) } else { checksum(&self.chunk[..stored]) };
+        let sum = if head.codec == Codec::None { written_chunk_sum(&self.chunk[..stored]) } else { checksum(&self.chunk[..stored]) };
         if sum != span.entry.checksum {
             return Ok(false);
         }
@@ -532,7 +545,7 @@ pub fn is_chunk_in_span(span: &ChunkSpan, chunk: ChunkIndex, payload_start: u64,
 
     let (from, to) = (start - buf_start, start - buf_start + span.entry.value_length.0);
     match buf.get(from as usize..to as usize) {
-        Some(bytes) => chunk_sum(bytes) == span.entry.checksum,
+        Some(bytes) => written_chunk_sum(bytes) == span.entry.checksum,
         None => false,
     }
 }
@@ -582,6 +595,7 @@ impl HollowItem for RecordReader {
             page: Vec::new(),
             chunk: Vec::new(),
             decoded: Vec::new(),
+            damaged_sums: 0,
         }
     }
 }

@@ -590,6 +590,8 @@ pub struct MaintenanceReport {
     pub reader_passes: u64,
     /// Keys a get_many answered from records its batch read together
     pub batched_gets: u64,
+    /// Chunks whose stored piece sums were damaged while the chunk's bytes were whole, which costs a window its fast way
+    pub damaged_sums: u64,
     /// Walk block lookups run together: blocks, candidates asked, candidates whose range held the whole block, per-key checks
     pub block_lookups: [u64; 4],
     pub volumes: Vec<VolumeReading>,
@@ -684,6 +686,7 @@ impl MaintenanceReport {
             reader_wakes: 0,
             reader_passes: 0,
             batched_gets: 0,
+            damaged_sums: 0,
             block_lookups: [0; 4],
             volumes: Vec::new(),
             complete_columns: Vec::new(),

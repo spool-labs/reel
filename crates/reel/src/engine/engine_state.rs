@@ -152,6 +152,8 @@ pub struct EngineState<Backend: Io> {
     pub corruption_errors: AtomicU64,
     /// Keys a get_many answered from records its batch read together
     pub batched_gets: AtomicU64,
+    /// Chunks whose stored piece sums were damaged while the chunk's bytes were whole
+    pub damaged_sums: AtomicU64,
     /// Caller operations, so maintenance can tell callers are busy
     pub caller_ops: CallerCounts,
     /// The line writers wait on, shared with every volume

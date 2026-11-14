@@ -853,7 +853,11 @@ impl<Backend: Io> EngineState<Backend> {
             RecordWant::Whole => reader.read_value(device, file, location, &identity, read.info.codec, buf).await,
             RecordWant::Window(window) => reader.read_window(device, file, location, &identity, read.info.codec, window, buf).await,
         };
+        let damaged = reader.take_damaged_sums();
         drop(reader);
+        if damaged > 0 {
+            self.damaged_sums.fetch_add(damaged, Ordering::Relaxed);
+        }
         // a bad sector comes back as a read error, and it means what a failed check means
         match outcome {
             Ok(read) => Ok(read),

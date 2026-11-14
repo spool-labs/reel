@@ -316,22 +316,30 @@ fn window_rotten_chunk() {
     assert_eq!(whole, RecordRead::Failed);
 }
 
-// a rotten byte in a chunk's sums fails a window over that chunk and the whole read, and leaves windows over other chunks whole
+// a rotten byte in a chunk's sums leaves the value whole: a window over that chunk takes the long way and gives the right
+// bytes, the whole read passes, and each read that met the damage counts it, at a size whose sums come with the front read
+// and one whose don't
 #[test]
 fn window_rotten_sums() {
-    let value = noise(4 * CHUNK_BYTES);
-    let stored = store(Codec::None, &value);
-    let shape = written_shape(stored.location.length).expect("stored as written");
-    rot_at(&stored, &stored.path, (shape.sums_at + CHUNK_SUMS as usize + 3) as u64);
+    for size in [1024 * 1024, 16 * 1024 * 1024] {
+        let value = noise(size);
+        let stored = store(Codec::None, &value);
+        let shape = written_shape(stored.location.length).expect("stored as written");
+        rot_at(&stored, &stored.path, (shape.sums_at + CHUNK_SUMS as usize + 3) as u64);
+        let file = open(&stored);
+        let mut reader = RecordReader::new();
+        let mut buf = Vec::new();
 
-    let (read, _bytes) = read_window(&stored, window(CHUNK_BYTES + 10, 100));
-    let (beside, bytes) = read_window(&stored, window(2 * CHUNK_BYTES + 10, 100));
+        let read = in_place(reader.read_window(&InPlace, &file, stored.location, &identity(), Codec::None, window(CHUNK_BYTES + 10, 100), &mut buf)).expect("read");
+        assert_eq!((read, buf.as_slice()), (RecordRead::Valid, &value[CHUNK_BYTES + 10..CHUNK_BYTES + 110]), "{size} B window");
+        assert_eq!(reader.take_damaged_sums(), 1, "{size} B window");
 
-    assert_eq!(read, RecordRead::Failed);
-    assert_eq!(beside, RecordRead::Valid);
-    assert_eq!(bytes, &value[2 * CHUNK_BYTES + 10..2 * CHUNK_BYTES + 110]);
-    let (whole, _value) = read_all(&stored, &identity());
-    assert_eq!(whole, RecordRead::Failed);
+        let whole = in_place(reader.read_value(&InPlace, &file, stored.location, &identity(), Codec::None, &mut buf)).expect("read");
+        assert_eq!((whole, buf.len()), (RecordRead::Valid, value.len()), "{size} B whole");
+        assert_eq!(buf, value, "{size} B whole");
+        let counted = reader.take_damaged_sums();
+        assert!(counted <= 1, "{size} B whole read counted {counted}");
+    }
 }
 
 // a record a merge copies as stored reads back whole and by window

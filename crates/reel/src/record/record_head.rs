@@ -105,7 +105,7 @@ pub fn put_piece_sums(chunk: &[u8], sums: &mut [u8]) -> usize {
 
 /// Sum a chunk stored as written: the sum over its pieces' sums, which its table entry keeps, so a whole read checks a chunk
 /// from its bytes alone and a window checks the stored piece sums against it
-pub fn chunk_sum(chunk: &[u8]) -> Checksum {
+pub fn written_chunk_sum(chunk: &[u8]) -> Checksum {
     let mut sums = [0; PIECES_PER_CHUNK * PIECE_SUM_BYTES];
     let length = put_piece_sums(chunk, &mut sums);
     checksum(&sums[..length])

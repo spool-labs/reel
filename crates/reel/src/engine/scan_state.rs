@@ -206,6 +206,9 @@ pub struct ScanState {
     pub is_sorted_done: bool,
     /// The walk takes its sealed keys from the column's sorted index, and seats no segment
     pub is_on_index: bool,
+    /// The rows the caller said it wants, and the rows it has asked for with a value
+    pub wanted: u64,
+    pub asked: u64,
     pub batch: ScanBatch,
 }
 
@@ -474,6 +477,8 @@ impl ScanState {
             sorted_next: 0,
             is_sorted_done: false,
             is_on_index: false,
+            wanted: u64::MAX,
+            asked: 0,
         }
     }
 
@@ -500,6 +505,8 @@ impl ScanState {
         self.batch.clear();
         self.forget_sorted();
         self.is_on_index = false;
+        self.wanted = u64::MAX;
+        self.asked = 0;
         self.limit.clear();
         self.has_limit = match range.limit {
             ScanLimit::None => false,

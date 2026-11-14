@@ -157,6 +157,7 @@ impl<Backend: Io> EngineState<Backend> {
         let directory = self.directories[scan.column.0 as usize].as_ref();
         // a walk for values answers a batch of keys located at one point, so a write landing while it lasts shows from the next
         if let ScanWant::Value(value) = &mut want {
+            scan.asked += 1;
             if !scan.batch.has_next() {
                 self.fill_batch(device, volume, directory, scan).await?;
             }
@@ -379,7 +380,9 @@ impl<Backend: Io> EngineState<Backend> {
         let mut outcome = Ok(());
         // a batch takes keys while the records it reads still fit its buffer, so wide records read in batches of fewer keys
         let mut located_bytes = 0;
-        while scan.batch.entries.len() < BATCH_KEYS && located_bytes + MOST_BATCH_RECORD <= BATCH_BYTES {
+        // a caller that said how many rows it wants gets no more located than that, the one it asked for now among them
+        let room = BATCH_KEYS.min(usize::try_from(scan.wanted.saturating_sub(scan.asked).saturating_add(1)).unwrap_or(BATCH_KEYS));
+        while scan.batch.entries.len() < room && located_bytes + MOST_BATCH_RECORD <= BATCH_BYTES {
             let entries = scan.batch.entries.len();
             match self.counted(self.try_step(ReadOn::new(device, volume), directory, scan, Some(point), &mut key, ScanWant::Locate).await) {
                 Ok(StepOutcome::Answer(ScanStep::Found) | StepOutcome::Passed) => {

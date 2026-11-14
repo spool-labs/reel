@@ -42,6 +42,7 @@ const CHURN_KEYS: u64 = 1_500;
 const COVER_ONE_IN: u64 = 40;
 const MARK: DeathMark = DeathMark(1_000_000);
 const SCAN_STARTS: u64 = 12;
+const WANTED_ROWS: u64 = 10;
 const SCAN_TAKE: usize = 40;
 const MERGE_KEYS: u64 = 15_000;
 
@@ -573,5 +574,35 @@ fn entries_whose_segment_left() {
     let found = rows(store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan"));
     assert_eq!(found, vec![(kept.clone(), b"value".to_vec()), (key(3), b"open".to_vec())]);
     assert!(report(&store).sorted_footer_asks > before + 1, "the scan's value didn't ask the footers");
+    store.close().expect("close");
+}
+
+// a walk told how many rows it wants locates no more than that a batch, and gives the same rows
+#[test]
+fn a_wanted_count_caps_the_batch() {
+    let io = SimulatedIo::new(Seed(9));
+    let store = open(&io, CAPACITY);
+    let mut model = Model::new();
+    for number in 0..KEYS {
+        store.put(COLUMN, &key(number), format!("{number}").as_bytes()).expect("put");
+        model.insert(key(number), format!("{number}").into_bytes());
+    }
+    seal_all(&store, &io);
+    let range = reel::engine::scan_state::from_key(COLUMN, b"", Direction::Ascending);
+    for wanted in [1, WANTED_ROWS, 1_000] {
+        let mut scan = store.state.take_scan(&range, None).expect("scan");
+        scan.wanted = wanted;
+        let (mut name, mut value) = (Vec::new(), Vec::new());
+        let mut found = Vec::new();
+        for _row in 0..wanted.min(KEYS) {
+            let step = store.state.step_scan(&mut scan, &mut name, reel::engine::scan_path::ScanWant::Value(&mut value)).expect("step");
+            assert_eq!(step, ScanStep::Found);
+            assert!(scan.batch.entries.len() as u64 <= wanted, "{} located for {wanted} wanted", scan.batch.entries.len());
+            found.push((name.clone(), value.clone()));
+        }
+        let expected: Vec<_> = model.iter().take(wanted.min(KEYS) as usize).map(|(name, value)| (name.clone(), value.clone())).collect();
+        assert_eq!(found, expected);
+        store.state.give_back_scan(scan);
+    }
     store.close().expect("close");
 }

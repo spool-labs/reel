@@ -182,6 +182,8 @@ impl<Backend: Io> EngineState<Backend> {
         report.reader_passes = self.record_readers.passes() + self.footer_readers.passes();
         report.batched_gets = self.batched_gets.load(Ordering::Relaxed);
         report.damaged_sums = self.damaged_sums.load(Ordering::Relaxed);
+        report.scan_seats = self.scan_seats.load(Ordering::Relaxed);
+        report.seats_together = self.seats_together.load(Ordering::Relaxed);
         for volume in &self.volumes {
             for row in hold(&volume.summary).rows() {
                 let rows = rows_of(&row);

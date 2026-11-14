@@ -908,6 +908,56 @@ fn interleaved_rows_keep_their_windows() {
     store.close().expect("close");
 }
 
+// scans over more overlapping segments than one batch seats give every key the model holds, in order, with deletes and
+// overwrites between seals, and the seats whose blocks the cache holds go together
+#[test]
+fn seats_together_agree() {
+    for seed in seeds(0..TOGETHER_SEEDS) {
+        let io = SimulatedIo::new(Seed(seed));
+        let store = open(&io);
+        hold_compaction(&store, true);
+        let mut random = SeededRandom::new(Seed(seed));
+        let mut model = Model::new();
+        for _round in 0..TOGETHER_SEALS {
+            for _put in 0..TOGETHER_PUTS {
+                let name = key(random.below(TOGETHER_KEY_SPACE));
+                if random.one_in(6) {
+                    store.delete(COLUMN, &name).expect("delete");
+                    model.remove(&name);
+                } else {
+                    let value = random.below(u64::MAX).to_le_bytes().to_vec();
+                    store.put(COLUMN, &name, &value).expect("put");
+                    model.insert(name, value);
+                }
+            }
+            seal(&store, &io);
+        }
+        let before = store.state.seats_together.load(Ordering::Relaxed);
+        for _start in 0..TOGETHER_STARTS {
+            let start = key(random.below(TOGETHER_KEY_SPACE + 10));
+            let want: Vec<(Vec<u8>, Vec<u8>)> = model.range(start.clone()..).take(TOGETHER_STEPS).map(|(name, value)| (name.clone(), value.clone())).collect();
+            // the second walk finds the blocks the first put in the cache
+            for _walk in 0..2 {
+                let mut scan = store.iter_from(COLUMN, &start, Direction::Ascending).expect("scan");
+                let (mut name, mut value, mut found) = (Vec::new(), Vec::new(), Vec::new());
+                while found.len() < TOGETHER_STEPS && scan.next_row(&mut name, &mut value).expect("step") == ScanStep::Found {
+                    found.push((name.clone(), value.clone()));
+                }
+                assert_eq!(found, want, "seed {seed} from {start:?}");
+            }
+        }
+        assert!(store.state.seats_together.load(Ordering::Relaxed) > before, "seed {seed}: no seat went together");
+        store.close().expect("close");
+    }
+}
+
+const TOGETHER_SEEDS: u64 = 6;
+const TOGETHER_SEALS: u64 = 24;
+const TOGETHER_PUTS: u64 = 80;
+const TOGETHER_KEY_SPACE: u64 = 2_000;
+const TOGETHER_STARTS: u64 = 40;
+const TOGETHER_STEPS: usize = 25;
+
 // step a walk to its end or a number of keys, and return what it found
 fn step_keys(store: &Store, scan: &mut reel::engine::scan_state::ScanState, most: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
     let (mut key, mut value, mut found) = (Vec::new(), Vec::new(), Vec::new());

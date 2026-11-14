@@ -592,6 +592,9 @@ pub struct MaintenanceReport {
     pub batched_gets: u64,
     /// Chunks whose stored piece sums were damaged while the chunk's bytes were whole, which costs a window its fast way
     pub damaged_sums: u64,
+    /// Scan sources seated, and those seated together in their cached blocks with their cache misses overlapped
+    pub scan_seats: u64,
+    pub seats_together: u64,
     /// Walk block lookups run together: blocks, candidates asked, candidates whose range held the whole block, per-key checks
     pub block_lookups: [u64; 4],
     pub volumes: Vec<VolumeReading>,
@@ -687,6 +690,8 @@ impl MaintenanceReport {
             reader_passes: 0,
             batched_gets: 0,
             damaged_sums: 0,
+            scan_seats: 0,
+            seats_together: 0,
             block_lookups: [0; 4],
             volumes: Vec::new(),
             complete_columns: Vec::new(),

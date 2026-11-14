@@ -431,8 +431,14 @@ impl<'block> RowBlockWalk<'block> {
             }
         }
 
-        self.position = self.restart_at(low);
-        self.next_index = low * RESTART_INTERVAL as usize;
+        self.seek_from(low, target, key)
+    }
+
+    /// Walk from a restart to the first row at or after a key, return its row, and leave its key in the buffer. A caller that
+    /// searched the restarts itself starts here
+    pub fn seek_from(&mut self, restart: usize, target: &[u8], key: &mut impl ListOut<u8>) -> Option<FooterRow> {
+        self.position = self.restart_at(restart);
+        self.next_index = restart * RESTART_INTERVAL as usize;
         key.clear();
         loop {
             let (kind, numbers_at) = self.next_key(key)?;
@@ -440,6 +446,11 @@ impl<'block> RowBlockWalk<'block> {
                 return self.row_numbers(kind, numbers_at);
             }
         }
+    }
+
+    /// Read the block's bytes, for a caller that asks the CPU to fetch them ahead
+    pub fn block_rows(&self) -> &'block [u8] {
+        self.rows
     }
 
     /// Read a restart's whole key where it lies in the block

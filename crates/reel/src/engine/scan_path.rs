@@ -14,7 +14,7 @@ use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
 use crate::engine::engine_state::EngineState;
 use crate::engine::read_path::{HeldPin, KeyRead, Located, MOST_READ_TRIES, RecordWant, SealedRow, newest_of};
 use crate::engine::scan_state::{
-    BATCH_BYTES, BATCH_KEYS, BatchEntry, BlockTake, JOIN_GAP, MOST_BATCH_RECORD, MOST_SCANS, MOST_WINDOW_RECORD, NO_GENERATION, ScanRange, ScanState, ScanWindows, SegmentSource, under_prefix,
+    BATCH_BYTES, BATCH_KEYS, BatchEntry, BlockTake, JOIN_GAP, MOST_BATCH_RECORD, MOST_SCANS, MOST_WINDOW_RECORD, NO_GENERATION, SEAT_BATCH, ScanRange, ScanState, ScanWindows, SegmentSource, seek_up_together, under_prefix,
 };
 use crate::engine::volume::Volume;
 use crate::guard::hold;
@@ -25,7 +25,7 @@ use crate::record::codec::Codec;
 use crate::record::record_reader::{RecordRead, form_of, open_small};
 use crate::row_kind::RowKind;
 use crate::segment::footer_reader::RowAt;
-use crate::segment::block_cache::BlockKey;
+use crate::segment::block_cache::{BlockKey, NO_BLOCK};
 use crate::segment::block_entry::{BlockEntry, KeyBound, SHARED_HEAD_BYTES};
 use crate::segment::segment_table::Seat;
 use crate::segment::column_directory::ColumnDirectory;
@@ -41,6 +41,17 @@ pub enum SourceMove {
     Done,
     /// Its segment left, and the list that took it out has its rows
     Left,
+}
+
+/// Where a seat starts in its segment, worked out with no read of the device
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SeatPlace {
+    /// The seat ended before any block: the segment left, or holds nothing past the key
+    Moved(SourceMove),
+    /// The seat starts in this block
+    Block { start: u32, line: BlockEntry, replacement: WritePlace },
+    /// The column's keys share more bytes than the tail holds, so the column's first row has to place the key
+    Unsettled,
 }
 
 /// What one try at a step came to
@@ -662,7 +673,8 @@ impl<Backend: Io> EngineState<Backend> {
         Ok(())
     }
 
-    /// Seat every segment a range of bounds meets. What the sources can't hold spills, and goes by seeks from then on
+    /// Seat every segment a range of bounds meets, a batch at a time. What the sources can't hold spills, and goes by seeks from
+    /// then on
     pub async fn join_range(
         &self,
         on: ReadOn<'_, impl DeviceReads<Backend::File>, Volume<Backend>>,
@@ -674,28 +686,98 @@ impl<Backend: Io> EngineState<Backend> {
     ) -> Result<(), StoreError> {
         let ReadOn { device, target: volume } = on;
         let mut skip = 0;
+        let mut batch = [SegmentNumber(0); SEAT_BATCH];
         loop {
             let page = directory.overlapping(low, high, skip, &mut scan.found);
             skip += scan.found.len();
+            let mut count = 0;
             for index in 0..scan.found.len() {
                 let segment = scan.found[index];
                 if scan.holds(segment) {
                     continue;
                 }
-                if scan.source_count == scan.sources.len() {
+                if scan.source_count + count == scan.sources.len() {
                     scan.is_spilled = true;
                     continue;
                 }
-                // a segment gone from under the list is in the next one, which the step's last look will see
-                if self.seat_listed(ReadOn::new(device, volume), scan, segment, point, false).await? == SourceMove::Row {
-                    scan.source_count += 1;
-                    scan.is_tree_stale = true;
+                batch[count] = segment;
+                count += 1;
+                if count == SEAT_BATCH {
+                    self.seat_together(ReadOn::new(device, volume), scan, &batch[..count], point).await?;
+                    count = 0;
                 }
             }
+            self.seat_together(ReadOn::new(device, volume), scan, &batch[..count], point).await?;
             if !page.is_cut {
                 return Ok(());
             }
         }
+    }
+
+    /// Seat listed segments in the next free sources. Going up, the seats whose blocks the row cache holds search them together
+    /// so their cache misses overlap, and every other seat goes alone as before. A segment gone from under the list is in the
+    /// next one, which the step's last look will see
+    pub async fn seat_together(
+        &self,
+        on: ReadOn<'_, impl DeviceReads<Backend::File>, Volume<Backend>>,
+        scan: &mut ScanState,
+        segments: &[SegmentNumber],
+        point: WritePlace,
+    ) -> Result<(), StoreError> {
+        let ReadOn { device, target: volume } = on;
+        let ScanState { column, position, is_inclusive, direction, is_counting, sources, source_count, is_tree_stale, .. } = scan;
+        let at = SeatAt {
+            column: *column,
+            key: position,
+            is_inclusive: *is_inclusive,
+            direction: *direction,
+            point,
+            is_counting: *is_counting,
+        };
+        let count = segments.len().min(SEAT_BATCH).min(sources.len() - *source_count);
+        let seats = &mut sources[*source_count..*source_count + count];
+        let mut keys = [NO_BLOCK; SEAT_BATCH];
+        for ((source, segment), key) in seats.iter_mut().zip(segments).zip(&mut keys) {
+            source.segment = *segment;
+            if at.direction != Direction::Ascending {
+                continue;
+            }
+            if let SeatPlace::Block { start, line, replacement } = self.seat_place(volume, source, &at)
+                && (line.live_rows > 0 || replacement > at.point)
+            {
+                source.block = start;
+                source.enter_block(line);
+                *key = BlockKey { segment: *segment, offset: line.block_offset };
+            }
+        }
+        let mut rows = [None; SEAT_BATCH];
+        if count > 1 {
+            self.row_cache.with_many(&keys[..count], |blocks| seek_up_together(seats, blocks, at.key, at.is_inclusive, &mut rows));
+        }
+        let mut seated = 0;
+        for index in 0..count {
+            let step = match rows[index] {
+                Some(row) => {
+                    seats[index].row = row;
+                    SourceMove::Row
+                },
+                None => self.seat_source(device, volume, &mut seats[index], &at).await?,
+            };
+            if step == SourceMove::Row {
+                seats.swap(seated, index);
+                seated += 1;
+            }
+        }
+        *source_count += seated;
+        if seated > 0 {
+            *is_tree_stale = true;
+        }
+        let together = rows[..count].iter().flatten().count() as u64;
+        self.scan_seats.fetch_add(count as u64, Ordering::Relaxed);
+        if together > 0 {
+            self.seats_together.fetch_add(together, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Find the walk's next key among the segments the sources couldn't hold, and say whether it has one
@@ -900,23 +982,12 @@ impl<Backend: Io> EngineState<Backend> {
         source: &mut SegmentSource,
         at: &SeatAt<'_>,
     ) -> Result<SourceMove, StoreError> {
-        let seat = match volume.table.seat_line(source.segment, at.column, at.key, at.direction) {
-            Seat::Left => return Ok(SourceMove::Left),
-            Seat::NoColumn => return Ok(SourceMove::Done),
-            Seat::Line(seat) => seat,
-        };
-        let tail = seat.tail;
-        source.place_base = seat.head.place_base;
-        let can_take = at.is_counting && seat.is_walked && seat.head.places.highest <= at.point;
-        source.is_countable = can_take && has_no_live_graves(volume, source.segment, at.column);
-        source.tail = tail;
-        source.first_block = tail.first_block;
-        source.end_block = tail.first_block + tail.block_count.0;
-        let (start, line, replacement) = match (seat.is_settled, seat.start) {
-            (true, Some((start, line))) => (start, line, seat.replacement),
-            (true, None) => return Ok(SourceMove::Done),
+        let (start, line, replacement) = match self.seat_place(volume, source, at) {
+            SeatPlace::Moved(step) => return Ok(step),
+            SeatPlace::Block { start, line, replacement } => (start, line, replacement),
             // a key that matches more shared bytes than the tail holds takes the column's first row to place
-            (false, _start) => {
+            SeatPlace::Unsettled => {
+                let tail = source.tail;
                 let spot = self.column_spot(device, volume, source, &tail, at).await?;
                 let start = match (spot, at.direction) {
                     (ColumnSpot::Inside, direction) => volume.table.entry_block(source.segment, &tail, at.key, direction),
@@ -960,6 +1031,27 @@ impl<Backend: Io> EngineState<Backend> {
                     }
                 },
             }
+        }
+    }
+
+    /// Set a source up on its segment and find the block its seat starts in, with no read of the device
+    pub fn seat_place(&self, volume: &Volume<Backend>, source: &mut SegmentSource, at: &SeatAt<'_>) -> SeatPlace {
+        let seat = match volume.table.seat_line(source.segment, at.column, at.key, at.direction) {
+            Seat::Left => return SeatPlace::Moved(SourceMove::Left),
+            Seat::NoColumn => return SeatPlace::Moved(SourceMove::Done),
+            Seat::Line(seat) => seat,
+        };
+        let tail = seat.tail;
+        source.place_base = seat.head.place_base;
+        let can_take = at.is_counting && seat.is_walked && seat.head.places.highest <= at.point;
+        source.is_countable = can_take && has_no_live_graves(volume, source.segment, at.column);
+        source.tail = tail;
+        source.first_block = tail.first_block;
+        source.end_block = tail.first_block + tail.block_count.0;
+        match (seat.is_settled, seat.start) {
+            (true, Some((start, line))) => SeatPlace::Block { start, line, replacement: seat.replacement },
+            (true, None) => SeatPlace::Moved(SourceMove::Done),
+            (false, _start) => SeatPlace::Unsettled,
         }
     }
 

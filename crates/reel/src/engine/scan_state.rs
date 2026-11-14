@@ -13,6 +13,8 @@ use crate::index::write_index::SHARD_COUNT;
 use crate::pool::{touched_capacity, touched_filled};
 use crate::row_kind::RowKind;
 use crate::segment::block_entry::{BlockEntry, KeyBound};
+use crate::prefetch::{LINE_BYTES, fetch_span};
+use crate::segment::block_cache::MOST_MANY_BLOCKS;
 use crate::segment::row_block::{FooterRow, ROW_BLOCK_BYTES, RowBlockWalk};
 use crate::segment::segment_tail::{ColumnTail, SegmentNumber};
 
@@ -290,6 +292,89 @@ impl SegmentSource {
         self.run = run;
         self.rows_left = rows - 1;
         walk.row_in_run(run, self.rows_left, &mut self.key)
+    }
+}
+
+/// The most sources one batch seats together
+pub const SEAT_BATCH: usize = MOST_MANY_BLOCKS;
+/// Bytes a restart's row takes past its offset with a short key, so a probe asks for the line its row runs into as well
+pub const RESTART_ROW_BYTES: usize = 24;
+
+/// Seat several sources in their cached blocks at once, going up: one binary-search probe a round for every source, each
+/// asking the CPU for its next probe's row, so their cache misses wait together where one source's would wait after another's.
+/// A source finds the row `seek_up` would. Nothing for a source with no block, or no row past the key in it, which then seats
+/// alone
+pub fn seek_up_together(sources: &mut [SegmentSource], blocks: &[Option<&[u8]>], target: &[u8], is_inclusive: bool, rows: &mut [Option<FooterRow>]) {
+    let count = sources.len().min(blocks.len()).min(rows.len()).min(SEAT_BATCH);
+    let mut walks: [Option<RowBlockWalk<'_>>; SEAT_BATCH] = [const { None }; SEAT_BATCH];
+    let mut bounds = [(0_usize, 0_usize); SEAT_BATCH];
+    for block in blocks.iter().take(count).flatten() {
+        // the counts and the restart offsets sit at the block's end
+        fetch_span(block, block.len().saturating_sub(2 * LINE_BYTES), 2 * LINE_BYTES);
+    }
+    for ((block, source), (walk, bound)) in blocks.iter().zip(sources.iter()).zip(walks.iter_mut().zip(&mut bounds)).take(count) {
+        let Some(opened) = block.and_then(|block| RowBlockWalk::open_checked(block, source.place_base)) else {
+            continue;
+        };
+        if opened.restart_count() == 0 {
+            continue;
+        }
+        *bound = (0, opened.restart_count());
+        fetch_span(opened.block_rows(), opened.restart_at(bound.1 / 2), RESTART_ROW_BYTES);
+        *walk = Some(opened);
+    }
+    let mut is_searching = true;
+    while is_searching {
+        is_searching = false;
+        for (walk, bound) in walks.iter_mut().zip(&mut bounds).take(count) {
+            let Some(searching) = walk.as_ref() else {
+                continue;
+            };
+            let (low, high) = *bound;
+            if low + 1 >= high {
+                continue;
+            }
+            is_searching = true;
+            let middle = (low + high) / 2;
+            let Some(is_below) = searching.restart_key(middle).map(|key| key < target) else {
+                *walk = None;
+                continue;
+            };
+            *bound = if is_below { (middle, high) } else { (low, middle) };
+            let next = if bound.0 + 1 < bound.1 { (bound.0 + bound.1) / 2 } else { bound.0 };
+            fetch_span(searching.block_rows(), searching.restart_at(next), RESTART_ROW_BYTES);
+        }
+    }
+    // a walk from its restart reads up to a run of rows, which every source asks for before any walks
+    for (walk, bound) in walks.iter().zip(&bounds).take(count) {
+        let Some(found) = walk.as_ref() else {
+            continue;
+        };
+        let start = found.restart_at(bound.0);
+        let end = if bound.0 + 1 < found.restart_count() { found.restart_at(bound.0 + 1) + RESTART_ROW_BYTES } else { found.block_rows().len() };
+        fetch_span(found.block_rows(), start, end.saturating_sub(start));
+    }
+    for ((walk, bound), (source, row)) in walks.iter_mut().zip(&bounds).zip(sources.iter_mut().zip(rows.iter_mut())).take(count) {
+        let Some(found) = walk.as_mut() else {
+            continue;
+        };
+        let Some(mut next) = found.seek_from(bound.0, target, &mut source.key) else {
+            continue;
+        };
+        let mut is_past = true;
+        while !is_inclusive && source.key == target {
+            match found.next_row(&mut source.key) {
+                Some(after) => next = after,
+                None => {
+                    is_past = false;
+                    break;
+                },
+            }
+        }
+        if is_past {
+            source.position = found.position();
+            *row = Some(next);
+        }
     }
 }
 

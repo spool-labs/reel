@@ -1,7 +1,7 @@
 //! One store-wide cache of checked filter and row blocks, cold blocks out first
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{RwLock, RwLockReadGuard};
 
 use reel_api::units::ByteCount;
 
@@ -13,6 +13,8 @@ use crate::segment::segment_tail::SegmentNumber;
 pub const CACHE_SHARDS: usize = 16;
 /// Slots a block can land in
 pub const CACHE_WAYS: usize = 4;
+/// The most blocks one visit over several takes
+pub const MOST_MANY_BLOCKS: usize = 16;
 /// Marks an unused slot
 pub const NO_BLOCK: BlockKey = BlockKey {
     segment: SegmentNumber(u64::MAX),
@@ -120,6 +122,37 @@ impl BlockCache {
             }
         }
         None
+    }
+
+    /// Run a function over several cached blocks at once, with no lock held past it. Each shard's read lock is taken once, in
+    /// shard order, so two callers with writers waiting between them can't hold one lock each and wait for the other's. A block
+    /// the cache doesn't hold comes as nothing
+    pub fn with_many<Answer>(&self, keys: &[BlockKey], visit: impl FnOnce(&[Option<&[u8]>]) -> Answer) -> Answer {
+        let count = keys.len().min(MOST_MANY_BLOCKS);
+        let mut wanted = [false; CACHE_SHARDS];
+        let mut places = [(0_usize, 0_usize); MOST_MANY_BLOCKS];
+        for (key, place) in keys.iter().zip(&mut places).take(count) {
+            *place = self.place_of(*key);
+            wanted[place.0] = true;
+        }
+        let mut guards: [Option<RwLockReadGuard<'_, CacheShard>>; CACHE_SHARDS] = [const { None }; CACHE_SHARDS];
+        for (shard, guard) in guards.iter_mut().enumerate() {
+            if wanted[shard] {
+                *guard = Some(self.shards.read(shard));
+            }
+        }
+        let mut blocks: [Option<&[u8]>; MOST_MANY_BLOCKS] = [None; MOST_MANY_BLOCKS];
+        for ((key, &(shard, first)), block) in keys.iter().zip(&places).zip(&mut blocks).take(count) {
+            let Some(guard) = guards[shard].as_ref() else {
+                continue;
+            };
+            if let Some(slot) = (first..first + CACHE_WAYS).find(|slot| guard.keys[*slot] == *key) {
+                self.touched[shard][slot].store(1, Ordering::Relaxed);
+                let start = slot * self.slot_bytes;
+                *block = Some(&guard.bytes[start..start + guard.lengths[slot] as usize]);
+            }
+        }
+        visit(&blocks[..count])
     }
 
     /// Keep a checked block, in place of a cold one when its bucket is full

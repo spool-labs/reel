@@ -1335,6 +1335,8 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         corruption_errors: AtomicU64::new(0),
         batched_gets: AtomicU64::new(0),
         damaged_sums: AtomicU64::new(0),
+        scan_seats: AtomicU64::new(0),
+        seats_together: AtomicU64::new(0),
         caller_ops: CallerCounts::default(),
         progress,
         is_arena_full: AtomicBool::new(false),

@@ -154,6 +154,9 @@ pub struct EngineState<Backend: Io> {
     pub batched_gets: AtomicU64,
     /// Chunks whose stored piece sums were damaged while the chunk's bytes were whole
     pub damaged_sums: AtomicU64,
+    /// Scan sources seated, and those seated together in their cached blocks
+    pub scan_seats: AtomicU64,
+    pub seats_together: AtomicU64,
     /// Caller operations, so maintenance can tell callers are busy
     pub caller_ops: CallerCounts,
     /// The line writers wait on, shared with every volume

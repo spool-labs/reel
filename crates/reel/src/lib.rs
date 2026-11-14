@@ -28,6 +28,7 @@ inner_modules!(
     record,
     region,
     pool,
+    prefetch,
     row_kind,
     rows,
     segment,

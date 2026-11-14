@@ -300,11 +300,20 @@ pub const SEAT_BATCH: usize = MOST_MANY_BLOCKS;
 /// Bytes a restart's row takes past its offset with a short key, so a probe asks for the line its row runs into as well
 pub const RESTART_ROW_BYTES: usize = 24;
 
-/// Seat several sources in their cached blocks at once, going up: one binary-search probe a round for every source, each
-/// asking the CPU for its next probe's row, so their cache misses wait together where one source's would wait after another's.
-/// A source finds the row `seek_up` would. Nothing for a source with no block, or no row past the key in it, which then seats
+/// Seat several sources in their cached blocks at once: one binary-search probe a round for every source, each asking the CPU
+/// for its next probe's row, so their cache misses wait together where one source's would wait after another's. A source finds
+/// the row `seek_up` or `seek_down` would. Nothing for a source with no block, or no row past the key in it, which then seats
 /// alone
-pub fn seek_up_together(sources: &mut [SegmentSource], blocks: &[Option<&[u8]>], target: &[u8], is_inclusive: bool, rows: &mut [Option<FooterRow>]) {
+pub fn seek_together(
+    sources: &mut [SegmentSource],
+    blocks: &[Option<&[u8]>],
+    target: &[u8],
+    is_inclusive: bool,
+    direction: Direction,
+    rows: &mut [Option<FooterRow>],
+) {
+    // the search keeps the last restart below the key going up, and the last one at or before it going down
+    let is_low = |key: &[u8]| key < target || (direction == Direction::Descending && is_inclusive && key == target);
     let count = sources.len().min(blocks.len()).min(rows.len()).min(SEAT_BATCH);
     let mut walks: [Option<RowBlockWalk<'_>>; SEAT_BATCH] = [const { None }; SEAT_BATCH];
     let mut bounds = [(0_usize, 0_usize); SEAT_BATCH];
@@ -317,6 +326,10 @@ pub fn seek_up_together(sources: &mut [SegmentSource], blocks: &[Option<&[u8]>],
             continue;
         };
         if opened.restart_count() == 0 {
+            continue;
+        }
+        // going down, a block whose first row already stands past the key holds nothing for this seat
+        if direction == Direction::Descending && !opened.restart_key(0).is_some_and(is_low) {
             continue;
         }
         *bound = (0, opened.restart_count());
@@ -336,7 +349,7 @@ pub fn seek_up_together(sources: &mut [SegmentSource], blocks: &[Option<&[u8]>],
             }
             is_searching = true;
             let middle = (low + high) / 2;
-            let Some(is_below) = searching.restart_key(middle).map(|key| key < target) else {
+            let Some(is_below) = searching.restart_key(middle).map(is_low) else {
                 *walk = None;
                 continue;
             };
@@ -358,24 +371,38 @@ pub fn seek_up_together(sources: &mut [SegmentSource], blocks: &[Option<&[u8]>],
         let Some(found) = walk.as_mut() else {
             continue;
         };
-        let Some(mut next) = found.seek_from(bound.0, target, &mut source.key) else {
-            continue;
+        *row = match direction {
+            Direction::Ascending => finish_up(found, bound.0, source, target, is_inclusive),
+            Direction::Descending => finish_down(found, bound.0, source, is_low),
         };
-        let mut is_past = true;
-        while !is_inclusive && source.key == target {
-            match found.next_row(&mut source.key) {
-                Some(after) => next = after,
-                None => {
-                    is_past = false;
-                    break;
-                },
-            }
-        }
-        if is_past {
-            source.position = found.position();
-            *row = Some(next);
-        }
     }
+}
+
+/// Walk up from the restart a search found to the source's first row past the key, as `seek_up` does
+fn finish_up(walk: &mut RowBlockWalk<'_>, restart: usize, source: &mut SegmentSource, target: &[u8], is_inclusive: bool) -> Option<FooterRow> {
+    let mut row = walk.seek_from(restart, target, &mut source.key)?;
+    while !is_inclusive && source.key == target {
+        row = walk.next_row(&mut source.key)?;
+    }
+    source.position = walk.position();
+    Some(row)
+}
+
+/// Count the run's rows at or before the key from the restart a search found, and stand on the last, as `seek_down` does
+fn finish_down(walk: &mut RowBlockWalk<'_>, restart: usize, source: &mut SegmentSource, is_low: impl Fn(&[u8]) -> bool) -> Option<FooterRow> {
+    walk.key_at_restart(restart, &mut source.key)?;
+    let mut rows = 1;
+    while rows < walk.rows_at_restart(restart) {
+        walk.next_row(&mut source.key)?;
+        if !is_low(&source.key) {
+            break;
+        }
+        rows += 1;
+    }
+    source.is_at_block_end = false;
+    source.run = restart;
+    source.rows_left = rows - 1;
+    walk.row_in_run(restart, rows - 1, &mut source.key)
 }
 
 impl ShardHead {

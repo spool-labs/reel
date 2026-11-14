@@ -20,14 +20,24 @@ pub fn fetch(pointer: *const u8) {
     let _hint = pointer;
 }
 
-/// Fetch the lines a span of bytes covers, from its start up to a number of bytes on
+/// Fetch the lines a span of bytes covers, from its start up to a number of bytes on, by the lines' own addresses so a span that
+/// starts mid-line still fetches its last line
 #[inline(always)]
 pub fn fetch_span(bytes: &[u8], at: usize, length: usize) {
-    let base = bytes.as_ptr();
-    let end = at.saturating_add(length).min(bytes.len());
-    let mut line = at / LINE_BYTES * LINE_BYTES;
+    let base = bytes.as_ptr() as usize;
+    let end = base + at.saturating_add(length).min(bytes.len());
+    let mut line = (base + at.min(bytes.len())) / LINE_BYTES * LINE_BYTES;
     while line < end {
-        fetch(base.wrapping_add(line));
+        fetch(line as *const u8);
         line += LINE_BYTES;
+    }
+}
+
+/// Fetch the first lines of a value in memory
+#[inline(always)]
+pub fn fetch_lines<Value>(value: &Value, lines: usize) {
+    let start = value as *const Value as usize / LINE_BYTES * LINE_BYTES;
+    for line in 0..lines {
+        fetch((start + line * LINE_BYTES) as *const u8);
     }
 }

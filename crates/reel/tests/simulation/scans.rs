@@ -908,8 +908,9 @@ fn interleaved_rows_keep_their_windows() {
     store.close().expect("close");
 }
 
-// scans over more overlapping segments than one batch seats give every key the model holds, in order, with deletes and
-// overwrites between seals, and the seats whose blocks the cache holds go together
+// scans over more overlapping segments than one batch seats, and over open trees in every shard, give every key the model
+// holds in order, either way, with deletes and overwrites between seals and a seal between two steps of a walk. The seats
+// whose blocks the cache holds go together, and so do the heads' tree descents
 #[test]
 fn seats_together_agree() {
     for seed in seeds(0..TOGETHER_SEEDS) {
@@ -919,36 +920,64 @@ fn seats_together_agree() {
         let mut random = SeededRandom::new(Seed(seed));
         let mut model = Model::new();
         for _round in 0..TOGETHER_SEALS {
-            for _put in 0..TOGETHER_PUTS {
-                let name = key(random.below(TOGETHER_KEY_SPACE));
-                if random.one_in(6) {
-                    store.delete(COLUMN, &name).expect("delete");
-                    model.remove(&name);
-                } else {
-                    let value = random.below(u64::MAX).to_le_bytes().to_vec();
-                    store.put(COLUMN, &name, &value).expect("put");
-                    model.insert(name, value);
-                }
-            }
+            churn(&store, &mut model, &mut random);
             seal(&store, &io);
         }
-        let before = store.state.seats_together.load(Ordering::Relaxed);
+        // the last round stays open, so the heads have trees to descend
+        churn(&store, &mut model, &mut random);
+        let (seats, heads) = (&store.state.seats_together, &store.state.heads_together);
+        let (seats_before, heads_before) = (seats.load(Ordering::Relaxed), heads.load(Ordering::Relaxed));
         for _start in 0..TOGETHER_STARTS {
             let start = key(random.below(TOGETHER_KEY_SPACE + 10));
-            let want: Vec<(Vec<u8>, Vec<u8>)> = model.range(start.clone()..).take(TOGETHER_STEPS).map(|(name, value)| (name.clone(), value.clone())).collect();
-            // the second walk finds the blocks the first put in the cache
-            for _walk in 0..2 {
-                let mut scan = store.iter_from(COLUMN, &start, Direction::Ascending).expect("scan");
-                let (mut name, mut value, mut found) = (Vec::new(), Vec::new(), Vec::new());
-                while found.len() < TOGETHER_STEPS && scan.next_row(&mut name, &mut value).expect("step") == ScanStep::Found {
-                    found.push((name.clone(), value.clone()));
-                }
-                assert_eq!(found, want, "seed {seed} from {start:?}");
+            let pair = |(name, value): (&Vec<u8>, &Vec<u8>)| (name.clone(), value.clone());
+            let up: Vec<(Vec<u8>, Vec<u8>)> = model.range(start.clone()..).take(TOGETHER_STEPS).map(pair).collect();
+            let down: Vec<(Vec<u8>, Vec<u8>)> = model.range(..=start.clone()).rev().take(TOGETHER_STEPS).map(pair).collect();
+            // the second walk each way finds the blocks the first put in the cache
+            for (direction, want) in [(Direction::Ascending, &up), (Direction::Descending, &down), (Direction::Ascending, &up), (Direction::Descending, &down)] {
+                assert_eq!(&walk_from(&store, &start, direction, None), want, "seed {seed} {direction:?} from {start:?}");
             }
         }
-        assert!(store.state.seats_together.load(Ordering::Relaxed) > before, "seed {seed}: no seat went together");
+        assert!(seats.load(Ordering::Relaxed) > seats_before, "seed {seed}: no seat went together");
+        assert!(heads.load(Ordering::Relaxed) > heads_before, "seed {seed}: no head descended together");
+
+        // a seal halfway through a walk moves the open rows into a segment the walk has to seat as it goes
+        let start = key(random.below(TOGETHER_KEY_SPACE));
+        let pair = |(name, value): (&Vec<u8>, &Vec<u8>)| (name.clone(), value.clone());
+        let want: Vec<(Vec<u8>, Vec<u8>)> = model.range(start.clone()..).take(TOGETHER_STEPS).map(pair).collect();
+        let found = walk_from(&store, &start, Direction::Ascending, Some(&|| seal(&store, &io)));
+        assert_eq!(found, want, "seed {seed} sealed under the walk from {start:?}");
         store.close().expect("close");
     }
+}
+
+// put and delete a round of keys the model follows
+fn churn(store: &Store, model: &mut Model, random: &mut SeededRandom) {
+    for _put in 0..TOGETHER_PUTS {
+        let name = key(random.below(TOGETHER_KEY_SPACE));
+        if random.one_in(6) {
+            store.delete(COLUMN, &name).expect("delete");
+            model.remove(&name);
+        } else {
+            let value = random.below(u64::MAX).to_le_bytes().to_vec();
+            store.put(COLUMN, &name, &value).expect("put");
+            model.insert(name, value);
+        }
+    }
+}
+
+// walk a number of rows from a key, running something halfway when asked
+fn walk_from(store: &Store, start: &[u8], direction: Direction, halfway: Option<&dyn Fn()>) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut scan = store.iter_from(COLUMN, start, direction).expect("scan");
+    let (mut name, mut value, mut found) = (Vec::new(), Vec::new(), Vec::new());
+    while found.len() < TOGETHER_STEPS && scan.next_row(&mut name, &mut value).expect("step") == ScanStep::Found {
+        found.push((name.clone(), value.clone()));
+        if found.len() == TOGETHER_STEPS / 2
+            && let Some(halfway) = halfway
+        {
+            halfway();
+        }
+    }
+    found
 }
 
 const TOGETHER_SEEDS: u64 = 6;

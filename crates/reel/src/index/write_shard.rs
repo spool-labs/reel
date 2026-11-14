@@ -10,12 +10,15 @@ use reel_api::units::{ByteCount, RowCount, WritePlace};
 use crate::index::entry_slab::{ENTRY_ALIGNMENT, EntryAddress, EntrySlab, NO_ENTRY, PAGE_BYTES, PageCount, PageIndex, entry_size};
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::index::key_table::{KeyTable, TableSlot};
-use crate::index::node_pool::{NODE_FANOUT, NodeCount, NodePool, TreeNode};
-use crate::index::open_slots::{OpenSlot, OpenSlots};
+use crate::index::node_pool::{NODE_FANOUT, NodeCount, NodeIndex, NodePool, TreeNode};
+use crate::index::open_slots::{MAX_OPEN_SLOTS, OpenSlot, OpenSlots};
 use crate::index::seek_target::SeekTarget;
 use crate::index::shard_cursor::{MAX_CURSOR_STEPS, ShardCursor, TreeCursor};
 use crate::index::write_row::{WriteLookup, WriteRow};
-use crate::index::write_tree::{MAX_NEW_NODES, TreePosition, WriteTree, entry_at, step_back, step_forward};
+use crate::index::write_tree::{
+    MAX_NEW_NODES, TreePosition, WriteTree, child_index, entry_at, lower_bound, normalize, step_back, step_forward,
+};
+use crate::prefetch::fetch_lines;
 use crate::row_kind::RowKind;
 
 /// A cleanup takes this many rows at a time, so their cold reads overlap
@@ -481,6 +484,11 @@ impl WriteShard {
         }
 
         let position = self.edge_of(tree, bound).unwrap_or_else(|| seek_bound(tree, &self.nodes, &self.slab, bound));
+        self.stand(cursor, position)
+    }
+
+    /// Stand a cursor on a position, or past the tree's end, and give the row there
+    pub fn stand(&self, cursor: &mut TreeCursor, position: Option<TreePosition>) -> Option<EntryAddress> {
         cursor.is_placed = true;
         cursor.position = position;
         let position = position?;
@@ -537,3 +545,109 @@ pub fn seek_bound(tree: &WriteTree, nodes: &NodePool, slab: &EntrySlab, bound: &
         },
     }
 }
+
+/// The most shards whose heads one batch places together: about as many cache misses as can be in flight, and few enough shard
+/// locks that writers wait for no more than a short batch
+pub const HEAD_GROUP: usize = 4;
+
+/// One shard's head a batch places: the shard under its read lock, the walk's cursor in it, and where its key goes
+pub struct HeadPlace<'place> {
+    pub shard: &'place WriteShard,
+    pub cursor: &'place mut ShardCursor,
+    pub key: &'place mut Vec<u8>,
+    pub has_key: &'place mut bool,
+}
+
+/// Place several shards' heads on the next key past a bound at once, each with the answer `next_key` gives. A tree a cursor
+/// still stands in steps on as `place_cursor` does, and a bound outside a tree's span needs no descent. Every other tree
+/// descends with the rest a level a round, each asking the CPU for its next node, so their cache misses wait together
+pub fn place_heads_together(heads: &mut [Option<HeadPlace<'_>>], bound: &WalkBound, view: OpenSlots) -> usize {
+    // the targets `seek_bound` searches for, and whether the answer is the row before it
+    let (place, is_before) = match (bound.direction, bound.is_inclusive) {
+        (Direction::Ascending, true) => (WritePlace(u64::MAX), false),
+        (Direction::Ascending, false) => (WritePlace(0), false),
+        (Direction::Descending, true) => (WritePlace(0), true),
+        (Direction::Descending, false) => (WritePlace(u64::MAX), true),
+    };
+    let target = SeekTarget::new(bound.column, bound.key, place);
+    let mut entries = [[None; MAX_OPEN_SLOTS]; HEAD_GROUP];
+    // each descent: its head's shard, its tree, and the node it stands on
+    let mut descents: [(Option<&WriteShard>, usize, NodeIndex); HEAD_GROUP * MAX_OPEN_SLOTS] = [(None, 0, NodeIndex(0)); HEAD_GROUP * MAX_OPEN_SLOTS];
+    let mut count = 0;
+    for (place, found) in heads.iter_mut().zip(&mut entries).take(HEAD_GROUP) {
+        let Some(place) = place.as_mut() else {
+            continue;
+        };
+        let shard = place.shard;
+        for (index, tree) in shard.trees.iter().enumerate() {
+            if !view.contains(OpenSlot(index as u8)) {
+                continue;
+            }
+            let cursor = &mut place.cursor.trees[index];
+            if cursor.is_placed && shard.is_cursor_standing(cursor) {
+                found[index] = shard.place_cursor(cursor, tree, bound);
+                continue;
+            }
+            if let Some(edge) = shard.edge_of(tree, bound) {
+                found[index] = shard.stand(cursor, edge);
+                continue;
+            }
+            fetch_lines(shard.nodes.node(tree.root), NODE_HEAD_LINES);
+            descents[count] = (Some(shard), index, tree.root);
+            count += 1;
+        }
+    }
+    let mut is_descending = true;
+    while is_descending {
+        is_descending = false;
+        for (shard, _tree, node) in descents.iter_mut().take(count) {
+            let Some(shard) = *shard else {
+                continue;
+            };
+            let standing = shard.nodes.node(*node);
+            if standing.is_leaf {
+                continue;
+            }
+            is_descending = true;
+            *node = standing.children[child_index(&shard.nodes, &shard.slab, *node, &target) as usize];
+            fetch_lines(shard.nodes.node(*node), NODE_HEAD_LINES);
+        }
+    }
+    // the descents went in head order, so each head's come in a run
+    let mut at = 0;
+    for (place, found) in heads.iter_mut().zip(&mut entries).take(HEAD_GROUP) {
+        let Some(place) = place.as_mut() else {
+            continue;
+        };
+        let shard = place.shard;
+        while let Some(&(Some(descended), index, leaf)) = descents.get(at).filter(|_descent| at < count)
+            && std::ptr::eq(descended, shard)
+        {
+            let row = lower_bound(&shard.nodes, &shard.slab, leaf, &target);
+            let mut position = normalize(&shard.nodes, TreePosition { leaf, index: row });
+            if is_before {
+                position = match position {
+                    Some(found) => step_back(&shard.nodes, found),
+                    None => shard.trees[index].last_position(&shard.nodes),
+                };
+            }
+            found[index] = shard.stand(&mut place.cursor.trees[index], position);
+            at += 1;
+        }
+        let mut best = None;
+        for entry in found.iter().flatten() {
+            if shard.slab.column(*entry) == bound.column {
+                best = Some(shard.closer(best, *entry, bound.direction));
+            }
+        }
+        *place.has_key = best.is_some();
+        if let Some(entry) = best {
+            place.key.clear();
+            place.key.extend_from_slice(shard.slab.key(entry));
+        }
+    }
+    count
+}
+
+/// Lines of a tree node that hold its header and the row prefixes a descent searches
+pub const NODE_HEAD_LINES: usize = 5;

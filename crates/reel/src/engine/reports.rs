@@ -184,6 +184,7 @@ impl<Backend: Io> EngineState<Backend> {
         report.damaged_sums = self.damaged_sums.load(Ordering::Relaxed);
         report.scan_seats = self.scan_seats.load(Ordering::Relaxed);
         report.seats_together = self.seats_together.load(Ordering::Relaxed);
+        report.heads_together = self.heads_together.load(Ordering::Relaxed);
         for volume in &self.volumes {
             for row in hold(&volume.summary).rows() {
                 let rows = rows_of(&row);

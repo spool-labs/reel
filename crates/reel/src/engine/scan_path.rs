@@ -3,7 +3,7 @@
 use std::cmp::Ordering as KeyOrder;
 use std::io::Error;
 use std::mem;
-use std::sync::atomic::Ordering;
+use std::sync::RwLockReadGuard; use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
 use reel_api::direction::Direction;
@@ -14,11 +14,12 @@ use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
 use crate::engine::engine_state::EngineState;
 use crate::engine::read_path::{HeldPin, KeyRead, Located, MOST_READ_TRIES, RecordWant, SealedRow, newest_of};
 use crate::engine::scan_state::{
-    BATCH_BYTES, BATCH_KEYS, BatchEntry, BlockTake, JOIN_GAP, MOST_BATCH_RECORD, MOST_SCANS, MOST_WINDOW_RECORD, NO_GENERATION, SEAT_BATCH, ScanRange, ScanState, ScanWindows, SegmentSource, seek_up_together, under_prefix,
+    BATCH_BYTES, BATCH_KEYS, BatchEntry, BlockTake, JOIN_GAP, MOST_BATCH_RECORD, MOST_SCANS, MOST_WINDOW_RECORD, NO_GENERATION,
+    SEAT_BATCH, ScanRange, ScanState, ScanWindows, SegmentSource, ShardHead, seek_together, under_prefix,
 };
 use crate::engine::volume::Volume;
 use crate::guard::hold;
-use crate::index::write_shard::WalkBound;
+use crate::index::write_shard::{HEAD_GROUP, HeadPlace, WalkBound, WriteShard, place_heads_together};
 use crate::io::{DeviceReads, Io, ManyRead, ReadOn, in_place};
 use crate::record::record_check::RecordIdentity;
 use crate::record::codec::Codec;
@@ -624,9 +625,26 @@ impl<Backend: Io> EngineState<Backend> {
         let is_new_view = view != scan.heads_view;
         scan.heads_view = view;
         let mut has_moved = false;
-        for (shard, head) in scan.heads.iter_mut().enumerate() {
-            if !head.is_placed || is_new_view {
-                head.has_key = self.index.next_key(shard, &mut head.cursor, &bound, view, &mut head.key);
+        let mut wanted = scan.heads.iter_mut().enumerate().filter(|(_shard, head)| !head.is_placed || is_new_view).peekable();
+        // a few shards a batch, so their tree descents overlap and writers wait on no more than those shards' locks
+        while wanted.peek().is_some() {
+            let mut group: [Option<(usize, &mut ShardHead)>; HEAD_GROUP] = [const { None }; HEAD_GROUP];
+            for member in &mut group {
+                *member = wanted.next();
+            }
+            // the read locks go in shard order, as the shards came
+            let guards: [Option<RwLockReadGuard<'_, WriteShard>>; HEAD_GROUP] =
+                std::array::from_fn(|index| group[index].as_ref().map(|(shard, _head)| self.index.shards.read(*shard)));
+            let mut places: [Option<HeadPlace<'_>>; HEAD_GROUP] = [const { None }; HEAD_GROUP];
+            for ((member, guard), place) in group.iter_mut().zip(&guards).zip(&mut places) {
+                if let (Some((_shard, head)), Some(guard)) = (member.as_mut(), guard.as_ref()) {
+                    *place = Some(HeadPlace { shard: guard, cursor: &mut head.cursor, key: &mut head.key, has_key: &mut head.has_key });
+                }
+            }
+            let descended = place_heads_together(&mut places, &bound, view);
+            self.heads_together.fetch_add(descended as u64, Ordering::Relaxed);
+            drop(guards);
+            for (_shard, head) in group.iter_mut().flatten() {
                 head.is_placed = true;
                 head.placed_at = mark;
                 has_moved = true;
@@ -714,7 +732,7 @@ impl<Backend: Io> EngineState<Backend> {
         }
     }
 
-    /// Seat listed segments in the next free sources. Going up, the seats whose blocks the row cache holds search them together
+    /// Seat listed segments in the next free sources. The seats whose blocks the row cache holds search them together
     /// so their cache misses overlap, and every other seat goes alone as before. A segment gone from under the list is in the
     /// next one, which the step's last look will see
     pub async fn seat_together(
@@ -739,9 +757,6 @@ impl<Backend: Io> EngineState<Backend> {
         let mut keys = [NO_BLOCK; SEAT_BATCH];
         for ((source, segment), key) in seats.iter_mut().zip(segments).zip(&mut keys) {
             source.segment = *segment;
-            if at.direction != Direction::Ascending {
-                continue;
-            }
             if let SeatPlace::Block { start, line, replacement } = self.seat_place(volume, source, &at)
                 && (line.live_rows > 0 || replacement > at.point)
             {
@@ -752,7 +767,7 @@ impl<Backend: Io> EngineState<Backend> {
         }
         let mut rows = [None; SEAT_BATCH];
         if count > 1 {
-            self.row_cache.with_many(&keys[..count], |blocks| seek_up_together(seats, blocks, at.key, at.is_inclusive, &mut rows));
+            self.row_cache.with_many(&keys[..count], |blocks| seek_together(seats, blocks, at.key, at.is_inclusive, at.direction, &mut rows));
         }
         let mut seated = 0;
         for index in 0..count {

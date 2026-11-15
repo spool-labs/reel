@@ -170,6 +170,11 @@ impl<Backend: Io> RewriteJob<Backend> {
                 OverlapLanes::All => true,
             };
         if may_overlap && let Some(target) = self.pick_overlap(volume, &rows, room) {
+            let beside = volume.lanes.iter().enumerate().any(|(lane, state)| lane != self.lane && state.is_overlap.load(Ordering::Acquire));
+            volume.overlap_beside.fetch_add(u64::from(beside), Ordering::Relaxed);
+            let outputs = self.numbers[..self.input_count].iter().filter(|number| volume.table.is_output(**number)).count();
+            volume.overlap_output_inputs.fetch_add(outputs as u64, Ordering::Relaxed);
+            volume.overlap_inputs.fetch_add(self.input_count as u64, Ordering::Relaxed);
             self.picked_as = Some(PickOutcome::Overlap);
             volume.note_pick(PickOutcome::Overlap);
             return Some((target, false));

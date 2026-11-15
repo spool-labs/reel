@@ -1244,3 +1244,35 @@ fn full_disk_frees_itself() {
     store.put(COLUMN, b"after", &value).expect("a put once the dead rows went");
     store.close().expect("close");
 }
+
+const LIVE_SEGMENTS: u64 = 66;
+const LIVE_SEGMENT_KEYS: u64 = 3_000;
+
+// merges that start as segments land show in the report: inputs an earlier merge wrote, and merges started beside another. With
+// today's widest-first order a merge takes the previous one's whole-range output, so the first count moves
+#[test]
+fn overlap_merges_count_their_outputs_taken() {
+    let io = SimulatedIo::new(Seed(71));
+    let store = open(&io);
+    let mut number: u64 = 0;
+    for _segment in 0..LIVE_SEGMENTS {
+        for _key in 0..LIVE_SEGMENT_KEYS {
+            store.put(COLUMN, &number.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes(), &[7; 100]).expect("put");
+            number += 1;
+        }
+        store.seal_now();
+        settle(&io);
+    }
+    for _round in 0..20 {
+        let until = store.state.quiet_at(io.clock_reading());
+        io.advance_clock(Nanoseconds(until.0.saturating_sub(io.clock_reading().0)));
+        settle(&io);
+    }
+    let mut report = MaintenanceReport::default();
+    store.maintenance_report(&mut report);
+    let volume = &report.volumes[0];
+    assert_eq!(volume.overlap_output_inputs, store.state.volumes[0].overlap_output_inputs.load(Ordering::Acquire));
+    assert!(volume.overlap_output_inputs > 0, "no merge took an output: {:?}", volume.picks);
+    assert!(volume.overlap_inputs > volume.overlap_output_inputs);
+    store.close().expect("close");
+}

@@ -289,6 +289,9 @@ impl<Backend: Io> RewriteJob<Backend> {
         if let (Some(totals), Some(output)) = (self.totals, &self.output) {
             list_output(&state, volume, output.number, totals.head.places.highest, self.writer.columns().iter());
         }
+        for number in self.staged.iter().map(|staged| staged.facts.segment).chain([self.output.as_ref(), self.grave_output.as_ref()].into_iter().flatten().map(|output| output.number)) {
+            volume.table.mark_output(number);
+        }
         between();
         // an unwalked merge's outputs owe a walk, and reads of finished segments leave them out until it's done
         // a walked merge marks its outputs after the lists, which only holds with no walk target running beside it

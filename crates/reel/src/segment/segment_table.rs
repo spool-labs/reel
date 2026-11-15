@@ -51,6 +51,8 @@ pub struct TableEntry<File> {
     pub unbacked_walk: u64,
     pub has_held_frees: bool,
     pub is_unproven: bool,
+    /// A merge wrote it, which the install marks, so a count of merges that take their own outputs reads it. Memory only
+    pub is_output: bool,
 }
 
 /// What a walk reads from the table to stand in a segment's column
@@ -313,6 +315,7 @@ impl<File: Clone> SegmentTable<File> {
             unbacked: 0,
             unbacked_walk: 0,
             has_held_frees: false,
+            is_output: false,
             is_unproven: false,
         });
         self.walked[shard_of(head.segment)][slot as usize].store(false, Ordering::Release);
@@ -436,6 +439,23 @@ impl<File: Clone> SegmentTable<File> {
         if let Some(entry) = guard.segments[slot as usize].as_mut() {
             entry.has_held_frees = is_held;
         }
+    }
+
+    /// Mark a segment a merge wrote
+    pub fn mark_output(&self, number: SegmentNumber) {
+        let mut guard = self.shards.write(shard_of(number));
+        let Some(slot) = guard.map.get(number) else {
+            return;
+        };
+        if let Some(entry) = guard.segments[slot as usize].as_mut() {
+            entry.is_output = true;
+        }
+    }
+
+    /// Check a merge wrote a segment, since this open
+    pub fn is_output(&self, number: SegmentNumber) -> bool {
+        let guard = self.shards.read(shard_of(number));
+        guard.map.get(number).and_then(|slot| guard.segments[slot as usize].as_ref()).is_some_and(|entry| entry.is_output)
     }
 
     /// Note a confirmation couldn't prove a segment's rows dead, so only a rewrite takes it until the next open

@@ -391,6 +391,10 @@ pub struct Volume<Backend: Io> {
     pub progress: Arc<WakeLine>,
     /// Picks refused because the park had no room for their inputs
     pub park_refusals: AtomicU64,
+    /// Overlap merges that started while another ran, and their inputs a merge wrote
+    pub overlap_beside: AtomicU64,
+    pub overlap_output_inputs: AtomicU64,
+    pub overlap_inputs: AtomicU64,
     /// The most merges that ran at once
     pub most_in_flight: AtomicU64,
     /// The caller operations a look last saw

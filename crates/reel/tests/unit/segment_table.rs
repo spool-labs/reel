@@ -44,6 +44,7 @@ fn pool_compact() {
         unbacked: 0,
         unbacked_walk: 0,
         has_held_frees: false,
+        is_output: false,
         is_unproven: false,
     };
     // the slots run against pool order, and the run at 1 has retired

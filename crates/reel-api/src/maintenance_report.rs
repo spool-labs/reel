@@ -336,6 +336,11 @@ pub struct VolumeReading {
     pub ingest_left: Nanoseconds,
     /// Seals that ended a segment writes had gone quiet on
     pub idle_seals: u64,
+    /// Overlap merges that started while another overlap merge ran, overlap merge inputs an earlier merge wrote, and every overlap
+    /// merge input
+    pub overlap_beside: u64,
+    pub overlap_output_inputs: u64,
+    pub overlap_inputs: u64,
     /// Bytes claims took and gave up without landing: a gap in the segment, or a record with no row
     pub unlanded_bytes: u64,
     /// Quiet open segments that gave their room ahead back

@@ -188,6 +188,9 @@ impl<Backend: Io> EngineState<Backend> {
         report.sorted_scan_keys = self.sorted_scan_keys.load(Ordering::Relaxed);
         report.sorted_runs = self.sorted_runs.load(Ordering::Relaxed);
         report.sorted_moves_missed = self.sorted_moves_missed.load(Ordering::Relaxed);
+        report.sorted_images_taken = self.sorted_images_taken.load(Ordering::Relaxed);
+        report.sorted_images_refused = self.sorted_images_refused.load(Ordering::Relaxed);
+        report.sorted_image_saves_failed = self.sorted_image_saves_failed.load(Ordering::Relaxed);
         for volume in &self.volumes {
             for row in hold(&volume.summary).rows() {
                 let rows = rows_of(&row);

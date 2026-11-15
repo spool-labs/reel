@@ -490,6 +490,11 @@ impl CompleteTable {
         RowCount(self.past_capacity.load(Ordering::Acquire))
     }
 
+    /// Mark the table at a segment whose rows it couldn't take, so reads from that segment on ask the footers until a refill
+    pub fn mark_from(&self, segment: SegmentNumber) {
+        self.mark.fetch_min(segment.0, Ordering::AcqRel);
+    }
+
     /// Read the segment a get's footer search starts from, if rows have gone past the table
     pub fn mark(&self) -> Option<SegmentNumber> {
         match self.mark.load(Ordering::Acquire) {

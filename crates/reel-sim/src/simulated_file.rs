@@ -158,6 +158,9 @@ impl IoFile for SimulatedFile {
         }
 
         disk.write_calls = OperationCount(disk.write_calls.0 + 1);
+        if disk.takes_write_fault(self.inode) {
+            return Err(Error::from(ErrorKind::StorageFull));
+        }
         if disk.full_writes.0 > 0 {
             disk.full_writes = OperationCount(disk.full_writes.0 - 1);
             return Err(Error::from(ErrorKind::StorageFull));

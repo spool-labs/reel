@@ -640,6 +640,11 @@ pub struct MaintenanceReport {
     pub sorted_runs: u64,
     /// Output row blocks a merge's install couldn't read to move sorted entries
     pub sorted_moves_missed: u64,
+    /// Sorted images open took and refused
+    pub sorted_images_taken: u64,
+    pub sorted_images_refused: u64,
+    /// Sorted image saves a close gave up on
+    pub sorted_image_saves_failed: u64,
     /// Walk block lookups run together: blocks, candidates asked, candidates whose range held the whole block, per-key checks
     pub block_lookups: [u64; 4],
     pub volumes: Vec<VolumeReading>,
@@ -747,6 +752,9 @@ impl MaintenanceReport {
             sorted_scan_keys: 0,
             sorted_runs: 0,
             sorted_moves_missed: 0,
+            sorted_images_taken: 0,
+            sorted_images_refused: 0,
+            sorted_image_saves_failed: 0,
             block_lookups: [0; 4],
             volumes: Vec::new(),
             complete_columns: Vec::new(),

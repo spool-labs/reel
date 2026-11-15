@@ -6,6 +6,7 @@ pub mod claim;
 pub mod column_info;
 pub mod compact_job;
 pub mod complete_image;
+pub mod sorted_image;
 pub mod complete_path;
 pub mod cover_apply;
 pub mod cue;

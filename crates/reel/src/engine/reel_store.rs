@@ -498,6 +498,7 @@ impl<Backend: Io> ReelStore<Backend> {
             // an image only saves the next open time, so one that fails costs that and no more
             if !volume.has_failed() {
                 let _saved = self.state.save_images(volume.id.0 as usize);
+                let _saved = self.state.save_sorted_images(volume.id.0 as usize);
             }
             outcome = outcome.and(self.state.drop_prepared(volume).map_err(open_error("removing a spare segment")));
             self.state.close_volume(volume);
@@ -667,6 +668,7 @@ pub fn bring_up<Backend: Io>(
         // bits that fail to load leave their rows to ask, which costs a merge time and nothing else
         let _loaded = state.load_dead_bits(volume);
     }
+    state.remove_stale_images().map_err(open_error("removing an image of a column that changed kind"))?;
     state.fill_complete_tables().map_err(open_error("filling a complete table"))?;
     state.fill_sorted_indexes().map_err(open_error("filling a sorted index"))?;
     let damaged: usize = state.volumes.iter().map(|volume| hold(&volume.damaged).len()).sum();
@@ -1382,6 +1384,10 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         sorted_scan_keys: AtomicU64::new(0),
         sorted_runs: AtomicU64::new(0),
         sorted_moves_missed: AtomicU64::new(0),
+        sorted_images_taken: AtomicU64::new(0),
+        sorted_images_refused: AtomicU64::new(0),
+        sorted_image_bytes: AtomicU64::new(0),
+        sorted_image_saves_failed: AtomicU64::new(0),
         caller_ops: CallerCounts::default(),
         progress,
         is_arena_full: AtomicBool::new(false),
@@ -1669,12 +1675,13 @@ pub fn sorted_indexes(config: &StoreConfig) -> Vec<Option<SortedKeys>> {
     indexes
 }
 
-/// Name each complete column's image files and allocate its buffer
+/// Name each complete and each sorted column's image files and allocate its buffer. A column is never both kinds
 pub fn complete_images(config: &StoreConfig) -> Vec<Option<Mutex<ImageFiles>>> {
     let mut images: Vec<Option<Mutex<ImageFiles>>> = (0..MAX_COLUMNS).map(|_column| None).collect();
-    for column in config.columns.iter().filter(|column| column.complete_rows.is_some()) {
+    for column in config.columns.iter().filter(|column| column.complete_rows.is_some() || column.sorted_rows.is_some()) {
         if let Some(root) = config.volumes[column.volume.0 as usize].roots.first() {
-            images[column.id.0 as usize] = Some(Mutex::new(ImageFiles::new(root, column.id)));
+            let files = if column.sorted_rows.is_some() { ImageFiles::sorted(root, column.id) } else { ImageFiles::new(root, column.id) };
+            images[column.id.0 as usize] = Some(Mutex::new(files));
         }
     }
     images

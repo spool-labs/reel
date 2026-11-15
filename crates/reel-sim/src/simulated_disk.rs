@@ -64,6 +64,13 @@ pub enum NameChange {
     Unlink { path: PathBuf },
 }
 
+/// A write failure aimed at the files whose name ends with a suffix, after some writes to them pass
+#[derive(Clone, Copy, Debug)]
+pub struct FileWriteFault {
+    pub suffix: &'static str,
+    pub skip: OperationCount,
+}
+
 /// A sync failure aimed at one kind of file, after that kind has synced so many times
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileSyncFault {
@@ -86,6 +93,7 @@ pub struct SimulatedDisk {
     pub capacities: BTreeMap<PathBuf, ByteCount>,
     pub failing_syncs: OperationCount,
     pub file_sync_fault: Option<FileSyncFault>,
+    pub file_write_fault: Option<FileWriteFault>,
     pub failing_writes: OperationCount,
     pub write_calls: OperationCount,
     pub writes_before_failure: Option<OperationCount>,
@@ -96,6 +104,8 @@ pub struct SimulatedDisk {
     pub failing_creates: OperationCount,
     pub failing_removes: OperationCount,
     pub failing_directory_syncs: OperationCount,
+    /// Directory syncs that pass before the failing ones start
+    pub skipped_directory_syncs: OperationCount,
     pub after_sync: SyncHook,
     pub on_read: ReadHook,
     pub reads: OperationCount,
@@ -135,6 +145,7 @@ impl SimulatedDisk {
             capacities: BTreeMap::new(),
             failing_syncs: OperationCount::default(),
             file_sync_fault: None,
+            file_write_fault: None,
             failing_writes: OperationCount::default(),
             write_calls: OperationCount(0),
             writes_before_failure: None,
@@ -145,6 +156,7 @@ impl SimulatedDisk {
             failing_creates: OperationCount::default(),
             failing_removes: OperationCount::default(),
             failing_directory_syncs: OperationCount::default(),
+            skipped_directory_syncs: OperationCount::default(),
             after_sync: SyncHook::default(),
             on_read: ReadHook::default(),
             reads: OperationCount::default(),
@@ -381,6 +393,23 @@ impl SimulatedDisk {
             image.handle_count += 1;
         }
         handle
+    }
+
+    /// Check an armed write failure lands on this file now, and spend it if so
+    pub fn takes_write_fault(&mut self, inode: InodeNumber) -> bool {
+        let Some(fault) = self.file_write_fault else {
+            return false;
+        };
+        let is_aimed = self.names.iter().any(|(path, named)| *named == inode && path.to_str().is_some_and(|name| name.ends_with(fault.suffix)));
+        if !is_aimed {
+            return false;
+        }
+        if fault.skip.0 > 0 {
+            self.file_write_fault = Some(FileWriteFault { suffix: fault.suffix, skip: OperationCount(fault.skip.0 - 1) });
+            return false;
+        }
+        self.file_write_fault = None;
+        true
     }
 
     /// Check an armed sync failure lands on this file now, and spend it if so

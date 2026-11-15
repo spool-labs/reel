@@ -17,7 +17,7 @@ use reel::io::lock_outcome::LockOutcome;
 use crate::count_pause::CountPause;
 use crate::file_image::{BitMask, SECTOR_BYTES};
 use crate::seeded_random::Seed;
-use crate::simulated_disk::{FileSyncFault, InodeNumber, OperationCount, ReadHook, SimulatedDisk, SyncHook};
+use crate::simulated_disk::{FileSyncFault, FileWriteFault, InodeNumber, OperationCount, ReadHook, SimulatedDisk, SyncHook};
 use crate::simulated_file::SimulatedFile;
 use crate::simulated_ring::SimulatedRing;
 use crate::simulated_task::{JobCount, JobIndex, JobSlot, JobWait, SimulatedTask};
@@ -167,6 +167,13 @@ impl SimulatedIo {
         hold(&self.disk).full_writes = count;
     }
 
+    /// Let some directory syncs pass, then make the next ones fail
+    pub fn fail_directory_syncs_after(&self, skip: OperationCount, count: OperationCount) {
+        let mut disk = hold(&self.disk);
+        disk.skipped_directory_syncs = skip;
+        disk.failing_directory_syncs = count;
+    }
+
     /// Make the next directory syncs fail
     pub fn fail_directory_syncs(&self, count: OperationCount) {
         hold(&self.disk).failing_directory_syncs = count;
@@ -237,6 +244,11 @@ impl SimulatedIo {
     /// Make one sync of one kind of file fail, after that kind has synced `skip` times
     pub fn fail_file_sync(&self, extension: &'static str, skip: OperationCount) {
         hold(&self.disk).file_sync_fault = Some(FileSyncFault { extension, skip });
+    }
+
+    /// Fail one write to the files whose name ends with a suffix, as a full disk, after `skip` writes to them pass
+    pub fn fail_writes_to(&self, suffix: &'static str, skip: OperationCount) {
+        hold(&self.disk).file_write_fault = Some(FileWriteFault { suffix, skip });
     }
 
     /// Take back an aimed sync failure that has not landed
@@ -472,7 +484,9 @@ impl Io for SimulatedIo {
         let _pause = CountPause::new();
         let mut disk = hold(&self.disk);
         disk.enter()?;
-        if disk.failing_directory_syncs.0 > 0 {
+        if disk.skipped_directory_syncs.0 > 0 {
+            disk.skipped_directory_syncs = OperationCount(disk.skipped_directory_syncs.0 - 1);
+        } else if disk.failing_directory_syncs.0 > 0 {
             disk.failing_directory_syncs = OperationCount(disk.failing_directory_syncs.0 - 1);
             return Err(Error::other("simulated directory sync failure"));
         }

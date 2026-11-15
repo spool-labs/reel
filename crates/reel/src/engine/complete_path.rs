@@ -275,6 +275,8 @@ impl<Backend: Io> EngineState<Backend> {
             numbers.sort_unstable();
             for number in numbers.into_iter().filter(|number| covered.binary_search(number).is_err()) {
                 if !self.fill_from_segment(volume, column, number)? {
+                    // the rows past the unread block have no slot, so the table sends reads of this segment on to the footers
+                    table.mark_from(number);
                     self.damage_unread(index, number);
                 }
             }
@@ -292,14 +294,21 @@ impl<Backend: Io> EngineState<Backend> {
             let column = ColumnId(id as u8);
             let volume_index = info.volume.0 as usize;
             let volume = &self.volumes[volume_index];
-            let mut numbers = Vec::new();
-            volume.table.for_each_segment(|number, _root, _file| numbers.push(number));
-            let mut run = SortedRun::new(index.width());
-            for number in numbers {
-                if !self.fill_sorted_segment(volume, (column, index), number, &mut run)? {
-                    self.damage_unread(volume_index, number);
+            // a clean close's image holds every segment's entries, and one that doesn't match leaves the index empty to fill
+            if !self.take_sorted_image(volume, column, index)? {
+                let mut numbers = Vec::new();
+                volume.table.for_each_segment(|number, _root, _file| numbers.push(number));
+                let mut run = SortedRun::new(index.width());
+                for number in numbers {
+                    if !self.fill_sorted_segment(volume, (column, index), number, &mut run)? {
+                        // the rows past the unread block have no entry, so the index sends reads of this segment on to the footers,
+                        // and a marked index saves no image
+                        index.mark_from(number);
+                        self.damage_unread(volume_index, number);
+                    }
                 }
             }
+            // a cover loaded at open may be newer than the image, so the pass runs whichever way the index filled
             volume.covers.read().visit(|cover, start, end| {
                 if cover.column == column {
                     index.remove_covered(start, end, cover.place);

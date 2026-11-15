@@ -173,6 +173,12 @@ pub struct EngineState<Backend: Io> {
     pub sorted_runs: AtomicU64,
     /// Row blocks a merge's install couldn't read to move sorted entries, whose keys ask the footers once the inputs go
     pub sorted_moves_missed: AtomicU64,
+    /// Sorted images open took and refused, and the bytes closes saved
+    pub sorted_images_taken: AtomicU64,
+    pub sorted_images_refused: AtomicU64,
+    pub sorted_image_bytes: AtomicU64,
+    /// Sorted image saves a close gave up on, which cost the next open its fast fill
+    pub sorted_image_saves_failed: AtomicU64,
     /// Caller operations, so maintenance can tell callers are busy
     pub caller_ops: CallerCounts,
     /// The line writers wait on, shared with every volume
@@ -767,7 +773,9 @@ impl<Backend: Io> EngineState<Backend> {
         // the declared indexes come out of the budget, so the report's budget is the one number the store was given
         let ring_readers = self.ring_record_readers.heap_bytes(RecordReader::heap_bytes).0 + self.ring_footer_readers.heap_bytes(FooterReader::heap_bytes).0;
         let ring = self.ring.as_ref().map_or(0, |ring| ring.heap_bytes().0 + ring.driver.heap_bytes().0);
-        report.read_buffers = ByteCount(report.read_buffers.0 + self.read_pool.heap_bytes().0 + ring + ring_readers);
+        // each complete and sorted column keeps a chunk its image goes through at close and at open
+        let images: u64 = self.complete_images.iter().flatten().map(|files| hold(files).chunk.len() as u64).sum();
+        report.read_buffers = ByteCount(report.read_buffers.0 + self.read_pool.heap_bytes().0 + ring + ring_readers + images);
         let encoders = self.encoders.heap_bytes(RecordEncoder::heap_bytes);
         let shares = self.stored_shares.heap_bytes(|share| ByteCount(share.capacity() as u64));
         report.compress_buffers = ByteCount(encoders.0 + shares.0);

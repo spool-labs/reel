@@ -1,7 +1,7 @@
 //! Sorted columns: an index holds each sealed key's newest place, so a get reads no footers, through seals, merges, covers and opens
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -22,7 +22,7 @@ use reel_api::direction::Direction;
 use reel_api::scan::ScanStep;
 use reel_api::maintenance_report::MaintenanceReport;
 use reel::segment::segment_tail::SegmentNumber;
-use reel_api::units::{ByteCount, DeathMark, Nanoseconds, RowCount, VolumeId};
+use reel_api::units::{ByteCount, DeathMark, Nanoseconds, RowCount, VolumeId, WritePlace};
 use reel_api::write_batch::WriteBatch;
 use reel_sim::seeded_random::{Seed, SeededRandom};
 use reel_sim::simulated_io::SimulatedIo;
@@ -1150,5 +1150,701 @@ fn cues_held_across_covers_and_single_seals() {
         check(&store, &model, &written);
         drop(cues);
         store.close().expect("close");
+    }
+}
+
+const COPY_STEPS: u64 = 2;
+const FAILURE_TRIES: u64 = 400;
+const TAIL_KEYS: usize = 10;
+// Draft: sims for the sorted index image, to go at the end of tests/simulation/sorted.rs. Every sim that expects the image taken
+// asserts taken 1 and refused 0, and every refusal asserts refused 1 and taken 0, since a refusal rebuilds and matches the model too
+
+use std::io::IoSlice;
+use reel::io::{Io, IoFile};
+use reel_api::units::FileOffset;
+use reel_sim::file_image::BitMask;
+use reel_sim::simulated_disk::OperationCount;
+
+const PAGE: u64 = 4_096;
+const TENTH_KEYS: u64 = CAPACITY.0 / 10;
+
+fn image_path() -> PathBuf {
+    PathBuf::from(ROOT).join(format!("sorted-{}.image", COLUMN.0))
+}
+
+fn new_image_path() -> PathBuf {
+    PathBuf::from(ROOT).join(format!("sorted-{}.image.new", COLUMN.0))
+}
+
+fn has_file(io: &SimulatedIo, path: &Path) -> bool {
+    io.list_directory(Path::new(ROOT)).expect("list").iter().any(|listed| listed == path)
+}
+
+fn read_file(io: &SimulatedIo, path: &Path) -> Vec<u8> {
+    let file = io.open_read_only(path).expect("open");
+    let mut bytes = vec![0; file.length().expect("length").0 as usize];
+    file.read_exact_at(FileOffset(0), &mut bytes).expect("read");
+    io.close_file(file);
+    bytes
+}
+
+fn write_file(io: &SimulatedIo, path: &Path, bytes: &[u8]) {
+    let _gone = io.remove_file(path);
+    let file = io.create_file(path, ByteCount(bytes.len() as u64)).expect("create");
+    file.write_at(FileOffset(0), &[IoSlice::new(bytes)]).expect("write");
+    file.sync().expect("sync");
+    io.close_file(file);
+}
+
+// (taken, refused) since open
+fn image_counts(store: &Store) -> (u64, u64) {
+    let report = report(store);
+    (report.sorted_images_taken, report.sorted_images_refused)
+}
+
+// overwrites, deletes and a range delete over a few seals, so the image holds values, graves and a cover's removals
+fn fill_for_image(store: &Store, io: &SimulatedIo, keys: u64) -> Model {
+    let mut model = Model::new();
+    for number in 0..keys {
+        store.put(COLUMN, &key(number), format!("first-{number}").as_bytes()).expect("put");
+        model.insert(key(number), format!("first-{number}").into_bytes());
+    }
+    seal_all(store, io);
+    for number in (0..keys).step_by(3) {
+        store.put(COLUMN, &key(number), b"second").expect("put");
+        model.insert(key(number), b"second".to_vec());
+    }
+    for number in (1..keys).step_by(7) {
+        store.delete(COLUMN, &key(number)).expect("delete");
+        model.remove(&key(number));
+    }
+    let names: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let (start, end) = (names[names.len() / 3].clone(), names[names.len() / 3 + COVERED].clone());
+    store.delete_range(COLUMN, &start, &end).expect("delete range");
+    model.retain(|name, _value| *name < start || *name >= end);
+    seal_all(store, io);
+    model
+}
+
+fn check_all(store: &Store, model: &Model, keys: u64, seed: u64) {
+    let written: Vec<Vec<u8>> = (0..keys).map(key).collect();
+    check(store, model, &written);
+    check_entries(store, model);
+    check_scans(store, model, &mut SeededRandom::new(Seed(seed)));
+}
+
+// a store closed clean with an image beside it, and the model it holds
+fn closed_with_image(io: &SimulatedIo) -> Model {
+    let store = open(io, CAPACITY);
+    let model = fill_for_image(&store, io, KEYS);
+    store.close().expect("close");
+    assert!(has_file(io, &image_path()), "a clean close saved no image");
+    model
+}
+
+// open, check the counters say the image went the expected way, and check every answer against the model
+fn reopen_and_check(io: &SimulatedIo, capacity: RowCount, model: &Model, expected: (u64, u64), seed: u64) {
+    let store = open(io, capacity);
+    assert_eq!(image_counts(&store), expected);
+    assert!(!has_file(io, &image_path()), "open left the image behind");
+    check_all(&store, model, KEYS, seed);
+    store.close().expect("close");
+}
+
+// a clean close saves the index, the next open takes it and removes it, and every get, scan and entry matches the model. The index
+// the image gave takes seals after
+#[test]
+fn an_image_carries_the_index_through_a_close() {
+    let io = SimulatedIo::new(Seed(30));
+    let store = open(&io, CAPACITY);
+    let mut model = fill_for_image(&store, &io, KEYS);
+    let entries = store.state.sorted_index(COLUMN).expect("an index").entry_count();
+    store.close().expect("close");
+    let store = open(&io, CAPACITY);
+    assert_eq!(image_counts(&store), (1, 0));
+    assert!(!has_file(&io, &image_path()));
+    assert_eq!(store.state.sorted_index(COLUMN).expect("an index").entry_count(), entries);
+    check_all(&store, &model, KEYS, 31);
+    for number in (0..KEYS).step_by(5) {
+        store.put(COLUMN, &key(number), b"third").expect("put");
+        model.insert(key(number), b"third".to_vec());
+    }
+    seal_all(&store, &io);
+    check_all(&store, &model, KEYS, 32);
+    store.close().expect("close");
+    reopen_and_check(&io, CAPACITY, &model, (1, 0), 33);
+}
+
+// open removes the image before any write, so a kill after later seals leaves none, and the next open rebuilds
+#[test]
+fn a_kill_after_an_image_open_rebuilds() {
+    let io = SimulatedIo::new(Seed(34));
+    let mut model = closed_with_image(&io);
+    let store = open(&io, CAPACITY);
+    assert_eq!(image_counts(&store), (1, 0));
+    for number in (0..KEYS).step_by(4) {
+        store.put(COLUMN, &key(number), b"after").expect("put");
+        model.insert(key(number), b"after".to_vec());
+    }
+    seal_all(&store, &io);
+    store.flush().expect("flush");
+    io.kill();
+    drop(store);
+    reopen_and_check(&io, CAPACITY, &model, (0, 0), 35);
+}
+
+// a kill after the image is read and removed but before the directory sync lands leaves the file, and the next open takes it
+#[test]
+fn a_kill_before_the_unlink_syncs_takes_the_image_again() {
+    // an open fails at the directory sync after the image's removal, and a kill follows. Whether the removal survived the kill
+    // or the image came back, the next open answers the model: an image that came back is taken, and none rebuilds
+    let landed = (0..FAILURE_TRIES).find_map(|skip| {
+        let io = SimulatedIo::new(Seed(36));
+        let model = closed_with_image(&io);
+        io.fail_directory_syncs_after(OperationCount(skip), OperationCount(1));
+        let is_failed = ReelStore::open(io.clone(), &config(CAPACITY)).is_err();
+        (is_failed && !has_file(&io, &image_path())).then_some((io, model))
+    });
+    let (io, model) = landed.expect("no failed sync landed after the image's removal");
+    io.kill();
+    let is_back = has_file(&io, &image_path());
+    reopen_and_check(&io, CAPACITY, &model, if is_back { (1, 0) } else { (0, 0) }, 37);
+}
+
+// an image from an index of another capacity is refused, and open rebuilds
+#[test]
+fn an_image_of_another_capacity_is_refused() {
+    let io = SimulatedIo::new(Seed(38));
+    let model = closed_with_image(&io);
+    reopen_and_check(&io, RowCount(CAPACITY.0 * 4), &model, (0, 1), 39);
+}
+
+// an image that lists a segment the volume no longer has is refused
+#[test]
+fn an_image_missing_a_segment_is_refused() {
+    let io = SimulatedIo::new(Seed(40));
+    let store = open(&io, CAPACITY);
+    let mut model = fill_for_image(&store, &io, KEYS);
+    // a segment of keys the model can drop whole, so its files can go with no answer changing
+    let lone = key(KEYS + 1);
+    store.put(COLUMN, &lone, b"lone").expect("put");
+    seal_all(&store, &io);
+    let number = store.state.sorted_index(COLUMN).expect("an index").find(&lone).expect("an entry").segment;
+    store.close().expect("close");
+    for path in io.list_directory(Path::new(ROOT)).expect("list") {
+        if path.file_stem().is_some_and(|stem| stem.to_string_lossy().ends_with(&format!("{:016x}", number.0))) {
+            io.remove_file(&path).expect("remove");
+        }
+    }
+    model.remove(&lone);
+    reopen_and_check(&io, CAPACITY, &model, (0, 1), 41);
+}
+
+// an image whose listed segment now holds other rows under the same number is refused
+#[test]
+fn an_image_with_a_swapped_segment_is_refused() {
+    let io = SimulatedIo::new(Seed(42));
+    let model = closed_with_image(&io);
+    // flip the seal stamp of the first listed segment, and fix the sum so only the identity check can refuse it
+    let mut bytes = read_file(&io, &image_path());
+    let listed = reel::engine::sorted_image::SORTED_HEAD_BYTES;
+    bytes[listed + 16] ^= 1;
+    reseal(&mut bytes);
+    write_file(&io, &image_path(), &bytes);
+    reopen_and_check(&io, CAPACITY, &model, (0, 1), 43);
+}
+
+// write the image's sum again over everything before it, as a save would
+fn reseal(bytes: &mut [u8]) {
+    let body = bytes.len() - 8;
+    let mut sum = reel::record::record_check::RunningSum::new();
+    sum.add(&bytes[..body]);
+    bytes[body..].copy_from_slice(&sum.sum().0.to_le_bytes());
+}
+
+// a flipped bit anywhere fails the sum: in the head, the list, the pages at three depths and the stored sum itself
+#[test]
+fn a_flipped_bit_refuses_the_image() {
+    for (at, seed) in [(0.0, 44), (0.15, 45), (0.1, 46), (0.5, 47), (0.99, 48), (1.0, 49)] {
+        let io = SimulatedIo::new(Seed(seed));
+        let model = closed_with_image(&io);
+        let length = read_file(&io, &image_path()).len() as u64;
+        let offset = match at {
+            0.0 => 56,
+            0.15 => reel::engine::sorted_image::SORTED_HEAD_BYTES as u64,
+            1.0 => length - 4,
+            share => ((length as f64 * share) as u64).min(length - 9),
+        };
+        io.rot(&image_path(), FileOffset(offset), BitMask(1)).expect("rot");
+        reopen_and_check(&io, CAPACITY, &model, (0, 1), seed + 100);
+    }
+}
+
+// a file a page short or a page long is refused before any page is read
+#[test]
+fn an_image_a_page_short_or_long_is_refused() {
+    for (is_long, seed) in [(false, 50), (true, 51)] {
+        let io = SimulatedIo::new(Seed(seed));
+        let model = closed_with_image(&io);
+        let mut bytes = read_file(&io, &image_path());
+        if is_long {
+            bytes.extend(std::iter::repeat_n(0, PAGE as usize));
+        } else {
+            bytes.drain(bytes.len() - 8 - PAGE as usize..bytes.len() - 8);
+        }
+        write_file(&io, &image_path(), &bytes);
+        reopen_and_check(&io, CAPACITY, &model, (0, 1), seed + 100);
+    }
+}
+
+// an empty file is refused
+#[test]
+fn an_empty_image_is_refused() {
+    let io = SimulatedIo::new(Seed(52));
+    let model = closed_with_image(&io);
+    write_file(&io, &image_path(), &[]);
+    reopen_and_check(&io, CAPACITY, &model, (0, 1), 53);
+}
+
+// a .new a close left beside no image goes at open, nothing is taken, and the next close saves again
+#[test]
+fn a_leftover_new_file_is_removed() {
+    let io = SimulatedIo::new(Seed(54));
+    let model = closed_with_image(&io);
+    let bytes = read_file(&io, &image_path());
+    io.remove_file(&image_path()).expect("remove");
+    write_file(&io, &new_image_path(), &bytes);
+    let store = open(&io, CAPACITY);
+    assert_eq!(image_counts(&store), (0, 0));
+    assert!(!has_file(&io, &new_image_path()), "open left the .new");
+    check_all(&store, &model, KEYS, 55);
+    store.close().expect("close");
+    assert!(has_file(&io, &image_path()));
+}
+
+// an index with a mark rebuilds at open, so its close saves nothing
+#[test]
+fn a_marked_index_saves_no_image() {
+    let io = SimulatedIo::new(Seed(56));
+    let store = open(&io, SMALL_CAPACITY);
+    let mut late = 0;
+    while store.state.sorted_index(COLUMN).expect("an index").mark().is_none() {
+        assert!(late < LATE_KEYS, "no row went past capacity");
+        for number in late..late + KEYS {
+            store.put(COLUMN, &key(number), b"late").expect("put");
+        }
+        late += KEYS;
+        seal_all(&store, &io);
+    }
+    store.close().expect("close");
+    assert!(!has_file(&io, &image_path()), "a marked index saved an image");
+    let store = open(&io, SMALL_CAPACITY);
+    assert_eq!(image_counts(&store), (0, 0));
+    for number in (0..late).step_by(97) {
+        assert_eq!(read(&store, &key(number)).as_deref(), Some(&b"late"[..]));
+    }
+    store.close().expect("close");
+}
+
+// a range delete, a put and a delete still open at close cross the image: open takes it, replays them, runs the cover pass,
+// and every answer matches
+#[test]
+fn open_rows_at_close_cross_an_image() {
+    let io = SimulatedIo::new(Seed(57));
+    let store = open(&io, CAPACITY);
+    let mut model = fill_for_image(&store, &io, KEYS);
+    let names: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let (start, end) = (names[names.len() / 2].clone(), names[names.len() / 2 + COVERED].clone());
+    store.delete_range(COLUMN, &start, &end).expect("delete range");
+    model.retain(|name, _value| *name < start || *name >= end);
+    store.put(COLUMN, &names[1], b"open").expect("put");
+    model.insert(names[1].clone(), b"open".to_vec());
+    store.delete(COLUMN, &names[2]).expect("delete");
+    model.remove(&names[2]);
+    store.close().expect("close");
+    let store = open(&io, CAPACITY);
+    assert_eq!(image_counts(&store), (1, 0));
+    // rows still open at the close sit in the write index, which the image never holds, so the entries match once they seal
+    let written: Vec<Vec<u8>> = (0..KEYS).map(key).collect();
+    check(&store, &model, &written);
+    check_scans(&store, &model, &mut SeededRandom::new(Seed(58)));
+    seal_all(&store, &io);
+    check_all(&store, &model, KEYS, 158);
+    store.close().expect("close");
+    reopen_and_check(&io, CAPACITY, &model, (1, 0), 258);
+}
+
+// a failed image write costs the next open its image and nothing else
+#[test]
+fn a_full_disk_mid_image_reopens_by_rebuild() {
+    // the image's write fails half way, as a full disk or a failed sync leaves it: the close still succeeds, the half file is
+    // gone by the next open, the open rebuilds, and a round trip after takes the next image
+    let io = SimulatedIo::new(Seed(59));
+    let store = open(&io, CAPACITY);
+    let model = fill_for_image(&store, &io, KEYS);
+    store.state.volumes[0].holds.sorted_image_fails.store(true, Ordering::Release);
+    store.close().expect("a close failed on its image");
+    assert!(!has_file(&io, &image_path()), "a failed write left an image");
+    reopen_and_check(&io, CAPACITY, &model, (0, 0), 60);
+    assert!(!has_file(&io, &new_image_path()), "the half written file stayed");
+    let store = open(&io, CAPACITY);
+    store.close().expect("close");
+    reopen_and_check(&io, CAPACITY, &model, (1, 0), 61);
+}
+
+// a column at a tenth of its rows saves about a tenth of its pool, and round trips
+#[test]
+fn a_column_at_a_tenth_saves_a_tenth() {
+    let io = SimulatedIo::new(Seed(62));
+    let store = open(&io, CAPACITY);
+    let model = fill_for_image(&store, &io, TENTH_KEYS);
+    let pool = store.state.sorted_index(COLUMN).expect("an index").heap_bytes().0;
+    store.close().expect("close");
+    let written = read_file(&io, &image_path()).len() as u64;
+    assert!(written < pool / 5, "{written} of a {pool} pool for a tenth of the rows");
+    let store = open(&io, CAPACITY);
+    assert_eq!(image_counts(&store), (1, 0));
+    check_all(&store, &model, TENTH_KEYS, 63);
+    store.close().expect("close");
+}
+
+// an old image put back after later seals is refused. With only open rows added after it, it is taken or refused and every answer
+// matches either way
+#[test]
+fn a_stale_image_is_refused() {
+    for (is_sealed, seed) in [(true, 64), (false, 65)] {
+        let io = SimulatedIo::new(Seed(seed));
+        let mut model = closed_with_image(&io);
+        let old = read_file(&io, &image_path());
+        let store = open(&io, CAPACITY);
+        for number in (0..KEYS).step_by(6) {
+            store.put(COLUMN, &key(number), b"later").expect("put");
+            model.insert(key(number), b"later".to_vec());
+        }
+        if is_sealed {
+            seal_all(&store, &io);
+        }
+        store.close().expect("close");
+        write_file(&io, &image_path(), &old);
+        let store = open(&io, CAPACITY);
+        let counts = image_counts(&store); eprintln!("STALE sealed {is_sealed} counts {counts:?}");
+        if is_sealed {
+            assert_eq!(counts, (0, 1));
+        } else {
+            assert_eq!(counts.0 + counts.1, 1);
+        }
+        // rows put back after their delete sit in the open segments, which the index never holds, so its entries match the
+        // model once those seal
+        let written: Vec<Vec<u8>> = (0..KEYS).map(key).collect();
+        check(&store, &model, &written);
+        check_scans(&store, &model, &mut SeededRandom::new(Seed(seed + 100)));
+        seal_all(&store, &io);
+        check_entries(&store, &model);
+        store.close().expect("close");
+    }
+}
+
+// a cue taken and dropped before the close leaves the image as good as any
+#[test]
+fn an_image_after_a_cue_round_trips() {
+    let io = SimulatedIo::new(Seed(66));
+    let store = open(&io, CAPACITY);
+    let model = fill_for_image(&store, &io, KEYS);
+    drop(store.cue().expect("cue"));
+    store.close().expect("close");
+    reopen_and_check(&io, CAPACITY, &model, (1, 0), 67);
+}
+
+// a close with a merge mid-copy on the store's own worker stops it before the save, and the image matches the store it reopens
+#[test]
+fn a_close_mid_merge_saves_a_still_index() {
+    let io = SimulatedIo::new(Seed(68));
+    let store = open(&io, CAPACITY);
+    let volume = &store.state.volumes[0];
+    volume.holds.compaction.store(true, Ordering::Release);
+    let mut model = Model::new();
+    for number in 0..MERGE_KEYS {
+        store.put(COLUMN, &key(number), b"first").expect("put");
+        model.insert(key(number), b"first".to_vec());
+    }
+    seal(&store, &io);
+    for number in (0..MERGE_KEYS).filter(|number| number % 3 != 2) {
+        store.put(COLUMN, &key(number), b"second").expect("put");
+        model.insert(key(number), b"second".to_vec());
+    }
+    seal(&store, &io);
+    // a merge of the two segments, run by hand until it has its first output and has copied rows into it, then left there
+    let first = hold(&volume.summary).rows().map(|row| row.facts.segment).min().expect("a segment");
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    job.rewrite.forced = Some(first);
+    job.rewrite.start();
+    let is_copying = || volume.output_floor() != reel::engine::volume::NO_SEAL;
+    for _step in 0..STEPS {
+        if is_copying() || !job.rewrite.is_running() {
+            break;
+        }
+        job.rewrite.step();
+    }
+    assert!(is_copying(), "no merge took an output");
+    for _step in 0..COPY_STEPS {
+        if job.rewrite.phase == RewritePhase::Installing {
+            break;
+        }
+        job.rewrite.step();
+    }
+    assert!(job.rewrite.phase != RewritePhase::Installing && is_copying(), "the merge reached its install before the close");
+    store.close().expect("close");
+    let store = open(&io, CAPACITY);
+    assert_eq!(image_counts(&store), (1, 0));
+    let written: Vec<Vec<u8>> = (0..MERGE_KEYS).map(key).collect();
+    check(&store, &model, &written);
+    check_entries(&store, &model);
+    check_scans(&store, &model, &mut SeededRandom::new(Seed(69)));
+    store.close().expect("close");
+}
+
+// an image read into an index that already took a page or an entry is refused, since the saved free chain runs into the tail of a
+// pool this index has written, and the index still answers the key it held
+#[test]
+fn an_image_into_a_used_index_is_refused() {
+    let io = SimulatedIo::new(Seed(69));
+    let _model = closed_with_image(&io);
+    let index = reel::index::sorted_keys::SortedKeys::new(WIDTH as usize, CAPACITY);
+    let held = key(KEYS + 7);
+    let entry = KeyEntry { place: WritePlace(1), segment: SegmentNumber(1), offset: FileOffset(0), length: ByteCount(1), is_grave: false };
+    index.upsert(&held, entry, WritePlace(0));
+    let file = io.open_read_only(&image_path()).expect("open");
+    let mut chunk = vec![0; reel::engine::complete_image::IMAGE_CHUNK_BYTES];
+    let read = reel::engine::sorted_image::read_sorted_image(&file, COLUMN, &index, &mut chunk, (&|_read_point, _count| true, &|_listed| true));
+    io.close_file(file);
+    assert_eq!(read.map_err(|error| error.kind()), Err(std::io::ErrorKind::InvalidData));
+    assert_eq!(index.find(&held), Some(entry));
+}
+
+// a pool whose leaves emptied and went back on the free chain round trips through an image, and the reopened index takes every
+// freed page and pages past the high-water mark with nothing lost
+#[test]
+fn freed_pages_round_trip_through_an_image() {
+    let io = SimulatedIo::new(Seed(70));
+    let store = open(&io, CAPACITY);
+    let mut model = Model::new();
+    for number in 0..KEYS * 4 {
+        store.put(COLUMN, &key(number), b"first").expect("put");
+        model.insert(key(number), b"first".to_vec());
+    }
+    seal_all(&store, &io);
+    // half the keys in one contiguous run empty whole leaves
+    let names: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let (start, end) = (names[names.len() / 4].clone(), names[names.len() * 3 / 4].clone());
+    for name in names.iter().filter(|name| **name >= start && **name < end) {
+        store.delete(COLUMN, name).expect("delete");
+        model.remove(name);
+    }
+    seal_all(&store, &io);
+    let index = store.state.sorted_index(COLUMN).expect("an index");
+    assert!(index.free_pages() > index.page_count() - index.high_water(), "no page went back on the chain below the high-water mark");
+    store.close().expect("close");
+    let store = open(&io, CAPACITY);
+    assert_eq!(image_counts(&store), (1, 0));
+    for number in KEYS * 4..KEYS * 12 {
+        store.put(COLUMN, &key(number), b"after").expect("put");
+        model.insert(key(number), b"after".to_vec());
+    }
+    seal_all(&store, &io);
+    let written: Vec<Vec<u8>> = (0..KEYS * 12).map(key).collect();
+    check(&store, &model, &written);
+    check_entries(&store, &model);
+    check_scans(&store, &model, &mut SeededRandom::new(Seed(71)));
+    store.close().expect("close");
+}
+
+// a put that fails after its place was given leaves the read point where the disk is, so the next close's image is taken
+#[test]
+fn an_image_after_a_failed_put_round_trips() {
+    let io = SimulatedIo::new(Seed(72));
+    let store = open(&io, CAPACITY);
+    let model = fill_for_image(&store, &io, KEYS);
+    io.fail_writes(OperationCount(1));
+    let _failed = store.put(COLUMN, &key(KEYS + 3), b"lost");
+    store.flush().ok();
+    store.close().ok();
+    let store = open(&io, CAPACITY);
+    store.close().expect("close");
+    // the write either landed or it didn't, and the model takes what the store says
+    let store = open(&io, CAPACITY);
+    // a reopen after a clean close takes the image; (0, 1) here means the read point refused a good image
+    assert_eq!(image_counts(&store), (1, 0), "the read point refused an image after a failed put");
+    let mut model = model;
+    if let Some(value) = read(&store, &key(KEYS + 3)) {
+        model.insert(key(KEYS + 3), value);
+    }
+    check_all(&store, &model, KEYS + 4, 73);
+    store.close().expect("close");
+}
+
+// the disk fills during the image: the close still succeeds, and the next open rebuilds
+#[test]
+fn a_disk_full_during_the_image_reopens_by_rebuild() {
+    // the same failure after writes that left open rows: the open replays them, rebuilds the index and answers the model
+    let io = SimulatedIo::new(Seed(74));
+    let store = open(&io, CAPACITY);
+    let mut model = fill_for_image(&store, &io, KEYS);
+    for number in (0..KEYS).step_by(9) {
+        store.put(COLUMN, &key(number), b"open").expect("put");
+        model.insert(key(number), b"open".to_vec());
+    }
+    store.state.volumes[0].holds.sorted_image_fails.store(true, Ordering::Release);
+    store.close().expect("a close failed on its image");
+    let store = open(&io, CAPACITY);
+    assert_eq!(image_counts(&store), (0, 0));
+    let written: Vec<Vec<u8>> = (0..KEYS).map(key).collect();
+    check(&store, &model, &written);
+    check_scans(&store, &model, &mut SeededRandom::new(Seed(75)));
+    store.close().expect("close");
+}
+
+// two sorted columns and a complete one on one volume: each sorted column takes its own image, and the complete table its own
+#[test]
+fn two_sorted_columns_and_a_complete_one_take_their_own_images() {
+    // column 1 is COLUMN; column 2 sorted the same way; column 3 complete
+    const SECOND: ColumnId = ColumnId(2);
+    const THIRD: ColumnId = ColumnId(3);
+    let three = || {
+        let mut config = config(CAPACITY);
+        let sorted = config.columns[0].clone();
+        config.columns.push(ColumnConfig { id: SECOND, name: "second".to_string(), ..sorted });
+        config.columns.push(ColumnConfig {
+            id: THIRD,
+            name: "third".to_string(),
+            key_shape: KeyShape::Variable { most: 64 },
+            sorted_rows: None,
+            complete_rows: Some(CAPACITY),
+            ..config.columns[0].clone()
+        });
+        config
+    };
+    let sorted_path = |column: ColumnId| PathBuf::from(ROOT).join(format!("sorted-{}.image", column.0));
+    let scan = |store: &Store, column: ColumnId| rows(store.iter_from(column, b"", Direction::Ascending).expect("scan"));
+    for is_swapped in [false, true] {
+        let io = SimulatedIo::new(Seed(70 + u64::from(is_swapped)));
+        let store = ReelStore::open(io.clone(), &three()).expect("open");
+        // each sorted column under its own model, with values that say which column wrote them
+        let (mut first, mut second) = (Model::new(), Model::new());
+        for number in 0..KEYS {
+            store.put(COLUMN, &key(number), format!("one-{number}").as_bytes()).expect("put");
+            first.insert(key(number), format!("one-{number}").into_bytes());
+            if number % 2 == 0 {
+                store.put(SECOND, &key(number), format!("two-{number}").as_bytes()).expect("put");
+                second.insert(key(number), format!("two-{number}").into_bytes());
+            }
+            store.put(THIRD, format!("third-{number}").as_bytes(), b"complete").expect("put");
+        }
+        seal_all(&store, &io);
+        store.close().expect("close");
+        drop(store);
+        assert!(has_file(&io, &sorted_path(COLUMN)) && has_file(&io, &sorted_path(SECOND)), "a sorted column saved no image");
+        if is_swapped {
+            // column 1's file carries column 2's image: its column word refuses it
+            let bytes = read_file(&io, &sorted_path(SECOND));
+            write_file(&io, &sorted_path(COLUMN), &bytes);
+        }
+
+        let store = ReelStore::open(io.clone(), &three()).expect("open");
+        let opened = report(&store);
+        let expected = if is_swapped { (1, 1) } else { (2, 0) };
+        assert_eq!((opened.sorted_images_taken, opened.sorted_images_refused), expected, "swapped {is_swapped}");
+        let asks = opened.sorted_footer_asks;
+        let as_rows = |model: &Model| model.iter().map(|(name, value)| (name.clone(), value.clone())).collect::<Vec<_>>();
+        assert_eq!(scan(&store, COLUMN), as_rows(&first), "swapped {is_swapped}: column 1 read another column's pages");
+        assert_eq!(scan(&store, SECOND), as_rows(&second), "swapped {is_swapped}: column 2 read another column's pages");
+        for number in 0..KEYS {
+            let mut value = Vec::new();
+            let got = store.get(COLUMN, &key(number), &mut value).expect("get").then(|| value.clone());
+            assert_eq!(got.as_ref(), first.get(&key(number)));
+            let got = store.get(SECOND, &key(number), &mut value).expect("get").then(|| value.clone());
+            assert_eq!(got.as_ref(), second.get(&key(number)));
+            assert!(store.get(THIRD, format!("third-{number}").as_bytes(), &mut value).expect("get"));
+        }
+        assert_eq!(report(&store).sorted_footer_asks, asks, "swapped {is_swapped}: a sorted get asked the footers");
+        store.close().expect("close");
+    }
+}
+
+// the gets of a store against its model: (found, refused), with no key read absent and every value found its own
+fn read_counts(store: &Store, model: &Model) -> (u64, u64) {
+    let (mut found, mut refused) = (0, 0);
+    for (name, value) in model {
+        let mut got = Vec::new();
+        match store.get(COLUMN, name, &mut got) {
+            Ok(true) => {
+                assert_eq!(&got, value);
+                found += 1;
+            },
+            Ok(false) => panic!("a live key read absent: the index has a hole and no mark"),
+            Err(_error) => refused += 1,
+        }
+    }
+    (found, refused)
+}
+
+// A sealed segment whose second row block rots while the store is closed: open's fill stops at that block, so the keys of the
+// later, readable blocks get no entry. Once the damage is cleared they read their values by get and by scan, the rotted block's
+// keys refuse, the index stays marked, the close saves no image, and the next open finds the same
+#[test]
+fn a_segment_with_an_unread_block_still_reads_its_rows() {
+    let io = SimulatedIo::new(Seed(170));
+    let store = open(&io, CAPACITY);
+    let mut model = Model::new();
+    for number in 0..KEYS {
+        store.put(COLUMN, &key(number), format!("value-{number}").as_bytes()).expect("put");
+        model.insert(key(number), format!("value-{number}").into_bytes());
+    }
+    let holder = hold(&store.state.volumes[0].claims).open[0].number;
+    seal_all(&store, &io);
+    let table = &store.state.volumes[0].table;
+    let rotted = table.walk_block(holder, 1).expect("a second block");
+    let at = rotted.entry.block_at();
+    store.close().expect("close");
+    drop(store);
+    let _gone = io.remove_file(&image_path());
+    let path = reel::engine::open_segment::data_path(&PathBuf::from(ROOT), holder).to_path_buf();
+    io.rot(&path, FileOffset(at.0 + 40), BitMask(1)).expect("rot");
+
+    let mut counts = None;
+    for round in 0..2 {
+        let store = open(&io, CAPACITY);
+        hold_rebuilds_here(&store);
+        assert_eq!(image_counts(&store), (0, 0), "round {round}: an image stood");
+        store.clear_damage(COLUMN, b"", None).expect("clear");
+        let reading = report(&store).sorted_columns[0];
+        assert!(reading.is_marked, "round {round}: a fill that missed rows left the index unmarked");
+        let (found, refused) = read_counts(&store, &model);
+        eprintln!("unread block, round {round}: found {found} refused {refused} of {}", model.len());
+        assert_eq!(found + refused, model.len() as u64);
+        assert!(refused > 0 && found > refused, "round {round}: found {found} refused {refused}");
+        assert_eq!(*counts.get_or_insert((found, refused)), (found, refused), "round {round}: the reads changed across a reopen");
+        // a scan over the last block's keys reads them all, and one across the rotted block refuses
+        // the model's last few keys sit in the segment's last block, well past the rotted second one
+        let first_of_last = model.keys().rev().nth(TAIL_KEYS).cloned().expect("keys");
+        let tail: Rows = model.range(first_of_last.clone()..).map(|(name, value)| (name.clone(), value.clone())).collect();
+        assert_eq!(rows(store.iter_from(COLUMN, &first_of_last, Direction::Ascending).expect("scan")), tail, "round {round}");
+        let mut scan = store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan");
+        let (mut name, mut value) = (Vec::new(), Vec::new());
+        let failed = loop {
+            match scan.next_row(&mut name, &mut value) {
+                Ok(ScanStep::Found) => {},
+                Ok(_end) => break false,
+                Err(_error) => break true,
+            }
+        };
+        assert!(failed, "round {round}: a scan across the rotted block went on");
+        store.close().expect("close");
+        assert!(!has_file(&io, &image_path()), "round {round}: a marked index saved an image");
+    }
+}
+
+fn hold_rebuilds_here(store: &Store) {
+    for volume in &store.state.volumes {
+        volume.holds.rebuild.store(true, Ordering::Release);
     }
 }

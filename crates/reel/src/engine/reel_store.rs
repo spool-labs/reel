@@ -443,6 +443,14 @@ impl<Backend: Io> ReelStore<Backend> {
         }
     }
 
+    /// Set the overlap bound for every volume in the process, for a bench that measures a store with no overlap merges. Zero
+    /// gives the bound back to the records
+    #[cfg(feature = "test-hooks")]
+    pub fn set_bound_base(&self, bound: usize) {
+        crate::engine::rewrite_job::BOUND_BASE.store(bound, Ordering::Relaxed);
+        self.state.ask_compaction();
+    }
+
     /// Set every volume's space target: the dead bytes a rewrite must win back, as thousandths of the live bytes, before busy
     /// callers' rewrites under half dead start
     pub fn set_space_target_per_mille(&self, per_mille: u64) {

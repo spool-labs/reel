@@ -49,7 +49,7 @@ pub use pick::{CrowdAnswer, CrowdAnswers, has_disk_room, is_mergeable, is_reclai
 #[cfg(any(test, feature = "test-hooks"))]
 pub use install::{Retiring, freed_in_place};
 #[cfg(any(test, feature = "test-hooks"))]
-pub use pick::{CROWD_ANSWERS, CrowdStamp, column_range, covers_point, has_settled_covers, is_crowded, is_overlap_input, overlap_bound, overlaps};
+pub use pick::{CROWD_ANSWERS, CrowdStamp, column_range, covers_point, has_settled_covers, is_crowded, is_overlap_input, overlap_bound, overlaps}; #[cfg(feature = "test-hooks")] pub use pick::BOUND_BASE;
 
 /// A bar counts in hundredths of a segment's bytes
 pub const BAR_SCALE: u64 = 100;

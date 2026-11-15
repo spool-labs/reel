@@ -834,7 +834,7 @@ pub fn is_crowded(
             bytes += row_bytes;
             rows_seen += row_rows;
         }
-        let bound = if is_sized && is_all_resident { overlap_bound(bytes, rows_seen) } else { MOST_OVERLAP };
+        let bound = bound_base().unwrap_or(if is_sized && is_all_resident { overlap_bound(bytes, rows_seen) } else { MOST_OVERLAP });
         if covering > bound {
             return true;
         }
@@ -1021,6 +1021,23 @@ pub fn record_totals(row: &SummaryRow<'_>) -> (u64, u64) {
 
 /// Work out how many segments over one key a crowd of this mean record size may hold before a merge is due, short of the most a
 /// crowd count reaches
+/// A bound a bench sets for every volume in the process, so it can measure a store whose overlap merges never start. Zero
+/// leaves the bound to the records
+#[cfg(feature = "test-hooks")]
+pub static BOUND_BASE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Read the bound a bench set, if one did
+#[cfg(feature = "test-hooks")]
+pub fn bound_base() -> Option<usize> {
+    Some(BOUND_BASE.load(Ordering::Relaxed)).filter(|bound| *bound > 0)
+}
+
+/// Read the bound a bench set, which a build without the hooks never has
+#[cfg(not(feature = "test-hooks"))]
+pub const fn bound_base() -> Option<usize> {
+    None
+}
+
 pub fn overlap_bound(bytes: u64, rows: u64) -> usize {
     let mean = bytes / rows.max(1);
     let scaled = MOST_OVERLAP as u64 * mean / OVERLAP_BASE_RECORD_BYTES;

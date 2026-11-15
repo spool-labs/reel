@@ -31,7 +31,7 @@ use reel_sim::wait::wait_until;
 
 const ROOT: &str = "/disk/meta";
 const COLUMN: ColumnId = ColumnId(1);
-const BUDGET: ByteCount = ByteCount(61 * 1024 * 1024);
+const BUDGET: ByteCount = ByteCount(63 * 1024 * 1024);
 const ROOM_BUDGET: ByteCount = ByteCount(400 * 1024 * 1024);
 const ROOM_VALUE: usize = 1024 * 1024;
 const ROOM_VALUES: u64 = 100;

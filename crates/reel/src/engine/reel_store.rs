@@ -1549,6 +1549,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         callers_seen: AtomicU64::new(0),
         last_call_at: AtomicU64::new(0),
         capped_picks: AtomicU64::new(0),
+        covers_held_by_cues: AtomicU64::new(0),
         pace_refusals: AtomicU64::new(0),
         trust_fallbacks: AtomicU64::new(0),
         dead_counted: AtomicU64::new(0),

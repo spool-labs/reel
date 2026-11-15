@@ -184,6 +184,36 @@ impl CoverPool {
         newest
     }
 
+    /// Find the oldest cover over a key that a test passes, with the same walk back
+    pub fn oldest_where(
+        &self,
+        column: ColumnId,
+        key: &[u8],
+        steps: &mut usize,
+        accepts: impl Fn(&CoverSlot) -> bool,
+    ) -> Option<WritePlace> {
+        let mut oldest: Option<WritePlace> = None;
+        let mut position = self.past_start(column, key);
+        while position > 0 {
+            let slot = self.order[position - 1];
+            *steps += 1;
+            if self.slots[slot as usize].column != column || self.end(self.reach[position - 1]) <= key {
+                break;
+            }
+            if position.is_multiple_of(COVER_BLOCK) && self.end(self.block_reach[position / COVER_BLOCK - 1]) <= key {
+                position -= COVER_BLOCK;
+                continue;
+            }
+            position -= 1;
+
+            let fields = &self.slots[slot as usize];
+            if key < self.end(slot) && accepts(fields) {
+                oldest = Some(oldest.map_or(fields.place, |place| place.min(fields.place)));
+            }
+        }
+        oldest
+    }
+
     /// Check a cover at this place or newer already holds this one, as one found again at open can be
     pub fn is_inside_newer(&self, cover: &Cover, is_applied: bool) -> bool {
         let mut position = self.past_start(cover.column, cover.start);
@@ -432,6 +462,18 @@ impl RangeCovers {
         let newest = self.read().newest_where(column, key, &mut steps, |slot| slot.is_applied);
         self.note_walk(steps);
         newest
+    }
+
+    /// Find the oldest applied cover over a key above a place: the first cover that hides a row at that place. Two covers stand
+    /// over one key only while a cue reads between them, and the newer one hides nothing from that cue
+    pub fn lowest_applied_above(&self, column: ColumnId, key: &[u8], place: WritePlace) -> Option<WritePlace> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut steps = 0;
+        let lowest = self.read().oldest_where(column, key, &mut steps, |slot| slot.is_applied && slot.place > place);
+        self.note_walk(steps);
+        lowest
     }
 
     /// Note a cover's apply has begun, and say whether the cover is still here to count for

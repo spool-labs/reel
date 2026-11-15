@@ -403,6 +403,8 @@ pub struct Volume<Backend: Io> {
     pub last_call_at: AtomicU64,
     /// Picks put off because callers were busy and the merges in flight had reached the cap
     pub capped_picks: AtomicU64,
+    /// Looks that left a cover unclear because a cue below it could still read rows in its own segment
+    pub covers_held_by_cues: AtomicU64,
     /// Record picks the pace put off, its credit short of their estimate
     pub pace_refusals: AtomicU64,
     /// Rows a record pick held to the half bar past the floor, their counts not trusted while a segment below them is unwalked

@@ -747,3 +747,146 @@ fn settled_cover_hides_after_reopen() {
 }
 
 const SPAN_KEYS: u64 = 1_000;
+
+// Every a- row and the cover over all of them sit in one segment. While a cue below the cover lives, the cover stays and its
+// segment doesn't merge, so the cue reads the rows and every other read finds them deleted. Once the cue goes, the merge
+// drops the rows with the cover. A reopen in between finds the cover in its segment's footer
+#[test]
+fn a_row_kept_for_a_cue_keeps_its_cover() {
+    for (is_reopened, seed) in [(false, 130), (true, 131)] {
+        let io = SimulatedIo::new(Seed(seed));
+        let mut store = open(&io);
+        put_keys(&store, "a", b"value");
+        let below = store.cue().expect("cue below the cover");
+        let before_cover = store.state.read_point(&store.state.volumes[0]);
+        store.delete_range(COLUMN, b"a", b"b").expect("delete");
+        put_keys(&store, "z", b"value");
+        let holder = seal(&store, &io);
+        let above = store.cue().expect("cue above the cover");
+        settle(&io);
+        let volume = &store.state.volumes[0];
+        assert_eq!(pending(&store), 1, "reopened {is_reopened}: the cover left while a cue below it lived");
+        assert!(volume.table.holds(holder), "reopened {is_reopened}: the cover's segment merged under a cue below it");
+        assert!(volume.covers_held_by_cues.load(Ordering::Acquire) > 0, "reopened {is_reopened}: no look was held back");
+        let get = |cue: &reel::engine::cue::Cue<SimulatedIo>| {
+            let mut value = Vec::new();
+            cue.get(COLUMN, b"a-000", &mut value).expect("get at a cue").then_some(value)
+        };
+        assert_eq!(get(&below), Some(b"value".to_vec()), "reopened {is_reopened}: the cue below lost a row live at its point");
+        assert_eq!(get(&above), None, "reopened {is_reopened}: a cue above the cover read a deleted key");
+        assert_eq!(read(&store, b"a-000"), None, "reopened {is_reopened}: a deleted key read at the current point");
+        drop(below);
+        drop(above);
+        if is_reopened {
+            store.close().expect("close");
+            store = open(&io);
+            assert_eq!(pending(&store), 1, "the cover didn't come back from its footer");
+            assert_eq!(read(&store, b"a-000"), None, "a deleted key read after the reopen");
+        }
+        store.state.ask_compaction();
+        settle(&io);
+        let volume = &store.state.volumes[0];
+        let kept = hold(&volume.summary).rows().filter(|row| row.facts.places.lowest <= before_cover).count();
+        assert!(!volume.table.holds(holder), "reopened {is_reopened}: the cover's segment never merged once the cue went");
+        assert_eq!(kept, 0, "reopened {is_reopened}: the merge kept rows no cue reads");
+        assert_eq!(pending(&store), 0, "reopened {is_reopened}: the cover outlived every row under it");
+        assert_eq!(read(&store, b"a-000"), None, "reopened {is_reopened}: a deleted key read after the merge");
+        store.close().expect("close");
+    }
+}
+
+// a scan open from before the cover across its segment's merge holds no point, so the merge drops the a- rows with the cover
+#[test]
+fn a_scan_open_across_the_merge_keeps_no_row() {
+    let io = SimulatedIo::new(Seed(134));
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    put_keys(&store, "a", b"value");
+    let mut scan = store.iter_from(COLUMN, b"a", reel_api::direction::Direction::Ascending).expect("scan");
+    let (mut name, mut value) = (Vec::new(), Vec::new());
+    assert_eq!(scan.next_row(&mut name, &mut value).expect("step"), reel_api::scan::ScanStep::Found);
+    let before_cover = store.state.read_point(volume);
+    store.delete_range(COLUMN, b"a", b"b").expect("delete");
+    put_keys(&store, "z", b"value");
+    hold_compaction(&store, true);
+    let rewritten = volume.segments_rewritten.load(Ordering::Acquire);
+    let holder = seal(&store, &io);
+    hold_compaction(&store, false);
+    settle(&io);
+    let kept = hold(&volume.summary).rows().filter(|row| row.facts.places.lowest <= before_cover).count();
+    eprintln!(
+        "scan open: listed {} rewritten {} kept segments {kept} covers {} current {:?}",
+        volume.table.holds(holder),
+        volume.segments_rewritten.load(Ordering::Acquire) - rewritten,
+        pending(&store),
+        read(&store, b"a-000")
+    );
+    assert!(!volume.table.holds(holder), "the cover's segment never merged");
+    assert_eq!(kept, 0, "the merge kept rows for an open scan");
+    assert_eq!(read(&store, b"a-000"), None, "a deleted key read at the current point");
+    drop(scan);
+    store.close().expect("close");
+}
+
+// A cue above the cover and a re-put of a key it hides in a later segment: the cover clears, and its segment's merge drops
+// the old row against the cover, the first place that hides it, though the newest place over it is the re-put
+#[test]
+fn a_row_under_a_cover_goes_against_the_cover() {
+    let io = SimulatedIo::new(Seed(135));
+    let store = open(&io);
+    // no merge before every cue and segment is in place
+    hold_compaction(&store, true);
+    put_keys(&store, "a", b"value");
+    store.delete_range(COLUMN, b"a", b"b").expect("delete");
+    let holder = seal(&store, &io);
+    let between = store.cue().expect("cue between the cover and the re-put");
+    store.put(COLUMN, b"a-000", b"later").expect("re-put");
+    seal(&store, &io);
+    hold_compaction(&store, false);
+    settle(&io);
+    let volume = &store.state.volumes[0];
+    let mut value = Vec::new();
+    let at_between = between.get(COLUMN, b"a-000", &mut value).expect("get between").then_some(value);
+    assert!(!volume.table.holds(holder), "the cover's segment never merged");
+    assert_eq!(pending(&store), 0, "the cover stayed with nothing under it");
+    assert_eq!(at_between, None, "a cue between the cover and the re-put read a deleted key");
+    assert_eq!(read(&store, b"a-000"), Some(b"later".to_vec()));
+    assert_eq!(read(&store, b"a-001"), None);
+    drop(between);
+    store.close().expect("close");
+}
+
+// Two covers over one key in two segments with a cue between them: the older cover is the one the merge of its segment drops
+// the row against, so the cue reads it deleted after the merge. The newest cover would keep the row for the cue and leave it bare
+#[test]
+fn a_row_under_two_covers_goes_against_the_older() {
+    for (is_cue_held, seed) in [(true, 136), (false, 137)] {
+        let io = SimulatedIo::new(Seed(seed));
+        let store = open(&io);
+        // no merge before every cue and segment is in place
+        hold_compaction(&store, true);
+        put_keys(&store, "a", b"value");
+        store.delete_range(COLUMN, b"a", b"b").expect("older delete");
+        let holder = seal(&store, &io);
+        let mut mid = Some(store.cue().expect("cue between the covers"));
+        store.delete_range(COLUMN, b"a", b"b").expect("newer delete");
+        put_keys(&store, "z", b"value");
+        seal(&store, &io);
+        if !is_cue_held {
+            mid = None;
+        }
+        hold_compaction(&store, false);
+        settle(&io);
+        let volume = &store.state.volumes[0];
+        let at_mid = mid.as_ref().map(|cue| {
+            let mut value = Vec::new();
+            cue.get(COLUMN, b"a-000", &mut value).expect("get between").then_some(value)
+        });
+        assert!(!volume.table.holds(holder), "held {is_cue_held}: the covers' segment never merged");
+        assert_eq!(pending(&store), 0, "held {is_cue_held}: a cover stayed with nothing under it");
+        assert_eq!(at_mid.flatten(), None, "held {is_cue_held}: a cue between the covers read a deleted key");
+        assert_eq!(read(&store, b"a-000"), None, "held {is_cue_held}: a deleted key read at the current point");
+        drop(mid);
+        store.close().expect("close");
+    }
+}

@@ -168,6 +168,9 @@ impl CueTable {
 }
 
 /// A read view at one point in the write order
+///
+/// A cue keeps every row its point reads, and while it lives a range delete written after it that hides rows in its own
+/// segment stays in the pool, and that segment waits to merge until the cue goes
 pub struct Cue<Backend: Io> {
     state: Arc<EngineState<Backend>>,
     slot: usize,

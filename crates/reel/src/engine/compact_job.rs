@@ -632,6 +632,8 @@ impl<Backend: Io> CompactJob<Backend> {
             self.state.drop_covers_inside(volume, &cover);
             position += 1;
         }
+        // a cover a cue held back from clearing gets its look now
+        volume.wants_compaction.store(true, Ordering::Release);
     }
 
     /// Take covers out of the pool that nothing older sits under any more, a few each time compaction is asked, and say whether
@@ -654,6 +656,14 @@ impl<Backend: Io> CompactJob<Backend> {
             }
             // rows under it in its own segment leave with it, at that segment's rewrite
             if self.has_row_under(volume, segment, column, place) {
+                // a cue below the cover reads those rows, and a merge would keep them for it after the cover left with the
+                // segment. Cues are only ever taken at the newest point, so with none below now, none comes later
+                if self.state.cues.has_cue_below(self.volume, place) {
+                    volume.covers_held_by_cues.fetch_add(1, Ordering::Relaxed);
+                    volume.has_kept_covers.store(true, Ordering::Release);
+                    self.settle_at += 1;
+                    continue;
+                }
                 if volume.covers.mark_clear(place) {
                     volume.wants_compaction.store(true, Ordering::Release);
                 }

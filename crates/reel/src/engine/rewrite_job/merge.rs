@@ -281,7 +281,8 @@ impl<Backend: Io> RewriteJob<Backend> {
             return Ok(());
         }
         let replacement = self.replacement(volume, column, row)?;
-        match replacement {
+        let hider = replacement.map(|place| self.first_hider(volume, column, row).unwrap_or(place));
+        match hider {
             Some(place) if self.can_drop(place, row) => {
                 self.dropped_graves += u64::from(row.kind == RowKind::Grave);
                 self.lowest_dropped = self.lowest_dropped.min(row.place);
@@ -453,7 +454,16 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.state.newest_walked_held(volume, column, &self.key, &self.numbers[..self.input_count], Some(self.top_place), &mut self.cursor)
     }
 
-    /// Check a replaced row can go: no live cue sits at or above it and below its newest replacement
+    /// Find the first place above a row that hides it: a newer row of the key, or the oldest applied cover over it above the
+    /// row. A cue at or above that place reads the hider, so the row goes with no cue below it. The newest cover would keep the
+    /// row for a cue between two covers, and the older cover leaves with this merge's inputs, which leaves the row bare
+    pub fn first_hider(&self, volume: &Volume<Backend>, column: ColumnId, row: &FooterRow) -> Option<WritePlace> {
+        let own = (!self.is_top_row).then_some(self.top_place);
+        let cover = self.cover_place.and_then(|_newest| volume.covers.lowest_applied_above(column, &self.key, row.place));
+        [own, self.newest_place, cover].into_iter().flatten().filter(|place| *place > row.place).min()
+    }
+
+    /// Check a replaced row can go: no live cue sits at or above it and below the first place that hides it
     pub fn can_drop(&self, replacement: WritePlace, row: &FooterRow) -> bool {
         !self.state.cues.has_cue_between(self.volume, row.place, replacement)
     }

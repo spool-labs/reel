@@ -1014,3 +1014,140 @@ fn a_value_and_its_range_delete_in_one_segment() {
         store.close().expect("close");
     }
 }
+
+// The sorted arm of range_apply's a_row_kept_for_a_cue_keeps_its_cover: the index drops its entries under the cover at the
+// seal, so the current point reads none, and the cue above the cover reads the index too. The cover stays while the cue below
+// lives, and the merge after it drops the rows with the cover
+#[test]
+fn a_row_kept_for_a_cue_keeps_its_cover_on_a_sorted_column() {
+    let io = SimulatedIo::new(Seed(132));
+    let store = open(&io, CAPACITY);
+    let volume = &store.state.volumes[0];
+    let old: Vec<Vec<u8>> = (0..COVERED as u64).map(key).collect();
+    for name in &old {
+        store.put(COLUMN, name, b"value").expect("put");
+    }
+    let below = store.cue().expect("cue below the cover");
+    let before_cover = store.state.read_point(volume);
+    store.delete_range(COLUMN, &[0; WIDTH as usize], &[0xFF; WIDTH as usize]).expect("delete range");
+    for number in LATE_KEYS..LATE_KEYS + COVERED as u64 {
+        store.put(COLUMN, &key(number), b"later").expect("put");
+    }
+    let holder = hold(&volume.claims).open[0].number;
+    seal_all(&store, &io);
+    let above = store.cue().expect("cue above the cover");
+    settle(&io);
+    let old_in = |scan: StoreScan<SimulatedIo>| rows(scan).iter().filter(|(name, _value)| old.contains(name)).count();
+    let mut value = Vec::new();
+    assert!(volume.table.holds(holder), "the cover's segment merged under a cue below it");
+    assert_eq!(volume.covers.len(), 1, "the cover left while a cue below it lived");
+    assert!(below.get(COLUMN, &old[0], &mut value).expect("get below"), "the cue below lost a row live at its point");
+    assert!(!above.get(COLUMN, &old[0], &mut value).expect("get above"), "a cue above the cover read a deleted key");
+    assert_eq!(old_in(above.iter_from(COLUMN, &[0; WIDTH as usize], Direction::Ascending).expect("scan above")), 0, "a scan above the cover read a deleted key");
+    assert_eq!(read(&store, &old[0]), None, "a deleted key read at the current point");
+    drop(below);
+    drop(above);
+    store.state.ask_compaction();
+    settle(&io);
+    let kept = hold(&volume.summary).rows().filter(|row| row.facts.places.lowest <= before_cover).count();
+    assert!(!volume.table.holds(holder), "the cover's segment never merged once the cue went");
+    assert_eq!(kept, 0, "the merge kept rows no cue reads");
+    assert_eq!(volume.covers.len(), 0, "the cover outlived every row under it");
+    assert_eq!(read(&store, &old[0]), None, "a deleted key read after the merge");
+    assert_eq!(old_in(store.iter_from(COLUMN, &[0; WIDTH as usize], Direction::Ascending).expect("scan")), 0, "a scan read a deleted key");
+    store.close().expect("close");
+}
+
+const CUE_SEEDS: u64 = 8;
+const CUE_STEPS: u64 = 400;
+const CUE_KEYS: u64 = 300;
+const MOST_CUES_HELD: usize = 4;
+const CUE_CHECK_EVERY: u64 = 25;
+
+// a held cue and the model as it stood when the cue was taken
+struct HeldCue {
+    cue: reel::engine::cue::Cue<SimulatedIo>,
+    model: Model,
+}
+
+// every read a cue gives matches the model at its point: a get of each key the run has written, and a whole walk
+fn check_cue(held: &HeldCue, written: &[Vec<u8>], step: u64, seed: u64) {
+    let mut value = Vec::new();
+    for name in written {
+        let got = held.cue.get(COLUMN, name, &mut value).expect("get at a cue").then(|| value.clone());
+        assert_eq!(got.as_ref(), held.model.get(name), "seed {seed} step {step}: a cue read a key off its point");
+    }
+    let walked = rows(held.cue.iter_from(COLUMN, b"", Direction::Ascending).expect("scan at a cue"));
+    let expected: Rows = held.model.iter().map(|(name, value)| (name.clone(), value.clone())).collect();
+    assert!(walked == expected, "seed {seed} step {step}: a cue's walk read off its point");
+}
+
+// random puts, deletes and range deletes on a sorted column, with single segments sealed at random points and cues held across
+// all of it: every cue reads its own point by get and by walk, to the end of the run, and the current point reads the model
+#[test]
+fn cues_held_across_covers_and_single_seals() {
+    for seed in seeds(0..CUE_SEEDS) {
+        let io = SimulatedIo::new(Seed(300 + seed));
+        let mut random = SeededRandom::new(Seed(400 + seed));
+        let store = open(&io, CAPACITY);
+        let mut model = Model::new();
+        let written: Vec<Vec<u8>> = (0..CUE_KEYS).map(key).collect();
+        let mut sorted_names = written.clone();
+        sorted_names.sort();
+        let mut cues: Vec<HeldCue> = Vec::new();
+        for step in 0..CUE_STEPS {
+            let name = key(random.below(CUE_KEYS));
+            match random.below(20) {
+                0 => {
+                    let at = random.below(CUE_KEYS) as usize;
+                    let until = (at + 1 + random.below(30) as usize).min(sorted_names.len() - 1);
+                    let (start, end) = (sorted_names[at].clone(), sorted_names[until].clone());
+                    store.delete_range(COLUMN, &start, &end).expect("delete range");
+                    model.retain(|name, _value| *name < start || *name >= end);
+                },
+                1..=3 => {
+                    store.delete(COLUMN, &name).expect("delete");
+                    model.remove(&name);
+                },
+                4 => {
+                    // one open segment seals on its own, so a cover and the rows under it can seal apart
+                    let volume = &store.state.volumes[0];
+                    let mut claims = hold(&volume.claims);
+                    let open: Vec<usize> = (0..claims.open.len()).filter(|at| claims.open[*at].row_count.0 > 0).collect();
+                    if let Some(&at) = open.get(random.below(open.len().max(1) as u64) as usize) {
+                        store.state.seal_at(&mut claims, volume, at);
+                    }
+                    drop(claims);
+                    settle(&io);
+                },
+                5 => {
+                    if cues.len() == MOST_CUES_HELD {
+                        cues.remove(random.below(MOST_CUES_HELD as u64) as usize);
+                    }
+                    cues.push(HeldCue { cue: store.cue().expect("cue"), model: model.clone() });
+                },
+                _ => {
+                    let value = format!("{seed}-{step}").into_bytes();
+                    // a marked put lands in a segment of its own, so rows and covers spread over open segments
+                    if random.below(3) == 0 {
+                        store.put_marked(COLUMN, &name, &value, MARK).expect("put");
+                    } else {
+                        store.put(COLUMN, &name, &value).expect("put");
+                    }
+                    model.insert(name, value);
+                },
+            }
+            if step % CUE_CHECK_EVERY == 0 {
+                for held in &cues {
+                    check_cue(held, &written, step, seed);
+                }
+            }
+        }
+        for held in &cues {
+            check_cue(held, &written, CUE_STEPS, seed);
+        }
+        check(&store, &model, &written);
+        drop(cues);
+        store.close().expect("close");
+    }
+}

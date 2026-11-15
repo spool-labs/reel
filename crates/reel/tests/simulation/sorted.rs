@@ -43,6 +43,7 @@ const COVER_ONE_IN: u64 = 40;
 const MARK: DeathMark = DeathMark(1_000_000);
 const SCAN_STARTS: u64 = 12;
 const WANTED_ROWS: u64 = 10;
+const AHEAD: usize = 500;
 const SCAN_TAKE: usize = 40;
 const MERGE_KEYS: u64 = 15_000;
 
@@ -225,6 +226,31 @@ fn reads_through_the_index() {
     assert_eq!(store.count_prefix(COLUMN, b"").expect("count").0, model.len() as u64);
     assert_eq!(store.state.sorted_scan_keys.load(Ordering::Relaxed), scan_keys, "a count stepped the index");
     assert_eq!(read(&store, &[7; WIDTH as usize]), None);
+    // with no cover a walk locates the index's entries in runs, and keys written since and left open stand between them
+    let mut random = SeededRandom::new(Seed(11));
+    let runs = store.state.sorted_runs.load(Ordering::Relaxed);
+    check_scans(&store, &model, &mut random);
+    assert!(store.state.sorted_runs.load(Ordering::Relaxed) > runs, "no batch took a run from the index");
+    for number in (0..KEYS).step_by(11) {
+        let value = format!("open-{number}").into_bytes();
+        store.put(COLUMN, &key(number), &value).expect("put");
+        model.insert(key(number), value);
+    }
+    for number in (5..KEYS).step_by(13) {
+        store.delete(COLUMN, &key(number)).expect("delete");
+        model.remove(&key(number));
+    }
+    store.put(COLUMN, &key(KEYS + 1), b"newest").expect("put");
+    model.insert(key(KEYS + 1), b"newest".to_vec());
+    check_scans(&store, &model, &mut random);
+    // a range delete still open hides sealed keys the index holds, so a walk takes those keys a step at a time
+    let mut names: Vec<Vec<u8>> = model.keys().cloned().collect();
+    names.sort();
+    let (start, end) = (names[names.len() / 4].clone(), names[names.len() / 2].clone());
+    store.delete_range(COLUMN, &start, &end).expect("delete range");
+    model.retain(|name, _value| *name < start || *name >= end);
+    check_scans(&store, &model, &mut random);
+    seal_all(&store, &io);
     store.close().expect("close");
 
     let store = open(&io, CAPACITY);
@@ -607,5 +633,47 @@ fn a_wanted_count_caps_the_batch() {
         assert_eq!(found, expected);
         store.state.give_back_scan(scan);
     }
+    store.close().expect("close");
+}
+
+// a write that lands between two batches of one walk shows from the next batch: an overwrite of a sealed key ahead of the walk
+// reads new, and a delete of one leaves it out, while the walk still takes its sealed keys in runs
+#[test]
+fn writes_between_batches_show() {
+    let io = SimulatedIo::new(Seed(10));
+    let store = open(&io, CAPACITY);
+    let mut model = Model::new();
+    for number in 0..KEYS {
+        store.put(COLUMN, &key(number), format!("{number}").as_bytes()).expect("put");
+        model.insert(key(number), format!("{number}").into_bytes());
+    }
+    seal_all(&store, &io);
+    // a segment stays open before the walk, so the writes under it land in the view the heads were placed in
+    store.put(COLUMN, &key(KEYS + 5), b"open").expect("put");
+    model.insert(key(KEYS + 5), b"open".to_vec());
+    let names: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let range = reel::engine::scan_state::from_key(COLUMN, b"", Direction::Ascending);
+    let mut scan = store.state.take_scan(&range, None).expect("scan");
+    let (mut name, mut value) = (Vec::new(), Vec::new());
+    let mut found = Vec::new();
+    let step = |scan: &mut reel::engine::scan_state::ScanState, name: &mut Vec<u8>, value: &mut Vec<u8>| {
+        store.state.step_scan(scan, name, reel::engine::scan_path::ScanWant::Value(value)).expect("step")
+    };
+    assert_eq!(step(&mut scan, &mut name, &mut value), ScanStep::Found);
+    found.push((name.clone(), value.clone()));
+    // two sealed keys well past the first batch change under the walk
+    let (changed, deleted) = (names[AHEAD].clone(), names[AHEAD + 1].clone());
+    store.put(COLUMN, &changed, b"changed").expect("put");
+    store.delete(COLUMN, &deleted).expect("delete");
+    model.insert(changed, b"changed".to_vec());
+    model.remove(&deleted);
+    let runs = store.state.sorted_runs.load(Ordering::Relaxed);
+    while step(&mut scan, &mut name, &mut value) == ScanStep::Found {
+        found.push((name.clone(), value.clone()));
+    }
+    store.state.give_back_scan(scan);
+    let expected: Vec<(Vec<u8>, Vec<u8>)> = model.iter().map(|(name, value)| (name.clone(), value.clone())).collect();
+    assert_eq!(found, expected);
+    assert!(store.state.sorted_runs.load(Ordering::Relaxed) > runs, "the later batches took no run");
     store.close().expect("close");
 }

@@ -1358,6 +1358,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         sorted_answers: AtomicU64::new(0),
         sorted_footer_asks: AtomicU64::new(0),
         sorted_scan_keys: AtomicU64::new(0),
+        sorted_runs: AtomicU64::new(0),
         sorted_moves_missed: AtomicU64::new(0),
         caller_ops: CallerCounts::default(),
         progress,

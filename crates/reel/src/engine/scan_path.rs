@@ -21,7 +21,7 @@ use crate::engine::scan_state::{
 };
 use crate::engine::volume::Volume;
 use crate::guard::hold;
-use crate::index::sorted_keys::{ScanFrom, SortedKeys};
+use crate::index::sorted_keys::{MOST_KEY_BYTES, ScanFrom, SortedKeys};
 use crate::index::write_shard::{HEAD_GROUP, HeadPlace, WalkBound, WriteShard, place_heads_together};
 use crate::io::{DeviceReads, Io, ManyRead, ReadOn, in_place};
 use crate::record::record_check::RecordIdentity;
@@ -376,6 +376,13 @@ impl<Backend: Io> EngineState<Backend> {
         scan.batch.clear();
         let point = scan.point.unwrap_or_else(|| self.read_point(volume));
         scan.batch.point = point;
+        // the heads of an index walk stand again at each batch's point, so the batch's runs see every row landed before it
+        if scan.is_on_index && point > scan.heads_mark {
+            for head in &mut scan.heads {
+                head.cursor.reset();
+                head.is_placed = false;
+            }
+        }
         let mut key = mem::take(&mut scan.out_key);
         let mut outcome = Ok(());
         // a batch takes keys while the records it reads still fit its buffer, so wide records read in batches of fewer keys
@@ -391,6 +398,7 @@ impl<Backend: Io> EngineState<Backend> {
                     {
                         located_bytes += row.row.length.0 as usize;
                     }
+                    self.take_sorted_run(volume, directory, scan, (point, room), &mut located_bytes);
                 },
                 // the step that answers one key at a time takes the end, a crossed try and anything it can't locate
                 Ok(StepOutcome::Moved) => {
@@ -411,6 +419,59 @@ impl<Backend: Io> EngineState<Backend> {
         }
         self.read_batch(device, volume, scan).await;
         Ok(())
+    }
+
+    /// Locate the index batch's next keys in one loop while nothing else can answer them: no head stands before them, no cover or
+    /// damage lies on the volume, the list is the one the walk was placed under, and each entry is at or under the point. Any
+    /// other key ends the run, and the step that answers one key at a time takes it
+    pub fn take_sorted_run(
+        &self,
+        volume: &Volume<Backend>,
+        directory: Option<&ColumnDirectory>,
+        scan: &mut ScanState,
+        (point, room): (WritePlace, usize),
+        located_bytes: &mut usize,
+    ) {
+        let Some(index) = self.sorted_index(scan.column).filter(|_index| scan.is_on_index) else {
+            return;
+        };
+        // a row that landed since the heads were placed stands on no head, so a run needs heads placed at or above its point
+        if !volume.covers.is_empty() || !volume.damage.is_empty() || point > scan.heads_mark {
+            return;
+        }
+        let mut taken = 0;
+        let mut key = [0; MOST_KEY_BYTES];
+        while scan.batch.entries.len() < room && *located_bytes + MOST_BATCH_RECORD <= BATCH_BYTES {
+            if directory.map_or(0, ColumnDirectory::generation) != scan.generation {
+                break;
+            }
+            fill_sorted(index, scan);
+            let Some(next) = scan.sorted_key() else {
+                break;
+            };
+            let head = scan.closest_head.map(|head| scan.heads[head].key.as_slice());
+            if scan.is_past_limit(next) || head.is_some_and(|head| !scan.is_before(next, head)) {
+                break;
+            }
+            let entry = scan.sorted.entries[scan.sorted_next];
+            if entry.place > point {
+                break;
+            }
+            let length = next.len();
+            key[..length].copy_from_slice(next);
+            if !entry.is_grave {
+                let key_at = scan.batch.keys.len();
+                scan.batch.keys.extend_from_slice(&key[..length]);
+                scan.batch.entries.push(BatchEntry { key_at, key_length: length, located: Located::Sealed(sealed_of(&entry)), record: None, is_value: false });
+                if entry.length.0 as usize <= MOST_BATCH_RECORD {
+                    *located_bytes += entry.length.0 as usize;
+                }
+                taken += 1;
+            }
+            scan.pass(&key[..length]);
+        }
+        self.sorted_scan_keys.fetch_add(taken, Ordering::Relaxed);
+        self.sorted_runs.fetch_add(u64::from(taken > 0), Ordering::Relaxed);
     }
 
     /// Say whether the record cache can hold most of a volume's live records, weighed again at most once a period. Scans read

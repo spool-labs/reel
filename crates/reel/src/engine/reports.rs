@@ -192,6 +192,7 @@ impl<Backend: Io> EngineState<Backend> {
         report.sorted_answers = self.sorted_answers.load(Ordering::Relaxed);
         report.sorted_footer_asks = self.sorted_footer_asks.load(Ordering::Relaxed);
         report.sorted_scan_keys = self.sorted_scan_keys.load(Ordering::Relaxed);
+        report.sorted_runs = self.sorted_runs.load(Ordering::Relaxed);
         report.sorted_moves_missed = self.sorted_moves_missed.load(Ordering::Relaxed);
         report.sorted_past_capacity = self.sorted.iter().flatten().map(|index| index.past_capacity().0).sum();
         report.sorted_entries = self.sorted.iter().flatten().map(|index| index.entry_count().0).sum();

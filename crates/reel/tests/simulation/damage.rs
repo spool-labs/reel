@@ -2297,3 +2297,92 @@ fn many_damaged_span() {
     assert!(assert_many_agrees(&store, &built) > 0);
     store.close().expect("close");
 }
+
+/// Keys the rebuild sim writes in the older segment
+const UNDER_KEYS: u64 = 40;
+
+// the reads of a range a lost tail's range delete covered: a get of its first key, and a scan from it that stops at its first
+// answer, either a row, a refusal or the end
+fn read_under(store: &Store) -> (Result<Option<Vec<u8>>, StoreError>, String) {
+    let first = key_of(ORDERED, 0);
+    let got = read(store, ORDERED, &first);
+    let mut scan = store.iter_from(ORDERED, &first, Direction::Ascending).expect("scan");
+    let (mut key, mut value) = (Vec::new(), Vec::new());
+    let walked = match scan.next_row(&mut key, &mut value) {
+        Ok(ScanStep::Found) => format!("found {:?}", String::from_utf8_lossy(&key)),
+        Ok(step) => format!("{step:?}"),
+        Err(error) => format!("error {error}"),
+    };
+    (got, walked)
+}
+
+// Rows in the oldest segment, a range delete over all of them sealed in the next, and that segment's two tails rotted. Its
+// range delete is in no footer open can read, so open trusts none of its summary row and damages its columns whole: no
+// rebuild runs, and the range refuses through every open, never reading a deleted row. The control's damaged segment held
+// no range delete, so it rebuilds from its row blocks and its rows read
+#[test]
+fn a_lost_tail_with_a_range_delete_stays_damaged() {
+    for (has_cover, seed) in [(true, 140), (false, 141)] {
+        let io = SimulatedIo::new(Seed(seed));
+        let store = open(&io);
+        store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
+        for number in 0..UNDER_KEYS {
+            store.put(ORDERED, &key_of(ORDERED, number), b"value").expect("put");
+        }
+        seal(&store, &io);
+        if has_cover {
+            store.delete_range(ORDERED, &key_of(ORDERED, 0), &key_of(ORDERED, UNDER_KEYS)).expect("delete range");
+        }
+        // the damaged segment holds rows of its own, so a rebuild has blocks to walk in both arms
+        for number in UNDER_KEYS..2 * UNDER_KEYS {
+            store.put(ORDERED, &key_of(ORDERED, number), b"later").expect("put");
+        }
+        seal(&store, &io);
+        // a newer segment, so the summary that lists the damaged one is saved past it, as a rebuild needs its row
+        store.put(ORDERED, b"newest", b"value").expect("put");
+        seal(&store, &io);
+        store.close().expect("close");
+        drop(store);
+        let files = data_files(&io);
+        let holder = &files[1];
+        let length = file_length(&io, holder);
+        io.rot(holder, FileOffset(length.0 - 3), FLIP).expect("rot first tail");
+        io.rot(holder, FileOffset(length.0 - SECOND_TAIL_DISTANCE - 3), FLIP).expect("rot second tail");
+
+        let store = open(&io);
+        hold_rebuilds(&store);
+        let before = read_under(&store);
+        let rewritten = store.state.volumes[0].segments_rewritten.load(Ordering::Acquire);
+        for volume in &store.state.volumes {
+            volume.holds.rebuild.store(false, Ordering::Release);
+        }
+        store.state.ask_compaction();
+        settle(&io);
+        let rebuilt = store.state.volumes[0].segments_rewritten.load(Ordering::Acquire) - rewritten;
+        let is_holder_gone = !data_files(&io).contains(holder);
+        let after = read_under(&store);
+        let damaged = store.damaged_segments();
+        store.close().expect("close");
+        drop(store);
+        let store = open(&io);
+        settle(&io);
+        let reopened = read_under(&store);
+        eprintln!("cover {has_cover}: rebuilt {rebuilt} holder gone {is_holder_gone} damaged {damaged}: before {before:?} after {after:?} reopened {reopened:?}");
+        if has_cover {
+            assert_eq!(rebuilt, 0, "a lost tail with a range delete was rebuilt");
+            assert_eq!(damaged, 1, "the lost tail with a range delete stopped being damaged");
+        } else {
+            assert!(rebuilt > 0 && is_holder_gone, "the control's damaged segment never rebuilt");
+            assert_eq!(damaged, 0, "the control's rebuild left damage");
+        }
+        for (stage, (got, walked)) in [("before", &before), ("after", &after), ("reopened", &reopened)] {
+            if has_cover {
+                assert!(matches!(got, Err(StoreError::Corruption { .. })), "{stage}: a get under a lost range delete answered {got:?}");
+                assert!(walked.starts_with("error"), "{stage}: a scan under a lost range delete went on: {walked}");
+            } else {
+                assert_eq!(got.as_ref().ok().cloned().flatten(), Some(b"value".to_vec()), "{stage}: the control lost a row");
+            }
+        }
+        store.close().expect("close");
+    }
+}

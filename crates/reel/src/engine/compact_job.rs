@@ -94,6 +94,22 @@ pub enum Blocker {
     Segment(SegmentNumber),
 }
 
+/// What a look under a cover in one segment found
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Under {
+    /// A row older than the cover inside its range
+    Row,
+    /// No such row
+    Nothing,
+    /// The segment left the table, so nothing was read
+    Unread,
+}
+
+/// Count what moves rows between segments: a rewrite landing or a segment unlinked
+fn moves<Backend: Io>(volume: &Volume<Backend>) -> u64 {
+    volume.segments_rewritten.load(Ordering::Acquire) + volume.segments_unlinked.load(Ordering::Acquire)
+}
+
 /// Segments a sweep step keeps its gone answers for
 pub const SWEEP_SEEN: usize = 256;
 
@@ -639,6 +655,13 @@ impl<Backend: Io> CompactJob<Backend> {
     /// Take covers out of the pool that nothing older sits under any more, a few each time compaction is asked, and say whether
     /// any went
     pub fn settle_covers(&mut self, volume: &Volume<Backend>) -> bool {
+        self.settle_covers_with(volume, &mut || {})
+    }
+
+    /// Settle covers as `settle_covers` does, and run some work before each blocker pass, the one over the summary and the one over
+    /// the lists, where a test lands the two halves of an install. A look that starts while an install is under way returns at
+    /// once, since the install's inputs count as leaving, so only an install that starts after the look began can split it
+    pub fn settle_covers_with(&mut self, volume: &Volume<Backend>, before_pass: &mut dyn FnMut()) -> bool {
         let mut has_settled = false;
         let is_stuck = || volume.is_parking() || volume.stray_outputs.load(Ordering::Acquire) > 0;
         if volume.covers.is_empty() || is_stuck() {
@@ -650,12 +673,34 @@ impl<Backend: Io> CompactJob<Backend> {
                 self.settle_at = 0;
                 return has_settled;
             };
-            if !is_applied || self.blocker(volume, column, place, segment) != Blocker::None {
+            if !is_applied {
                 self.settle_at += 1;
                 continue;
             }
+            let moved = moves(volume);
+            if self.blocker_with(volume, column, place, segment, before_pass) != Blocker::None {
+                self.settle_at += 1;
+                continue;
+            }
+            let mut own = self.look_under(volume, segment, column, place);
+            // an own segment out of the table and the summary with nothing landed since the look began has gone for good, and holds
+            // no row the cover could still hide
+            if own == Under::Unread && moves(volume) == moved && hold(&volume.summary).get(segment).is_none() {
+                own = Under::Nothing;
+            }
+            // a rewrite or an unlink that landed during the looks could have moved a row they passed over, so the look counts for
+            // nothing and the next cover gets its turn
+            if moves(volume) != moved || own == Under::Unread {
+                volume.settle_retries.fetch_add(1, Ordering::Relaxed);
+                self.settle_at += 1;
+                continue;
+            }
+            // an install can take a segment's row while the looks above ran, and its file stays until the park ends
+            if is_stuck() {
+                return has_settled;
+            }
             // rows under it in its own segment leave with it, at that segment's rewrite
-            if self.has_row_under(volume, segment, column, place) {
+            if own == Under::Row {
                 // a cue below the cover reads those rows, and a merge would keep them for it after the cover left with the
                 // segment. Cues are only ever taken at the newest point, so with none below now, none comes later
                 if self.state.cues.has_cue_below(self.volume, place) {
@@ -669,10 +714,6 @@ impl<Backend: Io> CompactJob<Backend> {
                 }
                 self.settle_at += 1;
                 continue;
-            }
-            // an install can take a segment's row while the walk above looked, and its file stays until the park ends
-            if is_stuck() {
-                return has_settled;
             }
             let cover = Cover {
                 column,
@@ -752,9 +793,15 @@ impl<Backend: Io> CompactJob<Backend> {
     /// Find the first segment that keeps a cover in the pool: an open row or a sealed one it still hides. A cue needs no check of
     /// its own, since the rows a cue below the cover reads stay while it lives, and those keep the cover here
     pub fn blocker(&mut self, volume: &Volume<Backend>, column: ColumnId, place: WritePlace, segment: SegmentNumber) -> Blocker {
+        self.blocker_with(volume, column, place, segment, &mut || {})
+    }
+
+    /// Find the blocker as `blocker` does, and run some work before the pass over the summary and before the pass over the lists
+    pub fn blocker_with(&mut self, volume: &Volume<Backend>, column: ColumnId, place: WritePlace, segment: SegmentNumber, before_pass: &mut dyn FnMut()) -> Blocker {
         if hold(&volume.claims).open.iter().any(|open| open.row_count.0 > 0 && open.lowest_place < place) {
             return Blocker::OpenRows;
         }
+        before_pass();
         let mut last = SegmentNumber(0);
         loop {
             let rows = self.state.hold_for_pick(self.volume, PickKind::Cover);
@@ -767,9 +814,11 @@ impl<Backend: Io> CompactJob<Backend> {
             let next = after.filter(is_under).map(|row| (row.facts.segment, row.facts.is_damaged)).next();
             drop(rows);
             let Some((other, is_damaged)) = next else {
+                before_pass();
                 return self.unrowed_blocker(volume, column, place, segment);
             };
-            if is_damaged || self.has_row_under(volume, other, column, place) {
+            // a segment that left the table while the pass looked may have moved its rows where the pass already went
+            if is_damaged || self.look_under(volume, other, column, place) != Under::Nothing {
                 return Blocker::Segment(other);
             }
             last = other;
@@ -790,7 +839,7 @@ impl<Backend: Io> CompactJob<Backend> {
             let page = directory.overlapping(&low, &high, skip, &mut listed);
             skip += listed.len();
             let has_no_row = |other: &SegmentNumber| *other != segment && hold(&volume.summary).get(*other).is_none();
-            let found = listed.iter().copied().filter(has_no_row).find(|other| self.has_row_under(volume, *other, column, place));
+            let found = listed.iter().copied().filter(has_no_row).find(|other| self.look_under(volume, *other, column, place) != Under::Nothing);
             self.listed = listed;
             if let Some(other) = found {
                 return Blocker::Segment(other);
@@ -801,32 +850,36 @@ impl<Backend: Io> CompactJob<Backend> {
         }
     }
 
-    /// Check a segment holds a row older than a place inside the range in `key` and `end`. A block that won't read counts as one
-    pub fn has_row_under(&mut self, volume: &Volume<Backend>, other: SegmentNumber, column: ColumnId, place: WritePlace) -> bool {
-        let (Some(pin), Some((first, end))) = (volume.table.pin(other), volume.table.blocks_from(other, column, &self.key)) else {
-            return false;
+    /// Look for a row older than a place inside the range in `key` and `end` in one segment. A block that won't read counts as a
+    /// row, and a segment that left the table is unread. A pinned segment with no blocks for the column holds none of its rows
+    pub fn look_under(&mut self, volume: &Volume<Backend>, other: SegmentNumber, column: ColumnId, place: WritePlace) -> Under {
+        let Some(pin) = volume.table.pin(other) else {
+            return Under::Unread;
+        };
+        let Some((first, end)) = volume.table.blocks_from(other, column, &self.key) else {
+            return Under::Nothing;
         };
         for index in first..end {
             let Some(block) = volume.table.walk_block(other, index) else {
-                return true;
+                return Under::Row;
             };
             let length = block.entry.block_length().0 as usize;
             if length > self.block.len() || pin.file.read_exact_at(block.entry.block_at(), &mut self.block[..length]).is_err() {
-                return true;
+                return Under::Row;
             }
             let Some(mut walk) = RowBlockWalk::open(&self.block[..length], pin.head.place_base) else {
-                return true;
+                return Under::Row;
             };
             while let Some(row) = walk.next_row(&mut self.row_key) {
                 if self.row_key >= self.end {
-                    return false;
+                    return Under::Nothing;
                 }
                 if self.row_key >= self.key && row.place < place {
-                    return true;
+                    return Under::Row;
                 }
             }
         }
-        false
+        Under::Nothing
     }
 
     /// While a seal waits on a full table shard, send that shard's smallest segment to a rewrite, whatever the trigger says. Its

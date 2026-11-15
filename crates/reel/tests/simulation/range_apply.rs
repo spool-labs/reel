@@ -890,3 +890,112 @@ fn a_row_under_two_covers_goes_against_the_older() {
         store.close().expect("close");
     }
 }
+
+// A cover over rows in two segments: a- rows alone in the older one, b- rows beside the cover in its own. A cue below the cover
+// keeps the a- rows through the older segment's rewrite, and goes once that rewrite has retired its input. The planner's look
+// at the cover then runs its summary pass while the input has no pin and the output no summary row, and the install's
+// summarize lands before the pass over the lists. The look counts for nothing: the cover isn't marked clear, and once the
+// planner runs again it finds the a- rows in the output and keeps the cover
+//
+// Readings on the three shapes of the fix: the whole fix stops at the unpinned input and the look never reaches the lists;
+// the moves count alone (an unpinned segment read as holding nothing) lets the look split and gives it up, settle_retries 1;
+// with neither the split look marks the cover clear and this fails
+#[test]
+fn a_cover_look_split_by_an_install_counts_for_nothing() {
+    let io = SimulatedIo::new(Seed(150));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    put_keys(&store, "a", b"value");
+    // x- rows the holder overwrites, so the older segment's rewrite drops something and copies
+    put_keys(&store, "x", b"old");
+    let older = seal(&store, &io);
+    // replaced below the cue, so the cue holds them back from nothing
+    put_keys(&store, "x", b"new");
+    let below = store.cue().expect("cue below the cover");
+    put_keys(&store, "b", b"value");
+    store.delete_range(COLUMN, b"a", b"c").expect("delete");
+    put_keys(&store, "z", b"value");
+    let holder = seal(&store, &io);
+    settle(&io);
+    let volume = &store.state.volumes[0];
+    assert_eq!(pending(&store), 1);
+
+    // the cue keeps the a- rows through the rewrite, which stops once its input is retired
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    job.rewrite.forced = Some(older);
+    job.rewrite.start();
+    for step in 0..STEPS {
+        if job.rewrite.phase == RewritePhase::Installing {
+            break;
+        }
+        assert!(step + 1 < STEPS && job.rewrite.is_running(), "the forced rewrite stopped at {:?}", job.rewrite.phase);
+        job.rewrite.step();
+    }
+    job.rewrite.stop_after_retire = true;
+    drop(below);
+    // the look begins with the install not yet started: its first pass runs once the install has retired its input, and its
+    // second once the install has finished
+    let mut planner = CompactJob::new(Arc::clone(&store.state), 0);
+    let mut passes = 0;
+    let mut land = || {
+        match passes {
+            0 => {
+                job.rewrite.install_with(|| {}, || {}).expect("install to the retire");
+                assert!(volume.table.pin(older).is_none(), "the input is still in the table");
+            },
+            1 => job.rewrite.finish_held_install().expect("finish the install"),
+            _other => {},
+        }
+        passes += 1;
+    };
+    planner.settle_covers_with(volume, &mut land);
+    // a look that stopped at the unpinned input never reached the lists, and the install finishes after it
+    let is_split = passes >= 2;
+    if passes == 0 {
+        job.rewrite.install_with(|| {}, || {}).expect("install to the retire");
+    }
+    if passes <= 1 {
+        job.rewrite.finish_held_install().expect("finish the install");
+    }
+    let is_clear = volume.covers.len() == 1 && !volume.covers.holds_segment(holder);
+    hold_compaction(&store, false);
+    settle(&io);
+    let at = read(&store, b"a-000");
+    eprintln!("split look: split {is_split} clear {is_clear} retries {} covers {} a-000 {at:?}", volume.settle_retries.load(Ordering::Acquire), pending(&store));
+    assert!(!is_clear, "a look an install split marked the cover clear");
+    assert_eq!(at, None, "a deleted key read at the current point");
+    assert_eq!(read(&store, b"b-000"), None, "a deleted key in the cover's own segment read at the current point");
+    store.close().expect("close");
+}
+
+// A range delete whose segment goes wholly dead once its cover has settled: the older rows die under the cover, the cover
+// leaves the pool, the holder's own rows are overwritten, and the holder is unlinked. No cover stays behind, and no look keeps
+// trying one
+#[test]
+fn a_dead_cover_segment_leaves_no_cover_behind() {
+    let io = SimulatedIo::new(Seed(152));
+    let store = open(&io);
+    put_keys(&store, "a", b"value");
+    seal(&store, &io);
+    store.delete_range(COLUMN, b"a", b"b").expect("delete");
+    put_keys(&store, "z", b"value");
+    let holder = seal(&store, &io);
+    store.state.ask_compaction();
+    settle(&io);
+    put_keys(&store, "z", b"newer");
+    seal(&store, &io);
+    store.state.ask_compaction();
+    settle(&io);
+    let volume = &store.state.volumes[0];
+    let retries = volume.settle_retries.load(Ordering::Acquire);
+    for _round in 0..4 {
+        store.state.ask_compaction();
+        settle(&io);
+    }
+    eprintln!("dead cover segment: holder listed {} covers {} retries {} then {}", volume.table.holds(holder), pending(&store), retries, volume.settle_retries.load(Ordering::Acquire));
+    assert_eq!(pending(&store), 0, "a cover stayed in the pool");
+    assert_eq!(volume.settle_retries.load(Ordering::Acquire), retries, "looks kept trying a cover");
+    assert_eq!(read(&store, b"a-000"), None);
+    assert_eq!(read(&store, b"z-000"), Some(b"newer".to_vec()));
+    store.close().expect("close");
+}

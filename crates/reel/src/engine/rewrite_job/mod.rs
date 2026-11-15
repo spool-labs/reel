@@ -47,7 +47,7 @@ mod place;
 
 pub use pick::{CrowdAnswer, CrowdAnswers, has_disk_room, is_mergeable, is_reclaim_due, record_totals};
 #[cfg(any(test, feature = "test-hooks"))]
-pub use install::freed_in_place;
+pub use install::{Retiring, freed_in_place};
 #[cfg(any(test, feature = "test-hooks"))]
 pub use pick::{CROWD_ANSWERS, CrowdStamp, column_range, covers_point, has_settled_covers, is_crowded, is_overlap_input, overlap_bound, overlaps};
 
@@ -475,6 +475,11 @@ pub struct RewriteJob<Backend: Io> {
     pub is_key_order_held: bool,
     /// A damaged segment the next pick copies whole, and the spans its lost blocks leave
     pub rebuild: Option<SegmentNumber>,
+    /// A test stops the install at its retire, and finishes it with finish_held_install
+    #[cfg(feature = "test-hooks")]
+    pub stop_after_retire: bool,
+    #[cfg(feature = "test-hooks")]
+    pub held_install: Option<Retiring<Backend::File>>,
     pub rebuild_blocks: u32,
     pub bars_fired: BarsFired,
     pub lost_spans: Vec<DamagedRange>,
@@ -595,6 +600,10 @@ impl<Backend: Io> RewriteJob<Backend> {
             is_ordered_bound: false,
             is_key_order_held: false,
             rebuild: None,
+            #[cfg(feature = "test-hooks")]
+            stop_after_retire: false,
+            #[cfg(feature = "test-hooks")]
+            held_install: None,
             rebuild_blocks: 0,
             bars_fired: BarsFired::default(),
             lost_spans: Vec::new(),

@@ -17,7 +17,7 @@ use crate::engine::compact_job::park;
 use crate::engine::engine_state::EngineState;
 use crate::engine::recovery::save_cleared_spans;
 use crate::engine::open_segment::{data_path, output_path};
-use crate::engine::volume::{GRAVE_SLOT, GaveUp, MOST_MERGE_OUTPUTS, NO_SEAL, OutputSlots, RewriteOutput, Volume};
+use crate::engine::volume::{GRAVE_SLOT, GaveUp, MOST_MERGE_OUTPUTS, NO_SEAL, OutputSlots, RewriteOutput, RowBytes, Volume};
 use crate::guard::hold;
 use crate::io::device_error::is_device_error;
 use crate::io::{Io, IoFile, IoTask};
@@ -25,7 +25,7 @@ use crate::fixed_list::ListFull;
 use crate::segment::column_directory::Listing;
 use crate::segment::footer_writer::{FooterTotals, FooterWriter};
 use crate::segment::row_block::ROW_BLOCK_BYTES;
-use crate::segment::segment_table::shard_of;
+use crate::segment::segment_table::{RetiredSegment, shard_of};
 use crate::segment::segment_tail::{ColumnTail, MOST_MERGE_SEGMENTS, SegmentNumber};
 use crate::segment::summary::{ColumnFacts, SegmentFacts, SummaryRow, SummaryRows};
 
@@ -326,6 +326,22 @@ impl<Backend: Io> RewriteJob<Backend> {
             volume.dead_bits.end(*input);
         }
         let retired: [_; MOST_MERGE_SEGMENTS] = array::from_fn(|index| inputs.get(index).and_then(|number| volume.table.retire(*number)));
+        let retiring = Retiring { retired, gone, leaving };
+        #[cfg(feature = "test-hooks")]
+        if self.stop_after_retire {
+            self.held_install = Some(retiring);
+            return Ok(());
+        }
+        self.finish_install(retiring, before_park)
+    }
+
+    /// Finish an install from its retire: the summary without the inputs and with the outputs, the counts, and the park
+    pub fn finish_install(&mut self, retiring: Retiring<Backend::File>, before_park: impl FnOnce()) -> Result<()> {
+        let Retiring { retired, gone, leaving } = retiring;
+        let state = Arc::clone(&self.state);
+        let volume = &state.volumes[self.volume];
+        let numbers = self.numbers;
+        let inputs = &numbers[..self.input_count];
         let footers = self.note_install();
         if self.picked_as == Some(PickOutcome::Overlap) {
             let elapsed = state.io.now().0.saturating_sub(self.begun_at.0);
@@ -383,6 +399,13 @@ impl<Backend: Io> RewriteJob<Backend> {
         volume.segments_leaving.fetch_sub(leaving, Ordering::AcqRel);
         self.release_region();
         saved
+    }
+
+    /// Finish an install a test stopped at its retire
+    #[cfg(feature = "test-hooks")]
+    pub fn finish_held_install(&mut self) -> Result<()> {
+        let retiring = self.held_install.take().ok_or_else(|| Error::other("no install held at its retire"))?;
+        self.finish_install(retiring, || {})
     }
 
     /// Put the outputs in the table, both or neither. No list holds them yet, so no read can have found the first
@@ -688,4 +711,11 @@ impl<Backend: Io> RewriteJob<Backend> {
         volume.promises_outgrown.fetch_add(1, Ordering::Relaxed);
         false
     }
+}
+
+/// What an install hands from its retire to its finish
+pub struct Retiring<File> {
+    pub retired: [Option<RetiredSegment<File>>; MOST_MERGE_SEGMENTS],
+    pub gone: RowBytes,
+    pub leaving: u64,
 }

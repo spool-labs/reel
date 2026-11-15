@@ -405,6 +405,8 @@ pub struct Volume<Backend: Io> {
     pub capped_picks: AtomicU64,
     /// Looks that left a cover unclear because a cue below it could still read rows in its own segment
     pub covers_held_by_cues: AtomicU64,
+    /// Cover looks given up because a rewrite or an unlink landed while they ran, or their own segment left the table
+    pub settle_retries: AtomicU64,
     /// Record picks the pace put off, its credit short of their estimate
     pub pace_refusals: AtomicU64,
     /// Rows a record pick held to the half bar past the floor, their counts not trusted while a segment below them is unwalked
@@ -657,6 +659,9 @@ impl<Backend: Io> Volume<Backend> {
 
     /// Note a sealed segment's highest place
     pub fn note_sealed(&self, place: WritePlace) {
+        // a seal raises it once the mark has passed its rows, and open once it has resumed the order past what it found, so a
+        // reader at the newest point never stands under a sealed row
+        debug_assert!(place <= self.order.mark(), "sealed place {place:?} above the mark {:?}", self.order.mark());
         self.highest_sealed.fetch_max(place.0, Ordering::AcqRel);
     }
 

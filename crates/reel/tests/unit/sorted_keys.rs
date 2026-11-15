@@ -283,7 +283,12 @@ fn past_capacity_sets_a_mark() {
     assert_eq!(index.check(), Ok(()));
     assert_eq!(index.mark(), Some(SegmentNumber(7)));
     assert_eq!(index.past_capacity(), RowCount(1));
-    assert!(index.clear_mark(SegmentNumber(7), RowCount(1)));
+    let seen = index.mark_word();
+    // a later mark, as a fill that missed a segment sets, moves the generation, and the clear from the older word is refused
+    index.mark_from(SegmentNumber(9));
+    assert!(!index.clear_mark(seen, RowCount(1)), "a clear went over a later miss");
+    assert_eq!(index.mark(), Some(SegmentNumber(7)));
+    assert!(index.clear_mark(index.mark_word(), RowCount(1)));
     assert_eq!(index.mark(), None);
 }
 

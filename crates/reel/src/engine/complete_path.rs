@@ -16,7 +16,7 @@ use crate::guard::hold;
 use crate::index::complete_table::{CompleteSlot, CompleteTable, TagMatches};
 use crate::index::open_slots::OpenSlot;
 use crate::engine::seal_job::SortedRun;
-use crate::index::sorted_keys::{HOLD_ROWS, KeyEntry, SortedKeys};
+use crate::index::sorted_keys::{HOLD_ROWS, KeyEntry, MarkWord, SortedKeys};
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::io::{DeviceReads, InPlace, Io, in_place};
 use crate::io::device_error::is_device_error;
@@ -36,6 +36,19 @@ pub struct BlockSpan {
     pub segment: SegmentNumber,
     pub first: u32,
     pub end: u32,
+}
+
+/// A refill of a sorted index past its mark, a segment a step, newest first
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SortedRefill {
+    pub column: ColumnId,
+    /// The mark word the refill began from, which its clear compares against: a miss or an install since moves it
+    pub seen: MarkWord,
+    pub mark: SegmentNumber,
+    pub missed: RowCount,
+    pub segment: Option<SegmentNumber>,
+    /// A block no read could give ended the refill, and the mark stands until the index has fewer entries than now
+    pub is_stuck: bool,
 }
 
 /// A refill of a complete table past its mark, a few row blocks a step
@@ -108,15 +121,19 @@ impl<Backend: Io> EngineState<Backend> {
         read: &KeyRead<'_>,
         index: &SortedKeys,
     ) -> Result<Option<SealedRow>, StoreError> {
+        let before = index.mark_word();
         let entry = index.find(read.key);
+        let after = index.mark_word();
         let is_behind = volume.may_hide_under_sealed(read.read_point);
-        // a grave answers absent wherever it sits, so only a value needs its segment
-        if is_behind || entry.is_some_and(|entry| entry.place > read.read_point || (!entry.is_grave && volume.table.pin(entry.segment).is_none())) {
+        // a miss, an install under a mark or a refill's clear between the loads: the entry may be older than one a refill put in
+        // and the mark may be gone, so the whole footer search answers. A grave answers absent wherever it sits, so only a value
+        // needs its segment
+        if before != after || is_behind || entry.is_some_and(|entry| entry.place > read.read_point || (!entry.is_grave && volume.table.pin(entry.segment).is_none())) {
             self.sorted_footer_asks.fetch_add(1, Ordering::Relaxed);
             return self.search_footers(device, volume, read).await;
         }
         let found = entry.as_ref().map(sealed_of);
-        let Some(mark) = index.mark() else {
+        let Some(mark) = after.mark() else {
             self.sorted_answers.fetch_add(1, Ordering::Relaxed);
             return Ok(found);
         };
@@ -489,6 +506,65 @@ impl<Backend: Io> EngineState<Backend> {
         } else {
             refill.block = end - first;
         }
+        Ok(true)
+    }
+
+    /// Find a sorted column of a volume whose index has a mark and room again, holding fewer entries than a refill that met an
+    /// unread block left, and start a refill from the mark. The word is read first, so anything that moves it after counts
+    pub fn start_sorted_refill(&self, index: usize, below: u64) -> Option<SortedRefill> {
+        for (id, sorted) in self.sorted.iter().enumerate() {
+            let (Some(sorted), Some(info)) = (sorted, self.columns[id]) else {
+                continue;
+            };
+            let is_due = info.volume.0 as usize == index && sorted.has_room() && sorted.entry_count().0 < below;
+            let seen = sorted.mark_word();
+            let Some(mark) = seen.mark().filter(|_mark| is_due) else {
+                continue;
+            };
+            // a seal or a merge output can hold rows past the mark before the summary lists them, so a refill waits for it
+            let volume = &self.volumes[index];
+            let sealing = volume.sealing.load(Ordering::Acquire);
+            if (sealing != NO_SEAL && sealing >= mark.0) || volume.output_floor() != NO_SEAL {
+                continue;
+            }
+            // newest first, so a key's newest row past the mark takes its entry ahead of the rows it superseded
+            let segment = hold(&volume.summary).orders().after(SegmentNumber(mark.0.saturating_sub(1))).last().copied();
+            self.sorted_refill_passes.fetch_add(1, Ordering::Relaxed);
+            return Some(SortedRefill { column: ColumnId(id as u8), seen, mark, missed: sorted.past_capacity(), segment, is_stuck: false });
+        }
+        None
+    }
+
+    /// Give one segment past a sorted refill's mark its entries, and once none is left take out what each sealed cover hides and
+    /// clear the mark from the word the refill began with. Say whether the refill goes on. A clear the word refuses, after a miss
+    /// or an install, ends the refill and the next one starts from the word as it stands. A block that can't be read ends it
+    /// with the mark standing, since its rows have no entry
+    pub fn sorted_refill_step(&self, index: usize, refill: &mut SortedRefill, run: &mut SortedRun) -> IoResult<bool> {
+        let volume = &self.volumes[index];
+        let Some(sorted) = self.sorted_index(refill.column) else {
+            return Ok(false);
+        };
+        let column = refill.column;
+        let Some(segment) = refill.segment else {
+            // only a cover at or under the highest sealed place takes entries out: a cue below one still above reads its rows
+            let sealed = WritePlace(volume.highest_sealed.load(Ordering::Acquire));
+            volume.covers.read().visit(|cover, start, end| {
+                if cover.column == column && cover.place <= sealed {
+                    sorted.remove_covered(start, end, cover.place);
+                }
+            });
+            let counter = if sorted.clear_mark(refill.seen, refill.missed) { &self.sorted_refill_clears } else { &self.sorted_refill_refused };
+            counter.fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        };
+        let mark = refill.mark;
+        let next = |segment: SegmentNumber| hold(&volume.summary).orders().below(segment).last().copied().filter(|below| *below >= mark);
+        if !self.fill_sorted_segment(volume, (column, sorted), segment, run)? {
+            refill.is_stuck = true;
+            self.sorted_refill_stuck.fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
+        refill.segment = next(segment);
         Ok(true)
     }
 

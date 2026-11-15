@@ -49,7 +49,7 @@ use reel_sim::simulated_io::SimulatedIo;
 
 const ROOT: &str = "/disk/rewrite";
 const COLUMN: ColumnId = ColumnId(1);
-const BUDGET: ByteCount = ByteCount(64 * 1024 * 1024);
+const BUDGET: ByteCount = ByteCount(68 * 1024 * 1024);
 const TICK: Nanoseconds = Nanoseconds(1_000_000);
 const STEPS: u64 = 20_000;
 const SMALL_RECORD_BYTES: usize = 1_024;

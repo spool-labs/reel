@@ -10,7 +10,7 @@ use reel_api::units::{ByteCount, RowCount, WritePlace};
 use crate::index::entry_slab::{ENTRY_ALIGNMENT, EntryAddress, EntrySlab, NO_ENTRY, PAGE_BYTES, PageCount, PageIndex, entry_size};
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::index::key_table::{KeyTable, TableSlot};
-use crate::index::node_pool::{NODE_FANOUT, NodeCount, NodeIndex, NodePool, TreeNode};
+use crate::index::node_pool::{NO_NODE, NODE_FANOUT, NodeCount, NodeIndex, NodePool, TreeNode};
 use crate::index::open_slots::{MAX_OPEN_SLOTS, OpenSlot, OpenSlots};
 use crate::index::seek_target::SeekTarget;
 use crate::index::shard_cursor::{MAX_CURSOR_STEPS, ShardCursor, TreeCursor};
@@ -570,11 +570,17 @@ pub fn place_heads_together(heads: &mut [Option<HeadPlace<'_>>], bound: &WalkBou
         (Direction::Descending, false) => (WritePlace(u64::MAX), true),
     };
     let target = SeekTarget::new(bound.column, bound.key, place);
-    let mut entries = [[None; MAX_OPEN_SLOTS]; HEAD_GROUP];
-    // each descent: its head's shard, its tree, and the node it stands on
-    let mut descents: [(Option<&WriteShard>, usize, NodeIndex); HEAD_GROUP * MAX_OPEN_SLOTS] = [(None, 0, NodeIndex(0)); HEAD_GROUP * MAX_OPEN_SLOTS];
+    // each head keeps only its closest entry in the bound's column, so a tree's answer folds in as it comes, and a head's
+    // equal keys copy the same bytes whatever order they come in
+    let mut best = [None; HEAD_GROUP];
+    let fold = |shard: &WriteShard, best: &mut Option<EntryAddress>, entry: Option<EntryAddress>| {
+        if let Some(entry) = entry.filter(|entry| shard.slab.column(*entry) == bound.column) {
+            *best = Some(shard.closer(*best, entry, bound.direction));
+        }
+    };
+    let mut descents = [NO_DESCENT; HEAD_GROUP * MAX_OPEN_SLOTS];
     let mut count = 0;
-    for (place, found) in heads.iter_mut().zip(&mut entries).take(HEAD_GROUP) {
+    for (head, (place, best)) in heads.iter_mut().zip(&mut best).enumerate().take(HEAD_GROUP) {
         let Some(place) = place.as_mut() else {
             continue;
         };
@@ -585,69 +591,74 @@ pub fn place_heads_together(heads: &mut [Option<HeadPlace<'_>>], bound: &WalkBou
             }
             let cursor = &mut place.cursor.trees[index];
             if cursor.is_placed && shard.is_cursor_standing(cursor) {
-                found[index] = shard.place_cursor(cursor, tree, bound);
+                fold(shard, best, shard.place_cursor(cursor, tree, bound));
                 continue;
             }
             if let Some(edge) = shard.edge_of(tree, bound) {
-                found[index] = shard.stand(cursor, edge);
+                fold(shard, best, shard.stand(cursor, edge));
                 continue;
             }
             fetch_lines(shard.nodes.node(tree.root), NODE_HEAD_LINES);
-            descents[count] = (Some(shard), index, tree.root);
+            descents[count] = Descent { head: head as u8, tree: index as u8, node: tree.root };
             count += 1;
         }
     }
     let mut is_descending = true;
     while is_descending {
         is_descending = false;
-        for (shard, _tree, node) in descents.iter_mut().take(count) {
-            let Some(shard) = *shard else {
+        for descent in descents.iter_mut().take(count) {
+            let Some(shard) = heads[usize::from(descent.head)].as_ref().map(|place| place.shard) else {
                 continue;
             };
-            let standing = shard.nodes.node(*node);
+            let standing = shard.nodes.node(descent.node);
             if standing.is_leaf {
                 continue;
             }
             is_descending = true;
-            *node = standing.children[child_index(&shard.nodes, &shard.slab, *node, &target) as usize];
-            fetch_lines(shard.nodes.node(*node), NODE_HEAD_LINES);
+            descent.node = standing.children[child_index(&shard.nodes, &shard.slab, descent.node, &target) as usize];
+            fetch_lines(shard.nodes.node(descent.node), NODE_HEAD_LINES);
         }
     }
-    // the descents went in head order, so each head's come in a run
-    let mut at = 0;
-    for (place, found) in heads.iter_mut().zip(&mut entries).take(HEAD_GROUP) {
-        let Some(place) = place.as_mut() else {
+    for descent in descents.iter().take(count) {
+        let Some(place) = heads[usize::from(descent.head)].as_mut() else {
             continue;
         };
         let shard = place.shard;
-        while let Some(&(Some(descended), index, leaf)) = descents.get(at).filter(|_descent| at < count)
-            && std::ptr::eq(descended, shard)
-        {
-            let row = lower_bound(&shard.nodes, &shard.slab, leaf, &target);
-            let mut position = normalize(&shard.nodes, TreePosition { leaf, index: row });
-            if is_before {
-                position = match position {
-                    Some(found) => step_back(&shard.nodes, found),
-                    None => shard.trees[index].last_position(&shard.nodes),
-                };
-            }
-            found[index] = shard.stand(&mut place.cursor.trees[index], position);
-            at += 1;
+        let index = usize::from(descent.tree);
+        let row = lower_bound(&shard.nodes, &shard.slab, descent.node, &target);
+        let mut position = normalize(&shard.nodes, TreePosition { leaf: descent.node, index: row });
+        if is_before {
+            position = match position {
+                Some(found) => step_back(&shard.nodes, found),
+                None => shard.trees[index].last_position(&shard.nodes),
+            };
         }
-        let mut best = None;
-        for entry in found.iter().flatten() {
-            if shard.slab.column(*entry) == bound.column {
-                best = Some(shard.closer(best, *entry, bound.direction));
-            }
-        }
+        let entry = shard.stand(&mut place.cursor.trees[index], position);
+        fold(shard, &mut best[usize::from(descent.head)], entry);
+    }
+    for (place, best) in heads.iter_mut().zip(best).take(HEAD_GROUP) {
+        let Some(place) = place.as_mut() else {
+            continue;
+        };
         *place.has_key = best.is_some();
         if let Some(entry) = best {
             place.key.clear();
-            place.key.extend_from_slice(shard.slab.key(entry));
+            place.key.extend_from_slice(place.shard.slab.key(entry));
         }
     }
     count
 }
+
+/// One tree a head descends: the head, the tree's slot and the node it stands on
+#[derive(Clone, Copy, Debug)]
+pub struct Descent {
+    pub head: u8,
+    pub tree: u8,
+    pub node: NodeIndex,
+}
+
+/// A descent that stands on no tree, which the list starts from
+pub const NO_DESCENT: Descent = Descent { head: 0, tree: 0, node: NO_NODE };
 
 /// Lines of a tree node that hold its header and the row prefixes a descent searches
 pub const NODE_HEAD_LINES: usize = 5;

@@ -259,6 +259,10 @@ impl<Backend: Io> SealJob<Backend> {
         self.end_step(|steps| &steps.drain);
         self.state.write_out(target.slot)?;
         self.writer.start(target.data_end, target.lowest_place);
+        // the sealed place rises before the walk withholds or removes a sorted entry under a cover, so a cue below the cover reads by
+        // the footers from here on. The rows stay in the write index until the switch, and a seal that stops later only sends a few
+        // more reads to the footers
+        self.volume().note_sealed(target.highest_place);
         self.writer.set_marks(target.marks);
         // a read that began before this count can't fill the spot cache behind the walk
         self.volume().handovers.fetch_add(1, Ordering::AcqRel);
@@ -728,7 +732,7 @@ impl SortedRun {
         }
     }
 
-    /// Take a key's newest row in a sealing segment for its column's sorted index. A value under a newer cover gets no entry,
+    /// Take a key's newest row in a sealing segment for its column's sorted index. A value under a newer sealed cover gets no entry,
     /// since a read never returns it and a merge drops it
     pub fn note<Backend: Io>(
         &mut self,
@@ -742,7 +746,10 @@ impl SortedRun {
             return;
         }
         let covers = &state.volumes[volume].covers;
-        if row.kind == RowKind::Value && covers.newest_over(column, key, WritePlace(u64::MAX)).is_some_and(|cover| cover > row.place) {
+        // only a cover at or under the highest sealed place withholds an entry: a cue below such a cover reads by the footers, and a
+        // cover still above it removes what it hides at its own seal
+        let sealed = WritePlace(state.volumes[volume].highest_sealed.load(Ordering::Acquire));
+        if row.kind == RowKind::Value && covers.newest_over(column, key, sealed).is_some_and(|cover| cover > row.place) {
             return;
         }
         if self.column != Some(column) || self.entries.len() == HOLD_ROWS {

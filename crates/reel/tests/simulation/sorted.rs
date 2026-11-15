@@ -903,3 +903,114 @@ fn a_merge_between_locate_and_read() {
     assert_eq!(found, expected);
     store.close().expect("close");
 }
+
+// K in a segment of its own, a cue, then a range delete over every key written into another open segment
+fn k_then_cue_then_open_cover(store: &Store) -> (reel::engine::cue::Cue<SimulatedIo>, Vec<u8>) {
+    let name = key(1);
+    store.put_marked(COLUMN, &name, b"live at the cue", MARK).expect("put");
+    let cue = store.cue().expect("cue");
+    store.delete_range(COLUMN, &[0; WIDTH as usize], &[0xFF; WIDTH as usize]).expect("delete range");
+    (cue, name)
+}
+
+// seal the marked segment that holds K alone, and leave every other open segment as it is
+fn seal_k_alone(store: &Store, io: &SimulatedIo) {
+    let volume = &store.state.volumes[0];
+    {
+        let mut claims = hold(&volume.claims);
+        let at = claims.open.iter().position(|open| open.ceiling.is_some() && open.row_count.0 > 0).expect("K's segment");
+        store.state.seal_at(&mut claims, volume, at);
+    }
+    settle(io);
+}
+
+// what a cue reads of K: the get, and a scan's first row from K
+fn cue_reads(cue: &reel::engine::cue::Cue<SimulatedIo>, name: &[u8]) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    let mut value = Vec::new();
+    let got = cue.get(COLUMN, name, &mut value).expect("get at the cue").then_some(value);
+    let walked = rows(cue.iter_from(COLUMN, name, Direction::Ascending).expect("scan"));
+    let first = walked.first().filter(|(found, _value)| found == name).map(|(_found, value)| value.clone());
+    (got, first)
+}
+
+// (a) a value sealed under a range delete still open: the cue reads it by get and scan, the current point doesn't. A second arm
+// seals the range delete first
+#[test]
+fn a_cue_reads_a_value_under_an_open_range_delete() {
+    for (is_cover_sealed, seed) in [(false, 90), (true, 91)] {
+        let io = SimulatedIo::new(Seed(seed));
+        let store = open(&io, CAPACITY);
+        let (cue, name) = k_then_cue_then_open_cover(&store);
+        seal_k_alone(&store, &io);
+        // the case that matters: nothing sealed sits above the cue, so the cue's get trusts the index
+        let point = cue.point_of(COLUMN).expect("point");
+        assert!(!store.state.volumes[0].may_hide_under_sealed(point), "the setup sends the cue to the footers");
+        if is_cover_sealed {
+            seal_all(&store, &io);
+        }
+        let live = Some(b"live at the cue".to_vec());
+        assert_eq!(cue_reads(&cue, &name), (live.clone(), live), "the cue lost K, cover sealed {is_cover_sealed}");
+        assert_eq!(read(&store, &name), None, "the range delete didn't hide K at the current point");
+        drop(cue);
+        store.close().expect("close");
+    }
+}
+
+// (b) the cover's own seal stepped one io step at a time: at every step the cue reads K by get and scan, and the current point
+// doesn't. The first arm writes the cover before K seals, so K never gets an entry. The second seals K first, so K has an entry
+// and only the window between the cover seal's removal and its raise of the sealed place can lose it
+#[test]
+fn a_cue_reads_the_value_through_every_step_of_the_covers_seal() {
+    for (is_k_sealed_first, seed) in [(false, 92), (true, 95)] {
+        let io = SimulatedIo::new(Seed(seed));
+        let store = open(&io, CAPACITY);
+        let name = key(1);
+        let cue = if is_k_sealed_first {
+            store.put_marked(COLUMN, &name, b"live at the cue", MARK).expect("put");
+            seal_k_alone(&store, &io);
+            let cue = store.cue().expect("cue");
+            store.delete_range(COLUMN, &[0; WIDTH as usize], &[0xFF; WIDTH as usize]).expect("delete range");
+            cue
+        } else {
+            let (cue, _name) = k_then_cue_then_open_cover(&store);
+            seal_k_alone(&store, &io);
+            cue
+        };
+        let point = cue.point_of(COLUMN).expect("point");
+        assert!(!store.state.volumes[0].may_hide_under_sealed(point), "the setup sends the cue to the footers");
+        store.seal_now();
+        let live = Some(b"live at the cue".to_vec());
+        for step in 0..STEPS {
+            assert_eq!(cue_reads(&cue, &name), (live.clone(), live.clone()), "step {step}: the cue lost K, K sealed first {is_k_sealed_first}");
+            assert_eq!(read(&store, &name), None, "step {step}: the current point read K");
+            if io.step_any().is_none() {
+                break;
+            }
+        }
+        drop(cue);
+        store.close().expect("close");
+    }
+}
+
+// (c) K and its range delete in one segment, with the cover starting below K and at K: the current point reads K gone, and a cue
+// taken between the two writes reads K
+#[test]
+fn a_value_and_its_range_delete_in_one_segment() {
+    for (is_inside, seed) in [(true, 93), (false, 94)] {
+        let io = SimulatedIo::new(Seed(seed));
+        let store = open(&io, CAPACITY);
+        let name = key(1);
+        store.put(COLUMN, &name, b"live at the cue").expect("put");
+        let cue = store.cue().expect("cue");
+        let start = if is_inside { vec![0; WIDTH as usize] } else { name.clone() };
+        store.delete_range(COLUMN, &start, &[0xFF; WIDTH as usize]).expect("delete range");
+        let volume = &store.state.volumes[0];
+        assert_eq!(hold(&volume.claims).open.iter().filter(|open| open.row_count.0 > 0).count(), 1, "K and its cover landed apart");
+        seal_all(&store, &io);
+        let live = Some(b"live at the cue".to_vec());
+        assert_eq!(cue_reads(&cue, &name), (live.clone(), live), "the cue lost K, inside {is_inside}");
+        assert_eq!(read(&store, &name), None, "a deleted key read at the current point, inside {is_inside}");
+        drop(cue);
+        store.close().expect("close");
+    }
+}

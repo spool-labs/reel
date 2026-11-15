@@ -1066,3 +1066,36 @@ fn walk_runs_beside_a_refill() {
     }
     store.close().expect("close");
 }
+
+// (d) the cue sim on a complete column, which slots every sealed row and applies covers when it reads: K in a segment of its
+// own, a cue, a range delete written into another open segment and left there, K's segment sealed alone. The cue reads K by get
+// and scan, and the current point doesn't. A guard against the table taking a rule that withholds rows under an open cover
+#[test]
+fn a_cue_reads_a_value_under_an_open_range_delete_on_a_complete_column() {
+    let io = SimulatedIo::new(Seed(96));
+    let store = open(&io, CAPACITY);
+    let name = b"key-k".to_vec();
+    store.put_marked(COLUMN, &name, b"live at the cue", reel_api::units::DeathMark(1_000_000)).expect("put");
+    let cue = store.cue().expect("cue");
+    store.delete_range(COLUMN, b"", &[0xFF; 8]).expect("delete range");
+    let volume = &store.state.volumes[0];
+    {
+        let mut claims = hold(&volume.claims);
+        let at = claims.open.iter().position(|open| open.ceiling.is_some() && open.row_count.0 > 0).expect("K's segment");
+        store.state.seal_at(&mut claims, volume, at);
+    }
+    settle(&io);
+    let point = cue.point_of(COLUMN).expect("point");
+    assert!(!volume.may_hide_under_sealed(point), "the setup sends the cue to the footers");
+    let mut value = Vec::new();
+    assert!(cue.get(COLUMN, &name, &mut value).expect("get at the cue"), "the cue lost K on a complete column");
+    assert_eq!(value, b"live at the cue");
+    let mut scan = cue.iter_from(COLUMN, &name, Direction::Ascending).expect("scan");
+    let (mut key, mut row) = (Vec::new(), Vec::new());
+    assert_eq!(scan.next_row(&mut key, &mut row).expect("step"), ScanStep::Found);
+    assert_eq!((key.as_slice(), row.as_slice()), (name.as_slice(), &b"live at the cue"[..]));
+    drop(scan);
+    assert!(!store.get(COLUMN, &name, &mut value).expect("get"), "the range delete didn't hide K at the current point");
+    drop(cue);
+    store.close().expect("close");
+}

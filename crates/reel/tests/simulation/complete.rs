@@ -13,6 +13,9 @@ use reel::io::job::JobStep;
 use reel::engine::complete_image::IMAGE_HEAD_BYTES;
 use reel::engine::read_path::RecordWant;
 use reel::engine::reel_store::ReelStore;
+use reel::engine::store_scan::StoreScan;
+use reel::{ScanRange, from_key};
+use crate::seed_sets::seeds;
 use reel::engine::rewrite_job::RewritePhase;
 use reel::engine::walk_job::WalkJob;
 use reel::guard::hold;
@@ -27,7 +30,7 @@ use reel_api::direction::Direction;
 use reel_api::maintenance_report::{MaintenanceReport, UNIT_KINDS, UnitKind};
 use reel_api::scan::ScanStep;
 use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RowCount, VolumeId};
+use reel_api::units::{ByteCount, DeathMark, FileOffset, Nanoseconds, RowCount, VolumeId};
 use reel_sim::file_image::BitMask;
 use reel_sim::seeded_random::{Seed, SeededRandom};
 use reel_sim::simulated_disk::OperationCount;
@@ -45,6 +48,15 @@ const INTERLEAVE_ROUNDS: u64 = 6;
 const INTERLEAVE_STEPS: u64 = 40;
 const INTERLEAVE_WORKERS: usize = 4;
 const CHURN_ROUNDS: u64 = 12;
+const MODEL_ROUNDS: u64 = 8;
+const CLEAR_ROUNDS: u64 = 200;
+const CHURN_SEEDS: u64 = 6;
+const CHURN_WRITES: u64 = 600;
+const CHURN_KEYS: u64 = 1_500;
+const CHURN_CAPACITY: RowCount = RowCount(1_000);
+const COVER_ONE_IN: u64 = 40;
+const SCAN_TAKE: usize = 40;
+const MARK: DeathMark = DeathMark(1_000_000);
 const CHURN_DELETE_ONE_IN: u64 = 8;
 const KEYS: u64 = 2_000;
 const CAPACITY: RowCount = RowCount(100_000);
@@ -61,6 +73,8 @@ const IMAGE_LIST_ROOM: u64 = 1_024;
 const CHARGE_CRASH_POINTS: u64 = 40;
 
 type Store = ReelStore<SimulatedIo>;
+type Model = BTreeMap<Vec<u8>, Vec<u8>>;
+type Rows = Vec<(Vec<u8>, Vec<u8>)>;
 type Filled = (BTreeMap<Vec<u8>, Vec<u8>>, Vec<Vec<u8>>);
 
 fn config(capacity: RowCount) -> StoreConfig {
@@ -1098,4 +1112,164 @@ fn a_cue_reads_a_value_under_an_open_range_delete_on_a_complete_column() {
     assert!(!store.get(COLUMN, &name, &mut value).expect("get"), "the range delete didn't hide K at the current point");
     drop(cue);
     store.close().expect("close");
+}
+
+// random puts, deletes and range deletes over seals, reopens and kills read as a model does, with the table's image taken at
+// each close and read or refused at each open
+#[test]
+fn churn_matches_the_model() {
+    let names: Vec<Vec<u8>> = (0..CHURN_KEYS).map(key).collect();
+    for seed in seeds(0..CHURN_SEEDS) {
+        assert_eq!(churn(seed, CAPACITY, &names), (false, true), "seed {seed}");
+    }
+}
+
+// the same churn with every key in one shard of the table, so its buckets fill and its keys share tags. The shard holds a 64th
+// of the slots, so a seed can mark the table and keep the mark, and reads still match the model
+#[test]
+fn churn_in_one_shard_matches_the_model() {
+    let names = one_shard_keys();
+    let (mut marked, mut cleared) = (0, 0);
+    for seed in seeds(0..CHURN_SEEDS) {
+        let (was_marked, is_cleared) = churn(seed, CAPACITY, &names);
+        marked += u64::from(was_marked);
+        cleared += u64::from(was_marked && is_cleared);
+    }
+    println!("complete churn in one shard: {marked} seeds marked, {cleared} cleared");
+}
+
+// the same churn on a table with room for fewer rows than a seed writes, so seeds go past capacity, and a range delete of half
+// the keys halfway through lets the walk and the refill free room
+#[test]
+fn churn_past_capacity_matches_the_model() {
+    let names: Vec<Vec<u8>> = (0..CHURN_KEYS).map(key).collect();
+    let (mut marked, mut cleared) = (0, 0);
+    for seed in seeds(0..CHURN_SEEDS) {
+        let (was_marked, is_cleared) = churn(seed, CHURN_CAPACITY, &names);
+        marked += u64::from(was_marked);
+        cleared += u64::from(was_marked && is_cleared);
+    }
+    println!("complete churn past capacity: {marked} seeds marked, {cleared} cleared");
+    assert!(marked > 0, "no seed went past capacity");
+}
+
+// keys whose hashes all fall in the table's first shard
+fn one_shard_keys() -> Vec<Vec<u8>> {
+    (0..).map(key).filter(|name| shard_of(hash_key(COLUMN, name)) == 0).take(CHURN_KEYS as usize).collect()
+}
+
+// run one seed's churn over these keys, and say whether the table was ever marked and whether it ends with no mark. A marked
+// put goes to a segment of its own, so a key's older row can seal after its grave
+fn churn(seed: u64, capacity: RowCount, names: &[Vec<u8>]) -> (bool, bool) {
+    let is_marked = |store: &Store| store.state.complete_table(COLUMN).expect("a table").mark().is_some();
+    let io = SimulatedIo::new(Seed(300 + seed));
+    let mut random = SeededRandom::new(Seed(400 + seed));
+    let mut store = open(&io, capacity);
+    let mut model = Model::new();
+    let mut sorted_names = names.to_vec();
+    sorted_names.sort();
+    let mut was_marked = false;
+    for round in 0..MODEL_ROUNDS {
+        if round == MODEL_ROUNDS / 2 {
+            let (start, end) = (sorted_names[0].clone(), sorted_names[sorted_names.len() / 2].clone());
+            store.delete_range(COLUMN, &start, &end).expect("delete range");
+            model.retain(|name, _value| *name < start || *name >= end);
+        }
+        for write in 0..CHURN_WRITES {
+            let name = names[random.below(CHURN_KEYS) as usize].clone();
+            match random.below(COVER_ONE_IN) {
+                0 => {
+                    let at = random.below(CHURN_KEYS) as usize;
+                    let until = (at + random.below(40) as usize).min(sorted_names.len() - 1);
+                    let (start, end) = (sorted_names[at].clone(), sorted_names[until].clone());
+                    store.delete_range(COLUMN, &start, &end).expect("delete range");
+                    model.retain(|name, _value| *name < start || *name >= end);
+                },
+                1..=6 => {
+                    store.delete(COLUMN, &name).expect("delete");
+                    model.remove(&name);
+                },
+                _ => {
+                    let value = format!("{seed}-{round}-{write}").into_bytes();
+                    if random.below(4) == 0 {
+                        store.put_marked(COLUMN, &name, &value, MARK).expect("put");
+                    } else {
+                        store.put(COLUMN, &name, &value).expect("put");
+                    }
+                    model.insert(name, value);
+                },
+            }
+        }
+        match random.below(3) {
+            0 => seal(&store, &io),
+            1 => {
+                store.close().expect("close");
+                drop(store);
+                store = open(&io, capacity);
+            },
+            _ => {
+                store.flush().expect("flush");
+                io.kill();
+                drop(store);
+                store = open(&io, capacity);
+            },
+        }
+        was_marked |= is_marked(&store);
+        check_model(&store, &model, names);
+        check_scans(&store, &model, &sorted_names, &mut random);
+    }
+    seal(&store, &io);
+    // the walk frees superseded slots and the refill clears the mark, over as many quiet spells as they take
+    for _round in 0..CLEAR_ROUNDS {
+        if !is_marked(&store) {
+            break;
+        }
+        io.advance_clock(Nanoseconds(1_000_000_000));
+        cool(&store, &io);
+    }
+    was_marked |= is_marked(&store);
+    check_model(&store, &model, names);
+    check_scans(&store, &model, &sorted_names, &mut random);
+    let is_cleared = !is_marked(&store);
+    store.close().expect("close");
+    (was_marked, is_cleared)
+}
+
+// every key reads what the model holds, and nothing for a key the model lacks
+fn check_model(store: &Store, model: &Model, names: &[Vec<u8>]) {
+    for name in names {
+        assert_eq!(read(store, name).as_ref(), model.get(name), "{name:?}");
+    }
+}
+
+// the first rows of a scan, read no further
+fn first_rows(mut scan: StoreScan<SimulatedIo>, most: usize) -> Rows {
+    let (mut key, mut value, mut found) = (Vec::new(), Vec::new(), Vec::new());
+    while found.len() < most && scan.next_row(&mut key, &mut value).expect("step") == ScanStep::Found {
+        found.push((key.clone(), value.clone()));
+    }
+    found
+}
+
+// whole walks both ways, and walks from stored keys with and without a told count, against the model
+fn check_scans(store: &Store, model: &Model, names: &[Vec<u8>], random: &mut SeededRandom) {
+    let forward: Rows = model.iter().map(|(key, value)| (key.clone(), value.clone())).collect();
+    assert_eq!(first_rows(store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan"), usize::MAX), forward);
+    let mut backward = forward.clone();
+    backward.reverse();
+    let top = vec![0xFF; 65];
+    assert_eq!(first_rows(store.iter_from(COLUMN, &top, Direction::Descending).expect("scan"), usize::MAX), backward);
+    for told in [None, Some(100), Some(256), Some(300)] {
+        let start = names[random.below(names.len() as u64) as usize].clone();
+        let most = told.unwrap_or(SCAN_TAKE) + SCAN_TAKE;
+        for direction in [Direction::Ascending, Direction::Descending] {
+            let expected: Rows = match direction {
+                Direction::Ascending => forward.iter().filter(|(name, _value)| *name >= start).take(most).cloned().collect(),
+                Direction::Descending => backward.iter().filter(|(name, _value)| *name <= start).take(most).cloned().collect(),
+            };
+            let range = ScanRange { wanted: told.map(|told| RowCount(told as u64)), ..from_key(COLUMN, &start, direction) };
+            let found = first_rows(store.iter(&range).expect("scan"), most);
+            assert_eq!(found, expected, "told {told:?} {direction:?} from {start:?}");
+        }
+    }
 }

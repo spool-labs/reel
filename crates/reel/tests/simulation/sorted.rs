@@ -16,6 +16,7 @@ use reel::guard::hold;
 use reel::index::sorted_keys::{Floors, KeyEntry};
 use reel::record::codec::Codec;
 use reel::engine::store_scan::StoreScan;
+use reel::{ScanRange, from_key};
 use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
 use reel_api::direction::Direction;
@@ -40,12 +41,15 @@ const CHURN_SEEDS: u64 = 6;
 const CHURN_ROUNDS: u64 = 8;
 const CHURN_WRITES: u64 = 600;
 const CHURN_KEYS: u64 = 1_500;
+const CHURN_CAPACITY: RowCount = RowCount(900);
+const EXTRA_KEYS: u64 = 32_000;
 const COVER_ONE_IN: u64 = 40;
 const MARK: DeathMark = DeathMark(1_000_000);
 const SCAN_STARTS: u64 = 12;
 const WANTED_ROWS: u64 = 10;
 const AHEAD: usize = 500;
 const SCAN_TAKE: usize = 40;
+const TOLD_COUNTS: [usize; 3] = [100, 256, 300];
 const MERGE_KEYS: u64 = 15_000;
 const CUE_ROUNDS: u64 = 3;
 const COVERED: usize = 40;
@@ -126,6 +130,21 @@ fn key(number: u64) -> Vec<u8> {
     number.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes().iter().chain(&number.to_be_bytes()).copied().collect()
 }
 
+// a key whose first byte is the same for every number, so every key falls in one part of the index and a small count fills it
+fn one_part_key(number: u64) -> Vec<u8> {
+    let mut name = key(number);
+    name[0] = 0x42;
+    name
+}
+
+// a key in the one part past every churn key there, numbered in order
+fn extra_key(number: u64) -> Vec<u8> {
+    let mut name = vec![0xFF; WIDTH as usize - size_of::<u64>()];
+    name[0] = 0x42;
+    name.extend_from_slice(&number.to_be_bytes());
+    name
+}
+
 fn read(store: &Store, name: &[u8]) -> Option<Vec<u8>> {
     let mut value = Vec::new();
     store.get(COLUMN, name, &mut value).expect("get").then_some(value)
@@ -173,6 +192,15 @@ fn rows(mut scan: StoreScan<SimulatedIo>) -> Vec<(Vec<u8>, Vec<u8>)> {
     }
 }
 
+// the first rows of a scan, read no further
+fn first_rows(mut scan: StoreScan<SimulatedIo>, most: usize) -> Rows {
+    let (mut key, mut value, mut found) = (Vec::new(), Vec::new(), Vec::new());
+    while found.len() < most && scan.next_row(&mut key, &mut value).expect("step") == ScanStep::Found {
+        found.push((key.clone(), value.clone()));
+    }
+    found
+}
+
 // whole walks both ways and walks from keys of every width, against the model
 fn check_scans(store: &Store, model: &Model, random: &mut SeededRandom) {
     let forward: Vec<(Vec<u8>, Vec<u8>)> = model.iter().map(|(key, value)| (key.clone(), value.clone())).collect();
@@ -192,11 +220,37 @@ fn check_scans(store: &Store, model: &Model, random: &mut SeededRandom) {
             _ => {},
         }
         let up: Vec<_> = forward.iter().filter(|(name, _value)| *name >= start).take(SCAN_TAKE).cloned().collect();
-        let found: Vec<_> = rows(store.iter_from(COLUMN, &start, Direction::Ascending).expect("scan")).into_iter().take(SCAN_TAKE).collect();
+        let found = first_rows(store.iter_from(COLUMN, &start, Direction::Ascending).expect("scan"), SCAN_TAKE);
         assert_eq!(found, up, "up from {start:?}");
         let down: Vec<_> = backward.iter().filter(|(name, _value)| *name <= start).take(SCAN_TAKE).cloned().collect();
-        let found: Vec<_> = rows(store.iter_from(COLUMN, &start, Direction::Descending).expect("scan")).into_iter().take(SCAN_TAKE).collect();
+        let found = first_rows(store.iter_from(COLUMN, &start, Direction::Descending).expect("scan"), SCAN_TAKE);
         assert_eq!(found, down, "down from {start:?}");
+    }
+    // one untold walk from a random key reads to the end, so its batch grows through every size
+    let start = key(random.below(CHURN_KEYS));
+    let up: Rows = forward.iter().filter(|(name, _value)| *name >= start).cloned().collect();
+    assert_eq!(rows(store.iter_from(COLUMN, &start, Direction::Ascending).expect("scan")), up, "whole walk up from {start:?}");
+    // a scan told its count takes that many rows, and one read on past the count returns the rows after them
+    for told in TOLD_COUNTS {
+        let start = key(random.below(CHURN_KEYS));
+        for direction in [Direction::Ascending, Direction::Descending] {
+            let expected: Rows = match direction {
+                Direction::Ascending => forward.iter().filter(|(name, _value)| *name >= start).take(told + SCAN_TAKE).cloned().collect(),
+                Direction::Descending => backward.iter().filter(|(name, _value)| *name <= start).take(told + SCAN_TAKE).cloned().collect(),
+            };
+            let range = ScanRange { wanted: Some(RowCount(told as u64)), ..from_key(COLUMN, &start, direction) };
+            let mut scan = store.iter(&range).expect("scan");
+            let (mut name, mut value, mut found) = (Vec::new(), Vec::new(), Vec::new());
+            let mut take = |found: &mut Rows, most: usize| {
+                while found.len() < most && scan.next_row(&mut name, &mut value).expect("step") == ScanStep::Found {
+                    found.push((name.clone(), value.clone()));
+                }
+            };
+            take(&mut found, told);
+            assert_eq!(found, expected.iter().take(told).cloned().collect::<Rows>(), "told {told} {direction:?} from {start:?}");
+            take(&mut found, told + SCAN_TAKE);
+            assert_eq!(found, expected, "past told {told} {direction:?} from {start:?}");
+        }
     }
 }
 
@@ -381,16 +435,69 @@ fn past_capacity_stays_right() {
 #[test]
 fn churn_matches_the_model() {
     for seed in seeds(0..CHURN_SEEDS) {
+        let marks = churn(seed, Arm { capacity: CAPACITY, key_of: key, extra: 0 });
+        assert_eq!(marks, (false, true), "seed {seed}");
+    }
+}
+
+// the same churn with every key in one part of the index, so leaves fill and split under it
+#[test]
+fn churn_in_one_part_matches_the_model() {
+    for seed in seeds(0..CHURN_SEEDS) {
+        let marks = churn(seed, Arm { capacity: CAPACITY, key_of: one_part_key, extra: 0 });
+        assert_eq!(marks, (false, true), "seed {seed}");
+    }
+}
+
+// the same churn on an index with room for fewer rows than a seed writes: extra keys put first take it past capacity, and a
+// range delete of them halfway through lets merges and the refill free room
+#[test]
+fn churn_past_capacity_matches_the_model() {
+    let (mut marked, mut cleared) = (0, 0);
+    for seed in seeds(0..CHURN_SEEDS) {
+        let (was_marked, is_cleared) = churn(seed, Arm { capacity: CHURN_CAPACITY, key_of: one_part_key, extra: EXTRA_KEYS });
+        marked += u64::from(was_marked);
+        cleared += u64::from(was_marked && is_cleared);
+    }
+    println!("churn past capacity: {marked} seeds marked, {cleared} cleared");
+    assert!(marked > 0, "no seed went past capacity");
+}
+
+// how one churn runs: the index's declared rows, the keys it writes, and the keys put before the rounds and deleted halfway
+struct Arm {
+    capacity: RowCount,
+    key_of: fn(u64) -> Vec<u8>,
+    extra: u64,
+}
+
+// run one seed's churn, and say whether the index was ever marked and whether it ends with no mark
+fn churn(seed: u64, Arm { capacity, key_of, extra }: Arm) -> (bool, bool) {
+    let is_marked = |store: &Store| store.state.sorted_index(COLUMN).expect("an index").mark().is_some();
+    let mut was_marked = false;
+    {
         let io = SimulatedIo::new(Seed(100 + seed));
         let mut random = SeededRandom::new(Seed(200 + seed));
-        let mut store = open(&io, CAPACITY);
+        let mut store = open(&io, capacity);
         let mut model = Model::new();
-        let written: Vec<Vec<u8>> = (0..CHURN_KEYS).map(key).collect();
+        let written: Vec<Vec<u8>> = (0..CHURN_KEYS).map(key_of).collect();
+        // the extra keys sort together past every churn key of their part, so one range delete takes them all
+        let (first_extra, last_extra) = (extra_key(0), extra_key(extra));
+        for number in 0..extra {
+            store.put(COLUMN, &extra_key(number), b"extra").expect("put");
+            model.insert(extra_key(number), b"extra".to_vec());
+        }
+        if extra > 0 {
+            seal_all(&store, &io);
+        }
         let mut sorted_names = written.clone();
         sorted_names.sort();
         for round in 0..CHURN_ROUNDS {
+            if extra > 0 && round == CHURN_ROUNDS / 2 {
+                store.delete_range(COLUMN, &first_extra, &last_extra).expect("delete range");
+                model.retain(|name, _value| *name < first_extra || *name >= last_extra);
+            }
             for write in 0..CHURN_WRITES {
-                let name = key(random.below(CHURN_KEYS));
+                let name = key_of(random.below(CHURN_KEYS));
                 match random.below(COVER_ONE_IN) {
                     0 => {
                         let at = random.below(CHURN_KEYS) as usize;
@@ -420,15 +527,16 @@ fn churn_matches_the_model() {
                 2 => {
                     store.close().expect("close");
                     drop(store);
-                    store = open(&io, CAPACITY);
+                    store = open(&io, capacity);
                 },
                 _ => {
                     store.flush().expect("flush");
                     io.kill();
                     drop(store);
-                    store = open(&io, CAPACITY);
+                    store = open(&io, capacity);
                 },
             }
+            was_marked |= is_marked(&store);
             check(&store, &model, &written);
             check_scans(&store, &model, &mut random);
             // a count keeps to the segments and takes nothing from the index, and counts what the model holds
@@ -447,12 +555,18 @@ fn churn_matches_the_model() {
             cool(&store, &io);
         }
         check(&store, &model, &written);
-        check_entries(&store, &model);
+        was_marked |= is_marked(&store);
+        // a marked index lacks the rows past its capacity, and with no mark it holds every live key
+        let is_cleared = !is_marked(&store);
+        if is_cleared {
+            check_entries(&store, &model);
+        }
         // a seed whose rounds all end in a reopen seals nothing until here, so the walks run once more over sealed keys
         check_scans(&store, &model, &mut random);
         assert!(store.state.sorted_answers.load(Ordering::Relaxed) > 0);
         assert!(store.state.sorted_scan_keys.load(Ordering::Relaxed) > 0, "no scan key came from the index");
         store.close().expect("close");
+        (was_marked, is_cleared)
     }
 }
 

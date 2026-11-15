@@ -80,7 +80,8 @@ over and over. The waste then spreads across segments that stay mostly alive, so
 ## Limits
 
 A sorted index takes keys of one fixed width, and a column has one index kind, sorted or complete. An index holds the rows
-its column declared. Rows past that mark it, and from then on gets and scans of that column read the footers until the store is
+its column declared. A sorted index also keeps a page for each of its 256 parts, so one declared with a few hundred rows still
+holds more than 16,000 keys 16 bytes wide. Rows past that mark it, and from then on gets and scans of that column read the footers until the store is
 opened again with room for them. A marked index saves no file at close. The maintenance report shows each index's rows, room and
 mark, so an index about to fill shows before it does. A count of the keys under a prefix reads the segments, with or
 without a sorted index. A damaged segment that held range deletes stays damaged until someone clears it, since reel can't

@@ -1383,11 +1383,13 @@ pub fn fill_sorted(index: &SortedKeys, scan: &mut ScanState) {
         if scan.is_sorted_done {
             return;
         }
+        // the index hands out no more entries than the caller still wants, the one asked for now among them
+        let most = BATCH_KEYS.min(usize::try_from(scan.wanted.saturating_sub(scan.asked).saturating_add(1)).unwrap_or(BATCH_KEYS)).max(1);
         let ScanState { sorted, position, is_inclusive, direction, .. } = scan;
         let from = ScanFrom::Key { key: position, is_inclusive: *is_inclusive };
         let is_done = match direction {
-            Direction::Ascending => index.read_after(from, BATCH_KEYS, sorted),
-            Direction::Descending => index.read_before(from, BATCH_KEYS, sorted),
+            Direction::Ascending => index.read_after(from, most, sorted),
+            Direction::Descending => index.read_before(from, most, sorted),
         };
         scan.sorted_next = 0;
         scan.is_sorted_done = is_done;

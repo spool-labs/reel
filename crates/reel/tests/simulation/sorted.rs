@@ -600,6 +600,7 @@ fn a_wanted_count_caps_the_batch() {
             let step = store.state.step_scan(&mut scan, &mut name, reel::engine::scan_path::ScanWant::Value(&mut value)).expect("step");
             assert_eq!(step, ScanStep::Found);
             assert!(scan.batch.entries.len() as u64 <= wanted, "{} located for {wanted} wanted", scan.batch.entries.len());
+            assert!(scan.sorted.len() as u64 <= wanted, "{} index entries for {wanted} wanted", scan.sorted.len());
             found.push((name.clone(), value.clone()));
         }
         let expected: Vec<_> = model.iter().take(wanted.min(KEYS) as usize).map(|(name, value)| (name.clone(), value.clone())).collect();

@@ -336,13 +336,13 @@ impl<Backend: Io> RewriteJob<Backend> {
         // counter is read before the lists, so a merge that starts or ends after them changes the next stamp
         let merges = volume.overlap_changes.load(Ordering::Acquire);
         let mut held = [[SegmentNumber(0); MOST_MERGE_SEGMENTS]; MOST_VOLUME_SLOTS + 1];
-        for (lane, inputs) in volume.lanes.iter().zip(held.iter_mut()) {
-            if lane.is_overlap.load(Ordering::Acquire) {
-                *inputs = *hold(&lane.inputs);
-                debug_assert!(inputs[0].0 != 0, "an overlap merge holds no inputs");
-            }
+        let mut running = 0;
+        // a worker clears a lane's inputs before its flag, so a lane can read as merging with none, and it groups nothing
+        for lane in volume.lanes.iter().filter(|lane| lane.is_overlap.load(Ordering::Acquire)) {
+            held[running] = *hold(&lane.inputs);
+            running += 1;
         }
-        let merge_of = |segment: SegmentNumber| held.iter().position(|inputs| inputs.contains(&segment));
+        let merge_of = |segment: SegmentNumber| held[..running].iter().position(|inputs| inputs.contains(&segment));
         let answers = (&mut self.crowd_answers, filters, merges);
         // a filter that arrives only loosens a bound, and one that leaves with its segment takes the segment out of the crowd too, so
         // a pass holds until a segment that stays loses its filters, or the filters are held out or the sizing changes

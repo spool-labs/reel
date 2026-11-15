@@ -1284,8 +1284,8 @@ const CROWD_BUDGET: ByteCount = ByteCount(256 * 1024 * 1024);
 const QUIET_ROUNDS: usize = 40;
 
 // a store with a seat a worker, and the overlap bound held at its least
-fn open_crowd(io: &SimulatedIo) -> Store {
-    let config = StoreConfig {
+fn open_crowd_config() -> StoreConfig {
+    StoreConfig {
         memory_budget: CROWD_BUDGET,
         threads: reel::config::ThreadCounts { maintenance_workers: Some(CROWD_WORKERS), ..reel::config::NO_WORKERS },
         volumes: vec![VolumeConfig {
@@ -1304,7 +1304,11 @@ fn open_crowd(io: &SimulatedIo) -> Store {
             sorted_rows: None,
             least_value: None,
         }],
-    };
+    }
+}
+
+fn open_crowd(io: &SimulatedIo) -> Store {
+    let config = open_crowd_config();
     let store = ReelStore::open(io.clone(), &config).expect("open");
     let volume = &store.state.volumes[0];
     volume.holds.reclaim.store(true, Ordering::Release);
@@ -1408,5 +1412,91 @@ fn a_given_up_merge_leaves_the_point_crowded() {
     let before = overlap(volume);
     job.hand_out();
     assert_eq!(overlap(volume) - before, 1, "the point read clear after the merge over it gave up");
+    store.close().expect("close");
+}
+
+const SPLIT_BUDGET: ByteCount = ByteCount(80 * 1024 * 1024);
+const SPLIT_WORKERS: usize = 2;
+const SPLIT_KEYS: u64 = 2_500;
+const SPLIT_VALUE_BYTES: usize = 3_000;
+const SPLIT_SEGMENTS: u64 = 39;
+
+// a lane a worker has cleared the inputs of and not yet its flag reads as merging with no inputs, groups nothing, and leaves the
+// pick as it was
+#[test]
+fn an_overlap_lane_with_no_inputs_groups_nothing() {
+    let io = SimulatedIo::new(Seed(75));
+    let store = open_crowd(&io);
+    let volume = &store.state.volumes[0];
+    // the last lane is no early seat's, so the second seat's pick sees one real merge and this empty lane beside it
+    let last = volume.lanes.len() - 1;
+    volume.lanes[last].is_overlap.store(true, Ordering::Release);
+    let (_job, merges, inputs) = crowd_hand_out(&io, &store, 36);
+    assert_eq!((merges, inputs), (1, 8));
+    volume.lanes[last].is_overlap.store(false, Ordering::Release);
+    store.close().expect("close");
+}
+
+// 39 segments large enough that one merge of 8 writes more than one output: counted once the merge brings the point to exactly
+// 32, so one count too many would start a second merge on the free seat. While it copies, and after its install with each
+// output counted as itself, nothing else starts
+#[test]
+fn a_merge_counts_once_mid_copy_and_by_its_outputs_after() {
+    let io = SimulatedIo::new(Seed(76));
+    let config = StoreConfig {
+        memory_budget: SPLIT_BUDGET,
+        threads: reel::config::ThreadCounts { maintenance_workers: Some(SPLIT_WORKERS), ..reel::config::NO_WORKERS },
+        ..open_crowd_config()
+    };
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let volume = &store.state.volumes[0];
+    volume.holds.reclaim.store(true, Ordering::Release);
+    volume.holds.small_bound.store(true, Ordering::Release);
+    volume.holds.compaction.store(true, Ordering::Release);
+    let value = vec![7; SPLIT_VALUE_BYTES];
+    let mut number: u64 = 0;
+    for _segment in 0..SPLIT_SEGMENTS {
+        for _key in 0..SPLIT_KEYS {
+            store.put(COLUMN, &number.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes(), &value).expect("put");
+            number += 1;
+        }
+        store.seal_now();
+        settle(&io);
+    }
+    let until = store.state.quiet_at(io.clock_reading());
+    io.advance_clock(Nanoseconds(until.0.saturating_sub(io.clock_reading().0)));
+    settle(&io);
+    volume.holds.compaction.store(false, Ordering::Release);
+    let overlap = || volume.picks[reel_api::maintenance_report::PickOutcome::Overlap.index()].load(Ordering::Acquire);
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    job.hand_out();
+    assert_eq!(overlap(), 1);
+    let seats = Arc::clone(&job.seats);
+    let seat = seats.iter().find(|seat| hold(&seat.job).as_ref().is_some_and(|rewrite| rewrite.is_claimed())).expect("a claimed seat");
+    {
+        let mut held = hold(&seat.job);
+        let rewrite = held.as_mut().expect("a rewrite");
+        assert!(rewrite.begin());
+        while rewrite.phase != reel::engine::rewrite_job::RewritePhase::Copying {
+            rewrite.step();
+        }
+        rewrite.step();
+        assert!(rewrite.is_running(), "the merge ended before the mid-copy look");
+    }
+    job.hand_out();
+    assert_eq!(overlap(), 1, "a look mid-copy counted the merge's inputs apart");
+    {
+        let mut held = hold(&seat.job);
+        let rewrite = held.as_mut().expect("a rewrite");
+        while rewrite.is_running() {
+            rewrite.step();
+        }
+    }
+    let mut report = MaintenanceReport::default();
+    store.maintenance_report(&mut report);
+    let segments = report.volumes[0].segment_count.0;
+    assert!(segments >= SPLIT_SEGMENTS - 8 + 2, "the merge wrote one output, so nothing split: {segments}");
+    job.hand_out();
+    assert_eq!(overlap(), 1, "a look after the install started a merge");
     store.close().expect("close");
 }

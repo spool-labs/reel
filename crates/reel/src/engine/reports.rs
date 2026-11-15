@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use reel_api::column_id::ColumnId;
 use reel_api::maintenance_report::{UNIT_KINDS, MaintenanceMemory, 
-    CompleteReading, JOB_KINDS, JobKind, JobState, LeastValueReading, MOST_REPORTED_LANES, MaintenanceReport, PaceReading, PauseCause, RewriteBytes, UnitKind, VolumeReading,
+    CompleteReading, JOB_KINDS, JobKind, JobState, LeastValueReading, MOST_REPORTED_LANES, MaintenanceReport, PaceReading, PauseCause, RewriteBytes, SortedReading, UnitKind, VolumeReading,
     WriteSource,
 };
 use reel_api::store_error::StoreError;
@@ -188,8 +188,6 @@ impl<Backend: Io> EngineState<Backend> {
         report.sorted_scan_keys = self.sorted_scan_keys.load(Ordering::Relaxed);
         report.sorted_runs = self.sorted_runs.load(Ordering::Relaxed);
         report.sorted_moves_missed = self.sorted_moves_missed.load(Ordering::Relaxed);
-        report.sorted_past_capacity = self.sorted.iter().flatten().map(|index| index.past_capacity().0).sum();
-        report.sorted_entries = self.sorted.iter().flatten().map(|index| index.entry_count().0).sum();
         for volume in &self.volumes {
             for row in hold(&volume.summary).rows() {
                 let rows = rows_of(&row);
@@ -267,11 +265,17 @@ impl<Backend: Io> EngineState<Backend> {
             let unbacked: u64 = rows.rows().map(|row| volume.table.unbacked(row.facts.segment, walk)).sum();
             let claims = hold(&volume.claims);
             let open_bytes: u64 = claims.open.iter().map(|segment| segment.write_end.0).sum();
+            let open_with_rows = claims.open.iter().filter(|segment| segment.row_count.0 > 0).count() as u64;
             let preallocated: u64 = claims.open.iter().map(|segment| segment.reserved_end.0.saturating_sub(segment.write_end.0)).sum();
             drop(claims);
             report.volumes.push(VolumeReading {
                 volume: VolumeId(index as u8),
                 segment_count: SegmentCount(segment_count),
+                rows_in_index: RowCount(volume.rows_in_index.load(Ordering::Acquire)),
+                open_segments_with_rows: SegmentCount(open_with_rows),
+                pending_covers: volume.covers.len() as u64,
+                covers_held_by_cues: volume.covers_held_by_cues.load(Ordering::Acquire),
+                settle_retries: volume.settle_retries.load(Ordering::Acquire),
                 used_bytes: ByteCount(used_bytes),
                 is_spinning: volume.is_spinning,
                 is_device_set: volume.is_device_set,
@@ -367,8 +371,21 @@ impl<Backend: Io> EngineState<Backend> {
                 report.complete_columns.push(CompleteReading {
                     column: ColumnId(id as u8),
                     has_table: table.is_some(),
-                    used_slots: table.map_or(RowCount(0), CompleteTable::used_slots),
+                    used: table.map_or(RowCount(0), CompleteTable::used_slots),
+                    capacity: RowCount(table.map_or(0, |table| table.slot_count() as u64)),
                     rows_past_capacity: table.map_or(RowCount(0), CompleteTable::past_capacity),
+                    is_marked: table.is_some_and(|table| table.mark().is_some()),
+                });
+            }
+        }
+        for (id, index) in self.sorted.iter().enumerate() {
+            if let Some(index) = index {
+                report.sorted_columns.push(SortedReading {
+                    column: ColumnId(id as u8),
+                    used: index.entry_count(),
+                    capacity: index.told_rows(),
+                    rows_past_capacity: index.past_capacity(),
+                    is_marked: index.mark().is_some(),
                 });
             }
         }

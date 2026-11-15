@@ -140,6 +140,8 @@ pub struct SortedKeys {
     entries: AtomicU64,
     mark: AtomicU64,
     past_capacity: AtomicU64,
+    /// The rows the column was told to hold, which sized the pool
+    told_rows: RowCount,
 }
 
 impl PackedKey {
@@ -264,6 +266,7 @@ impl SortedKeys {
             entries: AtomicU64::new(0),
             mark: AtomicU64::new(NO_MARK),
             past_capacity: AtomicU64::new(0),
+            told_rows: rows,
         }
         .chained()
     }
@@ -311,6 +314,11 @@ impl SortedKeys {
     /// Count the entries, graves among them
     pub fn entry_count(&self) -> RowCount {
         RowCount(self.entries.load(Memory::Acquire))
+    }
+
+    /// Read the rows the column was told to hold
+    pub fn told_rows(&self) -> RowCount {
+        self.told_rows
     }
 
     /// Read how many rows found no room

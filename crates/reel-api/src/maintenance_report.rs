@@ -269,6 +269,14 @@ pub struct JobReport {
 pub struct VolumeReading {
     pub volume: VolumeId,
     pub segment_count: SegmentCount,
+    /// Rows in the write index not yet sealed, and the open segments that hold them: what a scan meets beside the sealed segments
+    pub rows_in_index: RowCount,
+    pub open_segments_with_rows: SegmentCount,
+    /// Range deletes waiting in the pool, looks that left one there because a cue below it could read rows under it, and looks
+    /// given up because a rewrite or an unlink landed while they ran
+    pub pending_covers: u64,
+    pub covers_held_by_cues: u64,
+    pub settle_retries: u64,
     pub used_bytes: ByteCount,
     pub is_spinning: bool,
     /// The class came from the config, where a false here means it was detected
@@ -538,13 +546,29 @@ pub const SPAN_RUN_BUCKETS: usize = 16;
 /// Lanes a volume reading has room for. Workers past this show in the last one
 pub const MOST_REPORTED_LANES: usize = 16;
 
-/// How a complete column stands. A read-only view has no table, and reads through the footers
+/// How a complete column stands: the slots it uses and has, the rows that found no slot, and whether those put a mark on it.
+/// A marked table sends reads past it to the footers until a refill clears the mark. A read-only view has no table, and reads
+/// through the footers
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CompleteReading {
     pub column: ColumnId,
     pub has_table: bool,
-    pub used_slots: RowCount,
+    pub used: RowCount,
+    pub capacity: RowCount,
     pub rows_past_capacity: RowCount,
+    pub is_marked: bool,
+}
+
+/// How a sorted column's index stands: its entries, graves among them, the rows it was told to hold, the rows past its room,
+/// and whether those put a mark on it. A marked index sends every get and scan of its column to the segments until a refill
+/// clears the mark, so entries near the told rows say the next writes go past it
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SortedReading {
+    pub column: ColumnId,
+    pub used: RowCount,
+    pub capacity: RowCount,
+    pub rows_past_capacity: RowCount,
+    pub is_marked: bool,
 }
 
 /// How a column that declares a least value stands: the values written under it since open, which land as any other and size
@@ -616,13 +640,11 @@ pub struct MaintenanceReport {
     pub sorted_runs: u64,
     /// Output row blocks a merge's install couldn't read to move sorted entries
     pub sorted_moves_missed: u64,
-    /// Rows past a sorted index's room, and its entries, graves among them
-    pub sorted_past_capacity: u64,
-    pub sorted_entries: u64,
     /// Walk block lookups run together: blocks, candidates asked, candidates whose range held the whole block, per-key checks
     pub block_lookups: [u64; 4],
     pub volumes: Vec<VolumeReading>,
     pub complete_columns: Vec<CompleteReading>,
+    pub sorted_columns: Vec<SortedReading>,
     pub least_value_columns: Vec<LeastValueReading>,
     pub graves_at_open: RowCount,
     pub deletes_since_open: RowCount,
@@ -689,6 +711,7 @@ impl MaintenanceReport {
     pub fn clear(&mut self) {
         self.volumes.clear();
         self.complete_columns.clear();
+        self.sorted_columns.clear();
         self.least_value_columns.clear();
     }
 
@@ -724,11 +747,10 @@ impl MaintenanceReport {
             sorted_scan_keys: 0,
             sorted_runs: 0,
             sorted_moves_missed: 0,
-            sorted_past_capacity: 0,
-            sorted_entries: 0,
             block_lookups: [0; 4],
             volumes: Vec::new(),
             complete_columns: Vec::new(),
+            sorted_columns: Vec::new(),
             least_value_columns: Vec::new(),
             graves_at_open: RowCount::default(),
             deletes_since_open: RowCount::default(),

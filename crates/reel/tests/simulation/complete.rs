@@ -425,7 +425,7 @@ fn reports_the_table() {
     store.maintenance_report(&mut report);
     let reading = report.complete_columns.first().copied().expect("a reading");
     assert!(reading.has_table);
-    assert_eq!(reading.used_slots, RowCount(1));
+    assert_eq!(reading.used, RowCount(1));
     assert_eq!(reading.rows_past_capacity, RowCount(0));
 
     let view = ReelStore::open_read_only(io.clone(), &config(CAPACITY)).expect("open read-only");

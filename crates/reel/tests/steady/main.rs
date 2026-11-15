@@ -649,15 +649,16 @@ fn sorted_counts(store: &Store) -> (MaintenanceReport, u64) {
 // the window read through the index, scanned it and sealed into it, and no row passed the declared capacity, so the mark
 // never set and the fallback took no part
 fn check_sorted((before, seals_before): (MaintenanceReport, u64), (after, seals_after): (MaintenanceReport, u64)) -> u64 {
+    let past: u64 = after.sorted_columns.iter().map(|column| column.rows_past_capacity.0).sum();
     println!(
         "sorted in the window: {} answers, {} scan keys, {} seals, {} past capacity",
         after.sorted_answers - before.sorted_answers,
         after.sorted_scan_keys - before.sorted_scan_keys,
         seals_after - seals_before,
-        after.sorted_past_capacity,
+        past,
     );
     let is_exercised = after.sorted_answers > before.sorted_answers && after.sorted_scan_keys > before.sorted_scan_keys && seals_after > seals_before;
-    u64::from(!is_exercised || after.sorted_past_capacity > 0)
+    u64::from(!is_exercised || past > 0)
 }
 
 // the seal fills a complete table and a sorted index in the window, which only a budget of 512 MiB has room for

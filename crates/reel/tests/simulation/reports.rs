@@ -683,3 +683,55 @@ fn reopened_slots(has_wide: bool) -> usize {
 fn wide_column_leaves_the_cache_plan() {
     assert_eq!(reopened_slots(true), reopened_slots(false));
 }
+
+fn volume_reading(store: &Store) -> reel_api::maintenance_report::VolumeReading {
+    let mut report = MaintenanceReport::default();
+    store.maintenance_report(&mut report);
+    report.volumes[0]
+}
+
+// the rows a scan meets in the write index, and the open segments holding them, as a volume reading: the rows put and one
+// segment while they sit open, and none once they seal
+#[test]
+fn a_volume_reports_its_open_rows() {
+    let io = SimulatedIo::new(Seed(160));
+    let store = open(&io);
+    for number in 0..KEYS {
+        store.put(COLUMN, format!("key-{number:03}").as_bytes(), VALUE).expect("put");
+    }
+    let reading = volume_reading(&store);
+    assert_eq!(reading.rows_in_index, RowCount(KEYS), "{reading:?}");
+    assert_eq!(reading.open_segments_with_rows, SegmentCount(1), "{reading:?}");
+    store.seal_now();
+    settle(&io);
+    let reading = volume_reading(&store);
+    assert_eq!(reading.rows_in_index, RowCount(0), "{reading:?}");
+    assert_eq!(reading.open_segments_with_rows, SegmentCount(0), "{reading:?}");
+    store.close().expect("close");
+}
+
+// a range delete a cue below it holds in the pool shows as a pending cover and as looks the cue held, and both settle once the
+// cue goes
+#[test]
+fn a_volume_reports_covers_a_cue_holds() {
+    let io = SimulatedIo::new(Seed(161));
+    let store = open(&io);
+    for number in 0..KEYS {
+        store.put(COLUMN, format!("key-{number:03}").as_bytes(), VALUE).expect("put");
+    }
+    let cue = store.cue().expect("cue below the cover");
+    store.delete_range(COLUMN, b"key-", b"key-~").expect("delete range");
+    store.seal_now();
+    settle(&io);
+    store.state.ask_compaction();
+    settle(&io);
+    let held = volume_reading(&store);
+    assert_eq!(held.pending_covers, 1, "{held:?}");
+    assert!(held.covers_held_by_cues > 0, "{held:?}");
+    drop(cue);
+    store.state.ask_compaction();
+    settle(&io);
+    let gone = volume_reading(&store);
+    assert_eq!(gone.pending_covers, 0, "{gone:?}");
+    store.close().expect("close");
+}

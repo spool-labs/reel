@@ -369,7 +369,8 @@ fn past_capacity_stays_right() {
     }
     seal_all(&store, &io);
     assert!(store.state.sorted_index(COLUMN).expect("an index").mark().is_some());
-    assert!(report(&store).sorted_past_capacity > 0);
+    let reading = report(&store).sorted_columns.iter().find(|reading| reading.column == COLUMN).copied().expect("a reading");
+    assert!(reading.rows_past_capacity.0 > 0 && reading.is_marked && reading.capacity == SMALL_CAPACITY, "{reading:?}");
     let before = report(&store).sorted_footer_asks;
     check(&store, &model, &written);
     assert!(report(&store).sorted_footer_asks > before, "reads past the mark asked the footers");

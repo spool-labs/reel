@@ -722,7 +722,7 @@ impl<Backend: Io> WalkJob<Backend> {
         let started = state.io.now();
         let cpu_started = thread_cpu();
         let outcome = self.counter.count(volume, target, &mut counts);
-        state.note_unit_cpu(UnitKind::WalkBlock, counts.rows, started, cpu_started);
+        state.note_unit(UnitKind::WalkBlock, counts.rows, started, cpu_started);
         let landing = outcome.and_then(|next_block| self.land(volume, target, next_block, &mut counts));
         self.counts = counts;
         match landing? {
@@ -854,8 +854,9 @@ impl<Backend: Io> WalkJob<Backend> {
             return JobStep::Idle;
         };
         let started = self.state.io.now();
+        let cpu_started = thread_cpu();
         let applied = self.apply.step();
-        self.state.note_unit(UnitKind::CoverApply, 1, started);
+        self.state.note_unit(UnitKind::CoverApply, 1, started, cpu_started);
         match applied {
             Ok(ApplyStep::Working) => JobStep::Worked,
             Ok(ApplyStep::Done) => {
@@ -1094,7 +1095,7 @@ impl<Backend: Io> WalkWorker<Backend> {
         let started = state.io.now();
         let cpu_started = thread_cpu();
         let counted = self.counter.count(volume, *target, counts);
-        state.note_unit_cpu(UnitKind::WalkBlock, counts.rows, started, cpu_started);
+        state.note_unit(UnitKind::WalkBlock, counts.rows, started, cpu_started);
         let phase = match counted {
             Ok(position) => {
                 *next_block = position;

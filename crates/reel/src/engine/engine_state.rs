@@ -12,6 +12,7 @@ use reel_api::memory_report::MemoryReport;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, SegmentCount, WritePlace};
 
+use crate::engine::reports::thread_cpu;
 use crate::engine::caller_activity::CallerCounts;
 use crate::io::wake_line::WakeLine;
 use crate::engine::dead_bits::{CHUNK_WORDS, DEAD_BITS_SAVE_PERIOD, chunk_sum};
@@ -316,15 +317,16 @@ impl<Backend: Io> EngineState<Backend> {
         volume.summary_saves.fetch_add(1, Ordering::Relaxed);
         volume.summary_buffer.with(|buffer| {
             let started = self.io.now();
+            let cpu_started = thread_cpu();
             buffer.clear();
             let rows = hold(&volume.summary);
             buffer.extend_from_slice(rows.bytes());
             let forward = rows.highest_forward;
             drop(rows);
             let bytes = buffer.len() as u64;
-            self.note_unit(UnitKind::SummaryCopy, bytes, started);
+            self.note_unit(UnitKind::SummaryCopy, bytes, started, cpu_started);
             let saved = write_summary(&self.io, &volume.summary_paths, self.read_point(volume), forward, buffer);
-            self.note_unit(UnitKind::SummarySave, bytes, started);
+            self.note_unit(UnitKind::SummarySave, bytes, started, cpu_started);
             self.note_written(WriteSource::Summaries, ByteCount(bytes));
             // the bits are a saving of work, so a save of them that fails leaves the summary saved and its rows ask
             let _bits = self.save_dead_bits_if_due(volume);

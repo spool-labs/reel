@@ -54,17 +54,11 @@ impl<Backend: Io> EngineState<Backend> {
         self.tallies[kind.index()].note_moved(bytes, self.io.now());
     }
 
-    /// Note one maintenance unit's work and how long it ran from its start
-    pub fn note_unit(&self, kind: UnitKind, work: u64, started: Nanoseconds) {
-        let time = Nanoseconds(self.io.now().0.saturating_sub(started.0));
-        self.units[kind.index()].note(work, time);
-    }
-
     /// Note one unit's work, how long it ran and the thread's CPU time in it, from a start read with `thread_cpu`
-    pub fn note_unit_cpu(&self, kind: UnitKind, work: u64, started: Nanoseconds, cpu_started: Nanoseconds) {
+    pub fn note_unit(&self, kind: UnitKind, work: u64, started: Nanoseconds, cpu_started: Nanoseconds) {
         let time = Nanoseconds(self.io.now().0.saturating_sub(started.0));
         let cpu = Nanoseconds(thread_cpu().0.saturating_sub(cpu_started.0));
-        self.units[kind.index()].note_cpu(work, time, cpu);
+        self.units[kind.index()].note(work, time, cpu);
     }
 
     /// Count a corruption error on its way to a caller

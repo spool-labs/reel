@@ -238,7 +238,7 @@ pub struct UnitReading {
     pub work_sum: u64,
     /// The time every unit ran
     pub time_sum: Nanoseconds,
-    /// The thread's CPU time in the longest unit, where a test build reads it, so a long unit shows whether it worked or waited
+    /// The most thread CPU one unit took, where a test build reads it, so a long unit shows whether it worked or waited
     pub cpu: Nanoseconds,
 }
 

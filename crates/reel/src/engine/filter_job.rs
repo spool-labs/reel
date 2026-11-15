@@ -8,6 +8,7 @@ use reel_api::column_id::ColumnId;
 use reel_api::maintenance_report::{PickKind, UnitKind};
 use reel_api::units::FileOffset;
 
+use crate::engine::reports::thread_cpu;
 use crate::engine::engine_state::EngineState;
 use crate::engine::volume::Volume;
 use crate::io::{Io, IoFile};
@@ -69,8 +70,9 @@ impl<Backend: Io> FilterLoader<Backend> {
             return false;
         };
         let started = state.io.now();
+        let cpu_started = thread_cpu();
         let loaded = self.load_some(volume, segment);
-        state.note_unit(UnitKind::FilterLoad, self.loaded, started);
+        state.note_unit(UnitKind::FilterLoad, self.loaded, started, cpu_started);
         if !loaded {
             state.filter_arena.drop_segment(segment);
             state.filter_arena.note_loss();

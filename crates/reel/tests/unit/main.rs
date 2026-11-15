@@ -12,6 +12,7 @@ mod crowd_answers;
 mod damage_list;
 mod device_error;
 mod filter_arena;
+mod job_tally;
 mod engine_sizing;
 mod lifetime;
 mod lz4_block;

@@ -17,6 +17,7 @@ use reel_api::maintenance_report::{JobKind, PickKind, PickOutcome, UnitKind};
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, Nanoseconds, WritePlace};
 
+use crate::engine::reports::thread_cpu;
 use crate::config::MAX_KEY_BYTES;
 use crate::engine::complete_path::{REFILL_STEP_BLOCKS, Refill};
 use crate::engine::cover_apply::is_in_range;
@@ -203,6 +204,7 @@ impl<Backend: Io> CompactJob<Backend> {
     /// Step once: try the next segment the counts call dead, or nothing when none is
     pub fn step_unit(&mut self, now: Nanoseconds) -> JobStep {
         let started = self.state.io.now();
+        let cpu_started = thread_cpu();
         self.unit = None;
         let step = match self.step_work(now) {
             JobStep::Idle if self.has_parked() => JobStep::IdleUntil { deadline: Nanoseconds(now.0 + PARKED_RETRY.0) },
@@ -211,7 +213,7 @@ impl<Backend: Io> CompactJob<Backend> {
         // a rewrite's step notes its own unit, the same on the planner and on a worker
         self.last_unit = self.unit.map(|(kind, _work)| kind);
         if let Some((kind, work)) = self.unit.take() {
-            self.state.note_unit(kind, work, started);
+            self.state.note_unit(kind, work, started, cpu_started);
         }
         step
     }
@@ -288,9 +290,10 @@ impl<Backend: Io> CompactJob<Backend> {
         }
         // a refill or a sweep takes one step and the rest still runs, so a long pass holds back no pick and no merge
         let started = self.state.io.now();
+        let cpu_started = thread_cpu();
         self.did_background = self.step_refill() || self.step_sweep();
         if let Some((kind, work)) = self.unit.take() {
-            self.state.note_unit(kind, work, started);
+            self.state.note_unit(kind, work, started, cpu_started);
         }
         match self.step_rest(now) {
             JobStep::Idle | JobStep::IdleUntil { .. } if self.did_background => JobStep::Worked,

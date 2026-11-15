@@ -13,6 +13,7 @@ use reel_api::maintenance_report::{
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, WritePlace};
 
+use crate::engine::reports::thread_cpu;
 use crate::engine::dead_bits::{BIT_SAMPLE_EVERY, DECIDED_ASKED, DECIDED_CLEAR, DECIDED_SET, DECIDED_SHORT, DECIDED_WRONG, INEXACT_SHORT};
 use crate::engine::read_path::SealedRow;
 use crate::engine::open_segment::output_path;
@@ -131,9 +132,10 @@ impl<Backend: Io> RewriteJob<Backend> {
         // a claimed pick maps and carves here, on the thread that runs it, as a unit of its own
         if self.claimed.is_some() {
             let started = self.state.io.now();
+            let cpu_started = thread_cpu();
             let need = self.admitted.map_or(0, |(admit, _bound)| admit.need.0);
             if self.begin() {
-                self.state.note_unit(UnitKind::Start, need, started);
+                self.state.note_unit(UnitKind::Start, need, started, cpu_started);
             }
             return;
         }
@@ -141,6 +143,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             return;
         };
         let started = self.state.io.now();
+        let cpu_started = thread_cpu();
         self.unit = (UnitKind::MergeRows, 0);
         let phase = self.phase;
         let outcome = match self.phase {
@@ -165,7 +168,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         };
         let read: u64 = self.inputs.iter_mut().map(|input| mem::take(&mut input.read_bytes)).sum();
         self.state.volumes[self.volume].footer_reads[pass].fetch_add(read, Ordering::Relaxed);
-        self.state.note_unit(self.unit.0, self.unit.1, started);
+        self.state.note_unit(self.unit.0, self.unit.1, started, cpu_started);
         if outcome.is_err() {
             // a lost or rotten block fails every merge it joins, so its segment is damage the way a get would find it
             if let Some(segment) = self.unreadable.take() {

@@ -66,8 +66,11 @@ const SMALL_BYTES: usize = 100;
 const CHUNKED_BYTES: usize = 200_000;
 const BURST_RECORDS: usize = 8_000;
 const BURST_FREES: usize = BURST_RECORDS / 2;
-/// The longest any unit with a work bound may run on real files, a small multiple of the worst measured on the churn and insert arms
+/// The most thread CPU any unit with a work bound may take on real files, a small multiple of the worst measured on the churn and
+/// insert arms. Maintenance threads run at the lowest priority, so their wall time on a busy machine measures the scheduler
 const UNIT_TIME_LINE: Nanoseconds = Nanoseconds(100_000_000);
+/// The most wall time any unit with a work bound may take, ten times the CPU line, so a stall on a read or a sync still fails
+const UNIT_WALL_LINE: Nanoseconds = Nanoseconds(10 * UNIT_TIME_LINE.0);
 const LONG_GET_BYTES: usize = 4 * 1024 * 1024;
 const ROUNDS: usize = 1_500;
 const FLUSH_ROUNDS: usize = 64;
@@ -870,8 +873,14 @@ fn check_units(store: &Store) -> u64 {
     for (kind, reading) in UNIT_KINDS.iter().zip(&report.longest_units) {
         let bound = unit_bound(*kind);
         println!("unit {kind:?}: {} work, {} us, {} us of thread CPU", reading.work, reading.time.0 / 1_000, reading.cpu.0 / 1_000);
-        if bound.is_some_and(|bound| reading.work > bound) || (bound.is_some() && reading.time > UNIT_TIME_LINE) {
-            println!("unit {kind:?} is past its bound {bound:?} or the {} ms line", UNIT_TIME_LINE.0 / 1_000_000);
+        let is_past = bound.is_some_and(|bound| reading.work > bound) || (bound.is_some() && (reading.cpu > UNIT_TIME_LINE || reading.time > UNIT_WALL_LINE));
+        if is_past {
+            println!("unit {kind:?} is past its bound {bound:?}, the {} ms CPU line or the {} ms wall line", UNIT_TIME_LINE.0 / 1_000_000, UNIT_WALL_LINE.0 / 1_000_000);
+            failures += 1;
+        }
+        // a kind that did work and read no CPU has lost its clock, and a CPU line over it would pass anything
+        if bound.is_some() && reading.work > 0 && reading.cpu.0 == 0 {
+            println!("unit {kind:?} did work and read no thread CPU");
             failures += 1;
         }
     }

@@ -39,7 +39,7 @@ impl JobTally {
     }
 }
 
-/// The largest unit of one kind so far, in work and in wall time, and the sums over every unit
+/// The largest unit of one kind so far, in work, in wall time and in thread CPU, and the sums over every unit
 #[derive(Debug, Default)]
 pub struct UnitTally {
     work: AtomicU64,
@@ -53,17 +53,11 @@ pub struct UnitTally {
 pub type UnitTallies = [UnitTally; UNIT_KINDS.len()];
 
 impl UnitTally {
-    /// Note one unit's work and how long it ran
-    pub fn note(&self, work: u64, time: Nanoseconds) {
-        self.note_cpu(work, time, Nanoseconds(0));
-    }
-
-    /// Note one unit's work, how long it ran and the thread's CPU time in it, kept for the longest unit
-    pub fn note_cpu(&self, work: u64, time: Nanoseconds, cpu: Nanoseconds) {
+    /// Note one unit's work, how long it ran and the thread's CPU time in it, each kept as its own largest
+    pub fn note(&self, work: u64, time: Nanoseconds, cpu: Nanoseconds) {
         self.work.fetch_max(work, Ordering::Relaxed);
-        if self.time.fetch_max(time.0, Ordering::Relaxed) < time.0 {
-            self.cpu.store(cpu.0, Ordering::Relaxed);
-        }
+        self.time.fetch_max(time.0, Ordering::Relaxed);
+        self.cpu.fetch_max(cpu.0, Ordering::Relaxed);
         self.work_sum.fetch_add(work, Ordering::Relaxed);
         self.time_sum.fetch_add(time.0, Ordering::Relaxed);
     }

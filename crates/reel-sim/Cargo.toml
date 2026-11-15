@@ -1,8 +1,13 @@
 [package]
-name = "reel-sim"
+name = "tape-reel-sim"
 version.workspace = true
 edition.workspace = true
 publish = false
+license.workspace = true
+
+[lib]
+name = "reel_sim"
+path = "src/lib.rs"
 
 [dependencies]
 reel = { workspace = true, features = ["test-hooks"] }

@@ -1,7 +1,19 @@
 [package]
-name = "reel"
+name = "tape-reel"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["key-value", "storage", "log-structured", "database", "embedded"]
+categories = ["database", "database-implementations", "data-structures", "filesystem"]
+description = "A log-structured key-value store: sequential writes, immutable segments, whole-segment reclaim"
+exclude = ["tests/"]
+
+[lib]
+name = "reel"
+path = "src/lib.rs"
 
 [dependencies]
 libc.workspace = true
@@ -15,7 +27,7 @@ io-uring = "0.7"
 [dev-dependencies]
 libc.workspace = true
 # the tests reach the hooks whatever the command line says
-reel = { path = ".", features = ["test-hooks"] }
+reel = { package = "tape-reel", path = ".", features = ["test-hooks"] }
 reel-sim.workspace = true
 
 [lints]

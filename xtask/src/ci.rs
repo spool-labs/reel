@@ -25,15 +25,15 @@ pub const NODE_CLIPPY_ARGUMENTS: [&str; 8] = ["clippy", "--workspace", "--lib", 
 pub const TEST_ARGUMENTS: [&str; 6] = ["test", "--workspace", "--locked", "--no-fail-fast", "--features", TEST_HOOKS];
 /// Cargo arguments for the pick gate: every kind of pick at 100,000 segments a volume, timed in a release build against its line
 pub const PICK_GATE_ARGUMENTS: [&str; 12] =
-    ["test", "--release", "--locked", "-p", "reel", "--features", TEST_HOOKS, "--test", "simulation", "picks::", "--", "--nocapture"];
+    ["test", "--release", "--locked", "-p", "tape-reel", "--features", TEST_HOOKS, "--test", "simulation", "picks::", "--", "--nocapture"];
 /// The feature that lets the sims set a volume's worker count, which no node build turns on
-pub const TEST_HOOKS: &str = "reel/test-hooks";
+pub const TEST_HOOKS: &str = "tape-reel/test-hooks";
 /// Cargo arguments for the workers pass: the planner-facing sims again, with a worker beside each planner as a node runs
 pub const WORKERS_PASS_ARGUMENTS: [&str; 13] = [
     "test",
     "--locked",
     "-p",
-    "reel",
+    "tape-reel",
     "--features",
     TEST_HOOKS,
     "--test",

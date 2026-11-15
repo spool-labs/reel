@@ -18,7 +18,7 @@ pub const OVERFLOW_VARIABLE: &str = "CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS";
 pub const SWEEP_ARGUMENTS: [&str; 10] = [
     "test",
     "--package",
-    "reel",
+    "tape-reel",
     "--test",
     SWEEP_HARNESS,
     "--locked",

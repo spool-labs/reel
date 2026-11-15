@@ -1,7 +1,15 @@
 [package]
-name = "reel-api"
+name = "tape-reel-core"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "The types tape-reel takes and gives: column ids, units, batches, reports and errors"
+
+[lib]
+name = "reel_api"
+path = "src/lib.rs"
 
 [dependencies]
 thiserror.workspace = true

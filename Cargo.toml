@@ -5,13 +5,16 @@ members = ["crates/*", "xtask"]
 [workspace.package]
 version = "0.4.0"
 edition = "2024"
+license = "Apache-2.0"
+homepage = "https://tape.network"
+repository = "https://github.com/spool-labs/reel"
 
 [workspace.dependencies]
 libc = "0.2"
 lz4-sys = "1"
-reel = { path = "crates/reel" }
-reel-api = { path = "crates/reel-api" }
-reel-sim = { path = "crates/reel-sim" }
+reel = { package = "tape-reel", path = "crates/reel", version = "0.4.0" }
+reel-api = { package = "tape-reel-core", path = "crates/reel-api", version = "0.4.0" }
+reel-sim = { package = "tape-reel-sim", path = "crates/reel-sim" }
 thiserror = "2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 

@@ -76,35 +76,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "reel"
-version = "0.4.0"
-dependencies = [
- "io-uring",
- "libc",
- "lz4-sys",
- "reel",
- "reel-api",
- "reel-sim",
- "xxhash-rust",
-]
-
-[[package]]
-name = "reel-api"
-version = "0.4.0"
-dependencies = [
- "thiserror",
-]
-
-[[package]]
-name = "reel-sim"
-version = "0.4.0"
-dependencies = [
- "libc",
- "reel",
- "reel-api",
-]
-
-[[package]]
 name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -119,6 +90,35 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "tape-reel"
+version = "0.4.0"
+dependencies = [
+ "io-uring",
+ "libc",
+ "lz4-sys",
+ "tape-reel",
+ "tape-reel-core",
+ "tape-reel-sim",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "tape-reel-core"
+version = "0.4.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "tape-reel-sim"
+version = "0.4.0"
+dependencies = [
+ "libc",
+ "tape-reel",
+ "tape-reel-core",
 ]
 
 [[package]]

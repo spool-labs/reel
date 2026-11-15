@@ -1277,3 +1277,136 @@ fn overlap_merges_count_their_outputs_taken() {
     assert!(volume.overlap_inputs > volume.overlap_output_inputs);
     store.close().expect("close");
 }
+
+const CROWD_KEYS: u64 = 2_000;
+const CROWD_WORKERS: usize = 8;
+const CROWD_BUDGET: ByteCount = ByteCount(256 * 1024 * 1024);
+const QUIET_ROUNDS: usize = 40;
+
+// a store with a seat a worker, and the overlap bound held at its least
+fn open_crowd(io: &SimulatedIo) -> Store {
+    let config = StoreConfig {
+        memory_budget: CROWD_BUDGET,
+        threads: reel::config::ThreadCounts { maintenance_workers: Some(CROWD_WORKERS), ..reel::config::NO_WORKERS },
+        volumes: vec![VolumeConfig {
+            name: "crowd".to_string(),
+            roots: vec![PathBuf::from(ROOT)],
+            sync: SyncPolicy::Never,
+            device: Default::default(),
+        }],
+        columns: vec![ColumnConfig {
+            id: COLUMN,
+            name: "column".to_string(),
+            key_shape: KeyShape::Variable { most: 64 },
+            codec: Codec::None,
+            volume: VolumeId(0),
+            complete_rows: None,
+            sorted_rows: None,
+            least_value: None,
+        }],
+    };
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let volume = &store.state.volumes[0];
+    volume.holds.reclaim.store(true, Ordering::Release);
+    volume.holds.small_bound.store(true, Ordering::Release);
+    store
+}
+
+// segments whose keys each spread over the whole range land with the store's own planner held off, the callers go quiet, and one
+// hand-out offers every idle seat a pick, as a planner does when a change wakes it in a quiet volume. Give the merges it started
+// and the inputs they took
+fn crowd_hand_out(io: &SimulatedIo, store: &Store, segments: u64) -> (CompactJob<SimulatedIo>, u64, u64) {
+    let volume = &store.state.volumes[0];
+    volume.holds.compaction.store(true, Ordering::Release);
+    let mut number: u64 = 0;
+    for _segment in 0..segments {
+        for _key in 0..CROWD_KEYS {
+            store.put(COLUMN, &number.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes(), &[7; 100]).expect("put");
+            number += 1;
+        }
+        store.seal_now();
+        settle(io);
+    }
+    let until = store.state.quiet_at(io.clock_reading());
+    io.advance_clock(Nanoseconds(until.0.saturating_sub(io.clock_reading().0)));
+    settle(io);
+    volume.holds.compaction.store(false, Ordering::Release);
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    let before = volume.picks[reel_api::maintenance_report::PickOutcome::Overlap.index()].load(Ordering::Acquire);
+    job.hand_out();
+    let merges = volume.picks[reel_api::maintenance_report::PickOutcome::Overlap.index()].load(Ordering::Acquire) - before;
+    let inputs = volume.lanes.iter().map(|lane| hold(&lane.inputs).iter().filter(|input| input.0 != 0).count() as u64).sum();
+    (job, merges, inputs)
+}
+
+// let the merges a hand-out started run to their installs with the callers quiet, and give the segments left and the overlap
+// merges the volume ever started
+fn finish_merges(io: &SimulatedIo, store: &Store, job: &CompactJob<SimulatedIo>) -> (u64, u64) {
+    // no worker steps a seat of a planner the test built, so the test runs each claimed merge itself
+    for seat in job.seats.iter() {
+        if let Some(rewrite) = hold(&seat.job).as_mut().filter(|rewrite| rewrite.is_claimed()) {
+            assert!(rewrite.begin(), "a claimed merge did not begin");
+            while rewrite.is_running() {
+                rewrite.step();
+            }
+        }
+    }
+    for _round in 0..QUIET_ROUNDS {
+        let until = store.state.quiet_at(io.clock_reading());
+        io.advance_clock(Nanoseconds(until.0.saturating_sub(io.clock_reading().0)));
+        settle(io);
+    }
+    let mut report = MaintenanceReport::default();
+    store.maintenance_report(&mut report);
+    let volume = &report.volumes[0];
+    (volume.segment_count.0, volume.picks[reel_api::maintenance_report::PickOutcome::Overlap.index()])
+}
+
+// 36 segments over every key against a bound of 32: one merge of 8 brings the point to 29, so one hand-out starts that one and
+// no other. Before a running merge's inputs counted once, every seat after the first still read 36 and the hand-out started 4
+// merges over 32 inputs
+#[test]
+fn parallel_merges_at_one_point() {
+    let io = SimulatedIo::new(Seed(72));
+    let store = open_crowd(&io);
+    let (job, merges, inputs) = crowd_hand_out(&io, &store, 36);
+    assert_eq!((merges, inputs), (1, 8));
+    assert_eq!(finish_merges(&io, &store, &job), (29, 1), "the store merged past what the bound asks");
+    store.close().expect("close");
+}
+
+// 60 segments over every key against a bound of 32 need four merges of 8, and one hand-out starts all four beside each other and
+// no fifth. Before, it started 8 over 58 inputs
+#[test]
+fn merges_beside_each_other_when_far_behind() {
+    let io = SimulatedIo::new(Seed(73));
+    let store = open_crowd(&io);
+    let (job, merges, inputs) = crowd_hand_out(&io, &store, 60);
+    assert_eq!((merges, inputs), (4, 32));
+    assert_eq!(finish_merges(&io, &store, &job), (32, 4), "the store merged past what the bound asks");
+    store.close().expect("close");
+}
+
+// a merge given up before it began gives its segments back, the counter moves, and the next hand-out finds the point crowded
+// again and starts one merge, with no answer kept from while the first held them
+#[test]
+fn a_given_up_merge_leaves_the_point_crowded() {
+    let io = SimulatedIo::new(Seed(74));
+    let store = open_crowd(&io);
+    let (mut job, merges, inputs) = crowd_hand_out(&io, &store, 36);
+    assert_eq!((merges, inputs), (1, 8));
+    let volume = &store.state.volumes[0];
+    let changes = volume.overlap_changes.load(Ordering::Acquire);
+    for seat in job.seats.iter() {
+        if let Some(rewrite) = hold(&seat.job).as_mut().filter(|rewrite| rewrite.is_claimed()) {
+            rewrite.abandon();
+        }
+    }
+    assert!(volume.overlap_changes.load(Ordering::Acquire) > changes, "a give-up left the counter where it was");
+    assert!(!volume.is_overlap_running());
+    let overlap = |volume: &reel::engine::volume::Volume<SimulatedIo>| volume.picks[reel_api::maintenance_report::PickOutcome::Overlap.index()].load(Ordering::Acquire);
+    let before = overlap(volume);
+    job.hand_out();
+    assert_eq!(overlap(volume) - before, 1, "the point read clear after the merge over it gave up");
+    store.close().expect("close");
+}

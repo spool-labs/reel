@@ -12,6 +12,7 @@ use reel_api::maintenance_report::{
 };
 use reel_api::units::{ByteCount, DeathMark, FileOffset, WritePlace};
 
+use crate::config::MOST_VOLUME_SLOTS;
 use crate::engine::reserve_job::RESERVE_PERIOD;
 use crate::engine::engine_state::EngineState;
 use crate::engine::seal_job::MOST_SEGMENT_BLOCKS;
@@ -55,6 +56,10 @@ impl<Backend: Io> RewriteJob<Backend> {
         let mut inputs = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
         inputs[..self.input_count].copy_from_slice(&self.numbers[..self.input_count]);
         *hold(&volume.lanes[self.lane].inputs) = inputs;
+        // a pick reads which segments each overlap merge holds, so the crowd answers it kept from before this one stop holding
+        if self.picked_as == Some(PickOutcome::Overlap) {
+            volume.overlap_changes.fetch_add(1, Ordering::AcqRel);
+        }
         self.claimed = Some((target, is_grave_heavy));
         true
     }
@@ -199,7 +204,8 @@ impl<Backend: Io> RewriteJob<Backend> {
             volume.note_pick(PickOutcome::Deferred);
             return None;
         }
-        // a volume merges back to the bound before it reclaims, so record rewrites wait while an overlap merge runs or can start.
+        // a volume merges back to the bound before it reclaims, so record rewrites wait until a whole look finds no point over it,
+        // with each running overlap merge's inputs counted as the one segment they become
         // Hot ingest starts none, and a seal raises the bound again before any look can clear it, so the wait would last the ingest
         let can_overlap = !matches!(overlap_lanes(load), OverlapLanes::None) || volume.is_overlap_running();
         if volume.is_over_bound.load(Ordering::Acquire) && !load.is_disk_short && can_overlap {
@@ -326,7 +332,18 @@ impl<Backend: Io> RewriteJob<Backend> {
         let is_resident = |segment: SegmentNumber| !volume.are_filters_held_out() && arena.has_filters(segment);
         // a crowd answer holds while no filter came or went, and holding the filters out changes every answer
         let filters = 2 * arena.changes() + u64::from(volume.are_filters_held_out());
-        let answers = (&mut self.crowd_answers, filters);
+        // a running overlap merge brings its inputs back as one segment over any point, so a crowd counts them once a merge. The
+        // counter is read before the lists, so a merge that starts or ends after them changes the next stamp
+        let merges = volume.overlap_changes.load(Ordering::Acquire);
+        let mut held = [[SegmentNumber(0); MOST_MERGE_SEGMENTS]; MOST_VOLUME_SLOTS + 1];
+        for (lane, inputs) in volume.lanes.iter().zip(held.iter_mut()) {
+            if lane.is_overlap.load(Ordering::Acquire) {
+                *inputs = *hold(&lane.inputs);
+                debug_assert!(inputs[0].0 != 0, "an overlap merge holds no inputs");
+            }
+        }
+        let merge_of = |segment: SegmentNumber| held.iter().position(|inputs| inputs.contains(&segment));
+        let answers = (&mut self.crowd_answers, filters, merges);
         // a filter that arrives only loosens a bound, and one that leaves with its segment takes the segment out of the crowd too, so
         // a pass holds until a segment that stays loses its filters, or the filters are held out or the sizing changes
         let pass_stamp = 4 * arena.losses() + 2 * u64::from(volume.are_filters_held_out()) + u64::from(!volume.is_bound_pinned());
@@ -335,7 +352,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             volume.looks.set_whole(true);
         }
         let mut looked_up_to = volume.looks.up_to();
-        let found = overlap_start(rows, directory_of, &mut looked_up_to, can_merge, &mut self.crowded_key, lists, !volume.is_bound_pinned(), &is_resident, is_late, || volume.looks.note_passed(), answers);
+        let found = overlap_start(rows, directory_of, &mut looked_up_to, can_merge, &mut self.crowded_key, lists, !volume.is_bound_pinned(), &is_resident, &merge_of, is_late, || volume.looks.note_passed(), answers);
         volume.looks.set_up_to(looked_up_to);
         volume.looks.set_left(!rows.orders().after(looked_up_to).is_empty());
         let Some((crowded, column)) = found else {
@@ -674,9 +691,10 @@ pub fn overlap_start<'rows, 'state>(
     lists: (&mut FixedList<SegmentNumber>, &mut FixedList<SegmentNumber>),
     is_sized: bool,
     is_resident: &dyn Fn(SegmentNumber) -> bool,
+    merge_of: &dyn Fn(SegmentNumber) -> Option<usize>,
     is_late: impl Fn() -> bool,
     note_passed: impl Fn(),
-    (answers, filters): (&mut CrowdAnswers, u64),
+    (answers, filters, merges): (&mut CrowdAnswers, u64, u64),
 ) -> Option<(SummaryRow<'rows>, ColumnId)> {
     let (listed, crowd) = lists;
     for _look in 0..OVERLAP_LOOKS {
@@ -697,8 +715,8 @@ pub fn overlap_start<'rows, 'state>(
             let others = listed.iter().filter_map(|other| rows.get(*other));
             let inside = others.filter_map(|other| lowest_inside(&other, facts.column, facts.lowest, facts.bound));
             let mut probes = iter::once(facts.lowest).chain(inside.take(OVERLAP_PROBES));
-            let stamp = CrowdStamp { directory: directory.generation(), filters, is_sized };
-            let found = probes.find(|key| answers.answer(facts.column, key, stamp, || is_crowded(rows, directory, (facts.column, key), crowd, is_sized, is_resident)));
+            let stamp = CrowdStamp { directory: directory.generation(), filters, merges, is_sized };
+            let found = probes.find(|key| answers.answer(facts.column, key, stamp, || is_crowded(rows, directory, (facts.column, key), crowd, is_sized, is_resident, merge_of)));
             if let Some(key) = found {
                 if can_merge(&row) {
                     point.set_from(key).ok()?;
@@ -720,6 +738,7 @@ pub const CROWD_ANSWERS: usize = 64;
 pub struct CrowdStamp {
     pub directory: u64,
     pub filters: u64,
+    pub merges: u64,
     pub is_sized: bool,
 }
 
@@ -779,9 +798,10 @@ impl Default for CrowdAnswers {
     }
 }
 
-/// Check more than the bound's segments hold a key, counting the directory's segments over it against their rows. A segment a
-/// running rewrite, the walk or a seal holds now counts, since the merge takes it once that ends, and one no merge can ever take
-/// is left out, since no merge could bring the crowd down
+/// Check more than the bound's segments hold a key, counting the directory's segments over it against their rows. The inputs one
+/// running overlap merge holds count once, since its outputs split the key range and one of them comes back over the key. Any
+/// other segment a running rewrite, the walk or a seal holds counts, since the merge takes it once that ends, and one no merge
+/// can ever take is left out, since no merge could bring the crowd down
 pub fn is_crowded(
     rows: &SummaryRows,
     directory: &ColumnDirectory,
@@ -789,18 +809,26 @@ pub fn is_crowded(
     crowd: &mut FixedList<SegmentNumber>,
     is_sized: bool,
     is_resident: &dyn Fn(SegmentNumber) -> bool,
+    merge_of: &dyn Fn(SegmentNumber) -> Option<usize>,
 ) -> bool {
     // a summary row keeps a key cut short, so the directory is asked for every key that starts with it
     let (low, high) = (KeyBound::of_key(key), KeyBound::past_prefix(key));
     let (mut covering, mut skip, mut bytes, mut rows_seen) = (0, 0, 0, 0);
     // a bound above the least holds only while every crowd segment's filters are resident, since a get probes each of them
     let mut is_all_resident = true;
+    // a bit for each lane whose merge has counted, and lanes stop past the most volume slots
+    let mut merges_counted: u128 = 0;
     for _page in 0..CROWD_PAGES {
         let page = directory.overlapping(&low, &high, skip, crowd);
         skip += crowd.len();
         let over = crowd.iter().filter_map(|segment| rows.get(*segment));
         for row in over.filter(|row| can_ever_merge(row) && covers_point(row, column, key)) {
-            covering += 1;
+            let lane = merge_of(row.facts.segment);
+            let is_new = lane.is_none_or(|lane| merges_counted & (1 << lane) == 0);
+            if let Some(lane) = lane {
+                merges_counted |= 1 << lane;
+            }
+            covering += usize::from(is_new);
             is_all_resident &= is_resident(row.facts.segment);
             let (row_bytes, row_rows) = record_totals(&row);
             bytes += row_bytes;

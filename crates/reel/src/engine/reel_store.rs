@@ -1566,6 +1566,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         seal_interval: AtomicU64::new(0),
         merge_interval: AtomicU64::new(0),
         is_over_bound: AtomicBool::new(true),
+        overlap_changes: AtomicU64::new(0),
         walk_slots: (0..sizing.walk_slots).map(|_slot| WalkSlot::new()).collect(),
         can_free_blocks: volume.roots.iter().all(|root| io.can_free_blocks(root)),
         bytes_freed: AtomicU64::new(0),

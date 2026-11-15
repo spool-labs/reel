@@ -423,6 +423,8 @@ pub struct Volume<Backend: Io> {
     /// A seal may have taken overlap past the bound at a point a merge can start, so record picks wait until the planner's
     /// look says otherwise
     pub is_over_bound: AtomicBool,
+    /// Overlap merges started, finished and given up, so a crowd answer from before any of them is never reused
+    pub overlap_changes: AtomicU64,
     /// The segment the walk has as its target, or `NO_SEAL`
     pub walk_segment: AtomicU64,
     /// A walk is counting what its covers hide, and a row that left now would make an older one look live

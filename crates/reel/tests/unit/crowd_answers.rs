@@ -4,7 +4,7 @@ use reel::engine::rewrite_job::{CROWD_ANSWERS, CrowdAnswers, CrowdStamp};
 use reel_api::column_id::ColumnId;
 
 const COLUMN: ColumnId = ColumnId(1);
-const STAMP: CrowdStamp = CrowdStamp { directory: 7, filters: 3, is_sized: true };
+const STAMP: CrowdStamp = CrowdStamp { directory: 7, filters: 3, merges: 0, is_sized: true };
 
 // a point asked again under the same stamp reuses its answer, and a new stamp, another column or a pushed-out answer works it out
 #[test]

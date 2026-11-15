@@ -362,10 +362,13 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.target = None;
         volume.lanes[self.lane].output_floor.store(NO_SEAL, Ordering::Release);
         volume.lanes[self.lane].is_rewriting.store(false, Ordering::Release);
-        volume.lanes[self.lane].is_overlap.store(false, Ordering::Release);
         self.release_promise(volume);
         *hold(&volume.lanes[self.lane].merging) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
         *hold(&volume.lanes[self.lane].inputs) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
+        // the inputs leave the lane first, so a pick never sees them held by no overlap merge while they are still listed
+        if volume.lanes[self.lane].is_overlap.swap(false, Ordering::AcqRel) {
+            volume.overlap_changes.fetch_add(1, Ordering::AcqRel);
+        }
         self.release_hold(volume);
         volume.segments_rewritten.fetch_add(1, Ordering::AcqRel);
         volume.early_bar_rewrites.fetch_add(self.bars_fired.early, Ordering::Relaxed);
@@ -594,10 +597,13 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.drain_to_inputs(volume);
         self.release_hold(volume);
         volume.lanes[self.lane].is_rewriting.store(false, Ordering::Release);
-        volume.lanes[self.lane].is_overlap.store(false, Ordering::Release);
         self.release_promise(volume);
         *hold(&volume.lanes[self.lane].merging) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
         *hold(&volume.lanes[self.lane].inputs) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
+        // the inputs leave the lane first, so a pick never sees them held by no overlap merge while they are still listed
+        if volume.lanes[self.lane].is_overlap.swap(false, Ordering::AcqRel) {
+            volume.overlap_changes.fetch_add(1, Ordering::AcqRel);
+        }
         self.release_region();
     }
 }

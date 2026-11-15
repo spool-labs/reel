@@ -636,6 +636,27 @@ fn resident_bytes() -> Option<u64> {
     Some(kib * KIB)
 }
 
+// the sorted counts and seals done, read outside the window since a report allocates
+fn sorted_counts(store: &Store) -> (MaintenanceReport, u64) {
+    let mut report = MaintenanceReport::new();
+    store.maintenance_report(&mut report);
+    (report, store.state.volumes[0].seals_done.load(Ordering::Acquire))
+}
+
+// the window read through the index, scanned it and sealed into it, and no row passed the declared capacity, so the mark
+// never set and the fallback took no part
+fn check_sorted((before, seals_before): (MaintenanceReport, u64), (after, seals_after): (MaintenanceReport, u64)) -> u64 {
+    println!(
+        "sorted in the window: {} answers, {} scan keys, {} seals, {} past capacity",
+        after.sorted_answers - before.sorted_answers,
+        after.sorted_scan_keys - before.sorted_scan_keys,
+        seals_after - seals_before,
+        after.sorted_past_capacity,
+    );
+    let is_exercised = after.sorted_answers > before.sorted_answers && after.sorted_scan_keys > before.sorted_scan_keys && seals_after > seals_before;
+    u64::from(!is_exercised || after.sorted_past_capacity > 0)
+}
+
 // the seal fills a complete table and a sorted index in the window, which only a budget of 512 MiB has room for
 fn indexed_arm() -> u64 {
     let program = env::current_exe().expect("path");
@@ -761,6 +782,7 @@ fn main() {
     let unlinked_before = store.state.volumes[0].segments_unlinked.load(Ordering::Acquire);
     let freed_before = store.state.volumes[0].bytes_freed.load(Ordering::Acquire);
     let rewritten_before = store.state.volumes[0].segments_rewritten.load(Ordering::Acquire);
+    let sorted_before = sorted_counts(&store);
     touch_stack();
     let mut faults = FaultCounter::new();
     let _first_read = faults.read();
@@ -789,6 +811,7 @@ fn main() {
     let snapshot_after = thread_snapshot();
     store.state.volumes[0].holds.compaction.store(false, Ordering::Release);
     let unit_failures = check_units(&store);
+    let sorted_after = sorted_counts(&store);
 
     let allocations_before_close = ALLOCATIONS.load(Ordering::Acquire);
     IS_WINDOW.store(true, Ordering::Release);
@@ -815,6 +838,9 @@ fn main() {
     println!("{freed} bytes freed in place in the window");
     println!("{rewritten} rewrites in the window");
     failures += free_burst() + unit_failures;
+    if inputs.is_indexed {
+        failures += check_sorted(sorted_before, sorted_after);
+    }
     if env::var_os(INDEXED_VARIABLE).is_none() {
         failures += indexed_arm();
     }

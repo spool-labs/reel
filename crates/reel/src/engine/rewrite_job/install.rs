@@ -289,7 +289,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         if let (Some(totals), Some(output)) = (self.totals, &self.output) {
             list_output(&state, volume, output.number, totals.head.places.highest, self.writer.columns().iter());
         }
-        // sorted entries follow the kept rows to the listed outputs before the inputs leave theirs
+        // each output is marked as one, and sorted entries follow the kept rows to it before the inputs leave theirs
         let outputs = self.staged.iter().map(|staged| staged.facts.segment).chain([self.output.as_ref(), self.grave_output.as_ref()].into_iter().flatten().map(|output| output.number));
         for number in outputs {
             volume.table.mark_output(number);

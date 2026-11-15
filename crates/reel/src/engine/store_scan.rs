@@ -45,14 +45,6 @@ impl<Backend: Io> StoreScan<Backend> {
         }
     }
 
-    /// Say how many rows the caller wants from here, so the walk locates and reads no more than that a batch. A hint: a walk
-    /// goes on past it when asked
-    pub fn want(&mut self, rows: u64) {
-        if let Some(scan) = &mut self.scan {
-            scan.wanted = scan.asked.saturating_add(rows);
-        }
-    }
-
     /// Fill the buffers with the next row
     pub fn next_row(&mut self, key: &mut Vec<u8>, value: &mut Vec<u8>) -> Result<ScanStep, StoreError> {
         // every step counts, so a long scan reads as a busy caller to maintenance

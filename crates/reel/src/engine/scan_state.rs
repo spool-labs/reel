@@ -4,7 +4,7 @@ use std::mem;
 
 use reel_api::column_id::ColumnId;
 use reel_api::direction::Direction;
-use reel_api::units::{ByteCount, FileOffset, Nanoseconds, WritePlace};
+use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RowCount, WritePlace};
 
 use crate::index::shard_cursor::{ShardCursor, TreeCursor};
 use crate::index::sorted_keys::{KeyBatch, KeyEntry, MOST_KEY_BYTES};
@@ -49,6 +49,9 @@ pub struct ScanRange<'key> {
     pub is_start_inclusive: bool,
     pub limit: ScanLimit<'key>,
     pub direction: Direction,
+    /// The rows the caller takes, when it says, so the walk locates and reads no more than that a batch. A hint: a walk goes on
+    /// past it when asked
+    pub wanted: Option<RowCount>,
 }
 
 /// What lets a counting walk take a block by its line: the lowest bound of anything else the walk knows of, and the rows so far
@@ -505,7 +508,7 @@ impl ScanState {
         self.batch.clear();
         self.forget_sorted();
         self.is_on_index = false;
-        self.wanted = u64::MAX;
+        self.wanted = range.wanted.map_or(u64::MAX, |rows| rows.0);
         self.asked = 0;
         self.limit.clear();
         self.has_limit = match range.limit {
@@ -742,6 +745,7 @@ pub fn from_key(column: ColumnId, start: &[u8], direction: Direction) -> ScanRan
         is_start_inclusive: true,
         limit: ScanLimit::None,
         direction,
+        wanted: None,
     }
 }
 
@@ -757,6 +761,7 @@ pub fn in_range<'key>(column: ColumnId, start: &'key [u8], end: &'key [u8], dire
         is_start_inclusive,
         limit: ScanLimit::Key(limit),
         direction,
+        wanted: None,
     }
 }
 
@@ -768,6 +773,14 @@ pub fn under_prefix(column: ColumnId, prefix: &[u8]) -> ScanRange<'_> {
         is_start_inclusive: true,
         limit: ScanLimit::Prefix(prefix),
         direction: Direction::Ascending,
+        wanted: None,
+    }
+}
+
+impl<'key> ScanRange<'key> {
+    /// Say how many rows the caller takes from this range
+    pub fn wanting(self, rows: RowCount) -> Self {
+        Self { wanted: Some(rows), ..self }
     }
 }
 

@@ -46,7 +46,7 @@ use crate::engine::recovery::{
 };
 use crate::engine::reserve_job::ReserveJob;
 use crate::engine::row_job::RowJob;
-use crate::engine::scan_state::{MOST_SCANS, ScanState, from_key, in_range, under_prefix};
+use crate::engine::scan_state::{MOST_SCANS, ScanRange, ScanState, from_key, in_range, under_prefix};
 use crate::engine::seal_job::{MOST_SEGMENT_BLOCKS, SealJob};
 use crate::engine::store_scan::StoreScan;
 use crate::engine::compact_job::{CompactJob, park};
@@ -338,6 +338,12 @@ impl<Backend: Io> ReelStore<Backend> {
     pub fn cue(&self) -> Result<Cue<Backend>, StoreError> {
         self.check_read()?;
         Cue::new(Arc::clone(&self.state))
+    }
+
+    /// Walk a range built with the scan_state helpers, which can say how many rows the caller takes
+    pub fn iter(&self, range: &ScanRange) -> Result<StoreScan<Backend>, StoreError> {
+        self.check_read()?;
+        StoreScan::new(Arc::clone(&self.state), range)
     }
 
     /// Walk rows and keys from a key, which comes first when it has a row

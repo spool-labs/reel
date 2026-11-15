@@ -618,8 +618,7 @@ fn a_wanted_count_caps_the_batch() {
     seal_all(&store, &io);
     let range = reel::engine::scan_state::from_key(COLUMN, b"", Direction::Ascending);
     for wanted in [1, WANTED_ROWS, 1_000] {
-        let mut scan = store.state.take_scan(&range, None).expect("scan");
-        scan.wanted = wanted;
+        let mut scan = store.state.take_scan(&range.wanting(RowCount(wanted)), None).expect("scan");
         let (mut name, mut value) = (Vec::new(), Vec::new());
         let mut found = Vec::new();
         for _row in 0..wanted.min(KEYS) {
@@ -632,6 +631,9 @@ fn a_wanted_count_caps_the_batch() {
         let expected: Vec<_> = model.iter().take(wanted.min(KEYS) as usize).map(|(name, value)| (name.clone(), value.clone())).collect();
         assert_eq!(found, expected);
         store.state.give_back_scan(scan);
+        // the store's own walk takes the count on its range and gives the same rows
+        let walked: Vec<_> = rows(store.iter(&range.wanting(RowCount(wanted))).expect("scan")).into_iter().take(wanted.min(KEYS) as usize).collect();
+        assert_eq!(walked, expected);
     }
     store.close().expect("close");
 }

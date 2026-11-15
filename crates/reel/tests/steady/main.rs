@@ -27,7 +27,10 @@ use reel_api::direction::Direction;
 use reel_api::maintenance_report::{MaintenanceReport, UNIT_KINDS};
 use reel_api::scan::ScanStep;
 use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, Nanoseconds};
+use reel_api::units::{ByteCount, Nanoseconds, RowCount, VolumeId};
+use reel_api::column_id::ColumnId;
+use reel::config::{ColumnConfig, KeyShape};
+use reel::record::codec::Codec;
 use reel_api::value_list::ValueList;
 use reel_api::write_batch::WriteBatch;
 
@@ -38,6 +41,13 @@ use reel_sim::wait::wait_until;
 
 const BUDGET: ByteCount = ByteCount(192 * 1024 * 1024);
 const WORKERS_VARIABLE: &str = "REEL_STEADY_WORKERS";
+// set in the child that runs the store again at 512 MiB, with the complete table on META and a sorted column of its own
+const INDEXED_VARIABLE: &str = "REEL_STEADY_INDEXED";
+const INDEXED_BUDGET: ByteCount = ByteCount(512 * 1024 * 1024);
+const SORTED_ROWS: RowCount = RowCount(100_000);
+const SORTED: ColumnId = ColumnId(4);
+// the width of every steady key, "key-" and six digits
+const SORTED_WIDTH: u16 = 10;
 // set in the child that makes the damaged store, so the measured process runs one open
 const PREPARE_ROOT: &str = "REEL_STEADY_PREPARE";
 const PAGE_BYTES: usize = 4_096;
@@ -247,6 +257,7 @@ struct Inputs {
     buf: Vec<u8>,
     scan_key: Vec<u8>,
     values: ValueList,
+    is_indexed: bool,
 }
 
 /// What the process counted at one moment
@@ -320,7 +331,21 @@ impl Drop for ScratchRoot {
 }
 
 fn open(root: &Path) -> Store {
-    let mut config = config(root, BUDGET);
+    let is_indexed = env::var_os(INDEXED_VARIABLE).is_some();
+    let mut config = config(root, if is_indexed { INDEXED_BUDGET } else { BUDGET });
+    if is_indexed {
+        config.columns.push(ColumnConfig {
+            id: SORTED,
+            name: "sorted".to_string(),
+            key_shape: KeyShape::Fixed { width: SORTED_WIDTH },
+            codec: Codec::None,
+            volume: VolumeId(0),
+            complete_rows: None,
+            sorted_rows: Some(SORTED_ROWS),
+            least_value: None,
+        });
+        assert!(config.columns.iter().any(|column| column.id == META && column.complete_rows.is_some()), "no complete table at 512 MiB");
+    }
     // a gate run sets this to hold the same line with workers beside the planner
     if let Some(workers) = env::var(WORKERS_VARIABLE).ok().and_then(|workers| workers.parse().ok()) {
         config.threads.maintenance_workers = Some(workers);
@@ -382,6 +407,7 @@ fn inputs() -> Inputs {
         buf: vec![1; CHUNKED_BYTES * 2],
         scan_key: vec![1; SCAN_KEY_BYTES],
         values: ValueList::new(),
+        is_indexed: env::var_os(INDEXED_VARIABLE).is_some(),
     }
 }
 
@@ -431,10 +457,34 @@ fn round(store: &Store, inputs: &mut Inputs, number: usize) {
     assert!(store.get(PLAIN, key, buf).expect("get plain"));
     assert!(!store.get(PLAIN, &inputs.missing, buf).expect("get a plain miss"));
     store.get_many(PLAIN, &keys, &mut inputs.values).expect("get_many plain");
+    let mut scan = store.iter_prefix(PLAIN, b"key-").expect("plain scan");
+    for _row in 0..SCAN_ROWS {
+        if scan.next_row(&mut inputs.scan_key, buf).expect("step") == ScanStep::End {
+            break;
+        }
+    }
+    drop(scan);
     let cue = store.cue().expect("cue");
     assert!(cue.get(PLAIN, key, buf).expect("get plain at a cue"));
     cue.get_many(PLAIN, &keys, &mut inputs.values).expect("get_many plain at a cue");
     drop(cue);
+    if inputs.is_indexed {
+        let missing = &inputs.missing[..SORTED_WIDTH as usize];
+        store.put(SORTED, key, &inputs.small).expect("put sorted");
+        assert!(store.get(SORTED, key, buf).expect("get sorted"));
+        assert!(!store.get(SORTED, missing, buf).expect("get a sorted miss"));
+        let cue = store.cue().expect("cue");
+        assert!(cue.get(SORTED, key, buf).expect("get sorted at a cue"));
+        drop(cue);
+        let mut scan = store.iter_prefix(SORTED, b"key-").expect("sorted scan");
+        for _row in 0..SCAN_ROWS {
+            if scan.next_row(&mut inputs.scan_key, buf).expect("step") == ScanStep::End {
+                break;
+            }
+        }
+        drop(scan);
+        store.delete(SORTED, other).expect("delete sorted");
+    }
     store.delete(PLAIN, other).expect("delete plain");
     store.delete(BULK, other).expect("delete");
     // a segment with covers sits out compaction, so every other one has none
@@ -584,6 +634,14 @@ fn resident_bytes() -> Option<u64> {
     let line = status.lines().find(|line| line.starts_with(RESIDENT_FIELD))?;
     let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
     Some(kib * KIB)
+}
+
+// the seal fills a complete table and a sorted index in the window, which only a budget of 512 MiB has room for
+fn indexed_arm() -> u64 {
+    let program = env::current_exe().expect("path");
+    let status = Command::new(program).env(INDEXED_VARIABLE, "1").status().expect("run");
+    println!("indexed arm at 512 MiB: {status}");
+    u64::from(!status.success())
 }
 
 // an earlier open leaves the allocator holding freed pages, so the process that counts runs none
@@ -757,6 +815,9 @@ fn main() {
     println!("{freed} bytes freed in place in the window");
     println!("{rewritten} rewrites in the window");
     failures += free_burst() + unit_failures;
+    if env::var_os(INDEXED_VARIABLE).is_none() {
+        failures += indexed_arm();
+    }
     if unlinked == 0 || freed == 0 || rewritten == 0 {
         failures += 1;
     }

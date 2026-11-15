@@ -8,7 +8,7 @@ use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RowCount, WritePlace};
 
 use crate::index::shard_cursor::{ShardCursor, TreeCursor};
 use crate::index::sorted_keys::{KeyBatch, KeyEntry, MOST_KEY_BYTES};
-use crate::engine::read_path::Located;
+use crate::engine::read_path::{Located, SealedRow};
 use crate::index::open_slots::OpenSlots;
 use crate::index::write_index::SHARD_COUNT;
 use crate::pool::{touched_capacity, touched_filled};
@@ -99,11 +99,27 @@ pub struct ShardHead {
 
 /// The most keys a scan locates ahead of its caller at one point, and the bytes of records it reads for them in one go
 pub const BATCH_KEYS: usize = 32;
+/// The most keys a batch of a scan told it wants more than one batch locates, inside the same bytes of records
+pub const SCAN_BATCH_KEYS: usize = 256;
+/// The most runs one round of a batch's reads sends before it waits
+pub const MOST_BATCH_RUNS: usize = 32;
 pub const BATCH_BYTES: usize = 64 * 1024;
 /// The largest record a batch takes: a 4 KiB value with its key and header fits, so a store of them scans in batches
 pub const MOST_BATCH_RECORD: usize = 8 * 1024;
 /// Records in one segment this close join into one read
 pub const JOIN_GAP: u64 = 4 * 1024;
+
+/// Count the keys a scan's next batch locates: the told rows it still wants, the one asked for now among them, up to
+/// SCAN_BATCH_KEYS, and BATCH_KEYS for a scan told no count, as a get of many keys takes
+pub fn batch_room(wanted: u64, asked: u64) -> usize {
+    if wanted == u64::MAX {
+        return BATCH_KEYS;
+    }
+    usize::try_from(wanted.saturating_sub(asked).saturating_add(1)).map_or(SCAN_BATCH_KEYS, |left| left.min(SCAN_BATCH_KEYS))
+}
+
+/// A batch entry that holds nothing, which the batch's room is written with at open
+pub const NO_BATCH_ENTRY: BatchEntry = BatchEntry { key_at: 0, key_length: 0, located: Located::Absent, record: None, is_value: false };
 
 /// One key a scan located ahead, and where its record sits in the batch's buffer once read
 #[derive(Clone, Copy, Debug)]
@@ -125,17 +141,22 @@ pub struct ScanBatch {
     pub point: WritePlace,
     pub keys: Vec<u8>,
     pub records: Vec<u8>,
+    /// Each entry's sealed row for the batch's read, and the span its record landed at
+    pub rows: Vec<Option<SealedRow>>,
+    pub spans: Vec<Option<(usize, usize)>>,
 }
 
 impl ScanBatch {
     /// Allocate a batch's buffers
     pub fn new(widest_key: usize) -> Self {
         Self {
-            entries: Vec::with_capacity(BATCH_KEYS),
+            entries: touched_capacity(SCAN_BATCH_KEYS, NO_BATCH_ENTRY),
             next: 0,
             point: WritePlace(0),
-            keys: touched_capacity(BATCH_KEYS * widest_key, 0),
+            keys: touched_capacity(SCAN_BATCH_KEYS * widest_key, 0),
             records: touched_capacity(BATCH_BYTES, 0),
+            rows: touched_capacity(SCAN_BATCH_KEYS, None),
+            spans: touched_capacity(SCAN_BATCH_KEYS, None),
         }
     }
 
@@ -145,6 +166,8 @@ impl ScanBatch {
         self.next = 0;
         self.keys.clear();
         self.records.clear();
+        self.rows.clear();
+        self.spans.clear();
     }
 
     /// Check the batch has a key left to answer
@@ -159,7 +182,8 @@ impl ScanBatch {
 
     /// Read the heap the batch holds
     pub fn heap_bytes(&self) -> usize {
-        self.entries.capacity() * size_of::<BatchEntry>() + self.keys.capacity() + self.records.capacity()
+        let rows = self.rows.capacity() * size_of::<Option<SealedRow>>() + self.spans.capacity() * size_of::<Option<(usize, usize)>>();
+        self.entries.capacity() * size_of::<BatchEntry>() + self.keys.capacity() + self.records.capacity() + rows
     }
 }
 
@@ -803,8 +827,9 @@ pub fn planned_scan_bytes(widest_key: u64, open_slots: usize) -> u64 {
     let heads = SHARD_COUNT * (size_of::<ShardHead>() + open_slots * size_of::<TreeCursor>());
     let held = HELD_SOURCE_BLOCKS * ROW_BLOCK_BYTES;
     let tree = 2 * MOST_SCAN_SOURCES * size_of::<u16>();
-    let sorted = BATCH_KEYS * ((widest_key as usize).clamp(1, MOST_KEY_BYTES) + size_of::<KeyEntry>());
-    let batch = BATCH_KEYS * (widest_key as usize + size_of::<BatchEntry>()) + BATCH_BYTES + sorted;
+    let sorted = SCAN_BATCH_KEYS * ((widest_key as usize).clamp(1, MOST_KEY_BYTES) + size_of::<KeyEntry>());
+    let rows = SCAN_BATCH_KEYS * (size_of::<Option<SealedRow>>() + size_of::<Option<(usize, usize)>>());
+    let batch = SCAN_BATCH_KEYS * (widest_key as usize + size_of::<BatchEntry>()) + BATCH_BYTES + sorted + rows;
     keys + (sources + heads + held + tree + batch + MOST_SCAN_SOURCES * size_of::<SegmentNumber>() + SCAN_WINDOWS * SCAN_WINDOW_BYTES) as u64
 }
 
@@ -968,7 +993,7 @@ impl Default for ScanWindows {
 
 /// Allocate a scan's batch of sorted index entries, for the widest key a sorted column can have
 pub fn sorted_batch(widest_key: usize) -> KeyBatch {
-    let mut batch = KeyBatch::new(widest_key.clamp(1, MOST_KEY_BYTES), BATCH_KEYS);
+    let mut batch = KeyBatch::new(widest_key.clamp(1, MOST_KEY_BYTES), SCAN_BATCH_KEYS);
     batch.is_with_graves = true;
     batch
 }

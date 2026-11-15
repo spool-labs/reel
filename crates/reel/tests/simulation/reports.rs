@@ -22,7 +22,7 @@ use crate::seed_sets::seeds;
 
 const ROOT: &str = "/disk/reports";
 const COLUMN: ColumnId = ColumnId(1);
-const BUDGET: ByteCount = ByteCount(64 * 1024 * 1024);
+const BUDGET: ByteCount = ByteCount(66 * 1024 * 1024);
 const TICK: Nanoseconds = Nanoseconds(1_000_000);
 const STEPS: u64 = 400_000;
 const KEYS: u64 = 100;

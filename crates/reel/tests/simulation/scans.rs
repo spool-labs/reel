@@ -29,7 +29,7 @@ use crate::seed_sets::seeds;
 const ROOT: &str = "/disk/scans";
 const COLUMN: ColumnId = ColumnId(1);
 const OTHER_COLUMN: ColumnId = ColumnId(2);
-const BUDGET: ByteCount = ByteCount(64 * 1024 * 1024);
+const BUDGET: ByteCount = ByteCount(68 * 1024 * 1024);
 const TICK: Nanoseconds = Nanoseconds(1_000_000);
 const STEPS: u64 = 400_000;
 const KEYS: u64 = 200;
@@ -1325,3 +1325,4 @@ fn wide_records_read_in_batches() {
     store.state.give_back_scan(scan);
     store.close().expect("close");
 }
+

@@ -762,8 +762,8 @@ impl SortedRun {
     /// index or the sorted index at every moment
     pub fn flush<Backend: Io>(&mut self, state: &EngineState<Backend>, volume: usize, slot: OpenSlot) {
         if let Some(index) = self.column.and_then(|column| state.sorted_index(column)) {
-            let floor = state.sorted_floor(&state.volumes[volume], index, slot);
-            index.upsert_many(&self.keys, &self.entries, floor, |_row, _upserted| {});
+            let floors = state.sorted_floor(&state.volumes[volume], index, slot);
+            index.upsert_many(&self.keys, &self.entries, floors, |_row, _upserted| {});
         }
         self.clear();
     }

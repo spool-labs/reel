@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use reel::index::sorted_keys::{KeyBatch, KeyEntry, MOST_LOOKED, ScanFrom, SortedKeys, Upserted};
+use reel::index::sorted_keys::{Floors, KeyBatch, KeyEntry, MOST_LOOKED, ScanFrom, SortedKeys, Upserted};
 use reel::segment::segment_tail::SegmentNumber;
 use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
@@ -149,14 +149,14 @@ fn run_seed(seed: u64, width: usize, is_many: bool, keys: u64, row_count: u64) {
             let keys: Vec<u8> = sorted.iter().flat_map(|row| key_bytes(width, row.key)).collect();
             let entries: Vec<KeyEntry> = sorted.iter().map(|row| row.entry).collect();
             let floor = floors[(start * WINDOW + chunk.len() - 1).min(rows.len() - 1)];
-            index.upsert_many(&keys, &entries, floor, |_row, upserted| assert_ne!(upserted, Upserted::NoRoom));
+            index.upsert_many(&keys, &entries, Floors::at(floor), |_row, upserted| assert_ne!(upserted, Upserted::NoRoom));
             for row in chunk {
                 newest(&mut model, key_bytes(width, row.key), row.entry);
             }
         }
     } else {
         for (at, row) in rows.iter().enumerate() {
-            assert_ne!(index.upsert(&key_bytes(width, row.key), row.entry, floors[at]), Upserted::NoRoom);
+            assert_ne!(index.upsert(&key_bytes(width, row.key), row.entry, Floors::at(floors[at])), Upserted::NoRoom);
             newest(&mut model, key_bytes(width, row.key), row.entry);
         }
     }
@@ -210,7 +210,7 @@ fn run_seed(seed: u64, width: usize, is_many: bool, keys: u64, row_count: u64) {
 
     // graves past the floor drop every entry, and every page goes back
     for key in 0..keys {
-        index.upsert(&key_bytes(width, key), entry(row_count + 1 + key, true), WritePlace(u64::MAX));
+        index.upsert(&key_bytes(width, key), entry(row_count + 1 + key, true), Floors::at(WritePlace(u64::MAX)));
     }
     assert_eq!(index.check(), Ok(()));
     assert_eq!(index.entry_count(), RowCount(0));
@@ -240,10 +240,10 @@ fn matches_the_model_in_runs() {
 fn a_grave_holds_back_an_older_value() {
     let index = SortedKeys::new(16, RowCount(100));
     let key = [9; 16];
-    assert_eq!(index.upsert(&key, entry(20, true), WritePlace(10)), Upserted::Added);
-    assert_eq!(index.upsert(&key, entry(10, false), WritePlace(11)), Upserted::Kept);
+    assert_eq!(index.upsert(&key, entry(20, true), Floors::at(WritePlace(10))), Upserted::Added);
+    assert_eq!(index.upsert(&key, entry(10, false), Floors::at(WritePlace(11))), Upserted::Kept);
     assert!(index.find(&key).is_some_and(|entry| entry.is_grave));
-    assert_eq!(index.upsert(&key, entry(30, true), WritePlace(40)), Upserted::Dropped);
+    assert_eq!(index.upsert(&key, entry(30, true), Floors::at(WritePlace(40))), Upserted::Dropped);
     assert_eq!(index.find(&key), None);
     assert_eq!(index.check(), Ok(()));
 }
@@ -256,7 +256,7 @@ fn keys_in_order_fill_their_leaves() {
     for key in 0..rows {
         let mut bytes = [0; 16];
         bytes[8..].copy_from_slice(&key.to_be_bytes());
-        assert_eq!(index.upsert(&bytes, entry(key + 1, false), WritePlace(0)), Upserted::Added);
+        assert_eq!(index.upsert(&bytes, entry(key + 1, false), Floors::at(WritePlace(0))), Upserted::Added);
     }
     assert_eq!(index.check(), Ok(()));
     let used = index.page_count() - index.free_pages();
@@ -274,7 +274,7 @@ fn past_capacity_sets_a_mark() {
         bytes[..8].copy_from_slice(&key.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes());
         let mut row = entry(key + 1, false);
         row.segment = SegmentNumber(7);
-        if index.upsert(&bytes, row, WritePlace(0)) == Upserted::NoRoom {
+        if index.upsert(&bytes, row, Floors::at(WritePlace(0))) == Upserted::NoRoom {
             no_room = Some(key);
             break;
         }
@@ -312,19 +312,19 @@ fn a_full_leaf_drops_only_graves_under_the_floor() {
     let index = SortedKeys::new(16, RowCount(10_000));
     let capacity = index.leaf_capacity() as u64;
     for key in 0..capacity {
-        assert_eq!(index.upsert(&ordered_key(key), entry(1_000 + key, true), WritePlace(0)), Upserted::Added);
+        assert_eq!(index.upsert(&ordered_key(key), entry(1_000 + key, true), Floors::at(WritePlace(0))), Upserted::Added);
     }
-    assert_eq!(index.upsert(&ordered_key(capacity), entry(5_000, false), WritePlace(0)), Upserted::Added);
+    assert_eq!(index.upsert(&ordered_key(capacity), entry(5_000, false), Floors::at(WritePlace(0))), Upserted::Added);
     for key in 0..capacity {
-        assert_eq!(index.upsert(&ordered_key(key), entry(key + 1, false), WritePlace(0)), Upserted::Kept, "key {key}");
+        assert_eq!(index.upsert(&ordered_key(key), entry(key + 1, false), Floors::at(WritePlace(0))), Upserted::Kept, "key {key}");
     }
     assert_eq!(index.check(), Ok(()));
 
     let index = SortedKeys::new(16, RowCount(10_000));
     for key in 0..capacity {
-        index.upsert(&ordered_key(key), entry(key + 1, true), WritePlace(0));
+        index.upsert(&ordered_key(key), entry(key + 1, true), Floors::at(WritePlace(0)));
     }
-    assert_eq!(index.upsert(&ordered_key(capacity), entry(5_000, false), WritePlace(capacity + 1)), Upserted::Added);
+    assert_eq!(index.upsert(&ordered_key(capacity), entry(5_000, false), Floors::at(WritePlace(capacity + 1))), Upserted::Added);
     assert_eq!(index.entry_count(), RowCount(1));
     assert_eq!(index.page_count() - index.free_pages(), 1);
     assert_eq!(index.check(), Ok(()));
@@ -336,7 +336,7 @@ fn a_root_with_one_child_folds() {
     let index = SortedKeys::new(16, RowCount(10_000));
     let capacity = index.leaf_capacity() as u64;
     for key in 0..2 * capacity {
-        index.upsert(&ordered_key(key), entry(key + 1, false), WritePlace(0));
+        index.upsert(&ordered_key(key), entry(key + 1, false), Floors::at(WritePlace(0)));
     }
     assert_eq!(index.deepest(), 2);
     assert_eq!(index.remove_range(&ordered_key(0), Some(&ordered_key(capacity)), WritePlace(u64::MAX)), capacity);
@@ -350,9 +350,9 @@ fn a_scan_over_graves_stops_and_goes_on() {
     let index = SortedKeys::new(16, RowCount(10_000));
     let graves = 1_000;
     for key in 0..graves {
-        index.upsert(&ordered_key(key), entry(key + 1, true), WritePlace(0));
+        index.upsert(&ordered_key(key), entry(key + 1, true), Floors::at(WritePlace(0)));
     }
-    index.upsert(&ordered_key(graves), entry(graves + 1, false), WritePlace(0));
+    index.upsert(&ordered_key(graves), entry(graves + 1, false), Floors::at(WritePlace(0)));
     let mut batch = KeyBatch::new(16, 10);
     let mut from: Option<Vec<u8>> = None;
     let mut calls = 0;
@@ -377,7 +377,7 @@ fn a_scan_over_graves_stops_and_goes_on() {
 #[test]
 fn a_run_with_two_versions_of_a_key_keeps_one_entry() {
     let index = SortedKeys::new(16, RowCount(10_000));
-    index.upsert(&ordered_key(0), entry(1, false), WritePlace(0));
+    index.upsert(&ordered_key(0), entry(1, false), Floors::at(WritePlace(0)));
     let mut keys = Vec::new();
     let mut entries = Vec::new();
     for key in 1..50u64 {
@@ -386,7 +386,7 @@ fn a_run_with_two_versions_of_a_key_keeps_one_entry() {
         keys.extend_from_slice(&ordered_key(key));
         entries.push(entry(key, false));
     }
-    index.upsert_many(&keys, &entries, WritePlace(0), |_row, _upserted| {});
+    index.upsert_many(&keys, &entries, Floors::at(WritePlace(0)), |_row, _upserted| {});
     assert_eq!(index.check(), Ok(()));
     assert_eq!(index.entry_count(), RowCount(50));
     for key in 1..50u64 {
@@ -401,7 +401,7 @@ fn starts_of_another_width() {
     let index = SortedKeys::new(4, RowCount(100));
     let stored = [[1, 2, 0, 0], [1, 2, 3, 4], [1, 2, 3, 5]];
     for (place, key) in stored.iter().enumerate() {
-        index.upsert(key, entry(place as u64 + 1, false), WritePlace(0));
+        index.upsert(key, entry(place as u64 + 1, false), Floors::at(WritePlace(0)));
     }
     let scan = |start: &[u8], is_inclusive: bool, is_ascending: bool| {
         let mut batch = KeyBatch::new(4, 10);
@@ -428,7 +428,7 @@ fn starts_past_a_part_word() {
     let index = SortedKeys::new(6, RowCount(100));
     let stored = [[1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 7]];
     for (place, key) in stored.iter().enumerate() {
-        index.upsert(key, entry(place as u64 + 1, false), WritePlace(0));
+        index.upsert(key, entry(place as u64 + 1, false), Floors::at(WritePlace(0)));
     }
     let scan = |start: &[u8], is_ascending: bool| {
         let mut batch = KeyBatch::new(6, 10);

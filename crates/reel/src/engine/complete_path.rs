@@ -16,7 +16,7 @@ use crate::guard::hold;
 use crate::index::complete_table::{CompleteSlot, CompleteTable, TagMatches};
 use crate::index::open_slots::OpenSlot;
 use crate::engine::seal_job::SortedRun;
-use crate::index::sorted_keys::{HOLD_ROWS, KeyEntry, MarkWord, SortedKeys};
+use crate::index::sorted_keys::{Floors, HOLD_ROWS, KeyEntry, MarkWord, SortedKeys};
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::io::{DeviceReads, InPlace, Io, in_place};
 use crate::io::device_error::is_device_error;
@@ -82,17 +82,21 @@ impl<Backend: Io> EngineState<Backend> {
         self.sorted.get(column.0 as usize).and_then(Option::as_ref)
     }
 
-    /// Read the floor a seal gives a sorted index: the lowest place of any row not in it yet. A seal hands the index one row a
-    /// key, the key's newest in its segment, so an older row of a key in the sealing segment never comes, and only the other open
-    /// segments can hold one. Past a mark, sealed rows are out of the index too, so nothing drops
-    pub fn sorted_floor(&self, volume: &Volume<Backend>, index: &SortedKeys, sealing: OpenSlot) -> WritePlace {
+    /// Read the floors a seal gives a sorted index. A seal hands the index one row a key, the key's newest in its segment, so an
+    /// older row of a key in the sealing segment never comes, and the drop floor is the lowest place in the other open segments.
+    /// The sealing segment's rows of other keys are not in the index yet, so the purge floor counts them too. Past a mark, sealed
+    /// rows are out of the index too, so nothing drops
+    pub fn sorted_floor(&self, volume: &Volume<Backend>, index: &SortedKeys, sealing: OpenSlot) -> Floors {
         if index.mark().is_some() {
-            return WritePlace(0);
+            return Floors::at(WritePlace(0));
         }
         let claims = hold(&volume.claims);
-        let open = claims.open.iter().filter(|segment| segment.slot != sealing && segment.row_count.0 > 0);
         let next = WritePlace(self.places.last_given().0.saturating_add(1));
-        open.map(|segment| segment.lowest_place).min().unwrap_or(next).min(next)
+        let lowest = |others: bool| {
+            let open = claims.open.iter().filter(|segment| (segment.slot != sealing || !others) && segment.row_count.0 > 0);
+            open.map(|segment| segment.lowest_place).min().unwrap_or(next).min(next)
+        };
+        Floors { drops: lowest(true), purges: lowest(false) }
     }
 
     /// Find a key's newest sealed row: through the table on a complete column, and through the footers on any other
@@ -368,12 +372,12 @@ impl<Backend: Io> EngineState<Backend> {
                         continue;
                     }
                     if run.entries.len() == HOLD_ROWS {
-                        index.upsert_many(&run.keys, &run.entries, WritePlace(0), |_row, _upserted| {});
+                        index.upsert_many(&run.keys, &run.entries, Floors::at(WritePlace(0)), |_row, _upserted| {});
                         run.clear();
                     }
                     run.push(column, &key, number, &row);
                 }
-                index.upsert_many(&run.keys, &run.entries, WritePlace(0), |_row, _upserted| {});
+                index.upsert_many(&run.keys, &run.entries, Floors::at(WritePlace(0)), |_row, _upserted| {});
                 run.clear();
             }
             Ok(true)

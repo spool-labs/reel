@@ -13,7 +13,7 @@ use reel::engine::open_segment::SegmentPhase;
 use reel::engine::reel_store::ReelStore;
 use reel::engine::rewrite_job::RewritePhase;
 use reel::guard::hold;
-use reel::index::sorted_keys::KeyEntry;
+use reel::index::sorted_keys::{Floors, KeyEntry};
 use reel::record::codec::Codec;
 use reel::engine::store_scan::StoreScan;
 use reel_api::column_id::ColumnId;
@@ -1613,7 +1613,7 @@ fn an_image_into_a_used_index_is_refused() {
     let index = reel::index::sorted_keys::SortedKeys::new(WIDTH as usize, CAPACITY);
     let held = key(KEYS + 7);
     let entry = KeyEntry { place: WritePlace(1), segment: SegmentNumber(1), offset: FileOffset(0), length: ByteCount(1), is_grave: false };
-    index.upsert(&held, entry, WritePlace(0));
+    index.upsert(&held, entry, Floors::at(WritePlace(0)));
     let file = io.open_read_only(&image_path()).expect("open");
     let mut chunk = vec![0; reel::engine::complete_image::IMAGE_CHUNK_BYTES];
     let read = reel::engine::sorted_image::read_sorted_image(&file, COLUMN, &index, &mut chunk, (&|_read_point, _count| true, &|_listed| true));

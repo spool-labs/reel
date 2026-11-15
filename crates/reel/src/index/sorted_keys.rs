@@ -94,6 +94,22 @@ pub struct PackedKey {
     pub words: [u32; MOST_KEY_WORDS],
 }
 
+/// The places under which an upsert drops graves
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Floors {
+    /// An incoming grave under this drops its key's entry, since every older row of its key is in the index
+    pub drops: WritePlace,
+    /// A grave entry under this leaves a full leaf before it splits, since every row older than it is in the index
+    pub purges: WritePlace,
+}
+
+impl Floors {
+    /// Use one place for both floors
+    pub const fn at(place: WritePlace) -> Self {
+        Self { drops: place, purges: place }
+    }
+}
+
 /// What an upsert did
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Upserted {
@@ -103,7 +119,7 @@ pub enum Upserted {
     Replaced,
     /// The key's entry was as new or newer, and stays
     Kept,
-    /// A grave under the floor has nothing older left to hide, so the key has no entry now
+    /// A grave under the drop floor has nothing older left to hide, so the key has no entry now
     Dropped,
     /// The pool had no page for the row, so the index marked its segment
     NoRoom,
@@ -526,13 +542,13 @@ impl SortedKeys {
         key.first().map_or(0, |byte| usize::from(*byte))
     }
 
-    /// Give a sealed row an entry when it's newer than the key's. A grave under the floor drops the key's entry, since every row
-    /// older than it is in the index already. The floor is the lowest place of any row not in the index yet
-    pub fn upsert(&self, key: &[u8], entry: KeyEntry, floor: WritePlace) -> Upserted {
+    /// Give a sealed row an entry when it's newer than the key's. A grave under the drop floor takes the key's entry out, and a full
+    /// leaf sheds its graves under the purge floor before it splits
+    pub fn upsert(&self, key: &[u8], entry: KeyEntry, floors: Floors) -> Upserted {
         assert_eq!(key.len(), self.width, "a sorted index holds keys of one width");
         let part = self.part_of(key);
         let mut tree = self.parts.write(part);
-        let upserted = self.upsert_in(&mut tree, &PackedKey::new(key), entry, floor);
+        let upserted = self.upsert_in(&mut tree, &PackedKey::new(key), entry, floors);
         // the mark goes up under the part's hold, so no get finds the key missing with the mark not yet there
         if upserted == Upserted::NoRoom {
             self.note_missed(entry.segment, 1);
@@ -544,7 +560,7 @@ impl SortedKeys {
 
     /// Give sealed rows in ascending key order their entries, taking each part's lock once for the rows in it. The rows bound
     /// for one leaf go in with one pass over the leaf from its end, so a seal moves each leaf's words once
-    pub fn upsert_many(&self, keys: &[u8], entries: &[KeyEntry], floor: WritePlace, mut done: impl FnMut(usize, Upserted)) {
+    pub fn upsert_many(&self, keys: &[u8], entries: &[KeyEntry], floors: Floors, mut done: impl FnMut(usize, Upserted)) {
         assert_eq!(keys.len(), entries.len() * self.width, "a sorted index holds keys of one width");
         let mut at = 0;
         while at < entries.len() {
@@ -553,13 +569,13 @@ impl SortedKeys {
             // a reader of the part waits for one short hold at most
             let held_from = at;
             while at < entries.len() && at - held_from < HOLD_ROWS && self.part_of(&keys[at * self.width..]) == part {
-                let merged = self.merge_into_leaf(&mut tree, keys, entries, at, floor, &mut done);
+                let merged = self.merge_into_leaf(&mut tree, keys, entries, at, floors.drops, &mut done);
                 if merged > 0 {
                     at += merged;
                     continue;
                 }
                 let key = PackedKey::new(&keys[at * self.width..(at + 1) * self.width]);
-                let upserted = self.upsert_in(&mut tree, &key, entries[at], floor);
+                let upserted = self.upsert_in(&mut tree, &key, entries[at], floors);
                 // the mark goes up under the part's hold, so no get finds the key missing with the mark not yet there
                 if upserted == Upserted::NoRoom {
                     self.note_missed(entries[at].segment, 1);
@@ -684,8 +700,8 @@ impl SortedKeys {
     }
 
     /// Upsert one row into a part's tree
-    fn upsert_in(&self, tree: &mut PartTree, key: &PackedKey, entry: KeyEntry, floor: WritePlace) -> Upserted {
-        let is_dropped = entry.is_grave && entry.place < floor;
+    fn upsert_in(&self, tree: &mut PartTree, key: &PackedKey, entry: KeyEntry, floors: Floors) -> Upserted {
+        let is_dropped = entry.is_grave && entry.place < floors.drops;
         let (Ok(segment), Ok(offset), Ok(length)) =
             (u32::try_from(entry.segment.0), u32::try_from(entry.offset.0), u32::try_from(entry.length.0))
         else {
@@ -726,7 +742,7 @@ impl SortedKeys {
             return Upserted::Dropped;
         }
         if self.count(leaf) == self.leaf_capacity {
-            self.purge_graves(tree, leaf, floor);
+            self.purge_graves(tree, leaf, floors.purges);
             if self.count(leaf) == self.leaf_capacity {
                 if !self.split_leaf(tree, &path, leaf, key) {
                     return Upserted::NoRoom;

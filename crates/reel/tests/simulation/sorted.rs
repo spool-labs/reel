@@ -578,8 +578,11 @@ fn churn(seed: u64, Arm { capacity, key_of, extra }: Arm) -> (bool, bool) {
         }
         // a seed whose rounds all end in a reopen seals nothing until here, so the walks run once more over sealed keys
         check_scans(&store, &model, &mut random);
-        assert!(store.state.sorted_answers.load(Ordering::Relaxed) > 0);
-        assert!(store.state.sorted_scan_keys.load(Ordering::Relaxed) > 0, "no scan key came from the index");
+        // with a mark standing every get and scan reads the footers, so only an index with no mark answers on its own
+        if is_cleared {
+            assert!(store.state.sorted_answers.load(Ordering::Relaxed) > 0);
+            assert!(store.state.sorted_scan_keys.load(Ordering::Relaxed) > 0, "no scan key came from the index");
+        }
         store.close().expect("close");
         (was_marked, is_cleared)
     }

@@ -1500,3 +1500,38 @@ fn a_merge_counts_once_mid_copy_and_by_its_outputs_after() {
     assert_eq!(overlap(), 1, "a look after the install started a merge");
     store.close().expect("close");
 }
+
+// 77 segments over every key against a bound of 32, as the 50M load left the box: one hand-out starts merges while the count
+// net of running merges is over the bound, so 7 merges of 8 bring it to 28, and no eighth
+#[test]
+fn far_behind_starts_what_the_count_asks() {
+    let io = SimulatedIo::new(Seed(77));
+    let store = open_crowd(&io);
+    let (job, merges, inputs) = crowd_hand_out(&io, &store, 77);
+    assert_eq!((merges, inputs), (7, 56));
+    assert_eq!(finish_merges(&io, &store, &job), (28, 7), "the store merged past what the bound asks");
+    store.close().expect("close");
+}
+
+// the same, with five more segments sealing while the 7 merges run, as the box's settle sealed the load's open tail: 28 and 5
+// is 33, one over, so one more merge starts and the store ends under the bound
+#[test]
+fn seals_during_far_behind_merges_start_one_more() {
+    let io = SimulatedIo::new(Seed(78));
+    let store = open_crowd(&io);
+    let (job, merges, inputs) = crowd_hand_out(&io, &store, 77);
+    assert_eq!((merges, inputs), (7, 56));
+    let mut number: u64 = 1 << 40;
+    for _segment in 0..5 {
+        for _key in 0..CROWD_KEYS {
+            store.put(COLUMN, &number.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes(), &[7; 100]).expect("put");
+            number += 1;
+        }
+        store.seal_now();
+        settle(&io);
+    }
+    let (segments, ever) = finish_merges(&io, &store, &job);
+    assert_eq!(ever, 8, "five seals over the bound started other than one merge");
+    assert!(segments <= 32, "{segments} segments over every key after the merges");
+    store.close().expect("close");
+}

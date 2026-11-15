@@ -201,16 +201,29 @@ fn first_rows(mut scan: StoreScan<SimulatedIo>, most: usize) -> Rows {
     found
 }
 
+// a start among the model's keys with room rows past it in the walk's direction, or any churn key while the model is too small
+fn pick_start(names: &[&Vec<u8>], random: &mut SeededRandom, room: usize, direction: Direction) -> Vec<u8> {
+    if names.len() <= room {
+        return key(random.below(CHURN_KEYS));
+    }
+    let at = random.below((names.len() - room) as u64) as usize;
+    match direction {
+        Direction::Ascending => names[at].clone(),
+        Direction::Descending => names[at + room].clone(),
+    }
+}
+
 // whole walks both ways and walks from keys of every width, against the model
 fn check_scans(store: &Store, model: &Model, random: &mut SeededRandom) {
     let forward: Vec<(Vec<u8>, Vec<u8>)> = model.iter().map(|(key, value)| (key.clone(), value.clone())).collect();
+    let names: Vec<&Vec<u8>> = forward.iter().map(|(name, _value)| name).collect();
     assert_eq!(rows(store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan")), forward);
     let top = vec![0xFF; WIDTH as usize + 1];
     let mut backward = forward.clone();
     backward.reverse();
     assert_eq!(rows(store.iter_from(COLUMN, &top, Direction::Descending).expect("scan")), backward);
     for _start in 0..SCAN_STARTS {
-        let mut start = key(random.below(CHURN_KEYS));
+        let mut start = pick_start(&names, random, 0, Direction::Ascending);
         // a start a byte short or a byte long sorts beside the stored keys of its leading bytes
         match random.below(3) {
             0 => {
@@ -227,17 +240,19 @@ fn check_scans(store: &Store, model: &Model, random: &mut SeededRandom) {
         assert_eq!(found, down, "down from {start:?}");
     }
     // one untold walk from a random key reads to the end, so its batch grows through every size
-    let start = key(random.below(CHURN_KEYS));
+    let start = pick_start(&names, random, 0, Direction::Ascending);
     let up: Rows = forward.iter().filter(|(name, _value)| *name >= start).cloned().collect();
     assert_eq!(rows(store.iter_from(COLUMN, &start, Direction::Ascending).expect("scan")), up, "whole walk up from {start:?}");
-    // a scan told its count takes that many rows, and one read on past the count returns the rows after them
+    // a scan told its count takes that many rows, and one read on past the count returns the rows after them. Each starts with
+    // that many rows ahead of it, so a scan that comes back short fails
     for told in TOLD_COUNTS {
-        let start = key(random.below(CHURN_KEYS));
         for direction in [Direction::Ascending, Direction::Descending] {
+            let start = pick_start(&names, random, told + SCAN_TAKE, direction);
             let expected: Rows = match direction {
                 Direction::Ascending => forward.iter().filter(|(name, _value)| *name >= start).take(told + SCAN_TAKE).cloned().collect(),
                 Direction::Descending => backward.iter().filter(|(name, _value)| *name <= start).take(told + SCAN_TAKE).cloned().collect(),
             };
+            assert!(names.len() <= told + SCAN_TAKE || expected.len() == told + SCAN_TAKE, "a start with too few rows ahead");
             let range = ScanRange { wanted: Some(RowCount(told as u64)), ..from_key(COLUMN, &start, direction) };
             let mut scan = store.iter(&range).expect("scan");
             let (mut name, mut value, mut found) = (Vec::new(), Vec::new(), Vec::new());

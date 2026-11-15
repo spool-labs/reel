@@ -1254,19 +1254,26 @@ fn first_rows(mut scan: StoreScan<SimulatedIo>, most: usize) -> Rows {
 // whole walks both ways, and walks from stored keys with and without a told count, against the model
 fn check_scans(store: &Store, model: &Model, names: &[Vec<u8>], random: &mut SeededRandom) {
     let forward: Rows = model.iter().map(|(key, value)| (key.clone(), value.clone())).collect();
+    let stored: Vec<&Vec<u8>> = forward.iter().map(|(name, _value)| name).collect();
     assert_eq!(first_rows(store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan"), usize::MAX), forward);
     let mut backward = forward.clone();
     backward.reverse();
     let top = vec![0xFF; 65];
     assert_eq!(first_rows(store.iter_from(COLUMN, &top, Direction::Descending).expect("scan"), usize::MAX), backward);
     for told in [None, Some(100), Some(256), Some(300)] {
-        let start = names[random.below(names.len() as u64) as usize].clone();
         let most = told.unwrap_or(SCAN_TAKE) + SCAN_TAKE;
         for direction in [Direction::Ascending, Direction::Descending] {
+            // a start among the stored keys with the rows ahead of it, or any key while the model is too small
+            let start = match direction {
+                _ if stored.len() <= most => names[random.below(names.len() as u64) as usize].clone(),
+                Direction::Ascending => stored[random.below((stored.len() - most) as u64) as usize].clone(),
+                Direction::Descending => stored[most + random.below((stored.len() - most) as u64) as usize].clone(),
+            };
             let expected: Rows = match direction {
                 Direction::Ascending => forward.iter().filter(|(name, _value)| *name >= start).take(most).cloned().collect(),
                 Direction::Descending => backward.iter().filter(|(name, _value)| *name <= start).take(most).cloned().collect(),
             };
+            assert!(stored.len() <= most || expected.len() == most, "a start with too few rows ahead");
             let range = ScanRange { wanted: told.map(|told| RowCount(told as u64)), ..from_key(COLUMN, &start, direction) };
             let found = first_rows(store.iter(&range).expect("scan"), most);
             assert_eq!(found, expected, "told {told:?} {direction:?} from {start:?}");

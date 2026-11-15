@@ -19,9 +19,7 @@ use reel_api::units::{ByteCount, Nanoseconds, WritePlace};
 
 use crate::engine::reports::thread_cpu;
 use crate::config::MAX_KEY_BYTES;
-use crate::engine::complete_path::{REFILL_STEP_BLOCKS, Refill, SortedRefill};
-use crate::engine::seal_job::SortedRun;
-use crate::index::sorted_keys::MOST_KEY_BYTES;
+use crate::engine::complete_path::{REFILL_STEP_BLOCKS, Refill};
 use crate::engine::cover_apply::is_in_range;
 use crate::engine::engine_state::EngineState;
 use crate::engine::load_state::{Load, Owed, Refusal, is_deferring, is_holding_asks, is_reclaim_wanted, refusal_wait};
@@ -148,9 +146,6 @@ pub struct CompactJob<Backend: Io> {
     refill_key: FixedList<u8>,
     refill_below: u64,
     refill_reader: FooterReader,
-    sorted_refill: Option<SortedRefill>,
-    sorted_refill_below: u64,
-    sorted_run: SortedRun,
     sweep: Option<Sweep>,
     last_tried: SegmentNumber,
     settle_at: usize,
@@ -211,9 +206,6 @@ impl<Backend: Io> CompactJob<Backend> {
             refill_below: u64::MAX,
             sweep: None,
             refill_reader: FooterReader::new(),
-            sorted_refill: None,
-            sorted_refill_below: u64::MAX,
-            sorted_run: SortedRun::new(MOST_KEY_BYTES),
         }
     }
 
@@ -517,7 +509,7 @@ impl<Backend: Io> CompactJob<Backend> {
             self.refill = state.start_refill(self.volume, self.refill_below);
         }
         let Some(mut refill) = self.refill else {
-            return self.step_sorted_refill();
+            return false;
         };
         self.unit = Some((UnitKind::SlotRefill, u64::from(REFILL_STEP_BLOCKS)));
         // a failed read ends the refill with the mark standing, and a later step starts it over
@@ -527,26 +519,6 @@ impl<Backend: Io> CompactJob<Backend> {
         if !goes_on {
             let table = state.complete_table(refill.column);
             self.refill_below = table.filter(|table| table.mark().is_some()).map_or(u64::MAX, |table| table.used_slots().0);
-        }
-        true
-    }
-
-    /// Give one segment past a sorted index's mark its entries once it has room again, and say whether a step ran
-    pub fn step_sorted_refill(&mut self) -> bool {
-        let state = Arc::clone(&self.state);
-        if self.sorted_refill.is_none() {
-            self.sorted_refill = state.start_sorted_refill(self.volume, self.sorted_refill_below);
-        }
-        let Some(mut refill) = self.sorted_refill else {
-            return false;
-        };
-        self.unit = Some((UnitKind::SlotRefill, 1));
-        let goes_on = state.sorted_refill_step(self.volume, &mut refill, &mut self.sorted_run).unwrap_or(false);
-        self.sorted_refill = goes_on.then_some(refill);
-        // a refill that met a block no read could give waits for the index to hold fewer entries before it runs again, so the
-        // mark stands over that block's rows. One a miss or an install refused starts over from the word as it stands
-        if refill.is_stuck {
-            self.sorted_refill_below = state.sorted_index(refill.column).map_or(u64::MAX, |sorted| sorted.entry_count().0);
         }
         true
     }

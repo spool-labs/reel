@@ -1288,7 +1288,6 @@ fn cues_held_across_covers_and_single_seals() {
 const COPY_STEPS: u64 = 2;
 const FAILURE_TRIES: u64 = 400;
 const TAIL_KEYS: usize = 10;
-const REFILL_KEPT: usize = 50;
 // Draft: sims for the sorted index image, to go at the end of tests/simulation/sorted.rs. Every sim that expects the image taken
 // asserts taken 1 and refused 0, and every refusal asserts refused 1 and taken 0, since a refusal rebuilds and matches the model too
 
@@ -1951,10 +1950,6 @@ fn a_segment_with_an_unread_block_still_reads_its_rows() {
         store.clear_damage(COLUMN, b"", None).expect("clear");
         let reading = report(&store).sorted_columns[0];
         assert!(reading.is_marked, "round {round}: a fill that missed rows left the index unmarked");
-        // a refill that meets the unread block ends with the mark standing over its rows, and starts no more
-        store.state.ask_compaction();
-        settle(&io);
-        assert!(report(&store).sorted_columns[0].is_marked, "round {round}: a refill cleared the mark over an unread block");
         let (found, refused) = read_counts(&store, &model);
         eprintln!("unread block, round {round}: found {found} refused {refused} of {}", model.len());
         assert_eq!(found + refused, model.len() as u64);
@@ -1985,50 +1980,6 @@ fn hold_rebuilds_here(store: &Store) {
         volume.holds.rebuild.store(true, Ordering::Release);
     }
 }
-
-// An index past its declared rows takes its mark, and once a range delete takes most of its entries back out the refill gives
-// the rows past the mark their entries and clears it: gets and scans then answer from the index alone, and every answer
-// matches the model
-#[test]
-fn a_marked_index_refills_once_room_returns() {
-    let io = SimulatedIo::new(Seed(190));
-    let store = open(&io, SMALL_CAPACITY);
-    let index = store.state.sorted_index(COLUMN).expect("an index");
-    let mut model = Model::new();
-    let written: Vec<Vec<u8>> = (0..KEYS * 20).map(key).collect();
-    for number in 0..KEYS * 20 {
-        store.put(COLUMN, &key(number), format!("value-{number}").as_bytes()).expect("put");
-        model.insert(key(number), format!("value-{number}").into_bytes());
-    }
-    seal_all(&store, &io);
-    assert!(index.mark().is_some(), "the index never went past its rows");
-    // a range delete over all but the highest keys frees most of the pool once it seals
-    let names: Vec<Vec<u8>> = model.keys().cloned().collect();
-    let kept = names[names.len() - REFILL_KEPT..].to_vec();
-    store.delete_range(COLUMN, &names[0], &kept[0]).expect("delete range");
-    model.retain(|name, _value| kept.contains(name));
-    seal_all(&store, &io);
-    store.state.ask_compaction();
-    settle(&io);
-    let state = &store.state;
-    eprintln!(
-        "refill: mark {:?} entries {} passes {} clears {} refused {} stuck {}",
-        index.mark(),
-        index.entry_count().0,
-        state.sorted_refill_passes.load(Ordering::Acquire),
-        state.sorted_refill_clears.load(Ordering::Acquire),
-        state.sorted_refill_refused.load(Ordering::Acquire),
-        state.sorted_refill_stuck.load(Ordering::Acquire)
-    );
-    assert!(index.mark().is_none(), "the refill never cleared the mark");
-    let before = report(&store).sorted_footer_asks;
-    check(&store, &model, &written);
-    check_entries(&store, &model);
-    check_scans(&store, &model, &mut SeededRandom::new(Seed(191)));
-    assert_eq!(report(&store).sorted_footer_asks, before, "a get asked the footers after the refill");
-    store.close().expect("close");
-}
-
 // a scan told no count starts at the small batch and doubles with the rows it takes: one that stops after 33 rows locates no
 // more than 96 keys from the index, one that takes 1,000 no more than 1,256, and both return the model's rows
 #[test]

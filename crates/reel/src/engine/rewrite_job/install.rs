@@ -349,14 +349,6 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
         volume.lanes[self.lane].rewrites_done.fetch_add(1, Ordering::AcqRel);
         self.summarize(volume, inputs);
-        // a refill that read the inputs before they left can't clear its mark over rows it never read in the outputs
-        for (id, sorted) in state.sorted.iter().enumerate() {
-            if let (Some(sorted), Some(info)) = (sorted, state.columns[id])
-                && info.volume == volume.id
-            {
-                sorted.note_moved_under_mark();
-            }
-        }
         let staged = self.staged.iter().map(|staged| staged.facts.segment);
         let last = self.totals.and(self.output.as_ref()).map(|output| output.number);
         let graves = self.grave_totals.and(self.grave_output.as_ref()).map(|output| output.number);

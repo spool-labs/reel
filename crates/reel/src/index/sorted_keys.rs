@@ -34,41 +34,8 @@ pub const MAX_DEPTH: usize = 8;
 pub const NO_PAGE: u32 = u32::MAX;
 /// The bit of a place's high word that marks a grave
 pub const GRAVE_BIT: u32 = 1 << 31;
-/// The mark word's mark half when no row has gone past the index
-pub const NO_MARK_SEGMENT: u32 = u32::MAX;
-
-/// The mark word: a generation in the high half and, in the low half, the lowest segment a row of which found no room. Every
-/// miss, every install while a mark stands and every clear moves the generation, so a reader that loads it twice knows whether
-/// anything happened between
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MarkWord(pub u64);
-
-impl MarkWord {
-    pub const NONE: Self = Self::new(0, NO_MARK_SEGMENT);
-
-    /// Build a word from its generation and its mark half
-    pub const fn new(generation: u32, mark: u32) -> Self {
-        Self(((generation as u64) << 32) | mark as u64)
-    }
-
-    /// Read the generation
-    pub const fn generation(self) -> u32 {
-        (self.0 >> 32) as u32
-    }
-
-    /// Read the mark, if one stands
-    pub const fn mark(self) -> Option<SegmentNumber> {
-        match self.0 as u32 {
-            NO_MARK_SEGMENT => None,
-            mark => Some(SegmentNumber(mark as u64)),
-        }
-    }
-}
-
-/// The mark half for a segment: its number when it fits under the empty mark, or 0, which walks every segment, when it doesn't
-pub fn mark_of(segment: SegmentNumber) -> u32 {
-    u32::try_from(segment.0).ok().filter(|mark| *mark < NO_MARK_SEGMENT).unwrap_or(0)
-}
+/// An index with no mark serves every row from its entries
+pub const NO_MARK: u64 = u64::MAX;
 /// Leaves fill this many thirds on average under random upserts, which sizes the pool from a row count
 pub const FILL_THIRDS: usize = 2;
 /// Most rows one pass merges into a leaf
@@ -333,7 +300,7 @@ impl SortedKeys {
             parts: Shards((0..PARTS).map(|_part| std::sync::RwLock::new(PartTree::empty())).collect()),
             filled: (0..PARTS).map(|_part| AtomicU64::new(0)).collect(),
             entries: AtomicU64::new(0),
-            mark: AtomicU64::new(MarkWord::NONE.0),
+            mark: AtomicU64::new(NO_MARK),
             past_capacity: AtomicU64::new(0),
             told_rows: rows,
             high_water: AtomicU32::new(0),
@@ -413,7 +380,7 @@ impl SortedKeys {
             self.store(page, 1, next);
         }
         self.entries.store(0, Memory::Release);
-        self.mark.store(MarkWord::NONE.0, Memory::Release);
+        self.mark.store(NO_MARK, Memory::Release);
         self.past_capacity.store(0, Memory::Release);
         self.high_water.store(0, Memory::Release);
     }
@@ -473,43 +440,17 @@ impl SortedKeys {
         RowCount(self.past_capacity.load(Memory::Acquire))
     }
 
-    /// Read the mark word
-    pub fn mark_word(&self) -> MarkWord {
-        MarkWord(self.mark.load(Memory::Acquire))
-    }
-
     /// Read the segment a read's footer search starts from, if rows have gone past the index
     pub fn mark(&self) -> Option<SegmentNumber> {
-        self.mark_word().mark()
+        match self.mark.load(Memory::Acquire) {
+            NO_MARK => None,
+            mark => Some(SegmentNumber(mark)),
+        }
     }
 
     /// Mark the index at a segment whose rows it couldn't take, so reads from that segment on ask the footers until a refill
     pub fn mark_from(&self, segment: SegmentNumber) {
-        self.lower_mark(mark_of(segment));
-    }
-
-    /// Note rows that found no room: the misses counted, the generation up and the mark at the lowest segment among them
-    fn note_missed(&self, lowest: SegmentNumber, rows: u64) {
-        self.past_capacity.fetch_add(rows, Memory::AcqRel);
-        self.lower_mark(mark_of(lowest));
-    }
-
-    /// Move the generation and lower the mark to a segment, in one update of the word
-    fn lower_mark(&self, missed: u32) {
-        let _moved = self.mark.fetch_update(Memory::AcqRel, Memory::Acquire, |word| {
-            let word = MarkWord(word);
-            let mark = word.mark().map_or(missed, |mark| mark_of(mark).min(missed));
-            Some(MarkWord::new(word.generation().wrapping_add(1), mark).0)
-        });
-    }
-
-    /// Move the generation with the mark as it stands, for an install that moved rows while a mark stands, so a refill that read
-    /// the inputs before it can't clear over rows it never read
-    pub fn note_moved_under_mark(&self) {
-        let _moved = self.mark.fetch_update(Memory::AcqRel, Memory::Acquire, |word| {
-            let word = MarkWord(word);
-            word.mark().map(|_mark| MarkWord::new(word.generation().wrapping_add(1), word.0 as u32).0)
-        });
+        self.mark.fetch_min(segment.0, Memory::AcqRel);
     }
 
     /// Check a quarter of the pool is free, so rows past the mark can have entries again
@@ -517,24 +458,17 @@ impl SortedKeys {
         self.free_pages() * 4 >= self.page_count()
     }
 
-    /// Clear the mark from the word a refill read when its pass began, with the misses counted then, and say whether it went.
-    /// Any miss or install since moved the generation, so the clear fails and the mark stands, and the mark never reads empty
-    /// while a row is missing. The misses the pass made good leave the count
-    pub fn clear_mark(&self, seen: MarkWord, missed: RowCount) -> bool {
-        let cleared = MarkWord::new(seen.generation().wrapping_add(1), NO_MARK_SEGMENT);
-        if self.mark.compare_exchange(seen.0, cleared.0, Memory::AcqRel, Memory::Acquire).is_err() {
+    /// Clear a mark a refill from it made good, and say whether it went. A row that found no room since the refill began keeps it
+    pub fn clear_mark(&self, mark: SegmentNumber, missed: RowCount) -> bool {
+        if self.mark.compare_exchange(mark.0, NO_MARK, Memory::AcqRel, Memory::Acquire).is_err() {
+            return false;
+        }
+        if self.past_capacity.load(Memory::Acquire) != missed.0 {
+            self.mark.fetch_min(mark.0, Memory::AcqRel);
             return false;
         }
         self.past_capacity.fetch_sub(missed.0, Memory::AcqRel);
         true
-    }
-
-    /// Check an entry at a place a leaf holds keeps over a new one: a lower place, or the same place in a segment numbered no
-    /// higher. A row read again stands where its newer copy sits, and a merge's output always takes a higher number than its inputs
-    fn keeps_over(&self, leaf: u32, index: usize, entry: &KeyEntry) -> bool {
-        let held = self.entry_place(leaf, index);
-        let held_segment = u64::from(self.load(leaf, self.leaf_entry(index) + self.key_words + 2));
-        entry.place.0 < held || (entry.place.0 == held && entry.segment.0 <= held_segment)
     }
 
     /// Find the part a key sits in
@@ -549,12 +483,12 @@ impl SortedKeys {
         let part = self.part_of(key);
         let mut tree = self.parts.write(part);
         let upserted = self.upsert_in(&mut tree, &PackedKey::new(key), entry, floors);
-        // the mark goes up under the part's hold, so no get finds the key missing with the mark not yet there
-        if upserted == Upserted::NoRoom {
-            self.note_missed(entry.segment, 1);
-        }
         self.filled[part].store(tree.entries, Memory::Release);
         drop(tree);
+        if upserted == Upserted::NoRoom {
+            self.past_capacity.fetch_add(1, Memory::AcqRel);
+            self.mark.fetch_min(entry.segment.0, Memory::AcqRel);
+        }
         upserted
     }
 
@@ -576,9 +510,9 @@ impl SortedKeys {
                 }
                 let key = PackedKey::new(&keys[at * self.width..(at + 1) * self.width]);
                 let upserted = self.upsert_in(&mut tree, &key, entries[at], floors);
-                // the mark goes up under the part's hold, so no get finds the key missing with the mark not yet there
                 if upserted == Upserted::NoRoom {
-                    self.note_missed(entries[at].segment, 1);
+                    self.past_capacity.fetch_add(1, Memory::AcqRel);
+                    self.mark.fetch_min(entries[at].segment.0, Memory::AcqRel);
                 }
                 done(at, upserted);
                 at += 1;
@@ -651,7 +585,7 @@ impl SortedKeys {
             if !is_found {
                 continue;
             }
-            if self.keeps_over(leaf, index, &entry) {
+            if entry.place.0 <= self.entry_place(leaf, index) {
                 done(row, Upserted::Kept);
                 continue;
             }
@@ -728,7 +662,7 @@ impl SortedKeys {
         let mut leaf = self.descend(tree, key, &mut path);
         let (mut index, is_found) = self.leaf_search(leaf, key);
         if is_found {
-            if self.keeps_over(leaf, index, &entry) {
+            if entry.place.0 <= self.entry_place(leaf, index) {
                 return Upserted::Kept;
             }
             if is_dropped {

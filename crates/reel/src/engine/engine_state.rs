@@ -179,11 +179,6 @@ pub struct EngineState<Backend: Io> {
     pub sorted_image_bytes: AtomicU64,
     /// Sorted image saves a close gave up on, which cost the next open its fast fill
     pub sorted_image_saves_failed: AtomicU64,
-    /// Sorted refills started, cleared, refused by a miss or an install, and ended at a block no read could give
-    pub sorted_refill_passes: AtomicU64,
-    pub sorted_refill_clears: AtomicU64,
-    pub sorted_refill_refused: AtomicU64,
-    pub sorted_refill_stuck: AtomicU64,
     /// Caller operations, so maintenance can tell callers are busy
     pub caller_ops: CallerCounts,
     /// The line writers wait on, shared with every volume

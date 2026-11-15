@@ -21,7 +21,7 @@ use crate::record::record_check::RunningSum;
 use crate::segment::segment_tail::SegmentNumber;
 
 /// The first bytes of an image
-pub const IMAGE_MAGIC: u64 = 0x5245_454C_494D_4731;
+pub const IMAGE_MAGIC: u64 = 0x5245_454C_494D_4732;
 /// Bytes of an image's header: magic, column, slots and overflow a shard, used slots and covered segments
 pub const IMAGE_HEAD_BYTES: usize = 6 * size_of::<u64>();
 /// Bytes an image's sum and writes go by. Every part of an image is a whole number of words, so none splits across these

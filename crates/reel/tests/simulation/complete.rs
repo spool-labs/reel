@@ -75,6 +75,8 @@ const CHARGE_CRASH_POINTS: u64 = 40;
 type Store = ReelStore<SimulatedIo>;
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
 type Rows = Vec<(Vec<u8>, Vec<u8>)>;
+// keys seen for each shard and tag, with the first home of each
+type HomesSeen = BTreeMap<(usize, u16), Vec<(Vec<u8>, usize)>>;
 type Filled = (BTreeMap<Vec<u8>, Vec<u8>>, Vec<Vec<u8>>);
 
 fn config(capacity: RowCount) -> StoreConfig {
@@ -464,7 +466,8 @@ fn colliding_keys() -> [Vec<u8>; 3] {
     unreachable!("keys never run out");
 }
 
-// a key whose tag matches another's reads its own value, and one never written reads as absent, for the price of a block read
+// a key whose tag matches another's reads its own value, and one never written reads as absent, for the price of a block read. Two
+// keys of a tag in one block share one slot
 #[test]
 fn tag_collision() {
     let [left, right, never] = colliding_keys();
@@ -473,7 +476,9 @@ fn tag_collision() {
     store.put(COLUMN, &left, b"left").expect("put");
     store.put(COLUMN, &right, b"right").expect("put");
     seal(&store, &io);
-    assert_eq!(slots_of(&store, &left).len(), 2, "each key holds a slot of its own, in the same block");
+    let shared = slots_of(&store, &left);
+    assert_eq!(shared.len(), 1, "two keys of a tag in one block share one slot");
+    assert!(shared[0].is_shared(), "{shared:?}");
     assert_eq!(read(&store, &left), Some(b"left".to_vec()));
     assert_eq!(read(&store, &right), Some(b"right".to_vec()));
     assert_eq!(read(&store, &never), None);
@@ -1138,6 +1143,12 @@ fn churn_in_one_shard_matches_the_model() {
     println!("complete churn in one shard: {marked} seeds marked, {cleared} cleared");
 }
 
+// the seed whose one-shard churn read an older value once a free took a slot two keys of a tag needed
+#[test]
+fn churn_in_one_shard_keeps_seed_601271() {
+    let (_was_marked, _is_cleared) = churn(601_271, CAPACITY, &one_shard_keys());
+}
+
 // the same churn on a table with room for fewer rows than a seed writes, so seeds go past capacity, and a range delete of half
 // the keys halfway through lets the walk and the refill free room
 #[test]
@@ -1279,4 +1290,167 @@ fn check_scans(store: &Store, model: &Model, names: &[Vec<u8>], random: &mut See
             assert_eq!(found, expected, "told {told:?} {direction:?} from {start:?}");
         }
     }
+}
+
+// keys of one shard whose tags differ from a tag, to fill that shard's slots
+fn fillers(shard: usize, tag: u16) -> impl Iterator<Item = Vec<u8>> {
+    (1_000_000..).map(key).filter(move |name| {
+        let hash = hash_key(COLUMN, name);
+        shard_of(hash) == shard && tag_of(hash) != tag
+    })
+}
+
+// Two keys of one tag share one block's slot when the second finds no room, and a walk that supersedes the first keeps the slot
+// for the second. Before shared slots the second key's give failed, a refill took the first key's identical slot for the second's
+// and cleared the mark, and the walk then freed the only slot. With the walk held, the refill runs between the first key's newer
+// seal and its walk
+fn shared_slot_outlives_the_other_keys_free(is_walk_held: bool) {
+    let [first, second, _third] = colliding_keys();
+    let hash = hash_key(COLUMN, &first);
+    let (shard, tag) = (shard_of(hash), tag_of(hash));
+    let io = SimulatedIo::new(Seed(196));
+    let store = open(&io, TINY_CAPACITY);
+    let volume = &store.state.volumes[0];
+    let table = store.state.complete_table(COLUMN).expect("a table");
+    volume.holds.compaction.store(true, Ordering::Release);
+    // fill the shard until one slot is left
+    for filler in fillers(shard, tag) {
+        if table.free_slots_in(shard) == 1 {
+            break;
+        }
+        store.put(COLUMN, &filler, b"filler").expect("put");
+        seal(&store, &io);
+    }
+    assert_eq!(table.free_slots_in(shard), 1);
+    assert_eq!(table.mark(), None, "a filler found no room");
+    store.put(COLUMN, &first, b"first").expect("put");
+    store.put(COLUMN, &second, b"second").expect("put");
+    seal(&store, &io);
+    let slots = slots_of(&store, &second);
+    assert_eq!(slots.len(), 1, "the second key takes the first key's slot in their block: {slots:?}");
+    assert!(slots[0].is_shared(), "{slots:?}");
+    assert_eq!(table.mark(), None, "the second key found its slot");
+    volume.holds.walk.store(is_walk_held, Ordering::Release);
+    store.put(COLUMN, &first, b"newer").expect("put");
+    seal(&store, &io);
+    store.state.ask_compaction();
+    for _round in 0..20 {
+        io.advance_clock(Nanoseconds(1_000_000_000));
+        cool(&store, &io);
+    }
+    volume.holds.walk.store(false, Ordering::Release);
+    for _round in 0..20 {
+        io.advance_clock(Nanoseconds(1_000_000_000));
+        cool(&store, &io);
+    }
+    assert_eq!(read(&store, &first), Some(b"newer".to_vec()));
+    assert_eq!(read(&store, &second), Some(b"second".to_vec()), "the second key lost its slot");
+    assert!(slots_of(&store, &second).contains(&slots[0]), "the walk freed a slot the second key needs");
+    store.close().expect("close");
+}
+
+#[test]
+fn a_shared_slot_outlives_the_other_keys_free() {
+    shared_slot_outlives_the_other_keys_free(false);
+}
+
+#[test]
+fn a_shared_slot_outlives_a_free_after_a_refill() {
+    shared_slot_outlives_the_other_keys_free(true);
+}
+
+// three keys of one tag in one block: some slot points at the block while any of them has its newest row there, shared or a copy
+// in homes that never meet, and none does once the last of them is superseded
+#[test]
+fn a_shared_slot_goes_with_the_last_of_its_keys() {
+    let keys = colliding_keys();
+    let io = SimulatedIo::new(Seed(197));
+    let store = open(&io, CAPACITY);
+    store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
+    for name in &keys {
+        store.put(COLUMN, name, b"first").expect("put");
+    }
+    seal(&store, &io);
+    let first = slots_of(&store, &keys[0]);
+    let (segment, block) = (first[0].segment, first[0].block);
+    let points_at_block = |name: &[u8]| slots_of(&store, name).iter().any(|slot| slot.segment == segment && slot.block == block);
+    for (at, name) in keys.iter().enumerate() {
+        store.put(COLUMN, name, b"newer").expect("put");
+        seal(&store, &io);
+        cool(&store, &io);
+        for (other, name) in keys.iter().enumerate() {
+            let value: &[u8] = if other <= at { b"newer" } else { b"first" };
+            assert_eq!(read(&store, name), Some(value.to_vec()), "key {other} after {at} were superseded");
+        }
+        let is_pointed = keys.iter().any(|name| points_at_block(name));
+        assert_eq!(is_pointed, at + 1 < keys.len(), "after {} of {} keys superseded", at + 1, keys.len());
+    }
+    store.close().expect("close");
+}
+
+// two keys of one tag in one block superseded in one seal, in both orders: the walk frees their shared slot once and both read
+// their newest rows
+#[test]
+fn a_shared_slot_goes_once_when_both_keys_go_together() {
+    for is_reversed in [false, true] {
+        let [mut first, mut second, _third] = colliding_keys();
+        if is_reversed {
+            std::mem::swap(&mut first, &mut second);
+        }
+        let io = SimulatedIo::new(Seed(198));
+        let store = open(&io, CAPACITY);
+        store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
+        store.put(COLUMN, &first, b"first").expect("put");
+        store.put(COLUMN, &second, b"first").expect("put");
+        seal(&store, &io);
+        let shared = slots_of(&store, &first);
+        assert_eq!(shared.len(), 1, "{shared:?}");
+        store.put(COLUMN, &first, b"newer").expect("put");
+        store.put(COLUMN, &second, b"newer").expect("put");
+        seal(&store, &io);
+        cool(&store, &io);
+        assert_eq!(read(&store, &first), Some(b"newer".to_vec()));
+        assert_eq!(read(&store, &second), Some(b"newer".to_vec()));
+        assert!(!slots_of(&store, &first).contains(&shared[0]), "reversed {is_reversed}: the superseded rows kept their slot");
+        store.close().expect("close");
+    }
+}
+
+// A row freed twice never takes another key's slot. The first key's slot sits in its own homes and the second key's identical
+// slot in the run, which the first key reads too, and two frees of the first key's row leave the second key's slot standing
+#[test]
+fn a_second_free_of_a_row_keeps_another_keys_run_slot() {
+    let io = SimulatedIo::new(Seed(199));
+    let store = open(&io, CAPACITY);
+    let volume = &store.state.volumes[0];
+    let table = store.state.complete_table(COLUMN).expect("a table");
+    volume.holds.compaction.store(true, Ordering::Release);
+    // two keys of one shard and tag whose homes differ
+    let mut seen = HomesSeen::new();
+    let (first, second) = (0..)
+        .map(key)
+        .find_map(|name| {
+            let hash = hash_key(COLUMN, &name);
+            let home = table.shards.read(shard_of(hash)).homes(hash).first;
+            let found = seen.entry((shard_of(hash), tag_of(hash))).or_default();
+            let other = found.iter().find(|(_other, other_home)| *other_home != home).map(|(other, _home)| other.clone());
+            found.push((name.clone(), home));
+            other.map(|other| (other, name))
+        })
+        .expect("keys never run out");
+    let (first_hash, second_hash) = (hash_key(COLUMN, &first), hash_key(COLUMN, &second));
+    store.put(COLUMN, &first, b"first").expect("put");
+    store.put(COLUMN, &second, b"second").expect("put");
+    seal(&store, &io);
+    let slot = slots_of(&store, &second)[0];
+    let (segment, block) = (slot.segment_number(), slot.block);
+    // the second key's slot moves to the run, where the first key's frees can reach it
+    table.free_superseded(second_hash, segment, block, (table.shares(), false));
+    assert!(table.shards.write(shard_of(second_hash)).fill_overflow(CompleteSlot { segment: slot.segment, block, tag: tag_of(second_hash) }));
+    let (entry, _replacement) = volume.table.block_line(segment, u32::from(block)).expect("a block");
+    store.state.free_superseded_slot(volume, COLUMN, first_hash, segment, entry.block_offset);
+    store.state.free_superseded_slot(volume, COLUMN, first_hash, segment, entry.block_offset);
+    assert_eq!(read(&store, &second), Some(b"second".to_vec()), "a second free of the first key's row took the second key's slot");
+    assert!(table.frees_kept() > 0);
+    store.close().expect("close");
 }

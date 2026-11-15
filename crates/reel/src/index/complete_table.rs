@@ -38,8 +38,10 @@ pub const STALE_DIVISOR: u64 = 8;
 pub const MOST_TAG_SLOTS: usize = 2 * BUCKET_SLOTS + MOST_RUN_SLOTS;
 /// The bit of a slot's tag that marks a superseded row
 pub const STALE_BIT: u16 = 0x8000;
+/// The bit of a slot's tag that says other keys of its tag have rows in its block, so the slot stands for them too
+pub const SHARED_BIT: u16 = 0x4000;
 /// The bits of a slot's tag that come from the key
-pub const TAG_MASK: u16 = !STALE_BIT;
+pub const TAG_MASK: u16 = !(STALE_BIT | SHARED_BIT);
 /// A column with no mark serves every key from its table
 pub const NO_MARK: u64 = u64::MAX;
 /// The segment an unused slot holds
@@ -89,6 +91,8 @@ pub struct CompleteTable {
     used: AtomicU64,
     past_capacity: AtomicU64,
     stale: AtomicU64,
+    shares: AtomicU64,
+    frees_kept: AtomicU64,
 }
 
 impl CompleteSlot {
@@ -114,6 +118,11 @@ impl CompleteSlot {
     /// Check the slot stands for rows it no longer locates
     pub fn is_sticky(&self) -> bool {
         self.segment == STICKY_SEGMENT
+    }
+
+    /// Check other keys of the slot's tag may have rows in its block
+    pub fn is_shared(&self) -> bool {
+        self.tag & SHARED_BIT != 0
     }
 
     /// Read the bits that came from the key
@@ -287,7 +296,37 @@ impl CompleteShard {
         cleared
     }
 
-    /// Free one slot of a tag's homes or run that points at a block, and say whether one went
+    /// Find the slot a free of a tag's row in a block would reach, its homes first and then its run, and say whether the slot may
+    /// stand for another key: a shared slot, or one in the run, which every key of the tag reads
+    pub fn guarded_row(&self, homes: &Homes, segment: u32, block: u16) -> Option<bool> {
+        let is_row = |slot: &CompleteSlot| slot.is_used() && slot.key_tag() == homes.tag && !slot.is_sticky() && slot.segment == segment && slot.block == block;
+        let mut buckets = [Some(homes.first), Some(homes.second)];
+        if homes.first == homes.second {
+            buckets[1] = None;
+        }
+        for bucket in buckets.into_iter().flatten() {
+            if let Some(slot) = self.bucket(bucket).iter().find(|slot| is_row(slot)) {
+                return Some(slot.is_shared());
+            }
+        }
+        if self.overflow_used == 0 {
+            return None;
+        }
+        let mut at = self.overflow_start(homes.tag);
+        for _step in 0..self.run_reach() {
+            let slot = &self.overflow[at];
+            if !slot.is_used() {
+                return None;
+            }
+            if is_row(slot) {
+                return Some(true);
+            }
+            at = (at + 1) % self.overflow.len();
+        }
+        None
+    }
+
+    /// Free one slot of a tag's homes or run that points at a block, the one `guarded_row` finds, and say whether one went
     pub fn free_slot(&mut self, homes: &Homes, segment: u32, block: u16) -> bool {
         let is_row = |slot: &CompleteSlot| slot.key_tag() == homes.tag && !slot.is_sticky() && slot.segment == segment && slot.block == block;
         let mut buckets = [Some(homes.first), Some(homes.second)];
@@ -466,6 +505,8 @@ impl CompleteTable {
             used: AtomicU64::new(0),
             past_capacity: AtomicU64::new(0),
             stale: AtomicU64::new(0),
+            shares: AtomicU64::new(0),
+            frees_kept: AtomicU64::new(0),
         }
     }
 
@@ -620,17 +661,57 @@ impl CompleteTable {
         shard.visit_tag(&homes, |slot| matches.push(*slot));
     }
 
-    /// Free a superseded row's slot, so the table holds a slot a key whatever its overwrites. Two keys of a tag in one block hold
-    /// a slot each, so this frees one
-    pub fn free_superseded(&self, hash: KeyHash, segment: SegmentNumber, block: u16) {
+    /// Free a superseded row's slot, so the table holds a slot a key whatever its overwrites. The slot the free reaches decides it
+    /// under the shard's hold: one that may stand for another key goes only when the caller proved every other key of its tag in
+    /// the block superseded and no row shared a slot since it read `shares`, and otherwise stays and counts
+    pub fn free_superseded(&self, hash: KeyHash, segment: SegmentNumber, block: u16, (shares_seen, is_proved): (u64, bool)) {
         let Ok(segment) = u32::try_from(segment.0) else {
             return;
         };
         let mut shard = self.shards.write(shard_of(hash));
         let homes = shard.homes(hash);
+        match shard.guarded_row(&homes, segment, block) {
+            None => return,
+            Some(true) if !is_proved || shares_seen != self.shares.load(Ordering::Acquire) => {
+                self.note_kept();
+                return;
+            },
+            Some(_is_guarded) => {},
+        }
         if shard.free_slot(&homes, segment, block) {
             self.used.fetch_sub(1, Ordering::AcqRel);
         }
+    }
+
+    /// Count a shard's unused slots, its buckets' and its overflow area's
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn free_slots_in(&self, shard: usize) -> usize {
+        let shard = self.shards.read(shard);
+        shard.slots.iter().chain(shard.overflow.iter()).filter(|slot| !slot.is_used()).count()
+    }
+
+    /// Count the frees that left a slot standing because another key of its tag might still need it
+    pub fn frees_kept(&self) -> u64 {
+        self.frees_kept.load(Ordering::Acquire)
+    }
+
+    /// Note a free that left a slot standing
+    pub fn note_kept(&self) {
+        self.frees_kept.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count the rows that took a slot another key of their tag held in their block
+    pub fn shares(&self) -> u64 {
+        self.shares.load(Ordering::Acquire)
+    }
+
+    /// Find the slot a free of a tag's row in a block would reach, and say whether it may stand for another key, or nothing when the
+    /// tag has no slot there
+    pub fn slot_guard(&self, hash: KeyHash, segment: SegmentNumber, block: u16) -> Option<bool> {
+        let segment = u32::try_from(segment.0).ok()?;
+        let shard = self.shards.read(shard_of(hash));
+        let homes = shard.homes(hash);
+        shard.guarded_row(&homes, segment, block)
     }
 
     /// Give a tag whose list is full one sticky slot in place of the rest, or say its run has no room for one. Its readers go by the
@@ -686,6 +767,21 @@ impl CompleteTable {
             has_sticky |= slot.is_sticky();
         });
         if has_sticky {
+            return true;
+        }
+        // a key of this tag with a row in this block holds a slot already, and it stands for this row too, so two keys of a tag
+        // never hold two slots one free could mistake for each other
+        let mut is_shared = false;
+        let mut share = |slot: &mut CompleteSlot| {
+            if !is_shared && !slot.is_sticky() && slot.segment == segment && slot.block == block {
+                slot.tag |= SHARED_BIT;
+                is_shared = true;
+            }
+        };
+        shard.change_homes(&homes, &mut share);
+        shard.change_overflow(homes.tag, &mut share);
+        if is_shared {
+            self.shares.fetch_add(1, Ordering::AcqRel);
             return true;
         }
         if tag_slots >= MOST_TAG_SLOTS && self.fold_tag(&mut shard, &homes) {

@@ -1,5 +1,6 @@
 //! A complete column's gets and open: slots point a get at row blocks, and the blocks' keys say which slot is the key's
 
+use std::ops::{Deref, DerefMut};
 use std::io::Result as IoResult;
 use std::sync::atomic::Ordering;
 
@@ -7,13 +8,14 @@ use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
 use reel_api::units::{RowCount, WritePlace};
 
+use crate::config::MAX_KEY_BYTES;
 use crate::engine::engine_state::EngineState;
 use crate::engine::read_path::{KeyRead, SealedRow, WalkAsk, corruption};
 use crate::engine::recovery::{whole_columns, widen_row};
 use crate::engine::volume::{NO_SEAL, Volume};
-use crate::fixed_list::{FixedList, ListOut};
+use crate::fixed_list::{FixedList, ListFull, ListOut, full};
 use crate::guard::hold;
-use crate::index::complete_table::{CompleteSlot, CompleteTable, TagMatches};
+use crate::index::complete_table::{CompleteSlot, CompleteTable, TagMatches, tag_of};
 use crate::index::open_slots::OpenSlot;
 use crate::engine::seal_job::SortedRun;
 use crate::index::sorted_keys::{Floors, HOLD_ROWS, KeyEntry, SortedKeys};
@@ -250,11 +252,88 @@ impl<Backend: Io> EngineState<Backend> {
         })
     }
 
-    /// Free a charged row's slot, so a get reads one block for its key and the table holds a slot a key
+    /// Free a charged row's slot, so a get reads one block for its key and the table holds a slot a key. A slot that may stand for
+    /// other keys of its tag goes only once each of them has a newer row than its row in the block, and any answer short of that keeps it
     pub fn free_superseded_slot(&self, volume: &Volume<Backend>, column: ColumnId, hash: KeyHash, segment: SegmentNumber, block_offset: u32) {
-        if let (Some(table), Some(block)) = (self.complete_table(column), volume.table.block_at(segment, block_offset)) {
-            table.free_superseded(hash, segment, block as u16);
+        let (Some(table), Some(block)) = (self.complete_table(column), volume.table.block_at(segment, block_offset)) else {
+            return;
+        };
+        let block = block as u16;
+        // the count goes first, so a row that shares the slot after it moves the count and the free keeps a slot it never proved
+        let seen = table.shares();
+        let Some(is_guarded) = table.slot_guard(hash, segment, block) else {
+            return;
+        };
+        let is_proved = is_guarded && self.is_block_superseded(volume, (table, column), hash, (segment, block));
+        table.free_superseded(hash, segment, block, (seen, is_proved));
+    }
+
+    /// Check every key of a hash's tag in a block, the hash's own apart, has a newer row than its row there. A block that can't be
+    /// read or a sticky slot leaves it unproven, and so does a key whose newest row sits in that block
+    pub fn is_block_superseded(&self, volume: &Volume<Backend>, (table, column): (&CompleteTable, ColumnId), hash: KeyHash, (segment, block): (SegmentNumber, u16)) -> bool {
+        let tag = tag_of(hash);
+        let (mut key, mut other) = (KeyBuffer::new(), KeyBuffer::new());
+        // one key at a time, so the block's reader goes back before the key's slots are read with another
+        let mut from = 0;
+        loop {
+            let found = self.job_footer_readers.with(|reader| {
+                let (Some(pin), Some((entry, _replacement))) = (volume.table.pin(segment), volume.table.block_line(segment, u32::from(block))) else {
+                    return Err(());
+                };
+                let block_key = BlockKey { segment, offset: entry.block_offset };
+                let Ok(Some(loaded)) = in_place(reader.load_block(&InPlace, &pin.file, block_key, &entry, self.complete_cache.as_ref().unwrap_or(&self.row_cache))) else {
+                    return Err(());
+                };
+                let Some(mut walk) = RowBlockWalk::open(loaded, WritePlace(pin.head.place_base.0)) else {
+                    return Err(());
+                };
+                let (mut at, mut last) = (0, None);
+                while let Some(row) = walk.next_row(&mut key) {
+                    at += 1;
+                    let row_hash = hash_key(column, &key);
+                    // a key's rows in a block run newest first, so its first row is the one to ask about
+                    if row.kind == RowKind::RangeDelete || row_hash == hash || tag_of(row_hash) != tag || last == Some(row_hash) {
+                        continue;
+                    }
+                    last = Some(row_hash);
+                    if at > from {
+                        other.set(&key).map_err(|_full| ())?;
+                        return Ok(Some((at, row.place)));
+                    }
+                }
+                Ok(None)
+            });
+            let (at, place) = match found {
+                Ok(Some(found)) => found,
+                Ok(None) => return true,
+                Err(()) => return false,
+            };
+            if !self.has_newer_row(volume, (table, column), &other, place) {
+                return false;
+            }
+            from = at;
         }
+    }
+
+    /// Check a key's slots locate a row newer than a place
+    pub fn has_newer_row(&self, volume: &Volume<Backend>, (table, column): (&CompleteTable, ColumnId), key: &[u8], place: WritePlace) -> bool {
+        let Ok(read) = self.key_read(column, key, WritePlace(u64::MAX), false) else {
+            return false;
+        };
+        let mut matches = TagMatches::new();
+        table.find(read.hash, &mut matches);
+        if matches.slots().iter().any(CompleteSlot::is_sticky) {
+            return false;
+        }
+        self.job_footer_readers.with(|reader| {
+            let mut best = None;
+            for slot in matches.slots().iter().filter(|slot| !slot.is_stale()) {
+                if in_place(self.ask_slot(&InPlace, volume, &read, slot, reader, &mut best)).is_err() {
+                    return false;
+                }
+            }
+            best.is_some_and(|found: SealedRow| found.row.place > place)
+        })
     }
 
     /// Check a slot's segment has left the volume. A seal's own segment enters the table only when it finishes
@@ -496,10 +575,10 @@ impl<Backend: Io> EngineState<Backend> {
         Ok(true)
     }
 
-    /// Check a key holds a slotted row at or above a place, reading its slots' blocks so a tag collision never counts
-    pub fn is_slotted_at(&self, volume: &Volume<Backend>, (table, column): (&CompleteTable, ColumnId), (key, place): (&[u8], WritePlace), reader: &mut FooterReader) -> bool {
+    /// Find a key's slotted row at or above a place, reading its slots' blocks so a tag collision never counts
+    pub fn slotted_row(&self, volume: &Volume<Backend>, (table, column): (&CompleteTable, ColumnId), (key, place): (&[u8], WritePlace), reader: &mut FooterReader) -> Option<SealedRow> {
         let Ok(read) = self.key_read(column, key, WritePlace(u64::MAX), false) else {
-            return false;
+            return None;
         };
         let mut matches = TagMatches::new();
         table.find(read.hash, &mut matches);
@@ -507,10 +586,10 @@ impl<Backend: Io> EngineState<Backend> {
         for slot in matches.slots() {
             // a block that can't be read says nothing, and the row takes a slot of its own
             if !slot.is_stale() && !slot.is_sticky() && in_place(self.ask_slot(&InPlace, volume, &read, slot, reader, &mut best)).is_err() {
-                return false;
+                return None;
             }
         }
-        best.is_some_and(|found| found.row.place >= place)
+        best.filter(|found| found.row.place >= place)
     }
 
     /// Give a span of a segment's row blocks of a column their slots, and say whether every block read clean
@@ -550,8 +629,12 @@ impl<Backend: Io> EngineState<Backend> {
                             last = Some(hash);
                             // a refill gives no slot to a row a slotted row stands at or above, so a superseded row stays out
                             if let Some(check) = newer.as_deref_mut()
-                                && self.is_slotted_at(volume, (table, column), (&key[..], row.place), check)
+                                && let Some(found) = self.slotted_row(volume, (table, column), (&key[..], row.place), check)
                             {
+                                // a slot another key of the tag holds in this block stands for this row, and the insert says so
+                                if found.segment == number && volume.table.block_at(number, found.block_offset) == Some(index) {
+                                    table.insert(hash, number, index as u16, |segment| self.is_slot_gone(volume, segment));
+                                }
                                 continue;
                             }
                             table.insert(hash, number, index as u16, |segment| self.is_slot_gone(volume, segment));
@@ -585,5 +668,77 @@ pub fn sealed_of(entry: &KeyEntry) -> SealedRow {
         },
         block_offset: 0,
         at: RowAt::UNKNOWN,
+    }
+}
+
+/// A key read out of a row block, held on the stack, so a walk's free allocates nothing
+pub struct KeyBuffer {
+    bytes: [u8; MAX_KEY_BYTES as usize],
+    length: usize,
+}
+
+impl KeyBuffer {
+    /// Build an empty buffer
+    pub const fn new() -> Self {
+        Self { bytes: [0; MAX_KEY_BYTES as usize], length: 0 }
+    }
+
+    /// Hold a copy of a key
+    pub fn set(&mut self, key: &[u8]) -> Result<(), ListFull> {
+        ListOut::clear(self);
+        ListOut::extend_from_slice(self, key)
+    }
+}
+
+impl Default for KeyBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Deref for KeyBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.bytes[..self.length]
+    }
+}
+
+impl DerefMut for KeyBuffer {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes[..self.length]
+    }
+}
+
+impl ListOut<u8> for KeyBuffer {
+    fn clear(&mut self) {
+        self.length = 0;
+    }
+
+    fn truncate(&mut self, length: usize) {
+        self.length = self.length.min(length);
+    }
+
+    fn push(&mut self, item: u8) -> Result<(), ListFull> {
+        let Some(slot) = self.bytes.get_mut(self.length) else {
+            return Err(full());
+        };
+        *slot = item;
+        self.length += 1;
+        Ok(())
+    }
+
+    fn extend_from_slice(&mut self, items: &[u8]) -> Result<(), ListFull> {
+        let end = self.length + items.len();
+        let Some(room) = self.bytes.get_mut(self.length..end) else {
+            return Err(full());
+        };
+        room.copy_from_slice(items);
+        self.length = end;
+        Ok(())
+    }
+
+    fn push_if_room(&mut self, item: u8) -> bool {
+        self.push(item).is_ok()
     }
 }

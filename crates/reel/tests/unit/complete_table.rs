@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 use reel::index::complete_table::{
-    CompleteShard, CompleteSlot, CompleteTable, Homes, MOST_RUN_SLOTS, MOST_TAG_SLOTS, OVERFLOW_DIVISOR, STALE_BIT, TagMatches, shard_of, tag_of,
+    BUCKET_SLOTS, CompleteShard, CompleteSlot, CompleteTable, Homes, MOST_RUN_SLOTS, MOST_TAG_SLOTS, OVERFLOW_DIVISOR, STALE_BIT, TagMatches, shard_of, tag_of,
 };
 use reel::index::key_hash::KeyHash;
 use reel::segment::segment_tail::SegmentNumber;
@@ -223,4 +223,78 @@ fn planned_bytes_match_the_built_table() {
         let table = CompleteTable::new(RowCount(rows));
         assert_eq!(reel::index::complete_table::planned_table_bytes(RowCount(rows)), table.heap_bytes(), "{rows} rows");
     }
+}
+
+// two keys of one tag share both homes or neither, whatever the bucket count, so a key's free meets another key's slot in its
+// homes only where its give saw that slot and shared it
+#[test]
+fn keys_of_a_tag_share_both_homes_or_none() {
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut next = move || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut mixed = state;
+        mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        mixed ^ (mixed >> 31)
+    };
+    for buckets in [1, 2, 3, 7, 64, 1_000] {
+        let shard = CompleteShard::new(buckets * BUCKET_SLOTS);
+        let mut by_tag: std::collections::BTreeMap<u16, Vec<[usize; 2]>> = std::collections::BTreeMap::new();
+        for _key in 0..20_000 {
+            // few tags, so every tag gets many keys
+            let hash = KeyHash((next() & 0xFFFF_FFFF) | (u64::from(next() as u16 % 8) << 32));
+            let homes = shard.homes(hash);
+            let mut pair = [homes.first, homes.second];
+            pair.sort_unstable();
+            by_tag.entry(homes.tag).or_default().push(pair);
+        }
+        for (tag, pairs) in &by_tag {
+            for pair in pairs {
+                for other in pairs {
+                    let shares_one = pair.iter().any(|home| other.contains(home));
+                    assert!(!shares_one || pair == other, "{buckets} buckets, tag {tag}: {pair:?} and {other:?}");
+                }
+            }
+        }
+    }
+}
+
+// two keys of one shard and tag: the same high bits, and low bits that put the first home where asked
+fn same_tag_pair(other_low: u64) -> (KeyHash, KeyHash) {
+    (KeyHash(0x0005_1234_0000_0000), KeyHash(0x0005_1234_0000_0000 | other_low))
+}
+
+// a free that never proved its slot keeps a guarded one: two frees of one key's row, its own slot in its homes and another
+// key's identical slot in the run, take the first and keep the second
+#[test]
+fn an_unproved_second_free_keeps_a_run_slot() {
+    let table = CompleteTable::new(RowCount(ROWS));
+    let (first, second) = same_tag_pair(0x8000_0000);
+    let shard = shard_of(first);
+    let (first_homes, second_homes) = (table.shards.read(shard).homes(first), table.shards.read(shard).homes(second));
+    assert!(![second_homes.first, second_homes.second].contains(&first_homes.first), "{first_homes:?} {second_homes:?}");
+    table.insert(first, SegmentNumber(7), 3, |_segment| false);
+    assert!(table.shards.write(shard).fill_overflow(CompleteSlot { segment: 7, block: 3, tag: tag_of(second) }));
+    table.free_superseded(first, SegmentNumber(7), 3, (table.shares(), false));
+    table.free_superseded(first, SegmentNumber(7), 3, (table.shares(), false));
+    assert!(has_row(&table, second, 7, 3), "a second free took the other key's run slot");
+    assert_eq!(table.frees_kept(), 1);
+}
+
+// a share that lands between a free's count and its look keeps the slot: the free read the count before the other key's row
+// took the slot, so the slot it meets is guarded and unproved
+#[test]
+fn a_share_after_the_count_keeps_the_slot() {
+    let table = CompleteTable::new(RowCount(ROWS));
+    let (first, second) = same_tag_pair(1);
+    let shard = shard_of(first);
+    assert_eq!(table.shards.read(shard).homes(first).first, table.shards.read(shard).homes(second).first);
+    table.insert(first, SegmentNumber(7), 3, |_segment| false);
+    let seen = table.shares();
+    assert_eq!(table.slot_guard(first, SegmentNumber(7), 3), Some(false));
+    table.insert(second, SegmentNumber(7), 3, |_segment| false);
+    assert_eq!(table.shares(), seen + 1, "the second key's row took the first key's slot");
+    table.free_superseded(first, SegmentNumber(7), 3, (seen, false));
+    assert!(has_row(&table, second, 7, 3), "the free took a slot the second key shares");
+    assert_eq!(table.frees_kept(), 1);
 }

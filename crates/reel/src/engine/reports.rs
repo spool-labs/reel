@@ -378,6 +378,7 @@ impl<Backend: Io> EngineState<Backend> {
                     capacity: RowCount(table.map_or(0, |table| table.slot_count() as u64)),
                     rows_past_capacity: table.map_or(RowCount(0), CompleteTable::past_capacity),
                     is_marked: table.is_some_and(|table| table.mark().is_some()),
+                    frees_kept: table.map_or(0, CompleteTable::frees_kept),
                 });
             }
         }

@@ -548,7 +548,8 @@ pub const MOST_REPORTED_LANES: usize = 16;
 
 /// How a complete column stands: the slots it uses and has, the rows that found no slot, and whether those put a mark on it.
 /// A marked table sends reads past it to the footers until a refill clears the mark. A read-only view has no table, and reads
-/// through the footers
+/// through the footers. Frees kept counts slots a walk left standing because another key of their tag might still need them: a
+/// count that keeps growing holds slots the table can't get back until their segments go
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CompleteReading {
     pub column: ColumnId,
@@ -557,6 +558,7 @@ pub struct CompleteReading {
     pub capacity: RowCount,
     pub rows_past_capacity: RowCount,
     pub is_marked: bool,
+    pub frees_kept: u64,
 }
 
 /// How a sorted column's index stands: its entries, graves among them, the rows it was told to hold, the rows past its room,

@@ -196,6 +196,8 @@ fn passes_a_segment_without_filters() {
         sorted_rows: None,
         least_value: None,
     });
+    // the budget pays for the table, so this store takes a larger one
+    config.memory_budget = ByteCount(128 * 1024 * 1024);
     let store = ReelStore::open(io.clone(), &config).expect("open");
     for number in 0..KEYS {
         store.put(COLUMN, &key(2 * number), b"value").expect("put");

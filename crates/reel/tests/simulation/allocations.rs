@@ -34,6 +34,7 @@ const PLAIN: ColumnId = ColumnId(3);
 const BUDGET: ByteCount = ByteCount(177 * 1024 * 1024);
 const TABLE_ROWS: RowCount = RowCount(1_000_000);
 const LONG_ROWS: usize = 4_000;
+const LEAST_LONG_ROWS: usize = 500;
 const LONG_VALUE: &[u8] = b"a value on each column of a long batch, a value on each column of a long batch";
 const KEYS: usize = 64;
 const KEY_BUFFER_BYTES: usize = 128;
@@ -65,6 +66,10 @@ struct Inputs {
 }
 
 fn config() -> StoreConfig {
+    config_at(BUDGET)
+}
+
+fn config_at(budget: ByteCount) -> StoreConfig {
     let column = |id: ColumnId, name: &str, codec: Codec, complete_rows: Option<RowCount>| ColumnConfig {
         id,
         name: name.to_string(),
@@ -76,7 +81,7 @@ fn config() -> StoreConfig {
         least_value: None,
     };
     StoreConfig {
-        memory_budget: BUDGET,
+        memory_budget: budget,
         threads: reel::config::NO_WORKERS,
         volumes: vec![VolumeConfig {
             name: "allocations".to_string(),
@@ -186,9 +191,23 @@ fn damage(io: &SimulatedIo) {
 // once every path has run, no call on the simulated disk allocates or frees
 #[test]
 fn no_allocations() {
+    no_allocations_at(BUDGET, LONG_ROWS);
+}
+
+// the least budget the store opens with leaves the steady rounds as quiet
+#[test]
+fn no_allocations_at_the_least_budget() {
+    let store = ReelStore::open(SimulatedIo::new(Seed(1)), &config()).expect("open");
+    let least = store.memory_report().least_budget;
+    store.close().expect("close");
+    assert!(least < BUDGET, "the least budget is above the usual one");
+    no_allocations_at(least, LEAST_LONG_ROWS);
+}
+
+fn no_allocations_at(budget: ByteCount, long_rows: usize) {
     let io = SimulatedIo::new(Seed(1));
     damage(&io);
-    let store = ReelStore::open(io.clone(), &config()).expect("open");
+    let store = ReelStore::open(io.clone(), &config_at(budget)).expect("open");
     // the loop reads a span as damaged on every round, so no rebuild may clear it
     for volume in &store.state.volumes {
         volume.holds.rebuild.store(true, Ordering::Release);
@@ -205,7 +224,7 @@ fn no_allocations() {
     large_batch.put(BULK, &keys[2], &compressible);
     large_batch.put(META, &keys[2], &small);
     let mut long_batch = WriteBatch::new();
-    for number in 0..LONG_ROWS {
+    for number in 0..long_rows {
         let key = format!("long-{number:06}");
         long_batch.put(META, key.as_bytes(), LONG_VALUE);
         long_batch.put(BULK, key.as_bytes(), LONG_VALUE);

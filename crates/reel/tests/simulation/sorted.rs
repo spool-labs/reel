@@ -17,6 +17,7 @@ use reel::index::sorted_keys::KeyEntry;
 use reel::record::codec::Codec;
 use reel::engine::store_scan::StoreScan;
 use reel_api::column_id::ColumnId;
+use reel_api::store_error::StoreError;
 use reel_api::direction::Direction;
 use reel_api::scan::ScanStep;
 use reel_api::maintenance_report::MaintenanceReport;
@@ -29,7 +30,7 @@ use reel_sim::simulated_io::SimulatedIo;
 const ROOT: &str = "/disk/sorted";
 const COLUMN: ColumnId = ColumnId(1);
 const WIDTH: u16 = 16;
-const BUDGET: ByteCount = ByteCount(64 * 1024 * 1024);
+const BUDGET: ByteCount = ByteCount(128 * 1024 * 1024);
 const TICK: Nanoseconds = Nanoseconds(1_000_000);
 const STEPS: u64 = 400_000;
 const KEYS: u64 = 2_000;
@@ -46,6 +47,8 @@ const WANTED_ROWS: u64 = 10;
 const AHEAD: usize = 500;
 const SCAN_TAKE: usize = 40;
 const MERGE_KEYS: u64 = 15_000;
+const CUE_ROUNDS: u64 = 3;
+const SPOT_CEILING: ByteCount = ByteCount(1024 * 1024);
 
 type Store = ReelStore<SimulatedIo>;
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -677,5 +680,53 @@ fn writes_between_batches_show() {
     let expected: Vec<(Vec<u8>, Vec<u8>)> = model.iter().map(|(name, value)| (name.clone(), value.clone())).collect();
     assert_eq!(found, expected);
     assert!(store.state.sorted_runs.load(Ordering::Relaxed) > runs, "the later batches took no run");
+    store.close().expect("close");
+}
+
+// a store whose declared index is past its budget is refused at open, and the error names the least budget it needs
+#[test]
+fn an_index_past_the_budget_is_refused() {
+    let io = SimulatedIo::new(Seed(12));
+    let rows = RowCount(50_000_000);
+    match ReelStore::open(io.clone(), &config(rows)) {
+        Err(StoreError::BudgetTooSmall { budget, least }) => {
+            assert_eq!(budget, BUDGET);
+            assert!(least.0 > budget.0 + reel::index::sorted_keys::planned_index_bytes(WIDTH as usize, rows).0 / 2, "least {least:?}");
+        },
+        Err(error) => panic!("refused for {error:?}"),
+        Ok(_store) => panic!("opened with an index past its budget"),
+    }
+}
+
+// a store whose only column is sorted gives the spot cache no share, and a cue behind the newest sealed rows reads its own
+// values through the footers while gets at the tip go by the index
+#[test]
+fn an_all_sorted_store_reads_at_a_cue() {
+    let io = SimulatedIo::new(Seed(13));
+    let store = open(&io, CAPACITY);
+    assert!(store.memory_report().spot_cache.0 < SPOT_CEILING.0, "the spot cache took a share");
+    for number in 0..KEYS {
+        store.put(COLUMN, &key(number), b"first").expect("put");
+    }
+    seal_all(&store, &io);
+    let cue = store.cue().expect("cue");
+    for round in 0..CUE_ROUNDS {
+        for number in (0..KEYS).step_by(2) {
+            store.put(COLUMN, &key(number), format!("round-{round}").as_bytes()).expect("put");
+        }
+        seal_all(&store, &io);
+    }
+    let latest = format!("round-{}", CUE_ROUNDS - 1).into_bytes();
+    let (answers, asks) = (report(&store).sorted_answers, report(&store).sorted_footer_asks);
+    let mut value = Vec::new();
+    for number in 0..KEYS {
+        let newest: &[u8] = if number % 2 == 0 { &latest } else { b"first" };
+        assert_eq!(read(&store, &key(number)).as_deref(), Some(newest));
+        assert!(cue.get(COLUMN, &key(number), &mut value).expect("get"));
+        assert_eq!(value, b"first");
+    }
+    assert!(report(&store).sorted_answers >= answers + KEYS, "gets at the tip went by the footers");
+    assert!(report(&store).sorted_footer_asks >= asks + KEYS, "gets at the cue went by the index");
+    drop(cue);
     store.close().expect("close");
 }

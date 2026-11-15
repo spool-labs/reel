@@ -762,7 +762,7 @@ impl<Backend: Io> EngineState<Backend> {
         report.read_buffers = ByteCount(readers.0 + footers.0 + self.job_footer_readers.heap_bytes(FooterReader::heap_bytes).0);
         report.scans = self.scan_heap;
         // the tables and their block lines come on top of the budget
-        report.budget = ByteCount(report.budget.0 + report.complete_tables.0 + report.sorted_indexes.0 + self.complete_line_bytes.0);
+        // the declared indexes come out of the budget, so the report's budget is the one number the store was given
         let ring_readers = self.ring_record_readers.heap_bytes(RecordReader::heap_bytes).0 + self.ring_footer_readers.heap_bytes(FooterReader::heap_bytes).0;
         let ring = self.ring.as_ref().map_or(0, |ring| ring.heap_bytes().0 + ring.driver.heap_bytes().0);
         report.read_buffers = ByteCount(report.read_buffers.0 + self.read_pool.heap_bytes().0 + ring + ring_readers);

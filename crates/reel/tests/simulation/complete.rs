@@ -36,7 +36,7 @@ use reel_sim::simulated_io::SimulatedIo;
 const ROOT: &str = "/disk/complete";
 const IMAGE_NAME: &str = "complete-1.image";
 const COLUMN: ColumnId = ColumnId(1);
-const BUDGET: ByteCount = ByteCount(64 * 1024 * 1024);
+const BUDGET: ByteCount = ByteCount(128 * 1024 * 1024);
 const TICK: Nanoseconds = Nanoseconds(1_000_000);
 const STEPS: u64 = 400_000;
 const INTERLEAVE_SEEDS: u64 = 4;
@@ -418,7 +418,8 @@ fn reports_the_table() {
     seal(&store, &io);
     let memory = store.memory_report();
     assert!(memory.complete_tables.0 >= CAPACITY.0 * 8);
-    assert!(memory.budget.0 >= BUDGET.0 + memory.complete_tables.0);
+    // the table comes out of the budget, so the report's budget is the one the store was given
+    assert_eq!(memory.budget, BUDGET);
     assert!(memory.heap_total().0 <= memory.budget.0);
     let mut report = MaintenanceReport::default();
     store.maintenance_report(&mut report);

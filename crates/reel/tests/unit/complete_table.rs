@@ -215,3 +215,12 @@ fn run_stops_at_its_reach() {
     assert_eq!(shard.overflow_used(), MOST_RUN_SLOTS);
     assert_eq!(tag_count(&shard, 3), MOST_RUN_SLOTS);
 }
+
+// the budget's figure for a complete table is the heap the built table holds
+#[test]
+fn planned_bytes_match_the_built_table() {
+    for rows in [1, 1_000, 100_000, 2_000_000] {
+        let table = CompleteTable::new(RowCount(rows));
+        assert_eq!(reel::index::complete_table::planned_table_bytes(RowCount(rows)), table.heap_bytes(), "{rows} rows");
+    }
+}

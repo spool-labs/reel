@@ -44,6 +44,8 @@ fn shape(budget: ByteCount, roots: usize) -> StoreShape {
         disk_entry_bytes: ByteCount(0),
         floor_entry_bytes: ByteCount(0),
         workers: None,
+        declared_bytes: ByteCount(0),
+        is_all_sorted: false,
     }
 }
 
@@ -72,6 +74,8 @@ fn documented_rows() {
             disk_entry_bytes: ByteCount(0),
             floor_entry_bytes: ByteCount(0),
             workers: None,
+            declared_bytes: ByteCount(0),
+            is_all_sorted: false,
         };
 
         assert_eq!(EngineSizing::for_store(&store).segment_rows, RowCount(rows), "{mib} MiB");
@@ -92,6 +96,8 @@ fn summary_holds_blocks() {
         disk_entry_bytes: ByteCount(0),
         floor_entry_bytes: ByteCount(0),
         workers: None,
+        declared_bytes: ByteCount(0),
+        is_all_sorted: false,
     };
     let rows_room = EngineSizing::for_store(&store).summary_share.0 / 2;
     let blocks = 1_000_000_000 / ROWS_PER_BLOCK;
@@ -115,6 +121,8 @@ fn documented_reserve() {
             disk_entry_bytes: ByteCount(0),
             floor_entry_bytes: ByteCount(0),
             workers: None,
+            declared_bytes: ByteCount(0),
+            is_all_sorted: false,
         };
 
         let segment = EngineSizing::for_store(&store).segment_bytes;
@@ -350,4 +358,21 @@ fn idle_filter_room_goes_to_rows() {
 fn full_filter_room_stays() {
     let stripe = 1_000;
     assert_eq!(split_idle_room(stripe, stripe, 2 * stripe, 100 * stripe), IdleSplit { filter_cache: stripe, to_rows: 0, to_records: 0 });
+}
+
+// declared index bytes come out of the shares and raise the least budget, and a store of sorted columns gives the spot share and
+// most of the cache share to the write index
+#[test]
+fn declared_indexes_come_out_of_the_budget() {
+    let budget = ByteCount(1024 * 1024 * 1024);
+    let plain = shape(budget, 1);
+    let declared = StoreShape { declared_bytes: ByteCount(200 * 1024 * 1024), ..plain };
+    assert_eq!(declared.least_budget().0, plain.least_budget().0 + declared.declared_bytes.0);
+    let (plain_sizing, declared_sizing) = (EngineSizing::for_store(&plain), EngineSizing::for_store(&declared));
+    assert!(declared_sizing.cache_share < plain_sizing.cache_share);
+    assert!(declared_sizing.record_share < plain_sizing.record_share);
+    let sorted = EngineSizing::for_store(&StoreShape { is_all_sorted: true, ..plain });
+    assert_eq!(sorted.spot_share, ByteCount(0));
+    assert!(sorted.cache_share.0 <= plain_sizing.cache_share.0 / 4);
+    assert!(sorted.segment_rows > plain_sizing.segment_rows);
 }

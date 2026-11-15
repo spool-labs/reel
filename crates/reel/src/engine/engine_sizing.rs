@@ -169,6 +169,10 @@ pub struct StoreShape {
     pub disk_entry_bytes: ByteCount,
     pub floor_entry_bytes: ByteCount,
     pub workers: Option<usize>,
+    /// The heap the declared indexes hold: complete tables with their block lines, and sorted indexes. The budget pays for them
+    pub declared_bytes: ByteCount,
+    /// Every column declares a sorted index, so no get reads the spot cache and no scan the row cache
+    pub is_all_sorted: bool,
 }
 
 /// What a budget buys
@@ -240,7 +244,8 @@ impl StoreShape {
         let covers = 2 * cover_keys + volumes * cover_fixed;
         let jobs = SEAL_JOB_BYTES + WALK_JOB_BYTES + COMPACT_JOB_BYTES;
         let worker_jobs = seats * LANE_JOB_BYTES;
-        ByteCount(queues + gathers + windows + reads + job_reads + scans + read_slots + encoders + covers + volumes * (jobs + spans) + worker_jobs + workers * WALK_JOB_BYTES + stacks)
+        let declared = self.declared_bytes.0;
+        ByteCount(queues + gathers + windows + reads + job_reads + scans + read_slots + encoders + covers + volumes * (jobs + spans) + worker_jobs + workers * WALK_JOB_BYTES + stacks + declared)
     }
 
     /// Count the jobs a store runs: the shared ones, its read threads, a seal job a volume and the workers
@@ -278,14 +283,21 @@ impl EngineSizing {
         let budget = shape.budget;
         // the room and the entries come out before the shares
         let shared = budget.0.saturating_sub(shape.fixed_bytes().0 + shape.room().0 + shape.entry_line().0);
-        let index_share = share_of(shared, WRITE_INDEX_SIXTEENTHS);
+        let (mut spot_share, mut cache_share) = (share_of(shared, SPOT_SIXTEENTHS), share_of(shared, BLOCK_CACHE_SIXTEENTHS));
+        let mut index_share = share_of(shared, WRITE_INDEX_SIXTEENTHS);
+        // a store whose every column is sorted reads no spot cache, and its row cache serves walks, merges and fallbacks, so the
+        // write index takes the spot share and all of the cache share past a quarter
+        if shape.is_all_sorted {
+            index_share += spot_share + cache_share - cache_share / 4;
+            (spot_share, cache_share) = (0, cache_share / 4);
+        }
         let rows_total = index_share / PLANNED_ROW_BYTES;
         Self {
             segment_bytes: segment_bytes_for(budget),
             segment_rows: RowCount(rows_total * SEAL_ROWS_EIGHTHS / 8),
             shard: shard_for_rows(rows_total, open_slots),
-            spot_share: ByteCount(share_of(shared, SPOT_SIXTEENTHS)),
-            cache_share: ByteCount(share_of(shared, BLOCK_CACHE_SIXTEENTHS)),
+            spot_share: ByteCount(spot_share),
+            cache_share: ByteCount(cache_share),
             record_share: ByteCount(share_of(shared, RECORD_CACHE_SIXTEENTHS)),
             summary_share: ByteCount(share_of(shared, SUMMARY_SIXTEENTHS)),
             table_share: ByteCount(share_of(shared, TABLE_SIXTEENTHS)),

@@ -177,8 +177,7 @@ impl Default for TagMatches {
 impl CompleteShard {
     /// Allocate and touch a shard's share of the slots
     pub fn new(slots: usize) -> Self {
-        let buckets = slots.div_ceil(BUCKET_SLOTS).max(1);
-        let overflow = (slots / OVERFLOW_DIVISOR).max(LEAST_OVERFLOW);
+        let (buckets, overflow) = shard_shape(slots);
         Self {
             slots: touched_filled(buckets * BUCKET_SLOTS, CompleteSlot::empty()),
             overflow: touched_filled(overflow, CompleteSlot::empty()),
@@ -721,6 +720,19 @@ impl CompleteTable {
         // a key that fills its homes and finds its run full has no room left to wait for
         tag_slots >= 2 * BUCKET_SLOTS && self.fold_tag(&mut shard, &homes)
     }
+}
+
+/// Work out a shard's buckets and overflow slots for its share of the slots
+pub fn shard_shape(slots: usize) -> (usize, usize) {
+    (slots.div_ceil(BUCKET_SLOTS).max(1), (slots / OVERFLOW_DIVISOR).max(LEAST_OVERFLOW))
+}
+
+/// Work out the heap a table for these rows holds, as `CompleteTable::new` sizes it
+pub fn planned_table_bytes(rows: RowCount) -> ByteCount {
+    let slots = (rows.0 * 10 / LOAD_TENTHS) as usize;
+    let per_shard = slots.div_ceil(COMPLETE_SHARDS);
+    let (buckets, overflow) = shard_shape(per_shard);
+    ByteCount((COMPLETE_SHARDS * (buckets * BUCKET_SLOTS + overflow) * size_of::<CompleteSlot>()) as u64)
 }
 
 /// Read the tag a key's slots carry

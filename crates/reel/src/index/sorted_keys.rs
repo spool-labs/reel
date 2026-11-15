@@ -249,11 +249,7 @@ impl SortedKeys {
         let inner_stride = key_words + 1;
         let leaf_capacity = (PAGE_WORDS - HEAD_WORDS) / leaf_stride;
         let inner_capacity = (PAGE_WORDS - HEAD_WORDS) / inner_stride;
-        let leaves = (rows.0 as usize).div_ceil((leaf_capacity * FILL_THIRDS / 3).max(1));
-        // inner pages fill half at least, and each part can hold a leaf of its own however few rows it has
-        let pages = leaves + leaves.div_ceil(inner_capacity / 2) * 2 + PARTS;
-        // page numbers below the missing link's number are all a pool can have
-        let pages = pages.min(NO_PAGE as usize - 1) as u32;
+        let pages = planned_pages(width, rows);
         Self {
             width,
             key_words,
@@ -1332,4 +1328,21 @@ fn touched_words(length: usize) -> Vec<AtomicU32> {
     }
     black_box(words.as_ptr());
     words
+}
+
+/// Work out the pages an index for these rows of keys this wide holds
+pub fn planned_pages(width: usize, rows: RowCount) -> u32 {
+    let key_words = width.clamp(1, MOST_KEY_BYTES).div_ceil(size_of::<u32>());
+    let leaf_capacity = (PAGE_WORDS - HEAD_WORDS) / (key_words + ENTRY_TAIL_WORDS);
+    let inner_capacity = (PAGE_WORDS - HEAD_WORDS) / (key_words + 1);
+    let leaves = (rows.0 as usize).div_ceil((leaf_capacity * FILL_THIRDS / 3).max(1));
+    // inner pages fill half at least, and each part can hold a leaf of its own however few rows it has
+    let pages = leaves + leaves.div_ceil(inner_capacity / 2) * 2 + PARTS;
+    // page numbers below the missing link's number are all a pool can have
+    pages.min(NO_PAGE as usize - 1) as u32
+}
+
+/// Work out the heap an index for these rows of keys this wide holds, as `SortedKeys::new` sizes it
+pub fn planned_index_bytes(width: usize, rows: RowCount) -> ByteCount {
+    ByteCount(u64::from(planned_pages(width, rows)) * (PAGE_WORDS * size_of::<AtomicU32>()) as u64)
 }

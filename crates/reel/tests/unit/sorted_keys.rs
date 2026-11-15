@@ -438,3 +438,12 @@ fn starts_past_a_part_word() {
         assert_eq!(scan(&start, false), vec![vec![1, 2, 3, 4, 5, 6]]);
     }
 }
+
+// the budget's figure for a sorted index is the heap the built index holds
+#[test]
+fn planned_bytes_match_the_built_index() {
+    for (width, rows) in [(8, 1_000), (16, 100_000), (17, 2_000_000), (64, 300_000)] {
+        let index = SortedKeys::new(width, RowCount(rows));
+        assert_eq!(reel::index::sorted_keys::planned_index_bytes(width, RowCount(rows)), index.heap_bytes(), "{width} B keys, {rows} rows");
+    }
+}

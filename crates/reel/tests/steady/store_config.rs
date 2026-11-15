@@ -14,6 +14,7 @@ pub const BULK: ColumnId = ColumnId(2);
 pub const PLAIN: ColumnId = ColumnId(3);
 const MOST_KEY_BYTES: u16 = 64;
 const TABLE_ROWS: RowCount = RowCount(4_000_000);
+const TABLE_BUDGET: ByteCount = ByteCount(512 * 1024 * 1024);
 
 pub fn config(root: &Path, budget: ByteCount) -> StoreConfig {
     let column = |id: ColumnId, name: &str, codec: Codec, complete_rows: Option<RowCount>| ColumnConfig {
@@ -26,6 +27,8 @@ pub fn config(root: &Path, budget: ByteCount) -> StoreConfig {
         sorted_rows: None,
         least_value: None,
     };
+    // a complete column sets aside 29 MiB of block lines at any row count, more than the 128 and 192 MiB budgets have spare
+    let table_rows = (budget.0 >= TABLE_BUDGET.0).then_some(TABLE_ROWS);
     StoreConfig {
         memory_budget: budget,
         threads: Default::default(),
@@ -35,7 +38,7 @@ pub fn config(root: &Path, budget: ByteCount) -> StoreConfig {
             sync: SyncPolicy::Never,
             device: Default::default(),
         }],
-        columns: vec![column(META, "meta", Codec::None, Some(TABLE_ROWS)), column(BULK, "bulk", Codec::Lz4, None), column(PLAIN, "plain", Codec::None, None)],
+        columns: vec![column(META, "meta", Codec::None, table_rows), column(BULK, "bulk", Codec::Lz4, None), column(PLAIN, "plain", Codec::None, None)],
     }
 }
 

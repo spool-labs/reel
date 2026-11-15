@@ -64,7 +64,8 @@ use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
 use crate::engine::complete_image::ImageFiles;
 use crate::index::complete_table::CompleteTable;
-use crate::index::sorted_keys::{MOST_KEY_BYTES, SortedKeys};
+use crate::index::complete_table::planned_table_bytes;
+use crate::index::sorted_keys::{MOST_KEY_BYTES, SortedKeys, planned_index_bytes};
 use crate::index::spot_index::SpotIndex;
 use crate::index::write_index::WriteIndex;
 use crate::io::lock_outcome::LockOutcome;
@@ -801,10 +802,19 @@ pub fn store_shape(config: &StoreConfig, has_ring: bool, disks: &[Option<ByteCou
         disk_entry_bytes: ByteCount(0),
         floor_entry_bytes: entry_line(config, &disks.iter().map(|disk| disk.map(|_size| floor_entries())).collect::<Vec<_>>()),
         workers: None,
+        declared_bytes: declared_index_bytes(config),
+        is_all_sorted: !config.columns.is_empty() && config.columns.iter().all(|column| column.sorted_rows.is_some()),
     };
     // a segment's rows come from the shares, so the disks ask at the rows a plan with no line of theirs gives
     let rows = EngineSizing::for_store(&bare.with_workers_settled()).segment_rows;
     StoreShape { disk_entry_bytes: entry_line(config, &asked_entries(config, disks, rows)), ..bare }
+}
+
+/// Add up the heap a config's declared indexes hold, by the arithmetic the tables and indexes are built with
+pub fn declared_index_bytes(config: &StoreConfig) -> ByteCount {
+    let tables: u64 = config.columns.iter().filter_map(|column| column.complete_rows).map(|rows| planned_table_bytes(rows).0).sum();
+    let indexes: u64 = config.columns.iter().filter_map(|column| column.sorted_rows.map(|rows| planned_index_bytes(column.key_shape.widest(), rows).0)).sum();
+    ByteCount(tables + indexes + complete_lines(config) * size_of::<BlockEntry>() as u64)
 }
 
 /// Count the columns a volume holds
@@ -1235,6 +1245,12 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         window_copies.push(Mutex::new(touched_zeroes(RECORD_WINDOW_BYTES)));
         slot_files.push(SlotFile::new());
         free_slots.push(OpenSlot((open_slots - 1 - slot) as u8));
+    }
+    // a mutex's first lock can allocate, and a slot first used after open allocates nothing
+    for slot in 0..open_slots {
+        drop(hold(&queues[slot]));
+        drop(hold(&spare_groups[slot]));
+        drop(hold(&window_copies[slot]));
     }
 
     let largest_value = sizing.segment_bytes;

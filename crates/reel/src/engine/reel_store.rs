@@ -549,6 +549,9 @@ impl<Backend: Io> ReelStore<Backend> {
             assert!(volume.rows_in_index.load(Ordering::Acquire) >= open, "a volume counts fewer open rows than its open segments hold");
         }
 
+        #[cfg(feature = "test-hooks")]
+        check_dead_counts(&self.state);
+
         let mut outcome = Ok(());
         for volume in &self.state.volumes {
             if !volume.has_failed() {
@@ -739,6 +742,8 @@ pub fn bring_up<Backend: Io>(
         // bits that fail to load leave their rows to ask, which costs a merge time and nothing else
         let _loaded = state.load_dead_bits(volume);
     }
+    #[cfg(feature = "test-hooks")]
+    check_dead_counts(state);
     state.remove_stale_images().map_err(open_error("removing an image of a column that changed kind"))?;
     state.fill_complete_tables().map_err(open_error("filling a complete table"))?;
     state.fill_sorted_indexes().map_err(open_error("filling a sorted index"))?;
@@ -1626,6 +1631,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         rewrite_dead_kept: AtomicU64::new(0),
         rewrites_unreclaimed: AtomicU64::new(0),
         walk_blocks: AtomicU64::new(0),
+        zero_lines_read: AtomicU64::new(0),
         sealing: AtomicU64::new(NO_SEAL),
         lanes: (0..=sizing.walk_slots).map(|_lane| RewriteLane::new()).collect(),
         gave_up: Mutex::new(GaveUp::new()),
@@ -1950,4 +1956,24 @@ pub fn disk_root<Backend: Io>(io: &Backend, root: &Path) -> PathBuf {
         .map(|ancestor| if ancestor.as_os_str().is_empty() { Path::new(".") } else { ancestor })
         .find(|ancestor| io.capacity(ancestor).is_ok())
         .map_or_else(|| root.to_path_buf(), Path::to_path_buf)
+}
+
+/// Check every block of a segment with exact bits has as many bits set as the summary counts dead rows, so a row charged
+/// twice or with no bit shows at its cause. The sims run it at every open and close
+#[cfg(feature = "test-hooks")]
+pub fn check_dead_counts<Backend: Io>(state: &EngineState<Backend>) {
+    for volume in &state.volumes {
+        let rows = hold(&volume.summary);
+        for row in rows.rows() {
+            let segment = row.facts.segment;
+            if volume.dead_bits.exact(segment).is_none() {
+                continue;
+            }
+            for (block, dead) in row.block_dead.chunks_exact(size_of::<u32>()).enumerate() {
+                let dead = u32::from_le_bytes(dead.try_into().unwrap_or_default());
+                let set = volume.dead_bits.block_set(segment, block as u32);
+                assert_eq!(set, Some(dead), "{segment:?} block {block} counts {dead} dead rows and has {set:?} bits set");
+            }
+        }
+    }
 }

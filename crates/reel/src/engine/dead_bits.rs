@@ -163,6 +163,28 @@ impl DeadBits {
         hold(&self.books).extents.get(&segment).copied().filter(|extent| extent.is_exact)
     }
 
+    /// Set one row's bit and say whether it was clear, or nothing when the segment has no exact bits with room for the row
+    pub fn set_row(&self, segment: SegmentNumber, block: u32, index: u32) -> Option<bool> {
+        let books = hold(&self.books);
+        let (word, bit) = books.extents.get(&segment).filter(|extent| extent.is_exact).and_then(|extent| word_of(extent, block, index))?;
+        self.is_changed.store(true, Ordering::Release);
+        Some(self.words[word].fetch_or(bit, Ordering::AcqRel) & bit == 0)
+    }
+
+    /// Set the bits of a block's first so many rows, for a block a cover kills whole
+    pub fn set_block(&self, segment: SegmentNumber, block: u32, rows: u32) {
+        let books = hold(&self.books);
+        let Some(extent) = books.extents.get(&segment).filter(|extent| extent.is_exact) else {
+            return;
+        };
+        for index in 0..rows {
+            if let Some((word, bit)) = word_of(extent, block, index) {
+                self.words[word].fetch_or(bit, Ordering::AcqRel);
+            }
+        }
+        self.is_changed.store(true, Ordering::Release);
+    }
+
     /// Read one row's bit through an extent read before, or nothing when the row's place lies outside it
     pub fn is_set(&self, extent: &BitsExtent, block: u32, index: u32) -> Option<bool> {
         let (word, bit) = word_of(extent, block, index)?;

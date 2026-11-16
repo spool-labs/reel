@@ -149,7 +149,7 @@ pub struct CompactJob<Backend: Io> {
     sweep: Option<Sweep>,
     last_tried: SegmentNumber,
     settle_at: usize,
-    settled_rows: FixedList<DeadCount>,
+    settled_rows: FixedList<SettledRow>,
     listed: FixedList<SegmentNumber>,
     pub rebuilds_tried: FixedList<SegmentNumber>,
     block: FixedList<u8>,
@@ -212,7 +212,7 @@ impl<Backend: Io> CompactJob<Backend> {
     /// Read the heap the job's buffers hold
     pub fn heap_bytes(&self) -> ByteCount {
         let buffers = self.block.capacity() + self.key.capacity() + self.row_key.capacity() + self.end.capacity();
-        let settled = self.settled_rows.capacity() * size_of::<DeadCount>() + self.listed.capacity() * size_of::<SegmentNumber>();
+        let settled = self.settled_rows.capacity() * size_of::<SettledRow>() + self.listed.capacity() * size_of::<SegmentNumber>();
         let seats: u64 = self.seats.iter().map(RewriteSeat::heap_bytes).sum();
         ByteCount((buffers + settled) as u64 + self.rewrite.heap_bytes().0 + seats)
     }
@@ -750,13 +750,17 @@ impl<Backend: Io> CompactJob<Backend> {
             while let Some(row) = walk.next_row(&mut self.row_key) {
                 if row.place == place && row.kind == RowKind::RangeDelete {
                     // a list that's full leaves the row live, which only keeps its segment a while longer
-                    self.settled_rows.push_if_room(DeadCount {
-                        segment,
-                        column,
-                        block: index,
-                        rows: 1,
-                        replacement: place,
-                        ..DeadCount::default()
+                    let at = walk.row_index() as u32;
+                    self.settled_rows.push_if_room(SettledRow {
+                        index: at,
+                        count: DeadCount {
+                            segment,
+                            column,
+                            block: index,
+                            rows: 1,
+                            replacement: place,
+                            ..DeadCount::default()
+                        },
                     });
                     return;
                 }
@@ -781,11 +785,16 @@ impl<Backend: Io> CompactJob<Backend> {
                 return;
             };
             rows.clear_covers(segment);
-            for count in self.settled_rows.iter().filter(|count| count.segment == segment) {
+            // a settled cover's row counts once, with its bit
+            for settled in self.settled_rows.iter().filter(|settled| settled.count.segment == segment) {
+                let count = &settled.count;
+                if volume.dead_bits.set_row(segment, count.block, settled.index) == Some(false) {
+                    continue;
+                }
                 rows.apply_counts(segment, slice::from_ref(count), None);
                 volume.table.drop_live(segment, count.block, count.rows, count.replacement);
             }
-            self.settled_rows.retain(|count| count.segment != segment);
+            self.settled_rows.retain(|settled| settled.count.segment != segment);
             last = segment;
         }
     }
@@ -1173,4 +1182,11 @@ impl PickCounts {
             None
         }
     }
+}
+
+/// A settled cover's own row, with its place among its block's rows for its bit
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SettledRow {
+    pub count: DeadCount,
+    pub index: u32,
 }

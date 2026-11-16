@@ -310,6 +310,9 @@ impl<Backend: Io> CoverApply<Backend> {
             kept_bytes: ByteCount(0),
             replacement: place,
         })?;
+        // every row of the block is dead now, so every bit is set, the rows charged before and the ones this charges
+        let charged = volume.dead_bits.block_set(target.segment, target.next_block).unwrap_or(0);
+        volume.dead_bits.set_block(target.segment, target.next_block, charged + block.entry.live_rows);
         self.land(volume, target.segment)
     }
 

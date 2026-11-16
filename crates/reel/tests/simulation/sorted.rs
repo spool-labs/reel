@@ -1255,6 +1255,20 @@ fn check_cue(held: &HeldCue, written: &[Vec<u8>], step: u64, seed: u64) {
 #[test]
 fn cues_held_across_covers_and_single_seals() {
     for seed in seeds(0..CUE_SEEDS) {
+        cues_held_at(seed);
+    }
+}
+
+// seed 606453 had a merge charge a kept row's death by count and a walk charge it again, so its block counted no live row
+// and a walk crossed it unread
+#[test]
+fn cues_held_over_a_row_charged_twice() {
+    cues_held_at(606_453);
+}
+
+/// Run the cue test on one seed
+fn cues_held_at(seed: u64) {
+    {
         let io = SimulatedIo::new(Seed(300 + seed));
         let mut random = SeededRandom::new(Seed(400 + seed));
         let store = open(&io, CAPACITY);

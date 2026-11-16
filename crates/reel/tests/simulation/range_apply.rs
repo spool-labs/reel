@@ -999,3 +999,33 @@ fn a_dead_cover_segment_leaves_no_cover_behind() {
     assert_eq!(read(&store, b"z-000"), Some(b"newer".to_vec()));
     store.close().expect("close");
 }
+
+// a settled cover's own row counts dead once, though the cover settles again after a reopen or a kill
+#[test]
+fn a_settled_cover_counts_its_row_once() {
+    for (is_killed, seed) in [(false, 163), (true, 164)] {
+        let io = SimulatedIo::new(Seed(seed));
+        let store = open(&io);
+        put_keys(&store, "m", b"value");
+        seal(&store, &io);
+        store.delete_range(COLUMN, b"m", b"n").expect("delete");
+        put_keys(&store, "z", b"value");
+        let holder = seal(&store, &io);
+        settle(&io);
+        assert_eq!(pending(&store), 0, "killed {is_killed}: the cover never settled");
+        let dead = dead_rows(&store, holder);
+        if is_killed {
+            store.flush().expect("flush");
+            io.kill();
+            drop(store);
+        } else {
+            store.close().expect("close");
+        }
+        let store = open(&io);
+        store.state.ask_compaction();
+        settle(&io);
+        assert_eq!(pending(&store), 0, "killed {is_killed}: the cover came back and stayed");
+        assert_eq!(dead_rows(&store, holder), dead, "killed {is_killed}: the cover's row counted dead again");
+        store.close().expect("close");
+    }
+}

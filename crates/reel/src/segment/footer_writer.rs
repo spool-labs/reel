@@ -201,6 +201,11 @@ impl FooterWriter {
         &self.entries
     }
 
+    /// Give the place of the last row pushed among its block's rows
+    pub fn last_row_index(&self) -> u32 {
+        (self.builder.row_count().0 as u32).saturating_sub(1)
+    }
+
     /// Read the columns written so far, for the segment's tail in memory
     pub fn columns(&self) -> &[ColumnTail] {
         &self.columns

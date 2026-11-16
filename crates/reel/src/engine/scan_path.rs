@@ -1164,7 +1164,7 @@ impl<Backend: Io> EngineState<Backend> {
                 take.rows += u64::from(line.live_rows);
                 continue;
             }
-            if line.live_rows > 0 || replacement > point {
+            if line.live_rows > 0 || replacement > point || !can_cross_unread(volume, source.segment) {
                 source.enter_block(line);
                 return SourceMove::Row;
             }
@@ -1203,7 +1203,7 @@ impl<Backend: Io> EngineState<Backend> {
         };
         source.block = start;
         source.enter_block(line);
-        if line.live_rows == 0 && replacement <= at.point {
+        if line.live_rows == 0 && replacement <= at.point && can_cross_unread(volume, source.segment) {
             let crossed = self.cross_block(volume, source, at.direction, at.point, None);
             if crossed != SourceMove::Row {
                 return Ok(crossed);
@@ -1241,7 +1241,7 @@ impl<Backend: Io> EngineState<Backend> {
         let tail = seat.tail;
         source.place_base = seat.head.place_base;
         let can_take = at.is_counting && seat.is_walked && seat.head.places.highest <= at.point;
-        source.is_countable = can_take && has_no_live_graves(volume, source.segment, at.column);
+        source.is_countable = can_take && has_no_live_graves(volume, source.segment, at.column) && volume.dead_bits.exact(source.segment).is_some();
         source.tail = tail;
         source.first_block = tail.first_block;
         source.end_block = tail.first_block + tail.block_count.0;
@@ -1469,4 +1469,14 @@ pub fn fill_sorted(index: &SortedKeys, scan: &mut ScanState) {
             scan.is_sorted_done = true;
         }
     }
+}
+
+/// Check a block whose line counts no live row can be crossed unread. Only a segment with exact bits has a bit behind every
+/// charge on its lines, so a block of any other segment is read
+pub fn can_cross_unread<Backend: Io>(volume: &Volume<Backend>, segment: SegmentNumber) -> bool {
+    let is_exact = volume.dead_bits.exact(segment).is_some();
+    if !is_exact {
+        volume.zero_lines_read.fetch_add(1, Ordering::Relaxed);
+    }
+    is_exact
 }

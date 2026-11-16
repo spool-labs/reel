@@ -29,10 +29,10 @@ use crate::region::{LIST_ALIGN_ROOM, REGION_HEAD_BYTES, Region, list_bytes};
 use crate::engine::held_bits::HeldBits;
 use crate::engine::load_state::can_start;
 use crate::engine::admission::{Admit, JobRole, PICK_HALVINGS};
-use crate::engine::dead_bits::BitsExtent;
+use crate::engine::dead_bits::{BitsExtent, DeadRow};
 use crate::segment::key_cursor::KeyCursor;
 use crate::segment::damage_list::DamagedRange;
-use crate::segment::footer_writer::{FooterTotals, FooterWriter};
+use crate::segment::footer_writer::{FooterTotals, FooterWriter, MOST_BLOCK_ROWS};
 use crate::index::key_hash::KeyHash;
 use crate::segment::row_block::{BLOCK_TRAILER_BYTES, FooterRow, ROW_BLOCK_BYTES, ROW_ROOM_NUMBERS, RowBlockWalk};
 use crate::segment::segment_table::SegmentPin;
@@ -70,10 +70,15 @@ pub const ROOM_SHORT_BAR: u64 = 0;
 pub const MERGE_BUFFER_BYTES: usize = 3 * 512 * 1024;
 /// Most row blocks of an output that can hold rows kept for a cue, past which the merge waits for the cue to go
 pub const MOST_KEPT_BLOCKS: usize = 1_024;
+/// Most rows kept for a cue whose bits a merge lands, past which the outputs' bits stop answering
+pub const MOST_KEPT_ROWS: usize = 4_096;
 /// A row the merge dropped, which a held bit lands nowhere for
 pub const NO_HOME: u32 = u32::MAX;
-/// Bits of a row's home that give its block in the output, past which the bits give the output
-pub const HOME_BLOCK_BITS: u32 = 28;
+/// Bits of a row's home that give its place among its output block's rows
+pub const HOME_INDEX_BITS: u32 = 12;
+/// Bits of a row's home past its place that give its block in the output, past which the bits give the output
+pub const HOME_BLOCK_BITS: u32 = 16;
+const _: () = assert!(MOST_BLOCK_ROWS <= 1 << HOME_INDEX_BITS && MOST_MERGE_OUTPUTS < 1 << (u32::BITS - HOME_INDEX_BITS - HOME_BLOCK_BITS));
 /// Rows one step of a merge decides
 pub const MERGE_STEP_ROWS: usize = 4_096;
 /// The longest a step of a merge decides rows for. A row can ask every overlapping segment's footers, so rows alone can run a
@@ -392,6 +397,8 @@ pub struct RewriteJob<Backend: Io> {
     dropped_rows: u64,
     dropped_graves: u64,
     kept_dead: FixedList<DeadCount>,
+    kept_rows: FixedList<DeadRow>,
+    are_kept_rows_cut: bool,
     park_wait_since: Option<Nanoseconds>, is_long_wait_noted: bool,
     pub cut_floor: u64,
     cut_bytes: u64,
@@ -550,6 +557,8 @@ impl<Backend: Io> RewriteJob<Backend> {
             dropped_rows: 0,
             dropped_graves: 0,
             kept_dead: FixedList::empty(),
+            kept_rows: FixedList::empty(),
+            are_kept_rows_cut: false,
             park_wait_since: None, is_long_wait_noted: false,
             cut_floor,
             cut_bytes: 0,
@@ -700,6 +709,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
         self.buffer = region.carve_filled(MERGE_BUFFER_BYTES, 0)?;
         self.kept_dead = region.carve(MOST_KEPT_BLOCKS)?;
+        self.kept_rows = region.carve(MOST_KEPT_ROWS)?;
         for key in [&mut self.key, &mut self.last_key, &mut self.lowest, &mut self.highest] {
             *key = region.carve(keys)?;
         }
@@ -746,6 +756,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             touched += mem::take(key).peak_bytes();
         }
         touched += mem::take(&mut self.kept_dead).peak_bytes() + mem::take(&mut self.staged).peak_bytes();
+        touched += mem::take(&mut self.kept_rows).peak_bytes();
         touched += mem::take(&mut self.staged_columns).peak_bytes() + mem::take(&mut self.marks).peak_bytes();
         touched += mem::take(&mut self.placed).peak_bytes() + mem::take(&mut self.stripe).peak_bytes();
         touched += mem::take(&mut self.held_words).peak_bytes() + mem::take(&mut self.row_home).peak_bytes();
@@ -1026,7 +1037,7 @@ impl RewriteBound {
         let writers = FooterWriter::region_bytes(self.output_blocks()) + FooterWriter::region_bytes(self.grave_blocks());
         let inputs = self.inputs * MergeInput::region_bytes();
         let keys = RUN_KEYS * list_bytes::<u8>(MAX_KEY_BYTES as usize);
-        let buffers = list_bytes::<u8>(MERGE_BUFFER_BYTES) + list_bytes::<DeadCount>(MOST_KEPT_BLOCKS);
+        let buffers = list_bytes::<u8>(MERGE_BUFFER_BYTES) + list_bytes::<DeadCount>(MOST_KEPT_BLOCKS) + list_bytes::<DeadRow>(MOST_KEPT_ROWS);
         let staged = list_bytes::<StagedOutput>(MOST_MERGE_OUTPUTS)
             + list_bytes::<StagedColumn>(MOST_MERGE_OUTPUTS * self.columns)
             + list_bytes::<u8>(MOST_MERGE_OUTPUTS * self.columns * STAGED_COLUMN_KEY_BYTES);

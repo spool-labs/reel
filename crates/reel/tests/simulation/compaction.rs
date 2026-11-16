@@ -437,6 +437,8 @@ fn newest_stays() {
     assert!(is_wholly_dead(&rows.get(newest).expect("a row")));
     drop(rows);
     volume.table.drop_live(newest, 0, 1, WritePlace(0));
+    // a count with no bit leaves the segment's bits to stop answering, as every such charge in the engine does
+    volume.dead_bits.spoil_segment(newest, reel::engine::dead_bits::INEXACT_KEPT);
 
     state.ask_compaction();
     settle(&io);

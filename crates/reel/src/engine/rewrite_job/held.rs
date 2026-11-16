@@ -20,7 +20,7 @@ use crate::segment::row_block::RowBlockWalk;
 use crate::segment::segment_tail::SegmentNumber;
 use crate::segment::summary::DeadCount;
 
-use crate::engine::rewrite_job::{HOME_BLOCK_BITS, NO_HOME, RewriteJob, RewritePhase};
+use crate::engine::rewrite_job::{HOME_BLOCK_BITS, HOME_INDEX_BITS, NO_HOME, RewriteJob, RewritePhase};
 
 impl<Backend: Io> RewriteJob<Backend> {
     /// Hold the inputs from here on: lay their bits out over the region's words and publish them on the lane, so a walk that
@@ -38,13 +38,13 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.drain_block = 0;
     }
 
-    /// Note where the row being kept went: its output and its block there, for a held bit on it
-    pub fn note_home(&mut self, output: SegmentNumber, block: u32) {
+    /// Note where the row being kept went: its output, its block there and its place among the block's rows, for a held bit on it
+    pub fn note_home(&mut self, output: SegmentNumber, block: u32, index: u32) {
         if self.row_home.is_empty() {
             return;
         }
         let known = self.home_outputs[..self.home_count].iter().position(|number| *number == output);
-        let index = match known {
+        let slot = match known {
             Some(index) => index,
             None if self.home_count < self.home_outputs.len() => {
                 self.home_outputs[self.home_count] = output;
@@ -53,8 +53,12 @@ impl<Backend: Io> RewriteJob<Backend> {
             },
             None => return,
         };
+        // a block past what a home holds leaves the row with none, and its held bit counts again at the output's next walk
+        if block >= 1 << HOME_BLOCK_BITS {
+            return;
+        }
         if let Some(home) = self.row_home.get_mut(self.row_at as usize) {
-            *home = ((index as u32) << HOME_BLOCK_BITS) | block;
+            *home = ((slot as u32) << (HOME_BLOCK_BITS + HOME_INDEX_BITS)) | (block << HOME_INDEX_BITS) | index;
         }
     }
 
@@ -127,20 +131,31 @@ impl<Backend: Io> RewriteJob<Backend> {
             if bits.get(index / WORD_BITS).is_none_or(|word| word >> (index % WORD_BITS) & 1 == 0) {
                 continue;
             }
-            let (segment, block) = if is_to_outputs {
+            let (segment, block, index) = if is_to_outputs {
                 let home = first.and_then(|first| self.row_home.get((first + index as u64) as usize)).copied().unwrap_or(NO_HOME);
                 // the merge dropped the row, so nothing it went to holds it
                 if home == NO_HOME {
                     continue;
                 }
-                (self.home_outputs[(home >> HOME_BLOCK_BITS) as usize], home & ((1 << HOME_BLOCK_BITS) - 1))
+                let output = self.home_outputs[(home >> (HOME_BLOCK_BITS + HOME_INDEX_BITS)) as usize];
+                (output, (home >> HOME_INDEX_BITS) & ((1 << HOME_BLOCK_BITS) - 1), home & ((1 << HOME_INDEX_BITS) - 1))
             } else {
-                (segment, block)
+                (segment, block, index as u32)
             };
             if self.drained.len() == self.drained.capacity() {
                 coalesce(&mut self.drained);
             }
-            add_count(&mut self.drained, segment, line.column, block, &row, Some(replacement)).map_err(|_full| Error::from(ErrorKind::OutOfMemory))?;
+            // a row whose bit is set counted when it was set, and one with no exact bits to set leaves its segment's bits to stop answering
+            match volume.dead_bits.set_row(segment, block, index) {
+                Some(false) => continue,
+                Some(true) => {},
+                None => volume.dead_bits.spoil_segment(segment, INEXACT_KEPT),
+            }
+            // a bit set with no count to match leaves the segment's bits to stop answering
+            add_count(&mut self.drained, segment, line.column, block, &row, Some(replacement)).map_err(|_full| {
+                volume.dead_bits.spoil_segment(segment, INEXACT_KEPT);
+                Error::from(ErrorKind::OutOfMemory)
+            })?;
             landed += 1;
         }
         Ok(landed)
@@ -181,8 +196,6 @@ impl<Backend: Io> RewriteJob<Backend> {
         while let Some(count) = self.drained.get(first) {
             let length = self.drained[first..].partition_point(|other| other.segment == count.segment);
             rows.apply_counts(count.segment, &self.drained[first..first + length], None);
-            // these counts come with no bits, so the segment's bits stop answering
-            volume.dead_bits.spoil_segment(count.segment, INEXACT_KEPT);
             first += length;
         }
         drop(rows);

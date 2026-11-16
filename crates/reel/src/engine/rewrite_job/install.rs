@@ -212,6 +212,14 @@ impl<Backend: Io> RewriteJob<Backend> {
             self.totals = Some(totals);
             self.name_output(output, self.data_slot)?;
         }
+        // the drain sets the outputs' bits before the table has them, and a walk can charge their rows once it does
+        let volume = &state.volumes[self.volume];
+        if let (Some(totals), Some(output)) = (self.totals, &self.output) {
+            volume.dead_bits.begin(output.number, self.writer.entries().len() as u32, totals.most_block_rows);
+        }
+        if let (Some(totals), Some(output)) = (self.grave_totals, &self.grave_output) {
+            volume.dead_bits.begin(output.number, self.grave_writer.entries().len() as u32, totals.most_block_rows);
+        }
         self.phase = if self.is_holding { RewritePhase::Draining } else { RewritePhase::Installing };
         Ok(())
     }
@@ -425,13 +433,6 @@ impl<Backend: Io> RewriteJob<Backend> {
             }
             return Err(Error::from(ErrorKind::OutOfMemory));
         }
-        // a walk can charge an output's rows once the table has it, so its bits begin first
-        if let (Some(totals), Some(output)) = (self.totals, &self.output) {
-            volume.dead_bits.begin(output.number, self.writer.entries().len() as u32, totals.most_block_rows);
-        }
-        if let (Some(totals), Some(output)) = (self.grave_totals, &self.grave_output) {
-            volume.dead_bits.begin(output.number, self.grave_writer.entries().len() as u32, totals.most_block_rows);
-        }
         Ok(())
     }
 
@@ -473,12 +474,16 @@ impl<Backend: Io> RewriteJob<Backend> {
             });
             return;
         }
+        // a row a cue kept lands its bit with its count, and one a walk charged first comes back out. Rows past the list count
+        // with no bit, so their outputs' bits stop answering
+        if self.are_kept_rows_cut {
+            for count in self.kept_dead.iter().filter(|count| count.rows > 0) {
+                volume.dead_bits.spoil_segment(count.segment, INEXACT_KEPT);
+            }
+        }
+        volume.dead_bits.land(&self.kept_rows, &mut self.kept_dead);
         self.kept_dead.sort_unstable_by_key(|count| (count.segment, count.block));
         let number = self.output.as_ref().map_or(SegmentNumber(0), |output| output.number);
-        // a row a cue kept counts dead with no bit, so its output's bits stop answering
-        for count in self.kept_dead.iter().filter(|count| count.rows > 0) {
-            volume.dead_bits.spoil_segment(count.segment, INEXACT_KEPT);
-        }
         rows.apply_walk(number, self.writer.entries().len() as u32, &self.kept_dead);
         drop(rows);
         for count in self.kept_dead.iter().filter(|count| count.rows > 0) {
@@ -611,6 +616,9 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.staged.clear();
         // the outputs an offset-order pass made ahead went with the lane's slots above, and a later pass makes its own
         self.slot_outputs = Default::default();
+        for output in [&self.output, &self.grave_output].into_iter().flatten() {
+            volume.dead_bits.end(output.number);
+        }
         self.output = None;
         self.grave_output = None;
         self.leave_outputs(volume, slots);

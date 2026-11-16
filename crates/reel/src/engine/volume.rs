@@ -298,6 +298,8 @@ pub struct Volume<Backend: Io> {
     pub rewrite_dead_kept: AtomicU64,
     /// Rewrites that wrote at least the bytes their leaving inputs held
     pub rewrites_unreclaimed: AtomicU64,
+    /// Blocks a scan read though their lines count no live row, since the segment's bits stop answering for its counts
+    pub zero_lines_read: AtomicU64,
     /// Walk blocks whose counts landed
     pub walk_blocks: AtomicU64,
     /// The segment a seal is working on, or `NO_SEAL`. Its rows can still answer through its open slot, so no walk starts on it

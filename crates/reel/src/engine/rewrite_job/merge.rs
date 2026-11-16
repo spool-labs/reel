@@ -14,7 +14,8 @@ use reel_core::store_error::StoreError;
 use reel_core::units::{ByteCount, FileOffset, WritePlace};
 
 use crate::engine::reports::thread_cpu;
-use crate::engine::dead_bits::{BIT_SAMPLE_EVERY, DECIDED_ASKED, DECIDED_CLEAR, DECIDED_SET, DECIDED_SHORT, DECIDED_WRONG, INEXACT_SHORT};
+use crate::engine::dead_bits::{BIT_SAMPLE_EVERY, DECIDED_ASKED, DECIDED_CLEAR, DECIDED_SET, DECIDED_SHORT, DECIDED_WRONG, DeadRow, INEXACT_SHORT};
+use crate::segment::footer_reader::RowAt;
 use crate::engine::read_path::SealedRow;
 use crate::engine::open_segment::output_path;
 use crate::engine::seal_job::MOST_SEGMENT_BLOCKS;
@@ -122,6 +123,8 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.staged_columns.clear();
         self.staged_keys.clear();
         self.kept_dead.clear();
+        self.kept_rows.clear();
+        self.are_kept_rows_cut = false;
         for input in &mut self.inputs {
             input.rewind();
         }
@@ -528,10 +531,11 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.writer.push_row(&output.file, &self.key, &kept)?;
         self.output_rows += 1;
         self.output_last_key.set_from(&self.key)?;
+        let at = RowAt { index: self.writer.last_row_index(), rows: self.writer.last_row_index() + 1 };
         let block = self.writer.entries().len() as u32;
         self.give_slot(volume, output.number, column, block);
-        self.note_home(output.number, block);
-        self.note_kept_dead(output.number, column, block, &kept, replacement)
+        self.note_home(output.number, block, at.index);
+        self.note_kept_dead(output.number, column, block, at, &kept, replacement)
     }
 
     /// Carry a grave into the output of its own, a footer row with no bytes behind it
@@ -573,10 +577,11 @@ impl<Backend: Io> RewriteJob<Backend> {
         };
         self.grave_writer.push_row(&output.file, &self.key, &kept)?;
         self.grave_last_key.set_from(&self.key)?;
+        let at = RowAt { index: self.grave_writer.last_row_index(), rows: self.grave_writer.last_row_index() + 1 };
         let block = self.grave_writer.entries().len() as u32;
         self.give_slot(volume, output.number, column, block);
-        self.note_home(output.number, block);
-        self.note_kept_dead(output.number, column, block, &kept, replacement)
+        self.note_home(output.number, block, at.index);
+        self.note_kept_dead(output.number, column, block, at, &kept, replacement)
     }
 
     /// Give a kept row a slot in its column's table, before the inputs go, so a read that meets the change finds it twice
@@ -609,6 +614,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         output: SegmentNumber,
         column: ColumnId,
         block: u32,
+        at: RowAt,
         kept: &FooterRow,
         replacement: Option<WritePlace>,
     ) -> Result<()> {
@@ -617,6 +623,11 @@ impl<Backend: Io> RewriteJob<Backend> {
                 return Err(Error::from(ErrorKind::OutOfMemory));
             }
             add_count(&mut self.kept_dead, output, column, block, kept, replacement)?;
+            // the bit lands with the outputs, and a row past the list leaves the outputs' bits to stop answering
+            let row = DeadRow { segment: output, block, at, length: kept.length.0, is_grave: kept.kind == RowKind::Grave };
+            if self.kept_rows.push(row).is_err() {
+                self.are_kept_rows_cut = true;
+            }
         }
         Ok(())
     }

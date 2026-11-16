@@ -200,6 +200,8 @@ pub struct StoreShape {
     pub workers: Option<usize>,
     /// The heap the declared indexes hold: complete tables with their block lines, and sorted indexes. The budget pays for them
     pub declared_bytes: ByteCount,
+    /// A reader that writes nothing: no write buffers, no encoders, no jobs past its read threads
+    pub is_read_only: bool,
 }
 
 /// What a budget buys
@@ -220,11 +222,15 @@ pub struct EngineSizing {
     pub room: ByteCount,
     pub entry_line: ByteCount,
     pub counts: Counts,
+    pub is_read_only: bool,
 }
 
 impl StoreShape {
     /// Count the maintenance workers the store runs, which its volumes share
     pub fn workers(&self) -> usize {
+        if self.is_read_only {
+            return 0;
+        }
         self.workers.or_else(|| self.threads.set_workers()).unwrap_or_else(default_workers)
     }
 
@@ -255,7 +261,7 @@ impl StoreShape {
             scans: counted(MOST_SCANS, LEAST_SCANS),
             read_slots: counted(READ_SLOTS, LEAST_READ_SLOTS),
             read_buffers,
-            write_buffers: counted(WRITE_BUFFERS, LEAST_WRITE_BUFFERS),
+            write_buffers: if self.is_read_only { 0 } else { counted(WRITE_BUFFERS, LEAST_WRITE_BUFFERS) },
         }
     }
 
@@ -268,17 +274,18 @@ impl StoreShape {
     pub fn fixed_bytes(&self) -> ByteCount {
         let volumes = self.volumes as u64;
         let counts = self.counts();
-        let queues = (self.open_slots() as u64 * 2 + counts.write_buffers as u64) * GROUP_BYTES.0;
+        // a reader takes in open rows through no queue and writes no group
+        let queues = if self.is_read_only { 0 } else { (self.open_slots() as u64 * 2 + counts.write_buffers as u64) * GROUP_BYTES.0 };
         let gathers = counts.write_buffers as u64 * GATHER_BYTES as u64;
         let windows = self.open_slots() as u64 * 3 * RECORD_WINDOW_BYTES as u64;
         let ring = if self.has_ring { (RING_SLOTS * RING_SLOT_BYTES) as u64 + RING_READS as u64 * RING_READ_BYTES } else { 0 };
         let reads = counts.read_buffers as u64 * READ_BUFFER_BYTES + ring;
         // each planner and each worker holds one footer reader of the job pool at a time, so none waits on a caller's
         let workers = self.workers() as u64;
-        let job_reads = (volumes + workers) * JOB_READER_BYTES;
+        let job_reads = if self.is_read_only { 0 } else { (volumes + workers) * JOB_READER_BYTES };
         let scans = counts.scans as u64 * planned_scan_bytes(self.widest_keys, self.open_slots());
         let read_slots = counts.read_slots as u64 * (SLOT_KEY_BYTES + SLOT_KEYS * size_of::<usize>()) as u64;
-        let large = if self.has_lz4 { LZ4_STORED_LIMIT.0 } else { 0 };
+        let large = if self.has_lz4 && !self.is_read_only { LZ4_STORED_LIMIT.0 } else { 0 };
         let encoders = counts.write_buffers as u64 * ENCODER_BYTES + large;
         let spans = 4 * MOST_DAMAGED_SPANS as u64 * (SPAN_KEY_BYTES as u64 * 2);
         let seats = volumes * self.walk_slots() as u64;
@@ -287,7 +294,7 @@ impl StoreShape {
         let cover_keys = 2 * MOST_RANGE_COVERS as u64 * self.widest_keys;
         let cover_fixed = (COVER_SLOT_BYTES + COVER_RECORD_BYTES) as u64 * MOST_RANGE_COVERS as u64;
         let covers = 2 * cover_keys + volumes * cover_fixed;
-        let jobs = SEAL_JOB_BYTES + WALK_JOB_BYTES + COMPACT_JOB_BYTES;
+        let jobs = if self.is_read_only { 0 } else { SEAL_JOB_BYTES + WALK_JOB_BYTES + COMPACT_JOB_BYTES };
         let worker_jobs = seats * LANE_JOB_BYTES;
         let declared = self.declared_bytes.0;
         ByteCount(queues + gathers + windows + reads + job_reads + scans + read_slots + encoders + covers + volumes * (jobs + spans) + worker_jobs + workers * WALK_JOB_BYTES + stacks + declared)
@@ -300,6 +307,9 @@ impl StoreShape {
 
     /// Count the jobs that serve calls: the shared ones, the read threads and a seal job a volume
     pub fn foreground_jobs(&self) -> u64 {
+        if self.is_read_only {
+            return self.threads.read_threads as u64;
+        }
         SHARED_JOBS + self.threads.read_threads as u64 + self.volumes as u64
     }
 
@@ -347,6 +357,7 @@ impl EngineSizing {
             room: shape.room(),
             entry_line: shape.entry_line(),
             counts: shape.counts(),
+            is_read_only: shape.is_read_only,
         }
     }
 

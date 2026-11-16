@@ -47,6 +47,7 @@ fn shape(budget: ByteCount, roots: usize) -> StoreShape {
         floor_entry_bytes: ByteCount(0),
         workers: None,
         declared_bytes: ByteCount(0),
+        is_read_only: false,
     }
 }
 
@@ -78,6 +79,7 @@ fn documented_rows() {
             floor_entry_bytes: ByteCount(0),
             workers: None,
             declared_bytes: ByteCount(0),
+            is_read_only: false,
         };
 
         assert_eq!(EngineSizing::for_store(&store).segment_rows, RowCount(rows), "{mib} MiB");
@@ -101,6 +103,7 @@ fn summary_holds_blocks() {
         floor_entry_bytes: ByteCount(0),
         workers: None,
         declared_bytes: ByteCount(0),
+        is_read_only: false,
     };
     let rows_room = EngineSizing::for_store(&store).summary_share.0 / 2;
     let blocks = 1_000_000_000 / ROWS_PER_BLOCK;
@@ -127,6 +130,7 @@ fn documented_reserve() {
             floor_entry_bytes: ByteCount(0),
             workers: None,
             declared_bytes: ByteCount(0),
+            is_read_only: false,
         };
 
         let segment = EngineSizing::for_store(&store).segment_bytes;
@@ -592,3 +596,39 @@ fn the_headroom_is_shared_by_the_indexes() {
 
 const HEADROOM_EACH: [(u64, usize, u64); 9] =
     [(512, 1, 33), (512, 2, 16), (512, 5, 6), (2048, 1, 156), (2048, 2, 78), (2048, 5, 31), (8192, 1, 256), (8192, 2, 256), (8192, 5, 129)];
+
+// what a read-only open of a 2 GiB store gets, held as the writer's sizes are: segment bytes and rows, the spot, block, record,
+// summary and table shares, the least budget and the fixed bytes
+#[test]
+fn a_large_reader_keeps_its_sizes() {
+    use reel::engine::reel_store::{read_only_sizing, store_shape};
+    let config = StoreConfig {
+        memory_budget: ByteCount(2 * 1024 * 1024 * 1024),
+        threads: ThreadCounts { maintenance_workers: Some(8), ..ThreadCounts::default() },
+        volumes: vec![VolumeConfig::new("kv", vec![PathBuf::from("/nonexistent/reader")], SyncPolicy::Never)],
+        columns: vec![ColumnConfig {
+            id: ColumnId(1),
+            name: "kv".to_string(),
+            key_shape: KeyShape::Fixed { width: 16 },
+            codec: Codec::None,
+            volume: VolumeId(0),
+            complete_rows: None,
+            sorted_rows: Some(RowCount(10_000_000)),
+            least_value: None,
+        }],
+    };
+    let sizing = read_only_sizing(&config, &[None]).expect("sizing");
+    let shape = StoreShape { is_read_only: true, ..store_shape(&config, false, &[None]) };
+    let found = [
+        sizing.segment_bytes.0,
+        sizing.segment_rows.0,
+        sizing.spot_share.0,
+        sizing.cache_share.0,
+        sizing.record_share.0,
+        sizing.summary_share.0,
+        sizing.table_share.0,
+        sizing.least_budget.0,
+        shape.fixed_bytes().0,
+    ];
+    assert_eq!(found, [1073741824, 2497564, 302371802, 302371802, 302371802, 151185901, 151185901, 39269632, 29308160]);
+}

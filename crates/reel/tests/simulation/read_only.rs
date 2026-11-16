@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
+use reel::guard::hold;
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
 use reel::io::Io;
@@ -151,6 +152,13 @@ fn changes_nothing() {
     assert!(matches!(viewer.delete_range(COLUMN, b"a", b"b"), Err(StoreError::ReadOnly)));
     assert!(matches!(viewer.write_batch(&WriteBatch::new()), Err(StoreError::ReadOnly)));
     assert!(matches!(viewer.flush(), Err(StoreError::ReadOnly)));
+    // the refused calls touched no write buffer, and a view holds none, starts no job that would, and keeps no spare group
+    let state = &viewer.state;
+    assert!(state.encoders.grab().is_none() && state.batch_rows.grab().is_none() && state.batch_records.grab().is_none());
+    assert!(state.row_task.get().is_none() && state.reserve_task.get().is_none() && state.planner_task.get().is_none());
+    assert!(state.seal_tasks.iter().all(|task| task.get().is_none()));
+    assert!(state.spare_groups.iter().all(|group| hold(group).is_none()));
+    assert_eq!(viewer.memory_report().maintenance_workers, 0);
     assert_eq!(keys(&viewer).len(), KEYS as usize);
     viewer.close().expect("close");
 

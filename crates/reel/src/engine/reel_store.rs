@@ -863,6 +863,7 @@ pub fn store_shape(config: &StoreConfig, has_ring: bool, disks: &[Option<ByteCou
         floor_entry_bytes: entry_line(config, &disks.iter().map(|disk| disk.map(|_size| floor_entries())).collect::<Vec<_>>()),
         workers: None,
         declared_bytes: declared_index_bytes(config),
+        is_read_only: false,
     };
     // a segment's rows come from the shares, so the disks ask at the rows a plan with no line of theirs gives
     let rows = EngineSizing::for_store(&bare.with_workers_settled()).segment_rows;
@@ -940,7 +941,16 @@ pub fn ring_fits(config: &StoreConfig, disks: &[Option<ByteCount>]) -> bool {
 
 /// Share a budget out for a store, or say why it can't run on it
 pub fn store_sizing(config: &StoreConfig, has_ring: bool, disks: &[Option<ByteCount>]) -> Result<EngineSizing, StoreError> {
-    let shape = store_shape(config, has_ring, disks);
+    sizing_of(config, store_shape(config, has_ring, disks))
+}
+
+/// Size a read-only open: the reader's own parts, and none a writer holds for writing
+pub fn read_only_sizing(config: &StoreConfig, disks: &[Option<ByteCount>]) -> Result<EngineSizing, StoreError> {
+    sizing_of(config, StoreShape { is_read_only: true, ..store_shape(config, false, disks) })
+}
+
+/// Size a store of this shape, or refuse a budget or a thread count it can't hold
+pub fn sizing_of(config: &StoreConfig, shape: StoreShape) -> Result<EngineSizing, StoreError> {
     let shape = shape.with_workers_settled();
     let least_shape = StoreShape { workers: Some(0), ..shape };
     if config.threads.read_threads == 0 {
@@ -1276,6 +1286,8 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
     }
 
     let open_slots = sizing.shard.open_slots;
+    // a reader writes no group, so its slots hold no queue and no spare
+    let group_bytes = if sizing.is_read_only { ByteCount(0) } else { GROUP_BYTES };
     let mut volumes = Vec::with_capacity(config.volumes.len());
     let all_row_room = config.volumes.len() * MOST_ROW_FIXED_BYTES + config.columns.len() * MOST_ROW_COLUMN_BYTES;
     let mut summaries = summaries.into_iter();
@@ -1295,8 +1307,8 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
     let mut slot_files = Vec::with_capacity(open_slots);
     let mut free_slots = Vec::with_capacity(open_slots);
     for slot in 0..open_slots {
-        queues.push(Mutex::new(RowQueue::new(GROUP_BYTES)));
-        spare_groups.push(Mutex::new(Some(RowGroupBuffer::new(GROUP_BYTES))));
+        queues.push(Mutex::new(RowQueue::new(group_bytes)));
+        spare_groups.push(Mutex::new((!sizing.is_read_only).then(|| RowGroupBuffer::new(GROUP_BYTES))));
         windows.push([RecordWindow::new(), RecordWindow::new()]);
         window_copies.push(Mutex::new(touched_zeroes(RECORD_WINDOW_BYTES)));
         slot_files.push(SlotFile::new());
@@ -1310,7 +1322,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
     }
 
     let largest_value = sizing.segment_bytes;
-    let most_shares = if has_lz4 { sizing.lz4_stored_limit.0 as usize / SHARE_BYTES } else { 0 };
+    let most_shares = if has_lz4 && !sizing.is_read_only { sizing.lz4_stored_limit.0 as usize / SHARE_BYTES } else { 0 };
     let counts = sizing.counts;
     let mut encoders = Vec::with_capacity(counts.write_buffers);
     for _encoder in 0..counts.write_buffers {
@@ -1388,7 +1400,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         stored_shares: Pool::new(shares),
         batch_rows: Pool::new((0..counts.write_buffers).map(|_buffer| RowGroupBuffer::new(GROUP_BYTES)).collect()),
         batch_records: Pool::new((0..counts.write_buffers).map(|_buffer| touched_zeroes(GATHER_BYTES)).collect()),
-        batch_lengths: Pool::new(vec![touched_filled(sizing.segment_rows.0 as usize, 0)]),
+        batch_lengths: Pool::new(vec![touched_filled(if sizing.is_read_only { 0 } else { sizing.segment_rows.0 as usize }, 0)]),
         current_mark: AtomicU64::new(0),
         longest_turn: AtomicU64::new(0),
         index_waits: AtomicU64::new(0),

@@ -19,7 +19,7 @@ use crate::engine::recovery::{
     scan_roots,
     pass_open_rows, walk_rows,
 };
-use crate::engine::reel_store::{OpenInputs, build_state, open_error, read_superblock, store_sizing, volume_disks};
+use crate::engine::reel_store::{OpenInputs, build_state, open_error, read_only_sizing, read_superblock, volume_disks};
 use crate::engine::volume::Volume;
 use crate::guard::hold;
 use crate::io::Io;
@@ -47,7 +47,7 @@ pub fn load_read_only<Backend: Io>(io: &Backend, config: &StoreConfig) -> Result
 pub fn try_load<Backend: Io>(io: &Backend, config: &StoreConfig) -> Result<Arc<EngineState<Backend>>, StoreError> {
     let superblock = read_superblock(io, config)?;
     let disks = volume_disks(io, config).map_err(open_error("reading a disk's size"))?;
-    let sizing = store_sizing(config, false, &disks)?;
+    let sizing = read_only_sizing(config, &disks)?;
     let roots: Vec<_> = config.volumes.iter().enumerate().map(|(index, volume)| (index, volume.roots.clone())).collect();
     // the summary goes first: a cover settles only once its rows' files are gone, so a later listing can't find rows it hid
     let summaries = read_summaries(io, &roots).map_err(open_error("reading a summary"))?;

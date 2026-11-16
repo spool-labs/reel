@@ -115,9 +115,9 @@ impl RingDriver<PlainFile> for UringDriver {
 
     fn reap(&self, done: &mut dyn FnMut(usize, Result<usize>)) -> Result<bool> {
         // completions land in shared memory, so a look there costs no syscall, and a wait in the kernel costs a wake
-        // SAFETY: only the one reaper reads this queue
         let spin = reap_spin(self.in_flight.load(Ordering::Acquire), REAP_SPIN);
         let mut clock = SpinClock::new(spin);
+        // SAFETY: only the one reaper reads this queue
         while unsafe { self.ring.completion_shared() }.is_empty() && !clock.is_over() {
             std::hint::spin_loop();
         }

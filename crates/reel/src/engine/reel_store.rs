@@ -4,6 +4,7 @@ use std::io::{Error, ErrorKind};
 use std::mem;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use reel_api::column_id::ColumnId;
 use reel_api::direction::Direction;
@@ -32,7 +33,7 @@ use crate::engine::engine_sizing::{
     dead_bits_bytes, segment_bytes_for, target_rows,
 };
 use crate::engine::engine_state::{EngineState, PLACE_RUN, SEGMENT_NUMBER_BATCH, SlotFile};
-use crate::engine::open_segment::{RECORD_WINDOW_BYTES, RecordWindow, RowQueue, fits_a_segment_path};
+use crate::engine::open_segment::{RECORD_WINDOW_BYTES, RecordWindow, RowQueue, SegmentPhase, fits_a_segment_path};
 use crate::engine::ration::Ration;
 use crate::engine::ring_job::RingReaper;
 use crate::engine::read_only::{close_read_only, load_read_only};
@@ -94,6 +95,8 @@ use crate::write_order::{PlaceCount, WriteOrder};
 
 /// The lock file in each root
 pub const LOCK_NAME: &str = "lock";
+/// The longest a finish sleeps between looks at its seals, so a wake it missed costs this much
+pub const FINISH_WAIT: Duration = Duration::from_millis(10);
 
 /// An open store
 pub struct ReelStore<Backend: Io> {
@@ -465,6 +468,38 @@ impl<Backend: Io> ReelStore<Backend> {
         for volume in &self.state.volumes {
             self.state.seal_fullest(volume);
         }
+    }
+
+    /// Seal every open segment, wait for the seals, and close. A finished store holds sealed segments alone: no open segment, no
+    /// rows file, no room reserved past a segment's end and no spare made ahead, so a copy of its files opens anywhere, read-only
+    /// as well. Its complete and sorted images are saved as close saves them, and a read-only open reads them and removes none.
+    /// A write made while it runs is sealed with the rest
+    pub fn finish(&self) -> Result<(), StoreError> {
+        self.check_open()?;
+        if self.state.is_read_only {
+            return Err(StoreError::ReadOnly);
+        }
+        loop {
+            let mut is_open = false;
+            for volume in self.state.volumes.iter().filter(|volume| !volume.has_failed()) {
+                let seen = volume.progress.seen();
+                let mut claims = hold(&volume.claims);
+                for index in 0..claims.open.len() {
+                    if claims.open[index].phase == SegmentPhase::Taking {
+                        self.state.seal_at(&mut claims, volume, index);
+                    }
+                }
+                is_open |= !claims.open.is_empty();
+                drop(claims);
+                if is_open {
+                    volume.progress.wait(seen, FINISH_WAIT);
+                }
+            }
+            if !is_open {
+                break;
+            }
+        }
+        self.close()
     }
 
     /// Stop every job, make every returned write durable and release the locks

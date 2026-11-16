@@ -194,3 +194,55 @@ fn roots_in_another_order_read_right() -> Result<(), Box<dyn std::error::Error>>
     std::fs::remove_dir_all(&base)?;
     Ok(())
 }
+
+// every file under a directory, with its length and the bytes the disk holds for it
+fn files_under(root: &std::path::Path, found: &mut Vec<(PathBuf, u64, u64)>) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            files_under(&entry.path(), found)?;
+        } else {
+            found.push((entry.path(), metadata.len(), metadata.blocks() * 512));
+        }
+    }
+    Ok(())
+}
+
+// a finished store holds sealed segments alone, with no rows file and no room reserved past their ends, and a copy of it opens
+// read-only and reads everything
+#[test]
+fn a_finished_store_holds_sealed_segments_alone() -> Result<(), Box<dyn std::error::Error>> {
+    let root = scratch_root().with_extension("finished");
+    let _gone = std::fs::remove_dir_all(&root);
+    let config = config(root.clone());
+    let store = ReelStore::open(PlainIo::new(), &config)?;
+    for number in 0..KEYS {
+        store.put(COLUMN, format!("key-{number:03}").as_bytes(), format!("value-{number}").as_bytes())?;
+    }
+    store.finish()?;
+    drop(store);
+    let mut files = Vec::new();
+    files_under(&root, &mut files)?;
+    for (path, length, held) in &files {
+        println!("{} {length} B long, {held} B held", path.display());
+    }
+    assert!(files.iter().all(|(path, _length, _held)| !path.to_string_lossy().ends_with(".rows")), "{files:?}");
+    // no room past a file's end: the disk holds the file's length, rounded to its blocks
+    assert!(files.iter().all(|(_path, length, held)| *held <= length.next_multiple_of(4_096)), "{files:?}");
+    let copy = root.with_extension("finished-copy");
+    let _gone = std::fs::remove_dir_all(&copy);
+    copy_tree(&root, &copy)?;
+    let mut moved = config.clone();
+    moved.volumes[0].roots = vec![copy.clone()];
+    let reader = ReelStore::open_read_only(PlainIo::new(), &moved)?;
+    let mut value = Vec::new();
+    for number in 0..KEYS {
+        assert!(reader.get(COLUMN, format!("key-{number:03}").as_bytes(), &mut value)?, "key {number}");
+    }
+    reader.close()?;
+    std::fs::remove_dir_all(&root)?;
+    std::fs::remove_dir_all(&copy)?;
+    Ok(())
+}

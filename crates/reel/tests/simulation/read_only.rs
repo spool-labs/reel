@@ -446,3 +446,23 @@ const GROWN_KEYS: u64 = 20_000;
 // open rows past what a view's write index holds at BUDGET, from a writer that holds them all unsealed
 const MANY_KEYS: u64 = 400_000;
 const WRITER_BUDGET: u64 = 512 * 1024 * 1024;
+
+// a reader set to no lifetime group beside a writer with a marked open segment reads it and leaves it: the recovery seal of a
+// marked group is the writer's, and a reader writes nothing and seals nothing
+#[test]
+fn a_reader_with_no_groups_seals_nothing() {
+    let io = SimulatedIo::new(Seed(35));
+    let store = open(&io);
+    store.put_marked(COLUMN, b"marked", b"value", reel_core::units::DeathMark(1_000_000)).expect("put");
+    land_rows(&io);
+    let before = io.list_directory(ROOT.as_ref()).expect("list");
+    let writes = io.write_count();
+    let mut none = config();
+    none.volumes[0].lifetime_groups = Some(0);
+    let viewer = ReelStore::open_read_only(io.clone(), &none).expect("open read-only");
+    assert_eq!(read(&viewer, b"marked"), Some(b"value".to_vec()));
+    viewer.close().expect("close");
+    assert_eq!(io.write_count(), writes, "the reader wrote");
+    assert_eq!(io.list_directory(ROOT.as_ref()).expect("list"), before, "the reader changed the files");
+    store.close().expect("close");
+}

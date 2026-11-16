@@ -496,3 +496,91 @@ fn no_lifetime_groups_refuse_a_mark() {
     assert_eq!(store.memory_report().open_slots, 2);
     store.close().expect("close");
 }
+
+// a store that held two open groups comes back with none: its marked rows read back, no group is open, and unmarked writes fill
+// and seal segment after segment with no wait on a group nothing will seal, after a close and after a kill
+#[test]
+fn marked_rows_come_back_with_no_groups() {
+    for seed in crate::seed_sets::seeds([8, 9]) {
+        for is_killed in [false, true] {
+            marked_rows_come_back(seed, is_killed);
+        }
+    }
+}
+
+fn marked_rows_come_back(seed: u64, is_killed: bool) {
+    let io = SimulatedIo::new(Seed(seed));
+    let store = open(&io);
+    for number in 0..LIFETIME_KEYS {
+        let mark = DeathMark((1 + number % 2) * 100 * FAR_APART);
+        store.put_marked(COLUMN, &key(number), &[1; VALUE_BYTES], mark).expect("put");
+    }
+    settle(&io);
+    assert_eq!(reading(&store).lifetime_groups, 2, "seed {seed}");
+    if is_killed {
+        store.flush().expect("flush");
+        io.kill();
+    } else {
+        store.close().expect("close");
+    }
+    drop(store);
+
+    // the same store reopened with groups on keeps its recovered groups open
+    {
+        let store = ReelStore::open(io.clone(), &config()).expect("reopen with groups");
+        settle(&io);
+        assert!(reading(&store).lifetime_groups >= 1, "seed {seed}, killed {is_killed}: a volume with groups sealed its recovered group");
+        store.close().expect("close");
+    }
+    let mut none = config();
+    none.volumes[0].open_segments = Some(1);
+    none.volumes[0].lifetime_groups = Some(0);
+    none.volumes[0].segment_bytes = Some(ByteCount(256 * 1024));
+    let store = ReelStore::open(io.clone(), &none).expect("reopen");
+    settle(&io);
+    let mut value = Vec::new();
+    for number in 0..LIFETIME_KEYS {
+        assert!(store.get(COLUMN, &key(number), &mut value).expect("get"), "seed {seed}, killed {is_killed}: key {number}");
+    }
+    assert_eq!(reading(&store).lifetime_groups, 0, "seed {seed}, killed {is_killed}: a group is still open");
+    {
+        let state = slot_state(&store);
+        let claims = hold(&store.state.volumes[0].claims);
+        let free = hold(&store.state.free_slots).len();
+        // every slot is an open segment, the spare or free: none is held by a group no write will fill
+        let accounted = claims.open.len() + usize::from(claims.prepared.is_some()) + free;
+        assert!(claims.open.iter().all(|open| open.ceiling.is_none()) && accounted == 2, "seed {seed}, killed {is_killed}: the slots don't add up: {state}");
+    }
+    let sealed_before = hold(&store.state.volumes[0].summary).rows().count();
+    // the puts run on this thread, as every sim drives the store, so each pause a writer takes steps the jobs it waits for
+    for number in 0..UNMARKED_KEYS {
+        if let Err(error) = store.put(COLUMN, format!("plain-{number:05}").as_bytes(), &[2; VALUE_BYTES]) {
+            panic!("seed {seed}, killed {is_killed}: put {number}: {error:?}; {}", slot_state(&store));
+        }
+    }
+    settle(&io);
+    let sealed = hold(&store.state.volumes[0].summary).rows().count() - sealed_before;
+    assert!(sealed >= 4, "seed {seed}, killed {is_killed}: {sealed} segments sealed");
+    for number in 0..LIFETIME_KEYS {
+        assert!(store.get(COLUMN, &key(number), &mut value).expect("get"), "seed {seed}, killed {is_killed}: key {number} after the fill");
+    }
+    store.close().expect("close");
+}
+
+// unmarked keys of VALUE_BYTES that fill several 256 KiB segments
+const UNMARKED_KEYS: u64 = 1_500;
+
+// the volume's slot state for a failure message: the groups first, since the report takes the claims lock, then each open
+// segment with its phase and slot, the spare, and the free list
+fn slot_state(store: &Store) -> String {
+    let groups = reading(store).lifetime_groups;
+    let claims = hold(&store.state.volumes[0].claims);
+    let open: Vec<String> = claims.open.iter().map(|segment| format!("{:?} slot {:?} {:?}", segment.number, segment.slot, segment.phase)).collect();
+    let free = hold(&store.state.free_slots).clone();
+    format!(
+        "groups {groups}, open {open:?}, spare {:?}, creating {}, wants a spare {}, free {free:?}",
+        claims.prepared.as_ref().map(|segment| (segment.number, segment.slot)),
+        claims.is_creating,
+        claims.wants_prepared
+    )
+}

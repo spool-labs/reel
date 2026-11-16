@@ -117,7 +117,9 @@ pub struct VolumeConfig {
     /// three segments' worth of the smallest rows, and a batch can hold no more rows than that: 60,491 at 256 KiB segments
     pub segment_bytes: Option<ByteCount>,
     /// The lifetime groups marked writes may hold open at once. None takes them from open_segments. Some(0) runs none, for a
-    /// writer that never marks a row: its slots are its open segments alone, and a marked write is refused with NoLifetimeGroups
+    /// writer that never marks a row: its slots are its open segments alone, and a marked write is refused with NoLifetimeGroups.
+    /// A store that held marked rows and comes back with none seals its marked open segments at open, and their rows keep their
+    /// marks
     pub lifetime_groups: Option<usize>,
 }
 

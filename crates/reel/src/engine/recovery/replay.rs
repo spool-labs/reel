@@ -481,12 +481,14 @@ pub fn recover_one<Backend: Io>(state: &Arc<EngineState<Backend>>, segment: &Sca
         }
     }
     if state.recover_open(volume, segment)? {
+        seal_unwanted_group(state, index)?;
         return Ok(true);
     }
 
     // long keys can fill the index below the row limit
     seal_every_open(state, index)?;
     if state.recover_open(volume, segment)? {
+        seal_unwanted_group(state, index)?;
         return Ok(true);
     }
     copy_segment(state, index, segment)?;
@@ -541,6 +543,24 @@ pub fn seal_every_open<Backend: Io>(state: &Arc<EngineState<Backend>>, volume: u
         seal_inline(state, volume)?;
     }
     Ok(())
+}
+
+/// Seal a recovered segment that carries marks on a volume that runs no lifetime group, on the opening thread. No marked write
+/// comes to fill it or to seal it, and its rows keep their marks in the sealed segment. A volume that runs groups keeps its
+/// recovered groups open
+pub fn seal_unwanted_group<Backend: Io>(state: &Arc<EngineState<Backend>>, volume: usize) -> Result<()> {
+    let target = &state.volumes[volume];
+    if target.most_groups != 0 {
+        return Ok(());
+    }
+    {
+        let mut claims = hold(&target.claims);
+        let Some(at) = claims.open.iter().position(|open| open.ceiling.is_some() && open.phase != SegmentPhase::Sealing) else {
+            return Ok(());
+        };
+        state.seal_at(&mut claims, target, at);
+    }
+    seal_inline(state, volume)
 }
 
 /// Run the seals marked on a volume to their end, on the opening thread

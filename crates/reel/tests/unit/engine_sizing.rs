@@ -468,3 +468,61 @@ fn a_grant_under_the_pool_floor_builds_no_index() {
         assert!(after_caches + held <= caches + 4, "{columns} columns took more than the caches had");
     }
 }
+
+// every size a large store gets, at the bench budgets with the ring and eight workers, held at the values the bench rows ran
+// with: the fixed parts may move a small store's sizes and never these
+#[test]
+fn large_stores_keep_their_sizes() {
+    use reel::PlainIo;
+    use reel::engine::reel_store::{size_sorted_indexes, store_shape};
+    use reel::engine::scan_state::{MOST_SCANS, planned_scan_bytes};
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let mut found = Vec::new();
+    for budget in [2 * GIB, 4 * GIB, 8 * GIB] {
+        let config = StoreConfig {
+            memory_budget: ByteCount(budget),
+            threads: ThreadCounts { maintenance_workers: Some(8), ..ThreadCounts::default() },
+            volumes: vec![VolumeConfig::new("kv", vec![PathBuf::from("/nonexistent/large")], SyncPolicy::Never)],
+            columns: vec![ColumnConfig {
+                id: ColumnId(1),
+                name: "kv".to_string(),
+                key_shape: KeyShape::Fixed { width: 16 },
+                codec: Codec::None,
+                volume: VolumeId(0),
+                complete_rows: None,
+                sorted_rows: Some(RowCount(10_000_000)),
+                least_value: None,
+            }],
+        };
+        let sizing = store_sizing(&config, true, &[None]).expect("sizing");
+        let shape = store_shape(&config, true, &[None]).with_workers_settled();
+        let scans = MOST_SCANS as u64 * planned_scan_bytes(shape.widest_keys, shape.open_slots());
+        let (shared, sizes) = size_sorted_indexes(&PlainIo::new(), &config, &sizing, &[]);
+        let index = sizes[1].expect("a sorted column");
+        found.push([
+            sizing.segment_bytes.0,
+            sizing.segment_rows.0,
+            sizing.spot_share.0,
+            sizing.cache_share.0,
+            sizing.record_share.0,
+            sizing.summary_share.0,
+            sizing.table_share.0,
+            sizing.least_budget.0,
+            shape.fixed_bytes().0,
+            scans,
+            shared.spot_share.0 + shared.cache_share.0 + shared.record_share.0,
+            index.asked.0,
+            index.got.0,
+            index.rows.0,
+        ]);
+    }
+    assert_eq!(found, LARGE_STORE_SIZES);
+}
+
+// segment bytes, segment rows, the spot, block, record, summary and table shares, the least budget, the fixed bytes, the scan
+// room, the caches after the sorted index's share, and the index's asked bytes, got bytes and rows, at 2, 4 and 8 GiB
+const LARGE_STORE_SIZES: [[u64; 14]; 3] = [
+    [1073741824, 2403846, 291025766, 291025766, 291025766, 145512883, 145512883, 118691884, 108206124, 11433216, 145513010, 826335232, 727564288, 13047000],
+    [1073741824, 4937850, 597809144, 597809144, 597809144, 298904572, 298904572, 118691884, 108206124, 11433216, 967092200, 826335232, 826335232, 14820750],
+    [1073741824, 10005858, 1211375902, 1211375902, 1211375902, 605687951, 605687951, 118691884, 108206124, 11433216, 2807792474, 826335232, 826335232, 14820750],
+];

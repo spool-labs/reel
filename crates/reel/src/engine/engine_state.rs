@@ -736,6 +736,7 @@ impl<Backend: Io> EngineState<Backend> {
             thread_stacks: ByteCount(self.job_count.load(Ordering::Acquire) * self.io.job_stack_bytes().0),
             open_slots: self.queues.len(),
             maintenance_workers: self.sizing.workers,
+            is_read_only: self.is_read_only,
             least_budget: self.sizing.least_budget,
             room: self.sizing.room,
             open_time: Nanoseconds(self.open_time.load(Ordering::Acquire)),

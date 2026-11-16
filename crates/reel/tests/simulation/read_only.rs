@@ -161,6 +161,7 @@ fn changes_nothing() {
     assert!(state.seal_tasks.iter().all(|task| task.get().is_none()));
     assert!(state.spare_groups.iter().all(|group| hold(group).is_none()));
     assert_eq!(viewer.memory_report().maintenance_workers, 0);
+    assert!(viewer.memory_report().is_read_only && !store.memory_report().is_read_only);
     assert_eq!(keys(&viewer).len(), KEYS as usize);
     viewer.close().expect("close");
 

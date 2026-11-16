@@ -32,6 +32,9 @@ pub struct MemoryReport {
     pub open_slots: usize,
     /// Workers each volume runs beside its planner, which the budget may have set below the default
     pub maintenance_workers: usize,
+    /// The store was opened read-only: it runs no workers and no write side, and its write index holds the open rows its last
+    /// load found
+    pub is_read_only: bool,
     /// The least budget this store opens in with the workers and the ring it runs, a figure with no target on it
     pub least_budget: ByteCount,
     /// The fixed room the plan keeps for heap no part names: the rounding, and room a foreground job for its allocator's state

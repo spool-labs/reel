@@ -19,8 +19,9 @@ pub const COMMENT_PREFIX: char = '#';
 pub const LINE_END: u8 = b'\n';
 /// Cargo arguments for the lint pass
 pub const CLIPPY_ARGUMENTS: [&str; 9] = ["clippy", "--workspace", "--all-targets", "--locked", "--features", TEST_HOOKS, "--", "-D", "warnings"];
-/// Cargo arguments for the lint pass on the build a node takes, with no test hooks
-pub const NODE_CLIPPY_ARGUMENTS: [&str; 8] = ["clippy", "--workspace", "--lib", "--bins", "--locked", "--", "-D", "warnings"];
+/// Cargo arguments for the lint pass on the build a node takes, with no test hooks. It names the published crates alone, since a
+/// workspace build unifies features, and the sims crate turns the test hooks on for every member
+pub const NODE_CLIPPY_ARGUMENTS: [&str; 10] = ["clippy", "-p", "tape-reel", "-p", "tape-reel-core", "--lib", "--locked", "--", "-D", "warnings"];
 /// Cargo arguments for the test pass, which keeps going after a failure
 pub const TEST_ARGUMENTS: [&str; 6] = ["test", "--workspace", "--locked", "--no-fail-fast", "--features", TEST_HOOKS];
 /// Cargo arguments for the pick gate: every kind of pick at 100,000 segments a volume, timed in a release build against its line

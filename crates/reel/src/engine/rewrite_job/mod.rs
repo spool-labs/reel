@@ -879,6 +879,7 @@ impl<Backend: Io> RewriteJob<Backend> {
     }
 
     /// Check the volume's overlap pass has segments left to look at
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn has_looks_left(&self) -> bool {
         self.state.volumes[self.volume].looks.has_left()
     }

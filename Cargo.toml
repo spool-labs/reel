@@ -18,6 +18,10 @@ reel-sim = { package = "tape-reel-sim", path = "crates/reel-sim" }
 thiserror = "2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
+[workspace.lints.rust]
+# forces the plain unix file calls on any system, so the fallback is tested where the others exist
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(reel_plain_unix)"] }
+
 [workspace.lints.clippy]
 unwrap_used = "deny"
 undocumented_unsafe_blocks = "deny"

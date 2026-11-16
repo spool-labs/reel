@@ -525,7 +525,9 @@ fn most_dead_percent(store: &Store) -> u64 {
 // an unlink and a free in place have both run since these counts
 fn has_reclaimed(store: &Store, unlinked_before: u64, freed_before: u64) -> bool {
     let volume = &store.state.volumes[0];
-    volume.segments_unlinked.load(Ordering::Acquire) > unlinked_before && volume.bytes_freed.load(Ordering::Acquire) > freed_before
+    // a filesystem that can't punch holes frees no bytes in place, and its segments come back by unlink alone
+    let has_freed = !volume.can_free_blocks || volume.bytes_freed.load(Ordering::Acquire) > freed_before;
+    volume.segments_unlinked.load(Ordering::Acquire) > unlinked_before && has_freed
 }
 
 // a long get beside a burst of frees answers every time: a free moves no count a read that succeeded looks at
@@ -808,6 +810,7 @@ fn main() {
     let after = counts(&mut faults);
     let unlinked = store.state.volumes[0].segments_unlinked.load(Ordering::Acquire) - unlinked_before;
     let freed = store.state.volumes[0].bytes_freed.load(Ordering::Acquire) - freed_before;
+    let store_can_free = store.state.volumes[0].can_free_blocks;
     let rewritten = store.state.volumes[0].segments_rewritten.load(Ordering::Acquire) - rewritten_before;
     // the counts are read with compaction held and no map under way, so no populate straddles the read, and the read's own
     // faults land on this thread after its count was taken
@@ -848,7 +851,7 @@ fn main() {
     if env::var_os(INDEXED_VARIABLE).is_none() {
         failures += indexed_arm();
     }
-    if unlinked == 0 || freed == 0 || rewritten == 0 {
+    if unlinked == 0 || (freed == 0 && store_can_free) || rewritten == 0 {
         failures += 1;
     }
     if failures + allocations + frees + minor_faults + major_faults + close_allocations > 0 {

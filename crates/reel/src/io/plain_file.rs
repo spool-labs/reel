@@ -169,7 +169,7 @@ impl IoFile for PlainFile {
 }
 
 /// Hold a file's space through an end, growing it there
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(reel_plain_unix)))]
 pub fn reserve_descriptor_to(descriptor: RawFd, end: ByteCount) -> Result<()> {
     // SAFETY: the descriptor is open, and no pointer crosses the call
     let status = unsafe { libc::fallocate(descriptor, 0, 0, end.0 as libc::off_t) };
@@ -180,7 +180,7 @@ pub fn reserve_descriptor_to(descriptor: RawFd, end: ByteCount) -> Result<()> {
 }
 
 /// Hold a file's space through an end, growing it there
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(target_vendor = "apple", not(reel_plain_unix)))]
 pub fn reserve_descriptor_to(descriptor: RawFd, end: ByteCount) -> Result<()> {
     let length = descriptor_stats(descriptor)?.st_size as u64;
     if end.0 <= length {
@@ -206,8 +206,23 @@ pub fn reserve_descriptor_to(descriptor: RawFd, end: ByteCount) -> Result<()> {
     Ok(())
 }
 
+/// Grow a file through an end, on a unix with no call that reserves its blocks: a full disk then shows at a write
+#[cfg(any(reel_plain_unix, not(any(target_os = "linux", target_vendor = "apple"))))]
+pub fn reserve_descriptor_to(descriptor: RawFd, end: ByteCount) -> Result<()> {
+    let length = descriptor_stats(descriptor)?.st_size as u64;
+    if end.0 <= length {
+        return Ok(());
+    }
+    // SAFETY: the descriptor is open, and no pointer crosses the call
+    let status = unsafe { libc::ftruncate(descriptor, end.0 as libc::off_t) };
+    if status != 0 {
+        return Err(Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Give a range's blocks back to the disk
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(reel_plain_unix)))]
 pub fn free_descriptor_range(descriptor: RawFd, offset: FileOffset, length: ByteCount) -> Result<()> {
     let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
     // SAFETY: the descriptor is open, and no pointer crosses the call
@@ -219,7 +234,7 @@ pub fn free_descriptor_range(descriptor: RawFd, offset: FileOffset, length: Byte
 }
 
 /// Give a range's blocks back to the disk
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(target_vendor = "apple", not(reel_plain_unix)))]
 pub fn free_descriptor_range(descriptor: RawFd, offset: FileOffset, length: ByteCount) -> Result<()> {
     let mut range = libc::fpunchhole_t {
         fp_flags: 0,
@@ -235,8 +250,14 @@ pub fn free_descriptor_range(descriptor: RawFd, offset: FileOffset, length: Byte
     Ok(())
 }
 
+/// Say a range's blocks can't go back, on a unix with no hole punch, so space comes back only when a segment goes
+#[cfg(any(reel_plain_unix, not(any(target_os = "linux", target_vendor = "apple"))))]
+pub fn free_descriptor_range(_descriptor: RawFd, _offset: FileOffset, _length: ByteCount) -> Result<()> {
+    Err(Error::from(ErrorKind::Unsupported))
+}
+
 /// Make a file's writes reach the disk
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(reel_plain_unix)))]
 pub fn sync_descriptor(descriptor: RawFd) -> Result<()> {
     // SAFETY: the descriptor is open, and no pointer crosses the call
     let status = unsafe { libc::fdatasync(descriptor) };
@@ -247,10 +268,21 @@ pub fn sync_descriptor(descriptor: RawFd) -> Result<()> {
 }
 
 /// Make a file's writes reach the disk, which on macOS takes a full flush
-#[cfg(target_os = "macos")]
+#[cfg(all(target_vendor = "apple", not(reel_plain_unix)))]
 pub fn sync_descriptor(descriptor: RawFd) -> Result<()> {
     // SAFETY: the descriptor is open, and no pointer crosses the call
     let status = unsafe { libc::fcntl(descriptor, libc::F_FULLFSYNC) };
+    if status != 0 {
+        return Err(Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Make a file's writes reach the disk, on a unix with neither of the calls above
+#[cfg(any(reel_plain_unix, not(any(target_os = "linux", target_vendor = "apple"))))]
+pub fn sync_descriptor(descriptor: RawFd) -> Result<()> {
+    // SAFETY: the descriptor is open, and no pointer crosses the call
+    let status = unsafe { libc::fsync(descriptor) };
     if status != 0 {
         return Err(Error::last_os_error());
     }
@@ -311,7 +343,7 @@ pub fn descriptor_stats(descriptor: RawFd) -> Result<libc::stat> {
 }
 
 /// Reserve a new file's space, so a full disk fails here and never during a write
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(reel_plain_unix)))]
 pub fn reserve_space(file: &File, length: ByteCount) -> Result<()> {
     // SAFETY: the descriptor is open, and no pointer crosses the call
     let status = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, length.0 as libc::off_t) };
@@ -322,7 +354,7 @@ pub fn reserve_space(file: &File, length: ByteCount) -> Result<()> {
 }
 
 /// Reserve a new file's space, so a full disk fails here and never during a write
-#[cfg(target_os = "macos")]
+#[cfg(all(target_vendor = "apple", not(reel_plain_unix)))]
 pub fn reserve_space(file: &File, length: ByteCount) -> Result<()> {
     let mut store = libc::fstore_t {
         fst_flags: libc::F_ALLOCATEALL,
@@ -338,6 +370,12 @@ pub fn reserve_space(file: &File, length: ByteCount) -> Result<()> {
         return Err(Error::last_os_error());
     }
     file.set_len(length.0)
+}
+
+/// Size a new file, on a unix with no call that reserves its blocks: a full disk then shows at a write
+#[cfg(any(reel_plain_unix, not(any(target_os = "linux", target_vendor = "apple"))))]
+pub fn reserve_space(file: &File, length: ByteCount) -> Result<()> {
+    reserve_descriptor_to(file.as_raw_fd(), length)
 }
 
 /// Start a range's dirty pages for the device

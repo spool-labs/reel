@@ -630,5 +630,6 @@ fn a_large_reader_keeps_its_sizes() {
         sizing.least_budget.0,
         shape.fixed_bytes().0,
     ];
-    assert_eq!(found, [1073741824, 2497564, 302371802, 302371802, 302371802, 151185901, 151185901, 39269632, 29308160]);
+    // 11-16: a reader plans no record windows, 3,145,728 B at 16 slots, which the shares take by their sixteenths
+    assert_eq!(found, [1073741824, 2501276, 302821192, 302821192, 302821192, 151410596, 151410596, 36123904, 26162432]);
 }

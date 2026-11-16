@@ -1302,6 +1302,8 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
     let open_slots = sizing.shard.open_slots;
     // a reader writes no group, so its slots hold no queue and no spare
     let group_bytes = if sizing.is_read_only { ByteCount(0) } else { GROUP_BYTES };
+    // nor does it fill a record window, so its windows hold no buffer
+    let window_bytes = if sizing.is_read_only { 0 } else { RECORD_WINDOW_BYTES };
     let mut volumes = Vec::with_capacity(config.volumes.len());
     let all_row_room = config.volumes.len() * MOST_ROW_FIXED_BYTES + config.columns.len() * MOST_ROW_COLUMN_BYTES;
     let mut summaries = summaries.into_iter();
@@ -1323,8 +1325,8 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
     for slot in 0..open_slots {
         queues.push(Mutex::new(RowQueue::new(group_bytes)));
         spare_groups.push(Mutex::new((!sizing.is_read_only).then(|| RowGroupBuffer::new(GROUP_BYTES))));
-        windows.push([RecordWindow::new(), RecordWindow::new()]);
-        window_copies.push(Mutex::new(touched_zeroes(RECORD_WINDOW_BYTES)));
+        windows.push([RecordWindow::with_bytes(window_bytes), RecordWindow::with_bytes(window_bytes)]);
+        window_copies.push(Mutex::new(touched_zeroes(window_bytes)));
         slot_files.push(SlotFile::new());
         free_slots.push(OpenSlot((open_slots - 1 - slot) as u8));
     }

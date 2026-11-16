@@ -280,7 +280,8 @@ impl StoreShape {
         // a reader takes in open rows through no queue and writes no group
         let queues = if self.is_read_only { 0 } else { (self.open_slots() as u64 * 2 + counts.write_buffers as u64) * GROUP_BYTES.0 };
         let gathers = counts.write_buffers as u64 * GATHER_BYTES as u64;
-        let windows = self.open_slots() as u64 * 3 * RECORD_WINDOW_BYTES as u64;
+        // a reader fills no record window
+        let windows = if self.is_read_only { 0 } else { self.open_slots() as u64 * 3 * RECORD_WINDOW_BYTES as u64 };
         let ring = if self.has_ring { (RING_SLOTS * RING_SLOT_BYTES) as u64 + RING_READS as u64 * RING_READ_BYTES } else { 0 };
         let reads = counts.read_buffers as u64 * READ_BUFFER_BYTES + ring;
         // each planner and each worker holds one footer reader of the job pool at a time, so none waits on a caller's

@@ -719,8 +719,9 @@ impl<Backend: Io> EngineState<Backend> {
         want: RecordWant,
         buf: &mut Vec<u8>,
     ) -> Result<Option<RecordRead>, StoreError> {
+        // a reader writes nothing, so no record of its own sits in a window
         let length = row.length.0 as usize;
-        if length > MOST_WINDOW_RECORD_BYTES {
+        if self.is_read_only || length > MOST_WINDOW_RECORD_BYTES {
             return Ok(None);
         }
 

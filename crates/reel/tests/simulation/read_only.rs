@@ -162,6 +162,8 @@ fn changes_nothing() {
     assert!(state.spare_groups.iter().all(|group| hold(group).is_none()));
     assert_eq!(viewer.memory_report().maintenance_workers, 0);
     assert!(viewer.memory_report().is_read_only && !store.memory_report().is_read_only);
+    // a reader fills no record window, so its slots hold none
+    assert_eq!(viewer.memory_report().queues, ByteCount(0));
     assert_eq!(keys(&viewer).len(), KEYS as usize);
     viewer.close().expect("close");
 
@@ -442,5 +444,5 @@ fn open_rows_past_the_budget_refuse_the_view() {
 // keys a writer has out once it has added more past the first ones
 const GROWN_KEYS: u64 = 20_000;
 // open rows past what a view's write index holds at BUDGET, from a writer that holds them all unsealed
-const MANY_KEYS: u64 = 200_000;
+const MANY_KEYS: u64 = 400_000;
 const WRITER_BUDGET: u64 = 512 * 1024 * 1024;

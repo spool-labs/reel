@@ -108,10 +108,15 @@ pub struct RecordWindow {
 }
 
 impl RecordWindow {
-    /// Allocate a window with no range yet
+    /// Allocate a window of RECORD_WINDOW_BYTES with no range yet
     pub fn new() -> Self {
-        let mut bytes = Vec::with_capacity(RECORD_WINDOW_BYTES);
-        for _byte in 0..RECORD_WINDOW_BYTES {
+        Self::with_bytes(RECORD_WINDOW_BYTES)
+    }
+
+    /// Allocate a window of this many bytes with no range yet. A reader's windows take none, since it writes nothing
+    pub fn with_bytes(length: usize) -> Self {
+        let mut bytes = Vec::with_capacity(length);
+        for _byte in 0..length {
             bytes.push(AtomicU8::new(TOUCH_BYTE));
         }
         Self {

@@ -3,7 +3,7 @@
 use reel_core::units::{ByteCount, RowCount};
 
 use crate::config::{MOST_VOLUME_SLOTS, ThreadCounts, default_workers};
-use crate::engine::open_segment::RECORD_WINDOW_BYTES;
+
 use crate::engine::read_pool::{READ_SLOTS, SLOT_KEY_BYTES, SLOT_KEYS};
 use crate::engine::seal_job::MOST_SEGMENT_BLOCKS;
 use crate::engine::scan_state::{MOST_SCANS, planned_scan_bytes};
@@ -204,6 +204,8 @@ pub struct StoreShape {
     pub declared_bytes: ByteCount,
     /// A reader that writes nothing: no write buffers, no encoders, no jobs past its read threads
     pub is_read_only: bool,
+    /// The bytes of each record window: RECORD_WINDOW_BYTES, or a share of the smallest set segment size when every volume sets one
+    pub window_bytes: usize,
 }
 
 /// What a budget buys
@@ -224,6 +226,7 @@ pub struct EngineSizing {
     pub room: ByteCount,
     pub entry_line: ByteCount,
     pub counts: Counts,
+    pub window_bytes: usize,
     pub is_read_only: bool,
 }
 
@@ -281,7 +284,7 @@ impl StoreShape {
         let queues = if self.is_read_only { 0 } else { (self.open_slots() as u64 * 2 + counts.write_buffers as u64) * GROUP_BYTES.0 };
         let gathers = counts.write_buffers as u64 * GATHER_BYTES as u64;
         // a reader fills no record window
-        let windows = if self.is_read_only { 0 } else { self.open_slots() as u64 * 3 * RECORD_WINDOW_BYTES as u64 };
+        let windows = if self.is_read_only { 0 } else { self.open_slots() as u64 * 3 * self.window_bytes as u64 };
         let ring = if self.has_ring { (RING_SLOTS * RING_SLOT_BYTES) as u64 + RING_READS as u64 * RING_READ_BYTES } else { 0 };
         let reads = counts.read_buffers as u64 * READ_BUFFER_BYTES + ring;
         // each planner and each worker holds one footer reader of the job pool at a time, so none waits on a caller's
@@ -362,6 +365,7 @@ impl EngineSizing {
             entry_line: shape.entry_line(),
             counts: shape.counts(),
             is_read_only: shape.is_read_only,
+            window_bytes: shape.window_bytes,
         }
     }
 

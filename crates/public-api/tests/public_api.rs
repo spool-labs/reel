@@ -559,3 +559,28 @@ fn the_least_budget_needs_no_trial_open() -> Result<(), Box<dyn std::error::Erro
 
 // a config built on a root
 type Shape = Box<dyn Fn(PathBuf) -> StoreConfig>;
+
+// a finished store of a few KB on 256 KiB segments holds its rows in one small record window and the footer, with nothing reserved
+#[test]
+fn a_finished_small_store_holds_little_past_its_rows() -> Result<(), Box<dyn std::error::Error>> {
+    let root = scratch_root().with_extension("finished-small");
+    let _gone = std::fs::remove_dir_all(&root);
+    let mut small = config(root.clone());
+    small.volumes[0].segment_bytes = Some(ByteCount(256 * 1024));
+    let store = ReelStore::open(PlainIo::new(), &small)?;
+    for number in 0..64_u32 {
+        store.put(COLUMN, format!("key-{number:03}").as_bytes(), &[3_u8; 64])?;
+    }
+    store.finish()?;
+    drop(store);
+    let mut files = Vec::new();
+    files_under(&root, &mut files)?;
+    let data: Vec<_> = files.iter().filter(|(path, _length, _held)| path.to_string_lossy().ends_with(".data")).collect();
+    let length: u64 = data.iter().map(|(_path, length, _held)| *length).sum();
+    let held: u64 = data.iter().map(|(_path, _length, held)| *held).sum();
+    println!("{} data files, {length} B long, {held} B held, for 64 rows of 64 B", data.len());
+    // one data file of the rows in an 8 KiB window and the footer's fixed parts, which a segment of any size carries
+    assert!(data.len() == 1 && length <= 176 * 1024 && held <= length.next_multiple_of(4_096), "{data:?}");
+    std::fs::remove_dir_all(&root)?;
+    Ok(())
+}

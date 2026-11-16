@@ -13,7 +13,7 @@ use crate::engine::claim::Claim;
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::engine_state::EngineState;
 use crate::engine::open_segment::{
-    MOST_WINDOW_RECORD_BYTES, RECORD_WINDOW_BYTES, SegmentPhase,
+    MOST_WINDOW_RECORD_BYTES, SegmentPhase,
 };
 use crate::engine::volume::Volume;
 use crate::guard::hold;
@@ -231,7 +231,7 @@ impl<Backend: Io> EngineState<Backend> {
             return WindowSwitch::OtherBusy;
         }
         let left = volume.segment_bytes.0.saturating_sub(segment.write_end.0) as usize;
-        let room = left.min(RECORD_WINDOW_BYTES);
+        let room = left.min(self.sizing.window_bytes);
         if room < length {
             return WindowSwitch::NoRoom;
         }

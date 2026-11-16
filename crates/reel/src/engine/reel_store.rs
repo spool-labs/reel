@@ -34,7 +34,7 @@ use crate::engine::engine_sizing::{
     dead_bits_bytes, segment_bytes_for, target_rows, IndexAsk, index_ask, index_cap, is_index_exact, share_indexes,
 };
 use crate::engine::engine_state::{EngineState, PLACE_RUN, SEGMENT_NUMBER_BATCH, SlotFile};
-use crate::engine::open_segment::{RECORD_WINDOW_BYTES, RecordWindow, RowQueue, SegmentPhase, fits_a_segment_path, reserve_step, set_reserve_step};
+use crate::engine::open_segment::{RecordWindow, RowQueue, SegmentPhase, fits_a_segment_path, reserve_step, set_reserve_step, window_bytes_for};
 use crate::engine::ration::Ration;
 use crate::engine::ring_job::RingReaper;
 use crate::engine::read_only::{close_read_only, load_read_only};
@@ -876,6 +876,7 @@ pub fn store_shape(config: &StoreConfig, has_ring: bool, disks: &[Option<ByteCou
         workers: None,
         declared_bytes: declared_index_bytes(config),
         is_read_only: false,
+        window_bytes: window_bytes_for(config.volumes.iter().map(|volume| volume.segment_bytes.map(|bytes| bytes.0)).collect::<Option<Vec<u64>>>().and_then(|sizes| sizes.into_iter().min())),
     };
     // a segment's rows come from the shares, so the disks ask at the rows a plan with no line of theirs gives
     let rows = EngineSizing::for_store(&bare.with_workers_settled()).segment_rows;
@@ -1319,7 +1320,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
     // a reader writes no group, so its slots hold no queue and no spare
     let group_bytes = if sizing.is_read_only { ByteCount(0) } else { GROUP_BYTES };
     // nor does it fill a record window, so its windows hold no buffer
-    let window_bytes = if sizing.is_read_only { 0 } else { RECORD_WINDOW_BYTES };
+    let window_bytes = if sizing.is_read_only { 0 } else { sizing.window_bytes };
     let mut volumes = Vec::with_capacity(config.volumes.len());
     let all_row_room = config.volumes.len() * MOST_ROW_FIXED_BYTES + config.columns.len() * MOST_ROW_COLUMN_BYTES;
     let mut summaries = summaries.into_iter();

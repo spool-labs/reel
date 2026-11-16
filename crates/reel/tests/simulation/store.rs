@@ -1606,3 +1606,30 @@ fn a_declared_least_value_leaves_the_cap() {
     }
     store.close().expect("close");
 }
+
+// a store of 256 KiB segments takes 8 KiB record windows, so a finished segment of a few KB of rows holds one small window of data
+#[test]
+fn a_small_segment_holds_a_small_window() {
+    let io = SimulatedIo::new(Seed(150));
+    let mut small = config(SyncPolicy::Never);
+    small.volumes[0].segment_bytes = Some(ByteCount(256 * 1024));
+    let store = ReelStore::open(io.clone(), &small).expect("open");
+    for number in 0..64_u32 {
+        store.put(COLUMN, format!("key-{number:03}").as_bytes(), &[3_u8; 64]).expect("put");
+    }
+    std::thread::scope(|scope| {
+        let finishing = scope.spawn(|| store.finish());
+        while !finishing.is_finished() {
+            if io.step_any().is_none() {
+                io.advance_clock(Nanoseconds(1_000_000));
+            }
+        }
+        finishing.join().expect("thread").expect("finish");
+    });
+    let store = ReelStore::open(io.clone(), &small).expect("reopen");
+    for row in hold(&store.state.volumes[0].summary).rows() {
+        let facts = &row.facts;
+        assert_eq!(facts.data_end, reel_core::units::FileOffset(8 * 1024), "segment {:?}: {:?}", facts.segment, facts.file_length);
+    }
+    store.close().expect("close");
+}

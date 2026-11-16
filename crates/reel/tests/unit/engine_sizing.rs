@@ -48,6 +48,7 @@ fn shape(budget: ByteCount, roots: usize) -> StoreShape {
         workers: None,
         declared_bytes: ByteCount(0),
         is_read_only: false,
+        window_bytes: reel::engine::open_segment::RECORD_WINDOW_BYTES,
     }
 }
 
@@ -80,6 +81,7 @@ fn documented_rows() {
             workers: None,
             declared_bytes: ByteCount(0),
             is_read_only: false,
+            window_bytes: reel::engine::open_segment::RECORD_WINDOW_BYTES,
         };
 
         assert_eq!(EngineSizing::for_store(&store).segment_rows, RowCount(rows), "{mib} MiB");
@@ -104,6 +106,7 @@ fn summary_holds_blocks() {
         workers: None,
         declared_bytes: ByteCount(0),
         is_read_only: false,
+        window_bytes: reel::engine::open_segment::RECORD_WINDOW_BYTES,
     };
     let rows_room = EngineSizing::for_store(&store).summary_share.0 / 2;
     let blocks = 1_000_000_000 / ROWS_PER_BLOCK;
@@ -131,6 +134,7 @@ fn documented_reserve() {
             workers: None,
             declared_bytes: ByteCount(0),
             is_read_only: false,
+            window_bytes: reel::engine::open_segment::RECORD_WINDOW_BYTES,
         };
 
         let segment = EngineSizing::for_store(&store).segment_bytes;

@@ -121,40 +121,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
-name = "reel"
-version = "0.4.0"
-dependencies = [
- "io-uring",
- "libc",
- "lz4-sys",
- "reel-core",
- "xxhash-rust",
-]
-
-[[package]]
-name = "reel-core"
-version = "0.4.0"
-dependencies = [
- "thiserror",
-]
-
-[[package]]
 name = "reel-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
- "reel",
- "reel-core",
- "reel-sim",
-]
-
-[[package]]
-name = "reel-sim"
-version = "0.4.0"
-dependencies = [
- "libc",
- "reel",
- "reel-core",
+ "tape-reel",
+ "tape-reel-core",
+ "tape-reel-sim",
 ]
 
 [[package]]
@@ -172,6 +145,33 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "tape-reel"
+version = "0.4.0"
+dependencies = [
+ "io-uring",
+ "libc",
+ "lz4-sys",
+ "tape-reel-core",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "tape-reel-core"
+version = "0.4.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "tape-reel-sim"
+version = "0.4.0"
+dependencies = [
+ "libc",
+ "tape-reel",
+ "tape-reel-core",
 ]
 
 [[package]]

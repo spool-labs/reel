@@ -469,7 +469,7 @@ fn a_grant_under_the_pool_floor_builds_no_index() {
     }
 }
 
-// every size a large store gets, at the bench budgets with the ring and eight workers, held at the values the bench rows ran
+// every size a large store gets, at the bench budgets with the ring and 8 or 32 workers (the box runs 32), held at the values the bench rows ran
 // with: the fixed parts may move a small store's sizes and never these
 #[test]
 fn large_stores_keep_their_sizes() {
@@ -478,10 +478,10 @@ fn large_stores_keep_their_sizes() {
     use reel::engine::scan_state::{MOST_SCANS, planned_scan_bytes};
     const GIB: u64 = 1024 * 1024 * 1024;
     let mut found = Vec::new();
-    for budget in [2 * GIB, 4 * GIB, 8 * GIB] {
+    for (budget, workers) in [8, 32].into_iter().flat_map(|workers| [2 * GIB, 4 * GIB, 8 * GIB].map(|budget| (budget, workers))) {
         let config = StoreConfig {
             memory_budget: ByteCount(budget),
-            threads: ThreadCounts { maintenance_workers: Some(8), ..ThreadCounts::default() },
+            threads: ThreadCounts { maintenance_workers: Some(workers), ..ThreadCounts::default() },
             volumes: vec![VolumeConfig::new("kv", vec![PathBuf::from("/nonexistent/large")], SyncPolicy::Never)],
             columns: vec![ColumnConfig {
                 id: ColumnId(1),
@@ -520,9 +520,12 @@ fn large_stores_keep_their_sizes() {
 }
 
 // segment bytes, segment rows, the spot, block, record, summary and table shares, the least budget, the fixed bytes, the scan
-// room, the caches after the sorted index's share, and the index's asked bytes, got bytes and rows, at 2, 4 and 8 GiB
-const LARGE_STORE_SIZES: [[u64; 14]; 3] = [
+// room, the caches after the sorted index's share, and the index's asked bytes, got bytes and rows, at 2, 4 and 8 GiB with 8 workers, then 32
+const LARGE_STORE_SIZES: [[u64; 14]; 6] = [
     [1073741824, 2403846, 291025766, 291025766, 291025766, 145512883, 145512883, 118691884, 108206124, 11433216, 145513010, 826335232, 727564288, 13047000],
     [1073741824, 4937850, 597809144, 597809144, 597809144, 298904572, 298904572, 118691884, 108206124, 11433216, 967092200, 826335232, 826335232, 14820750],
     [1073741824, 10005858, 1211375902, 1211375902, 1211375902, 605687951, 605687951, 118691884, 108206124, 11433216, 2807792474, 826335232, 826335232, 14820750],
+    [1073741824, 2237645, 270904372, 270904372, 270904372, 135452186, 135452186, 259541644, 249055884, 11433216, 135455900, 826335232, 677257216, 12143550],
+    [1073741824, 4771649, 577687750, 577687750, 577687750, 288843875, 288843875, 259541644, 249055884, 11433216, 906728018, 826335232, 826335232, 14820750],
+    [1073741824, 9839656, 1191254508, 1191254508, 1191254508, 595627254, 595627254, 259541644, 249055884, 11433216, 2747428292, 826335232, 826335232, 14820750],
 ];

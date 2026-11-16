@@ -8,6 +8,7 @@
 //! The save and the read both go through the one chunk `ImageFiles` holds from open, so neither allocates
 
 use std::io::{Error, ErrorKind, Result};
+use std::path::Path;
 
 use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, FileOffset};
@@ -301,4 +302,16 @@ const _: () = assert!(IMAGE_CHUNK_BYTES.is_multiple_of(PAGE_BYTES));
 /// Read the newest place any segment the summary lists holds
 fn newest_listed(rows: &crate::segment::summary::SummaryRows) -> u64 {
     rows.orders().present().iter().filter_map(|number| rows.get(*number)).map(|row| row.facts.places.highest.0).max().unwrap_or(0)
+}
+
+/// Read the entries and the saved pages a column's image holds, from its head alone, or nothing when no image reads as one
+pub fn sorted_image_size<Backend: Io>(io: &Backend, root: &Path, column: ColumnId) -> Option<(u64, u32)> {
+    let file = io.open_read_only(&root.join(format!("sorted-{}.image", column.0))).ok()?;
+    let mut head = [0_u8; SORTED_HEAD_WORDS * size_of::<u64>()];
+    let read = file.read_exact_at(FileOffset(0), &mut head);
+    io.close_file(file);
+    read.ok()?;
+    let word = |index: usize| read_word(&head, index * size_of::<u64>());
+    let is_image = word(0)? == SORTED_IMAGE_MAGIC && word(1)? == u64::from(column.0);
+    is_image.then_some((word(7)?, u32::try_from(word(4)?).ok()?))
 }

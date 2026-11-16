@@ -571,6 +571,9 @@ pub struct SortedReading {
     pub capacity: RowCount,
     pub rows_past_capacity: RowCount,
     pub is_marked: bool,
+    /// The bytes its sizing rule asked of the caches at open, and the bytes it got under the cap
+    pub asked_bytes: ByteCount,
+    pub got_bytes: ByteCount,
 }
 
 /// How a column that declares a least value stands: the values written under it since open, which land as any other and size

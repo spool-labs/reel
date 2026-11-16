@@ -18,7 +18,6 @@ use reel::record::codec::Codec;
 use reel::engine::store_scan::StoreScan;
 use reel::{ScanRange, from_key};
 use reel_api::column_id::ColumnId;
-use reel_api::store_error::StoreError;
 use reel_api::direction::Direction;
 use reel_api::scan::ScanStep;
 use reel_api::maintenance_report::MaintenanceReport;
@@ -54,13 +53,14 @@ const MERGE_KEYS: u64 = 15_000;
 const CUE_ROUNDS: u64 = 3;
 const COVERED: usize = 40;
 const LATE_KEYS: u64 = 100_000;
-const SPOT_CEILING: ByteCount = ByteCount(1024 * 1024);
 
 type Store = ReelStore<SimulatedIo>;
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
 type Rows = Vec<(Vec<u8>, Vec<u8>)>;
 
+// every store these sims open gives its index exactly the rows it declared, so a small one fills and marks
 fn config(capacity: RowCount) -> StoreConfig {
+    reel::engine::engine_sizing::EXACT_INDEX_ROWS.with(|exact| exact.set(true));
     StoreConfig {
         memory_budget: BUDGET,
         threads: crate::shape::threads(),
@@ -819,28 +819,23 @@ fn writes_between_batches_show() {
     store.close().expect("close");
 }
 
-// a store whose declared index is past its budget is refused at open, and the error names the least budget it needs
+// an index declared past the budget opens with what the cap gives it, and the report says it asked for more than it got
 #[test]
-fn an_index_past_the_budget_is_refused() {
+fn an_index_past_the_budget_is_capped() {
     let io = SimulatedIo::new(Seed(12));
     let rows = RowCount(50_000_000);
-    match ReelStore::open(io.clone(), &config(rows)) {
-        Err(StoreError::BudgetTooSmall { budget, least }) => {
-            assert_eq!(budget, BUDGET);
-            assert!(least.0 > budget.0 + reel::index::sorted_keys::planned_index_bytes(WIDTH as usize, rows).0 / 2, "least {least:?}");
-        },
-        Err(error) => panic!("refused for {error:?}"),
-        Ok(_store) => panic!("opened with an index past its budget"),
-    }
+    let store = ReelStore::open(io.clone(), &config(rows)).expect("open");
+    let reading = report(&store).sorted_columns.iter().find(|reading| reading.column == COLUMN).copied().expect("a reading");
+    assert!(reading.asked_bytes > reading.got_bytes, "{reading:?}");
+    assert!(reading.capacity < rows, "{reading:?}");
+    store.close().expect("close");
 }
-
-// a store whose only column is sorted gives the spot cache no share, and a cue behind the newest sealed rows reads its own
-// values through the footers while gets at the tip go by the index
+// a store whose only column is sorted reads at a cue behind the newest sealed rows through the footers, while gets at the tip go
+// by the index
 #[test]
 fn an_all_sorted_store_reads_at_a_cue() {
     let io = SimulatedIo::new(Seed(13));
     let store = open(&io, CAPACITY);
-    assert!(store.memory_report().spot_cache.0 < SPOT_CEILING.0, "the spot cache took a share");
     for number in 0..KEYS {
         store.put(COLUMN, &key(number), b"first").expect("put");
     }
@@ -2046,5 +2041,65 @@ fn an_untold_scan_grows_its_batch_with_its_rows() {
         assert_eq!(taken, expected, "{rows} rows");
         assert!(located <= most, "{rows} rows located {located} keys, past {most}");
     }
+    store.close().expect("close");
+}
+
+// open a store whose index the store sizes from the keys it held, with no declared count
+fn open_sized(io: &SimulatedIo) -> Store {
+    let mut config = config(RowCount(0));
+    reel::engine::engine_sizing::EXACT_INDEX_ROWS.with(|exact| exact.set(false));
+    config.columns[0].sorted_rows = Some(RowCount(0));
+    ReelStore::open(io.clone(), &config).expect("open")
+}
+
+fn sorted_reading(store: &Store) -> reel_api::maintenance_report::SortedReading {
+    report(store).sorted_columns.iter().find(|reading| reading.column == COLUMN).copied().expect("a reading")
+}
+
+// the bytes a sorted index asks for at open: twice the keys with the headroom past them
+fn asked_for(keys: u64) -> ByteCount {
+    use reel::engine::engine_sizing::{INDEX_GROWTH, INDEX_HEADROOM};
+    ByteCount(reel::index::sorted_keys::planned_index_bytes(WIDTH as usize, RowCount(keys * INDEX_GROWTH)).0 + INDEX_HEADROOM.0)
+}
+
+// an empty index asks for its whole part of the cap, a clean close and open asks by the image's keys, and an open after a kill
+// asks by the rows on disk, overwrites and all. Every answer matches the model
+#[test]
+fn a_sorted_index_is_sized_by_the_keys_it_held() {
+    let io = SimulatedIo::new(Seed(202));
+    let store = open_sized(&io);
+    // no merge drops an overwrite, so the rows on disk stay twice the keys
+    store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
+    let empty = sorted_reading(&store);
+    // an empty index takes its whole part, rounded down to the pages its pool holds
+    assert!(empty.got_bytes <= empty.asked_bytes && empty.got_bytes.0 >= empty.asked_bytes.0 / 10 * 9, "{empty:?}");
+    let mut model = Model::new();
+    for round in 0..2 {
+        for number in 0..KEYS {
+            let value = format!("{round}-{number}").into_bytes();
+            store.put(COLUMN, &key(number), &value).expect("put");
+            model.insert(key(number), value);
+        }
+        seal_all(&store, &io);
+    }
+    let written: Vec<Vec<u8>> = (0..KEYS).map(key).collect();
+    check(&store, &model, &written);
+    store.close().expect("close");
+    drop(store);
+
+    let store = open_sized(&io);
+    store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
+    let clean = sorted_reading(&store);
+    assert_eq!(clean.asked_bytes, asked_for(KEYS), "{clean:?}");
+    assert!(clean.got_bytes <= clean.asked_bytes && clean.capacity.0 >= KEYS, "{clean:?}");
+    check(&store, &model, &written);
+    store.flush().expect("flush");
+    io.kill();
+    drop(store);
+
+    let store = open_sized(&io);
+    let killed = sorted_reading(&store);
+    assert_eq!(killed.asked_bytes, asked_for(KEYS * 2), "the rows on disk hold every overwrite: {killed:?}");
+    check(&store, &model, &written);
     store.close().expect("close");
 }

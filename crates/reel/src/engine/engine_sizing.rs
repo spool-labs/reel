@@ -8,6 +8,7 @@ use crate::engine::read_pool::{READ_SLOTS, SLOT_KEY_BYTES, SLOT_KEYS};
 use crate::engine::seal_job::MOST_SEGMENT_BLOCKS;
 use crate::engine::scan_state::{MOST_SCANS, planned_scan_bytes};
 use crate::index::entry_slab::{PAGE_BYTES, PageCount};
+use crate::index::sorted_keys::planned_index_bytes;
 use crate::index::node_pool::{NODE_FANOUT, NodeCount};
 use crate::index::open_slots::MAX_OPEN_SLOTS;
 use crate::io::ring::{RING_READ_BYTES, RING_READS, RING_SLOT_BYTES, RING_SLOTS};
@@ -43,6 +44,12 @@ pub const BLOCK_CACHE_SIXTEENTHS: u64 = 2;
 pub const RECORD_CACHE_SIXTEENTHS: u64 = 2;
 /// Times the filters of the rows on disk at open the arena may hold, room for the store to grow. A starting value, tuned at the end
 pub const ARENA_GROWTH: u64 = 2;
+/// Times the keys a sorted index held at open it asks room for, so the store grows until the next open with no mark
+pub const INDEX_GROWTH: u64 = 2;
+/// Bytes a sorted index asks for past its grown keys, so a small index never sits at twice a small count
+pub const INDEX_HEADROOM: ByteCount = ByteCount(256 * 1024 * 1024);
+/// Quarters of the spot, block and record caches they keep however much the sorted indexes ask, and the rest is the indexes' cap
+pub const CACHE_FLOOR_QUARTERS: u64 = 1;
 /// Rows a fresh store holds dead bits and filters for before its segments start going without. A missing bit asks and a
 /// missing filter reads through the cache, so past it every answer stays right and takes the slow path, which the report
 /// shows. A starting value, tuned at the end
@@ -171,8 +178,6 @@ pub struct StoreShape {
     pub workers: Option<usize>,
     /// The heap the declared indexes hold: complete tables with their block lines, and sorted indexes. The budget pays for them
     pub declared_bytes: ByteCount,
-    /// Every column declares a sorted index, so no get reads the spot cache and no scan the row cache
-    pub is_all_sorted: bool,
 }
 
 /// What a budget buys
@@ -283,14 +288,8 @@ impl EngineSizing {
         let budget = shape.budget;
         // the room and the entries come out before the shares
         let shared = budget.0.saturating_sub(shape.fixed_bytes().0 + shape.room().0 + shape.entry_line().0);
-        let (mut spot_share, mut cache_share) = (share_of(shared, SPOT_SIXTEENTHS), share_of(shared, BLOCK_CACHE_SIXTEENTHS));
-        let mut index_share = share_of(shared, WRITE_INDEX_SIXTEENTHS);
-        // a store whose every column is sorted reads no spot cache, and its row cache serves walks, merges and fallbacks, so the
-        // write index takes the spot share and all of the cache share past a quarter
-        if shape.is_all_sorted {
-            index_share += spot_share + cache_share - cache_share / 4;
-            (spot_share, cache_share) = (0, cache_share / 4);
-        }
+        let (spot_share, cache_share) = (share_of(shared, SPOT_SIXTEENTHS), share_of(shared, BLOCK_CACHE_SIXTEENTHS));
+        let index_share = share_of(shared, WRITE_INDEX_SIXTEENTHS);
         let rows_total = index_share / PLANNED_ROW_BYTES;
         Self {
             segment_bytes: segment_bytes_for(budget),
@@ -486,4 +485,62 @@ pub fn split_idle_room(cache_room: u64, stripe: u64, base_rows: u64, row_block_b
         to_rows,
         to_records: idle - to_rows,
     }
+}
+
+/// What one sorted index asks of the caches: its bytes, or its whole part of the cap for an empty index with no least rows
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IndexAsk {
+    Bytes(ByteCount),
+    Part,
+}
+
+/// Work out a sorted index's ask: the keys it held at open times the growth with the headroom past them, at least its least
+/// rows, and never less than the pages its image saved, so the image loads
+pub fn index_ask(width: usize, keys: u64, least_rows: Option<RowCount>, saved: ByteCount) -> IndexAsk {
+    if keys == 0 && least_rows.is_none() && saved.0 == 0 {
+        return IndexAsk::Part;
+    }
+    let rows = keys.saturating_mul(INDEX_GROWTH).max(least_rows.map_or(0, |least| least.0));
+    IndexAsk::Bytes(ByteCount((planned_index_bytes(width, RowCount(rows)).0 + INDEX_HEADROOM.0).max(saved.0)))
+}
+
+/// Read the sorted indexes' cap: the spot, block and record caches past the floor they keep
+pub const fn index_cap(caches: u64) -> u64 {
+    caches - caches / 4 * CACHE_FLOOR_QUARTERS
+}
+
+/// Share the cap among the asks: each its ask while they fit, and each the same fraction of its ask past it. An empty index's
+/// part is the cap over the indexes
+pub fn share_indexes(asks: &[IndexAsk], cap: u64) -> Vec<u64> {
+    let part = cap / asks.len().max(1) as u64;
+    let wanted: Vec<u64> = asks
+        .iter()
+        .map(|ask| match ask {
+            IndexAsk::Bytes(bytes) => bytes.0,
+            IndexAsk::Part => part,
+        })
+        .collect();
+    let total: u64 = wanted.iter().sum();
+    if total <= cap {
+        return wanted;
+    }
+    wanted.iter().map(|bytes| (u128::from(*bytes) * u128::from(cap) / u128::from(total)) as u64).collect()
+}
+
+#[cfg(feature = "test-hooks")]
+thread_local! {
+    /// A sim on its own thread sets this to give each sorted index exactly the rows it declared, so a small one fills and marks
+    pub static EXACT_INDEX_ROWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Read whether this thread's stores give each sorted index exactly the rows it declared
+#[cfg(feature = "test-hooks")]
+pub fn is_index_exact() -> bool {
+    EXACT_INDEX_ROWS.with(std::cell::Cell::get)
+}
+
+/// Read whether this thread's stores give each sorted index exactly the rows it declared, which no node build does
+#[cfg(not(feature = "test-hooks"))]
+pub const fn is_index_exact() -> bool {
+    false
 }

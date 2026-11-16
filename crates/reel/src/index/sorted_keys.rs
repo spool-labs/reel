@@ -1480,3 +1480,17 @@ pub fn planned_pages(width: usize, rows: RowCount) -> u32 {
 pub fn planned_index_bytes(width: usize, rows: RowCount) -> ByteCount {
     ByteCount(u64::from(planned_pages(width, rows)) * (PAGE_WORDS * size_of::<AtomicU32>()) as u64)
 }
+
+/// Work out the most rows of keys this wide an index holds in these bytes, as `SortedKeys::new` sizes it
+pub fn rows_for_bytes(width: usize, bytes: ByteCount) -> RowCount {
+    let (mut low, mut high) = (0_u64, 1_u64 << 40);
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if planned_index_bytes(width, RowCount(middle)).0 <= bytes.0 {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    RowCount(low)
+}

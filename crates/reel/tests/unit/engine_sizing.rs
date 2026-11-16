@@ -45,7 +45,6 @@ fn shape(budget: ByteCount, roots: usize) -> StoreShape {
         floor_entry_bytes: ByteCount(0),
         workers: None,
         declared_bytes: ByteCount(0),
-        is_all_sorted: false,
     }
 }
 
@@ -75,7 +74,6 @@ fn documented_rows() {
             floor_entry_bytes: ByteCount(0),
             workers: None,
             declared_bytes: ByteCount(0),
-            is_all_sorted: false,
         };
 
         assert_eq!(EngineSizing::for_store(&store).segment_rows, RowCount(rows), "{mib} MiB");
@@ -97,7 +95,6 @@ fn summary_holds_blocks() {
         floor_entry_bytes: ByteCount(0),
         workers: None,
         declared_bytes: ByteCount(0),
-        is_all_sorted: false,
     };
     let rows_room = EngineSizing::for_store(&store).summary_share.0 / 2;
     let blocks = 1_000_000_000 / ROWS_PER_BLOCK;
@@ -122,7 +119,6 @@ fn documented_reserve() {
             floor_entry_bytes: ByteCount(0),
             workers: None,
             declared_bytes: ByteCount(0),
-            is_all_sorted: false,
         };
 
         let segment = EngineSizing::for_store(&store).segment_bytes;
@@ -359,8 +355,7 @@ fn full_filter_room_stays() {
     let stripe = 1_000;
     assert_eq!(split_idle_room(stripe, stripe, 2 * stripe, 100 * stripe), IdleSplit { filter_cache: stripe, to_rows: 0, to_records: 0 });
 }
-
-// declared index bytes come out of the shares and raise the least budget, and a store of sorted columns gives the spot share and
+// declared complete tables come out of the shares and raise the least budget
 // most of the cache share to the write index
 #[test]
 fn declared_indexes_come_out_of_the_budget() {
@@ -371,8 +366,105 @@ fn declared_indexes_come_out_of_the_budget() {
     let (plain_sizing, declared_sizing) = (EngineSizing::for_store(&plain), EngineSizing::for_store(&declared));
     assert!(declared_sizing.cache_share < plain_sizing.cache_share);
     assert!(declared_sizing.record_share < plain_sizing.record_share);
-    let sorted = EngineSizing::for_store(&StoreShape { is_all_sorted: true, ..plain });
-    assert_eq!(sorted.spot_share, ByteCount(0));
-    assert!(sorted.cache_share.0 <= plain_sizing.cache_share.0 / 4);
-    assert!(sorted.segment_rows > plain_sizing.segment_rows);
+}
+
+// a sorted index asks for twice its keys with the headroom past them, at least the pages its image saved, and an empty one with
+// no least asks for its part
+#[test]
+fn a_sorted_index_asks_by_its_keys() {
+    use reel::engine::engine_sizing::{INDEX_GROWTH, INDEX_HEADROOM, IndexAsk, index_ask};
+    use reel::index::sorted_keys::planned_index_bytes;
+
+    assert_eq!(index_ask(16, 0, None, ByteCount(0)), IndexAsk::Part);
+    let grown = planned_index_bytes(16, RowCount(1_000_000 * INDEX_GROWTH)).0 + INDEX_HEADROOM.0;
+    assert_eq!(index_ask(16, 1_000_000, None, ByteCount(0)), IndexAsk::Bytes(ByteCount(grown)));
+    assert_eq!(index_ask(16, 1_000_000, Some(RowCount(10_000_000)), ByteCount(0)), IndexAsk::Bytes(ByteCount(planned_index_bytes(16, RowCount(10_000_000)).0 + INDEX_HEADROOM.0)));
+    assert_eq!(index_ask(16, 10, None, ByteCount(grown * 2)), IndexAsk::Bytes(ByteCount(grown * 2)));
+}
+
+// the indexes get their asks while they fit the cap, each the same fraction of its ask past it, and an empty one its part
+#[test]
+fn the_cap_is_shared_by_the_asks() {
+    use reel::engine::engine_sizing::{IndexAsk, index_cap, share_indexes};
+
+    assert_eq!(index_cap(400), 300);
+    let asks = [IndexAsk::Bytes(ByteCount(100)), IndexAsk::Bytes(ByteCount(50))];
+    assert_eq!(share_indexes(&asks, 300), vec![100, 50]);
+    let asks = [IndexAsk::Bytes(ByteCount(400)), IndexAsk::Bytes(ByteCount(200))];
+    assert_eq!(share_indexes(&asks, 300), vec![200, 100]);
+    let asks = [IndexAsk::Part, IndexAsk::Bytes(ByteCount(50))];
+    assert_eq!(share_indexes(&asks, 300), vec![150, 50]);
+}
+
+// a store of sorted columns at a budget, with no rows on disk
+fn sorted_config(budget: u64, columns: u8) -> StoreConfig {
+    StoreConfig {
+        memory_budget: ByteCount(budget),
+        threads: NO_WORKERS,
+        volumes: vec![VolumeConfig::new("volume", vec![PathBuf::from("/disk/sized")], SyncPolicy::Never)],
+        columns: (1..=columns)
+            .map(|id| ColumnConfig {
+                id: reel_api::column_id::ColumnId(id),
+                name: format!("c{id}"),
+                key_shape: KeyShape::Fixed { width: 16 },
+                codec: Codec::None,
+                volume: reel_api::units::VolumeId(0),
+                complete_rows: None,
+                sorted_rows: Some(RowCount(0)),
+                least_value: None,
+            })
+            .collect(),
+    }
+}
+
+// in a store whose columns are all sorted the spot share goes to the indexes first and ends at nothing, the write index keeps its
+// share, and the caches and the index bytes add up to what the caches had
+#[test]
+fn an_all_sorted_store_gives_its_spot_share_to_the_indexes() {
+    use reel::engine::reel_store::size_sorted_indexes;
+
+    let io = reel_sim::simulated_io::SimulatedIo::new(reel_sim::seeded_random::Seed(1));
+    for budget in [512 * 1024 * 1024, 2_048 * 1024 * 1024] {
+        let config = sorted_config(budget, 1);
+        let before = store_sizing(&config, false, &[None]).expect("sizing");
+        let (after, sizes) = size_sorted_indexes(&io, &config, &before, &[]);
+        let held: u64 = sizes.iter().flatten().map(|size| size.got.0).sum();
+        assert_eq!(after.spot_share, ByteCount(0), "{budget} B");
+        assert_eq!(after.segment_rows, before.segment_rows, "the write index keeps its share at {budget} B");
+        let caches = |sizing: &EngineSizing| sizing.spot_share.0 + sizing.cache_share.0 + sizing.record_share.0;
+        // the shares round down a byte or so each
+        assert!(caches(&before).abs_diff(caches(&after) + held) <= 4, "{} against {} at {budget} B", caches(&before), caches(&after) + held);
+        assert!(held > 0, "no index at {budget} B");
+    }
+}
+
+// a grant under one pool's floor builds no index and charges the caches nothing, while a grant over it builds one at the bytes its
+// pool holds
+#[test]
+fn a_grant_under_the_pool_floor_builds_no_index() {
+    use reel::engine::reel_store::size_sorted_indexes;
+    use reel::index::sorted_keys::planned_index_bytes;
+
+    let io = reel_sim::simulated_io::SimulatedIo::new(reel_sim::seeded_random::Seed(2));
+    let floor = planned_index_bytes(16, RowCount(1)).0;
+    // the least budget a store of three sorted columns runs at
+    let least = match store_sizing(&sorted_config(1 << 20, 3), false, &[None]) {
+        Err(reel_api::store_error::StoreError::BudgetTooSmall { least, .. }) => least.0,
+        other => panic!("a 1 MiB store sized: {other:?}"),
+    };
+    for (columns, is_built) in [(1, true), (3, false)] {
+        let config = sorted_config(least, columns);
+        let before = store_sizing(&config, false, &[None]).expect("sizing");
+        let caches = before.spot_share.0 + before.cache_share.0 + before.record_share.0;
+        let (after, sizes) = size_sorted_indexes(&io, &config, &before, &[]);
+        let built: Vec<_> = sizes.iter().flatten().collect();
+        assert_eq!(built.len(), usize::from(columns));
+        for size in &built {
+            assert_eq!(size.rows.0 > 0, is_built, "{columns} columns at {least} B, a floor of {floor} B: {size:?}");
+            assert_eq!(size.got.0 > 0, is_built);
+        }
+        let held: u64 = built.iter().map(|size| size.got.0).sum();
+        let after_caches = after.spot_share.0 + after.cache_share.0 + after.record_share.0;
+        assert!(after_caches + held <= caches + 4, "{columns} columns took more than the caches had");
+    }
 }

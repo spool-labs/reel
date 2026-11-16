@@ -30,7 +30,7 @@ use crate::engine::engine_sizing::{
     complete_block_rows, complete_row_limit, split_idle_room,
     EngineSizing, FILTER_CACHE_QUARTERS, FILTER_SLOT_BYTES, GROUP_BYTES, LEAST_LZ4_BUDGET, LEAST_SHARD_ENTRIES, PLANNED_LINE_BYTES,
     SHARED_JOBS, StoreShape, GATHER_BYTES, WRITE_BUFFERS, read_buffers, assumed_segment_bytes, capped_entries, disk_entries, entry_cost, entry_cover, floor_entries,
-    dead_bits_bytes, segment_bytes_for, target_rows,
+    dead_bits_bytes, segment_bytes_for, target_rows, IndexAsk, index_ask, index_cap, is_index_exact, share_indexes,
 };
 use crate::engine::engine_state::{EngineState, PLACE_RUN, SEGMENT_NUMBER_BATCH, SlotFile};
 use crate::engine::open_segment::{RECORD_WINDOW_BYTES, RecordWindow, RowQueue, SegmentPhase, fits_a_segment_path};
@@ -66,7 +66,8 @@ use crate::index::open_slots::OpenSlot;
 use crate::engine::complete_image::ImageFiles;
 use crate::index::complete_table::CompleteTable;
 use crate::index::complete_table::planned_table_bytes;
-use crate::index::sorted_keys::{MOST_KEY_BYTES, SortedKeys, planned_index_bytes};
+use crate::index::sorted_keys::{MOST_KEY_BYTES, PAGE_BYTES as SORTED_PAGE_BYTES, SortedKeys, planned_index_bytes, rows_for_bytes};
+use crate::engine::sorted_image::sorted_image_size;
 use crate::index::spot_index::SpotIndex;
 use crate::index::write_index::WriteIndex;
 use crate::io::lock_outcome::LockOutcome;
@@ -140,9 +141,12 @@ impl<Backend: Io> ReelStore<Backend> {
 
         // the pools are built and touched here and as the jobs start, and open reports that time apart
         let touched_from = io.now();
+        // the sorted indexes take their room from the caches before anything is built, by the keys they held at open
+        let (sizing, sorted_sizes) = size_sorted_indexes(&io, config, &sizing, &summaries);
         let mut state = build_state(OpenInputs { io, config, sizing: &sizing, disks: &disks, superblock, locks, scan: &scan, summaries });
         state.complete = complete_tables(config);
-        state.sorted = sorted_indexes(config);
+        state.sorted = sorted_indexes(config, &sorted_sizes);
+        state.sorted_sizes = sorted_sizes;
         state.complete_images = complete_images(config);
         state.attach_ring(ring);
         state.prefault_time.store(state.io.now().0.saturating_sub(touched_from.0), Ordering::Release);
@@ -857,18 +861,17 @@ pub fn store_shape(config: &StoreConfig, has_ring: bool, disks: &[Option<ByteCou
         floor_entry_bytes: entry_line(config, &disks.iter().map(|disk| disk.map(|_size| floor_entries())).collect::<Vec<_>>()),
         workers: None,
         declared_bytes: declared_index_bytes(config),
-        is_all_sorted: !config.columns.is_empty() && config.columns.iter().all(|column| column.sorted_rows.is_some()),
     };
     // a segment's rows come from the shares, so the disks ask at the rows a plan with no line of theirs gives
     let rows = EngineSizing::for_store(&bare.with_workers_settled()).segment_rows;
     StoreShape { disk_entry_bytes: entry_line(config, &asked_entries(config, disks, rows)), ..bare }
 }
 
-/// Add up the heap a config's declared indexes hold, by the arithmetic the tables and indexes are built with
+/// Add up the heap a config's complete tables hold with their block lines, by the arithmetic they are built with. Sorted indexes
+/// take their room from the caches at open
 pub fn declared_index_bytes(config: &StoreConfig) -> ByteCount {
     let tables: u64 = config.columns.iter().filter_map(|column| column.complete_rows).map(|rows| planned_table_bytes(rows).0).sum();
-    let indexes: u64 = config.columns.iter().filter_map(|column| column.sorted_rows.map(|rows| planned_index_bytes(column.key_shape.widest(), rows).0)).sum();
-    ByteCount(tables + indexes + complete_lines(config) * size_of::<BlockEntry>() as u64)
+    ByteCount(tables + complete_lines(config) * size_of::<BlockEntry>() as u64)
 }
 
 /// Count the columns a volume holds
@@ -1462,6 +1465,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         is_read_only: false,
         complete: Vec::new(),
         sorted: Vec::new(),
+        sorted_sizes: Vec::new(),
         complete_images: Vec::new(),
         seal_tasks,
         planner_task: OnceLock::new(),
@@ -1716,11 +1720,87 @@ pub fn column_lines(column: &ColumnConfig) -> u64 {
     column.complete_rows.map_or(0, |rows| rows.0.div_ceil(rows_per_block))
 }
 
-/// Allocate and touch each sorted column's index
-pub fn sorted_indexes(config: &StoreConfig) -> Vec<Option<SortedKeys>> {
+/// What open gave a sorted index: the bytes its rule asked for, the bytes it got, and the rows those hold
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SortedSize {
+    pub asked: ByteCount,
+    pub got: ByteCount,
+    pub rows: RowCount,
+}
+
+/// Size each sorted column's index from the keys it held at open: its image's entries, or else its rows on disk. The indexes
+/// share the spot, block and record caches past their floor, and the caches give up what the indexes take
+pub fn size_sorted_indexes<Backend: Io>(io: &Backend, config: &StoreConfig, sizing: &EngineSizing, summaries: &[SummaryFound]) -> (EngineSizing, Vec<Option<SortedSize>>) {
+    let mut rows_on_disk = [0_u64; MAX_COLUMNS];
+    for summary in summaries {
+        for row in summary.rows.rows() {
+            let mut cursor = row.cursor();
+            for _column in 0..row.column_count {
+                let Some(column) = cursor.column() else {
+                    break;
+                };
+                rows_on_disk[column.column.0 as usize] += column.row_count.0;
+            }
+        }
+    }
+    let sorted: Vec<&ColumnConfig> = config.columns.iter().filter(|column| column.sorted_rows.is_some()).collect();
+    let asks: Vec<IndexAsk> = sorted
+        .iter()
+        .map(|column| {
+            let width = column.key_shape.widest();
+            // a declared count of zero asks for no least, and the store sizes the index alone
+            let least = column.sorted_rows.filter(|rows| rows.0 > 0);
+            if is_index_exact() {
+                return IndexAsk::Bytes(planned_index_bytes(width, least.unwrap_or(RowCount(0))));
+            }
+            let image = config.volumes[column.volume.0 as usize].roots.first().and_then(|root| sorted_image_size(io, root, column.id));
+            let keys = image.map_or(rows_on_disk[column.id.0 as usize], |(entries, _saved)| entries);
+            let saved = ByteCount(image.map_or(0, |(_entries, saved)| u64::from(saved) * SORTED_PAGE_BYTES as u64));
+            index_ask(width, keys, least, saved)
+        })
+        .collect();
+    let (spot, block, record) = (sizing.spot_share.0, sizing.cache_share.0, sizing.record_share.0);
+    // where every column is sorted no get reads the spot cache, so its share is the indexes' first, and the floor holds on the
+    // block and record caches alone
+    let is_all_sorted = !config.columns.is_empty() && config.columns.iter().all(|column| column.sorted_rows.is_some());
+    let cap = if is_all_sorted { spot + index_cap(block + record) } else { index_cap(spot + block + record) };
+    // an exact index asks for what it declared, and past the cap it gets its share as any index does
+    let granted = share_indexes(&asks, cap);
+    let mut sizes: Vec<Option<SortedSize>> = (0..MAX_COLUMNS).map(|_column| None).collect();
+    let part = cap / asks.len().max(1) as u64;
+    let mut taken = 0;
+    for ((column, ask), got) in sorted.iter().zip(&asks).zip(&granted) {
+        let asked = ByteCount(if let IndexAsk::Bytes(bytes) = ask { bytes.0 } else { part });
+        let width = column.key_shape.widest();
+        let declared = column.sorted_rows.unwrap_or(RowCount(0));
+        let is_whole = is_index_exact() && *got >= asked.0;
+        // a grant under one pool's floor, a page for each part, builds no index, and the column reads its footers
+        let rows = if is_whole { declared } else if *got < planned_index_bytes(width, RowCount(1)).0 { RowCount(0) } else { rows_for_bytes(width, ByteCount(*got)) };
+        // the caches give up what the pool holds, which a grant rounds down to
+        let held = if rows.0 == 0 { 0 } else { planned_index_bytes(width, rows).0 };
+        taken += held;
+        sizes[column.id.0 as usize] = Some(SortedSize { asked, got: ByteCount(held), rows });
+    }
+    // in a store of sorted columns the spot share pays first, and what it has left goes to the block and record caches
+    let (from_caches, to_caches) = if is_all_sorted { (taken.saturating_sub(spot), spot.saturating_sub(taken)) } else { (taken, 0) };
+    // each cache gives and takes by its size
+    let caches = if is_all_sorted { block + record } else { spot + block + record };
+    let by_size = |share: u64, bytes: u64| (u128::from(share) * u128::from(bytes) / u128::from(caches.max(1))) as u64;
+    let changed = |share: u64| (share + by_size(share, to_caches)).saturating_sub(by_size(share, from_caches));
+    let shared = EngineSizing {
+        spot_share: ByteCount(if is_all_sorted { 0 } else { changed(spot) }),
+        cache_share: ByteCount(changed(block)),
+        record_share: ByteCount(changed(record)),
+        ..*sizing
+    };
+    (shared, sizes)
+}
+
+/// Allocate and touch each sorted column's index at the rows open sized it for
+pub fn sorted_indexes(config: &StoreConfig, sizes: &[Option<SortedSize>]) -> Vec<Option<SortedKeys>> {
     let mut indexes: Vec<Option<SortedKeys>> = (0..MAX_COLUMNS).map(|_column| None).collect();
     for column in &config.columns {
-        indexes[column.id.0 as usize] = column.sorted_rows.map(|rows| SortedKeys::new(column.key_shape.widest(), rows));
+        indexes[column.id.0 as usize] = sizes[column.id.0 as usize].filter(|size| size.rows.0 > 0).map(|size| SortedKeys::new(column.key_shape.widest(), size.rows));
     }
     indexes
 }

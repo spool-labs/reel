@@ -13,6 +13,7 @@ use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, Nanoseconds, RootId, RowCount, SegmentCount, VolumeId};
 use reel_api::usage::{ColumnRootUsage, ColumnUsage, RootUsage, UsageReport, VolumeUsage};
 
+use crate::index::sorted_keys::SortedKeys;
 use crate::engine::rewrite_job::rows_of;
 use crate::engine::engine_state::EngineState;
 use crate::engine::job_tally::STALL_AFTER;
@@ -382,16 +383,21 @@ impl<Backend: Io> EngineState<Backend> {
                 });
             }
         }
-        for (id, index) in self.sorted.iter().enumerate() {
-            if let Some(index) = index {
-                report.sorted_columns.push(SortedReading {
-                    column: ColumnId(id as u8),
-                    used: index.entry_count(),
-                    capacity: index.told_rows(),
-                    rows_past_capacity: index.past_capacity(),
-                    is_marked: index.mark().is_some(),
-                });
-            }
+        // a sorted column whose grant fell under one pool's floor has no index, and its reading says it asked and got nothing
+        for (id, size) in self.sorted_sizes.iter().enumerate() {
+            let Some(size) = size else {
+                continue;
+            };
+            let index = self.sorted.get(id).and_then(Option::as_ref);
+            report.sorted_columns.push(SortedReading {
+                column: ColumnId(id as u8),
+                used: index.map_or(RowCount(0), SortedKeys::entry_count),
+                capacity: index.map_or(RowCount(0), SortedKeys::told_rows),
+                rows_past_capacity: index.map_or(RowCount(0), SortedKeys::past_capacity),
+                is_marked: index.is_some_and(|index| index.mark().is_some()),
+                asked_bytes: size.asked,
+                got_bytes: size.got,
+            });
         }
         report.segments_rewritten = SegmentCount(rewritten);
         report.segments_unlinked = SegmentCount(unlinked);

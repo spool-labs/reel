@@ -207,6 +207,8 @@ pub struct EngineState<Backend: Io> {
     pub complete: Vec<Option<CompleteTable>>,
     /// Each column's sorted index, for a column that declares one
     pub sorted: Vec<Option<SortedKeys>>,
+    /// What open gave each sorted index: asked, got and the rows those hold
+    pub sorted_sizes: Vec<Option<crate::engine::reel_store::SortedSize>>,
     pub complete_images: Vec<Option<Mutex<ImageFiles>>>,
     pub complete_cache: Option<BlockCache>,
     pub complete_line_bytes: ByteCount,

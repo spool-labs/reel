@@ -1723,3 +1723,54 @@ fn two_volume_windows_match_the_model() {
         store.close().expect("close");
     }
 }
+
+// 128 KiB segments take 4 KiB windows. A record is 9 B of head and its value, so values of 4,080 to 4,087 B go through a window,
+// 4,087 B fills one exactly, and 4,088 to 4,110 B are written direct: records on both sides of the largest one a window
+// takes, so both the held and the direct write run and a window fills exactly: closed, killed and sealed, read back as a model
+#[test]
+fn records_at_the_window_edge_match_the_model() {
+    for seed in seeds(0..8) {
+        let io = SimulatedIo::new(Seed(700 + seed));
+        let mut random = SeededRandom::new(Seed(800 + seed));
+        let mut edge = config(SyncPolicy::Never);
+        edge.volumes[0].segment_bytes = Some(ByteCount(128 * 1024));
+        let mut store = ReelStore::open(io.clone(), &edge).expect("open");
+        let mut model = BTreeMap::new();
+        for round in 0..16 {
+            for write in 0..100 {
+                let key = format!("key-{}", random.below(200)).into_bytes();
+                if random.below(8) == 0 {
+                    store.delete(COLUMN, &key).expect("delete");
+                    model.remove(&key);
+                } else {
+                    let value = vec![(round + write) as u8; 4_080 + random.below(31) as usize];
+                    store.put(COLUMN, &key, &value).expect("put");
+                    model.insert(key, value);
+                }
+            }
+            match random.below(4) {
+                0 => {
+                    store.seal_now();
+                    settle(&io);
+                },
+                1 => {
+                    store.close().expect("close");
+                    drop(store);
+                    store = ReelStore::open(io.clone(), &edge).expect("open");
+                },
+                2 => {
+                    store.flush().expect("flush");
+                    io.kill();
+                    drop(store);
+                    store = ReelStore::open(io.clone(), &edge).expect("open");
+                },
+                _ => settle(&io),
+            }
+            for number in 0..200 {
+                let key = format!("key-{number}").into_bytes();
+                assert_eq!(read(&store, &key).as_ref(), model.get(&key), "seed {seed} round {round} key {number}");
+            }
+        }
+        store.close().expect("close");
+    }
+}

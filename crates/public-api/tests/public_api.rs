@@ -102,3 +102,95 @@ fn the_rest_of_the_surface_answers_from_outside() -> Result<(), Box<dyn std::err
     std::fs::remove_dir_all(&root)?;
     Ok(())
 }
+
+// copy every file of a directory tree, so a store can be moved
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else if !entry.file_name().to_string_lossy().ends_with(".lock") {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+// a store on two roots, written and closed, under a root of its own
+fn two_root_store(name: &str) -> Result<(PathBuf, StoreConfig), Box<dyn std::error::Error>> {
+    let base = scratch_root().with_extension(name);
+    let _gone = std::fs::remove_dir_all(&base);
+    let mut config = config(base.join("first"));
+    config.volumes[0].roots.push(base.join("second"));
+    let store = ReelStore::open(PlainIo::new(), &config)?;
+    for number in 0..KEYS {
+        store.put(COLUMN, format!("key-{number:03}").as_bytes(), b"value")?;
+    }
+    store.close()?;
+    Ok((base, config))
+}
+
+// a copy of a store's files opens at its new path, writable and read-only, and reads what the original held
+#[test]
+fn a_copied_store_opens_where_it_lies() -> Result<(), Box<dyn std::error::Error>> {
+    let (base, config) = two_root_store("copied")?;
+    let copy = base.with_extension("copy");
+    let _gone = std::fs::remove_dir_all(&copy);
+    copy_tree(&base, &copy)?;
+    let mut moved = config.clone();
+    moved.volumes[0].roots = vec![copy.join("first"), copy.join("second")];
+    let mut value = Vec::new();
+    let reader = ReelStore::open_read_only(PlainIo::new(), &moved)?;
+    assert!(reader.get(COLUMN, b"key-042", &mut value)?);
+    reader.close()?;
+    drop(reader);
+    let store = ReelStore::open(PlainIo::new(), &moved)?;
+    assert!(store.get(COLUMN, b"key-042", &mut value)?);
+    store.put(COLUMN, b"key-new", b"value")?;
+    store.close()?;
+    std::fs::remove_dir_all(&base)?;
+    std::fs::remove_dir_all(&copy)?;
+    Ok(())
+}
+
+// a config with fewer roots than the store has, or with a root of another store, is refused
+#[test]
+fn a_missing_root_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+    let (base, config) = two_root_store("missing")?;
+    let mut fewer = config.clone();
+    fewer.volumes[0].roots.truncate(1);
+    let refused = ReelStore::open_read_only(PlainIo::new(), &fewer).err().map(|error| error.to_string());
+    assert!(refused.as_deref().is_some_and(|message| message.contains("dropped a root")), "{refused:?}");
+    let (other, other_config) = two_root_store("other")?;
+    let mut mixed = config.clone();
+    mixed.volumes[0].roots[1] = other_config.volumes[0].roots[1].clone();
+    let refused = ReelStore::open_read_only(PlainIo::new(), &mixed).err().map(|error| error.to_string());
+    assert!(refused.as_deref().is_some_and(|message| message.contains("different stores")), "{refused:?}");
+    std::fs::remove_dir_all(&other)?;
+    std::fs::remove_dir_all(&base)?;
+    Ok(())
+}
+
+// the same roots listed in the other order open and read what the store held
+#[test]
+fn roots_in_another_order_read_right() -> Result<(), Box<dyn std::error::Error>> {
+    let (base, config) = two_root_store("order")?;
+    let mut swapped = config.clone();
+    swapped.volumes[0].roots.reverse();
+    let store = ReelStore::open(PlainIo::new(), &swapped)?;
+    let mut value = Vec::new();
+    for number in 0..KEYS {
+        assert!(store.get(COLUMN, format!("key-{number:03}").as_bytes(), &mut value)?, "key {number}");
+    }
+    store.put(COLUMN, b"key-new", b"value")?;
+    store.close()?;
+    drop(store);
+    let store = ReelStore::open(PlainIo::new(), &config)?;
+    assert!(store.get(COLUMN, b"key-new", &mut value)?);
+    assert!(store.get(COLUMN, b"key-042", &mut value)?);
+    store.close()?;
+    std::fs::remove_dir_all(&base)?;
+    Ok(())
+}

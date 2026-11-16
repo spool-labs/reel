@@ -1081,21 +1081,18 @@ pub fn settle_superblock<Backend: Io>(io: &Backend, config: &StoreConfig) -> Res
 
 /// Refuse a config that dropped a root or changed a column
 pub fn check_layout(superblock: &Superblock, config: &StoreConfig) -> Result<(), StoreError> {
+    let layout_error = |message: &str| StoreError::Io {
+        action: "checking the volume layout",
+        source: Error::other(message.to_string()),
+    };
+    // a root is matched by its volume and its place in the volume, so a store opens wherever its files were copied. Roots of
+    // two stores are refused where the superblocks are read, by their store ids
     for stored in &superblock.volumes {
         let Some(volume) = config.volumes.iter().find(|volume| volume.name == stored.name) else {
-            return Err(StoreError::Io {
-                action: "checking the volume layout",
-                source: Error::other("config dropped a volume"),
-            });
+            return Err(layout_error("config dropped a volume"));
         };
-        for root in &stored.roots {
-            let is_declared = volume.roots.iter().any(|path| path.to_string_lossy() == root.as_str());
-            if !is_declared && !superblock.dead_roots.contains(root) {
-                return Err(StoreError::Io {
-                    action: "checking the volume layout",
-                    source: Error::other("config dropped a root"),
-                });
-            }
+        if volume.roots.len() < stored.roots.len() {
+            return Err(layout_error("config dropped a root"));
         }
     }
 

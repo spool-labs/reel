@@ -273,3 +273,28 @@ fn random_words_differ() {
     let (first, second) = (io.random_word(), io.random_word());
     assert!(first != 0 && second != 0 && first != second, "{first} {second}");
 }
+
+// a sealed segment that reserved more than one step gives back what lies past its end
+#[test]
+fn a_sealed_segment_holds_no_room_past_its_end() -> Result<(), Box<dyn std::error::Error>> {
+    let root = scratch_root().with_extension("sealed");
+    let _gone = std::fs::remove_dir_all(&root);
+    let config = config(root.clone());
+    let store = ReelStore::open(PlainIo::new(), &config)?;
+    let value = vec![7_u8; 64 * 1024];
+    for number in 0..400_u32 {
+        store.put(COLUMN, format!("key-{number:05}").as_bytes(), &value)?;
+    }
+    store.finish()?;
+    drop(store);
+    let mut files = Vec::new();
+    files_under(&root, &mut files)?;
+    let segments: Vec<_> = files.iter().filter(|(path, _length, _held)| path.to_string_lossy().ends_with(".data")).collect();
+    for (path, length, held) in &segments {
+        println!("{} {length} B long, {held} B held", path.display());
+    }
+    assert!(segments.iter().any(|(_path, length, _held)| *length > 8 * 1024 * 1024), "no segment passed one step: {segments:?}");
+    assert!(segments.iter().all(|(_path, length, held)| *held <= length.next_multiple_of(4_096)), "{segments:?}");
+    std::fs::remove_dir_all(&root)?;
+    Ok(())
+}

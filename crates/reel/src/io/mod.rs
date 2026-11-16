@@ -315,6 +315,11 @@ pub trait Io: Clone + Send + Sync + 'static {
     /// A running job
     type Task: IoTask;
 
+    /// Say whether the engine proves its dead counts and bits at every close and every merge, which only the simulator asks for
+    fn proves_dead_bits(&self) -> bool {
+        false
+    }
+
     /// Open the ring async reads complete through, or nothing where they run on the blocking pool
     fn open_ring(&self) -> Result<Option<Self::Ring>>;
 

@@ -550,9 +550,10 @@ impl<Backend: Io> ReelStore<Backend> {
         }
 
         #[cfg(feature = "test-hooks")]
-        check_dead_counts(&self.state);
-        #[cfg(feature = "test-hooks")]
-        check_dead_bits_true(&self.state);
+        if self.state.io.proves_dead_bits() {
+            check_dead_counts(&self.state);
+            check_dead_bits_true(&self.state);
+        }
 
         let mut outcome = Ok(());
         for volume in &self.state.volumes {
@@ -745,10 +746,9 @@ pub fn bring_up<Backend: Io>(
         let _loaded = state.load_dead_bits(volume);
     }
     #[cfg(feature = "test-hooks")]
-    check_dead_counts(state);
-    // the bit check runs at close, and its buffers are reserved here so that close allocates nothing
-    #[cfg(feature = "test-hooks")]
-    BIT_CHECK.with(|_buffers| {});
+    if state.io.proves_dead_bits() {
+        check_dead_counts(state);
+    }
     state.remove_stale_images().map_err(open_error("removing an image of a column that changed kind"))?;
     state.fill_complete_tables().map_err(open_error("filling a complete table"))?;
     state.fill_sorted_indexes().map_err(open_error("filling a sorted index"))?;
@@ -1984,27 +1984,37 @@ pub fn check_dead_counts<Backend: Io>(state: &EngineState<Backend>) {
 }
 
 
+/// Blocks the bit check has read, so a sim can show the check ran
 #[cfg(feature = "test-hooks")]
-thread_local! {
-    /// The check's buffers, reserved at its first run, which is an open, so a close that runs it allocates nothing
-    static BIT_CHECK: std::cell::RefCell<(Vec<SegmentNumber>, Vec<u8>, Vec<u8>)> =
-        std::cell::RefCell::new((Vec::with_capacity(1 << 16), vec![0; 4 << 20], Vec::with_capacity(1 << 12)));
-}
+pub static BLOCKS_PROVEN: AtomicU64 = AtomicU64::new(0);
 
 /// Check every set bit of a segment with exact bits is true: its row has a newer version in a sealed segment, lies under an
-/// applied cover or a damaged range, or is a cover's own row. A bit on a live row would let a merge drop it
+/// applied cover or a damaged range, is a cover's own row, or is a grave with nothing older left. A bit on a live row would let
+/// a merge drop it. The buffers sit on the stack, so a close that runs it allocates nothing
 #[cfg(feature = "test-hooks")]
 pub fn check_dead_bits_true<Backend: Io>(state: &EngineState<Backend>) {
+    use crate::engine::complete_path::KeyBuffer;
     use crate::io::{InPlace, IoFile, in_place};
     use crate::row_kind::RowKind;
-    use crate::segment::row_block::RowBlockWalk;
+    use crate::segment::row_block::{ROW_BLOCK_BYTES, RowBlockWalk};
 
-    BIT_CHECK.with(|buffers| {
-        let (segments, bytes, key) = &mut *buffers.borrow_mut();
-        for volume in &state.volumes {
-            segments.clear();
-            segments.extend(hold(&volume.summary).rows().map(|row| row.facts.segment).take(segments.capacity()));
-            for segment in segments.iter().copied() {
+    const SEGMENTS_A_LOOK: usize = 256;
+    let mut bytes = [0_u8; 2 * ROW_BLOCK_BYTES];
+    let mut key = KeyBuffer::new();
+    for volume in &state.volumes {
+        let mut first = 0;
+        loop {
+            let mut segments = [SegmentNumber(0); SEGMENTS_A_LOOK];
+            let mut count = 0;
+            for (slot, row) in segments.iter_mut().zip(hold(&volume.summary).rows().skip(first)) {
+                *slot = row.facts.segment;
+                count += 1;
+            }
+            if count == 0 {
+                break;
+            }
+            first += count;
+            for segment in segments[..count].iter().copied() {
                 let (Some(extent), Some(pin)) = (volume.dead_bits.exact(segment), volume.table.pin(segment)) else {
                     continue;
                 };
@@ -2017,26 +2027,27 @@ pub fn check_dead_bits_true<Backend: Io>(state: &EngineState<Backend>) {
                     let Some(mut walk) = RowBlockWalk::open(&bytes[..length], pin.head.place_base) else {
                         break;
                     };
-                    while let Some(row) = walk.next_row(key) {
+                    BLOCKS_PROVEN.fetch_add(1, Ordering::Relaxed);
+                    while let Some(row) = walk.next_row(&mut key) {
                         let at = walk.row_index() as u32;
                         if volume.dead_bits.is_set(&extent, index, at) != Some(true) || row.kind == RowKind::RangeDelete {
                             continue;
                         }
-                        let Ok(read) = state.key_read(block.column, key, WritePlace(u64::MAX), false) else {
+                        let Ok(read) = state.key_read(block.column, &key, WritePlace(u64::MAX), false) else {
                             continue;
                         };
                         let Ok(newest) = in_place(state.search_footers(&InPlace, volume, &read)) else {
                             continue;
                         };
                         let is_replaced = newest.is_some_and(|found| found.row.place > row.place);
-                        let is_covered = volume.covers.newest_applied(block.column, key).is_some_and(|cover| cover > row.place);
-                        let is_hidden = volume.damage.covering(block.column, key).is_some_and(|highest| highest > row.place);
-                        let is_bare_grave = row.kind == RowKind::Grave && !state.has_older_row(volume, block.column, key, row.place, &[]).unwrap_or(true);
-                        assert!(is_replaced || is_covered || is_hidden || is_bare_grave, "{segment:?} block {index} row {at} has its bit set and is live: key {key:02x?}");
+                        let is_covered = volume.covers.newest_applied(block.column, &key).is_some_and(|cover| cover > row.place);
+                        let is_hidden = volume.damage.covering(block.column, &key).is_some_and(|highest| highest > row.place);
+                        let is_bare_grave = row.kind == RowKind::Grave && !state.has_older_row(volume, block.column, &key, row.place, &[]).unwrap_or(true);
+                        assert!(is_replaced || is_covered || is_hidden || is_bare_grave, "{segment:?} block {index} row {at} has its bit set and is live: key {:02x?}", &key[..]);
                     }
                     index += 1;
                 }
             }
         }
-    });
+    }
 }

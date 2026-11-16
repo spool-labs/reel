@@ -1027,5 +1027,8 @@ fn a_settled_cover_counts_its_row_once() {
         assert_eq!(pending(&store), 0, "killed {is_killed}: the cover came back and stayed");
         assert_eq!(dead_rows(&store, holder), dead, "killed {is_killed}: the cover's row counted dead again");
         store.close().expect("close");
+        let proven = reel::engine::reel_store::BLOCKS_PROVEN.load(Ordering::Acquire);
+        println!("the bit check has read {proven} blocks");
+        assert!(proven > 0, "killed {is_killed}: the bit check read no block");
     }
 }

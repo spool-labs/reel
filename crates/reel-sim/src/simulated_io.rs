@@ -408,6 +408,10 @@ impl Io for SimulatedIo {
     type Task = SimulatedTask;
     type Ring = SimulatedRing;
 
+    fn proves_dead_bits(&self) -> bool {
+        true
+    }
+
     fn open_ring(&self) -> Result<Option<SimulatedRing>> {
         Ok(self.has_ring.load(Ordering::Acquire).then(|| SimulatedRing::new(self.clone())))
     }

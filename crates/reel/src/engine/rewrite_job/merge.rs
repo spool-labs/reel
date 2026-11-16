@@ -429,7 +429,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         // the sims ask every set bit the merge decides by: its row has a newer sealed version, inputs and all, or lies under an
         // applied cover or a damaged range
         #[cfg(feature = "test-hooks")]
-        if is_set {
+        if is_set && state.io.proves_dead_bits() {
             let is_replaced = state.has_newer_sealed(volume, column, &self.key, row.place, &[]).unwrap_or(true);
             let is_covered = volume.covers.newest_applied(column, &self.key).is_some_and(|cover| cover > row.place);
             let is_hidden = volume.damage.covering(column, &self.key).is_some_and(|highest| highest > row.place);

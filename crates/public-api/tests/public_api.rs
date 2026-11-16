@@ -246,3 +246,30 @@ fn a_finished_store_holds_sealed_segments_alone() -> Result<(), Box<dyn std::err
     std::fs::remove_dir_all(&copy)?;
     Ok(())
 }
+
+// a second open of a store another holds is refused with the holder, and opens once the first closes
+#[test]
+fn a_held_store_refuses_a_second_writer() -> Result<(), Box<dyn std::error::Error>> {
+    let root = scratch_root().with_extension("held");
+    let _gone = std::fs::remove_dir_all(&root);
+    let config = config(root.clone());
+    let first = ReelStore::open(PlainIo::new(), &config)?;
+    let second = ReelStore::open(PlainIo::new(), &config);
+    assert!(matches!(second, Err(reel_api::store_error::StoreError::Locked { .. })), "{:?}", second.err());
+    first.close()?;
+    drop(first);
+    let second = ReelStore::open(PlainIo::new(), &config)?;
+    second.close()?;
+    std::fs::remove_dir_all(&root)?;
+    Ok(())
+}
+
+// the random words a store's ids come from are never zero and never repeat
+#[test]
+fn random_words_differ() {
+    use reel::Io;
+
+    let io = PlainIo::new();
+    let (first, second) = (io.random_word(), io.random_word());
+    assert!(first != 0 && second != 0 && first != second, "{first} {second}");
+}

@@ -96,8 +96,8 @@ impl VolumeConfig {
 /// open, and a count the budget can't hold is refused there. One seal thread a volume runs whatever these say
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ThreadCounts {
-    /// Workers the store runs for every volume, refused when the budget can't hold them. None counts one an online CPU, as many as
-    /// the budget holds, and 0 leaves each volume's planner alone
+    /// Workers the store runs for every volume, refused when the budget can't hold them. None runs one an online CPU, as many as
+    /// the budget holds, so a budget at its floor runs none, and 0 leaves each volume's planner alone
     pub maintenance_workers: Option<usize>,
     /// Threads that serve the async read forms
     pub read_threads: usize,

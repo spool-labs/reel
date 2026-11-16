@@ -1,7 +1,7 @@
 //! The plain-syscall backend, used on every platform
 
 use std::collections::hash_map::RandomState;
-use std::fs::{self, DirBuilder, File, OpenOptions, TryLockError};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::hash::{BuildHasher, Hasher};
 use std::hint::black_box;
 use std::io::{Error, ErrorKind, Result};
@@ -14,7 +14,9 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread::{self, Builder};
 use std::time::{Duration, Instant};
 
-use reel_api::maintenance_report::{PriorityClass, WorkerPriority};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use reel_api::maintenance_report::PriorityClass;
+use reel_api::maintenance_report::WorkerPriority;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, ProcessId};
 
 use crate::io::wake_line::WakeLine;
@@ -204,18 +206,22 @@ impl Io for PlainIo {
         options.read(true).write(true).create(true).truncate(false).mode(FILE_MODE).custom_flags(libc::O_NOFOLLOW);
         let file = options.open(path)?;
 
-        match file.try_lock() {
-            Ok(()) => {
-                // one padded write, so a reader never sees a cut-down id
-                let holder = format!("{:>HOLDER_WIDTH$}", process::id());
-                file.write_all_at(holder.as_bytes(), 0)?;
-                Ok(LockOutcome::Held(PlainLock { file }))
-            },
-            Err(TryLockError::WouldBlock) => Ok(LockOutcome::Refused {
-                holder: read_holder(&file)?,
-            }),
-            Err(TryLockError::Error(error)) => Err(error),
+        // flock holds on every unix, where the standard library's try_lock holds only on some
+        // SAFETY: the descriptor is open, and no pointer crosses the call
+        let status = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if status != 0 {
+            let error = Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Ok(LockOutcome::Refused {
+                    holder: read_holder(&file)?,
+                });
+            }
+            return Err(error);
         }
+        // one padded write, so a reader never sees a cut-down id
+        let holder = format!("{:>HOLDER_WIDTH$}", process::id());
+        file.write_all_at(holder.as_bytes(), 0)?;
+        Ok(LockOutcome::Held(PlainLock { file }))
     }
 
     fn now(&self) -> Nanoseconds {
@@ -225,15 +231,9 @@ impl Io for PlainIo {
     }
 
     fn random_word(&self) -> u64 {
-        // the record key keeps one store's records from checking under another's, so it comes from the kernel's random source
-        let mut bytes = [0u8; size_of::<u64>()];
-        // SAFETY: the buffer is valid for its length, which is under the 256 bytes getentropy takes
-        let status = unsafe { libc::getentropy(bytes.as_mut_ptr().cast::<libc::c_void>(), bytes.len()) };
-        if status == 0 {
-            return u64::from_le_bytes(bytes);
-        }
-        // a kernel with no random source still needs a store id, and the per-thread SipHash keys are the best left
-        RandomState::new().build_hasher().finish()
+        // the record key keeps one store's records from checking under another's, so it comes from the kernel's random source, and
+        // a kernel with no random source still needs a store id, for which the per-thread SipHash keys are the best left
+        random_bytes().map_or_else(|| RandomState::new().build_hasher().finish(), u64::from_le_bytes)
     }
 
     fn pause_on(&self, line: &WakeLine, seen: u64) {
@@ -421,4 +421,23 @@ pub fn lower_priority() -> WorkerPriority {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn lower_priority() -> WorkerPriority {
     WorkerPriority::default()
+}
+
+/// Read a word from the kernel's random source, where getentropy is always there
+#[cfg(all(any(target_os = "linux", target_vendor = "apple"), not(reel_plain_unix)))]
+pub fn random_bytes() -> Option<[u8; 8]> {
+    let mut bytes = [0u8; 8];
+    // SAFETY: the buffer is valid for its length, which is under the 256 bytes getentropy takes
+    let status = unsafe { libc::getentropy(bytes.as_mut_ptr().cast::<libc::c_void>(), bytes.len()) };
+    (status == 0).then_some(bytes)
+}
+
+/// Read a word from the kernel's random device, on a unix whose C library may predate getentropy
+#[cfg(any(reel_plain_unix, not(any(target_os = "linux", target_vendor = "apple"))))]
+pub fn random_bytes() -> Option<[u8; 8]> {
+    use std::io::Read;
+
+    let mut bytes = [0u8; 8];
+    File::open("/dev/urandom").and_then(|mut device| device.read_exact(&mut bytes)).ok()?;
+    Some(bytes)
 }

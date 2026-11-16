@@ -649,6 +649,10 @@ fn a_set_segment_size_caps_the_write_index() {
         let (index, capped_index) = (planned.shard.heap_bytes().0, capped.shard.heap_bytes().0);
         println!("{mib} MiB: index rows {} → {}, a shard {index} → {capped_index} B, record cache {} → {} B", planned.segment_rows.0 * 8 / SEAL_ROWS_EIGHTHS, capped.segment_rows.0 * 8 / SEAL_ROWS_EIGHTHS, planned.record_share.0, capped.record_share.0);
         assert!(capped == planned || capped.segment_rows.0 * 8 / SEAL_ROWS_EIGHTHS <= cap, "{mib} MiB: the index holds more than the set segments can");
+        // a batch holds no more rows than a segment takes, three segments' worth of the smallest rows where the cap bites
+        if mib >= 256 {
+            assert_eq!(capped.segment_rows, RowCount(60_491), "{mib} MiB");
+        }
         assert_eq!(capped.record_share.0 - planned.record_share.0, (index - capped_index) * reel::index::write_index::SHARD_COUNT as u64);
         assert_eq!((capped.spot_share, capped.cache_share, capped.summary_share, capped.table_share), (planned.spot_share, planned.cache_share, planned.summary_share, planned.table_share));
     }

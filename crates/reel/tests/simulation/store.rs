@@ -1491,13 +1491,24 @@ fn a_capped_index_matches_the_model() {
     one_open_segment_runs(Some(ByteCount(256 * 1024)), Some(ByteCount(256 * 1024 * 1024)));
 }
 
+// the same capped index with the volume's default open segments, so several take writes at once under the cap
+#[test]
+fn a_capped_index_with_open_segments_matches_the_model() {
+    one_open_segment_runs_with(Some(ByteCount(256 * 1024)), Some(ByteCount(256 * 1024 * 1024)), None);
+}
+
 // run the one-open-segment model over the seeds, on segments of this size or the budget's
 fn one_open_segment_runs(segment_bytes: Option<ByteCount>, budget: Option<ByteCount>) {
+    one_open_segment_runs_with(segment_bytes, budget, Some(1));
+}
+
+// run the model over the seeds with this many open segments, or the volume's default
+fn one_open_segment_runs_with(segment_bytes: Option<ByteCount>, budget: Option<ByteCount>, open_segments: Option<usize>) {
     for seed in seeds(0..8) {
         let io = SimulatedIo::new(Seed(300 + seed));
         let mut random = SeededRandom::new(Seed(400 + seed));
         let mut one = config(SyncPolicy::Never);
-        one.volumes[0].open_segments = Some(1);
+        one.volumes[0].open_segments = open_segments;
         one.volumes[0].segment_bytes = segment_bytes;
         if let Some(budget) = budget {
             one.memory_budget = budget;
@@ -1550,4 +1561,46 @@ fn one_open_segment_runs(segment_bytes: Option<ByteCount>, budget: Option<ByteCo
         }
         store.close().expect("close");
     }
+}
+
+// a column that declares a large least value doesn't shrink the capped write index: its rows can be smaller than it, and a
+// delete has no value, so batches of empty values and of deletes land as on a store that declares none
+#[test]
+fn a_declared_least_value_leaves_the_cap() {
+    let budget = ByteCount(256 * 1024 * 1024);
+    let shaped = |least_value: Option<ByteCount>| {
+        let mut config = config(SyncPolicy::Never);
+        config.memory_budget = budget;
+        config.volumes[0].segment_bytes = Some(ByteCount(256 * 1024));
+        config.columns[0].least_value = least_value;
+        config
+    };
+    let plain_rows = {
+        let io = SimulatedIo::new(Seed(120));
+        let store = ReelStore::open(io, &shaped(None)).expect("open");
+        let rows = store.state.sizing.segment_rows;
+        store.close().expect("close");
+        rows
+    };
+    let declared = shaped(Some(ByteCount(64 * 1024)));
+    let io = SimulatedIo::new(Seed(121));
+    let store = ReelStore::open(io.clone(), &declared).expect("open");
+    let mut puts = WriteBatch::new();
+    for number in 0..1_000_u32 {
+        puts.put(COLUMN, format!("empty-{number:04}").as_bytes(), b"");
+    }
+    store.write_batch(&puts).expect("a batch of empty values");
+    let mut deletes = WriteBatch::new();
+    for number in 0..1_000_u32 {
+        deletes.delete(COLUMN, format!("gone-{number:04}").as_bytes());
+    }
+    store.write_batch(&deletes).expect("a batch of deletes");
+    assert_eq!(store.state.sizing.segment_rows, plain_rows, "a declared least value moved the cap");
+    store.close().expect("close");
+    drop(store);
+    let store = ReelStore::open(io, &declared).expect("reopen");
+    for number in 0..1_000_u32 {
+        assert_eq!(read(&store, format!("empty-{number:04}").as_bytes()), Some(Vec::new()), "key {number}");
+    }
+    store.close().expect("close");
 }

@@ -113,7 +113,8 @@ pub struct VolumeConfig {
     /// The bytes each segment of this volume takes before it seals. None sizes them from the budget. A set size is at least
     /// LEAST_SEGMENT_BYTES, which holds a whole one-chunk record with its head and the record window it lands through, and at
     /// most MOST_SET_SEGMENT_BYTES, which leaves a segment's footer room under the format's four-byte offsets. The reservation
-    /// step then follows it, an eighth of the segment down to a page
+    /// step then follows it, an eighth of the segment down to a page. A store whose every volume sets one caps its write index at
+    /// three segments' worth of the smallest rows, and a batch can hold no more rows than that: 60,491 at 256 KiB segments
     pub segment_bytes: Option<ByteCount>,
 }
 

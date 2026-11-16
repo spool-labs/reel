@@ -17,7 +17,7 @@ use reel_core::units::{ByteCount, DeathMark, Nanoseconds, RowCount, VolumeId, Wr
 use reel_core::usage::{ColumnUsage, UsageReport};
 use reel_core::write_batch::WriteBatch;
 
-use crate::config::{ColumnConfig, ColumnIndex, DeviceClass, KeyShape, LEAST_SEGMENT_BYTES, MOST_SET_SEGMENT_BYTES, StoreConfig, VolumeConfig};
+use crate::config::{ColumnConfig, ColumnIndex, DeviceClass, FORMAT_ROW_FLOOR, KeyShape, LEAST_SEGMENT_BYTES, MOST_SET_SEGMENT_BYTES, StoreConfig, VolumeConfig};
 use crate::engine::dead_bits::{CHUNK_WORDS, DEAD_BITS_NAME, DeadBits, NEW_DEAD_BITS_NAME, SAVE_HEADS_PAGE};
 use crate::engine::rewrite_job::{record_totals, rows_of};
 use crate::segment::block_filter::BITS_PER_ROW;
@@ -1266,9 +1266,9 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
     let mean = mean_record(&summaries);
     let cache_mean = cacheable_mean(&summaries);
     let sizing = sizing.for_mean_record(mean, config.volumes.len() as u64);
-    // a store whose every volume set its segment size holds no more rows than those segments can, a segment's bytes over its
-    // volume's row floor
-    let set_rows = config.volumes.iter().enumerate().map(|(index, volume)| volume.segment_bytes.map(|bytes| bytes.0 / config.row_floor(index).max(1))).collect::<Option<Vec<u64>>>();
+    // a store whose every volume set its segment size holds no more rows than those segments can, a segment's bytes over the
+    // format's row floor. A column's declared least value is no floor here, since a smaller value lands and a delete has none
+    let set_rows = config.volumes.iter().map(|volume| volume.segment_bytes.map(|bytes| bytes.0 / FORMAT_ROW_FLOOR)).collect::<Option<Vec<u64>>>();
     let sizing = sizing.for_set_segments(set_rows.and_then(|rows| rows.into_iter().max()), config.volumes.len() as u64);
     // a reader holds the open rows its listing found with room past them, at every open and refresh
     let open_rows = RowCount(scan.scanned.iter().map(|scanned| scanned.scan.row_count.0).sum());

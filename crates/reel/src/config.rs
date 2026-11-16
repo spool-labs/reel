@@ -115,7 +115,8 @@ pub struct ThreadCounts {
     /// Workers the store runs for every volume, refused when the budget can't hold them. None runs one an online CPU, as many as
     /// the budget holds, so a budget at its floor runs none, and 0 leaves each volume's planner alone
     pub maintenance_workers: Option<usize>,
-    /// Threads that serve the async read forms
+    /// Threads that serve the async read forms. 0 runs none, for a caller that uses only the blocking forms: the async ones then
+    /// return NoAsyncReads, and the store holds no read slot and no ring
     pub read_threads: usize,
 }
 

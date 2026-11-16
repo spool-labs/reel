@@ -35,8 +35,8 @@ pub enum StoreError {
     BudgetTooSmall { budget: ByteCount, least: ByteCount },
     #[error("{maintenance_workers} maintenance workers and {read_threads} read threads need {least:?}, past a budget of {budget:?}")]
     ThreadsPastBudget { maintenance_workers: usize, read_threads: usize, budget: ByteCount, least: ByteCount },
-    #[error("a store needs at least one read thread")]
-    NoReadThreads,
+    #[error("the store runs no read threads, so it answers only the blocking calls")]
+    NoAsyncReads,
     #[error("batch touches more than one volume")]
     BatchAcrossVolumes,
     #[error("a record in column {column:?} failed its check")]

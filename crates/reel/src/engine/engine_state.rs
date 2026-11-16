@@ -737,6 +737,8 @@ impl<Backend: Io> EngineState<Backend> {
             open_slots: self.queues.len(),
             maintenance_workers: self.sizing.workers,
             is_read_only: self.is_read_only,
+            read_threads: self.read_tasks.len(),
+            read_slots: self.read_pool.slot_count(),
             least_budget: self.sizing.least_budget,
             room: self.sizing.room,
             open_time: Nanoseconds(self.open_time.load(Ordering::Acquire)),

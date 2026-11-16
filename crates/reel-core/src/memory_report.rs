@@ -35,6 +35,10 @@ pub struct MemoryReport {
     /// The store was opened read-only: it runs no workers and no write side, and its write index holds the open rows its last
     /// load found
     pub is_read_only: bool,
+    /// Read threads the store runs for the async calls, none when a caller uses only the blocking ones
+    pub read_threads: usize,
+    /// Async reads the store holds in flight at once
+    pub read_slots: usize,
     /// The least budget this store opens in with the workers and the ring it runs, a figure with no target on it
     pub least_budget: ByteCount,
     /// The fixed room the plan keeps for heap no part names: the rounding, and room a foreground job for its allocator's state

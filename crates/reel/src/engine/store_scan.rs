@@ -58,6 +58,9 @@ impl<Backend: Io> StoreScan<Backend> {
     /// Stream the next block of keys through the read workers, and say whether the walk has more. A walk dropped part way
     /// gives its buffers back when the worker ends, and a future dropped part way ends the walk
     pub async fn next_block(&mut self, keys: &mut ValueList) -> Result<bool, StoreError> {
+        if self.state.read_tasks.is_empty() {
+            return Err(StoreError::NoAsyncReads);
+        }
         self.state.caller_ops.note();
         keys.clear();
         if self.state.ring.is_some() {

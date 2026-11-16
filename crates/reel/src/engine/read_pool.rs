@@ -329,6 +329,9 @@ impl<Backend: Io> EngineState<Backend> {
         point: Option<WritePlace>,
         buf: &mut Vec<u8>,
     ) -> Result<bool, StoreError> {
+        if self.read_tasks.is_empty() {
+            return Err(StoreError::NoAsyncReads);
+        }
         if self.is_stopping.load(Ordering::Acquire) {
             return Err(StoreError::Closed);
         }
@@ -364,6 +367,9 @@ impl<Backend: Io> EngineState<Backend> {
         handovers: u64,
         values: &mut ValueList,
     ) -> Result<(), StoreError> {
+        if self.read_tasks.is_empty() {
+            return Err(StoreError::NoAsyncReads);
+        }
         if self.is_stopping.load(Ordering::Acquire) {
             return Err(StoreError::Closed);
         }

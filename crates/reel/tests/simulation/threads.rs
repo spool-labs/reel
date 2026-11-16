@@ -114,14 +114,12 @@ fn any_count_same_store() {
     assert_eq!(contents(4), none);
 }
 
-// a count the budget can't hold is refused, by name, and a store with no read thread has nothing to run async reads on
+// a count the budget can't hold is refused, by name
 #[test]
 fn refused_at_open() {
     let io = SimulatedIo::new(Seed(3));
     let many = ThreadCounts { maintenance_workers: Some(MANY_WORKERS), ..ThreadCounts::default() };
     assert!(matches!(ReelStore::open(io.clone(), &config(many)), Err(StoreError::ThreadsPastBudget { .. })));
-    let none = ThreadCounts { read_threads: 0, ..reel::config::NO_WORKERS };
-    assert!(matches!(ReelStore::open(io, &config(none)), Err(StoreError::NoReadThreads)));
 }
 
 // more read threads run, and memory_report counts their stacks

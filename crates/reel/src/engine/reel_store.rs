@@ -933,8 +933,13 @@ pub fn volume_disks<Backend: Io>(io: &Backend, config: &StoreConfig) -> Result<V
     Ok(disks)
 }
 
-/// Check a budget holds the ring beside the least a store runs on. A smaller one keeps async reads on the blocking pool
+/// Check a store runs async reads and its budget holds the ring beside the least it runs on. A smaller one keeps async reads on
+/// the blocking pool
 pub fn ring_fits(config: &StoreConfig, disks: &[Option<ByteCount>]) -> bool {
+    // the ring serves async reads alone, and a store with no read thread answers none
+    if config.threads.read_threads == 0 {
+        return false;
+    }
     let shape = StoreShape { workers: Some(0), ..store_shape(config, true, disks) };
     shape.least_budget() <= config.memory_budget
 }
@@ -953,9 +958,6 @@ pub fn read_only_sizing(config: &StoreConfig, disks: &[Option<ByteCount>]) -> Re
 pub fn sizing_of(config: &StoreConfig, shape: StoreShape) -> Result<EngineSizing, StoreError> {
     let shape = shape.with_workers_settled();
     let least_shape = StoreShape { workers: Some(0), ..shape };
-    if config.threads.read_threads == 0 {
-        return Err(StoreError::NoReadThreads);
-    }
     if config.memory_budget >= least_shape.least_budget() && config.memory_budget < shape.least_budget() {
         return Err(StoreError::ThreadsPastBudget {
             maintenance_workers: shape.workers(),

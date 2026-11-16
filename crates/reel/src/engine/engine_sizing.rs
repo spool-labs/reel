@@ -261,7 +261,8 @@ impl StoreShape {
         let read_buffers = counted(READ_BUFFERS, LEAST_READ_BUFFERS).max(READERS_PER_WORKER * self.workers());
         Counts {
             scans: counted(MOST_SCANS, LEAST_SCANS),
-            read_slots: counted(READ_SLOTS, LEAST_READ_SLOTS),
+            // the slots carry async reads to the read threads, and a store with none holds no slot
+            read_slots: if self.threads.read_threads == 0 { 0 } else { counted(READ_SLOTS, LEAST_READ_SLOTS) },
             read_buffers,
             write_buffers: if self.is_read_only { 0 } else { counted(WRITE_BUFFERS, LEAST_WRITE_BUFFERS) },
         }

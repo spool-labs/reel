@@ -365,3 +365,48 @@ fn segments_filled_by_a_mix_hold_no_room_past_their_ends() -> Result<(), Box<dyn
     std::fs::remove_dir_all(&root)?;
     Ok(())
 }
+
+// a store with no read thread answers the blocking calls, refuses the async ones by name, and holds no read slot or ring
+#[test]
+fn a_store_with_no_read_thread_answers_the_blocking_calls() -> Result<(), Box<dyn std::error::Error>> {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    use reel_core::reads::Reads;
+    use reel_core::store_error::StoreError;
+    use reel_core::value_list::ValueList;
+
+    let root = scratch_root().with_extension("blocking");
+    let _gone = std::fs::remove_dir_all(&root);
+    let mut config = config(root.clone());
+    config.threads = ThreadCounts { maintenance_workers: Some(0), read_threads: 0 };
+    let store = ReelStore::open(PlainIo::new(), &config)?;
+    let mut batch = WriteBatch::new();
+    for number in 0..KEYS {
+        batch.put(COLUMN, format!("key-{number:03}").as_bytes(), format!("value-{number}").as_bytes());
+    }
+    store.write_batch(&batch)?;
+    let mut value = Vec::new();
+    assert!(store.get(COLUMN, b"key-007", &mut value)?);
+    assert_eq!(value, b"value-7");
+    let mut scan = store.iter_from(COLUMN, b"key-050", Direction::Ascending)?;
+    let (mut key, mut found) = (Vec::new(), 0);
+    while scan.next_row(&mut key, &mut value)? == ScanStep::Found {
+        found += 1;
+    }
+    assert_eq!(found, KEYS - 50);
+    // the refusal comes on the first poll, before any slot or worker is asked for
+    let mut context = Context::from_waker(Waker::noop());
+    let mut buf = Vec::new();
+    let refused = std::pin::pin!(Reads::get_async(&store, COLUMN, b"key-007", &mut buf)).as_mut().poll(&mut context);
+    assert!(matches!(refused, Poll::Ready(Err(StoreError::NoAsyncReads))), "{refused:?}");
+    let mut keys = ValueList::new();
+    let block = std::pin::pin!(scan.next_block(&mut keys)).as_mut().poll(&mut context);
+    assert!(matches!(block, Poll::Ready(Err(StoreError::NoAsyncReads))), "{block:?}");
+    drop(scan);
+    let memory = store.memory_report();
+    assert_eq!((memory.read_threads, memory.read_slots), (0, 0), "{memory:?}");
+    store.close()?;
+    std::fs::remove_dir_all(&root)?;
+    Ok(())
+}

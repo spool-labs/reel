@@ -22,6 +22,8 @@ pub const CLIPPY_ARGUMENTS: [&str; 9] = ["clippy", "--workspace", "--all-targets
 /// Cargo arguments for the lint pass on the build a node takes, with no test hooks. It names the published crates alone, since a
 /// workspace build unifies features, and the sims crate turns the test hooks on for every member
 pub const NODE_CLIPPY_ARGUMENTS: [&str; 10] = ["clippy", "-p", "tape-reel", "-p", "tape-reel-core", "--lib", "--locked", "--", "-D", "warnings"];
+/// Cargo arguments for the outside caller's test, in a call of its own with no features, so the test hooks never reach it
+pub const PUBLIC_API_ARGUMENTS: [&str; 4] = ["test", "--locked", "-p", "tape-reel-public-api"];
 /// Cargo arguments for the test pass, which keeps going after a failure
 pub const TEST_ARGUMENTS: [&str; 8] = ["test", "--workspace", "--locked", "--no-fail-fast", "--profile", CI_PROFILE, "--features", TEST_HOOKS];
 /// Cargo arguments for the pick gate: every kind of pick at 100,000 segments a volume, timed in a release build against its line
@@ -84,6 +86,11 @@ pub fn run_ci() -> Result<(), TaskError> {
     let node = run_cargo(&root, &NODE_CLIPPY_ARGUMENTS)?;
     if !node.is_success {
         failures.push("the build without test hooks has problems".to_string());
+    }
+
+    let public = run_cargo(&root, &PUBLIC_API_ARGUMENTS)?;
+    if !public.is_success {
+        failures.push("an outside caller can't build or run a store through the public surface".to_string());
     }
 
     // the workers pass runs the same binary beside the test pass, and waits on cargo's build lock until it's built

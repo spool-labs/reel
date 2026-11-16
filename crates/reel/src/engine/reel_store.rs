@@ -402,7 +402,7 @@ impl<Backend: Io> ReelStore<Backend> {
 
     /// Clear spans in memory and in the summary, and go back to how they were when the save fails, so an
     /// error always means nothing changed
-    pub fn clear_spans(
+    pub(crate) fn clear_spans(
         &self,
         volume: &Volume<Backend>,
         column: ColumnId,
@@ -525,7 +525,7 @@ impl<Backend: Io> Drop for ReelStore<Backend> {
 
 impl<Backend: Io> EngineState<Backend> {
     /// Stop every job
-    pub fn stop_jobs(&self) -> Result<(), Error> {
+    pub(crate) fn stop_jobs(&self) -> Result<(), Error> {
         self.is_stopping.store(true, Ordering::Release);
         // the jobs with long steps all stop at once, so the joins below wait for the slowest step and not the sum
         self.workers.ask_stop();
@@ -566,7 +566,7 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Close every handle of a volume
-    pub fn close_volume(&self, volume: &Volume<Backend>) {
+    pub(crate) fn close_volume(&self, volume: &Volume<Backend>) {
         // a read that outlives its store keeps its handle, and open finishes what the file's leaving started
         for slot in hold(&volume.parked).iter_mut() {
             if slot.as_ref().is_some_and(|parked| volume.is_unpinned(parked))

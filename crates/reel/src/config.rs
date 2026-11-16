@@ -85,6 +85,13 @@ pub struct VolumeConfig {
     pub device: DeviceClass,
 }
 
+impl VolumeConfig {
+    /// Build a volume on these roots, with the device under the first root asked about
+    pub fn new(name: impl Into<String>, roots: Vec<PathBuf>, sync: SyncPolicy) -> Self {
+        Self { name: name.into(), roots, sync, device: DeviceClass::Detect }
+    }
+}
+
 /// How many threads a store runs for maintenance and async reads. Each one's memory comes out of the budget, sized and touched at
 /// open, and a count the budget can't hold is refused there. One seal thread a volume runs whatever these say
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

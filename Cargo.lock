@@ -113,6 +113,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tape-reel-public-api"
+version = "0.4.0"
+dependencies = [
+ "tape-reel",
+ "tape-reel-core",
+]
+
+[[package]]
 name = "tape-reel-sim"
 version = "0.4.0"
 dependencies = [

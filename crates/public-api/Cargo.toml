@@ -1,0 +1,14 @@
+[package]
+name = "tape-reel-public-api"
+version.workspace = true
+edition.workspace = true
+publish = false
+license.workspace = true
+description = "Opens a store through tape-reel's public surface alone, as an outside caller does"
+
+[dependencies]
+reel.workspace = true
+reel-api.workspace = true
+
+[lints]
+workspace = true

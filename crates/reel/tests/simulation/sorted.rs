@@ -450,7 +450,7 @@ fn past_capacity_stays_right() {
 #[test]
 fn churn_matches_the_model() {
     for seed in seeds(0..CHURN_SEEDS) {
-        let marks = churn(seed, Arm { capacity: CAPACITY, key_of: key, extra: 0 });
+        let marks = churn(seed, Arm { capacity: CAPACITY, key_of: key, extra: 0, is_sized: false });
         assert_eq!(marks, (false, true), "seed {seed}");
     }
 }
@@ -459,9 +459,26 @@ fn churn_matches_the_model() {
 #[test]
 fn churn_in_one_part_matches_the_model() {
     for seed in seeds(0..CHURN_SEEDS) {
-        let marks = churn(seed, Arm { capacity: CAPACITY, key_of: one_part_key, extra: 0 });
+        let marks = churn(seed, Arm { capacity: CAPACITY, key_of: one_part_key, extra: 0, is_sized: false });
         assert_eq!(marks, (false, true), "seed {seed}");
     }
+}
+
+// opens that resized an index in the sized churn, over every seed
+static SIZED_RESIZES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// the same churn with the index sized by the store at every open: from the image after a clean close, from the rows on disk
+// after a kill, and an image saved at one pool size taken into another
+#[test]
+fn churn_sized_by_the_store_matches_the_model() {
+    // a small headroom, so each pool follows the keys its index held and opens resize it
+    reel::engine::engine_sizing::TEST_INDEX_HEADROOM.with(|headroom| headroom.set(Some(64 * 1024)));
+    for seed in seeds(0..CHURN_SEEDS) {
+        churn(seed, Arm { capacity: CAPACITY, key_of: key, extra: 0, is_sized: true });
+    }
+    let resized = SIZED_RESIZES.load(Ordering::Relaxed);
+    println!("{resized} opens resized an index");
+    assert!(resized > 0, "no open resized an index");
 }
 
 // the same churn on an index with room for fewer rows than a seed writes: extra keys put first take it past capacity, and a
@@ -470,7 +487,7 @@ fn churn_in_one_part_matches_the_model() {
 fn churn_past_capacity_matches_the_model() {
     let (mut marked, mut cleared) = (0, 0);
     for seed in seeds(0..CHURN_SEEDS) {
-        let (was_marked, is_cleared) = churn(seed, Arm { capacity: CHURN_CAPACITY, key_of: one_part_key, extra: EXTRA_KEYS });
+        let (was_marked, is_cleared) = churn(seed, Arm { capacity: CHURN_CAPACITY, key_of: one_part_key, extra: EXTRA_KEYS, is_sized: false });
         marked += u64::from(was_marked);
         cleared += u64::from(was_marked && is_cleared);
     }
@@ -483,16 +500,31 @@ struct Arm {
     capacity: RowCount,
     key_of: fn(u64) -> Vec<u8>,
     extra: u64,
+    /// The store sizes the index from the keys it held at each open, in place of the declared rows
+    is_sized: bool,
 }
 
 // run one seed's churn, and say whether the index was ever marked and whether it ends with no mark
-fn churn(seed: u64, Arm { capacity, key_of, extra }: Arm) -> (bool, bool) {
+fn churn(seed: u64, Arm { capacity, key_of, extra, is_sized }: Arm) -> (bool, bool) {
+    let open_arm = |io: &SimulatedIo| if is_sized { open_sized(io) } else { open(io, capacity) };
+    // a store that sizes its index: got stays under asked, a clean close's image is taken or refused once, and the pool moves
+    let mut resized = 0;
+    let mut sized_check = |store: &Store, was_clean: bool, before: RowCount| {
+        if !is_sized {
+            return;
+        }
+        let reading = sorted_reading(store);
+        assert!(reading.got_bytes <= reading.asked_bytes, "seed {seed}: {reading:?}");
+        let (taken, refused) = image_counts(store);
+        assert_eq!(taken + refused, u64::from(was_clean), "seed {seed}: taken {taken}, refused {refused}");
+        resized += u64::from(reading.capacity != before);
+    };
     let is_marked = |store: &Store| store.state.sorted_index(COLUMN).expect("an index").mark().is_some();
     let mut was_marked = false;
     {
         let io = SimulatedIo::new(Seed(100 + seed));
         let mut random = SeededRandom::new(Seed(200 + seed));
-        let mut store = open(&io, capacity);
+        let mut store = open_arm(&io);
         let mut model = Model::new();
         let written: Vec<Vec<u8>> = (0..CHURN_KEYS).map(key_of).collect();
         // the extra keys sort together past every churn key of their part, so one range delete takes them all
@@ -540,15 +572,19 @@ fn churn(seed: u64, Arm { capacity, key_of, extra }: Arm) -> (bool, bool) {
                 0 => seal(&store, &io),
                 1 => seal_all(&store, &io),
                 2 => {
+                    let before = sorted_reading(&store).capacity;
                     store.close().expect("close");
                     drop(store);
-                    store = open(&io, capacity);
+                    store = open_arm(&io);
+                    sized_check(&store, true, before);
                 },
                 _ => {
                     store.flush().expect("flush");
+                    let before = sorted_reading(&store).capacity;
                     io.kill();
                     drop(store);
-                    store = open(&io, capacity);
+                    store = open_arm(&io);
+                    sized_check(&store, false, before);
                 },
             }
             was_marked |= is_marked(&store);
@@ -584,6 +620,10 @@ fn churn(seed: u64, Arm { capacity, key_of, extra }: Arm) -> (bool, bool) {
             assert!(store.state.sorted_scan_keys.load(Ordering::Relaxed) > 0, "no scan key came from the index");
         }
         store.close().expect("close");
+        if is_sized {
+            println!("seed {seed}: {resized} opens resized the index");
+            SIZED_RESIZES.fetch_add(resized, Ordering::Relaxed);
+        }
         (was_marked, is_cleared)
     }
 }

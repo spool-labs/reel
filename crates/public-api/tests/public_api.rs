@@ -322,7 +322,8 @@ fn segments_sealed_by_filling_hold_no_room_past_their_ends() -> Result<(), Box<d
     for (path, length, held) in &sealed {
         println!("{} {length} B long, {held} B held", path.display());
     }
-    // close waits for no seal under way, so how many filled segments sealed by then depends on timing, and one is enough
+    // close waits for no seal under way, so how many filled segments sealed by then depends on timing, and one is enough: the mix
+    // test below holds the shape that kept blocks past a segment's end
     assert!(!sealed.is_empty(), "no segment sealed: {files:?}");
     assert!(sealed.iter().all(|(_path, length, held)| *held <= length.next_multiple_of(4_096)), "{sealed:?}");
     std::fs::remove_dir_all(&root)?;

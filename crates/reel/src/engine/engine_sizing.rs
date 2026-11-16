@@ -501,7 +501,7 @@ pub fn index_ask(width: usize, keys: u64, least_rows: Option<RowCount>, saved: B
         return IndexAsk::Part;
     }
     let rows = keys.saturating_mul(INDEX_GROWTH).max(least_rows.map_or(0, |least| least.0));
-    IndexAsk::Bytes(ByteCount((planned_index_bytes(width, RowCount(rows)).0 + INDEX_HEADROOM.0).max(saved.0)))
+    IndexAsk::Bytes(ByteCount((planned_index_bytes(width, RowCount(rows)).0 + index_headroom().0).max(saved.0)))
 }
 
 /// Read the sorted indexes' cap: the spot, block and record caches past the floor they keep
@@ -543,4 +543,22 @@ pub fn is_index_exact() -> bool {
 #[cfg(not(feature = "test-hooks"))]
 pub const fn is_index_exact() -> bool {
     false
+}
+
+#[cfg(feature = "test-hooks")]
+thread_local! {
+    /// A headroom a sim sets for the stores it opens on its own thread, so a small index's pool follows its keys
+    pub static TEST_INDEX_HEADROOM: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Read the headroom a sorted index asks for: a sim's when it set one, else INDEX_HEADROOM
+#[cfg(feature = "test-hooks")]
+pub fn index_headroom() -> ByteCount {
+    TEST_INDEX_HEADROOM.with(std::cell::Cell::get).map_or(INDEX_HEADROOM, ByteCount)
+}
+
+/// Read the headroom a sorted index asks for
+#[cfg(not(feature = "test-hooks"))]
+pub const fn index_headroom() -> ByteCount {
+    INDEX_HEADROOM
 }

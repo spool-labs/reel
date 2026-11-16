@@ -206,7 +206,7 @@ fn config(policy: SyncPolicy, complete_rows: Option<RowCount>) -> StoreConfig {
         name: name.to_string(),
         roots: roots.iter().map(PathBuf::from).collect(),
         sync,
-        device: Default::default(), open_segments: None, segment_bytes: None,
+        device: Default::default(), open_segments: None, segment_bytes: None, lifetime_groups: None,
     };
     let column = |id: ColumnId, name: &str, volume: u8, complete_rows: Option<RowCount>| ColumnConfig {
         id,

@@ -87,7 +87,7 @@ fn config_at(budget: ByteCount) -> StoreConfig {
             name: "allocations".to_string(),
             roots: vec![PathBuf::from(ROOT)],
             sync: SyncPolicy::Never,
-            device: Default::default(), open_segments: None, segment_bytes: None,
+            device: Default::default(), open_segments: None, segment_bytes: None, lifetime_groups: None,
         }],
         columns: vec![column(META, "meta", Codec::None, Some(TABLE_ROWS)), column(BULK, "bulk", Codec::Lz4, None), column(PLAIN, "plain", Codec::None, None)],
     }

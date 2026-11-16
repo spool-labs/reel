@@ -51,7 +51,7 @@ fn open(io: &SimulatedIo) -> Store {
             name: "compact".to_string(),
             roots: vec![PathBuf::from(ROOT)],
             sync: SyncPolicy::Never,
-            device: Default::default(), open_segments: None, segment_bytes: None,
+            device: Default::default(), open_segments: None, segment_bytes: None, lifetime_groups: None,
         }],
         columns: vec![ColumnConfig {
             id: COLUMN,
@@ -1292,7 +1292,7 @@ fn open_crowd_config() -> StoreConfig {
             name: "crowd".to_string(),
             roots: vec![PathBuf::from(ROOT)],
             sync: SyncPolicy::Never,
-            device: Default::default(), open_segments: None, segment_bytes: None,
+            device: Default::default(), open_segments: None, segment_bytes: None, lifetime_groups: None,
         }],
         columns: vec![ColumnConfig {
             id: COLUMN,

@@ -116,6 +116,9 @@ pub struct VolumeConfig {
     /// step then follows it, an eighth of the segment down to a page. A store whose every volume sets one caps its write index at
     /// three segments' worth of the smallest rows, and a batch can hold no more rows than that: 60,491 at 256 KiB segments
     pub segment_bytes: Option<ByteCount>,
+    /// The lifetime groups marked writes may hold open at once. None takes them from open_segments. Some(0) runs none, for a
+    /// writer that never marks a row: its slots are its open segments alone, and a marked write is refused with NoLifetimeGroups
+    pub lifetime_groups: Option<usize>,
 }
 
 impl ColumnConfig {
@@ -148,7 +151,7 @@ impl ColumnConfig {
 impl VolumeConfig {
     /// Build a volume on these roots, with the device under the first root asked about
     pub fn new(name: impl Into<String>, roots: Vec<PathBuf>, sync: SyncPolicy) -> Self {
-        Self { name: name.into(), roots, sync, device: DeviceClass::Detect, open_segments: None, segment_bytes: None }
+        Self { name: name.into(), roots, sync, device: DeviceClass::Detect, open_segments: None, segment_bytes: None, lifetime_groups: None }
     }
 
     /// Count the segments this volume's unmarked writes may take at once
@@ -158,7 +161,10 @@ impl VolumeConfig {
 
     /// Count the lifetime groups this volume's marked writes may hold open at once
     pub fn most_groups(&self) -> usize {
-        self.open_segments.map_or(MOST_LIFETIME_GROUPS, |most| most.clamp(1, MOST_LIFETIME_GROUPS))
+        match self.lifetime_groups {
+            Some(groups) => groups.min(MOST_LIFETIME_GROUPS),
+            None => self.open_segments.map_or(MOST_LIFETIME_GROUPS, |most| most.clamp(1, MOST_LIFETIME_GROUPS)),
+        }
     }
 }
 

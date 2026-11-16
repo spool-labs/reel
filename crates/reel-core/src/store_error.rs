@@ -41,6 +41,8 @@ pub enum StoreError {
     SegmentSize { asked: ByteCount, least: ByteCount, most: ByteCount },
     #[error("column {column}: {reason}")]
     BadIndex { column: String, reason: &'static str },
+    #[error("volume {volume:?} runs no lifetime groups, so it takes no marked write")]
+    NoLifetimeGroups { volume: VolumeId },
     #[error("batch touches more than one volume")]
     BatchAcrossVolumes,
     #[error("a record in column {column:?} failed its check")]

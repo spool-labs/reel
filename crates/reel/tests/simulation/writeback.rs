@@ -37,7 +37,7 @@ fn open_with(io: &SimulatedIo, sync: SyncPolicy) -> Store {
             name: "writeback".to_string(),
             roots: vec![PathBuf::from(ROOT)],
             sync,
-            device: Default::default(), open_segments: None, segment_bytes: None,
+            device: Default::default(), open_segments: None, segment_bytes: None, lifetime_groups: None,
         }],
         columns: vec![ColumnConfig {
             id: COLUMN,

@@ -205,6 +205,10 @@ impl<Backend: Io> EngineState<Backend> {
         volume: &'state Volume<Backend>,
         request: &ClaimRequest,
     ) -> Result<Claim<'state, Backend>, StoreError> {
+        // a volume with no group has nowhere to put a mark, and a pick for one would wait for a group that never opens
+        if request.mark.is_some() && volume.most_groups == 0 {
+            return Err(StoreError::NoLifetimeGroups { volume: volume.id });
+        }
         let deadline = self.io.now().0.saturating_add(INDEX_WAIT.0);
         loop {
             // a failed volume frees no slot, so a wait for one would never end

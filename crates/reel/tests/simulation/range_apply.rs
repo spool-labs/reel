@@ -43,7 +43,7 @@ fn open(io: &SimulatedIo) -> Store {
             name: "range".to_string(),
             roots: vec![PathBuf::from(ROOT)],
             sync: SyncPolicy::Never,
-            device: Default::default(), open_segments: None, segment_bytes: None,
+            device: Default::default(), open_segments: None, segment_bytes: None, lifetime_groups: None,
         }],
         columns: vec![ColumnConfig {
             id: COLUMN,

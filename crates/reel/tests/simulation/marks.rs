@@ -42,7 +42,7 @@ fn config() -> StoreConfig {
             name: "marks".to_string(),
             roots: vec![PathBuf::from(ROOT)],
             sync: SyncPolicy::Never,
-            device: Default::default(), open_segments: None, segment_bytes: None,
+            device: Default::default(), open_segments: None, segment_bytes: None, lifetime_groups: None,
         }],
         columns: vec![ColumnConfig {
             id: COLUMN,
@@ -468,5 +468,31 @@ fn open_segments_cap_the_groups() {
     let sealed = sealed_marks(&store);
     assert_eq!(sealed.len(), 1);
     assert_eq!(sealed[0].1.highest, far(0));
+    store.close().expect("close");
+}
+
+// a volume set to no lifetime group refuses a marked write by name, a marked batch too, takes unmarked ones, and holds the slots
+// of its open segment alone
+#[test]
+fn no_lifetime_groups_refuse_a_mark() {
+    use reel_core::store_error::StoreError;
+    let io = SimulatedIo::new(Seed(7));
+    let mut config = config();
+    config.volumes[0].open_segments = Some(1);
+    config.volumes[0].lifetime_groups = Some(0);
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let refused = store.put_marked(COLUMN, b"marked", b"value", DeathMark(FAR_APART));
+    assert!(matches!(refused, Err(StoreError::NoLifetimeGroups { volume: VolumeId(0) })), "{refused:?}");
+    let mut batch = WriteBatch::new();
+    batch.set_mark(DeathMark(FAR_APART));
+    batch.put(COLUMN, b"batched", b"value");
+    let refused = store.write_batch(&batch);
+    assert!(matches!(refused, Err(StoreError::NoLifetimeGroups { .. })), "{refused:?}");
+    store.put(COLUMN, b"plain", b"value").expect("put");
+    let mut value = Vec::new();
+    assert!(store.get(COLUMN, b"plain", &mut value).expect("get"));
+    assert!(!store.get(COLUMN, b"marked", &mut value).expect("get") && !store.get(COLUMN, b"batched", &mut value).expect("get"));
+    // one open segment takes its own slot and one while it seals, and no group adds any
+    assert_eq!(store.memory_report().open_slots, 2);
     store.close().expect("close");
 }

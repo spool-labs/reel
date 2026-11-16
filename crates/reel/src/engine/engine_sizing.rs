@@ -22,7 +22,9 @@ use crate::segment::column_directory::Candidate;
 use crate::segment::footer_reader::CANDIDATE_PAGE;
 use crate::segment::row_block::{BLOCK_TRAILER_BYTES, COMPLETE_BLOCK_BYTES, ROW_BLOCK_BYTES, ROW_ROOM_NUMBERS};
 use crate::segment::segment_table::TABLE_SHARDS;
-use crate::segment::segment_tail::{MAX_TAIL_BYTES, MOST_SEGMENT_BYTES};
+use crate::segment::segment_tail::{BlockCount, MAX_COLUMNS, MAX_TAIL_BYTES, MOST_SEGMENT_BYTES};
+
+use crate::config::{FORMAT_ROW_FLOOR, StoreConfig};
 use crate::segment::summary_orders::ORDER_BYTES;
 
 /// A segment's target size on a store with a full budget, and a smaller budget targets half of itself
@@ -206,6 +208,8 @@ pub struct StoreShape {
     pub is_read_only: bool,
     /// The bytes each slot's record windows hold: the largest window any volume takes
     pub window_bytes: usize,
+    /// The bytes the volumes' seals plan under MOST_SEGMENT_BLOCKS' list, where a set segment size bounds the blocks they write
+    pub seal_entries_saved: u64,
 }
 
 /// What a budget buys
@@ -302,9 +306,10 @@ impl StoreShape {
         let cover_fixed = (COVER_SLOT_BYTES + COVER_RECORD_BYTES) as u64 * MOST_RANGE_COVERS as u64;
         let covers = 2 * cover_keys + volumes * cover_fixed;
         let jobs = if self.is_read_only { 0 } else { SEAL_JOB_BYTES + WALK_JOB_BYTES + COMPACT_JOB_BYTES };
+        let seal_saved = if self.is_read_only { 0 } else { self.seal_entries_saved };
         let worker_jobs = seats * LANE_JOB_BYTES;
         let declared = self.declared_bytes.0;
-        ByteCount(queues + gathers + windows + reads + job_reads + scans + read_slots + encoders + covers + volumes * (jobs + spans) + worker_jobs + workers * WALK_JOB_BYTES + stacks + declared)
+        ByteCount(queues + gathers + windows + reads + job_reads + scans + read_slots + encoders + covers + volumes * (jobs + spans) + worker_jobs + workers * WALK_JOB_BYTES + stacks + declared - seal_saved)
     }
 
     /// Count the jobs a store runs: the shared ones, its read threads, a seal job a volume and the workers
@@ -401,14 +406,14 @@ impl EngineSizing {
             return self;
         };
         let planned_rows = self.segment_rows.0 * 8 / SEAL_ROWS_EIGHTHS;
-        let wanted_rows = (rows * 8 / SEAL_ROWS_EIGHTHS * INDEX_ROWS_MARGIN * volumes.max(1)).max(1);
+        let (wanted_rows, segment_rows) = capped_rows(rows, volumes);
         if wanted_rows >= planned_rows {
             return self;
         }
         let shard = shard_for_rows(wanted_rows, self.shard.open_slots);
         let freed = (self.shard.heap_bytes().0.saturating_sub(shard.heap_bytes().0)) * SHARD_COUNT as u64;
         Self {
-            segment_rows: RowCount(wanted_rows * SEAL_ROWS_EIGHTHS / 8),
+            segment_rows: RowCount(segment_rows),
             shard,
             record_share: ByteCount(self.record_share.0 + freed),
             ..self
@@ -667,4 +672,62 @@ pub const fn index_headroom(cap: u64, indexes: usize) -> ByteCount {
 pub const fn store_headroom(cap: u64, indexes: usize) -> ByteCount {
     let each = cap / 4 * HEADROOM_QUARTERS / if indexes == 0 { 1 } else { indexes as u64 };
     ByteCount(if each < INDEX_HEADROOM.0 { each } else { INDEX_HEADROOM.0 })
+}
+
+/// Work out the row blocks a seal can write for a segment of this many rows: a block holds at least fewest_rows_for_key of the
+/// widest rows the volume's keys allow, a column change can close one early, and two more for the margin a merge keeps. Never more than
+/// MOST_SEGMENT_BLOCKS
+pub fn blocks_for_segment_rows(rows: u64, widest_key: usize) -> BlockCount {
+    let blocks = rows.div_ceil(fewest_rows_for_key(widest_key)) + MAX_COLUMNS as u64 + 2;
+    BlockCount(blocks.min(u64::from(MOST_SEGMENT_BLOCKS.0)) as u32)
+}
+
+/// Work out the most rows a segment can take and still seal into this many row blocks, the other side of blocks_for_segment_rows
+pub fn rows_within_blocks(blocks: BlockCount, widest_key: usize) -> u64 {
+    u64::from(blocks.0).saturating_sub(MAX_COLUMNS as u64 + 2) * fewest_rows_for_key(widest_key)
+}
+
+/// Work out the row blocks a volume's seal plans for. A store whose every volume sets its segment size caps the rows a segment
+/// takes (for_set_segments), so the seal's list follows that cap, the same rows from the same function. A volume
+/// with a complete column keeps MOST_SEGMENT_BLOCKS, since its seals feed the table
+pub fn seal_blocks(config: &StoreConfig, volume: usize) -> BlockCount {
+    let has_complete = config.columns.iter().any(|column| column.volume.0 as usize == volume && column.complete_rows().is_some());
+    let capped = set_segment_rows(config).map(|rows| capped_rows(rows, config.volumes.len() as u64).1);
+    match capped {
+        Some(rows) if !has_complete => blocks_for_segment_rows(rows, config.widest_key(volume)),
+        _ => MOST_SEGMENT_BLOCKS,
+    }
+}
+
+/// Read the rows a segment of the largest set size can hold at the format's row floor, when every volume sets its size
+pub fn set_segment_rows(config: &StoreConfig) -> Option<u64> {
+    let sizes = config.volumes.iter().map(|volume| volume.segment_bytes.map(|bytes| bytes.0)).collect::<Option<Vec<u64>>>()?;
+    sizes.into_iter().max().map(|bytes| bytes / FORMAT_ROW_FLOOR)
+}
+
+/// Work out the write index rows and the segment rows a set size caps a store at, from a segment's rows at the floor and the
+/// volume count: the index holds three segments' worth with the seal's margin for every volume, and a segment seals at its share
+pub fn capped_rows(segment_rows: u64, volumes: u64) -> (u64, u64) {
+    let wanted_rows = (segment_rows * 8 / SEAL_ROWS_EIGHTHS * INDEX_ROWS_MARGIN * volumes.max(1)).max(1);
+    (wanted_rows, wanted_rows * SEAL_ROWS_EIGHTHS / 8)
+}
+
+/// Check a volume's seal can write every block its segments can need: its segment row limit within what its list holds
+pub fn check_seal_blocks(segment_rows: RowCount, blocks: BlockCount, widest_key: usize) -> std::io::Result<()> {
+    if segment_rows.0 > rows_within_blocks(blocks, widest_key) {
+        return Err(std::io::Error::other(format!(
+            "a segment can take {} rows and its seal's list of {} blocks holds {}",
+            segment_rows.0,
+            blocks.0,
+            rows_within_blocks(blocks, widest_key)
+        )));
+    }
+    Ok(())
+}
+
+/// Count the fewest rows a row block holds when no key is wider than this: the block's room over the widest row it can take,
+/// less one for the row that closes it
+pub fn fewest_rows_for_key(widest_key: usize) -> u64 {
+    let widest_row = ROW_ROOM_NUMBERS + widest_key + size_of::<u16>();
+    (ROW_BLOCK_BYTES.saturating_sub(BLOCK_TRAILER_BYTES) / widest_row).saturating_sub(1).max(1) as u64
 }

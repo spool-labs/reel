@@ -112,13 +112,14 @@ impl<Backend: Io> SealJob<Backend> {
     /// Build a job with its buffers
     pub fn new(state: Arc<EngineState<Backend>>, volume: usize) -> Self {
         let ranges_room = state.volumes[volume].covers.footer_room();
+        let seal_blocks = state.volumes[volume].seal_blocks;
         let sorted_width = state.sorted.iter().enumerate().filter(|(id, index)| index.is_some() && state.columns[*id].is_some_and(|info| info.volume.0 as usize == volume)).flat_map(|(_id, index)| index.as_ref().map(|index| index.width())).max().unwrap_or(0);
         Self {
             state,
             volume,
             phase: SealPhase::Idle,
             target: None,
-            writer: FooterWriter::new(MOST_SEGMENT_BLOCKS),
+            writer: FooterWriter::new(seal_blocks),
             walk: SealWalk::new(),
             column: None,
             highest: touched_capacity(MAX_KEY_BYTES as usize, 0),
@@ -273,6 +274,15 @@ impl<Backend: Io> SealJob<Backend> {
         self.is_in_table = false;
         self.columns_listed = 0;
         self.is_summarized = false;
+        // a seal's list holds the blocks its volume's row limit can need, so a target past that limit is the bound broken at its cause
+        #[cfg(feature = "test-hooks")]
+        assert!(
+            target.row_count.0 <= self.volume().seal_rows,
+            "a seal of {} rows past the {} its list of {} blocks holds",
+            target.row_count.0,
+            self.volume().seal_rows,
+            self.volume().seal_blocks.0
+        );
         self.phase = SealPhase::Writing;
         Ok(())
     }

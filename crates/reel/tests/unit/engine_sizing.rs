@@ -49,6 +49,7 @@ fn shape(budget: ByteCount, roots: usize) -> StoreShape {
         declared_bytes: ByteCount(0),
         is_read_only: false,
         window_bytes: reel::engine::open_segment::RECORD_WINDOW_BYTES,
+        seal_entries_saved: 0,
     }
 }
 
@@ -82,6 +83,7 @@ fn documented_rows() {
             declared_bytes: ByteCount(0),
             is_read_only: false,
             window_bytes: reel::engine::open_segment::RECORD_WINDOW_BYTES,
+            seal_entries_saved: 0,
         };
 
         assert_eq!(EngineSizing::for_store(&store).segment_rows, RowCount(rows), "{mib} MiB");
@@ -107,6 +109,7 @@ fn summary_holds_blocks() {
         declared_bytes: ByteCount(0),
         is_read_only: false,
         window_bytes: reel::engine::open_segment::RECORD_WINDOW_BYTES,
+        seal_entries_saved: 0,
     };
     let rows_room = EngineSizing::for_store(&store).summary_share.0 / 2;
     let blocks = 1_000_000_000 / ROWS_PER_BLOCK;
@@ -135,6 +138,7 @@ fn documented_reserve() {
             declared_bytes: ByteCount(0),
             is_read_only: false,
             window_bytes: reel::engine::open_segment::RECORD_WINDOW_BYTES,
+            seal_entries_saved: 0,
         };
 
         let segment = EngineSizing::for_store(&store).segment_bytes;
@@ -673,4 +677,17 @@ fn a_missing_relative_root_sits_on_the_current_directory() {
     assert_eq!(disk_root(&PlainIo::new(), root), std::path::PathBuf::from("."));
     let absolute = std::env::temp_dir().join("no-such-reel-dir-for-a-test").join("store");
     assert_eq!(disk_root(&PlainIo::new(), &absolute), std::env::temp_dir());
+}
+
+// a seal list holds the rows its blocks can take by the volume's widest key, and the check at open refuses a row limit one past it
+#[test]
+fn a_seal_list_bounds_its_rows() {
+    use reel::engine::engine_sizing::{blocks_for_segment_rows, check_seal_blocks, rows_within_blocks};
+    for (rows, widest) in [(60_491_u64, 64_usize), (20_000, 16), (900_591, 64), (1_000, 1_024)] {
+        let blocks = blocks_for_segment_rows(rows, widest);
+        let within = rows_within_blocks(blocks, widest);
+        assert!(within >= rows || blocks.0 == 65_536, "{rows} rows of {widest} B keys: {blocks:?} hold {within}");
+        assert!(check_seal_blocks(RowCount(within), blocks, widest).is_ok());
+        assert!(check_seal_blocks(RowCount(within + 1), blocks, widest).is_err(), "a row past the bound passed");
+    }
 }

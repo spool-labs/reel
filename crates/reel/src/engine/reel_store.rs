@@ -18,7 +18,7 @@ use reel_core::units::{ByteCount, DeathMark, Nanoseconds, RowCount, VolumeId, Wr
 use reel_core::usage::{ColumnUsage, UsageReport};
 use reel_core::write_batch::WriteBatch;
 
-use crate::config::{ColumnConfig, ColumnIndex, DeviceClass, FORMAT_ROW_FLOOR, KeyShape, LEAST_SEGMENT_BYTES, MOST_SET_SEGMENT_BYTES, StoreConfig, VolumeConfig};
+use crate::config::{ColumnConfig, ColumnIndex, DeviceClass, KeyShape, LEAST_SEGMENT_BYTES, MOST_SET_SEGMENT_BYTES, StoreConfig, VolumeConfig};
 use crate::engine::dead_bits::{CHUNK_WORDS, DEAD_BITS_NAME, DeadBits, NEW_DEAD_BITS_NAME, SAVE_HEADS_PAGE};
 use crate::engine::rewrite_job::{record_totals, rows_of};
 use crate::segment::block_filter::BITS_PER_ROW;
@@ -28,7 +28,7 @@ use crate::engine::admission::Admission;
 use reel_core::maintenance_report::WorkerPriority;
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::engine_sizing::{
-    complete_block_rows, complete_row_limit, index_headroom, split_idle_room,
+    check_seal_blocks, complete_block_rows, complete_row_limit, index_headroom, rows_within_blocks, seal_blocks, set_segment_rows, split_idle_room,
     EngineSizing, FILTER_CACHE_QUARTERS, FILTER_SLOT_BYTES, GROUP_BYTES, LEAST_LZ4_BUDGET, LEAST_SHARD_ENTRIES, PLANNED_LINE_BYTES,
     SHARED_JOBS, StoreShape, GATHER_BYTES, assumed_segment_bytes, capped_entries, disk_entries, entry_cost, entry_cover, floor_entries,
     dead_bits_bytes, segment_bytes_for, target_rows, IndexAsk, index_ask, index_cap, is_index_exact, share_indexes,
@@ -151,6 +151,9 @@ impl<Backend: Io> ReelStore<Backend> {
         state.complete_images = complete_images(config);
         state.attach_ring(ring);
         state.prefault_time.store(state.io.now().0.saturating_sub(touched_from.0), Ordering::Release);
+        for volume in &state.volumes {
+            check_seal_blocks(volume.segment_rows, volume.seal_blocks, config.widest_key(volume.id.0 as usize)).map_err(open_error("checking a seal's block list"))?;
+        }
         let state = Arc::new(state);
         if let Err(error) = bring_up(&state, &mut scan) {
             // a caller can retry, so a failed open leaves no handle behind
@@ -878,6 +881,8 @@ pub fn store_shape(config: &StoreConfig, has_ring: bool, disks: &[Option<ByteCou
         is_read_only: false,
         // the slots' windows serve every volume, so they hold the largest any volume takes
         window_bytes: config.volumes.iter().map(|volume| window_bytes_for(volume.segment_bytes.map(|bytes| bytes.0))).max().unwrap_or(0),
+        // each volume's seal plans its list at the blocks its segments can need
+        seal_entries_saved: (0..config.volumes.len()).map(|volume| u64::from(MOST_SEGMENT_BLOCKS.0 - seal_blocks(config, volume).0) * size_of::<BlockEntry>() as u64).sum(),
     };
     // a segment's rows come from the shares, so the disks ask at the rows a plan with no line of theirs gives
     let rows = EngineSizing::for_store(&bare.with_workers_settled()).segment_rows;
@@ -1282,8 +1287,8 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
     let sizing = sizing.for_mean_record(mean, config.volumes.len() as u64);
     // a store whose every volume set its segment size holds no more rows than those segments can, a segment's bytes over the
     // format's row floor. A column's declared least value is no floor here, since a smaller value lands and a delete has none
-    let set_rows = config.volumes.iter().map(|volume| volume.segment_bytes.map(|bytes| bytes.0 / FORMAT_ROW_FLOOR)).collect::<Option<Vec<u64>>>();
-    let sizing = sizing.for_set_segments(set_rows.and_then(|rows| rows.into_iter().max()), config.volumes.len() as u64);
+    let set_rows = set_segment_rows(config);
+    let sizing = sizing.for_set_segments(set_rows, config.volumes.len() as u64);
     // a reader holds the open rows its listing found with room past them, at every open and refresh
     let open_rows = RowCount(scan.scanned.iter().map(|scanned| scanned.scan.row_count.0).sum());
     let sizing = &if sizing.is_read_only { sizing.for_open_rows(open_rows) } else { sizing };
@@ -1593,6 +1598,8 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         // a set size takes an eighth of itself a step, and the budget's rule keeps its floor
         reserve_step: volume.segment_bytes.map_or_else(|| reserve_step(sizing.segment_bytes), set_reserve_step),
         window_bytes: window_bytes_for(volume.segment_bytes.map(|bytes| bytes.0)),
+        seal_blocks: seal_blocks(config, index),
+        seal_rows: rows_within_blocks(seal_blocks(config, index), config.widest_key(index)),
         segment_rows: volume_rows(config, index, sizing.segment_rows),
         walk_retries: AtomicU64::new(0),
         walks_waiting: AtomicU64::new(0),

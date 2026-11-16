@@ -26,7 +26,7 @@ impl std::error::Error for ListFull {}
 
 impl From<ListFull> for std::io::Error {
     fn from(_full: ListFull) -> Self {
-        std::io::Error::from(std::io::ErrorKind::OutOfMemory)
+        std::io::Error::new(std::io::ErrorKind::OutOfMemory, "a fixed list filled past its bound")
     }
 }
 

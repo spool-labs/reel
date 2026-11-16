@@ -22,7 +22,7 @@ use crate::io::Io;
 use crate::pool::Pool;
 use crate::segment::damage_list::DamageList;
 use crate::segment::segment_table::{RetiredSegment, SegmentTable};
-use crate::segment::segment_tail::{MOST_MERGE_SEGMENTS, SegmentNumber};
+use crate::segment::segment_tail::{BlockCount, MOST_MERGE_SEGMENTS, SegmentNumber};
 use crate::segment::range_covers::RangeCovers;
 use crate::segment::summary::{LostRows, SummaryPaths, SummaryRows};
 use crate::superblock::SuperblockPaths;
@@ -251,6 +251,10 @@ pub struct Volume<Backend: Io> {
     pub reserve_step: u64,
     /// The bytes of a record window this volume's writes take: a share of its own set segment size, or RECORD_WINDOW_BYTES
     pub window_bytes: usize,
+    /// The row blocks this volume's seal writer holds, which its segments' row limit can never need more of
+    pub seal_blocks: BlockCount,
+    /// The rows a segment of this volume can take and still seal into that list, by its widest key
+    pub seal_rows: u64,
     pub segment_rows: RowCount,
     pub walk_retries: AtomicU64,
     pub walks_waiting: AtomicU64,

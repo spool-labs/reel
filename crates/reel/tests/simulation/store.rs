@@ -1774,3 +1774,120 @@ fn records_at_the_window_edge_match_the_model() {
         store.close().expect("close");
     }
 }
+
+// a store of 256 KiB segments at 256 MiB, where the set size caps the rows a segment takes, fed rows near the format's floor:
+// keys of two or three bytes and empty values, in batches and singly, with deletes. Its seals write lists the size of that cap,
+// and none fills, through seals, closes and kills
+fn tiny_rows_config() -> StoreConfig {
+    let mut tiny = config(SyncPolicy::Never);
+    tiny.memory_budget = ByteCount(256 * 1024 * 1024);
+    tiny.volumes[0].segment_bytes = Some(ByteCount(256 * 1024));
+    tiny
+}
+
+#[test]
+fn tiny_rows_stay_within_the_seal_list() {
+    let full_before = reel::fixed_list::lists_full();
+    for seed in seeds(0..8) {
+        let io = SimulatedIo::new(Seed(900 + seed));
+        let mut random = SeededRandom::new(Seed(1_000 + seed));
+        let mut store = ReelStore::open(io.clone(), &tiny_rows_config()).expect("open");
+        assert!(store.state.volumes[0].seal_blocks.0 < 65_536, "the seal list stayed at the constant");
+        let mut model = BTreeMap::new();
+        let key_of = |number: u64| if number < 65_536 { (number as u16).to_be_bytes().to_vec() } else { vec![(number >> 16) as u8, (number >> 8) as u8, number as u8] };
+        for round in 0..8 {
+            let mut batch = WriteBatch::new();
+            for _row in 0..4_000 {
+                let key = key_of(random.below(100_000));
+                if random.below(10) == 0 {
+                    batch.delete(COLUMN, &key);
+                    model.remove(&key);
+                } else {
+                    batch.put(COLUMN, &key, b"");
+                    model.insert(key, Vec::new());
+                }
+            }
+            store.write_batch(&batch).expect("batch");
+            for _row in 0..2_000 {
+                let key = key_of(random.below(100_000));
+                store.put(COLUMN, &key, b"").expect("put");
+                model.insert(key, Vec::new());
+            }
+            match random.below(4) {
+                0 => {
+                    store.seal_now();
+                    settle(&io);
+                },
+                1 => {
+                    store.close().expect("close");
+                    drop(store);
+                    store = ReelStore::open(io.clone(), &tiny_rows_config()).expect("open");
+                },
+                2 => {
+                    store.flush().expect("flush");
+                    io.kill();
+                    drop(store);
+                    store = ReelStore::open(io.clone(), &tiny_rows_config()).expect("open");
+                },
+                _ => settle(&io),
+            }
+            for (key, value) in model.iter().take(500) {
+                assert_eq!(read(&store, key).as_ref(), Some(value), "seed {seed} round {round}");
+            }
+        }
+        store.close().expect("close");
+    }
+    assert_eq!(reel::fixed_list::lists_full(), full_before, "a seal list filled");
+}
+
+// two volumes at 256 KiB, and one at 256 KiB beside one at 64 MiB, open and take rows: each seal list is sized from the rows the
+// store enforces, which the largest set size and the volume count set
+#[test]
+fn several_set_volumes_open_with_their_seal_lists() {
+    for large in [256 * 1024_u64, 64 * 1024 * 1024] {
+        let io = SimulatedIo::new(Seed(160));
+        let mut two = two_volumes();
+        two.volumes[1].segment_bytes = Some(ByteCount(large));
+        let store = ReelStore::open(io.clone(), &two).expect("open");
+        for volume in &store.state.volumes {
+            assert!(volume.segment_rows.0 <= volume.seal_rows, "{large}: {:?} rows past {}", volume.segment_rows, volume.seal_rows);
+        }
+        for number in 0..2_000_u32 {
+            store.put(COLUMN, &number.to_be_bytes(), b"").expect("put");
+            store.put(ColumnId(2), &number.to_be_bytes(), b"").expect("put");
+        }
+        store.close().expect("close");
+    }
+}
+
+// a store written with the budget's segments holds sealed segments of many blocks, and reopened with 256 KiB segments it reads
+// every key, and its merges and walks run over the old segments with no list filling
+#[test]
+fn old_segments_under_a_small_seal_list() {
+    let full_before = reel::fixed_list::lists_full();
+    let io = SimulatedIo::new(Seed(161));
+    let mut wide = tiny_rows_config();
+    wide.volumes[0].segment_bytes = None;
+    let store = ReelStore::open(io.clone(), &wide).expect("open");
+    for number in 0..120_000_u32 {
+        store.put(COLUMN, &number.to_be_bytes(), b"old").expect("put");
+    }
+    store.seal_now();
+    settle(&io);
+    store.close().expect("close");
+    drop(store);
+    let store = ReelStore::open(io.clone(), &tiny_rows_config()).expect("reopen small");
+    for number in (0..120_000_u32).step_by(7) {
+        store.put(COLUMN, &number.to_be_bytes(), b"new").expect("put");
+    }
+    store.seal_now();
+    for _turn in 0..20 {
+        settle(&io);
+    }
+    for number in 0..120_000_u32 {
+        let wanted: &[u8] = if number % 7 == 0 { b"new" } else { b"old" };
+        assert_eq!(read(&store, &number.to_be_bytes()).as_deref(), Some(wanted), "key {number}");
+    }
+    store.close().expect("close");
+    assert_eq!(reel::fixed_list::lists_full(), full_before, "a list filled over the old segments");
+}

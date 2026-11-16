@@ -25,6 +25,9 @@ each segment's block index, the buffers every thread reads and writes through, a
 part from the budget and writes every page before open returns, so once the store is open, gets, puts and scans allocate
 nothing. A budget too small for what the columns declare is refused at open with the least budget that would do.
 
+A store under 1 GiB holds fewer live scans, read slots and buffers, down to 4 scans at the least budget, and a fifth scan
+fails with `ScansFull`. A caller that scans from several threads on a small budget bounds its own scans.
+
 ### Writing
 
 A write goes onto the end of whichever open segment is least busy. Several segments are open at once, so writers don't queue

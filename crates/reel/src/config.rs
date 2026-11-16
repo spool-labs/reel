@@ -209,6 +209,8 @@ impl ThreadCounts {
 /// A whole store
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoreConfig {
+    /// The heap the store holds. Under 1 GiB it holds fewer live scans, read slots and buffers, down to 4 scans, so a caller
+    /// that scans from several threads on a small budget bounds its own scans
     pub memory_budget: ByteCount,
     pub threads: ThreadCounts,
     pub volumes: Vec<VolumeConfig>,

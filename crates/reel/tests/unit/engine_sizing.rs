@@ -633,3 +633,23 @@ fn a_large_reader_keeps_its_sizes() {
     // 11-16: a reader plans no record windows, 3,145,728 B at 16 slots, which the shares take by their sixteenths
     assert_eq!(found, [1073741824, 2501276, 302821192, 302821192, 302821192, 151410596, 151410596, 36123904, 26162432]);
 }
+
+// a store whose volume set 256 KiB segments holds no more write index rows than those segments can, with the rest in the record
+// cache, and a store with no set size is sized as it was
+#[test]
+fn a_set_segment_size_caps_the_write_index() {
+    use reel::config::FORMAT_ROW_FLOOR;
+    use reel::engine::engine_sizing::{INDEX_ROWS_MARGIN, SEAL_ROWS_EIGHTHS};
+    for mib in [64_u64, 256, 1024] {
+        let planned = EngineSizing::for_store(&shape(ByteCount(mib * 1024 * 1024), 1));
+        assert_eq!(planned.for_set_segments(None, 1), planned, "{mib} MiB: no set size moved the sizing");
+        let segment_rows = 256 * 1024 / FORMAT_ROW_FLOOR;
+        let capped = planned.for_set_segments(Some(segment_rows), 1);
+        let cap = segment_rows * 8 / SEAL_ROWS_EIGHTHS * INDEX_ROWS_MARGIN;
+        let (index, capped_index) = (planned.shard.heap_bytes().0, capped.shard.heap_bytes().0);
+        println!("{mib} MiB: index rows {} → {}, a shard {index} → {capped_index} B, record cache {} → {} B", planned.segment_rows.0 * 8 / SEAL_ROWS_EIGHTHS, capped.segment_rows.0 * 8 / SEAL_ROWS_EIGHTHS, planned.record_share.0, capped.record_share.0);
+        assert!(capped == planned || capped.segment_rows.0 * 8 / SEAL_ROWS_EIGHTHS <= cap, "{mib} MiB: the index holds more than the set segments can");
+        assert_eq!(capped.record_share.0 - planned.record_share.0, (index - capped_index) * reel::index::write_index::SHARD_COUNT as u64);
+        assert_eq!((capped.spot_share, capped.cache_share, capped.summary_share, capped.table_share), (planned.spot_share, planned.cache_share, planned.summary_share, planned.table_share));
+    }
+}

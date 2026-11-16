@@ -390,6 +390,27 @@ impl EngineSizing {
         }
     }
 
+    /// Size the write index for the rows the open segments of a set segment size can hold, a segment's bytes over its row
+    /// floor with the seal's margin, and give the rest to the record cache. A cap under the rows only seals a segment sooner
+    pub fn for_set_segments(self, segment_rows: Option<u64>, volumes: u64) -> Self {
+        let Some(rows) = segment_rows else {
+            return self;
+        };
+        let planned_rows = self.segment_rows.0 * 8 / SEAL_ROWS_EIGHTHS;
+        let wanted_rows = (rows * 8 / SEAL_ROWS_EIGHTHS * INDEX_ROWS_MARGIN * volumes.max(1)).max(1);
+        if wanted_rows >= planned_rows {
+            return self;
+        }
+        let shard = shard_for_rows(wanted_rows, self.shard.open_slots);
+        let freed = (self.shard.heap_bytes().0.saturating_sub(shard.heap_bytes().0)) * SHARD_COUNT as u64;
+        Self {
+            segment_rows: RowCount(wanted_rows * SEAL_ROWS_EIGHTHS / 8),
+            shard,
+            record_share: ByteCount(self.record_share.0 + freed),
+            ..self
+        }
+    }
+
     /// Size a reader's write index for twice the open rows its listing found, and give the rest to the record cache. Past what
     /// the writer's share holds the index stays at that share, and rows past it refuse the load as they always have
     pub fn for_open_rows(self, rows: RowCount) -> Self {

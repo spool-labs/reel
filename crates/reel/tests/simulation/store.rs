@@ -1475,23 +1475,33 @@ fn one_open_segment_takes_every_writer() {
 // holds them
 #[test]
 fn one_open_segment_matches_the_model() {
-    one_open_segment_runs(None);
+    one_open_segment_runs(None, None);
 }
 
 // the same on segments of 256 KiB, which fill and seal many times a seed
 #[test]
 fn small_segments_match_the_model() {
-    one_open_segment_runs(Some(ByteCount(256 * 1024)));
+    one_open_segment_runs(Some(ByteCount(256 * 1024)), None);
+}
+
+// the same at 256 MiB, where the set size caps the write index, with keys of a few bytes and empty values so a segment's rows reach
+// the cap: it seals by rows sooner and goes on taking writes
+#[test]
+fn a_capped_index_matches_the_model() {
+    one_open_segment_runs(Some(ByteCount(256 * 1024)), Some(ByteCount(256 * 1024 * 1024)));
 }
 
 // run the one-open-segment model over the seeds, on segments of this size or the budget's
-fn one_open_segment_runs(segment_bytes: Option<ByteCount>) {
+fn one_open_segment_runs(segment_bytes: Option<ByteCount>, budget: Option<ByteCount>) {
     for seed in seeds(0..8) {
         let io = SimulatedIo::new(Seed(300 + seed));
         let mut random = SeededRandom::new(Seed(400 + seed));
         let mut one = config(SyncPolicy::Never);
         one.volumes[0].open_segments = Some(1);
         one.volumes[0].segment_bytes = segment_bytes;
+        if let Some(budget) = budget {
+            one.memory_budget = budget;
+        }
         let mut store = ReelStore::open(io.clone(), &one).expect("open");
         let mut model = BTreeMap::new();
         for round in 0..24 {

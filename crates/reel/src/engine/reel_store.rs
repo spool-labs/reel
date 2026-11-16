@@ -1266,6 +1266,10 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
     let mean = mean_record(&summaries);
     let cache_mean = cacheable_mean(&summaries);
     let sizing = sizing.for_mean_record(mean, config.volumes.len() as u64);
+    // a store whose every volume set its segment size holds no more rows than those segments can, a segment's bytes over its
+    // volume's row floor
+    let set_rows = config.volumes.iter().enumerate().map(|(index, volume)| volume.segment_bytes.map(|bytes| bytes.0 / config.row_floor(index).max(1))).collect::<Option<Vec<u64>>>();
+    let sizing = sizing.for_set_segments(set_rows.and_then(|rows| rows.into_iter().max()), config.volumes.len() as u64);
     // a reader holds the open rows its listing found with room past them, at every open and refresh
     let open_rows = RowCount(scan.scanned.iter().map(|scanned| scanned.scan.row_count.0).sum());
     let sizing = &if sizing.is_read_only { sizing.for_open_rows(open_rows) } else { sizing };

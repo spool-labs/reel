@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
-use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::config::{ColumnConfig, ColumnIndex, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
 use reel::io::Io;
 use reel::record::codec::Codec;
@@ -45,8 +45,8 @@ fn column(id: ColumnId, name: &str, volume: u8) -> ColumnConfig {
         key_shape: KeyShape::Variable { most: 64 },
         codec: Codec::None,
         volume: VolumeId(volume),
-        complete_rows: None,
-        sorted_rows: None,
+        index: ColumnIndex::Plain,
+        least_rows: None,
         least_value: None,
     }
 }

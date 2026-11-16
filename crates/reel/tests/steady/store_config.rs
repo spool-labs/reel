@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 
-use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::config::{ColumnConfig, ColumnIndex, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::record::codec::Codec;
 use reel_core::column_id::ColumnId;
 use reel_core::units::{ByteCount, RowCount, VolumeId};
@@ -23,8 +23,8 @@ pub fn config(root: &Path, budget: ByteCount) -> StoreConfig {
         key_shape: KeyShape::Variable { most: MOST_KEY_BYTES },
         codec,
         volume: VolumeId(0),
-        complete_rows,
-        sorted_rows: None,
+        index: complete_rows.map_or(ColumnIndex::Plain, |_rows| ColumnIndex::Complete),
+        least_rows: complete_rows,
         least_value: None,
     };
     // a complete column sets aside 29 MiB of block lines at any row count, more than the 128 and 192 MiB budgets have spare

@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
-use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::config::{ColumnConfig, ColumnIndex, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
 use reel::engine::row_job::{DELETE_SEAL_AFTER, IDLE_SEAL_AFTER, IDLE_SEAL_BYTES};
 use reel::guard::hold;
@@ -38,8 +38,8 @@ fn open(io: &SimulatedIo) -> Store {
             key_shape: KeyShape::Variable { most: 64 },
             codec: Codec::None,
             volume: VolumeId(0),
-            complete_rows: None,
-            sorted_rows: None,
+            index: ColumnIndex::Plain,
+            least_rows: None,
             least_value: None,
         }],
     };

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, ThreadCounts, VolumeConfig};
+use reel::config::{ColumnConfig, ColumnIndex, KeyShape, StoreConfig, SyncPolicy, ThreadCounts, VolumeConfig};
 use reel::engine::compact_job::{CompactJob, can_unlink};
 use reel::engine::filter_job::FilterLoader;
 use reel::engine::reel_store::ReelStore;
@@ -64,8 +64,8 @@ fn config(workers: usize) -> StoreConfig {
             key_shape: KeyShape::Variable { most: 16 },
             codec: Codec::None,
             volume: VolumeId(0),
-            complete_rows: None,
-            sorted_rows: None,
+            index: ColumnIndex::Plain,
+            least_rows: None,
             least_value: None,
         }],
     }

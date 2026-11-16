@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crate::shape;
-use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::config::{ColumnConfig, ColumnIndex, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::compact_job::{CompactJob, ConfirmPass, RowsProof, is_under_applied_cover};
 use reel::segment::summary_orders::is_wholly_dead;
 use reel::engine::cue::MOST_CUES;
@@ -59,8 +59,8 @@ fn open(io: &SimulatedIo) -> Store {
             key_shape: KeyShape::Variable { most: 64 },
             codec: Codec::None,
             volume: VolumeId(0),
-            complete_rows: None,
-            sorted_rows: None,
+            index: ColumnIndex::Plain,
+            least_rows: None,
             least_value: None,
         }],
     };
@@ -1300,8 +1300,8 @@ fn open_crowd_config() -> StoreConfig {
             key_shape: KeyShape::Variable { most: 64 },
             codec: Codec::None,
             volume: VolumeId(0),
-            complete_rows: None,
-            sorted_rows: None,
+            index: ColumnIndex::Plain,
+            least_rows: None,
             least_value: None,
         }],
     }

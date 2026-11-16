@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::config::{ColumnConfig, ColumnIndex, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
 use reel::engine::read_path::MOST_READ_TRIES;
 use reel::engine::scan_state::{MOST_SCAN_SOURCES, MOST_WINDOW_RECORD};
@@ -55,8 +55,8 @@ fn open(io: &SimulatedIo) -> Store {
         key_shape: KeyShape::Variable { most: 96 },
         codec: Codec::None,
         volume: VolumeId(0),
-        complete_rows: None,
-        sorted_rows: None,
+        index: ColumnIndex::Plain,
+        least_rows: None,
         least_value: None,
     };
     let config = StoreConfig {
@@ -836,8 +836,8 @@ fn lz4_config() -> StoreConfig {
             key_shape: KeyShape::Variable { most: 96 },
             codec: Codec::Lz4,
             volume: VolumeId(0),
-            complete_rows: None,
-            sorted_rows: None,
+            index: ColumnIndex::Plain,
+            least_rows: None,
             least_value: None,
         }],
     }

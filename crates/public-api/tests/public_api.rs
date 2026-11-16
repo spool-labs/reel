@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use reel::{Codec, ColumnConfig, DeviceClass, KeyShape, PlainIo, ReelStore, StoreConfig, SyncPolicy, ThreadCounts, VolumeConfig};
+use reel::{Codec, ColumnConfig, ColumnIndex, DeviceClass, KeyShape, PlainIo, ReelStore, StoreConfig, SyncPolicy, ThreadCounts, VolumeConfig};
 use reel_core::column_id::ColumnId;
 use reel_core::direction::Direction;
 use reel_core::scan::ScanStep;
@@ -29,8 +29,8 @@ fn config(root: PathBuf) -> StoreConfig {
             key_shape: KeyShape::Variable { most: 32 },
             codec: Codec::None,
             volume: VolumeId(0),
-            complete_rows: None,
-            sorted_rows: None,
+            index: ColumnIndex::Plain,
+            least_rows: None,
             least_value: None,
         }],
     }
@@ -454,3 +454,45 @@ fn a_set_segment_size_keeps_a_small_store_small() -> Result<(), Box<dyn std::err
 
 // the file range a slot's small records fill before one write call, which a segment takes whole
 const WINDOW_BYTES: u64 = 64 * 1024;
+
+// a column left to the default keeps a sorted index on fixed-width keys and none on variable ones, a fixed-width column can opt
+// out, and a sorted index on variable-width keys is refused with the reason
+#[test]
+fn a_column_index_follows_its_keys_by_default() -> Result<(), Box<dyn std::error::Error>> {
+    use reel::ColumnIndex;
+    use reel_core::maintenance_report::MaintenanceReport;
+    use reel_core::store_error::StoreError;
+
+    let root = scratch_root().with_extension("kinds");
+    let _gone = std::fs::remove_dir_all(&root);
+    let column = |id: u8, key_shape: KeyShape, index: ColumnIndex| ColumnConfig {
+        id: ColumnId(id),
+        name: format!("column-{id}"),
+        key_shape,
+        codec: Codec::None,
+        volume: VolumeId(0),
+        index,
+        least_rows: None,
+        least_value: None,
+    };
+    let fixed = KeyShape::Fixed { width: 8 };
+    let mut kinds = config(root.clone());
+    kinds.columns = vec![
+        column(1, fixed, ColumnIndex::default()),
+        column(2, KeyShape::Variable { most: 32 }, ColumnIndex::default()),
+        column(3, fixed, ColumnIndex::Plain),
+    ];
+    let store = ReelStore::open(PlainIo::new(), &kinds)?;
+    let mut report = MaintenanceReport::new();
+    store.maintenance_report(&mut report);
+    let sorted: Vec<u8> = report.sorted_columns.iter().map(|reading| reading.column.0).collect();
+    assert_eq!(sorted, vec![1], "{:?}", report.sorted_columns);
+    store.close()?;
+    std::fs::remove_dir_all(&root)?;
+
+    let mut refused = config(scratch_root().with_extension("kinds-refused"));
+    refused.columns = vec![column(1, KeyShape::Variable { most: 32 }, ColumnIndex::Sorted)];
+    let outcome = ReelStore::open(PlainIo::new(), &refused).map(|_store| ());
+    assert!(matches!(&outcome, Err(StoreError::BadIndex { reason, .. }) if reason.contains("fixed width")), "{outcome:?}");
+    Ok(())
+}

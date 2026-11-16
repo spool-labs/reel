@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::config::{ColumnConfig, ColumnIndex, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::compact_job::CompactJob;
 use reel::engine::cue::MOST_CUES;
 use reel::engine::read_path::{MOST_READ_TRIES, RecordWant};
@@ -49,8 +49,8 @@ fn open(io: &SimulatedIo) -> Store {
             key_shape: KeyShape::Variable { most: 64 },
             codec: Codec::None,
             volume: VolumeId(0),
-            complete_rows: None,
-            sorted_rows: None,
+            index: ColumnIndex::Plain,
+            least_rows: None,
             least_value: None,
         }],
     };

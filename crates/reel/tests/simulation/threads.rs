@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
-use reel::config::{default_workers, ColumnConfig, DeviceClass, KeyShape, StoreConfig, SyncPolicy, ThreadCounts, VolumeConfig};
+use reel::config::{default_workers, ColumnConfig, ColumnIndex, DeviceClass, KeyShape, StoreConfig, SyncPolicy, ThreadCounts, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
 use reel::engine::walk_job::{SLOT_ASSIGNED, SLOT_FREE};
 use reel::guard::hold;
@@ -56,8 +56,8 @@ fn config_on(threads: ThreadCounts, device: DeviceClass) -> StoreConfig {
             key_shape: KeyShape::Variable { most: 64 },
             codec: Codec::None,
             volume: VolumeId(0),
-            complete_rows: None,
-            sorted_rows: None,
+            index: ColumnIndex::Plain,
+            least_rows: None,
             least_value: None,
         }],
     }
@@ -282,8 +282,8 @@ fn two_volumes(threads: ThreadCounts) -> StoreConfig {
         key_shape: KeyShape::Variable { most: 64 },
         codec: Codec::None,
         volume: VolumeId(volume),
-        complete_rows: None,
-        sorted_rows: None,
+        index: ColumnIndex::Plain,
+        least_rows: None,
         least_value: None,
     };
     StoreConfig {

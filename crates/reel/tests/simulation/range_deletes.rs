@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::thread;
 
-use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::config::{ColumnConfig, ColumnIndex, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::open_segment::{data_path, rows_path};
 use reel::engine::recovery::copy_row;
 use reel::engine::reel_store::ReelStore;
@@ -57,8 +57,8 @@ fn config_at(budget: ByteCount) -> StoreConfig {
         key_shape: KeyShape::Variable { most: 64 },
         codec: Codec::None,
         volume: VolumeId(0),
-        complete_rows: None,
-        sorted_rows: None,
+        index: ColumnIndex::Plain,
+        least_rows: None,
         least_value: None,
     };
     StoreConfig {

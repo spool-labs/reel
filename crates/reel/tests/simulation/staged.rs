@@ -9,7 +9,7 @@ use std::thread;
 
 use crate::seed_sets::seeds;
 use reel::engine::dead_bits::DECIDED_WRONG;
-use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::config::{ColumnConfig, ColumnIndex, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::claim::Claim;
 use reel::engine::engine_state::EngineState;
 use reel::engine::open_segment::{data_path, rows_path};
@@ -100,8 +100,8 @@ fn config(budget: ByteCount) -> StoreConfig {
                 key_shape: KeyShape::Variable { most: 64 },
                 codec: Codec::None,
                 volume: VolumeId(0),
-                complete_rows: None,
-                sorted_rows: None,
+                index: ColumnIndex::Plain,
+                least_rows: None,
                 least_value: None,
             },
             ColumnConfig {
@@ -110,8 +110,8 @@ fn config(budget: ByteCount) -> StoreConfig {
                 key_shape: KeyShape::Variable { most: 1_056 },
                 codec: Codec::None,
                 volume: VolumeId(0),
-                complete_rows: None,
-                sorted_rows: None,
+                index: ColumnIndex::Plain,
+                least_rows: None,
                 least_value: None,
             },
         ],

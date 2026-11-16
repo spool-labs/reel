@@ -7,7 +7,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use crate::seed_sets::seeds;
-use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::config::{ColumnConfig, ColumnIndex, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
 use reel_sim::file_image::BitMask;
 use reel_sim::seeded_random::{Seed, SeededRandom};
@@ -214,8 +214,8 @@ fn config(policy: SyncPolicy, complete_rows: Option<RowCount>) -> StoreConfig {
         key_shape: KeyShape::Variable { most: 64 },
         codec: Codec::None,
         volume: VolumeId(volume),
-        complete_rows,
-        sorted_rows: None,
+        index: complete_rows.map_or(ColumnIndex::Plain, |_rows| ColumnIndex::Complete),
+        least_rows: complete_rows,
         least_value: None,
     };
     StoreConfig {

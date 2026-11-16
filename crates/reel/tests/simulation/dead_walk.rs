@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crate::shape;
-use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::config::{ColumnConfig, ColumnIndex, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::compact_job::CompactJob;
 use reel::engine::engine_state::IndexWait;
 use reel::engine::open_segment::SegmentPhase;
@@ -77,8 +77,8 @@ fn config(budget: ByteCount) -> StoreConfig {
             key_shape: KeyShape::Variable { most: LONG_KEY_BYTES as u16 + 8 },
             codec: Codec::None,
             volume: VolumeId(0),
-            complete_rows: None,
-            sorted_rows: None,
+            index: ColumnIndex::Plain,
+            least_rows: None,
             least_value: None,
         }],
     }
@@ -526,8 +526,8 @@ fn turn_with(seed: Seed) {
         key_shape: KeyShape::Variable { most: 64 },
         codec: Codec::None,
         volume: VolumeId(1),
-        complete_rows: None,
-        sorted_rows: None,
+        index: ColumnIndex::Plain,
+        least_rows: None,
         least_value: None,
     });
     let store = held(ReelStore::open(io.clone(), &config).expect("open"));

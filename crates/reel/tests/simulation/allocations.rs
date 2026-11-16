@@ -5,7 +5,7 @@ use std::time::Duration;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
-use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::config::{ColumnConfig, ColumnIndex, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::open_segment::SegmentPhase;
 use reel::engine::reel_store::ReelStore;
 use reel::guard::hold;
@@ -76,8 +76,8 @@ fn config_at(budget: ByteCount) -> StoreConfig {
         key_shape: KeyShape::Variable { most: 64 },
         codec,
         volume: VolumeId(0),
-        complete_rows,
-        sorted_rows: None,
+        index: complete_rows.map_or(ColumnIndex::Plain, |_rows| ColumnIndex::Complete),
+        least_rows: complete_rows,
         least_value: None,
     };
     StoreConfig {

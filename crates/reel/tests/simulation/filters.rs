@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::config::{ColumnConfig, ColumnIndex, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::open_segment::data_path;
 use reel::engine::reel_store::ReelStore;
 use reel::io::Io;
@@ -45,8 +45,8 @@ fn config() -> StoreConfig {
             key_shape: KeyShape::Variable { most: 64 },
             codec: Codec::None,
             volume: VolumeId(0),
-            complete_rows: None,
-            sorted_rows: None,
+            index: ColumnIndex::Plain,
+            least_rows: None,
             least_value: None,
         }],
     }
@@ -192,8 +192,8 @@ fn passes_a_segment_without_filters() {
         key_shape: KeyShape::Variable { most: 64 },
         codec: Codec::None,
         volume: VolumeId(0),
-        complete_rows: Some(RowCount(KEYS)),
-        sorted_rows: None,
+        index: ColumnIndex::Complete,
+        least_rows: Some(RowCount(KEYS)),
         least_value: None,
     });
     // the budget pays for the table, so this store takes a larger one

@@ -29,7 +29,7 @@ use reel_core::scan::ScanStep;
 use reel_core::store_error::StoreError;
 use reel_core::units::{ByteCount, Nanoseconds, RowCount, VolumeId};
 use reel_core::column_id::ColumnId;
-use reel::config::{ColumnConfig, KeyShape};
+use reel::config::{ColumnConfig, ColumnIndex, KeyShape};
 use reel::record::codec::Codec;
 use reel_core::value_list::ValueList;
 use reel_core::write_batch::WriteBatch;
@@ -343,11 +343,11 @@ fn open(root: &Path) -> Store {
             key_shape: KeyShape::Fixed { width: SORTED_WIDTH },
             codec: Codec::None,
             volume: VolumeId(0),
-            complete_rows: None,
-            sorted_rows: Some(SORTED_ROWS),
+            index: ColumnIndex::Sorted,
+            least_rows: Some(SORTED_ROWS),
             least_value: None,
         });
-        assert!(config.columns.iter().any(|column| column.id == META && column.complete_rows.is_some()), "no complete table at 512 MiB");
+        assert!(config.columns.iter().any(|column| column.id == META && column.complete_rows().is_some()), "no complete table at 512 MiB");
     }
     // a gate run sets this to hold the same line with workers beside the planner
     if let Some(workers) = env::var(WORKERS_VARIABLE).ok().and_then(|workers| workers.parse().ok()) {

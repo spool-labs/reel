@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use reel::engine::engine_sizing::shard_for_rows;
 use reel::guard::hold;
 use reel::index::write_index::SHARD_COUNT;
-use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::config::{ColumnConfig, ColumnIndex, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
 use reel::io::Io;
 use reel::record::codec::{CHUNK_BYTES, Codec};
@@ -46,8 +46,8 @@ fn config() -> StoreConfig {
             key_shape: KeyShape::Variable { most: 64 },
             codec: Codec::None,
             volume: VolumeId(0),
-            complete_rows: None,
-            sorted_rows: None,
+            index: ColumnIndex::Plain,
+            least_rows: None,
             least_value: None,
         }],
     }

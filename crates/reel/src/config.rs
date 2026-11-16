@@ -62,6 +62,21 @@ pub enum DeviceClass {
     Solid,
 }
 
+/// The index a column keeps over its sealed segments
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ColumnIndex {
+    /// A sorted index on a column of fixed-width keys, and none on one of variable width
+    #[default]
+    ByKeys,
+    /// None: gets and scans read the footers of the sealed segments
+    Plain,
+    /// A sorted index, sized at each open from the keys it held. A get reads no footers, and a scan steps one sorted list. It
+    /// takes keys of one fixed width
+    Sorted,
+    /// A complete table of `least_rows` rows by hash, for a column read only by key. A get reads no footers
+    Complete,
+}
+
 /// One column
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ColumnConfig {
@@ -70,11 +85,11 @@ pub struct ColumnConfig {
     pub key_shape: KeyShape,
     pub codec: Codec,
     pub volume: VolumeId,
-    /// The rows a complete table holds, for a column that declares one. A get on it reads no footers
-    pub complete_rows: Option<RowCount>,
-    /// The rows a sorted index holds, for a column of fixed-width keys that declares one. A get on it reads no footers, and a
-    /// scan steps one sorted list. A column declares this or a complete table, never both
-    pub sorted_rows: Option<RowCount>,
+    /// The index the column keeps, by default sorted when its keys have one fixed width
+    pub index: ColumnIndex,
+    /// For a sorted index the fewest rows it asks room for at open, for a load the operator knows is coming. For a complete
+    /// table the rows it holds, which it needs
+    pub least_rows: Option<RowCount>,
     /// The fewest value bytes a record of this column holds, when it declares them, which raises its volume's row floor
     pub least_value: Option<ByteCount>,
 }
@@ -100,6 +115,27 @@ pub struct VolumeConfig {
     /// most MOST_SET_SEGMENT_BYTES, which leaves a segment's footer room under the format's four-byte offsets. The reservation
     /// step then follows it, an eighth of the segment down to a page
     pub segment_bytes: Option<ByteCount>,
+}
+
+impl ColumnConfig {
+    /// Check the column keeps a sorted index: asked for, or by default on keys of one fixed width
+    pub fn is_sorted(&self) -> bool {
+        match self.index {
+            ColumnIndex::Sorted => true,
+            ColumnIndex::ByKeys => matches!(self.key_shape, KeyShape::Fixed { .. }),
+            ColumnIndex::Plain | ColumnIndex::Complete => false,
+        }
+    }
+
+    /// Read the rows a complete table holds, for a column that keeps one
+    pub fn complete_rows(&self) -> Option<RowCount> {
+        if self.index == ColumnIndex::Complete { self.least_rows } else { None }
+    }
+
+    /// Read the fewest rows a sorted index asks room for, for a column that keeps one
+    pub fn sorted_least(&self) -> Option<RowCount> {
+        if self.is_sorted() { self.least_rows } else { None }
+    }
 }
 
 impl VolumeConfig {

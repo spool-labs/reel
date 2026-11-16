@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 use crate::shape;
-use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, ThreadCounts, VolumeConfig};
+use reel::config::{ColumnConfig, ColumnIndex, KeyShape, StoreConfig, SyncPolicy, ThreadCounts, VolumeConfig};
 use reel::engine::engine_sizing::{ENTRY_LINE_DIVISOR, ENTRY_MARGIN, floor_entries};
 use reel::engine::job_tally::STALL_AFTER;
 use reel::engine::reel_store::ReelStore;
@@ -71,8 +71,8 @@ fn open_with(io: &SimulatedIo, budget: ByteCount, threads: ThreadCounts) -> Stor
             key_shape: KeyShape::Variable { most: 64 },
             codec: Codec::None,
             volume: VolumeId(0),
-            complete_rows: None,
-            sorted_rows: None,
+            index: ColumnIndex::Plain,
+            least_rows: None,
             least_value: None,
         }],
     };
@@ -658,8 +658,8 @@ fn open_mixed(io: &SimulatedIo) -> Store {
         key_shape: KeyShape::Variable { most: 64 },
         codec: Codec::None,
         volume: VolumeId(0),
-        complete_rows: None,
-        sorted_rows: None,
+        index: ColumnIndex::Plain,
+        least_rows: None,
         least_value: None,
     };
     let config = StoreConfig {

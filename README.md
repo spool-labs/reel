@@ -35,11 +35,12 @@ are the log.
 
 ### Finding a key
 
-Keys in open segments sit in an in-memory index. For keys in sealed segments a column can declare one of two indexes, and the
+Keys in open segments sit in an in-memory index. For keys in sealed segments a column keeps one of two indexes, and the
 budget pays for it:
 
 - A complete table holds a slot for every key by hash, for a column that is only read by key.
-- A sorted index holds every key's newest place in key order, for a column that is also scanned. Its keys are one fixed width.
+- A sorted index holds every key's newest place in key order, for a column that is also scanned. Its keys are one fixed width,
+  and a column of fixed-width keys keeps one unless its config says `ColumnIndex::Plain`.
 
 A column with neither searches the footers of the sealed segments, skipping any whose key range or filter rules the key out.
 Either way, one disk read usually fetches the value. The files are the source of truth, so reel can rebuild every index from
@@ -83,7 +84,7 @@ A sorted index takes keys of one fixed width, and a column has one index kind, s
 each open from the keys it held: twice them with a share of the headroom past them, out of the block, spot and record caches,
 which keep a quarter of their room. The store keeps a quarter of what the indexes may take as headroom, shared evenly among
 them and at most 256 MiB each.
-A complete table holds the rows its column declared. Rows past an index's room mark it, and from then on gets and
+A complete table holds the `least_rows` its column gives it. Rows past an index's room mark it, and from then on gets and
 scans of that column read the footers until the store is opened again with room for them. A marked index saves no file at
 close. The maintenance report shows each index's rows, room and mark, and the bytes a sorted index asked for and got, so an
 index about to fill shows before it does and a budget too small for it shows why. A count of the keys under a prefix reads

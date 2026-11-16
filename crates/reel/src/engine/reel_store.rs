@@ -17,7 +17,7 @@ use reel_core::units::{ByteCount, DeathMark, Nanoseconds, RowCount, VolumeId, Wr
 use reel_core::usage::{ColumnUsage, UsageReport};
 use reel_core::write_batch::WriteBatch;
 
-use crate::config::{ColumnConfig, DeviceClass, KeyShape, LEAST_SEGMENT_BYTES, MOST_SET_SEGMENT_BYTES, StoreConfig, VolumeConfig};
+use crate::config::{ColumnConfig, ColumnIndex, DeviceClass, KeyShape, LEAST_SEGMENT_BYTES, MOST_SET_SEGMENT_BYTES, StoreConfig, VolumeConfig};
 use crate::engine::dead_bits::{CHUNK_WORDS, DEAD_BITS_NAME, DeadBits, NEW_DEAD_BITS_NAME, SAVE_HEADS_PAGE};
 use crate::engine::rewrite_job::{record_totals, rows_of};
 use crate::segment::block_filter::BITS_PER_ROW;
@@ -873,7 +873,7 @@ pub fn store_shape(config: &StoreConfig, has_ring: bool, disks: &[Option<ByteCou
 /// Add up the heap a config's complete tables hold with their block lines, by the arithmetic they are built with. Sorted indexes
 /// take their room from the caches at open
 pub fn declared_index_bytes(config: &StoreConfig) -> ByteCount {
-    let tables: u64 = config.columns.iter().filter_map(|column| column.complete_rows).map(|rows| planned_table_bytes(rows).0).sum();
+    let tables: u64 = config.columns.iter().filter_map(ColumnConfig::complete_rows).map(|rows| planned_table_bytes(rows).0).sum();
     ByteCount(tables + complete_lines(config) * size_of::<BlockEntry>() as u64)
 }
 
@@ -994,11 +994,15 @@ pub fn check_config(config: &StoreConfig) -> Result<(), StoreError> {
     let mut has_lz4 = false;
     let mut seen = [false; MAX_COLUMNS];
     for column in &config.columns {
-        // a sorted index holds keys of one width, and a column takes it or a complete table
-        let is_sorted_valid = column.sorted_rows.is_none()
-            || (column.complete_rows.is_none()
-                && matches!(column.key_shape, KeyShape::Fixed { width } if (1..=MOST_KEY_BYTES).contains(&usize::from(width))));
-        if seen[column.id.0 as usize] || !column.key_shape.is_valid() || !is_sorted_valid {
+        // a sorted index holds keys of one width, and a complete table holds the rows it was given
+        let has_fixed_keys = matches!(column.key_shape, KeyShape::Fixed { width } if (1..=MOST_KEY_BYTES).contains(&usize::from(width)));
+        if column.index == ColumnIndex::Sorted && !has_fixed_keys {
+            return Err(StoreError::BadIndex { column: column.name.clone(), reason: "a sorted index takes keys of one fixed width" });
+        }
+        if column.index == ColumnIndex::Complete && column.least_rows.is_none() {
+            return Err(StoreError::BadIndex { column: column.name.clone(), reason: "a complete table takes least_rows, the rows it holds" });
+        }
+        if seen[column.id.0 as usize] || !column.key_shape.is_valid() || (column.is_sorted() && !has_fixed_keys) {
             return Err(column_changed(&column.name, "declaration"));
         }
         seen[column.id.0 as usize] = true;
@@ -1286,7 +1290,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
             key_shape: column.key_shape,
             codec: column.codec,
             volume: column.volume,
-            is_complete: column.complete_rows.is_some(),
+            is_complete: column.complete_rows().is_some(),
             least_value: column.least_value.map_or(0, |bytes| bytes.0),
         });
         let found = scan.sealed.len();
@@ -1372,7 +1376,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
     let record_room = sizing.record_share.0.saturating_sub(dead_bits);
     let arena_taken = arena_wanted.saturating_sub(base_arena).min(record_room.saturating_sub(RecordCache::least_bytes()));
     let arena_share = ByteCount(base_arena + arena_taken);
-    let is_complete = config.columns.iter().any(|column| column.complete_rows.is_some());
+    let is_complete = config.columns.iter().any(|column| column.complete_rows().is_some());
     let block_share = ByteCount(sizing.cache_share.0 - filter_share.0);
     // complete columns read small blocks, and a slot sized for a full block would hold a sixteenth of what it could
     let complete_share = ByteCount(if is_complete { block_share.0 / 2 } else { 0 });
@@ -1713,7 +1717,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
 
 /// Work out a volume's row limit: the budget's, or less when a complete column on it needs its row blocks addressable
 pub fn volume_rows(config: &StoreConfig, volume: usize, rows: RowCount) -> RowCount {
-    let on_volume = config.columns.iter().filter(|column| column.volume.0 as usize == volume && column.complete_rows.is_some());
+    let on_volume = config.columns.iter().filter(|column| column.volume.0 as usize == volume && column.complete_rows().is_some());
     let widest = on_volume.map(|column| column.key_shape.widest()).max();
     widest.map_or(rows, |widest| RowCount(rows.0.min(complete_row_limit(widest).0)))
 }
@@ -1722,7 +1726,7 @@ pub fn volume_rows(config: &StoreConfig, volume: usize, rows: RowCount) -> RowCo
 pub fn complete_tables(config: &StoreConfig) -> Vec<Option<CompleteTable>> {
     let mut tables: Vec<Option<CompleteTable>> = (0..MAX_COLUMNS).map(|_column| None).collect();
     for column in &config.columns {
-        tables[column.id.0 as usize] = column.complete_rows.map(CompleteTable::new);
+        tables[column.id.0 as usize] = column.complete_rows().map(CompleteTable::new);
     }
     tables
 }
@@ -1747,7 +1751,7 @@ pub fn complete_lines(config: &StoreConfig) -> u64 {
 /// Work out the block lines a complete column's rows can fill
 pub fn column_lines(column: &ColumnConfig) -> u64 {
     let rows_per_block = complete_block_rows(column.key_shape.widest()) as u64;
-    column.complete_rows.map_or(0, |rows| rows.0.div_ceil(rows_per_block))
+    column.complete_rows().map_or(0, |rows| rows.0.div_ceil(rows_per_block))
 }
 
 /// What open gave a sorted index: the bytes its rule asked for, the bytes it got, and the rows those hold
@@ -1773,11 +1777,11 @@ pub fn size_sorted_indexes<Backend: Io>(io: &Backend, config: &StoreConfig, sizi
             }
         }
     }
-    let sorted: Vec<&ColumnConfig> = config.columns.iter().filter(|column| column.sorted_rows.is_some()).collect();
+    let sorted: Vec<&ColumnConfig> = config.columns.iter().filter(|column| column.is_sorted()).collect();
     let (spot, block, record) = (sizing.spot_share.0, sizing.cache_share.0, sizing.record_share.0);
     // where every column is sorted no get reads the spot cache, so its share is the indexes' first, and the floor holds on the
     // block and record caches alone
-    let is_all_sorted = !config.columns.is_empty() && config.columns.iter().all(|column| column.sorted_rows.is_some());
+    let is_all_sorted = !config.columns.is_empty() && config.columns.iter().all(|column| column.is_sorted());
     let cap = if is_all_sorted { spot + index_cap(block + record) } else { index_cap(spot + block + record) };
     // the store keeps one headroom for all its indexes, a quarter of the cap shared evenly
     let headroom = index_headroom(cap, sorted.len());
@@ -1785,8 +1789,8 @@ pub fn size_sorted_indexes<Backend: Io>(io: &Backend, config: &StoreConfig, sizi
         .iter()
         .map(|column| {
             let width = column.key_shape.widest();
-            // a declared count of zero asks for no least, and the store sizes the index alone
-            let least = column.sorted_rows.filter(|rows| rows.0 > 0);
+            // a column with no least rows leaves the store to size the index alone
+            let least = column.sorted_least();
             if is_index_exact() {
                 return IndexAsk::Bytes(planned_index_bytes(width, least.unwrap_or(RowCount(0))));
             }
@@ -1804,7 +1808,7 @@ pub fn size_sorted_indexes<Backend: Io>(io: &Backend, config: &StoreConfig, sizi
     for ((column, ask), got) in sorted.iter().zip(&asks).zip(&granted) {
         let asked = ByteCount(if let IndexAsk::Bytes(bytes) = ask { bytes.0 } else { part });
         let width = column.key_shape.widest();
-        let declared = column.sorted_rows.unwrap_or(RowCount(0));
+        let declared = column.sorted_least().unwrap_or(RowCount(0));
         let is_whole = is_index_exact() && *got >= asked.0;
         // a grant under one pool's floor, a page for each part, builds no index, and the column reads its footers
         let rows = if is_whole { declared } else if *got < planned_index_bytes(width, RowCount(1)).0 { RowCount(0) } else { rows_for_bytes(width, ByteCount(*got)) };
@@ -1840,9 +1844,9 @@ pub fn sorted_indexes(config: &StoreConfig, sizes: &[Option<SortedSize>]) -> Vec
 /// Name each complete and each sorted column's image files and allocate its buffer. A column is never both kinds
 pub fn complete_images(config: &StoreConfig) -> Vec<Option<Mutex<ImageFiles>>> {
     let mut images: Vec<Option<Mutex<ImageFiles>>> = (0..MAX_COLUMNS).map(|_column| None).collect();
-    for column in config.columns.iter().filter(|column| column.complete_rows.is_some() || column.sorted_rows.is_some()) {
+    for column in config.columns.iter().filter(|column| column.complete_rows().is_some() || column.is_sorted()) {
         if let Some(root) = config.volumes[column.volume.0 as usize].roots.first() {
-            let files = if column.sorted_rows.is_some() { ImageFiles::sorted(root, column.id) } else { ImageFiles::new(root, column.id) };
+            let files = if column.is_sorted() { ImageFiles::sorted(root, column.id) } else { ImageFiles::new(root, column.id) };
             images[column.id.0 as usize] = Some(Mutex::new(files));
         }
     }

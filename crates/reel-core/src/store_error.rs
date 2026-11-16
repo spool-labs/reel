@@ -39,6 +39,8 @@ pub enum StoreError {
     NoAsyncReads,
     #[error("a segment size of {asked:?} is outside the {least:?} to {most:?} a volume may set")]
     SegmentSize { asked: ByteCount, least: ByteCount, most: ByteCount },
+    #[error("column {column}: {reason}")]
+    BadIndex { column: String, reason: &'static str },
     #[error("batch touches more than one volume")]
     BatchAcrossVolumes,
     #[error("a record in column {column:?} failed its check")]

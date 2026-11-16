@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::config::{ColumnConfig, ColumnIndex, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::compact_job::CompactJob;
 use reel::engine::planner::MOST_WALKLESS_STEPS;
 use reel::engine::open_segment::data_path;
@@ -95,8 +95,8 @@ fn config(capacity: RowCount) -> StoreConfig {
             key_shape: KeyShape::Variable { most: 64 },
             codec: Codec::None,
             volume: VolumeId(0),
-            complete_rows: Some(capacity),
-            sorted_rows: None,
+            index: ColumnIndex::Complete,
+            least_rows: Some(capacity),
             least_value: None,
         }],
     }

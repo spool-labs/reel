@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::config::{ColumnConfig, ColumnIndex, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::cue::MOST_CUES;
 use reel::engine::reel_store::ReelStore;
 use reel::record::codec::Codec;
@@ -37,8 +37,8 @@ fn open(io: &SimulatedIo) -> Store {
             key_shape: KeyShape::Variable { most: 64 },
             codec: Codec::None,
             volume: VolumeId(0),
-            complete_rows: None,
-            sorted_rows: None,
+            index: ColumnIndex::Plain,
+            least_rows: None,
             least_value: None,
         }],
     };

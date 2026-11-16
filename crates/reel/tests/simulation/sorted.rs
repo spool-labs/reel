@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 
 use crate::seed_sets::seeds;
 
-use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::config::{ColumnConfig, ColumnIndex, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::compact_job::CompactJob;
 use reel::engine::open_segment::SegmentPhase;
 use reel::engine::reel_store::ReelStore;
@@ -76,8 +76,8 @@ fn config(capacity: RowCount) -> StoreConfig {
             key_shape: KeyShape::Fixed { width: WIDTH },
             codec: Codec::None,
             volume: VolumeId(0),
-            complete_rows: None,
-            sorted_rows: Some(capacity),
+            index: ColumnIndex::Sorted,
+            least_rows: Some(capacity),
             least_value: None,
         }],
     }
@@ -1924,8 +1924,8 @@ fn two_sorted_columns_and_a_complete_one_take_their_own_images() {
             id: THIRD,
             name: "third".to_string(),
             key_shape: KeyShape::Variable { most: 64 },
-            sorted_rows: None,
-            complete_rows: Some(CAPACITY),
+            index: ColumnIndex::Complete,
+            least_rows: Some(CAPACITY),
             ..config.columns[0].clone()
         });
         config
@@ -2088,7 +2088,7 @@ fn an_untold_scan_grows_its_batch_with_its_rows() {
 fn open_sized(io: &SimulatedIo) -> Store {
     let mut config = config(RowCount(0));
     reel::engine::engine_sizing::EXACT_INDEX_ROWS.with(|exact| exact.set(false));
-    config.columns[0].sorted_rows = Some(RowCount(0));
+    config.columns[0].least_rows = None;
     ReelStore::open(io.clone(), &config).expect("open")
 }
 

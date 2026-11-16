@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use crate::seed_sets::seeds;
-use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::config::{ColumnConfig, ColumnIndex, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::open_segment::{RECORD_WINDOW_BYTES, SegmentPhase, reserve_step, rows_path};
 use reel::engine::engine_sizing::OPEN_PER_ROOT;
 use reel::engine::reserve_job::RESERVE_PERIOD;
@@ -181,8 +181,8 @@ fn config(sync: SyncPolicy) -> StoreConfig {
             key_shape: KeyShape::Variable { most: 64 },
             codec: Codec::None,
             volume: VolumeId(0),
-            complete_rows: None,
-            sorted_rows: None,
+            index: ColumnIndex::Plain,
+            least_rows: None,
             least_value: None,
         }],
     }

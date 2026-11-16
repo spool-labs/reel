@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::config::{ColumnConfig, ColumnIndex, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
 use reel::engine::store_scan::StoreScan;
 use reel::guard::hold;
@@ -44,8 +44,8 @@ fn open(io: &SimulatedIo) -> Store {
         key_shape: KeyShape::Variable { most: 64 },
         codec,
         volume: VolumeId(0),
-        complete_rows: None,
-        sorted_rows: None,
+        index: ColumnIndex::Plain,
+        least_rows: None,
         least_value: None,
     };
     let config = StoreConfig {

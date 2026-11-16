@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use reel::config::{ColumnConfig, DeviceClass, KeyShape, NO_WORKERS, StoreConfig, SyncPolicy, ThreadCounts, VolumeConfig};
+use reel::config::{ColumnConfig, ColumnIndex, DeviceClass, KeyShape, NO_WORKERS, StoreConfig, SyncPolicy, ThreadCounts, VolumeConfig};
 use reel::engine::engine_sizing::*;
 use reel::engine::reel_store::{planned_table, store_sizing, volume_entries};
 use reel::engine::seal_job::MOST_SEGMENT_BLOCKS;
@@ -272,8 +272,8 @@ fn box_churn_fits_the_table() {
         key_shape: KeyShape::Variable { most: 64 },
         codec,
         volume: VolumeId(0),
-        complete_rows: None,
-        sorted_rows: None,
+        index: ColumnIndex::Plain,
+        least_rows: None,
         least_value: None,
     };
     let config = StoreConfig {
@@ -422,8 +422,8 @@ fn sorted_config(budget: u64, columns: u8) -> StoreConfig {
                 key_shape: KeyShape::Fixed { width: 16 },
                 codec: Codec::None,
                 volume: reel_core::units::VolumeId(0),
-                complete_rows: None,
-                sorted_rows: Some(RowCount(0)),
+                index: ColumnIndex::Sorted,
+                least_rows: None,
                 least_value: None,
             })
             .collect(),
@@ -502,8 +502,8 @@ fn large_stores_keep_their_sizes() {
                 key_shape: KeyShape::Fixed { width: 16 },
                 codec: Codec::None,
                 volume: VolumeId(0),
-                complete_rows: None,
-                sorted_rows: Some(RowCount(10_000_000)),
+                index: ColumnIndex::Sorted,
+                least_rows: Some(RowCount(10_000_000)),
                 least_value: None,
             }],
         };
@@ -575,8 +575,8 @@ fn the_headroom_is_shared_by_the_indexes() {
                 key_shape: KeyShape::Fixed { width: 16 },
                 codec: Codec::None,
                 volume: VolumeId(0),
-                complete_rows: None,
-                sorted_rows: None,
+                index: ColumnIndex::Plain,
+                least_rows: None,
                 least_value: None,
             }],
         };
@@ -612,8 +612,8 @@ fn a_large_reader_keeps_its_sizes() {
             key_shape: KeyShape::Fixed { width: 16 },
             codec: Codec::None,
             volume: VolumeId(0),
-            complete_rows: None,
-            sorted_rows: Some(RowCount(10_000_000)),
+            index: ColumnIndex::Sorted,
+            least_rows: Some(RowCount(10_000_000)),
             least_value: None,
         }],
     };

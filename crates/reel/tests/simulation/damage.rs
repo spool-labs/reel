@@ -5,7 +5,7 @@ use std::io::IoSlice;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
-use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::config::{ColumnConfig, ColumnIndex, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::open_segment::{SegmentPhase, data_path};
 use reel::engine::reel_store::ReelStore;
 use reel::guard::hold;
@@ -126,8 +126,8 @@ fn sized_config(budget: ByteCount) -> StoreConfig {
                 key_shape: KeyShape::Variable { most: 128 },
                 codec: Codec::None,
                 volume: VolumeId(0),
-                complete_rows: None,
-                sorted_rows: None,
+                index: ColumnIndex::Plain,
+                least_rows: None,
                 least_value: None,
             },
             ColumnConfig {
@@ -136,8 +136,8 @@ fn sized_config(budget: ByteCount) -> StoreConfig {
                 key_shape: KeyShape::Variable { most: 128 },
                 codec: Codec::None,
                 volume: VolumeId(0),
-                complete_rows: None,
-                sorted_rows: None,
+                index: ColumnIndex::Plain,
+                least_rows: None,
                 least_value: None,
             },
         ],
@@ -1588,8 +1588,8 @@ fn wide_config(budget: ByteCount) -> StoreConfig {
             key_shape: KeyShape::Variable { most: 128 },
             codec: Codec::None,
             volume: VolumeId(0),
-            complete_rows: None,
-            sorted_rows: None,
+            index: ColumnIndex::Plain,
+            least_rows: None,
             least_value: None,
         })
         .collect();

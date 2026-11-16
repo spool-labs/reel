@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use reel::config::{ColumnConfig, KeyShape, MAX_KEY_BYTES, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::config::{ColumnConfig, ColumnIndex, KeyShape, MAX_KEY_BYTES, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::compact_job::CompactJob;
 use reel::engine::reel_store::ReelStore;
 use reel::engine::rewrite_job::{MERGE_BUFFER_BYTES, MOST_OVERLAP};
@@ -45,8 +45,8 @@ fn config() -> StoreConfig {
             key_shape: KeyShape::Variable { most: MAX_KEY_BYTES },
             codec: Codec::None,
             volume: VolumeId(0),
-            complete_rows: None,
-            sorted_rows: None,
+            index: ColumnIndex::Plain,
+            least_rows: None,
             least_value: None,
         }],
     }

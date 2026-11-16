@@ -96,16 +96,14 @@ impl VolumeConfig {
 /// open, and a count the budget can't hold is refused there. One seal thread a volume runs whatever these say
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ThreadCounts {
-    /// Workers the store runs for every volume, a hook only the sims and the bench reach through the test-hooks feature, refused
-    /// when the budget can't hold it. A store's count is otherwise one an online CPU, as many as the budget holds
-    #[cfg(feature = "test-hooks")]
+    /// Workers the store runs for every volume, refused when the budget can't hold them. None counts one an online CPU, as many as
+    /// the budget holds, and 0 leaves each volume's planner alone
     pub maintenance_workers: Option<usize>,
     /// Threads that serve the async read forms
     pub read_threads: usize,
 }
 
 /// A planner alone on each volume, with no workers beside it
-#[cfg(feature = "test-hooks")]
 pub const NO_WORKERS: ThreadCounts = ThreadCounts {
     maintenance_workers: Some(0),
     read_threads: DEFAULT_READ_THREADS,
@@ -114,7 +112,6 @@ pub const NO_WORKERS: ThreadCounts = ThreadCounts {
 impl Default for ThreadCounts {
     fn default() -> Self {
         Self {
-            #[cfg(feature = "test-hooks")]
             maintenance_workers: None,
             read_threads: DEFAULT_READ_THREADS,
         }
@@ -122,12 +119,9 @@ impl Default for ThreadCounts {
 }
 
 impl ThreadCounts {
-    /// Read the worker count a test set, or nothing for a store that counts its CPUs
+    /// Read the worker count the caller set, or nothing for a store that counts its CPUs
     pub fn set_workers(&self) -> Option<usize> {
-        #[cfg(feature = "test-hooks")]
-        return self.maintenance_workers;
-        #[cfg(not(feature = "test-hooks"))]
-        None
+        self.maintenance_workers
     }
 }
 

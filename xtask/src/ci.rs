@@ -31,7 +31,7 @@ pub const PICK_GATE_ARGUMENTS: [&str; 12] =
     ["test", "--release", "--locked", "-p", "tape-reel", "--features", TEST_HOOKS, "--test", "simulation", "picks::", "--", "--nocapture"];
 /// The profile the CI's tests build in: optimized, with debug assertions and overflow checks
 pub const CI_PROFILE: &str = "ci";
-/// The feature that lets the sims set a volume's worker count, which no node build turns on
+/// The feature that opens the crate's inner modules to the sims and benches, which no node build turns on
 pub const TEST_HOOKS: &str = "tape-reel/test-hooks";
 /// Cargo arguments for the workers pass: the planner-facing sims again, with a worker beside each planner as a node runs
 pub const WORKERS_PASS_ARGUMENTS: [&str; 15] = [

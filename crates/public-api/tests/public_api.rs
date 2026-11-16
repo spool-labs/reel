@@ -70,6 +70,8 @@ fn the_rest_of_the_surface_answers_from_outside() -> Result<(), Box<dyn std::err
     let _gone = std::fs::remove_dir_all(&root);
     let mut config = config(root.clone());
     config.volumes = vec![VolumeConfig::new("volume", vec![root.clone()], SyncPolicy::Never)];
+    // a planner alone on its volume and one read thread
+    config.threads = ThreadCounts { maintenance_workers: Some(0), read_threads: 1 };
     let store = ReelStore::open(PlainIo::new(), &config)?;
     for number in 0..KEYS {
         store.put(COLUMN, format!("key-{number:03}").as_bytes(), b"value")?;

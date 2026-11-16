@@ -8,9 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
-use reel::engine::read_pool::{READ_SLOTS, SCAN_BLOCK_KEYS, SLOT_KEYS};
+use reel::engine::read_pool::{SCAN_BLOCK_KEYS, SLOT_KEYS};
 use reel::engine::reel_store::ReelStore;
-use reel::engine::scan_state::MOST_SCANS;
 use reel::record::codec::Codec;
 use reel_api::column_id::ColumnId;
 use reel_api::direction::Direction;
@@ -208,7 +207,7 @@ fn scan_streams() {
 fn line_for_a_slot() {
     let io = SimulatedIo::new(Seed(5));
     let store = filled(&io);
-    let count = READ_SLOTS as u64 * 3;
+    let count = store.state.read_pool.slot_count() as u64 * 3;
     let names: Vec<Vec<u8>> = (0..count).map(key).collect();
     let mut buffers: Vec<Vec<u8>> = (0..count).map(|_buffer| Vec::new()).collect();
     let mut reads: Vec<PendingRead<'_>> = Vec::new();
@@ -244,14 +243,14 @@ fn dropped_part_way() {
     let store = filled(&io);
     let name = key(1);
     let mut context = Context::from_waker(Waker::noop());
-    for _round in 0..READ_SLOTS * 2 {
+    for _round in 0..store.state.read_pool.slot_count() * 2 {
         let mut buf = Vec::new();
         let mut read = Box::pin(Reads::get_async(&store, COLUMN, &name, &mut buf));
         assert!(read.as_mut().poll(&mut context).is_pending());
         drop(read);
         settle(&io);
     }
-    for _round in 0..MOST_SCANS * 2 {
+    for _round in 0..store.state.read_pool.scan_count * 2 {
         let mut scan = store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan");
         let mut keys = ValueList::new();
         let mut block = Box::pin(Scan::next_block(&mut scan, &mut keys));
@@ -318,7 +317,7 @@ fn wakes_its_caller() {
     let io = SimulatedIo::new(Seed(9));
     let store = filled(&io);
     let name = key(1);
-    let mut buffers: Vec<Vec<u8>> = (0..=READ_SLOTS).map(|_buffer| Vec::new()).collect();
+    let mut buffers: Vec<Vec<u8>> = (0..=store.state.read_pool.slot_count()).map(|_buffer| Vec::new()).collect();
     let (last, others) = buffers.split_last_mut().expect("buffers");
     let mut context = Context::from_waker(Waker::noop());
     let mut reads: Vec<PendingRead<'_>> = Vec::new();

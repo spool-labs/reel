@@ -12,7 +12,6 @@ use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig
 use reel::engine::read_path::RecordWant;
 use reel::engine::reel_store::ReelStore;
 use reel::engine::ring_job::RingReaper;
-use reel::engine::scan_state::MOST_SCANS;
 use reel::guard::hold;
 use reel::io::{InPlace, Io, IoFile};
 use reel::io::job::{Job, JobStep};
@@ -378,7 +377,7 @@ fn dropped_block_ends_the_walk() {
     settle(&io);
     assert!(!run(&io, Scan::next_block(&mut scan, &mut keys)).expect("block"));
     drop(scan);
-    let scans: Vec<_> = (0..MOST_SCANS).map(|_scan| store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan")).collect();
+    let scans: Vec<_> = (0..store.state.read_pool.scan_count).map(|_scan| store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan")).collect();
     drop(scans);
     store.close().expect("close");
 }

@@ -29,7 +29,7 @@ use crate::engine::column_info::ColumnInfo;
 use crate::engine::engine_sizing::{
     complete_block_rows, complete_row_limit, split_idle_room,
     EngineSizing, FILTER_CACHE_QUARTERS, FILTER_SLOT_BYTES, GROUP_BYTES, LEAST_LZ4_BUDGET, LEAST_SHARD_ENTRIES, PLANNED_LINE_BYTES,
-    SHARED_JOBS, StoreShape, GATHER_BYTES, WRITE_BUFFERS, read_buffers, assumed_segment_bytes, capped_entries, disk_entries, entry_cost, entry_cover, floor_entries,
+    SHARED_JOBS, StoreShape, GATHER_BYTES, assumed_segment_bytes, capped_entries, disk_entries, entry_cost, entry_cover, floor_entries,
     dead_bits_bytes, segment_bytes_for, target_rows, IndexAsk, index_ask, index_cap, is_index_exact, share_indexes,
 };
 use crate::engine::engine_state::{EngineState, PLACE_RUN, SEGMENT_NUMBER_BATCH, SlotFile};
@@ -47,7 +47,7 @@ use crate::engine::recovery::{
 };
 use crate::engine::reserve_job::ReserveJob;
 use crate::engine::row_job::RowJob;
-use crate::engine::scan_state::{MOST_SCANS, ScanRange, ScanState, from_key, in_range, under_prefix};
+use crate::engine::scan_state::{ScanRange, ScanState, from_key, in_range, under_prefix};
 use crate::engine::seal_job::{MOST_SEGMENT_BLOCKS, SealJob};
 use crate::engine::store_scan::StoreScan;
 use crate::engine::compact_job::{CompactJob, park};
@@ -1311,16 +1311,17 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
 
     let largest_value = sizing.segment_bytes;
     let most_shares = if has_lz4 { sizing.lz4_stored_limit.0 as usize / SHARE_BYTES } else { 0 };
-    let mut encoders = Vec::with_capacity(WRITE_BUFFERS);
-    for _encoder in 0..WRITE_BUFFERS {
+    let counts = sizing.counts;
+    let mut encoders = Vec::with_capacity(counts.write_buffers);
+    for _encoder in 0..counts.write_buffers {
         encoders.push(RecordEncoder::new(largest_value, most_shares));
     }
     let shares = (0..most_shares).map(|_share| touched_zeroes(SHARE_BYTES)).collect();
 
-    let readers = read_buffers(sizing.workers);
+    let readers = counts.read_buffers;
     let mut record_readers = Vec::with_capacity(readers);
     let widest_key = (0..config.volumes.len()).map(|volume| config.widest_key(volume)).max().unwrap_or(0);
-    let scans: Vec<ScanState> = (0..MOST_SCANS).map(|_scan| ScanState::new(widest_key, open_slots)).collect();
+    let scans: Vec<ScanState> = (0..counts.scans).map(|_scan| ScanState::new(widest_key, open_slots)).collect();
     let scan_heap = ByteCount(scans.iter().map(|scan| scan.heap_bytes().0).sum());
     let mut footer_readers = Vec::with_capacity(readers);
     for _reader in 0..readers {
@@ -1385,8 +1386,8 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         free_slots: Mutex::new(free_slots),
         encoders: Pool::new(encoders),
         stored_shares: Pool::new(shares),
-        batch_rows: Pool::new((0..WRITE_BUFFERS).map(|_buffer| RowGroupBuffer::new(GROUP_BYTES)).collect()),
-        batch_records: Pool::new((0..WRITE_BUFFERS).map(|_buffer| touched_zeroes(GATHER_BYTES)).collect()),
+        batch_rows: Pool::new((0..counts.write_buffers).map(|_buffer| RowGroupBuffer::new(GROUP_BYTES)).collect()),
+        batch_records: Pool::new((0..counts.write_buffers).map(|_buffer| touched_zeroes(GATHER_BYTES)).collect()),
         batch_lengths: Pool::new(vec![touched_filled(sizing.segment_rows.0 as usize, 0)]),
         current_mark: AtomicU64::new(0),
         longest_turn: AtomicU64::new(0),
@@ -1459,7 +1460,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         row_task: OnceLock::new(),
         reserve_task: OnceLock::new(),
         read_tasks: (0..config.threads.read_threads).map(|_worker| OnceLock::new()).collect(),
-        read_pool: ReadPool::new(scans, config.threads.read_threads),
+        read_pool: ReadPool::new(scans, counts.read_slots, config.threads.read_threads),
         ring: None,
         ring_task: OnceLock::new(),
         ring_record_readers: Pool::new(Vec::new()),

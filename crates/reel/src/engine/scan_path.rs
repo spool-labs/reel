@@ -15,7 +15,7 @@ use crate::engine::engine_state::EngineState;
 use crate::engine::complete_path::sealed_of;
 use crate::engine::read_path::{HeldPin, KeyRead, Located, MOST_READ_TRIES, RecordWant, SealedRow, newest_of};
 use crate::engine::scan_state::{
-    BATCH_BYTES, BatchEntry, BlockTake, JOIN_GAP, MOST_BATCH_RECORD, MOST_BATCH_RUNS, MOST_SCANS, MOST_WINDOW_RECORD, NO_GENERATION, SCAN_BATCH_KEYS, ScanBatch, batch_room,
+    BATCH_BYTES, BatchEntry, BlockTake, JOIN_GAP, MOST_BATCH_RECORD, MOST_BATCH_RUNS, MOST_WINDOW_RECORD, NO_GENERATION, SCAN_BATCH_KEYS, ScanBatch, batch_room,
     SCAN_CACHE_PARTS, SCAN_CACHE_WEIGH_EVERY, SEAT_BATCH, ScanRange, ScanState, ScanWindows, SegmentSource, ShardHead,
     seek_together, under_prefix,
 };
@@ -127,7 +127,7 @@ impl<Backend: Io> EngineState<Backend> {
     pub fn take_scan(&self, range: &ScanRange, point: Option<WritePlace>) -> Result<ScanState, StoreError> {
         self.column(range.column)?;
         let Some(mut scan) = hold(&self.read_pool.scans).pop() else {
-            return Err(StoreError::ScansFull { limit: MOST_SCANS as u64 });
+            return Err(StoreError::ScansFull { limit: self.read_pool.scan_count as u64 });
         };
         scan.start(range, point);
         Ok(scan)

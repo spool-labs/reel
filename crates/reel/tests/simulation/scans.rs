@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
 use reel::engine::read_path::MOST_READ_TRIES;
-use reel::engine::scan_state::{MOST_SCAN_SOURCES, MOST_SCANS, MOST_WINDOW_RECORD};
+use reel::engine::scan_state::{MOST_SCAN_SOURCES, MOST_WINDOW_RECORD};
 use reel::engine::store_scan::StoreScan;
 use reel::engine::walk_job::FREE_IN_PLACE_BYTES;
 use reel::guard::hold;
@@ -388,11 +388,11 @@ fn scans_run_out() {
     let io = SimulatedIo::new(Seed(12));
     let store = open(&io);
     let mut scans = Vec::new();
-    for _scan in 0..MOST_SCANS {
+    for _scan in 0..store.state.read_pool.scan_count {
         scans.push(store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan"));
     }
     let refused = store.iter_from(COLUMN, b"", Direction::Ascending);
-    assert!(matches!(refused, Err(StoreError::ScansFull { limit }) if limit == MOST_SCANS as u64));
+    assert!(matches!(refused, Err(StoreError::ScansFull { limit }) if limit == store.state.read_pool.scan_count as u64));
     scans.pop();
     assert!(store.iter_from(COLUMN, b"", Direction::Ascending).is_ok());
     drop(scans);

@@ -27,7 +27,7 @@ use crate::io::{DeviceReads, InPlace, Io, IoTask, OnlyWarm, WalkMark, in_place, 
 use crate::lease::{Ended, LeaseCell, LeasePhase};
 use crate::pool::{touched_capacity, touched_queue};
 
-/// Async reads in flight at once
+/// Async reads in flight at once in a store with the full budget
 pub const READ_SLOTS: usize = 64;
 /// Bytes of keys a slot holds, and a longer get_many goes through in turns
 pub const SLOT_KEY_BYTES: usize = 16 * 1024;
@@ -82,6 +82,8 @@ pub struct ReadPool {
     next_worker: AtomicUsize,
     workers: usize,
     pub scans: Mutex<Vec<ScanState>>,
+    /// The scans the store runs at once, which a caller past them is refused
+    pub scan_count: usize,
 }
 
 /// A slot a caller holds
@@ -123,26 +125,32 @@ impl Default for ReadSlot {
 
 impl ReadPool {
     /// Allocate every slot
-    pub fn new(scans: Vec<ScanState>, workers: usize) -> Self {
-        let mut queue = VecDeque::with_capacity(READ_SLOTS);
-        queue.extend(0..READ_SLOTS);
+    pub fn new(scans: Vec<ScanState>, read_slots: usize, workers: usize) -> Self {
+        let mut queue = VecDeque::with_capacity(read_slots);
+        queue.extend(0..read_slots);
         queue.clear();
         Self {
-            slots: (0..READ_SLOTS).map(|_slot| Mutex::new(ReadSlot::new())).collect(),
-            free: Mutex::new((0..READ_SLOTS).collect()),
+            slots: (0..read_slots).map(|_slot| Mutex::new(ReadSlot::new())).collect(),
+            free: Mutex::new((0..read_slots).collect()),
             queue: Mutex::new(queue),
             waiters: Mutex::new(touched_queue(MOST_WAITERS, Waker::noop().clone())),
             next_worker: AtomicUsize::new(0),
             workers,
+            scan_count: scans.len(),
             scans: Mutex::new(scans),
         }
+    }
+
+    /// Count the async reads the pool holds in flight at once
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
     }
 
     /// Read the heap the pool holds
     pub fn heap_bytes(&self) -> ByteCount {
         let slot = size_of::<ReadSlot>() + SLOT_KEY_BYTES + SLOT_KEYS * size_of::<usize>();
-        let lines = READ_SLOTS * 2 * size_of::<usize>() + MOST_WAITERS * size_of::<Waker>();
-        ByteCount((READ_SLOTS * slot + lines) as u64)
+        let lines = self.slots.len() * 2 * size_of::<usize>() + MOST_WAITERS * size_of::<Waker>();
+        ByteCount((self.slots.len() * slot + lines) as u64)
     }
 
     /// Take a free slot, or wait in line for one

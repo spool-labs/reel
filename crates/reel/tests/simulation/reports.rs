@@ -31,6 +31,15 @@ const SMALL_DISK: ByteCount = ByteCount(1024 * 1024 * 1024);
 const RUN_STEPS: u64 = 20_000;
 const LARGE_DISK: ByteCount = ByteCount(1 << 40);
 const COVER_BUDGET: ByteCount = ByteCount(128 * 1024 * 1024);
+// a budget a little past the least, so the segment table's share fills before a small disk does
+const TIGHT_BUDGET: ByteCount = ByteCount(48 * 1024 * 1024);
+// the same with room for one worker
+const TIGHT_WORKER_BUDGET: ByteCount = ByteCount(52 * 1024 * 1024);
+
+// the tight budget for the threads a sim opens with: the workers pass adds a worker
+fn tight_budget() -> ByteCount {
+    if shape::workers() > 0 { TIGHT_WORKER_BUDGET } else { TIGHT_BUDGET }
+}
 const MOST_PAST_PUTS: u64 = 10_000_000;
 const BIG_DISK: ByteCount = ByteCount(8 << 30);
 const REAL_RECORD: &[u8] = &[5; 256 * 1024];
@@ -206,7 +215,7 @@ fn full_table_stops_a_seal() {
     for seed in seeds([5]) {
         let io = SimulatedIo::new(Seed(seed));
         io.add_disk(Path::new(ROOT), SMALL_DISK);
-        let store = open(&io);
+        let store = open_at(&io, tight_budget());
         store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
         let memory = store.memory_report();
         let mut report = MaintenanceReport::new();
@@ -274,7 +283,7 @@ fn disk_past_the_cover() {
 fn puts_under_a_seal_stop() {
     let io = SimulatedIo::new(Seed(7));
     io.add_disk(Path::new(ROOT), SMALL_DISK);
-    let store = open(&io);
+    let store = open_at(&io, tight_budget());
     store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
     let mut report = MaintenanceReport::new();
     store.maintenance_report(&mut report);
@@ -399,7 +408,10 @@ fn arena_takes_room_for_rows_on_disk() {
     let bits_grew = grown.dead_bits.0 - fresh.dead_bits.0;
     let arena_grew = grown.arena_room.0 - fresh.arena_room.0;
     let cache_gave = fresh.record_cache.0 - grown.record_cache.0;
-    assert!(cache_gave <= bits_grew + arena_grew + PAGE_SLACK, "the record cache gave past the dead bits and the arena");
+    // the block share holds the arena, and the idle filter room it took from the record cache once rows sat in blocks
+    let blocks_grew = grown.block_cache.0 - fresh.block_cache.0;
+    assert!(blocks_grew >= arena_grew, "the block share grew {blocks_grew} for an arena of {arena_grew}");
+    assert!(cache_gave <= bits_grew + blocks_grew + PAGE_SLACK, "the record cache gave {cache_gave} past the dead bits {bits_grew} and the block share {blocks_grew}");
     // the filter cache's idle room went to the other caches on both opens, so the arena grew into room they gave back
     assert_eq!(store.state.filter_cache.heap_bytes(), filter_cache, "the filter cache kept more than its stripe");
     store.close().expect("close");
@@ -441,7 +453,7 @@ fn stuck_shard_frees(io: &SimulatedIo, store: Store) {
 fn stuck_shard_comes_free() {
     let io = SimulatedIo::new(Seed(5));
     io.add_disk(Path::new(ROOT), SMALL_DISK);
-    let store = open(&io);
+    let store = open_at(&io, tight_budget());
     stuck_shard_frees(&io, store);
 }
 
@@ -450,7 +462,7 @@ fn stuck_shard_comes_free() {
 fn stuck_shard_comes_free_with_workers() {
     let io = SimulatedIo::new(Seed(5));
     io.add_disk(Path::new(ROOT), SMALL_DISK);
-    let store = open_with(&io, BUDGET, ThreadCounts { maintenance_workers: Some(1), ..reel::config::NO_WORKERS });
+    let store = open_with(&io, TIGHT_WORKER_BUDGET, ThreadCounts { maintenance_workers: Some(1), ..reel::config::NO_WORKERS });
     stuck_shard_frees(&io, store);
 }
 

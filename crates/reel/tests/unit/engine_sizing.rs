@@ -63,7 +63,7 @@ fn least_budget() {
 // the rows a segment takes at each budget, as `SEAL_ROWS_EIGHTHS` documents them
 #[test]
 fn documented_rows() {
-    for (mib, rows) in [(128, 12_317), (192, 91_505), (512, 487_443), (4_096, 4_921_950)] {
+    for (mib, rows) in [(128, 34_582), (192, 112_743), (512, 500_917), (4_096, 4_921_950)] {
         let store = StoreShape {
             budget: ByteCount(mib * 1024 * 1024),
             roots: 1,
@@ -537,3 +537,17 @@ const LARGE_STORE_SIZES: [[u64; 14]; 6] = [
     [1073741824, 4771649, 577687750, 577687750, 577687750, 288843875, 288843875, 259541644, 249055884, 11433216, 906728018, 826335232, 826335232, 14820750],
     [1073741824, 9839656, 1191254508, 1191254508, 1191254508, 595627254, 595627254, 259541644, 249055884, 11433216, 2747428292, 826335232, 826335232, 14820750],
 ];
+
+// a store keeps every scan, slot and buffer from FULL_COUNTS_BUDGET on, a share in step with its budget under it, and never
+// fewer than the least counts or than its workers read through
+#[test]
+fn counts_follow_the_budget() {
+    let counts = |mib: u64, workers: usize| StoreShape { workers: Some(workers), ..shape(ByteCount(mib * 1024 * 1024), 1) }.counts();
+    let full = Counts { scans: 32, read_slots: 64, read_buffers: 8, write_buffers: 8 };
+    assert_eq!(counts(1024, 0), full);
+    assert_eq!(counts(8192, 0), full);
+    assert_eq!(counts(512, 0), Counts { scans: 16, read_slots: 32, read_buffers: 4, write_buffers: 4 });
+    assert_eq!(counts(64, 0), Counts { scans: LEAST_SCANS, read_slots: LEAST_READ_SLOTS, read_buffers: LEAST_READ_BUFFERS, write_buffers: LEAST_WRITE_BUFFERS });
+    assert_eq!(counts(64, 3).read_buffers, 3 * READERS_PER_WORKER);
+    assert!(shape(ByteCount(64 * 1024 * 1024), 1).least_budget() < StoreShape { budget: FULL_COUNTS_BUDGET, ..shape(ByteCount(64 * 1024 * 1024), 1) }.least_budget());
+}

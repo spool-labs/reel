@@ -147,20 +147,36 @@ pub const FILTER_CACHE_QUARTERS: u64 = 3;
 /// Bytes of a filter cache slot, which holds the filter of a full block of typical rows
 pub const FILTER_SLOT_BYTES: usize = 4 * 1024;
 /// Eighths of the filters' share that stay resident, and the rest cache what the arena has no room for
-/// The fewest read buffers a store keeps
+/// Read buffers a store with the full budget keeps
 pub const READ_BUFFERS: usize = 8;
 /// Read buffers a store keeps for each maintenance worker, one a CPU, so callers past the CPUs still each find one
 pub const READERS_PER_WORKER: usize = 4;
 
-/// Count the read buffers a store keeps for this many workers
-pub const fn read_buffers(workers: usize) -> usize {
-    let readers = READERS_PER_WORKER * workers;
-    if readers > READ_BUFFERS { readers } else { READ_BUFFERS }
-}
 /// Bytes of the buffer a batch gathers its records in, which holds the largest one-chunk record
 pub const GATHER_BYTES: usize = CHUNK_BYTES + SMALL_HEAD_BYTES;
-/// Write buffers a store keeps
+/// Write buffers a store with the full budget keeps
 pub const WRITE_BUFFERS: usize = 8;
+
+/// The budget a store needs to run every scan, read slot, read buffer and write buffer the constants allow. A smaller one runs
+/// a share of each in step with its budget, down to the least counts
+pub const FULL_COUNTS_BUDGET: ByteCount = ByteCount(1024 * 1024 * 1024);
+/// The fewest scans a store runs at once
+pub const LEAST_SCANS: usize = 4;
+/// The fewest async read slots a store keeps
+pub const LEAST_READ_SLOTS: usize = 8;
+/// Read buffers a store with the full budget keeps
+pub const LEAST_READ_BUFFERS: usize = 2;
+/// The fewest write buffers a store keeps
+pub const LEAST_WRITE_BUFFERS: usize = 2;
+
+/// How many of each pooled part a store keeps
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Counts {
+    pub scans: usize,
+    pub read_slots: usize,
+    pub read_buffers: usize,
+    pub write_buffers: usize,
+}
 
 /// What a store is made of, which fixes the parts a budget can't shrink
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -200,6 +216,7 @@ pub struct EngineSizing {
     pub least_budget: ByteCount,
     pub room: ByteCount,
     pub entry_line: ByteCount,
+    pub counts: Counts,
 }
 
 impl StoreShape {
@@ -223,7 +240,23 @@ impl StoreShape {
         with_workers((0..=default_workers()).rev().find(fits).unwrap_or(0))
     }
 
-    /// Count the open slots the roots and the lifetime groups can use
+    /// Count the scans, read slots, read buffers and write buffers this budget runs: all of them at FULL_COUNTS_BUDGET and past
+    /// it, a share in step with the budget below it, and never fewer read buffers than the workers read through
+    pub fn counts(&self) -> Counts {
+        let counted = |most: usize, least: usize| {
+            let share = (most as u128 * u128::from(self.budget.0) / u128::from(FULL_COUNTS_BUDGET.0)) as usize;
+            share.clamp(least, most)
+        };
+        let read_buffers = counted(READ_BUFFERS, LEAST_READ_BUFFERS).max(READERS_PER_WORKER * self.workers());
+        Counts {
+            scans: counted(MOST_SCANS, LEAST_SCANS),
+            read_slots: counted(READ_SLOTS, LEAST_READ_SLOTS),
+            read_buffers,
+            write_buffers: counted(WRITE_BUFFERS, LEAST_WRITE_BUFFERS),
+        }
+    }
+
+    /// Count the slots every volume's open segments take
     pub fn open_slots(&self) -> usize {
         (self.open_segments * SLOTS_PER_OPEN + self.lifetime_groups).min(MAX_OPEN_SLOTS)
     }
@@ -231,18 +264,19 @@ impl StoreShape {
     /// Add up what a store holds whatever its budget: buffers, pools, stacks and the spans a summary must keep
     pub fn fixed_bytes(&self) -> ByteCount {
         let volumes = self.volumes as u64;
-        let queues = (self.open_slots() as u64 * 2 + WRITE_BUFFERS as u64) * GROUP_BYTES.0;
-        let gathers = WRITE_BUFFERS as u64 * GATHER_BYTES as u64;
+        let counts = self.counts();
+        let queues = (self.open_slots() as u64 * 2 + counts.write_buffers as u64) * GROUP_BYTES.0;
+        let gathers = counts.write_buffers as u64 * GATHER_BYTES as u64;
         let windows = self.open_slots() as u64 * 3 * RECORD_WINDOW_BYTES as u64;
         let ring = if self.has_ring { (RING_SLOTS * RING_SLOT_BYTES) as u64 + RING_READS as u64 * RING_READ_BYTES } else { 0 };
-        let reads = read_buffers(self.workers()) as u64 * READ_BUFFER_BYTES + ring;
+        let reads = counts.read_buffers as u64 * READ_BUFFER_BYTES + ring;
         // each planner and each worker holds one footer reader of the job pool at a time, so none waits on a caller's
         let workers = self.workers() as u64;
         let job_reads = (volumes + workers) * JOB_READER_BYTES;
-        let scans = MOST_SCANS as u64 * planned_scan_bytes(self.widest_keys, self.open_slots());
-        let read_slots = READ_SLOTS as u64 * (SLOT_KEY_BYTES + SLOT_KEYS * size_of::<usize>()) as u64;
+        let scans = counts.scans as u64 * planned_scan_bytes(self.widest_keys, self.open_slots());
+        let read_slots = counts.read_slots as u64 * (SLOT_KEY_BYTES + SLOT_KEYS * size_of::<usize>()) as u64;
         let large = if self.has_lz4 { LZ4_STORED_LIMIT.0 } else { 0 };
-        let encoders = WRITE_BUFFERS as u64 * ENCODER_BYTES + large;
+        let encoders = counts.write_buffers as u64 * ENCODER_BYTES + large;
         let spans = 4 * MOST_DAMAGED_SPANS as u64 * (SPAN_KEY_BYTES as u64 * 2);
         let seats = volumes * self.walk_slots() as u64;
         let stacks = self.job_count() * JOB_STACK_PLAN_BYTES;
@@ -309,6 +343,7 @@ impl EngineSizing {
             least_budget: shape.least_budget(),
             room: shape.room(),
             entry_line: shape.entry_line(),
+            counts: shape.counts(),
         }
     }
 

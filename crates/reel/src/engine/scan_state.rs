@@ -19,7 +19,7 @@ use crate::segment::block_cache::MOST_MANY_BLOCKS;
 use crate::segment::row_block::{FooterRow, ROW_BLOCK_BYTES, RowBlockWalk};
 use crate::segment::segment_tail::{ColumnTail, SegmentNumber};
 
-/// The most scans a store holds at once
+/// The most scans a store with the full budget holds at once
 pub const MOST_SCANS: usize = 32;
 /// The most segments a scan keeps a place in, twice the overlap bound's worth of room. A key past that many goes by seeks
 pub const MOST_SCAN_SOURCES: usize = 64;

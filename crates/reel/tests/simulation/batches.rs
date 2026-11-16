@@ -24,10 +24,10 @@ use reel::rows::row_group::{
     GROUP_OVERHEAD_BYTES, GroupHead, ROW_HEADER_BYTES, ROW_KIND_AT, RowEntry, RowGroupBuffer, parse_group,
 };
 use reel::superblock::Superblock;
-use reel_api::column_id::ColumnId;
-use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RowCount, VolumeId, WritePlace};
-use reel_api::write_batch::WriteBatch;
+use reel_core::column_id::ColumnId;
+use reel_core::store_error::StoreError;
+use reel_core::units::{ByteCount, FileOffset, Nanoseconds, RowCount, VolumeId, WritePlace};
+use reel_core::write_batch::WriteBatch;
 use reel_sim::file_image::BitMask;
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_disk::OperationCount;

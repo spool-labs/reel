@@ -10,7 +10,7 @@ use std::hint::black_box;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as Memory};
 
-use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
+use reel_core::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
 use crate::guard::{Shards, hold};
 use crate::pool::ask_huge_pages;

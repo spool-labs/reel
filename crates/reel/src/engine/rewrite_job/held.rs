@@ -5,8 +5,8 @@ use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use reel_api::maintenance_report::UnitKind;
-use reel_api::units::ByteCount;
+use reel_core::maintenance_report::UnitKind;
+use reel_core::units::ByteCount;
 
 use crate::segment::summary_orders::ROW_FOOTER_BYTES;
 use crate::engine::dead_bits::INEXACT_KEPT;

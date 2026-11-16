@@ -3,8 +3,8 @@
 use std::io::{IoSliceMut, Result};
 use std::ops::Range;
 
-use reel_api::reads::ValueWindow;
-use reel_api::units::{ByteCount, FileOffset};
+use reel_core::reads::ValueWindow;
+use reel_core::units::{ByteCount, FileOffset};
 
 use crate::pool::{HollowItem, touched_zeroes};
 use crate::io::{DeviceReads, IoFile, ManyRead, ReadOn};

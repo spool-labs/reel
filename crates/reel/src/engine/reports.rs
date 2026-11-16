@@ -4,14 +4,14 @@ use std::array;
 use std::io::Error;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::{UNIT_KINDS, MaintenanceMemory, 
+use reel_core::column_id::ColumnId;
+use reel_core::maintenance_report::{UNIT_KINDS, MaintenanceMemory, 
     CompleteReading, JOB_KINDS, JobKind, JobState, LeastValueReading, MOST_REPORTED_LANES, MaintenanceReport, PaceReading, PauseCause, RewriteBytes, SortedReading, UnitKind, VolumeReading,
     WriteSource,
 };
-use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, Nanoseconds, RootId, RowCount, SegmentCount, VolumeId};
-use reel_api::usage::{ColumnRootUsage, ColumnUsage, RootUsage, UsageReport, VolumeUsage};
+use reel_core::store_error::StoreError;
+use reel_core::units::{ByteCount, Nanoseconds, RootId, RowCount, SegmentCount, VolumeId};
+use reel_core::usage::{ColumnRootUsage, ColumnUsage, RootUsage, UsageReport, VolumeUsage};
 
 use crate::index::sorted_keys::SortedKeys;
 use crate::engine::rewrite_job::rows_of;

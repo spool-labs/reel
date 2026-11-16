@@ -3,8 +3,8 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::units::{ByteCount, WritePlace};
 
 use crate::config::MAX_KEY_BYTES;
 use crate::guard::hold;

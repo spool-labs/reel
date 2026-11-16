@@ -26,12 +26,12 @@ use reel::segment::summary::{
 };
 use reel::rows::row_group::parse_group;
 use reel::superblock::{Superblock, SuperblockPaths};
-use reel_api::column_id::ColumnId;
-use reel_api::direction::Direction;
-use reel_api::scan::ScanStep;
-use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, FileOffset, Nanoseconds, VolumeId, WritePlace};
-use reel_api::value_list::{ValueAnswer, ValueList};
+use reel_core::column_id::ColumnId;
+use reel_core::direction::Direction;
+use reel_core::scan::ScanStep;
+use reel_core::store_error::StoreError;
+use reel_core::units::{ByteCount, FileOffset, Nanoseconds, VolumeId, WritePlace};
+use reel_core::value_list::{ValueAnswer, ValueList};
 
 const ROOT: &str = "/disk/damage";
 const ORDERED: ColumnId = ColumnId(1);

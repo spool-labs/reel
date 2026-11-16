@@ -6,8 +6,8 @@ use std::process;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::record::codec::Codec;
-use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, RowCount, VolumeId};
+use reel_core::column_id::ColumnId;
+use reel_core::units::{ByteCount, RowCount, VolumeId};
 
 pub const META: ColumnId = ColumnId(1);
 pub const BULK: ColumnId = ColumnId(2);

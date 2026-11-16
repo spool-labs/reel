@@ -1,5 +1,5 @@
-use reel_api::column_id::ColumnId;
-use reel_api::write_batch::*;
+use reel_core::column_id::ColumnId;
+use reel_core::write_batch::*;
 
 const COLUMN: ColumnId = ColumnId(3);
 

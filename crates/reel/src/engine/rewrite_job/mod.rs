@@ -11,11 +11,11 @@ use std::mem;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::{
+use reel_core::column_id::ColumnId;
+use reel_core::maintenance_report::{
     PickOutcome, UnitKind,
 };
-use reel_api::units::{ByteCount, FileOffset, Nanoseconds, WritePlace};
+use reel_core::units::{ByteCount, FileOffset, Nanoseconds, WritePlace};
 
 use crate::config::MAX_KEY_BYTES;
 use crate::engine::engine_state::EngineState;

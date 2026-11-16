@@ -2,18 +2,18 @@
 
 use std::future::Future;
 
-use reel_api::column_id::ColumnId;
-use reel_api::direction::Direction;
-use reel_api::maintenance_report::MaintenanceReport;
-use reel_api::memory_report::MemoryReport;
-use reel_api::reads::{Reads, ValueWindow};
-use reel_api::scan::{KeyScan, Scan, ScanStep};
-use reel_api::store::Store;
-use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, DeathMark, RowCount};
-use reel_api::usage::{ColumnUsage, UsageReport};
-use reel_api::value_list::ValueList;
-use reel_api::write_batch::WriteBatch;
+use reel_core::column_id::ColumnId;
+use reel_core::direction::Direction;
+use reel_core::maintenance_report::MaintenanceReport;
+use reel_core::memory_report::MemoryReport;
+use reel_core::reads::{Reads, ValueWindow};
+use reel_core::scan::{KeyScan, Scan, ScanStep};
+use reel_core::store::Store;
+use reel_core::store_error::StoreError;
+use reel_core::units::{ByteCount, DeathMark, RowCount};
+use reel_core::usage::{ColumnUsage, UsageReport};
+use reel_core::value_list::ValueList;
+use reel_core::write_batch::WriteBatch;
 
 use crate::engine::cue::Cue;
 use crate::engine::read_path::RecordWant;

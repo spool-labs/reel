@@ -3,7 +3,7 @@
 use reel::engine::read_path::{LatestRead, RecordWant};
 use reel::engine::reel_store::ReelStore;
 use reel::io::{InPlace, Io, in_place};
-use reel_api::store_error::StoreError;
+use reel_core::store_error::StoreError;
 
 /// Answer a read at its point, or return nothing when a job crossed it and took what the point could see
 pub fn answer<Backend: Io>(

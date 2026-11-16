@@ -34,9 +34,9 @@ use reel::segment::footer_reader::FooterReader;
 use reel::segment::range_covers::Cover;
 use reel::segment::segment_tail::SECOND_TAIL_DISTANCE;
 use reel::superblock::Superblock;
-use reel_api::column_id::ColumnId;
-use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RowCount, VolumeId, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::store_error::StoreError;
+use reel_core::units::{ByteCount, FileOffset, Nanoseconds, RowCount, VolumeId, WritePlace};
 use reel_sim::wait::wait_until;
 
 const ROOT: &str = "/disk/staged";

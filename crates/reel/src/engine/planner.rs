@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use reel_api::units::Nanoseconds;
+use reel_core::units::Nanoseconds;
 
 use crate::engine::compact_job::CompactJob;
 use crate::engine::engine_state::EngineState;

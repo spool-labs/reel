@@ -6,8 +6,8 @@
 use std::io::{Error, ErrorKind, Result as IoResult};
 use std::sync::Arc;
 
-use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RowCount, WritePlace};
+use reel_core::store_error::StoreError;
+use reel_core::units::{ByteCount, FileOffset, Nanoseconds, RowCount, WritePlace};
 
 use crate::config::StoreConfig;
 use crate::engine::engine_sizing::GROUP_BYTES;

@@ -1,6 +1,6 @@
 //! One row block's line in a segment's resident index
 
-use reel_api::units::{ByteCount, FileOffset};
+use reel_core::units::{ByteCount, FileOffset};
 
 use crate::little_endian::read_half;
 use crate::segment::row_block::BLOCK_HEADER_BYTES;

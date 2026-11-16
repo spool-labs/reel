@@ -1,7 +1,7 @@
 use std::cell::Cell;
 
 use reel::engine::rewrite_job::{CROWD_ANSWERS, CrowdAnswers, CrowdStamp};
-use reel_api::column_id::ColumnId;
+use reel_core::column_id::ColumnId;
 
 const COLUMN: ColumnId = ColumnId(1);
 const STAMP: CrowdStamp = CrowdStamp { directory: 7, filters: 3, merges: 0, is_sized: true };

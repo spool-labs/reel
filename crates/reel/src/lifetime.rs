@@ -1,6 +1,6 @@
 //! Death marks: which lifetime group a marked record joins, so data that dies together sits together
 
-use reel_api::units::DeathMark;
+use reel_core::units::DeathMark;
 
 /// A record may wait past its death for this share of its remaining life, as one over this
 pub const SLACK_DIVISOR: u64 = 4;

@@ -4,11 +4,11 @@ use std::cmp::Reverse;
 use std::io::{Error, ErrorKind};
 use std::sync::atomic::Ordering;
 
-use reel_api::column_id::ColumnId;
-use reel_api::reads::ValueWindow;
-use reel_api::store_error::StoreError;
-use reel_api::value_list::{ReadBuffers, ValueList};
-use reel_api::units::{ByteCount, FileOffset, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::reads::ValueWindow;
+use reel_core::store_error::StoreError;
+use reel_core::value_list::{ReadBuffers, ValueList};
+use reel_core::units::{ByteCount, FileOffset, WritePlace};
 
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::cue::JobCounts;

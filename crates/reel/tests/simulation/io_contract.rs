@@ -20,7 +20,7 @@ use reel_sim::simulated_io::SimulatedIo;
 use reel::guard::hold;
 use reel_sim::simulated_task::{JobCount, JobIndex};
 use reel::io::{Io, IoFile, IoTask};
-use reel_api::units::{ByteCount, FileOffset, Nanoseconds};
+use reel_core::units::{ByteCount, FileOffset, Nanoseconds};
 use reel_sim::wait::wait_until;
 
 const RESERVED_BYTES: u64 = 4 * 1024 * 1024 * 1024;

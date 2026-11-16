@@ -4,9 +4,9 @@ use std::cmp;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::RwLock;
 
-use reel_api::column_id::ColumnId;
-use reel_api::direction::Direction;
-use reel_api::units::{ByteCount, RootId, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::direction::Direction;
+use reel_core::units::{ByteCount, RootId, WritePlace};
 
 use crate::pool::{touched_capacity, touched_filled};
 use crate::guard::Shards;

@@ -3,7 +3,7 @@
 use std::io::{Error, ErrorKind, Result};
 use std::path::{Path, PathBuf};
 
-use reel_api::units::{FileOffset, RootId};
+use reel_core::units::{FileOffset, RootId};
 
 use crate::engine::open_segment::{DATA_SUFFIX, OUTPUT_SUFFIX, data_path, parse_segment, rows_path};
 use crate::engine::volume::Volume;

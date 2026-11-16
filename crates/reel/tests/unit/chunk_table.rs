@@ -1,6 +1,6 @@
 use reel::record::chunk_table::*;
 use reel::record::record_check::Checksum;
-use reel_api::units::{ByteCount, FileOffset};
+use reel_core::units::{ByteCount, FileOffset};
 
 const ENTRY: ChunkEntry = ChunkEntry {
     stored_offset: FileOffset(1_000),

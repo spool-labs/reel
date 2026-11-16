@@ -21,9 +21,9 @@ use reel::segment::block_entry::{BlockEntry, KeyBound, KeyPrefix};
 use reel::segment::column_directory::{DirectoryEntry, Listing, RangeEntry};
 use reel::segment::segment_tail::{MOST_MERGE_SEGMENTS, PlaceRange, SegmentNumber, TailHead};
 use reel::segment::summary::{ColumnFacts, DeadCount, SegmentFacts};
-use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::PickOutcome;
-use reel_api::units::{ByteCount, DeathMark, FileOffset, RootId, RowCount, VolumeId, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::maintenance_report::PickOutcome;
+use reel_core::units::{ByteCount, DeathMark, FileOffset, RootId, RowCount, VolumeId, WritePlace};
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_io::SimulatedIo;
 

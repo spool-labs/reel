@@ -18,14 +18,14 @@ use reel::record::codec::Codec;
 use reel::rows::row_group::parse_group;
 use reel::segment::summary::SummaryPaths;
 use reel::superblock::Superblock;
-use reel_api::column_id::ColumnId;
-use reel_api::direction::Direction;
-use reel_api::maintenance_report::MaintenanceReport;
-use reel_api::scan::ScanStep;
-use reel_api::reads::Reads;
-use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, DeathMark, FileOffset, Nanoseconds, RowCount, SegmentCount, VolumeId};
-use reel_api::write_batch::WriteBatch;
+use reel_core::column_id::ColumnId;
+use reel_core::direction::Direction;
+use reel_core::maintenance_report::MaintenanceReport;
+use reel_core::scan::ScanStep;
+use reel_core::reads::Reads;
+use reel_core::store_error::StoreError;
+use reel_core::units::{ByteCount, DeathMark, FileOffset, Nanoseconds, RowCount, SegmentCount, VolumeId};
+use reel_core::write_batch::WriteBatch;
 
 // the default walk runs on the planner, so seeds spread over 0 to 2 workers to keep the worker path under test
 const WALK_WORKER_COUNTS: u64 = 3;

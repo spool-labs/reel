@@ -1,5 +1,5 @@
 use reel::lifetime::*;
-use reel_api::units::DeathMark;
+use reel_core::units::DeathMark;
 
 const NOW: DeathMark = DeathMark(1_000);
 

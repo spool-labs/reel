@@ -12,9 +12,9 @@ use reel::fixed_list::lists_full;
 use reel::guard::hold;
 use reel::record::codec::Codec;
 use reel::segment::segment_tail::MOST_MERGE_SEGMENTS;
-use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::{MaintenanceMemory, MaintenanceReport};
-use reel_api::units::{ByteCount, Nanoseconds, VolumeId};
+use reel_core::column_id::ColumnId;
+use reel_core::maintenance_report::{MaintenanceMemory, MaintenanceReport};
+use reel_core::units::{ByteCount, Nanoseconds, VolumeId};
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_io::SimulatedIo;
 

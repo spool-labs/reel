@@ -1,6 +1,6 @@
 //! Fixed tree nodes, all allocated and touched at open
 
-use reel_api::units::ByteCount;
+use reel_core::units::ByteCount;
 
 use crate::pool::touched_filled;
 use crate::index::entry_slab::{EntryAddress, NO_ENTRY};

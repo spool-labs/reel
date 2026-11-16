@@ -9,12 +9,12 @@ use reel::engine::walk_job::{SLOT_ASSIGNED, SLOT_FREE};
 use reel::guard::hold;
 use reel::record::codec::Codec;
 use reel::segment::segment_tail::SegmentNumber;
-use reel_api::column_id::ColumnId;
-use reel_api::direction::Direction;
-use reel_api::maintenance_report::MaintenanceReport;
-use reel_api::scan::ScanStep;
-use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, Nanoseconds, VolumeId};
+use reel_core::column_id::ColumnId;
+use reel_core::direction::Direction;
+use reel_core::maintenance_report::MaintenanceReport;
+use reel_core::scan::ScanStep;
+use reel_core::store_error::StoreError;
+use reel_core::units::{ByteCount, Nanoseconds, VolumeId};
 use reel_sim::seeded_random::{Seed, SeededRandom};
 use reel_sim::simulated_io::SimulatedIo;
 

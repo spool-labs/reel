@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::task::{Context, Poll, Waker};
 
-use reel_api::units::{ByteCount, FileOffset};
+use reel_core::units::{ByteCount, FileOffset};
 
 use crate::guard::hold;
 use crate::io::spin_clock::SpinClock;

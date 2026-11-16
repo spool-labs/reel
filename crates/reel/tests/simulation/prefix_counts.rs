@@ -9,11 +9,11 @@ use reel::engine::reel_store::ReelStore;
 use reel::engine::store_scan::StoreScan;
 use reel::guard::hold;
 use reel::record::codec::Codec;
-use reel_api::column_id::ColumnId;
-use reel_api::direction::Direction;
-use reel_api::scan::ScanStep;
-use reel_api::units::{ByteCount, Nanoseconds, RowCount, VolumeId};
-use reel_api::usage::ColumnUsage;
+use reel_core::column_id::ColumnId;
+use reel_core::direction::Direction;
+use reel_core::scan::ScanStep;
+use reel_core::units::{ByteCount, Nanoseconds, RowCount, VolumeId};
+use reel_core::usage::ColumnUsage;
 use reel_sim::seeded_random::{Seed, SeededRandom};
 use reel_sim::simulated_io::SimulatedIo;
 

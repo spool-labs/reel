@@ -11,8 +11,8 @@ use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig
 use reel::engine::reel_store::ReelStore;
 use reel::io::plain::PlainIo;
 use reel::record::codec::Codec;
-use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, VolumeId};
+use reel_core::column_id::ColumnId;
+use reel_core::units::{ByteCount, VolumeId};
 
 const FIRST: ColumnId = ColumnId(1);
 const SECOND: ColumnId = ColumnId(2);

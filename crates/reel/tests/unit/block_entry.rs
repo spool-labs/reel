@@ -1,5 +1,5 @@
 use reel::segment::block_entry::*;
-use reel_api::units::ByteCount;
+use reel_core::units::ByteCount;
 
 // a line reads back as written and is the size the budget allows
 #[test]

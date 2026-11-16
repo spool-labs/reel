@@ -10,7 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 reel = { path = "../crates/reel", features = ["test-hooks"] }
-reel-api = { path = "../crates/reel-api" }
+reel-core = { path = "../crates/reel-core" }
 reel-sim = { path = "../crates/reel-sim" }
 
 # its own workspace, so the fuzz build's sanitizer flags stay out of the store's

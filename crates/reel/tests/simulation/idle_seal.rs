@@ -8,8 +8,8 @@ use reel::engine::reel_store::ReelStore;
 use reel::engine::row_job::{DELETE_SEAL_AFTER, IDLE_SEAL_AFTER, IDLE_SEAL_BYTES};
 use reel::guard::hold;
 use reel::record::codec::Codec;
-use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, DeathMark, Nanoseconds, VolumeId};
+use reel_core::column_id::ColumnId;
+use reel_core::units::{ByteCount, DeathMark, Nanoseconds, VolumeId};
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_io::SimulatedIo;
 

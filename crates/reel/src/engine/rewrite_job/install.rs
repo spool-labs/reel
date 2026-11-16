@@ -6,10 +6,10 @@ use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use reel_api::maintenance_report::{
+use reel_core::maintenance_report::{
     JobKind, OTHER_MERGE, OVERLAP_MERGE, PickOutcome, RECORD_PAST_EARLY_BAR, RECORD_UNDER_EARLY_BAR, UnitKind, WriteSource,
 };
-use reel_api::units::{ByteCount, FileOffset, RootId, RowCount, WritePlace};
+use reel_core::units::{ByteCount, FileOffset, RootId, RowCount, WritePlace};
 
 use crate::segment::summary_orders::ROW_FOOTER_BYTES;
 use crate::engine::dead_bits::INEXACT_KEPT;

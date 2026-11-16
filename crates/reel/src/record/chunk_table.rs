@@ -1,6 +1,6 @@
 //! The table in front of a chunked value's chunks, cut into checksummed pages
 
-use reel_api::units::{ByteCount, FileOffset};
+use reel_core::units::{ByteCount, FileOffset};
 
 use crate::record::record_check::Checksum;
 

@@ -1,7 +1,7 @@
 //! The cue table: which reads still stand below a place
 
 use reel::engine::cue::CueTable;
-use reel_api::units::WritePlace;
+use reel_core::units::WritePlace;
 
 // a cue counts inside a row's window from the row's place up to, and not including, its replacement's
 #[test]

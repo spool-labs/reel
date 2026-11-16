@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use io_uring::{IoUring, opcode, types};
-use reel_api::units::{ByteCount, FileOffset};
+use reel_core::units::{ByteCount, FileOffset};
 
 use crate::guard::hold;
 use crate::io::spin_clock::SpinClock;

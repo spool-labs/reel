@@ -7,7 +7,7 @@
 
 use std::sync::Mutex;
 
-use reel_api::units::{ByteCount, FileOffset};
+use reel_core::units::{ByteCount, FileOffset};
 
 use crate::engine::caller_activity::CallerCounts;
 use crate::guard::hold;

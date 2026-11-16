@@ -4,9 +4,9 @@ use std::io::{Error, ErrorKind, Result};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::{JobKind, WriteSource};
-use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RootId, RowCount, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::maintenance_report::{JobKind, WriteSource};
+use reel_core::units::{ByteCount, FileOffset, Nanoseconds, RootId, RowCount, WritePlace};
 
 use crate::pool::touched_capacity;
 use crate::config::MAX_KEY_BYTES;

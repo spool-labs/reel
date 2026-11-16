@@ -5,9 +5,9 @@ use std::cmp::Reverse;
 use std::io::{Error, ErrorKind};
 use std::sync::atomic::Ordering;
 
-use reel_api::column_id::ColumnId;
-use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::store_error::StoreError;
+use reel_core::units::{ByteCount, WritePlace};
 
 use crate::pool::{touched_capacity, touched_room};
 use crate::engine::engine_state::EngineState;

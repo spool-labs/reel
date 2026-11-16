@@ -3,7 +3,7 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 
 use reel::io::Io;
 use reel::io::plain::{DIRECTORY_MODE, FILE_MODE, PlainIo};
-use reel_api::units::ByteCount;
+use reel_core::units::ByteCount;
 
 // a store's files and roots are its user's alone, and a create never follows a link someone left in a root
 #[test]

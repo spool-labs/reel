@@ -1,7 +1,7 @@
 //! Fixed pages that hold rows with their keys inline
 
-use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, FileOffset, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::units::{ByteCount, FileOffset, WritePlace};
 
 use crate::index::open_slots::OpenSlot;
 use crate::index::write_row::WriteRow;

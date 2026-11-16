@@ -22,11 +22,11 @@ use reel::record::codec::Codec;
 use reel::segment::damage_list::DamagedRange;
 use reel::segment::segment_tail::SegmentNumber;
 use reel::segment::summary::{DeadCount, LostRows, SummaryPaths, SummaryRows, read_summary};
-use reel_api::column_id::ColumnId;
-use reel_api::store_error::StoreError;
-use reel_api::maintenance_report::MaintenanceReport;
-use reel_api::units::{ByteCount, Nanoseconds, SegmentCount, VolumeId, WritePlace};
-use reel_api::value_list::{ReadBuffers, ValueAnswer, ValueList};
+use reel_core::column_id::ColumnId;
+use reel_core::store_error::StoreError;
+use reel_core::maintenance_report::MaintenanceReport;
+use reel_core::units::{ByteCount, Nanoseconds, SegmentCount, VolumeId, WritePlace};
+use reel_core::value_list::{ReadBuffers, ValueAnswer, ValueList};
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_io::SimulatedIo;
@@ -1336,9 +1336,9 @@ fn crowd_hand_out(io: &SimulatedIo, store: &Store, segments: u64) -> (CompactJob
     settle(io);
     volume.holds.compaction.store(false, Ordering::Release);
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
-    let before = volume.picks[reel_api::maintenance_report::PickOutcome::Overlap.index()].load(Ordering::Acquire);
+    let before = volume.picks[reel_core::maintenance_report::PickOutcome::Overlap.index()].load(Ordering::Acquire);
     job.hand_out();
-    let merges = volume.picks[reel_api::maintenance_report::PickOutcome::Overlap.index()].load(Ordering::Acquire) - before;
+    let merges = volume.picks[reel_core::maintenance_report::PickOutcome::Overlap.index()].load(Ordering::Acquire) - before;
     let inputs = volume.lanes.iter().map(|lane| hold(&lane.inputs).iter().filter(|input| input.0 != 0).count() as u64).sum();
     (job, merges, inputs)
 }
@@ -1363,7 +1363,7 @@ fn finish_merges(io: &SimulatedIo, store: &Store, job: &CompactJob<SimulatedIo>)
     let mut report = MaintenanceReport::default();
     store.maintenance_report(&mut report);
     let volume = &report.volumes[0];
-    (volume.segment_count.0, volume.picks[reel_api::maintenance_report::PickOutcome::Overlap.index()])
+    (volume.segment_count.0, volume.picks[reel_core::maintenance_report::PickOutcome::Overlap.index()])
 }
 
 // 36 segments over every key against a bound of 32: one merge of 8 brings the point to 29, so one hand-out starts that one and
@@ -1408,7 +1408,7 @@ fn a_given_up_merge_leaves_the_point_crowded() {
     }
     assert!(volume.overlap_changes.load(Ordering::Acquire) > changes, "a give-up left the counter where it was");
     assert!(!volume.is_overlap_running());
-    let overlap = |volume: &reel::engine::volume::Volume<SimulatedIo>| volume.picks[reel_api::maintenance_report::PickOutcome::Overlap.index()].load(Ordering::Acquire);
+    let overlap = |volume: &reel::engine::volume::Volume<SimulatedIo>| volume.picks[reel_core::maintenance_report::PickOutcome::Overlap.index()].load(Ordering::Acquire);
     let before = overlap(volume);
     job.hand_out();
     assert_eq!(overlap(volume) - before, 1, "the point read clear after the merge over it gave up");
@@ -1467,7 +1467,7 @@ fn a_merge_counts_once_mid_copy_and_by_its_outputs_after() {
     io.advance_clock(Nanoseconds(until.0.saturating_sub(io.clock_reading().0)));
     settle(&io);
     volume.holds.compaction.store(false, Ordering::Release);
-    let overlap = || volume.picks[reel_api::maintenance_report::PickOutcome::Overlap.index()].load(Ordering::Acquire);
+    let overlap = || volume.picks[reel_core::maintenance_report::PickOutcome::Overlap.index()].load(Ordering::Acquire);
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
     job.hand_out();
     assert_eq!(overlap(), 1);

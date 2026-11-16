@@ -6,12 +6,12 @@ use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::{
+use reel_core::column_id::ColumnId;
+use reel_core::maintenance_report::{
     PickOutcome, UnitKind,
 };
-use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, FileOffset, WritePlace};
+use reel_core::store_error::StoreError;
+use reel_core::units::{ByteCount, FileOffset, WritePlace};
 
 use crate::engine::reports::thread_cpu;
 use crate::engine::dead_bits::{BIT_SAMPLE_EVERY, DECIDED_ASKED, DECIDED_CLEAR, DECIDED_SET, DECIDED_SHORT, DECIDED_WRONG, INEXACT_SHORT};

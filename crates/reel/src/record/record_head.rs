@@ -1,6 +1,6 @@
 //! The bytes at the front of every record
 
-use reel_api::units::ByteCount;
+use reel_core::units::ByteCount;
 
 use crate::little_endian::read_word;
 use crate::record::chunk_table::{ChunkCount, TablePageIndex, page_count, table_bytes};

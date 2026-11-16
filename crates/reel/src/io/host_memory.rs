@@ -1,6 +1,6 @@
 //! What the host's memory holds for a store's maintenance jobs, read at each start with nothing on the heap
 
-use reel_api::units::ByteCount;
+use reel_core::units::ByteCount;
 
 /// The host's memory as one read of it found
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

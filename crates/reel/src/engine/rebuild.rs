@@ -6,8 +6,8 @@
 
 use std::io::Result;
 
-use reel_api::column_id::ColumnId;
-use reel_api::units::{FileOffset, RowCount, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::units::{FileOffset, RowCount, WritePlace};
 
 use crate::engine::compact_job::CompactJob;
 use crate::engine::open_segment::data_path;

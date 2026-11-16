@@ -2,7 +2,7 @@
 
 use std::sync::atomic::Ordering;
 
-use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
+use reel_core::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
 use crate::engine::engine_state::EngineState;
 use crate::engine::open_segment::SegmentPhase;

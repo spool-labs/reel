@@ -13,7 +13,7 @@ repository = "https://github.com/spool-labs/reel"
 libc = "0.2"
 lz4-sys = "1"
 reel = { package = "tape-reel", path = "crates/reel", version = "0.4.0" }
-reel-api = { package = "tape-reel-core", path = "crates/reel-api", version = "0.4.0" }
+reel-core = { package = "tape-reel-core", path = "crates/reel-core", version = "0.4.0" }
 reel-sim = { package = "tape-reel-sim", path = "crates/reel-sim" }
 thiserror = "2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }

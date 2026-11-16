@@ -5,8 +5,8 @@ use std::mem;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::units::{ByteCount, WritePlace};
 
 use crate::fixed_list::ListOut;
 use crate::little_endian::read_word;

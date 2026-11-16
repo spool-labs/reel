@@ -8,7 +8,7 @@ description = "Opens a store through tape-reel's public surface alone, as an out
 
 [dependencies]
 reel.workspace = true
-reel-api.workspace = true
+reel-core.workspace = true
 
 [lints]
 workspace = true

@@ -15,9 +15,9 @@ use reel::index::write_shard::{ShardHold, ShardNeed, ShardSizing, WalkBound, Wri
 use reel_sim::seeded_random::{Seed, SeededRandom};
 use reel::row_kind::RowKind;
 use reel::segment::segment_tail::SegmentNumber;
-use reel_api::column_id::ColumnId;
-use reel_api::direction::Direction;
-use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::direction::Direction;
+use reel_core::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
 const SEED_COUNT: u64 = 16;
 const COLUMN: ColumnId = ColumnId(5);

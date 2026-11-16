@@ -6,8 +6,8 @@ use libfuzzer_sys::fuzz_target;
 use reel::record::record_check::{RecordIdentity, RecordKey};
 use reel::record::record_reader::{RecordReader, form_of, open_small};
 use reel::row_kind::RowKind;
-use reel_api::column_id::ColumnId;
-use reel_api::units::WritePlace;
+use reel_core::column_id::ColumnId;
+use reel_core::units::WritePlace;
 
 fuzz_target!(|bytes: &[u8]| {
     let Some(form) = form_of(bytes) else {

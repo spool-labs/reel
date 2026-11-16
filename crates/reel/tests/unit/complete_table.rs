@@ -7,7 +7,7 @@ use reel::index::complete_table::{
 };
 use reel::index::key_hash::KeyHash;
 use reel::segment::segment_tail::SegmentNumber;
-use reel_api::units::RowCount;
+use reel_core::units::RowCount;
 
 const ROWS: u64 = 100_000;
 const OVERFLOW_SHARD_SLOTS: usize = 64;

@@ -4,9 +4,9 @@ use std::ops::{Deref, DerefMut};
 use std::io::Result as IoResult;
 use std::sync::atomic::Ordering;
 
-use reel_api::column_id::ColumnId;
-use reel_api::store_error::StoreError;
-use reel_api::units::{RowCount, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::store_error::StoreError;
+use reel_core::units::{RowCount, WritePlace};
 
 use crate::config::MAX_KEY_BYTES;
 use crate::engine::engine_state::EngineState;

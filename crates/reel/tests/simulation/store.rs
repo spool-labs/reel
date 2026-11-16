@@ -21,12 +21,12 @@ use reel_sim::seeded_random::{Seed, SeededRandom};
 use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_io::SimulatedIo;
 use reel::record::codec::Codec;
-use reel_api::column_id::ColumnId;
-use reel_api::reads::ValueWindow;
-use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, Nanoseconds, RootId, RowCount, VolumeId};
-use reel_api::value_list::{ReadBuffers, ValueAnswer, ValueList};
-use reel_api::write_batch::WriteBatch;
+use reel_core::column_id::ColumnId;
+use reel_core::reads::ValueWindow;
+use reel_core::store_error::StoreError;
+use reel_core::units::{ByteCount, Nanoseconds, RootId, RowCount, VolumeId};
+use reel_core::value_list::{ReadBuffers, ValueAnswer, ValueList};
+use reel_core::write_batch::WriteBatch;
 use reel_sim::wait::wait_until;
 
 const ROOT: &str = "/disk/meta";
@@ -1319,7 +1319,7 @@ fn quiet_room_goes_back() {
         (segment.data.length().expect("length").0, segment.write_end.0)
     };
     let preallocated = || {
-        let mut report = reel_api::maintenance_report::MaintenanceReport::default();
+        let mut report = reel_core::maintenance_report::MaintenanceReport::default();
         store.maintenance_report(&mut report);
         report.volumes[0].preallocated.0
     };
@@ -1492,7 +1492,7 @@ fn one_open_segment_matches_the_model() {
                     },
                     1 => {
                         let value = format!("{seed}-{round}-{write}-marked").into_bytes();
-                        let mark = reel_api::units::DeathMark(1 + random.below(6) * 1_000_000);
+                        let mark = reel_core::units::DeathMark(1 + random.below(6) * 1_000_000);
                         store.put_marked(COLUMN, &key, &value, mark).expect("put");
                         model.insert(key, value);
                     },

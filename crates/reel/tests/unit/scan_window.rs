@@ -1,6 +1,6 @@
 use reel::engine::scan_state::*;
 use reel::segment::segment_tail::SegmentNumber;
-use reel_api::direction::Direction;
+use reel_core::direction::Direction;
 
 const SEGMENT: SegmentNumber = SegmentNumber(7);
 const FAR_END: u64 = 1 << 40;

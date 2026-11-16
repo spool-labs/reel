@@ -1,7 +1,7 @@
 //! A shard's table from a key to its newest row, whatever open segment holds it
 
-use reel_api::column_id::ColumnId;
-use reel_api::units::ByteCount;
+use reel_core::column_id::ColumnId;
+use reel_core::units::ByteCount;
 
 use crate::pool::touched_filled;
 use crate::index::entry_slab::{EntryAddress, EntrySlab, NO_ENTRY};

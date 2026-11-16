@@ -1,5 +1,5 @@
 use reel::engine::ration::*;
-use reel_api::units::{Nanoseconds, RowCount};
+use reel_core::units::{Nanoseconds, RowCount};
 
 const SEAL_ROWS: u64 = 100_000;
 const HELD: RowCount = RowCount(1_000);

@@ -8,7 +8,7 @@ repository.workspace = true
 description = "The types tape-reel takes and gives: column ids, units, batches, reports and errors"
 
 [lib]
-name = "reel_api"
+name = "reel_core"
 path = "src/lib.rs"
 
 [dependencies]

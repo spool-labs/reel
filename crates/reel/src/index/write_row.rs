@@ -1,6 +1,6 @@
 //! One row of an open segment
 
-use reel_api::units::{ByteCount, FileOffset, WritePlace};
+use reel_core::units::{ByteCount, FileOffset, WritePlace};
 
 use crate::index::open_slots::OpenSlot;
 use crate::row_kind::RowKind;

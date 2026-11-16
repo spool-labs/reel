@@ -6,11 +6,11 @@ use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig
 use reel::engine::cue::MOST_CUES;
 use reel::engine::reel_store::ReelStore;
 use reel::record::codec::Codec;
-use reel_api::column_id::ColumnId;
-use reel_api::reads::ValueWindow;
-use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, Nanoseconds, VolumeId};
-use reel_api::value_list::{ValueAnswer, ValueList};
+use reel_core::column_id::ColumnId;
+use reel_core::reads::ValueWindow;
+use reel_core::store_error::StoreError;
+use reel_core::units::{ByteCount, Nanoseconds, VolumeId};
+use reel_core::value_list::{ValueAnswer, ValueList};
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_io::SimulatedIo;
 

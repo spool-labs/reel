@@ -9,7 +9,7 @@ use std::hint::black_box;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
-use reel_api::units::ByteCount;
+use reel_core::units::ByteCount;
 
 use crate::guard::hold;
 use crate::pool::{touched_capacity, touched_filled};

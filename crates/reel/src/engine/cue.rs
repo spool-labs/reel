@@ -5,12 +5,12 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use reel_api::column_id::ColumnId;
-use reel_api::direction::Direction;
-use reel_api::reads::ValueWindow;
-use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, RowCount, WritePlace};
-use reel_api::value_list::ValueList;
+use reel_core::column_id::ColumnId;
+use reel_core::direction::Direction;
+use reel_core::reads::ValueWindow;
+use reel_core::store_error::StoreError;
+use reel_core::units::{ByteCount, RowCount, WritePlace};
+use reel_core::value_list::ValueList;
 
 use crate::engine::engine_state::EngineState;
 use crate::engine::read_path::{ReadAt, RecordWant};

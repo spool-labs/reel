@@ -11,10 +11,10 @@ use reel::lifetime::{MOST_LIFETIME_GROUPS, MarkRange};
 use reel::engine::rewrite_job::MOST_OVERLAP;
 use reel::record::codec::Codec;
 use reel::segment::segment_tail::SegmentNumber;
-use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::{MaintenanceReport, VolumeReading};
-use reel_api::units::{ByteCount, DeathMark, Nanoseconds, VolumeId};
-use reel_api::write_batch::WriteBatch;
+use reel_core::column_id::ColumnId;
+use reel_core::maintenance_report::{MaintenanceReport, VolumeReading};
+use reel_core::units::{ByteCount, DeathMark, Nanoseconds, VolumeId};
+use reel_core::write_batch::WriteBatch;
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_io::SimulatedIo;
 

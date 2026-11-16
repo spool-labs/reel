@@ -3,7 +3,7 @@
 use std::io::Result;
 use std::sync::{Arc, Mutex};
 
-use reel_api::units::{Nanoseconds, ProcessId};
+use reel_core::units::{Nanoseconds, ProcessId};
 
 use reel::guard::hold;
 use reel::io::IoTask;

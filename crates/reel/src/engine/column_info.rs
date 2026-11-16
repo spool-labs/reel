@@ -1,6 +1,6 @@
 //! What the engine keeps about each declared column
 
-use reel_api::units::VolumeId;
+use reel_core::units::VolumeId;
 
 use crate::config::KeyShape;
 use crate::record::codec::Codec;

@@ -1,6 +1,6 @@
 use reel::segment::block_cache::*;
 use reel::segment::segment_tail::SegmentNumber;
-use reel_api::units::ByteCount;
+use reel_core::units::ByteCount;
 
 const SLOT: usize = 64;
 const SHARE: ByteCount = ByteCount(64 * 1024);

@@ -1,7 +1,7 @@
 //! A kind's unit tally: its largest work, wall time and thread CPU, each on its own
 
 use reel::engine::job_tally::UnitTally;
-use reel_api::units::Nanoseconds;
+use reel_core::units::Nanoseconds;
 
 // a long unit that mostly waited and a short one that mostly worked give the long wall time and the high CPU
 #[test]

@@ -3,8 +3,8 @@
 use std::io::{Error, ErrorKind, IoSlice, Result};
 use std::path::{Path, PathBuf};
 
-use reel_api::column_id::ColumnId;
-use reel_api::units::{FileOffset, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::units::{FileOffset, WritePlace};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::config::{ColumnConfig, KeyShape};

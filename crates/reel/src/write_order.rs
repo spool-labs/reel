@@ -4,7 +4,7 @@ use std::hint;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use reel_api::units::{RowCount, WritePlace};
+use reel_core::units::{RowCount, WritePlace};
 
 use crate::guard::hold;
 

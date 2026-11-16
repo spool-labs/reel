@@ -127,12 +127,12 @@ dependencies = [
  "io-uring",
  "libc",
  "lz4-sys",
- "reel-api",
+ "reel-core",
  "xxhash-rust",
 ]
 
 [[package]]
-name = "reel-api"
+name = "reel-core"
 version = "0.4.0"
 dependencies = [
  "thiserror",
@@ -144,7 +144,7 @@ version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "reel",
- "reel-api",
+ "reel-core",
  "reel-sim",
 ]
 
@@ -154,7 +154,7 @@ version = "0.4.0"
 dependencies = [
  "libc",
  "reel",
- "reel-api",
+ "reel-core",
 ]
 
 [[package]]

@@ -2,8 +2,8 @@
 
 use std::cmp::Ordering;
 
-use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, DeathMark, FileOffset, RowCount, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::units::{ByteCount, DeathMark, FileOffset, RowCount, WritePlace};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::lifetime::MarkRange;

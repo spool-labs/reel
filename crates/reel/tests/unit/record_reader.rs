@@ -2,7 +2,7 @@ use reel::record::chunk_table::table_bytes;
 use reel::record::codec::CHUNK_BYTES;
 use reel::record::record_head::{PIECE_BYTES, chunk_count, head_bytes_for, plain_length, sums_bytes};
 use reel::record::record_reader::*;
-use reel_api::units::ByteCount;
+use reel_core::units::ByteCount;
 
 // the split comes back from the record length for every value size, at each chunk and piece edge
 #[test]

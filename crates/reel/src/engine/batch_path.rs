@@ -4,11 +4,11 @@ use std::io::{Error, ErrorKind, IoSlice};
 use std::slice::Iter;
 use std::sync::atomic::Ordering;
 
-use reel_api::maintenance_report::{PauseCause, WriteSource};
-use reel_api::column_id::ColumnId;
-use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, DeathMark, FileOffset, RowCount, VolumeId, WritePlace};
-use reel_api::write_batch::{BatchOperation, WriteBatch};
+use reel_core::maintenance_report::{PauseCause, WriteSource};
+use reel_core::column_id::ColumnId;
+use reel_core::store_error::StoreError;
+use reel_core::units::{ByteCount, DeathMark, FileOffset, RowCount, VolumeId, WritePlace};
+use reel_core::write_batch::{BatchOperation, WriteBatch};
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::engine::claim::Claim;

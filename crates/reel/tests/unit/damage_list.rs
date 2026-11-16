@@ -1,7 +1,7 @@
 use reel::segment::damage_list::*;
 use reel::segment::segment_tail::SegmentNumber;
-use reel_api::column_id::ColumnId;
-use reel_api::units::WritePlace;
+use reel_core::column_id::ColumnId;
+use reel_core::units::WritePlace;
 
 const COLUMN: ColumnId = ColumnId(1);
 

@@ -1,5 +1,5 @@
 use reel::engine::scan_state::*;
-use reel_api::direction::Direction;
+use reel_core::direction::Direction;
 use reel_sim::seeded_random::{Seed, SeededRandom};
 
 const WIDEST_KEY: usize = 16;

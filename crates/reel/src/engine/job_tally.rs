@@ -2,8 +2,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use reel_api::maintenance_report::{JOB_KINDS, UNIT_KINDS, UnitReading};
-use reel_api::units::{ByteCount, Nanoseconds};
+use reel_core::maintenance_report::{JOB_KINDS, UNIT_KINDS, UnitReading};
+use reel_core::units::{ByteCount, Nanoseconds};
 
 /// A job with work standing that moved nothing for this long shows as stalled, so a loop never reads as activity
 pub const STALL_AFTER: Nanoseconds = Nanoseconds(3_600_000_000_000);

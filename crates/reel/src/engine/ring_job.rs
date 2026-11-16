@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use reel_api::units::Nanoseconds;
+use reel_core::units::Nanoseconds;
 
 use crate::engine::engine_state::EngineState;
 use crate::io::job::{Job, JobStep};

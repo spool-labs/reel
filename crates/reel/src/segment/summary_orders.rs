@@ -1,6 +1,6 @@
 //! Orders over a volume's summary rows, kept as each row changes, so a pick asks them and walks no other row
 
-use reel_api::units::ByteCount;
+use reel_core::units::ByteCount;
 
 use crate::pool::{touched_capacity, touched_filled};
 use crate::segment::segment_table::NumberMap;

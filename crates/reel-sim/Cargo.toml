@@ -12,7 +12,7 @@ path = "src/lib.rs"
 [dependencies]
 reel = { workspace = true, features = ["test-hooks"] }
 libc.workspace = true
-reel-api.workspace = true
+reel-core.workspace = true
 
 [lints]
 workspace = true

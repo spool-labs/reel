@@ -1,6 +1,6 @@
 use reel::index::key_hash::{KeyHash, hash_key};
 use reel::segment::block_filter::*;
-use reel_api::column_id::ColumnId;
+use reel_core::column_id::ColumnId;
 
 const ROWS: u64 = 1_400;
 const CHECKS: u64 = 100_000;

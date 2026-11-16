@@ -6,16 +6,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use reel_api::column_id::ColumnId;
-use reel_api::direction::Direction;
-use reel_api::maintenance_report::MaintenanceReport;
-use reel_api::memory_report::MemoryReport;
-use reel_api::reads::ValueWindow;
-use reel_api::store_error::StoreError;
-use reel_api::value_list::ValueList;
-use reel_api::units::{ByteCount, DeathMark, Nanoseconds, RowCount, VolumeId, WritePlace};
-use reel_api::usage::{ColumnUsage, UsageReport};
-use reel_api::write_batch::WriteBatch;
+use reel_core::column_id::ColumnId;
+use reel_core::direction::Direction;
+use reel_core::maintenance_report::MaintenanceReport;
+use reel_core::memory_report::MemoryReport;
+use reel_core::reads::ValueWindow;
+use reel_core::store_error::StoreError;
+use reel_core::value_list::ValueList;
+use reel_core::units::{ByteCount, DeathMark, Nanoseconds, RowCount, VolumeId, WritePlace};
+use reel_core::usage::{ColumnUsage, UsageReport};
+use reel_core::write_batch::WriteBatch;
 
 use crate::config::{ColumnConfig, DeviceClass, KeyShape, StoreConfig, VolumeConfig};
 use crate::engine::dead_bits::{CHUNK_WORDS, DEAD_BITS_NAME, DeadBits, NEW_DEAD_BITS_NAME, SAVE_HEADS_PAGE};
@@ -24,7 +24,7 @@ use crate::segment::block_filter::BITS_PER_ROW;
 use crate::engine::caller_activity::CallerCounts;
 use crate::io::wake_line::WakeLine;
 use crate::engine::admission::Admission;
-use reel_api::maintenance_report::WorkerPriority;
+use reel_core::maintenance_report::WorkerPriority;
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::engine_sizing::{
     complete_block_rows, complete_row_limit, index_headroom, split_idle_room,

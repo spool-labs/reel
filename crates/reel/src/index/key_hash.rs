@@ -1,6 +1,6 @@
 //! The hash every in-memory index shards by
 
-use reel_api::column_id::ColumnId;
+use reel_core::column_id::ColumnId;
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 /// A key's hash within its column

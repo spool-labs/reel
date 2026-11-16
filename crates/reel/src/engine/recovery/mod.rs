@@ -2,8 +2,8 @@
 
 use std::path::PathBuf;
 
-use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, FileOffset, RootId, RowCount, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::units::{ByteCount, FileOffset, RootId, RowCount, WritePlace};
 
 use crate::lifetime::MarkRange;
 use crate::io::device_error::SECTOR_BYTES;

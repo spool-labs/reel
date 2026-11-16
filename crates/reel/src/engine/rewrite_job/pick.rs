@@ -6,11 +6,11 @@ use std::iter;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::{
+use reel_core::column_id::ColumnId;
+use reel_core::maintenance_report::{
     PickKind, PickOutcome,
 };
-use reel_api::units::{ByteCount, DeathMark, FileOffset, WritePlace};
+use reel_core::units::{ByteCount, DeathMark, FileOffset, WritePlace};
 
 use crate::config::MOST_VOLUME_SLOTS;
 use crate::engine::reserve_job::RESERVE_PERIOD;

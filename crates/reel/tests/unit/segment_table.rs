@@ -2,7 +2,7 @@ use reel::segment::block_entry::BlockEntry;
 use reel::segment::row_block::BLOCK_HEADER_BYTES;
 use reel::segment::segment_table::*;
 use reel::segment::segment_tail::{SegmentNumber, TailHead};
-use reel_api::units::{RootId, WritePlace};
+use reel_core::units::{RootId, WritePlace};
 
 const NUMBERS: u64 = 500;
 

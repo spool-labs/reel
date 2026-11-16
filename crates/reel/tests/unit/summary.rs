@@ -1,9 +1,9 @@
 use reel::segment::segment_tail::{PlaceRange, SegmentNumber};
 use reel::record::record_check::Checksum;
 use reel::segment::summary::*;
-use reel_api::column_id::ColumnId;
+use reel_core::column_id::ColumnId;
 use reel::lifetime::MarkRange;
-use reel_api::units::{DeathMark, ByteCount, FileOffset, RowCount, WritePlace};
+use reel_core::units::{DeathMark, ByteCount, FileOffset, RowCount, WritePlace};
 
 const ROOM: ByteCount = ByteCount(4_096);
 

@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use reel::index::sorted_keys::{Floors, KeyBatch, KeyEntry, MOST_LOOKED, PAGE_BYTES, ScanFrom, SortedKeys, Upserted, planned_pages};
 use reel::segment::segment_tail::SegmentNumber;
-use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
+use reel_core::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
 const SEEDS: u64 = 40;
 const ROWS: u64 = 30_000;

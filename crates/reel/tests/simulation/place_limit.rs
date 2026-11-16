@@ -14,8 +14,8 @@ use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_io::SimulatedIo;
 use reel::record::codec::Codec;
 use reel::superblock::{CopyRead, Superblock, SuperblockPaths};
-use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, FileOffset, RowCount, VolumeId, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::units::{ByteCount, FileOffset, RowCount, VolumeId, WritePlace};
 
 const FIRST_ROOT: &str = "/disk/limit-one";
 const SECOND_ROOT: &str = "/disk/limit-two";

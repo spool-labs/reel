@@ -11,14 +11,14 @@ use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig
 use reel::engine::read_pool::{SCAN_BLOCK_KEYS, SLOT_KEYS};
 use reel::engine::reel_store::ReelStore;
 use reel::record::codec::Codec;
-use reel_api::column_id::ColumnId;
-use reel_api::direction::Direction;
-use reel_api::reads::{Reads, ValueWindow};
-use reel_api::scan::{KeyScan, Scan};
-use reel_api::store::Store;
-use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, Nanoseconds, VolumeId};
-use reel_api::value_list::{ValueAnswer, ValueList};
+use reel_core::column_id::ColumnId;
+use reel_core::direction::Direction;
+use reel_core::reads::{Reads, ValueWindow};
+use reel_core::scan::{KeyScan, Scan};
+use reel_core::store::Store;
+use reel_core::store_error::StoreError;
+use reel_core::units::{ByteCount, Nanoseconds, VolumeId};
+use reel_core::value_list::{ValueAnswer, ValueList};
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_io::SimulatedIo;
 
@@ -193,7 +193,7 @@ fn scan_streams() {
         if !has_more {
             break;
         }
-        assert_eq!(KeyScan::next_key(&mut scan, &mut name).expect("step"), reel_api::scan::ScanStep::Found);
+        assert_eq!(KeyScan::next_key(&mut scan, &mut name).expect("step"), reel_core::scan::ScanStep::Found);
         assert_eq!(name, key(seen));
         seen += 1;
     }

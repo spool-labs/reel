@@ -2,8 +2,8 @@
 
 use std::io::{Error, ErrorKind, IoSlice, Result};
 
-use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
 use crate::config::MAX_KEY_BYTES;
 use crate::fixed_list::{FixedList, ListFull};

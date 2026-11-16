@@ -4,7 +4,7 @@ use std::io::ErrorKind;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use reel_api::units::{ByteCount, Nanoseconds};
+use reel_core::units::{ByteCount, Nanoseconds};
 
 use crate::engine::engine_state::EngineState;
 use crate::engine::open_segment::{OpenSegment, SegmentPhase};

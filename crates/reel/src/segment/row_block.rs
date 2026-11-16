@@ -1,7 +1,7 @@
 //! One block of a footer's rows, with shared key prefixes and restart points
 
-use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::units::{ByteCount, FileOffset, RowCount, WritePlace};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::fixed_list::{FixedList, ListFull, ListOut};

@@ -3,11 +3,11 @@
 use std::path::PathBuf;
 
 use reel::{Codec, ColumnConfig, DeviceClass, KeyShape, PlainIo, ReelStore, StoreConfig, SyncPolicy, ThreadCounts, VolumeConfig};
-use reel_api::column_id::ColumnId;
-use reel_api::direction::Direction;
-use reel_api::scan::ScanStep;
-use reel_api::units::{ByteCount, VolumeId};
-use reel_api::write_batch::WriteBatch;
+use reel_core::column_id::ColumnId;
+use reel_core::direction::Direction;
+use reel_core::scan::ScanStep;
+use reel_core::units::{ByteCount, VolumeId};
+use reel_core::write_batch::WriteBatch;
 
 const COLUMN: ColumnId = ColumnId(1);
 const BUDGET: ByteCount = ByteCount(128 * 1024 * 1024);
@@ -79,7 +79,7 @@ fn the_rest_of_the_surface_answers_from_outside() -> Result<(), Box<dyn std::err
     store.delete(COLUMN, b"key-000")?;
     store.delete_range(COLUMN, b"key-090", b"key-100")?;
     let cue = store.cue()?;
-    let range = reel::from_key(COLUMN, b"key-010", Direction::Ascending).wanting(reel_api::units::RowCount(5));
+    let range = reel::from_key(COLUMN, b"key-010", Direction::Ascending).wanting(reel_core::units::RowCount(5));
     let mut scan = store.iter(&range)?;
     let (mut key, mut value, mut found) = (Vec::new(), Vec::new(), 0);
     while found < 5 && scan.next_row(&mut key, &mut value)? == ScanStep::Found {
@@ -89,7 +89,7 @@ fn the_rest_of_the_surface_answers_from_outside() -> Result<(), Box<dyn std::err
     drop(scan);
     drop(cue);
     assert_eq!(store.count_prefix(COLUMN, b"key-0")?.0, 89);
-    let mut report = reel_api::maintenance_report::MaintenanceReport::default();
+    let mut report = reel_core::maintenance_report::MaintenanceReport::default();
     store.maintenance_report(&mut report);
     let _memory = store.memory_report();
     store.flush()?;
@@ -255,7 +255,7 @@ fn a_held_store_refuses_a_second_writer() -> Result<(), Box<dyn std::error::Erro
     let config = config(root.clone());
     let first = ReelStore::open(PlainIo::new(), &config)?;
     let second = ReelStore::open(PlainIo::new(), &config);
-    assert!(matches!(second, Err(reel_api::store_error::StoreError::Locked { .. })), "{:?}", second.err());
+    assert!(matches!(second, Err(reel_core::store_error::StoreError::Locked { .. })), "{:?}", second.err());
     first.close()?;
     drop(first);
     let second = ReelStore::open(PlainIo::new(), &config)?;
@@ -345,7 +345,7 @@ fn segments_filled_by_a_mix_hold_no_room_past_their_ends() -> Result<(), Box<dyn
         .collect();
     config.memory_budget = ByteCount(1 << 20);
     let least = match ReelStore::open(PlainIo::new(), &config) {
-        Err(reel_api::store_error::StoreError::BudgetTooSmall { least, .. }) => least.0,
+        Err(reel_core::store_error::StoreError::BudgetTooSmall { least, .. }) => least.0,
         other => return Err(format!("a 1 MiB budget opened: {:?}", other.err()).into()),
     };
     config.memory_budget = ByteCount(least.div_ceil(1 << 20) << 20);

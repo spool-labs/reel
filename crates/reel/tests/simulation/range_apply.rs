@@ -15,10 +15,10 @@ use reel::record::codec::Codec;
 use reel::segment::range_covers::MOST_RANGE_COVERS;
 use reel::segment::segment_tail::SegmentNumber;
 use reel::io::Io;
-use reel_api::column_id::ColumnId;
-use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, Nanoseconds, VolumeId};
-use reel_api::write_batch::WriteBatch;
+use reel_core::column_id::ColumnId;
+use reel_core::store_error::StoreError;
+use reel_core::units::{ByteCount, Nanoseconds, VolumeId};
+use reel_core::write_batch::WriteBatch;
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_io::SimulatedIo;
 
@@ -802,9 +802,9 @@ fn a_scan_open_across_the_merge_keeps_no_row() {
     let store = open(&io);
     let volume = &store.state.volumes[0];
     put_keys(&store, "a", b"value");
-    let mut scan = store.iter_from(COLUMN, b"a", reel_api::direction::Direction::Ascending).expect("scan");
+    let mut scan = store.iter_from(COLUMN, b"a", reel_core::direction::Direction::Ascending).expect("scan");
     let (mut name, mut value) = (Vec::new(), Vec::new());
-    assert_eq!(scan.next_row(&mut name, &mut value).expect("step"), reel_api::scan::ScanStep::Found);
+    assert_eq!(scan.next_row(&mut name, &mut value).expect("step"), reel_core::scan::ScanStep::Found);
     let before_cover = store.state.read_point(volume);
     store.delete_range(COLUMN, b"a", b"b").expect("delete");
     put_keys(&store, "z", b"value");

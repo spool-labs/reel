@@ -5,7 +5,7 @@ use std::io::{Error, ErrorKind, IoSlice, IoSliceMut, Result};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 
-use reel_api::units::{ByteCount, FileOffset};
+use reel_core::units::{ByteCount, FileOffset};
 
 use crate::io::IoFile;
 

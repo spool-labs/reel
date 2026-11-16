@@ -2,8 +2,8 @@
 
 use std::mem;
 
-use reel_api::column_id::ColumnId;
-use reel_api::units::ByteCount;
+use reel_core::column_id::ColumnId;
+use reel_core::units::ByteCount;
 
 use crate::config::MAX_KEY_BYTES;
 use crate::index::entry_slab::NO_ENTRY;

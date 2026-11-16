@@ -1,6 +1,6 @@
 //! Background work, written as steps so a test can run it one step at a time
 
-use reel_api::units::Nanoseconds;
+use reel_core::units::Nanoseconds;
 
 /// What a job reports after one step
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

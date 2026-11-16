@@ -1,6 +1,6 @@
 //! How one memory budget splits across the engine
 
-use reel_api::units::{ByteCount, RowCount};
+use reel_core::units::{ByteCount, RowCount};
 
 use crate::config::{MOST_VOLUME_SLOTS, ThreadCounts, default_workers};
 use crate::engine::open_segment::RECORD_WINDOW_BYTES;

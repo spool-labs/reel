@@ -12,9 +12,9 @@ use reel::record::codec::Codec;
 use reel::record::record_check::{RecordIdentity, RecordKey};
 use reel::record::record_reader::{RecordLocation, RecordReader};
 use reel::row_kind::RowKind;
-use reel_api::column_id::ColumnId;
-use reel_api::reads::ValueWindow;
-use reel_api::units::{ByteCount, FileOffset, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::reads::ValueWindow;
+use reel_core::units::{ByteCount, FileOffset, WritePlace};
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_io::SimulatedIo;
 

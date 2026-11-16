@@ -2,7 +2,7 @@
 
 use std::io::Result;
 
-use reel_api::units::{ByteCount, FileOffset, WritePlace};
+use reel_core::units::{ByteCount, FileOffset, WritePlace};
 
 use crate::fixed_list::ListOut;
 use crate::pool::{HollowItem, touched_capacity, touched_zeroes};

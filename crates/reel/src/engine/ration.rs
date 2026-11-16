@@ -3,7 +3,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use reel_api::units::{Nanoseconds, RowCount};
+use reel_core::units::{Nanoseconds, RowCount};
 
 /// Eighths of the free room writers draw during the walk. The rest is held back from the start for the steps after it
 pub const WALK_RATION_EIGHTHS: u64 = 7;

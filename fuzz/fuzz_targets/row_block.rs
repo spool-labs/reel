@@ -6,7 +6,7 @@ use libfuzzer_sys::fuzz_target;
 use reel::config::MAX_KEY_BYTES;
 use reel::fixed_list::FixedList;
 use reel::segment::row_block::RowBlockWalk;
-use reel_api::units::WritePlace;
+use reel_core::units::WritePlace;
 
 fuzz_target!(|bytes: &[u8]| {
     let mut key: FixedList<u8> = FixedList::on_heap(MAX_KEY_BYTES as usize);

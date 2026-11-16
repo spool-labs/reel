@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use reel_api::maintenance_report::{PICK_OUTCOMES, PickOutcome, SHARE_KINDS, SPAN_RUN_BUCKETS, SealSteps};
-use reel_api::units::{ByteCount, Nanoseconds, RowCount, VolumeId, WritePlace};
+use reel_core::maintenance_report::{PICK_OUTCOMES, PickOutcome, SHARE_KINDS, SPAN_RUN_BUCKETS, SealSteps};
+use reel_core::units::{ByteCount, Nanoseconds, RowCount, VolumeId, WritePlace};
 
 use crate::config::SyncPolicy;
 use crate::engine::dead_bits::{DeadBits, SavedHead};

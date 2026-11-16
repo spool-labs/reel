@@ -2,8 +2,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use reel_api::maintenance_report::MaintenanceMemory;
-use reel_api::units::ByteCount;
+use reel_core::maintenance_report::MaintenanceMemory;
+use reel_core::units::ByteCount;
 
 use crate::fixed_list::lists_full;
 

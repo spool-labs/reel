@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use reel::io::DiskSize;
 use reel::io::host_memory::HostMemory;
-use reel_api::units::{ByteCount, ProcessId};
+use reel_core::units::{ByteCount, ProcessId};
 
 use crate::file_image::FileImage;
 use crate::seeded_random::{Seed, SeededRandom};

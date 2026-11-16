@@ -11,8 +11,8 @@ use reel::row_kind::RowKind;
 use reel::segment::column_directory::ColumnDirectory;
 use reel::segment::row_block::{COMPLETE_BLOCK_BYTES, FooterRow, RowBlockBuilder};
 use reel::segment::segment_table::{NumberMap, SegmentTable, TABLE_SHARDS, TableSizing};
-use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, FileOffset, RowCount, VolumeId, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::units::{ByteCount, FileOffset, RowCount, VolumeId, WritePlace};
 
 const ROWS_PER_BLOCK: u64 = 1_400;
 const MOST_ROW_BYTES: u64 = 1_024;
@@ -413,11 +413,11 @@ fn sorted_config(budget: u64, columns: u8) -> StoreConfig {
         volumes: vec![VolumeConfig::new("volume", vec![PathBuf::from("/disk/sized")], SyncPolicy::Never)],
         columns: (1..=columns)
             .map(|id| ColumnConfig {
-                id: reel_api::column_id::ColumnId(id),
+                id: reel_core::column_id::ColumnId(id),
                 name: format!("c{id}"),
                 key_shape: KeyShape::Fixed { width: 16 },
                 codec: Codec::None,
-                volume: reel_api::units::VolumeId(0),
+                volume: reel_core::units::VolumeId(0),
                 complete_rows: None,
                 sorted_rows: Some(RowCount(0)),
                 least_value: None,
@@ -458,7 +458,7 @@ fn a_grant_under_the_pool_floor_builds_no_index() {
     let floor = planned_index_bytes(16, RowCount(1)).0;
     // the least budget a store of three sorted columns runs at
     let least = match store_sizing(&sorted_config(1 << 20, 3), false, &[None]) {
-        Err(reel_api::store_error::StoreError::BudgetTooSmall { least, .. }) => least.0,
+        Err(reel_core::store_error::StoreError::BudgetTooSmall { least, .. }) => least.0,
         other => panic!("a 1 MiB store sized: {other:?}"),
     };
     for (columns, is_built) in [(1, true), (3, false)] {

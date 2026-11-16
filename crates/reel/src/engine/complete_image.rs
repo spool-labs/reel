@@ -6,8 +6,8 @@
 use std::io::{Error, ErrorKind, IoSlice, Result};
 use std::path::{Path, PathBuf};
 
-use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, FileOffset};
+use reel_core::column_id::ColumnId;
+use reel_core::units::{ByteCount, FileOffset};
 
 use crate::engine::engine_state::EngineState;
 use crate::engine::volume::Volume;

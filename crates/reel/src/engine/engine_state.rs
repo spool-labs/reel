@@ -6,11 +6,11 @@ use std::mem;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
-use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::{PAUSE_CAUSES, PICK_KINDS, PauseCause, UnitKind, WRITE_SOURCES, WriteSource};
-use reel_api::memory_report::MemoryReport;
-use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, FileOffset, Nanoseconds, SegmentCount, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::maintenance_report::{PAUSE_CAUSES, PICK_KINDS, PauseCause, UnitKind, WRITE_SOURCES, WriteSource};
+use reel_core::memory_report::MemoryReport;
+use reel_core::store_error::StoreError;
+use reel_core::units::{ByteCount, FileOffset, Nanoseconds, SegmentCount, WritePlace};
 
 use crate::engine::reports::thread_cpu;
 use crate::engine::caller_activity::CallerCounts;
@@ -21,7 +21,7 @@ use crate::io::replace::move_into_place;
 use crate::engine::load_state::Load;
 use crate::engine::rewrite_job::{has_disk_room, rows_of};
 use crate::engine::admission::{Admission, Admit, Decision, JobRole, reserve_for, room_for};
-use reel_api::maintenance_report::WorkerPriority;
+use reel_core::maintenance_report::WorkerPriority;
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::cue::{CueTable, JobCounts};
 use crate::engine::engine_sizing::EngineSizing;

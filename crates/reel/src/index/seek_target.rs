@@ -2,8 +2,8 @@
 
 use std::cmp::Ordering;
 
-use reel_api::column_id::ColumnId;
-use reel_api::units::WritePlace;
+use reel_core::column_id::ColumnId;
+use reel_core::units::WritePlace;
 
 /// Bytes of a key that fit a prefix beside the column
 pub const PREFIX_KEY_BYTES: usize = 7;

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::mem;
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use reel_api::units::{ByteCount, WritePlace};
+use reel_core::units::{ByteCount, WritePlace};
 
 use crate::fixed_list::ListOut;
 use crate::guard::hold;

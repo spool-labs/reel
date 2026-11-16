@@ -4,9 +4,9 @@ use std::io::{Error, ErrorKind};
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
-use reel_api::column_id::ColumnId;
-use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, DeathMark, Nanoseconds, RowCount};
+use reel_core::column_id::ColumnId;
+use reel_core::store_error::StoreError;
+use reel_core::units::{ByteCount, DeathMark, Nanoseconds, RowCount};
 
 use crate::engine::open_segment::{
     OpenSegment, RowQueue, reserve_step,

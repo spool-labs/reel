@@ -3,7 +3,7 @@ use reel::segment::block_entry::{KeyBound, KeyPrefix};
 use reel::segment::column_directory::*;
 use reel::segment::footer_writer::shared_prefix;
 use reel::segment::segment_tail::SegmentNumber;
-use reel_api::units::WritePlace;
+use reel_core::units::WritePlace;
 
 const CAPACITY: usize = 64;
 const MANY: u64 = 1_000;

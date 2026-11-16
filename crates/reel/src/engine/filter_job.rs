@@ -4,9 +4,9 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::{PickKind, UnitKind};
-use reel_api::units::FileOffset;
+use reel_core::column_id::ColumnId;
+use reel_core::maintenance_report::{PickKind, UnitKind};
+use reel_core::units::FileOffset;
 
 use crate::engine::reports::thread_cpu;
 use crate::engine::engine_state::EngineState;

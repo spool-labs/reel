@@ -6,8 +6,8 @@ use std::mem;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
-use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, RowCount, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::units::{ByteCount, RowCount, WritePlace};
 
 use crate::engine::engine_state::EngineState;
 use crate::engine::volume::Volume;

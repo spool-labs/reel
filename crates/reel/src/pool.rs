@@ -9,7 +9,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 use std::sync::{Condvar, Mutex, MutexGuard};
 
-use reel_api::units::ByteCount;
+use reel_core::units::ByteCount;
 
 use crate::guard::hold;
 

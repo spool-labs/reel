@@ -7,7 +7,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
-use reel_api::units::{ByteCount, RowCount};
+use reel_core::units::{ByteCount, RowCount};
 
 use crate::index::key_hash::KeyHash;
 use crate::guard::Shards;

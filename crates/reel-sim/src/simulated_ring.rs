@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use reel::guard::hold;
 use reel::io::IoFile;
 use reel::io::ring::{RING_SLOT_BYTES, RING_SLOTS, RingDriver};
-use reel_api::units::{ByteCount, FileOffset};
+use reel_core::units::{ByteCount, FileOffset};
 
 use crate::count_pause::CountPause;
 use crate::simulated_file::SimulatedFile;

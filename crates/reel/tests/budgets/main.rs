@@ -12,10 +12,10 @@ use reel::engine::engine_sizing::{COMPACT_JOB_BYTES, ENTRY_LINE_DIVISOR, LANE_JO
 use reel::engine::reel_store::{ReelStore, ring_fits, store_shape, volume_disks};
 use reel::segment::segment_table::TABLE_SHARDS;
 use reel::io::plain::PlainIo;
-use reel_api::maintenance_report::MaintenanceReport;
-use reel_api::memory_report::MemoryReport;
-use reel_api::store_error::StoreError;
-use reel_api::units::ByteCount;
+use reel_core::maintenance_report::MaintenanceReport;
+use reel_core::memory_report::MemoryReport;
+use reel_core::store_error::StoreError;
+use reel_core::units::ByteCount;
 
 #[path = "../steady/store_config.rs"]
 mod store_config;

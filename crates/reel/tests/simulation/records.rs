@@ -14,9 +14,9 @@ use reel::record::record_encoder::{MOST_RECORD_RUNS, PlainRecord, RecordEncoder,
 use reel::record::record_head::{ PIECE_BYTES, PIECE_SUM_BYTES, PIECES_PER_CHUNK, SMALL_HEAD_BYTES, chunk_count, chunked_head_bytes, plain_length, };
 use reel::record::record_reader::{FIRST_READ_BYTES, RecordLocation, RecordRead, RecordReader, written_shape};
 use reel::row_kind::RowKind;
-use reel_api::column_id::ColumnId;
-use reel_api::reads::ValueWindow;
-use reel_api::units::{ByteCount, FileOffset, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::reads::ValueWindow;
+use reel_core::units::{ByteCount, FileOffset, WritePlace};
 
 const SEED: Seed = Seed(3);
 const RECORD_KEY: RecordKey = RecordKey(21);

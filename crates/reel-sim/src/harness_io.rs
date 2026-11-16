@@ -9,7 +9,7 @@ use reel::io::host_memory::HostMemory;
 use reel::io::{DiskSize, Io};
 use reel::io::job::Job;
 use reel::io::lock_outcome::LockOutcome;
-use reel_api::units::{ByteCount, Nanoseconds};
+use reel_core::units::{ByteCount, Nanoseconds};
 
 /// The plain backend, with or without its ring
 #[derive(Clone, Debug)]

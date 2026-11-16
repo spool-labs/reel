@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use reel::write_order::*;
-use reel_api::units::{RowCount, WritePlace};
+use reel_core::units::{RowCount, WritePlace};
 
 const ONE: RowCount = RowCount(1);
 const NO_LIMIT: WritePlace = WritePlace(u64::MAX);

@@ -1,7 +1,7 @@
 use reel::row_kind::RowKind;
 use reel::segment::row_block::*;
-use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, FileOffset, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::units::{ByteCount, FileOffset, WritePlace};
 
 const ROWS: u64 = 500;
 

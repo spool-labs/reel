@@ -10,11 +10,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker, ready};
 
-use reel_api::column_id::ColumnId;
-use reel_api::scan::ScanStep;
-use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, WritePlace};
-use reel_api::value_list::ValueList;
+use reel_core::column_id::ColumnId;
+use reel_core::scan::ScanStep;
+use reel_core::store_error::StoreError;
+use reel_core::units::{ByteCount, WritePlace};
+use reel_core::value_list::ValueList;
 
 use crate::engine::engine_state::EngineState;
 use crate::engine::read_path::{ReadAt, RecordWant};

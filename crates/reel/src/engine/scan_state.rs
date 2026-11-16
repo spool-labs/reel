@@ -2,9 +2,9 @@
 
 use std::mem;
 
-use reel_api::column_id::ColumnId;
-use reel_api::direction::Direction;
-use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RowCount, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::direction::Direction;
+use reel_core::units::{ByteCount, FileOffset, Nanoseconds, RowCount, WritePlace};
 
 use crate::index::shard_cursor::{ShardCursor, TreeCursor};
 use crate::index::sorted_keys::{KeyBatch, KeyEntry, MOST_KEY_BYTES};

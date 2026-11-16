@@ -10,8 +10,8 @@
 use std::io::{Error, ErrorKind, Result};
 use std::path::Path;
 
-use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, FileOffset};
+use reel_core::column_id::ColumnId;
+use reel_core::units::{ByteCount, FileOffset};
 
 use crate::engine::complete_image::{IMAGE_CHUNK_BYTES, ImageFiles, ImageWriter};
 use crate::engine::engine_state::EngineState;

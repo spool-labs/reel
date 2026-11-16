@@ -1,6 +1,6 @@
 use reel::record::codec::Codec;
 use reel::record::record_head::*;
-use reel_api::units::ByteCount;
+use reel_core::units::ByteCount;
 
 // both codecs and both shapes survive the form byte, and an unknown byte is refused
 #[test]

@@ -5,8 +5,8 @@ use std::hint::black_box;
 use std::io::{ErrorKind, IoSlice, Result};
 use std::path::{Path, PathBuf};
 
-use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, DeathMark, FileOffset, RowCount, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::units::{ByteCount, DeathMark, FileOffset, RowCount, WritePlace};
 
 use crate::fixed_list::{ListFull, ListOut};
 use crate::io::replace::replace_whole;

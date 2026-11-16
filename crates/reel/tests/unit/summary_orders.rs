@@ -5,8 +5,8 @@ use reel::record::record_check::Checksum;
 use reel::segment::segment_tail::{PlaceRange, SegmentNumber};
 use reel::segment::summary::{ColumnFacts, DeadCount, SegmentFacts, SummaryRows};
 use reel::segment::summary_orders::{COVERS_LIST, SHARE_SCALE, WalkList, reclaim_share, share_bucket};
-use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, DeathMark, FileOffset, RowCount, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::units::{ByteCount, DeathMark, FileOffset, RowCount, WritePlace};
 
 const COLUMN: ColumnId = ColumnId(1);
 const BLOCKS: u32 = 4;

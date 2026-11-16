@@ -3,7 +3,7 @@
 use std::io::{ErrorKind, IoSlice, Result};
 use std::path::Path;
 
-use reel_api::units::{ByteCount, FileOffset};
+use reel_core::units::{ByteCount, FileOffset};
 
 use crate::io::{Io, IoFile};
 

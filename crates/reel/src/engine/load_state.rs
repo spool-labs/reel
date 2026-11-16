@@ -3,7 +3,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering};
 
-use reel_api::units::Nanoseconds;
+use reel_core::units::Nanoseconds;
 
 use crate::engine::reserve_job::RESERVE_PERIOD;
 use crate::engine::rewrite_job::{PLAIN_BAR, QUIET_BAR, ROOM_SHORT_BAR};

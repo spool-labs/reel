@@ -1,6 +1,6 @@
 //! The bound each kind of maintenance unit is held to, which the sims and benches check units against
 
-use reel_api::maintenance_report::UnitKind;
+use reel_core::maintenance_report::UnitKind;
 
 use crate::engine::complete_path::REFILL_STEP_BLOCKS;
 use crate::engine::filter_job::FILTER_STEP_BLOCKS;

@@ -7,12 +7,12 @@ use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig
 use reel::engine::reel_store::ReelStore;
 use reel::io::Io;
 use reel::record::codec::Codec;
-use reel_api::column_id::ColumnId;
-use reel_api::direction::Direction;
-use reel_api::scan::ScanStep;
-use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, Nanoseconds, RowCount, VolumeId};
-use reel_api::write_batch::WriteBatch;
+use reel_core::column_id::ColumnId;
+use reel_core::direction::Direction;
+use reel_core::scan::ScanStep;
+use reel_core::store_error::StoreError;
+use reel_core::units::{ByteCount, Nanoseconds, RowCount, VolumeId};
+use reel_core::write_batch::WriteBatch;
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_io::SimulatedIo;

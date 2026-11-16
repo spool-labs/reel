@@ -4,8 +4,8 @@ use std::ops::{Deref, DerefMut};
 use std::sync::MutexGuard;
 use std::sync::atomic::Ordering;
 
-use reel_api::maintenance_report::PickKind;
-use reel_api::units::Nanoseconds;
+use reel_core::maintenance_report::PickKind;
+use reel_core::units::Nanoseconds;
 
 use crate::engine::engine_state::EngineState;
 use crate::guard::hold;

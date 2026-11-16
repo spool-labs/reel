@@ -1,4 +1,4 @@
-use reel_api::value_list::*;
+use reel_core::value_list::*;
 
 // answers come back in order, and clear keeps nothing
 #[test]

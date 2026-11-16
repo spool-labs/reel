@@ -13,9 +13,9 @@ use reel::engine::reel_store::ReelStore;
 use reel::io::plain::PlainIo;
 use reel::record::codec::Codec;
 use reel::rows::row_group::ROW_HEADER_BYTES;
-use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, VolumeId};
-use reel_api::write_batch::WriteBatch;
+use reel_core::column_id::ColumnId;
+use reel_core::units::{ByteCount, VolumeId};
+use reel_core::write_batch::WriteBatch;
 
 const COLUMN: ColumnId = ColumnId(1);
 const MIB: u64 = 1024 * 1024;

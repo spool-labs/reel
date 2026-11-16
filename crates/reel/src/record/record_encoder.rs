@@ -2,7 +2,7 @@
 
 use std::io::{IoSlice, Result};
 
-use reel_api::units::{ByteCount, FileOffset, WritePlace};
+use reel_core::units::{ByteCount, FileOffset, WritePlace};
 
 use crate::io::IoFile;
 use crate::pool::{Pool, touched_room, touched_zeroes};

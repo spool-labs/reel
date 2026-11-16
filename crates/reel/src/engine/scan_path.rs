@@ -5,11 +5,11 @@ use std::io::Error;
 use std::mem;
 use std::sync::RwLockReadGuard; use std::sync::atomic::Ordering;
 
-use reel_api::column_id::ColumnId;
-use reel_api::direction::Direction;
-use reel_api::scan::ScanStep;
-use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::direction::Direction;
+use reel_core::scan::ScanStep;
+use reel_core::store_error::StoreError;
+use reel_core::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
 use crate::engine::engine_state::EngineState;
 use crate::engine::complete_path::sealed_of;

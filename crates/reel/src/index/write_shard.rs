@@ -3,9 +3,9 @@
 use std::cmp::Ordering;
 use std::hint;
 
-use reel_api::column_id::ColumnId;
-use reel_api::direction::Direction;
-use reel_api::units::{ByteCount, RowCount, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::direction::Direction;
+use reel_core::units::{ByteCount, RowCount, WritePlace};
 
 use crate::index::entry_slab::{ENTRY_ALIGNMENT, EntryAddress, EntrySlab, NO_ENTRY, PAGE_BYTES, PageCount, PageIndex, entry_size};
 use crate::index::key_hash::{KeyHash, hash_key};

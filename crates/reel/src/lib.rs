@@ -7,9 +7,9 @@
 //!
 //! ```no_run
 //! use reel::{ReelStore, PlainIo, StoreConfig, from_key};
-//! use reel_api::column_id::ColumnId;
-//! use reel_api::direction::Direction;
-//! use reel_api::units::RowCount;
+//! use reel_core::column_id::ColumnId;
+//! use reel_core::direction::Direction;
+//! use reel_core::units::RowCount;
 //!
 //! fn first_ten(store: &ReelStore<PlainIo>, start: &[u8]) {
 //!     let range = from_key(ColumnId(1), start, Direction::Ascending).wanting(RowCount(10));

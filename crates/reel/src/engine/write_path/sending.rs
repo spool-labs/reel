@@ -3,9 +3,9 @@
 use std::io::{Error, IoSlice};
 use std::mem; use std::sync::atomic::Ordering;
 
-use reel_api::maintenance_report::{JobKind, PauseCause, WriteSource};
-use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, FileOffset};
+use reel_core::maintenance_report::{JobKind, PauseCause, WriteSource};
+use reel_core::store_error::StoreError;
+use reel_core::units::{ByteCount, FileOffset};
 
 use crate::config::SyncPolicy;
 use crate::engine::engine_state::{EngineState, SlotPin};

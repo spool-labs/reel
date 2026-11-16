@@ -2,8 +2,8 @@ use reel::config::KeyShape;
 use reel::record::record_check::RecordKey;
 use reel::segment::segment_tail::SegmentNumber;
 use reel::superblock::*;
-use reel_api::column_id::ColumnId;
-use reel_api::units::WritePlace;
+use reel_core::column_id::ColumnId;
+use reel_core::units::WritePlace;
 
 fn superblock() -> Superblock {
     Superblock {

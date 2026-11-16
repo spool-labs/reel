@@ -2,7 +2,7 @@
 
 use std::cmp::Ordering;
 
-use reel_api::units::RowCount;
+use reel_core::units::RowCount;
 
 use crate::index::entry_slab::{EntryAddress, EntrySlab, PageChain};
 use crate::index::node_pool::{NO_NODE, NODE_FANOUT, NodeCount, NodeIndex, NodePool};

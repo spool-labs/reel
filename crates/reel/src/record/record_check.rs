@@ -1,7 +1,7 @@
 //! The keyed check that ties a record to its key
 
-use reel_api::column_id::ColumnId;
-use reel_api::units::WritePlace;
+use reel_core::column_id::ColumnId;
+use reel_core::units::WritePlace;
 use xxhash_rust::xxh3::{Xxh3, xxh3_64, xxh3_64_with_seed};
 
 use crate::record::record_head::RecordForm;

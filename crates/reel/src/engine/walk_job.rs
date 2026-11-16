@@ -13,10 +13,10 @@ use std::sync::atomic::AtomicU8;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::Ordering;
 
-use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::{JobKind, PickKind, UnitKind};
-use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, FileOffset, Nanoseconds, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::maintenance_report::{JobKind, PickKind, UnitKind};
+use reel_core::store_error::StoreError;
+use reel_core::units::{ByteCount, FileOffset, Nanoseconds, WritePlace};
 
 use crate::config::{MAX_KEY_BYTES, MOST_VOLUME_SLOTS};
 use crate::engine::load_state::{is_capped, pace_credit};

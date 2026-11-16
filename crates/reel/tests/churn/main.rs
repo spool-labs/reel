@@ -10,10 +10,10 @@ use reel::engine::planner::MOST_WALKLESS_STEPS;
 use reel::engine::reel_store::ReelStore;
 use reel::engine::store_scan::StoreScan;
 use reel::io::plain::PlainIo;
-use reel_api::direction::Direction;
-use reel_api::maintenance_report::MaintenanceReport;
-use reel_api::scan::ScanStep;
-use reel_api::units::ByteCount;
+use reel_core::direction::Direction;
+use reel_core::maintenance_report::MaintenanceReport;
+use reel_core::scan::ScanStep;
+use reel_core::units::ByteCount;
 
 #[path = "../steady/store_config.rs"]
 mod store_config;

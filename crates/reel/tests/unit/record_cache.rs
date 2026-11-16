@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use reel::index::record_cache::{CACHE_SHARDS, CacheLookup, MOST_CACHED_BYTES, RecordCache, place_hash};
-use reel_api::units::{ByteCount, FileOffset};
+use reel_core::units::{ByteCount, FileOffset};
 use reel::segment::segment_tail::SegmentNumber;
 
 const SEGMENT: SegmentNumber = SegmentNumber(7);

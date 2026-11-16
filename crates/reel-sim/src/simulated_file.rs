@@ -3,7 +3,7 @@
 use std::io::{Error, ErrorKind, IoSlice, IoSliceMut, Result};
 use std::sync::{Arc, Mutex};
 
-use reel_api::units::{ByteCount, FileOffset, ProcessId};
+use reel_core::units::{ByteCount, FileOffset, ProcessId};
 
 use reel::guard::hold;
 use reel::io::IoFile;

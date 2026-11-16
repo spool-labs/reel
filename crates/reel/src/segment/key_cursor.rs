@@ -1,8 +1,8 @@
 //! Walked segments a walk block or merge step asks again and again, pinned once and with a run of block lines each, so a
 //! row's lookup takes no shard lock
 
-use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::units::{ByteCount, WritePlace};
 
 use crate::pool::{touched_filled, touched_room};
 use crate::segment::block_entry::{BlockEntry, KeyPrefix};

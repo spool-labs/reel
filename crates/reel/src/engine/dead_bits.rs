@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use reel_api::units::{ByteCount, Nanoseconds};
+use reel_core::units::{ByteCount, Nanoseconds};
 
 use crate::fixed_list::FixedList;
 use crate::record::record_check::checksum;

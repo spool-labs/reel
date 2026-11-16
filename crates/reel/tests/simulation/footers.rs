@@ -18,8 +18,8 @@ use reel::segment::row_block::{BLOCK_HEADER_BYTES, FooterRow, ROW_BLOCK_BYTES, r
 use reel::segment::segment_tail::{
     BlockCount, COPY_GAP_BYTES, ColumnTail, MAX_TAIL_BYTES, SECOND_TAIL_DISTANCE, SegmentNumber, TailHead,
 };
-use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
 const RECORD_KEY: RecordKey = RecordKey(41);
 const ROOT: &str = "/disk/footers";

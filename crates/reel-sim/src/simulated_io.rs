@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
-use reel_api::units::{ByteCount, FileOffset, Nanoseconds, ProcessId};
+use reel_core::units::{ByteCount, FileOffset, Nanoseconds, ProcessId};
 
 use reel::guard::hold;
 use reel::io::host_memory::HostMemory;

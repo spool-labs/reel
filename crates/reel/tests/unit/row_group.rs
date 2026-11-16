@@ -2,8 +2,8 @@ use reel::lifetime::MarkRange;
 use reel::record::record_check::RecordKey;
 use reel::row_kind::RowKind;
 use reel::rows::row_group::*;
-use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, DeathMark, FileOffset, RowCount, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::units::{ByteCount, DeathMark, FileOffset, RowCount, WritePlace};
 
 const RECORD_KEY: RecordKey = RecordKey(11);
 const CAPACITY: ByteCount = ByteCount(4_096);

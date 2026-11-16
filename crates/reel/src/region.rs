@@ -4,7 +4,7 @@ use std::io::{Error, Result};
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 
-use reel_api::units::ByteCount;
+use reel_core::units::ByteCount;
 
 use crate::fixed_list::{FixedList, ListFull, full};
 

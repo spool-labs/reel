@@ -17,13 +17,13 @@ use reel::index::sorted_keys::{Floors, KeyEntry};
 use reel::record::codec::Codec;
 use reel::engine::store_scan::StoreScan;
 use reel::{ScanRange, from_key};
-use reel_api::column_id::ColumnId;
-use reel_api::direction::Direction;
-use reel_api::scan::ScanStep;
-use reel_api::maintenance_report::MaintenanceReport;
+use reel_core::column_id::ColumnId;
+use reel_core::direction::Direction;
+use reel_core::scan::ScanStep;
+use reel_core::maintenance_report::MaintenanceReport;
 use reel::segment::segment_tail::SegmentNumber;
-use reel_api::units::{ByteCount, DeathMark, Nanoseconds, RowCount, VolumeId, WritePlace};
-use reel_api::write_batch::WriteBatch;
+use reel_core::units::{ByteCount, DeathMark, Nanoseconds, RowCount, VolumeId, WritePlace};
+use reel_core::write_batch::WriteBatch;
 use reel_sim::seeded_random::{Seed, SeededRandom};
 use reel_sim::simulated_io::SimulatedIo;
 
@@ -1328,7 +1328,7 @@ const TAIL_KEYS: usize = 10;
 
 use std::io::IoSlice;
 use reel::io::{Io, IoFile};
-use reel_api::units::FileOffset;
+use reel_core::units::FileOffset;
 use reel_sim::file_image::BitMask;
 use reel_sim::simulated_disk::OperationCount;
 
@@ -2092,7 +2092,7 @@ fn open_sized(io: &SimulatedIo) -> Store {
     ReelStore::open(io.clone(), &config).expect("open")
 }
 
-fn sorted_reading(store: &Store) -> reel_api::maintenance_report::SortedReading {
+fn sorted_reading(store: &Store) -> reel_core::maintenance_report::SortedReading {
     report(store).sorted_columns.iter().find(|reading| reading.column == COLUMN).copied().expect("a reading")
 }
 

@@ -2,8 +2,8 @@
 
 use std::path::PathBuf;
 
-use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, RowCount, VolumeId};
+use reel_core::column_id::ColumnId;
+use reel_core::units::{ByteCount, RowCount, VolumeId};
 
 use crate::engine::engine_sizing::OPEN_PER_ROOT;
 use crate::lifetime::MOST_LIFETIME_GROUPS;

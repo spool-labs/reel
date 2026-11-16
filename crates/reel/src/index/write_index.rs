@@ -2,8 +2,8 @@
 
 use std::sync::RwLock;
 
-use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, RowCount, WritePlace};
+use reel_core::column_id::ColumnId;
+use reel_core::units::{ByteCount, RowCount, WritePlace};
 
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::guard::Shards;

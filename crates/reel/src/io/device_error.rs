@@ -2,7 +2,7 @@
 
 use std::io::{Error, ErrorKind, Result};
 
-use reel_api::units::FileOffset;
+use reel_core::units::FileOffset;
 
 use crate::io::{DeviceReads, IoFile};
 

@@ -4,10 +4,10 @@ use std::io::{Error, ErrorKind, IoSlice, Result};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use reel_api::maintenance_report::{
+use reel_core::maintenance_report::{
     SPAN_RUN_BUCKETS, UnitKind,
 };
-use reel_api::units::FileOffset;
+use reel_core::units::FileOffset;
 
 use crate::io::{Io, IoFile};
 

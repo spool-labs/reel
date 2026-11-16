@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use reel_api::units::{ByteCount, FileOffset, Nanoseconds};
+use reel_core::units::{ByteCount, FileOffset, Nanoseconds};
 
 use crate::engine::engine_state::EngineState;
 use crate::engine::open_segment::SegmentPhase;

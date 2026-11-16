@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{RwLock, RwLockReadGuard};
 
-use reel_api::units::ByteCount;
+use reel_core::units::ByteCount;
 
 use crate::pool::touched_filled;
 use crate::guard::Shards;

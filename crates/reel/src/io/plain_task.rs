@@ -5,7 +5,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use reel_api::units::Nanoseconds;
+use reel_core::units::Nanoseconds;
 
 use crate::guard::hold;
 use crate::io::job::{Job, JobStep};

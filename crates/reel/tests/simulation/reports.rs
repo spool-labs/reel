@@ -10,11 +10,11 @@ use reel::engine::job_tally::STALL_AFTER;
 use reel::engine::reel_store::ReelStore;
 use reel::io::Io;
 use reel::record::codec::Codec;
-use reel_api::column_id::ColumnId;
-use reel_api::maintenance_report::{JobKind, JobState, MaintenanceReport, PickOutcome, WriteSource};
-use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, Nanoseconds, RootId, RowCount, SegmentCount, VolumeId};
-use reel_api::usage::{ColumnUsage, UsageReport};
+use reel_core::column_id::ColumnId;
+use reel_core::maintenance_report::{JobKind, JobState, MaintenanceReport, PickOutcome, WriteSource};
+use reel_core::store_error::StoreError;
+use reel_core::units::{ByteCount, Nanoseconds, RootId, RowCount, SegmentCount, VolumeId};
+use reel_core::usage::{ColumnUsage, UsageReport};
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_io::{PAUSE_TICK, SimulatedIo};
 
@@ -563,7 +563,7 @@ fn wide_records_grow_the_record_cache() {
     let wide = store.state.memory_report();
     assert!(wide.write_index < fresh.write_index, "the write index stayed at {:?}", wide.write_index);
     // filters come first, so the arena takes what it lacks out of the record cache's share, and the share is what grew
-    let share = |report: &reel_api::memory_report::MemoryReport| report.record_cache.0 + report.arena_room.0;
+    let share = |report: &reel_core::memory_report::MemoryReport| report.record_cache.0 + report.arena_room.0;
     assert!(share(&wide) > share(&fresh), "the record cache's share stayed at {}", share(&wide));
     let mut found = Vec::new();
     assert!(store.get(COLUMN, b"wide-00007", &mut found).expect("get"));
@@ -696,7 +696,7 @@ fn wide_column_leaves_the_cache_plan() {
     assert_eq!(reopened_slots(true), reopened_slots(false));
 }
 
-fn volume_reading(store: &Store) -> reel_api::maintenance_report::VolumeReading {
+fn volume_reading(store: &Store) -> reel_core::maintenance_report::VolumeReading {
     let mut report = MaintenanceReport::default();
     store.maintenance_report(&mut report);
     report.volumes[0]

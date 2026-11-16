@@ -1,6 +1,6 @@
 //! The result of asking for a lock
 
-use reel_api::units::ProcessId;
+use reel_core::units::ProcessId;
 
 /// Either the lock, or the process that holds it
 #[derive(Debug)]

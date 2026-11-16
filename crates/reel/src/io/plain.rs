@@ -15,9 +15,9 @@ use std::thread::{self, Builder};
 use std::time::{Duration, Instant};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use reel_api::maintenance_report::PriorityClass;
-use reel_api::maintenance_report::WorkerPriority;
-use reel_api::units::{ByteCount, FileOffset, Nanoseconds, ProcessId};
+use reel_core::maintenance_report::PriorityClass;
+use reel_core::maintenance_report::WorkerPriority;
+use reel_core::units::{ByteCount, FileOffset, Nanoseconds, ProcessId};
 
 use crate::io::wake_line::WakeLine;
 use crate::io::host_memory::{HostMemory, read_host_memory};

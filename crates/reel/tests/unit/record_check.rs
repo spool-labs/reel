@@ -2,8 +2,8 @@ use reel::record::codec::Codec;
 use reel::record::record_check::*;
 use reel::record::record_head::RecordForm;
 use reel::row_kind::RowKind;
-use reel_api::column_id::ColumnId;
-use reel_api::units::WritePlace;
+use reel_core::column_id::ColumnId;
+use reel_core::units::WritePlace;
 
 const RECORD_KEY: RecordKey = RecordKey(9);
 const FORM: RecordForm = RecordForm {

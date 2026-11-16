@@ -18,7 +18,7 @@ path = "src/lib.rs"
 [dependencies]
 libc.workspace = true
 lz4-sys.workspace = true
-reel-api.workspace = true
+reel-core.workspace = true
 xxhash-rust.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]

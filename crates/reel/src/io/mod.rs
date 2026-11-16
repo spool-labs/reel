@@ -22,8 +22,8 @@ use std::pin::pin;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 
-use reel_api::maintenance_report::WorkerPriority;
-use reel_api::units::{ByteCount, FileOffset, Nanoseconds, WritePlace};
+use reel_core::maintenance_report::WorkerPriority;
+use reel_core::units::{ByteCount, FileOffset, Nanoseconds, WritePlace};
 
 use crate::engine::read_path::SealedRow;
 use crate::io::host_memory::HostMemory;

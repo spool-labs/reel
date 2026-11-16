@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use reel::index::key_hash::KeyHash;
 use reel::segment::filter_arena::*;
 use reel::segment::segment_tail::SegmentNumber;
-use reel_api::units::ByteCount;
+use reel_core::units::ByteCount;
 
 const SHARE: ByteCount = ByteCount(4_096);
 const SEGMENTS: usize = 8;

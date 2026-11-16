@@ -6,8 +6,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RowCount, WritePlace};
+use reel_core::store_error::StoreError;
+use reel_core::units::{ByteCount, FileOffset, Nanoseconds, RowCount, WritePlace};
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::engine::engine_sizing::GROUP_BYTES;

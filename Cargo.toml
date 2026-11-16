@@ -23,3 +23,8 @@ unwrap_used = "deny"
 undocumented_unsafe_blocks = "deny"
 expect_used = "deny"
 panic = "deny"
+
+# the CI's test builds: optimized, with every check a debug build makes, so the sims run about fifteen times faster
+[profile.ci]
+inherits = "dev"
+opt-level = 2

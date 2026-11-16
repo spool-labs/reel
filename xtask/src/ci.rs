@@ -23,16 +23,20 @@ pub const CLIPPY_ARGUMENTS: [&str; 9] = ["clippy", "--workspace", "--all-targets
 /// workspace build unifies features, and the sims crate turns the test hooks on for every member
 pub const NODE_CLIPPY_ARGUMENTS: [&str; 10] = ["clippy", "-p", "tape-reel", "-p", "tape-reel-core", "--lib", "--locked", "--", "-D", "warnings"];
 /// Cargo arguments for the test pass, which keeps going after a failure
-pub const TEST_ARGUMENTS: [&str; 6] = ["test", "--workspace", "--locked", "--no-fail-fast", "--features", TEST_HOOKS];
+pub const TEST_ARGUMENTS: [&str; 8] = ["test", "--workspace", "--locked", "--no-fail-fast", "--profile", CI_PROFILE, "--features", TEST_HOOKS];
 /// Cargo arguments for the pick gate: every kind of pick at 100,000 segments a volume, timed in a release build against its line
 pub const PICK_GATE_ARGUMENTS: [&str; 12] =
     ["test", "--release", "--locked", "-p", "tape-reel", "--features", TEST_HOOKS, "--test", "simulation", "picks::", "--", "--nocapture"];
+/// The profile the CI's tests build in: optimized, with debug assertions and overflow checks
+pub const CI_PROFILE: &str = "ci";
 /// The feature that lets the sims set a volume's worker count, which no node build turns on
 pub const TEST_HOOKS: &str = "tape-reel/test-hooks";
 /// Cargo arguments for the workers pass: the planner-facing sims again, with a worker beside each planner as a node runs
-pub const WORKERS_PASS_ARGUMENTS: [&str; 13] = [
+pub const WORKERS_PASS_ARGUMENTS: [&str; 15] = [
     "test",
     "--locked",
+    "--profile",
+    CI_PROFILE,
     "-p",
     "tape-reel",
     "--features",
@@ -82,14 +86,23 @@ pub fn run_ci() -> Result<(), TaskError> {
         failures.push("the build without test hooks has problems".to_string());
     }
 
-    let tests = run_cargo(&root, &TEST_ARGUMENTS)?;
+    // the workers pass runs the same binary beside the test pass, and waits on cargo's build lock until it's built
+    let workers = [Variable { name: WORKERS_VARIABLE.to_string(), value: PASS_WORKERS.to_string() }];
+    let (tests, pass) = thread::scope(|scope| {
+        let pass = scope.spawn(|| run_cargo_with(&root, &WORKERS_PASS_ARGUMENTS, &workers));
+        let tests = run_cargo(&root, &TEST_ARGUMENTS);
+        (tests, pass.join())
+    });
+    let tests = tests?;
+    let Ok(pass) = pass else {
+        return Err(TaskError::Failed { failures: vec!["the workers pass stopped with a panic".to_string()] });
+    };
+    let pass = pass?;
     if !tests.is_success {
         failures.push("a test failed or a test binary stopped early".to_string());
     }
     check_lines(&tests.lines, &harnesses, &mut failures);
 
-    let workers = [Variable { name: WORKERS_VARIABLE.to_string(), value: PASS_WORKERS.to_string() }];
-    let pass = run_cargo_with(&root, &WORKERS_PASS_ARGUMENTS, &workers)?;
     if !pass.is_success {
         failures.push("a planner-facing sim failed with a worker beside the planner".to_string());
     }

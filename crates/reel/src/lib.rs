@@ -3,6 +3,23 @@
 //! The store and what opening one takes are the crate's surface. The modules behind it are the crate's own, and the sims and
 //! benches reach them through the test-hooks feature
 //!
+//! A store opens on a budget, its volumes and its columns. A column of fixed-width keys keeps a sorted index by default:
+//!
+//! ```no_run
+//! use reel::{ColumnConfig, KeyShape, PlainIo, ReelStore, StoreConfig, SyncPolicy, ThreadCounts, VolumeConfig};
+//! use reel_core::column_id::ColumnId;
+//! use reel_core::units::ByteCount;
+//!
+//! let config = StoreConfig {
+//!     memory_budget: ByteCount(256 * 1024 * 1024),
+//!     threads: ThreadCounts::default(),
+//!     volumes: vec![VolumeConfig::new("data", vec!["/var/lib/reel".into()], SyncPolicy::Never)],
+//!     columns: vec![ColumnConfig::new(ColumnId(1), "accounts", KeyShape::Fixed { width: 32 })],
+//! };
+//! let store = ReelStore::open(PlainIo::new(), &config).expect("open");
+//! store.put(ColumnId(1), &[7; 32], b"value").expect("put");
+//! ```
+//!
 //! A caller can tell a scan how many rows it will take, and the scan then locates and reads only that many at a time:
 //!
 //! ```no_run

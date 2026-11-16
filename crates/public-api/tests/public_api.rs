@@ -465,22 +465,14 @@ fn a_column_index_follows_its_keys_by_default() -> Result<(), Box<dyn std::error
 
     let root = scratch_root().with_extension("kinds");
     let _gone = std::fs::remove_dir_all(&root);
-    let column = |id: u8, key_shape: KeyShape, index: ColumnIndex| ColumnConfig {
-        id: ColumnId(id),
-        name: format!("column-{id}"),
-        key_shape,
-        codec: Codec::None,
-        volume: VolumeId(0),
-        index,
-        least_rows: None,
-        least_value: None,
-    };
+    // the constructor leaves the index to the keys, and a config names one only to choose otherwise
+    let column = |id: u8, key_shape: KeyShape| ColumnConfig::new(ColumnId(id), format!("column-{id}"), key_shape);
     let fixed = KeyShape::Fixed { width: 8 };
     let mut kinds = config(root.clone());
     kinds.columns = vec![
-        column(1, fixed, ColumnIndex::default()),
-        column(2, KeyShape::Variable { most: 32 }, ColumnIndex::default()),
-        column(3, fixed, ColumnIndex::Plain),
+        column(1, fixed),
+        column(2, KeyShape::Variable { most: 32 }),
+        ColumnConfig { index: ColumnIndex::Plain, ..column(3, fixed) },
     ];
     let store = ReelStore::open(PlainIo::new(), &kinds)?;
     let mut report = MaintenanceReport::new();
@@ -491,7 +483,7 @@ fn a_column_index_follows_its_keys_by_default() -> Result<(), Box<dyn std::error
     std::fs::remove_dir_all(&root)?;
 
     let mut refused = config(scratch_root().with_extension("kinds-refused"));
-    refused.columns = vec![column(1, KeyShape::Variable { most: 32 }, ColumnIndex::Sorted)];
+    refused.columns = vec![ColumnConfig { index: ColumnIndex::Sorted, ..column(1, KeyShape::Variable { most: 32 }) }];
     let outcome = ReelStore::open(PlainIo::new(), &refused).map(|_store| ());
     assert!(matches!(&outcome, Err(StoreError::BadIndex { reason, .. }) if reason.contains("fixed width")), "{outcome:?}");
     Ok(())

@@ -118,6 +118,12 @@ pub struct VolumeConfig {
 }
 
 impl ColumnConfig {
+    /// Build a column on the first volume with no codec and the index its keys take by default: sorted on fixed-width keys,
+    /// none on variable ones
+    pub fn new(id: ColumnId, name: impl Into<String>, key_shape: KeyShape) -> Self {
+        Self { id, name: name.into(), key_shape, codec: Codec::None, volume: VolumeId(0), index: ColumnIndex::ByKeys, least_rows: None, least_value: None }
+    }
+
     /// Check the column keeps a sorted index: asked for, or by default on keys of one fixed width
     pub fn is_sorted(&self) -> bool {
         match self.index {

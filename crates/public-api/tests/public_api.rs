@@ -298,3 +298,32 @@ fn a_sealed_segment_holds_no_room_past_its_end() -> Result<(), Box<dyn std::erro
     std::fs::remove_dir_all(&root)?;
     Ok(())
 }
+
+// segments that seal because they filled give back the room reserved past their ends, as part-full ones do
+#[test]
+fn segments_sealed_by_filling_hold_no_room_past_their_ends() -> Result<(), Box<dyn std::error::Error>> {
+    let root = scratch_root().with_extension("filled");
+    let _gone = std::fs::remove_dir_all(&root);
+    let config = config(root.clone());
+    let store = ReelStore::open(PlainIo::new(), &config)?;
+    let value = vec![9_u8; 64 * 1024];
+    for number in 0..4_000_u32 {
+        store.put(COLUMN, format!("key-{number:05}").as_bytes(), &value)?;
+    }
+    store.close()?;
+    drop(store);
+    let mut files = Vec::new();
+    files_under(&root, &mut files)?;
+    let rows: Vec<String> = files.iter().filter_map(|(path, _length, _held)| path.to_string_lossy().strip_suffix(".rows").map(str::to_string)).collect();
+    let sealed: Vec<_> = files
+        .iter()
+        .filter(|(path, _length, _held)| path.to_string_lossy().strip_suffix(".data").is_some_and(|stem| !rows.iter().any(|open| open == stem)))
+        .collect();
+    for (path, length, held) in &sealed {
+        println!("{} {length} B long, {held} B held", path.display());
+    }
+    assert!(sealed.len() >= 3, "only {} segments sealed: {files:?}", sealed.len());
+    assert!(sealed.iter().all(|(_path, length, held)| *held <= length.next_multiple_of(4_096)), "{sealed:?}");
+    std::fs::remove_dir_all(&root)?;
+    Ok(())
+}

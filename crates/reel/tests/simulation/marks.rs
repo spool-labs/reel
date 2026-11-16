@@ -503,12 +503,14 @@ fn no_lifetime_groups_refuse_a_mark() {
 fn marked_rows_come_back_with_no_groups() {
     for seed in crate::seed_sets::seeds([8, 9]) {
         for is_killed in [false, true] {
-            marked_rows_come_back(seed, is_killed);
+            // groups on in one run and none in another, so each reopen is the first open after the kill or the close
+            marked_rows_come_back(seed, is_killed, true);
+            marked_rows_come_back(seed, is_killed, false);
         }
     }
 }
 
-fn marked_rows_come_back(seed: u64, is_killed: bool) {
+fn marked_rows_come_back(seed: u64, is_killed: bool, has_groups: bool) {
     let io = SimulatedIo::new(Seed(seed));
     let store = open(&io);
     for number in 0..LIFETIME_KEYS {
@@ -525,12 +527,13 @@ fn marked_rows_come_back(seed: u64, is_killed: bool) {
     }
     drop(store);
 
-    // the same store reopened with groups on keeps its recovered groups open
-    {
+    // a store reopened with groups on keeps its recovered groups open
+    if has_groups {
         let store = ReelStore::open(io.clone(), &config()).expect("reopen with groups");
         settle(&io);
         assert!(reading(&store).lifetime_groups >= 1, "seed {seed}, killed {is_killed}: a volume with groups sealed its recovered group");
         store.close().expect("close");
+        return;
     }
     let mut none = config();
     none.volumes[0].open_segments = Some(1);

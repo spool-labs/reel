@@ -13,11 +13,9 @@ const COLUMN: ColumnId = ColumnId(1);
 const BUDGET: ByteCount = ByteCount(128 * 1024 * 1024);
 const KEYS: u32 = 100;
 
-// a directory of its own under the system's temporary one
+// a path under the system's temporary one, which each test gives its own extension and clears itself, so no test removes another's
 fn scratch_root() -> PathBuf {
-    let root = std::env::temp_dir().join(format!("reel-public-api-{}", std::process::id()));
-    let _gone = std::fs::remove_dir_all(&root);
-    root
+    std::env::temp_dir().join(format!("reel-public-api-{}", std::process::id()))
 }
 
 fn config(root: PathBuf) -> StoreConfig {
@@ -40,7 +38,8 @@ fn config(root: PathBuf) -> StoreConfig {
 
 #[test]
 fn a_store_opens_writes_reads_and_scans_from_outside() -> Result<(), Box<dyn std::error::Error>> {
-    let root = scratch_root();
+    let root = scratch_root().with_extension("basic");
+    let _gone = std::fs::remove_dir_all(&root);
     let store = ReelStore::open(PlainIo::new(), &config(root.clone()))?;
     let mut batch = WriteBatch::new();
     for number in 0..KEYS {

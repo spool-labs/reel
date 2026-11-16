@@ -426,6 +426,17 @@ impl<Backend: Io> RewriteJob<Backend> {
         let decided = &volume.dead_bits.decided;
         decided[if is_set { DECIDED_SET } else { DECIDED_CLEAR }].fetch_add(1, Ordering::Relaxed);
         self.bit_rows += 1;
+        // the sims ask every set bit the merge decides by: its row has a newer sealed version, inputs and all, or lies under an
+        // applied cover or a damaged range
+        #[cfg(feature = "test-hooks")]
+        if is_set {
+            let is_replaced = state.has_newer_sealed(volume, column, &self.key, row.place, &[]).unwrap_or(true);
+            let is_covered = volume.covers.newest_applied(column, &self.key).is_some_and(|cover| cover > row.place);
+            let is_hidden = volume.damage.covering(column, &self.key).is_some_and(|highest| highest > row.place);
+            // a grave counts dead once nothing older is left for it to hide
+            let is_bare_grave = row.kind == RowKind::Grave && !state.has_older_row(volume, column, &self.key, row.place, &[]).unwrap_or(true);
+            assert!(is_replaced || is_covered || is_hidden || is_bare_grave, "a merge decides {segment:?} block {block} row {index} by its bit, and the row is live: key {:02x?}", &self.key[..]);
+        }
         // one row in so many asks as well: a set bit with no newer row anywhere is wrong, a clear bit the ask finds replaced is
         // a row the walk didn't charge
         if volume.asks_every_bit() || self.bit_rows.is_multiple_of(BIT_SAMPLE_EVERY) {

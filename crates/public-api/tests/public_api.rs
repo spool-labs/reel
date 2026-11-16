@@ -488,3 +488,74 @@ fn a_column_index_follows_its_keys_by_default() -> Result<(), Box<dyn std::error
     assert!(matches!(&outcome, Err(StoreError::BadIndex { reason, .. }) if reason.contains("fixed width")), "{outcome:?}");
     Ok(())
 }
+
+// the least budget a call gives with no store opened is the one a store opens at and a byte under it is refused, and the one a
+// refusal for its budget gives, for a writer and for a reader, over six shapes
+#[test]
+fn the_least_budget_needs_no_trial_open() -> Result<(), Box<dyn std::error::Error>> {
+    use reel_core::store_error::StoreError;
+
+    let tiny = ByteCount(1024 * 1024);
+    let base = scratch_root().with_extension("least");
+    let _gone = std::fs::remove_dir_all(&base);
+    let shapes: Vec<(&str, Shape)> = vec![
+        ("default", Box::new(config)),
+        ("small", Box::new(|root| {
+            let mut small = config(root);
+            small.threads = ThreadCounts { maintenance_workers: Some(0), read_threads: 0 };
+            small.volumes[0].open_segments = Some(1);
+            small.volumes[0].segment_bytes = Some(ByteCount(256 * 1024));
+            small.volumes[0].lifetime_groups = Some(0);
+            small
+        })),
+        ("three columns, one lz4", Box::new(|root| {
+            let mut three = config(root);
+            three.columns.push(ColumnConfig { codec: Codec::Lz4, ..ColumnConfig::new(ColumnId(2), "bulk", KeyShape::Variable { most: 32 }) });
+            three.columns.push(ColumnConfig::new(ColumnId(3), "plain", KeyShape::Variable { most: 32 }));
+            three
+        })),
+        ("sorted", Box::new(|root| {
+            let mut sorted = config(root);
+            sorted.columns = vec![ColumnConfig::new(ColumnId(1), "column", KeyShape::Fixed { width: 16 })];
+            sorted
+        })),
+        ("two volumes", Box::new(|root: PathBuf| {
+            let mut two = config(root.join("first"));
+            two.volumes.push(VolumeConfig::new("second", vec![root.join("second")], SyncPolicy::Never));
+            two.columns.push(ColumnConfig { volume: VolumeId(1), ..ColumnConfig::new(ColumnId(2), "other", KeyShape::Variable { most: 32 }) });
+            two
+        })),
+        ("two workers", Box::new(|root| {
+            let mut workers = config(root);
+            workers.threads = ThreadCounts { maintenance_workers: Some(2), ..ThreadCounts::default() };
+            workers
+        })),
+    ];
+    for (name, shape) in &shapes {
+        let root = base.join(name.replace(' ', "-"));
+        let at = |budget: ByteCount| StoreConfig { memory_budget: budget, ..shape(root.clone()) };
+        let writer = ReelStore::least_budget(&PlainIo::new(), &at(tiny))?;
+        // a store opens at the least the call gives and is refused a byte under it, and a refusal for its budget gives the same
+        assert!(ReelStore::open(PlainIo::new(), &at(ByteCount(writer.0 - 1))).is_err(), "{name}: opened under its least");
+        if let Err(StoreError::BudgetTooSmall { least, .. }) = ReelStore::open(PlainIo::new(), &at(tiny)) {
+            assert_eq!(writer, least, "{name}: the writer's least");
+        }
+        let store = ReelStore::open(PlainIo::new(), &at(writer))?;
+        store.put(ColumnId(1), &[1; 16], b"value")?;
+        store.finish()?;
+        drop(store);
+        let reader = ReelStore::least_read_only_budget(&PlainIo::new(), &at(tiny))?;
+        assert!(ReelStore::open_read_only(PlainIo::new(), &at(ByteCount(reader.0 - 1))).is_err(), "{name}: a view opened under its least");
+        drop(ReelStore::open_read_only(PlainIo::new(), &at(reader))?);
+        if let Err(StoreError::BudgetTooSmall { least, .. }) = ReelStore::open_read_only(PlainIo::new(), &at(tiny)) {
+            assert_eq!(reader, least, "{name}: the reader's least");
+        }
+        println!("{name}: writer {} B, reader {} B", writer.0, reader.0);
+        assert!(reader <= writer, "{name}: a reader takes more than a writer");
+    }
+    std::fs::remove_dir_all(&base)?;
+    Ok(())
+}
+
+// a config built on a root
+type Shape = Box<dyn Fn(PathBuf) -> StoreConfig>;

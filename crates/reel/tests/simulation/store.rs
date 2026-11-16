@@ -1591,16 +1591,18 @@ fn a_declared_least_value_leaves_the_cap() {
     }
     store.write_batch(&puts).expect("a batch of empty values");
     let mut deletes = WriteBatch::new();
-    for number in 0..1_000_u32 {
-        deletes.delete(COLUMN, format!("gone-{number:04}").as_bytes());
+    for number in 0..500_u32 {
+        deletes.delete(COLUMN, format!("empty-{:04}", number * 2).as_bytes());
     }
     store.write_batch(&deletes).expect("a batch of deletes");
     assert_eq!(store.state.sizing.segment_rows, plain_rows, "a declared least value moved the cap");
     store.close().expect("close");
     drop(store);
     let store = ReelStore::open(io, &declared).expect("reopen");
+    // the even keys were deleted and the odd ones keep their empty values
     for number in 0..1_000_u32 {
-        assert_eq!(read(&store, format!("empty-{number:04}").as_bytes()), Some(Vec::new()), "key {number}");
+        let wanted = (number % 2 == 1).then(Vec::new);
+        assert_eq!(read(&store, format!("empty-{number:04}").as_bytes()), wanted, "key {number}");
     }
     store.close().expect("close");
 }

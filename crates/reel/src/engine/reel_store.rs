@@ -212,6 +212,17 @@ impl<Backend: Io> ReelStore<Backend> {
         self.state.damaged_segments.load(Ordering::Acquire)
     }
 
+    /// Read the least budget a store of this config opens on as a writer, the one a refusal gives, with no store opened: its
+    /// parts with the workers the config sets, or none, and no ring
+    pub fn least_budget(io: &Backend, config: &StoreConfig) -> Result<ByteCount, StoreError> {
+        least_budget_of(io, config, false)
+    }
+
+    /// Read the least budget a read-only open of this config takes, with no store opened
+    pub fn least_read_only_budget(io: &Backend, config: &StoreConfig) -> Result<ByteCount, StoreError> {
+        least_budget_of(io, config, true)
+    }
+
     /// Open a store beside its writer, with no lock and no write. It sees the store as it stood, every batch whole or absent,
     /// until `refresh` looks again
     pub fn open_read_only(io: Backend, config: &StoreConfig) -> Result<Self, StoreError> {
@@ -1901,4 +1912,24 @@ pub fn cacheable_mean(summaries: &[SummaryFound]) -> Option<u64> {
     let held = columns.iter().filter(|(bytes, rows)| *rows > 0 && bytes / rows <= MOST_CACHED_BYTES as u64);
     let (bytes, rows) = held.fold((0, 0), |(bytes, rows), (column_bytes, column_rows)| (bytes + column_bytes, rows + column_rows));
     (rows > 0).then(|| bytes / rows)
+}
+
+/// Read the least budget a config takes as a writer or a reader, as a refusal at a budget too small for anything would give it:
+/// the shape with no ring, the workers the config sets or none, and LEAST_LZ4_BUDGET past it for a store with an lz4 column
+pub fn least_budget_of<Backend: Io>(io: &Backend, config: &StoreConfig, is_read_only: bool) -> Result<ByteCount, StoreError> {
+    // the config is checked for all but its budget, which is what the call answers
+    check_config(&StoreConfig { memory_budget: ByteCount(u64::MAX), ..config.clone() })?;
+    // a root not made yet sits on the disk of its nearest ancestor that exists
+    let mut placed = config.clone();
+    for root in placed.volumes.iter_mut().flat_map(|volume| volume.roots.iter_mut()) {
+        if let Some(found) = root.ancestors().find(|ancestor| io.capacity(ancestor).is_ok()) {
+            *root = found.to_path_buf();
+        }
+    }
+    let disks = volume_disks(io, &placed).map_err(open_error("reading a disk's size"))?;
+    let shape = StoreShape { budget: ByteCount(0), is_read_only, ..store_shape(config, false, &disks) };
+    // an lz4 column also needs its compress pool, which no budget under LEAST_LZ4_BUDGET holds
+    let has_lz4 = config.columns.iter().any(|column| column.codec == Codec::Lz4);
+    let lz4_least = if has_lz4 { LEAST_LZ4_BUDGET } else { ByteCount(0) };
+    Ok(shape.with_workers_settled().least_budget().max(lz4_least))
 }

@@ -1032,3 +1032,37 @@ fn a_settled_cover_counts_its_row_once() {
         assert!(proven > 0, "killed {is_killed}: the bit check read no block");
     }
 }
+
+// a cover that charged a row and waits to apply again, as one reloaded at a crash's open does, still hides the row for both dead
+// bit checks: the check on the reopened store, a merge over the row's segment and the close all pass, and a get finds nothing. The
+// range starts below the key, so the cover's own row is no newer version of it
+#[test]
+fn an_unapplied_cover_hides_its_rows_for_the_checks() {
+    let io = SimulatedIo::new(Seed(166));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    put_keys(&store, "a", b"value");
+    store.put(COLUMN, b"m", b"value").expect("put");
+    put_keys(&store, "z", b"value");
+    let rows = seal(&store, &io);
+    store.delete_range(COLUMN, b"l", b"n").expect("delete");
+    store.put(COLUMN, b"zz", b"value").expect("put");
+    seal(&store, &io);
+    settle(&io);
+    let charged = |store: &Store| (0..4).filter_map(|block| store.state.volumes[0].dead_bits.block_set(rows, block)).sum::<u32>();
+    assert!(charged(&store) > 0, "the cover set no bit");
+    store.close().expect("close");
+
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    assert!(charged(&store) > 0, "the bits didn't come back");
+    // what a crash's open leaves: the cover in the pool and its segment's walk not yet landed
+    volume.covers.mark_all_unapplied();
+    assert!(volume.covers.newest_applied(COLUMN, b"m").is_none());
+    assert!(volume.covers.newest_over(COLUMN, b"m", reel_core::units::WritePlace(u64::MAX)).is_some(), "the cover didn't come back");
+    reel::engine::reel_store::check_dead_bits_true(&store.state);
+    hold_compaction(&store, false);
+    settle(&io);
+    assert_eq!(read(&store, b"m"), None, "a deleted key read");
+    store.close().expect("close");
+}

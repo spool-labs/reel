@@ -2040,7 +2040,8 @@ pub fn check_dead_bits_true<Backend: Io>(state: &EngineState<Backend>) {
                             continue;
                         };
                         let is_replaced = newest.is_some_and(|found| found.row.place > row.place);
-                        let is_covered = volume.covers.newest_applied(block.column, &key).is_some_and(|cover| cover > row.place);
+                        // a cover reloaded at open is durable, and a get reads through it before it applies again
+                        let is_covered = volume.covers.newest_over(block.column, &key, WritePlace(u64::MAX)).is_some_and(|cover| cover > row.place);
                         let is_hidden = volume.damage.covering(block.column, &key).is_some_and(|highest| highest > row.place);
                         let is_bare_grave = row.kind == RowKind::Grave && !state.has_older_row(volume, block.column, &key, row.place, &[]).unwrap_or(true);
                         assert!(is_replaced || is_covered || is_hidden || is_bare_grave, "{segment:?} block {index} row {at} has its bit set and is live: key {:02x?}", &key[..]);

@@ -431,7 +431,8 @@ impl<Backend: Io> RewriteJob<Backend> {
         #[cfg(feature = "test-hooks")]
         if is_set && state.io.proves_dead_bits() {
             let is_replaced = state.has_newer_sealed(volume, column, &self.key, row.place, &[]).unwrap_or(true);
-            let is_covered = volume.covers.newest_applied(column, &self.key).is_some_and(|cover| cover > row.place);
+            // a cover reloaded at open is durable, and a get reads through it before it applies again
+            let is_covered = volume.covers.newest_over(column, &self.key, WritePlace(u64::MAX)).is_some_and(|cover| cover > row.place);
             let is_hidden = volume.damage.covering(column, &self.key).is_some_and(|highest| highest > row.place);
             // a grave counts dead once nothing older is left for it to hide
             let is_bare_grave = row.kind == RowKind::Grave && !state.has_older_row(volume, column, &self.key, row.place, &[]).unwrap_or(true);

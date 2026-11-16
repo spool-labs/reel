@@ -502,6 +502,14 @@ impl RangeCovers {
         pool.order = order;
     }
 
+    /// Note every cover as waiting to apply again, the state a crash's open can leave, for the sims
+    #[cfg(feature = "test-hooks")]
+    pub fn mark_all_unapplied(&self) {
+        for slot in self.write().slots.iter_mut() {
+            slot.is_applied = false;
+        }
+    }
+
     /// Note every cover of a segment as applied
     pub fn mark_segment_applied(&self, segment: SegmentNumber) {
         let mut pool = self.write();

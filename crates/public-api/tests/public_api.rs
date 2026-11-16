@@ -327,3 +327,39 @@ fn segments_sealed_by_filling_hold_no_room_past_their_ends() -> Result<(), Box<d
     std::fs::remove_dir_all(&root)?;
     Ok(())
 }
+
+// a mix of value sizes, at the least budget, fills segments by bytes until one takes its reservation a step past the byte target:
+// six columns, their key counts and value sizes
+const MIX: [(u64, usize); 6] = [(95, 111_781), (95, 33_349), (13_009, 11_746), (39_995, 179), (157_183, 504), (604, 161_835)];
+
+// segments that filled by bytes on a mix of value sizes give back the room past their ends, at the least budget
+#[test]
+fn segments_filled_by_a_mix_hold_no_room_past_their_ends() -> Result<(), Box<dyn std::error::Error>> {
+    let root = scratch_root().with_extension("mix");
+    let _gone = std::fs::remove_dir_all(&root);
+    let mut config = config(root.clone());
+    config.columns = (1..=MIX.len() as u8)
+        .map(|id| ColumnConfig { id: ColumnId(id), name: format!("c{id}"), key_shape: KeyShape::Variable { most: 64 }, ..config.columns[0].clone() })
+        .collect();
+    config.memory_budget = ByteCount(1 << 20);
+    let least = match ReelStore::open(PlainIo::new(), &config) {
+        Err(reel_api::store_error::StoreError::BudgetTooSmall { least, .. }) => least.0,
+        other => return Err(format!("a 1 MiB budget opened: {:?}", other.err()).into()),
+    };
+    config.memory_budget = ByteCount(least.div_ceil(1 << 20) << 20);
+    let store = ReelStore::open(PlainIo::new(), &config)?;
+    for (index, (keys, length)) in MIX.iter().enumerate() {
+        let value = vec![index as u8; *length];
+        for number in 0..*keys {
+            store.put(ColumnId(index as u8 + 1), format!("c{index}/{number:08}").as_bytes(), &value)?;
+        }
+    }
+    store.finish()?;
+    drop(store);
+    let mut files = Vec::new();
+    files_under(&root, &mut files)?;
+    let past: Vec<_> = files.iter().filter(|(path, length, held)| path.to_string_lossy().ends_with(".data") && *held > length.next_multiple_of(4_096)).collect();
+    assert!(past.is_empty(), "segments holding blocks past their ends: {past:?}");
+    std::fs::remove_dir_all(&root)?;
+    Ok(())
+}

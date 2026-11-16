@@ -23,7 +23,7 @@ pub const CLIPPY_ARGUMENTS: [&str; 9] = ["clippy", "--workspace", "--all-targets
 /// workspace build unifies features, and the sims crate turns the test hooks on for every member
 pub const NODE_CLIPPY_ARGUMENTS: [&str; 10] = ["clippy", "-p", "tape-reel", "-p", "tape-reel-core", "--lib", "--locked", "--", "-D", "warnings"];
 /// Cargo arguments for the outside caller's test, in a call of its own with no features, so the test hooks never reach it
-pub const PUBLIC_API_ARGUMENTS: [&str; 4] = ["test", "--locked", "-p", "tape-reel-public-api"];
+pub const PUBLIC_API_ARGUMENTS: [&str; 6] = ["test", "--locked", "--profile", CI_PROFILE, "-p", "tape-reel-public-api"];
 /// Cargo arguments for the test pass, which keeps going after a failure
 pub const TEST_ARGUMENTS: [&str; 8] = ["test", "--workspace", "--locked", "--no-fail-fast", "--profile", CI_PROFILE, "--features", TEST_HOOKS];
 /// Cargo arguments for the pick gate: every kind of pick at 100,000 segments a volume, timed in a release build against its line

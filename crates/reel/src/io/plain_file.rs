@@ -155,12 +155,7 @@ impl IoFile for PlainFile {
     }
 
     fn truncate(&self, length: ByteCount) -> Result<()> {
-        // SAFETY: the descriptor is open, and no pointer crosses the call
-        let status = unsafe { libc::ftruncate(self.descriptor, length.0 as libc::off_t) };
-        if status != 0 {
-            return Err(Error::last_os_error());
-        }
-        Ok(())
+        truncate_descriptor(self.descriptor, length)
     }
 
     fn reserve_to(&self, end: ByteCount) -> Result<()> {
@@ -217,6 +212,32 @@ pub fn reserve_descriptor_to(descriptor: RawFd, end: ByteCount) -> Result<()> {
     let status = unsafe { libc::ftruncate(descriptor, end.0 as libc::off_t) };
     if status != 0 {
         return Err(Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Set a file's length
+#[cfg(not(all(target_vendor = "apple", not(reel_plain_unix))))]
+pub fn truncate_descriptor(descriptor: RawFd, length: ByteCount) -> Result<()> {
+    // SAFETY: the descriptor is open, and no pointer crosses the call
+    let status = unsafe { libc::ftruncate(descriptor, length.0 as libc::off_t) };
+    if status != 0 {
+        return Err(Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Set a file's length and give back the blocks reserved past it. A truncate to the length a file already has changes nothing
+/// here and leaves blocks reserved past the end held, so that one grows the file a byte first and shrinks it back
+#[cfg(all(target_vendor = "apple", not(reel_plain_unix)))]
+pub fn truncate_descriptor(descriptor: RawFd, length: ByteCount) -> Result<()> {
+    let steps: &[u64] = if descriptor_stats(descriptor)?.st_size as u64 == length.0 { &[length.0 + 1, length.0] } else { &[length.0] };
+    for step in steps {
+        // SAFETY: the descriptor is open, and no pointer crosses the call
+        let status = unsafe { libc::ftruncate(descriptor, *step as libc::off_t) };
+        if status != 0 {
+            return Err(Error::last_os_error());
+        }
     }
     Ok(())
 }

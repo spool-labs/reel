@@ -657,3 +657,16 @@ fn a_set_segment_size_caps_the_write_index() {
         assert_eq!((capped.spot_share, capped.cache_share, capped.summary_share, capped.table_share), (planned.spot_share, planned.cache_share, planned.summary_share, planned.table_share));
     }
 }
+
+// a relative root of two parts that isn't made yet sits on the current directory's disk, read through "." since a relative path's
+// last ancestor is empty, and no test changes the working directory to show it
+#[test]
+fn a_missing_relative_root_sits_on_the_current_directory() {
+    use reel::engine::reel_store::disk_root;
+    use reel::io::plain::PlainIo;
+    let root = std::path::Path::new("no-such-reel-dir-for-a-test/store");
+    assert!(!root.exists());
+    assert_eq!(disk_root(&PlainIo::new(), root), std::path::PathBuf::from("."));
+    let absolute = std::env::temp_dir().join("no-such-reel-dir-for-a-test").join("store");
+    assert_eq!(disk_root(&PlainIo::new(), &absolute), std::env::temp_dir());
+}

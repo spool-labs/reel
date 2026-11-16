@@ -2,6 +2,7 @@
 
 use std::io::{Error, ErrorKind};
 use std::mem;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -1922,9 +1923,7 @@ pub fn least_budget_of<Backend: Io>(io: &Backend, config: &StoreConfig, is_read_
     // a root not made yet sits on the disk of its nearest ancestor that exists
     let mut placed = config.clone();
     for root in placed.volumes.iter_mut().flat_map(|volume| volume.roots.iter_mut()) {
-        if let Some(found) = root.ancestors().find(|ancestor| io.capacity(ancestor).is_ok()) {
-            *root = found.to_path_buf();
-        }
+        *root = disk_root(io, root);
     }
     let disks = volume_disks(io, &placed).map_err(open_error("reading a disk's size"))?;
     let shape = StoreShape { budget: ByteCount(0), is_read_only, ..store_shape(config, false, &disks) };
@@ -1932,4 +1931,13 @@ pub fn least_budget_of<Backend: Io>(io: &Backend, config: &StoreConfig, is_read_
     let has_lz4 = config.columns.iter().any(|column| column.codec == Codec::Lz4);
     let lz4_least = if has_lz4 { LEAST_LZ4_BUDGET } else { ByteCount(0) };
     Ok(shape.with_workers_settled().least_budget().max(lz4_least))
+}
+
+/// Read the path whose disk a root sits on: the root, or its nearest ancestor that exists when the root isn't made yet. The
+/// empty ancestor of a relative path is the current directory
+pub fn disk_root<Backend: Io>(io: &Backend, root: &Path) -> PathBuf {
+    root.ancestors()
+        .map(|ancestor| if ancestor.as_os_str().is_empty() { Path::new(".") } else { ancestor })
+        .find(|ancestor| io.capacity(ancestor).is_ok())
+        .map_or_else(|| root.to_path_buf(), Path::to_path_buf)
 }

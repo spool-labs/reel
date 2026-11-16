@@ -1254,7 +1254,10 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
     // the write index holds what a segment of the store's mean record needs, and the record cache takes the rest
     let mean = mean_record(&summaries);
     let cache_mean = cacheable_mean(&summaries);
-    let sizing = &sizing.for_mean_record(mean, config.volumes.len() as u64);
+    let sizing = sizing.for_mean_record(mean, config.volumes.len() as u64);
+    // a reader holds the open rows its listing found with room past them, at every open and refresh
+    let open_rows = RowCount(scan.scanned.iter().map(|scanned| scanned.scan.row_count.0).sum());
+    let sizing = &if sizing.is_read_only { sizing.for_open_rows(open_rows) } else { sizing };
     let first_place = superblock.place_limit.0.saturating_sub(PLACE_RUN);
     let places = Arc::new(PlaceCount::new(WritePlace(first_place), superblock.place_limit));
     let volume_share = sizing.table_share.0 / config.volumes.len().max(1) as u64;

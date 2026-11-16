@@ -3,7 +3,9 @@
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
+use reel::engine::engine_sizing::shard_for_rows;
 use reel::guard::hold;
+use reel::index::write_index::SHARD_COUNT;
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
 use reel::io::Io;
@@ -352,3 +354,92 @@ fn reads_compressed_values() {
 
 // a budget that holds the lz4 stored share and the largest stored value
 const LZ4_BUDGET: u64 = 320 * 1024 * 1024;
+
+// run a finish on its own thread while this one steps the jobs it waits on
+fn finish_stepped(store: &Store, io: &SimulatedIo) {
+    std::thread::scope(|scope| {
+        let finishing = scope.spawn(|| store.finish());
+        while !finishing.is_finished() {
+            if io.step_any().is_none() {
+                io.advance_clock(TICK);
+            }
+        }
+        finishing.join().expect("the finish thread").expect("finish");
+    });
+}
+
+// the write index a view holds for no open rows: the least each shard takes
+fn least_index(viewer: &Store) -> ByteCount {
+    let shard = shard_for_rows(0, viewer.state.sizing.shard.open_slots);
+    ByteCount(shard.heap_bytes().0 * SHARD_COUNT as u64)
+}
+
+// a view of a finished store holds the least write index, and its record cache has what a writer's index would
+#[test]
+fn a_finished_store_is_viewed_with_the_least_index() {
+    let io = SimulatedIo::new(Seed(32));
+    let store = open(&io);
+    put_keys(&store, b"value");
+    finish_stepped(&store, &io);
+    let writer_index = store.memory_report().write_index;
+    drop(store);
+    let viewer = view(&io);
+    let memory = viewer.memory_report();
+    assert_eq!(memory.write_index, least_index(&viewer), "{memory:?}");
+    assert!(memory.write_index < writer_index, "{memory:?}");
+    assert_eq!(keys(&viewer).len(), KEYS as usize);
+    viewer.close().expect("close");
+}
+
+// a view beside a writer sizes its index from the open rows at each load, so a refresh after the writer added rows holds more,
+// and every row reads
+#[test]
+fn a_refresh_sizes_the_index_from_the_open_rows() {
+    let io = SimulatedIo::new(Seed(33));
+    let store = open(&io);
+    put_keys(&store, b"first");
+    land_rows(&io);
+    let mut viewer = view(&io);
+    let before = viewer.memory_report().write_index;
+    for number in KEYS..GROWN_KEYS {
+        store.put(COLUMN, &key(number), b"later").expect("put");
+    }
+    land_rows(&io);
+    viewer.refresh().expect("refresh");
+    let after = viewer.memory_report().write_index;
+    assert!(after > before, "the index stayed at {before:?}, now {after:?}");
+    for number in 0..GROWN_KEYS {
+        let wanted: &[u8] = if number < KEYS { b"first" } else { b"later" };
+        assert_eq!(read(&viewer, &key(number)).as_deref(), Some(wanted), "key {number}");
+    }
+    viewer.close().expect("close");
+    store.close().expect("close");
+}
+
+// a budget too small for a writer's open rows refuses the view at open and at refresh, as it did before the index followed the rows
+#[test]
+fn open_rows_past_the_budget_refuse_the_view() {
+    let io = SimulatedIo::new(Seed(34));
+    let mut big = config();
+    big.memory_budget = ByteCount(WRITER_BUDGET);
+    let store = ReelStore::open(io.clone(), &big).expect("open");
+    let small = config();
+    store.put(COLUMN, &key(0), b"one").expect("put");
+    land_rows(&io);
+    let mut viewer = ReelStore::open_read_only(io.clone(), &small).expect("a view of one open row");
+    for number in 1..MANY_KEYS {
+        store.put(COLUMN, &key(number), b"many").expect("put");
+    }
+    land_rows(&io);
+    let is_too_many = |outcome: Result<(), StoreError>| matches!(outcome, Err(StoreError::Io { source, .. }) if source.to_string().contains("open rows don't fit"));
+    let refreshed = viewer.refresh();
+    assert!(is_too_many(refreshed), "a refresh took the open rows in");
+    assert!(is_too_many(ReelStore::open_read_only(io.clone(), &small).map(|_view| ())), "an open took the open rows in");
+    store.close().expect("close");
+}
+
+// keys a writer has out once it has added more past the first ones
+const GROWN_KEYS: u64 = 20_000;
+// open rows past what a view's write index holds at BUDGET, from a writer that holds them all unsealed
+const MANY_KEYS: u64 = 200_000;
+const WRITER_BUDGET: u64 = 512 * 1024 * 1024;

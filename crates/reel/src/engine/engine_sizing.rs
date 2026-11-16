@@ -45,6 +45,8 @@ pub const RECORD_CACHE_SIXTEENTHS: u64 = 2;
 pub const ARENA_GROWTH: u64 = 2;
 /// Times the keys a sorted index held at open it asks room for, so the store grows until the next open with no mark
 pub const INDEX_GROWTH: u64 = 2;
+/// Times the open rows a read-only load found its write index holds, room for a writer that keeps adding until the next refresh
+pub const OPEN_ROWS_GROWTH: u64 = 2;
 /// The most headroom one sorted index asks for past its grown keys
 pub const INDEX_HEADROOM: ByteCount = ByteCount(256 * 1024 * 1024);
 /// Quarters of the cap a store keeps as headroom for its sorted indexes, shared evenly among them, so a small index never sits at
@@ -380,6 +382,23 @@ impl EngineSizing {
         let freed = (self.shard.heap_bytes().0.saturating_sub(shard.heap_bytes().0)) * SHARD_COUNT as u64;
         Self {
             segment_rows: RowCount(wanted_rows * SEAL_ROWS_EIGHTHS / 8),
+            shard,
+            record_share: ByteCount(self.record_share.0 + freed),
+            ..self
+        }
+    }
+
+    /// Size a reader's write index for twice the open rows its listing found, and give the rest to the record cache. Past what
+    /// the writer's share holds the index stays at that share, and rows past it refuse the load as they always have
+    pub fn for_open_rows(self, rows: RowCount) -> Self {
+        let planned_rows = self.segment_rows.0 * 8 / SEAL_ROWS_EIGHTHS;
+        let wanted_rows = rows.0.saturating_mul(OPEN_ROWS_GROWTH);
+        if wanted_rows >= planned_rows {
+            return self;
+        }
+        let shard = shard_for_rows(wanted_rows, self.shard.open_slots);
+        let freed = (self.shard.heap_bytes().0.saturating_sub(shard.heap_bytes().0)) * SHARD_COUNT as u64;
+        Self {
             shard,
             record_share: ByteCount(self.record_share.0 + freed),
             ..self

@@ -1633,3 +1633,93 @@ fn a_small_segment_holds_a_small_window() {
     }
     store.close().expect("close");
 }
+
+// a store of a 256 KiB volume and a 64 MiB one: each volume's writes take its own window, so the small one's data region steps
+// 8 KiB a window and the large one's 64 KiB
+fn two_volumes() -> StoreConfig {
+    let mut two = config(SyncPolicy::Never);
+    two.memory_budget = ByteCount(128 * 1024 * 1024);
+    two.volumes[0].segment_bytes = Some(ByteCount(256 * 1024));
+    two.volumes.push(VolumeConfig::new("large", vec![PathBuf::from("/disk/large")], SyncPolicy::Never));
+    two.volumes[1].segment_bytes = Some(ByteCount(64 * 1024 * 1024));
+    two.columns.push(ColumnConfig { volume: VolumeId(1), ..ColumnConfig::new(ColumnId(2), "large", KeyShape::Variable { most: 64 }) });
+    two
+}
+
+#[test]
+fn each_volume_takes_its_own_window() {
+    let io = SimulatedIo::new(Seed(151));
+    let store = ReelStore::open(io.clone(), &two_volumes()).expect("open");
+    for number in 0..64_u32 {
+        store.put(COLUMN, format!("key-{number:03}").as_bytes(), &[3_u8; 64]).expect("put");
+        store.put(ColumnId(2), format!("key-{number:03}").as_bytes(), &[3_u8; 64]).expect("put");
+    }
+    std::thread::scope(|scope| {
+        let finishing = scope.spawn(|| store.finish());
+        while !finishing.is_finished() {
+            if io.step_any().is_none() {
+                io.advance_clock(Nanoseconds(1_000_000));
+            }
+        }
+        finishing.join().expect("thread").expect("finish");
+    });
+    let store = ReelStore::open(io.clone(), &two_volumes()).expect("reopen");
+    for (volume, window) in [(0, 8 * 1024_u64), (1, 64 * 1024)] {
+        let rows = hold(&store.state.volumes[volume].summary);
+        let ends: Vec<u64> = rows.rows().map(|row| row.facts.data_end.0).collect();
+        assert_eq!(ends, vec![window], "volume {volume}");
+    }
+    store.close().expect("close");
+}
+
+// puts, deletes and seals over both volumes, closed and killed between rounds, read back as a model holds them
+#[test]
+fn two_volume_windows_match_the_model() {
+    for seed in seeds(0..8) {
+        let io = SimulatedIo::new(Seed(500 + seed));
+        let mut random = SeededRandom::new(Seed(600 + seed));
+        let mut store = ReelStore::open(io.clone(), &two_volumes()).expect("open");
+        let mut model = BTreeMap::new();
+        for round in 0..16 {
+            for write in 0..150 {
+                let column = if random.below(2) == 0 { COLUMN } else { ColumnId(2) };
+                let key = (column.0, format!("key-{}", random.below(300)).into_bytes());
+                if random.below(6) == 0 {
+                    store.delete(column, &key.1).expect("delete");
+                    model.remove(&key);
+                } else {
+                    let value = vec![(round + write) as u8; 1 + random.below(5_000) as usize];
+                    store.put(column, &key.1, &value).expect("put");
+                    model.insert(key, value);
+                }
+            }
+            match random.below(4) {
+                0 => {
+                    store.seal_now();
+                    settle(&io);
+                },
+                1 => {
+                    store.close().expect("close");
+                    drop(store);
+                    store = ReelStore::open(io.clone(), &two_volumes()).expect("open");
+                },
+                2 => {
+                    store.flush().expect("flush");
+                    io.kill();
+                    drop(store);
+                    store = ReelStore::open(io.clone(), &two_volumes()).expect("open");
+                },
+                _ => settle(&io),
+            }
+            for column in [COLUMN, ColumnId(2)] {
+                for number in 0..300 {
+                    let key = (column.0, format!("key-{number}").into_bytes());
+                    let mut value = Vec::new();
+                    let found = store.get(column, &key.1, &mut value).expect("get").then_some(value);
+                    assert_eq!(found.as_ref(), model.get(&key), "seed {seed} round {round} column {column:?} key {number}");
+                }
+            }
+        }
+        store.close().expect("close");
+    }
+}

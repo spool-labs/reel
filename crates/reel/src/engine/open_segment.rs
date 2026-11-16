@@ -98,10 +98,10 @@ pub const MOST_WINDOW_RECORD_BYTES: usize = 4 * 1024;
 /// A set segment size's share each record window takes, as a divisor, so a small segment counts little of a window it barely used
 pub const SET_WINDOW_DIVISOR: usize = 32;
 
-/// Read the window bytes for the segment sizes the volumes set: a 32nd of the smallest, between the largest record a window
-/// takes and RECORD_WINDOW_BYTES, or RECORD_WINDOW_BYTES when a volume sets none
-pub fn window_bytes_for(set_sizes: Option<u64>) -> usize {
-    set_sizes.map_or(RECORD_WINDOW_BYTES, |smallest| (smallest as usize / SET_WINDOW_DIVISOR).clamp(MOST_WINDOW_RECORD_BYTES, RECORD_WINDOW_BYTES))
+/// Read the window bytes for a volume's set segment size: a 32nd of it, between the largest record a window
+/// takes and RECORD_WINDOW_BYTES, or RECORD_WINDOW_BYTES when it sets none
+pub fn window_bytes_for(set_size: Option<u64>) -> usize {
+    set_size.map_or(RECORD_WINDOW_BYTES, |bytes| (bytes as usize / SET_WINDOW_DIVISOR).clamp(MOST_WINDOW_RECORD_BYTES, RECORD_WINDOW_BYTES))
 }
 
 /// Records of an open segment on their way to the kernel, in a range of its data file claimed ahead. Only the holder

@@ -114,7 +114,9 @@ pub struct VolumeConfig {
     /// LEAST_SEGMENT_BYTES, which holds a whole one-chunk record with its head and the record window it lands through, and at
     /// most MOST_SET_SEGMENT_BYTES, which leaves a segment's footer room under the format's four-byte offsets. The reservation
     /// step then follows it, an eighth of the segment down to a page. A store whose every volume sets one caps its write index at
-    /// three segments' worth of the smallest rows, and a batch can hold no more rows than that: 60,491 at 256 KiB segments
+    /// three segments' worth of the smallest rows, and a batch can hold no more rows than that: 60,491 at 256 KiB segments.
+    /// Every sealed segment carries about 162 KB of footer whatever it holds, so a small size suits a store of a few segments and
+    /// a store that will hold many sets a larger one: 2,000 rows of 1,000 B take 4.7 MB at 128 KiB and 3.6 MB at 256 KiB
     pub segment_bytes: Option<ByteCount>,
     /// The lifetime groups marked writes may hold open at once. None takes them from open_segments. Some(0) runs none, for a
     /// writer that never marks a row: its slots are its open segments alone, and a marked write is refused with NoLifetimeGroups.

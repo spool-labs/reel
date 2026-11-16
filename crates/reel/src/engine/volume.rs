@@ -249,6 +249,8 @@ pub struct Volume<Backend: Io> {
     pub segment_bytes: ByteCount,
     /// The bytes a segment of this volume reserves past its writes at a time
     pub reserve_step: u64,
+    /// The bytes of a record window this volume's writes take: a share of its own set segment size, or RECORD_WINDOW_BYTES
+    pub window_bytes: usize,
     pub segment_rows: RowCount,
     pub walk_retries: AtomicU64,
     pub walks_waiting: AtomicU64,

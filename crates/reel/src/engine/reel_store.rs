@@ -876,7 +876,8 @@ pub fn store_shape(config: &StoreConfig, has_ring: bool, disks: &[Option<ByteCou
         workers: None,
         declared_bytes: declared_index_bytes(config),
         is_read_only: false,
-        window_bytes: window_bytes_for(config.volumes.iter().map(|volume| volume.segment_bytes.map(|bytes| bytes.0)).collect::<Option<Vec<u64>>>().and_then(|sizes| sizes.into_iter().min())),
+        // the slots' windows serve every volume, so they hold the largest any volume takes
+        window_bytes: config.volumes.iter().map(|volume| window_bytes_for(volume.segment_bytes.map(|bytes| bytes.0))).max().unwrap_or(0),
     };
     // a segment's rows come from the shares, so the disks ask at the rows a plan with no line of theirs gives
     let rows = EngineSizing::for_store(&bare.with_workers_settled()).segment_rows;
@@ -1591,6 +1592,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         segment_bytes: volume.segment_bytes.unwrap_or(sizing.segment_bytes),
         // a set size takes an eighth of itself a step, and the budget's rule keeps its floor
         reserve_step: volume.segment_bytes.map_or_else(|| reserve_step(sizing.segment_bytes), set_reserve_step),
+        window_bytes: window_bytes_for(volume.segment_bytes.map(|bytes| bytes.0)),
         segment_rows: volume_rows(config, index, sizing.segment_rows),
         walk_retries: AtomicU64::new(0),
         walks_waiting: AtomicU64::new(0),

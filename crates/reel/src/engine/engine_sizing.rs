@@ -204,7 +204,7 @@ pub struct StoreShape {
     pub declared_bytes: ByteCount,
     /// A reader that writes nothing: no write buffers, no encoders, no jobs past its read threads
     pub is_read_only: bool,
-    /// The bytes of each record window: RECORD_WINDOW_BYTES, or a share of the smallest set segment size when every volume sets one
+    /// The bytes each slot's record windows hold: the largest window any volume takes
     pub window_bytes: usize,
 }
 

@@ -231,7 +231,7 @@ impl<Backend: Io> EngineState<Backend> {
             return WindowSwitch::OtherBusy;
         }
         let left = volume.segment_bytes.0.saturating_sub(segment.write_end.0) as usize;
-        let room = left.min(self.sizing.window_bytes);
+        let room = left.min(volume.window_bytes);
         if room < length {
             return WindowSwitch::NoRoom;
         }

@@ -7,7 +7,7 @@ use reel::guard::hold;
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
 use reel::io::Io;
-use reel::record::codec::Codec;
+use reel::record::codec::{CHUNK_BYTES, Codec};
 use reel_core::column_id::ColumnId;
 use reel_core::direction::Direction;
 use reel_core::scan::ScanStep;
@@ -301,3 +301,54 @@ fn view_mid_seal_keeps_covers() {
 }
 
 const SPAN_KEYS: u64 = 100;
+
+// a view of an lz4 column decodes values under a chunk, over one and at the largest stored size with no encoder and no stored
+// share, by get and by a full scan
+#[test]
+fn reads_compressed_values() {
+    let io = SimulatedIo::new(Seed(31));
+    let mut config = config();
+    config.memory_budget = ByteCount(LZ4_BUDGET);
+    config.threads = crate::shape::threads();
+    config.columns[0].codec = Codec::Lz4;
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let largest = store.state.sizing.lz4_stored_limit.0 as usize;
+    let lengths = [1_000, CHUNK_BYTES - 1, CHUNK_BYTES + 1_000, 5 * CHUNK_BYTES + 17, largest];
+    let value_of = |length: usize| (0..length).map(|at| ((at * 7 + length) % 251) as u8).collect::<Vec<u8>>();
+    let mut written = Vec::new();
+    for (number, length) in lengths.into_iter().enumerate() {
+        let name = key(number as u64);
+        store.put(COLUMN, &name, &value_of(length)).expect("put");
+        written.push((name, value_of(length)));
+    }
+    // the finish waits on seals that only the stepped jobs run, so it runs on its own thread while this one steps them
+    std::thread::scope(|scope| {
+        let finishing = scope.spawn(|| store.finish());
+        while !finishing.is_finished() {
+            if io.step_any().is_none() {
+                io.advance_clock(TICK);
+            }
+        }
+        finishing.join().expect("the finish thread").expect("finish");
+    });
+    drop(store);
+
+    let viewer = ReelStore::open_read_only(io.clone(), &config).expect("open read-only");
+    let state = &viewer.state;
+    assert!(state.encoders.grab().is_none() && state.stored_shares.grab().is_none(), "a view holds an encoder or a stored share");
+    for (name, value) in &written {
+        assert_eq!(read(&viewer, name).as_deref(), Some(value.as_slice()), "{} bytes", value.len());
+    }
+    let mut scan = viewer.iter_from(COLUMN, b"", Direction::Ascending).expect("scan");
+    let (mut name, mut value, mut seen) = (Vec::new(), Vec::new(), 0);
+    while scan.next_row(&mut name, &mut value).expect("row") == ScanStep::Found {
+        assert_eq!((&name, &value), (&written[seen].0, &written[seen].1), "row {seen}");
+        seen += 1;
+    }
+    assert_eq!(seen, written.len());
+    drop(scan);
+    viewer.close().expect("close");
+}
+
+// a budget that holds the lz4 stored share and the largest stored value
+const LZ4_BUDGET: u64 = 320 * 1024 * 1024;

@@ -45,8 +45,11 @@ pub const RECORD_CACHE_SIXTEENTHS: u64 = 2;
 pub const ARENA_GROWTH: u64 = 2;
 /// Times the keys a sorted index held at open it asks room for, so the store grows until the next open with no mark
 pub const INDEX_GROWTH: u64 = 2;
-/// Bytes a sorted index asks for past its grown keys, so a small index never sits at twice a small count
+/// The most headroom one sorted index asks for past its grown keys
 pub const INDEX_HEADROOM: ByteCount = ByteCount(256 * 1024 * 1024);
+/// Quarters of the cap a store keeps as headroom for its sorted indexes, shared evenly among them, so a small index never sits at
+/// twice a small count
+pub const HEADROOM_QUARTERS: u64 = 1;
 /// Quarters of the spot, block and record caches they keep however much the sorted indexes ask, and the rest is the indexes' cap
 pub const CACHE_FLOOR_QUARTERS: u64 = 1;
 /// Rows a fresh store holds dead bits and filters for before its segments start going without. A missing bit asks and a
@@ -534,12 +537,12 @@ pub enum IndexAsk {
 
 /// Work out a sorted index's ask: the keys it held at open times the growth with the headroom past them, at least its least
 /// rows, and never less than the pages its image saved, so the image loads
-pub fn index_ask(width: usize, keys: u64, least_rows: Option<RowCount>, saved: ByteCount) -> IndexAsk {
+pub fn index_ask(width: usize, keys: u64, least_rows: Option<RowCount>, saved: ByteCount, headroom: ByteCount) -> IndexAsk {
     if keys == 0 && least_rows.is_none() && saved.0 == 0 {
         return IndexAsk::Part;
     }
     let rows = keys.saturating_mul(INDEX_GROWTH).max(least_rows.map_or(0, |least| least.0));
-    IndexAsk::Bytes(ByteCount((planned_index_bytes(width, RowCount(rows)).0 + index_headroom().0).max(saved.0)))
+    IndexAsk::Bytes(ByteCount((planned_index_bytes(width, RowCount(rows)).0 + headroom.0).max(saved.0)))
 }
 
 /// Read the sorted indexes' cap: the spot, block and record caches past the floor they keep
@@ -589,14 +592,22 @@ thread_local! {
     pub static TEST_INDEX_HEADROOM: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
-/// Read the headroom a sorted index asks for: a sim's when it set one, else INDEX_HEADROOM
+/// Work out each sorted index's headroom: a quarter of the cap shared evenly among the indexes, and no more than INDEX_HEADROOM
+/// each. A sim's own headroom takes its place when it set one
 #[cfg(feature = "test-hooks")]
-pub fn index_headroom() -> ByteCount {
-    TEST_INDEX_HEADROOM.with(std::cell::Cell::get).map_or(INDEX_HEADROOM, ByteCount)
+pub fn index_headroom(cap: u64, indexes: usize) -> ByteCount {
+    TEST_INDEX_HEADROOM.with(std::cell::Cell::get).map_or_else(|| store_headroom(cap, indexes), ByteCount)
 }
 
-/// Read the headroom a sorted index asks for
+/// Work out each sorted index's headroom: a quarter of the cap shared evenly among the indexes, and no more than INDEX_HEADROOM
+/// each
 #[cfg(not(feature = "test-hooks"))]
-pub const fn index_headroom() -> ByteCount {
-    INDEX_HEADROOM
+pub const fn index_headroom(cap: u64, indexes: usize) -> ByteCount {
+    store_headroom(cap, indexes)
+}
+
+/// Share a quarter of the cap evenly among the indexes, up to INDEX_HEADROOM each
+pub const fn store_headroom(cap: u64, indexes: usize) -> ByteCount {
+    let each = cap / 4 * HEADROOM_QUARTERS / if indexes == 0 { 1 } else { indexes as u64 };
+    ByteCount(if each < INDEX_HEADROOM.0 { each } else { INDEX_HEADROOM.0 })
 }

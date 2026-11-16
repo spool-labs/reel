@@ -2096,10 +2096,11 @@ fn sorted_reading(store: &Store) -> reel_api::maintenance_report::SortedReading 
     report(store).sorted_columns.iter().find(|reading| reading.column == COLUMN).copied().expect("a reading")
 }
 
-// the bytes a sorted index asks for at open: twice the keys with the headroom past them
-fn asked_for(keys: u64) -> ByteCount {
-    use reel::engine::engine_sizing::{INDEX_GROWTH, INDEX_HEADROOM};
-    ByteCount(reel::index::sorted_keys::planned_index_bytes(WIDTH as usize, RowCount(keys * INDEX_GROWTH)).0 + INDEX_HEADROOM.0)
+// the bytes a sorted index asks for at open: twice the keys with the store's headroom past them, a quarter of the cap for the one
+// index
+fn asked_for(keys: u64, cap: ByteCount) -> ByteCount {
+    use reel::engine::engine_sizing::{INDEX_GROWTH, store_headroom};
+    ByteCount(reel::index::sorted_keys::planned_index_bytes(WIDTH as usize, RowCount(keys * INDEX_GROWTH)).0 + store_headroom(cap.0, 1).0)
 }
 
 // an empty index asks for its whole part of the cap, a clean close and open asks by the image's keys, and an open after a kill
@@ -2111,6 +2112,8 @@ fn a_sorted_index_is_sized_by_the_keys_it_held() {
     // no merge drops an overwrite, so the rows on disk stay twice the keys
     store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
     let empty = sorted_reading(&store);
+    // an empty index asks for the whole cap, the one index's part of it
+    let cap = empty.asked_bytes;
     // an empty index takes its whole part, rounded down to the pages its pool holds
     assert!(empty.got_bytes <= empty.asked_bytes && empty.got_bytes.0 >= empty.asked_bytes.0 / 10 * 9, "{empty:?}");
     let mut model = Model::new();
@@ -2130,7 +2133,7 @@ fn a_sorted_index_is_sized_by_the_keys_it_held() {
     let store = open_sized(&io);
     store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
     let clean = sorted_reading(&store);
-    assert_eq!(clean.asked_bytes, asked_for(KEYS), "{clean:?}");
+    assert_eq!(clean.asked_bytes, asked_for(KEYS, cap), "{clean:?}");
     assert!(clean.got_bytes <= clean.asked_bytes && clean.capacity.0 >= KEYS, "{clean:?}");
     check(&store, &model, &written);
     store.flush().expect("flush");
@@ -2139,7 +2142,7 @@ fn a_sorted_index_is_sized_by_the_keys_it_held() {
 
     let store = open_sized(&io);
     let killed = sorted_reading(&store);
-    assert_eq!(killed.asked_bytes, asked_for(KEYS * 2), "the rows on disk hold every overwrite: {killed:?}");
+    assert_eq!(killed.asked_bytes, asked_for(KEYS * 2, cap), "the rows on disk hold every overwrite: {killed:?}");
     check(&store, &model, &written);
     store.close().expect("close");
 }

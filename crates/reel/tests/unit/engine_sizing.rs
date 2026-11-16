@@ -380,14 +380,15 @@ fn declared_indexes_come_out_of_the_budget() {
 // no least asks for its part
 #[test]
 fn a_sorted_index_asks_by_its_keys() {
-    use reel::engine::engine_sizing::{INDEX_GROWTH, INDEX_HEADROOM, IndexAsk, index_ask};
+    use reel::engine::engine_sizing::{INDEX_GROWTH, IndexAsk, index_ask};
     use reel::index::sorted_keys::planned_index_bytes;
+    const HEADROOM: ByteCount = ByteCount(30 * 1024 * 1024);
 
-    assert_eq!(index_ask(16, 0, None, ByteCount(0)), IndexAsk::Part);
-    let grown = planned_index_bytes(16, RowCount(1_000_000 * INDEX_GROWTH)).0 + INDEX_HEADROOM.0;
-    assert_eq!(index_ask(16, 1_000_000, None, ByteCount(0)), IndexAsk::Bytes(ByteCount(grown)));
-    assert_eq!(index_ask(16, 1_000_000, Some(RowCount(10_000_000)), ByteCount(0)), IndexAsk::Bytes(ByteCount(planned_index_bytes(16, RowCount(10_000_000)).0 + INDEX_HEADROOM.0)));
-    assert_eq!(index_ask(16, 10, None, ByteCount(grown * 2)), IndexAsk::Bytes(ByteCount(grown * 2)));
+    assert_eq!(index_ask(16, 0, None, ByteCount(0), HEADROOM), IndexAsk::Part);
+    let grown = planned_index_bytes(16, RowCount(1_000_000 * INDEX_GROWTH)).0 + HEADROOM.0;
+    assert_eq!(index_ask(16, 1_000_000, None, ByteCount(0), HEADROOM), IndexAsk::Bytes(ByteCount(grown)));
+    assert_eq!(index_ask(16, 1_000_000, Some(RowCount(10_000_000)), ByteCount(0), HEADROOM), IndexAsk::Bytes(ByteCount(planned_index_bytes(16, RowCount(10_000_000)).0 + HEADROOM.0)));
+    assert_eq!(index_ask(16, 10, None, ByteCount(grown * 2), HEADROOM), IndexAsk::Bytes(ByteCount(grown * 2)));
 }
 
 // the indexes get their asks while they fit the cap, each the same fraction of its ask past it, and an empty one its part
@@ -530,10 +531,10 @@ fn large_stores_keep_their_sizes() {
 // segment bytes, segment rows, the spot, block, record, summary and table shares, the least budget, the fixed bytes, the scan
 // room, the caches after the sorted index's share, and the index's asked bytes, got bytes and rows, at 2, 4 and 8 GiB with 8 workers, then 32
 const LARGE_STORE_SIZES: [[u64; 14]; 6] = [
-    [1073741824, 2403846, 291025766, 291025766, 291025766, 145512883, 145512883, 118691884, 108206124, 11433216, 145513010, 826335232, 727564288, 13047000],
+    [1073741824, 2403846, 291025766, 291025766, 291025766, 145512883, 145512883, 118691884, 108206124, 11433216, 145513010, 739790879, 727564288, 13047000],
     [1073741824, 4937850, 597809144, 597809144, 597809144, 298904572, 298904572, 118691884, 108206124, 11433216, 967092200, 826335232, 826335232, 14820750],
     [1073741824, 10005858, 1211375902, 1211375902, 1211375902, 605687951, 605687951, 118691884, 108206124, 11433216, 2807792474, 826335232, 826335232, 14820750],
-    [1073741824, 2237645, 270904372, 270904372, 270904372, 135452186, 135452186, 259541644, 249055884, 11433216, 135455900, 826335232, 677257216, 12143550],
+    [1073741824, 2237645, 270904372, 270904372, 270904372, 135452186, 135452186, 259541644, 249055884, 11433216, 135455900, 727215008, 677257216, 12143550],
     [1073741824, 4771649, 577687750, 577687750, 577687750, 288843875, 288843875, 259541644, 249055884, 11433216, 906728018, 826335232, 826335232, 14820750],
     [1073741824, 9839656, 1191254508, 1191254508, 1191254508, 595627254, 595627254, 259541644, 249055884, 11433216, 2747428292, 826335232, 826335232, 14820750],
 ];
@@ -551,3 +552,43 @@ fn counts_follow_the_budget() {
     assert_eq!(counts(64, 3).read_buffers, 3 * READERS_PER_WORKER);
     assert!(shape(ByteCount(64 * 1024 * 1024), 1).least_budget() < StoreShape { budget: FULL_COUNTS_BUDGET, ..shape(ByteCount(64 * 1024 * 1024), 1) }.least_budget());
 }
+
+// a store keeps one headroom for its sorted indexes, a quarter of the cap shared evenly, and no index takes more than
+// INDEX_HEADROOM of it: one, two and five indexes at 512 MiB, 2 GiB and 8 GiB
+#[test]
+fn the_headroom_is_shared_by_the_indexes() {
+    use reel::engine::engine_sizing::{INDEX_HEADROOM, index_cap, store_headroom};
+    const MIB: u64 = 1024 * 1024;
+    let mut found = Vec::new();
+    for mib in [512, 2048, 8192] {
+        let config = StoreConfig {
+            memory_budget: ByteCount(mib * MIB),
+            threads: ThreadCounts { maintenance_workers: Some(8), ..ThreadCounts::default() },
+            volumes: vec![VolumeConfig::new("kv", vec![PathBuf::from("/nonexistent/headroom")], SyncPolicy::Never)],
+            columns: vec![ColumnConfig {
+                id: ColumnId(1),
+                name: "kv".to_string(),
+                key_shape: KeyShape::Fixed { width: 16 },
+                codec: Codec::None,
+                volume: VolumeId(0),
+                complete_rows: None,
+                sorted_rows: None,
+                least_value: None,
+            }],
+        };
+        let sizing = store_sizing(&config, true, &[None]).expect("sizing");
+        let cap = index_cap(sizing.spot_share.0 + sizing.cache_share.0 + sizing.record_share.0);
+        for indexes in [1_usize, 2, 5] {
+            let each = store_headroom(cap, indexes);
+            assert!(each <= INDEX_HEADROOM, "{mib} MiB, {indexes} indexes: {each:?}");
+            assert!(each.0 * indexes as u64 <= cap / 4, "{mib} MiB, {indexes} indexes: {each:?} each past a quarter of {cap}");
+            assert!(each.0 == INDEX_HEADROOM.0 || each.0 * indexes as u64 + indexes as u64 > cap / 4 - indexes as u64, "{mib} MiB, {indexes}: shared less than the quarter");
+            found.push((mib, indexes, each.0 / MIB));
+        }
+    }
+    // MiB of headroom each index gets
+    assert_eq!(found, HEADROOM_EACH);
+}
+
+const HEADROOM_EACH: [(u64, usize, u64); 9] =
+    [(512, 1, 33), (512, 2, 16), (512, 5, 6), (2048, 1, 156), (2048, 2, 78), (2048, 5, 31), (8192, 1, 256), (8192, 2, 256), (8192, 5, 129)];

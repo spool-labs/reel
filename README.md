@@ -80,8 +80,10 @@ over and over. The waste then spreads across segments that stay mostly alive, so
 ## Limits
 
 A sorted index takes keys of one fixed width, and a column has one index kind, sorted or complete. A sorted index is sized at
-each open from the keys it held: twice them with 256 MiB past, out of the block, spot and record caches, which keep a quarter of
-their room. A complete table holds the rows its column declared. Rows past an index's room mark it, and from then on gets and
+each open from the keys it held: twice them with a share of the headroom past them, out of the block, spot and record caches,
+which keep a quarter of their room. The store keeps a quarter of what the indexes may take as headroom, shared evenly among
+them and at most 256 MiB each.
+A complete table holds the rows its column declared. Rows past an index's room mark it, and from then on gets and
 scans of that column read the footers until the store is opened again with room for them. A marked index saves no file at
 close. The maintenance report shows each index's rows, room and mark, and the bytes a sorted index asked for and got, so an
 index about to fill shows before it does and a budget too small for it shows why. A count of the keys under a prefix reads

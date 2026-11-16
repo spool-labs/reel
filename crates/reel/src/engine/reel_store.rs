@@ -27,7 +27,7 @@ use crate::engine::admission::Admission;
 use reel_api::maintenance_report::WorkerPriority;
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::engine_sizing::{
-    complete_block_rows, complete_row_limit, split_idle_room,
+    complete_block_rows, complete_row_limit, index_headroom, split_idle_room,
     EngineSizing, FILTER_CACHE_QUARTERS, FILTER_SLOT_BYTES, GROUP_BYTES, LEAST_LZ4_BUDGET, LEAST_SHARD_ENTRIES, PLANNED_LINE_BYTES,
     SHARED_JOBS, StoreShape, GATHER_BYTES, assumed_segment_bytes, capped_entries, disk_entries, entry_cost, entry_cover, floor_entries,
     dead_bits_bytes, segment_bytes_for, target_rows, IndexAsk, index_ask, index_cap, is_index_exact, share_indexes,
@@ -1749,6 +1749,13 @@ pub fn size_sorted_indexes<Backend: Io>(io: &Backend, config: &StoreConfig, sizi
         }
     }
     let sorted: Vec<&ColumnConfig> = config.columns.iter().filter(|column| column.sorted_rows.is_some()).collect();
+    let (spot, block, record) = (sizing.spot_share.0, sizing.cache_share.0, sizing.record_share.0);
+    // where every column is sorted no get reads the spot cache, so its share is the indexes' first, and the floor holds on the
+    // block and record caches alone
+    let is_all_sorted = !config.columns.is_empty() && config.columns.iter().all(|column| column.sorted_rows.is_some());
+    let cap = if is_all_sorted { spot + index_cap(block + record) } else { index_cap(spot + block + record) };
+    // the store keeps one headroom for all its indexes, a quarter of the cap shared evenly
+    let headroom = index_headroom(cap, sorted.len());
     let asks: Vec<IndexAsk> = sorted
         .iter()
         .map(|column| {
@@ -1761,14 +1768,9 @@ pub fn size_sorted_indexes<Backend: Io>(io: &Backend, config: &StoreConfig, sizi
             let image = config.volumes[column.volume.0 as usize].roots.first().and_then(|root| sorted_image_size(io, root, column.id));
             let keys = image.map_or(rows_on_disk[column.id.0 as usize], |(entries, _saved)| entries);
             let saved = ByteCount(image.map_or(0, |(_entries, saved)| u64::from(saved) * SORTED_PAGE_BYTES as u64));
-            index_ask(width, keys, least, saved)
+            index_ask(width, keys, least, saved, headroom)
         })
         .collect();
-    let (spot, block, record) = (sizing.spot_share.0, sizing.cache_share.0, sizing.record_share.0);
-    // where every column is sorted no get reads the spot cache, so its share is the indexes' first, and the floor holds on the
-    // block and record caches alone
-    let is_all_sorted = !config.columns.is_empty() && config.columns.iter().all(|column| column.sorted_rows.is_some());
-    let cap = if is_all_sorted { spot + index_cap(block + record) } else { index_cap(spot + block + record) };
     // an exact index asks for what it declared, and past the cap it gets its share as any index does
     let granted = share_indexes(&asks, cap);
     let mut sizes: Vec<Option<SortedSize>> = (0..MAX_COLUMNS).map(|_column| None).collect();

@@ -279,7 +279,7 @@ fn box_churn_fits_the_table() {
     let config = StoreConfig {
         memory_budget: FULL_BUDGET,
         threads: ThreadCounts { maintenance_workers: Some(2), ..NO_WORKERS },
-        volumes: vec![VolumeConfig { name: "smoke".to_string(), roots: vec![PathBuf::from("/box")], sync: SyncPolicy::Never, device: DeviceClass::default(), open_segments: None }],
+        volumes: vec![VolumeConfig { name: "smoke".to_string(), roots: vec![PathBuf::from("/box")], sync: SyncPolicy::Never, device: DeviceClass::default(), open_segments: None, segment_bytes: None }],
         columns: vec![column(1, "meta", Codec::None), column(2, "bulk", Codec::Lz4)],
     };
     let disks = [Some(ByteCount(BOX_DISK_BYTES))];

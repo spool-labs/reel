@@ -36,7 +36,7 @@ pub fn config(root: &Path, budget: ByteCount) -> StoreConfig {
             name: "steady".to_string(),
             roots: vec![root.to_path_buf()],
             sync: SyncPolicy::Never,
-            device: Default::default(), open_segments: None,
+            device: Default::default(), open_segments: None, segment_bytes: None,
         }],
         columns: vec![column(META, "meta", Codec::None, table_rows), column(BULK, "bulk", Codec::Lz4, None), column(PLAIN, "plain", Codec::None, None)],
     }

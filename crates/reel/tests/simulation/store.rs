@@ -173,7 +173,7 @@ fn config(sync: SyncPolicy) -> StoreConfig {
             name: "meta".to_string(),
             roots: vec![PathBuf::from(ROOT)],
             sync,
-            device: Default::default(), open_segments: None,
+            device: Default::default(), open_segments: None, segment_bytes: None,
         }],
         columns: vec![ColumnConfig {
             id: COLUMN,
@@ -1475,11 +1475,23 @@ fn one_open_segment_takes_every_writer() {
 // holds them
 #[test]
 fn one_open_segment_matches_the_model() {
+    one_open_segment_runs(None);
+}
+
+// the same on segments of 256 KiB, which fill and seal many times a seed
+#[test]
+fn small_segments_match_the_model() {
+    one_open_segment_runs(Some(ByteCount(256 * 1024)));
+}
+
+// run the one-open-segment model over the seeds, on segments of this size or the budget's
+fn one_open_segment_runs(segment_bytes: Option<ByteCount>) {
     for seed in seeds(0..8) {
         let io = SimulatedIo::new(Seed(300 + seed));
         let mut random = SeededRandom::new(Seed(400 + seed));
         let mut one = config(SyncPolicy::Never);
         one.volumes[0].open_segments = Some(1);
+        one.volumes[0].segment_bytes = segment_bytes;
         let mut store = ReelStore::open(io.clone(), &one).expect("open");
         let mut model = BTreeMap::new();
         for round in 0..24 {

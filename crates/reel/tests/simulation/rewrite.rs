@@ -91,7 +91,7 @@ fn config() -> StoreConfig {
             name: "rewrite".to_string(),
             roots: vec![PathBuf::from(ROOT)],
             sync: SyncPolicy::Never,
-            device: Default::default(), open_segments: None,
+            device: Default::default(), open_segments: None, segment_bytes: None,
         }],
         columns: vec![ColumnConfig {
             id: COLUMN,

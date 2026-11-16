@@ -17,7 +17,7 @@ use reel_core::units::{ByteCount, DeathMark, Nanoseconds, RowCount, VolumeId, Wr
 use reel_core::usage::{ColumnUsage, UsageReport};
 use reel_core::write_batch::WriteBatch;
 
-use crate::config::{ColumnConfig, DeviceClass, KeyShape, StoreConfig, VolumeConfig};
+use crate::config::{ColumnConfig, DeviceClass, KeyShape, LEAST_SEGMENT_BYTES, MOST_SET_SEGMENT_BYTES, StoreConfig, VolumeConfig};
 use crate::engine::dead_bits::{CHUNK_WORDS, DEAD_BITS_NAME, DeadBits, NEW_DEAD_BITS_NAME, SAVE_HEADS_PAGE};
 use crate::engine::rewrite_job::{record_totals, rows_of};
 use crate::segment::block_filter::BITS_PER_ROW;
@@ -33,7 +33,7 @@ use crate::engine::engine_sizing::{
     dead_bits_bytes, segment_bytes_for, target_rows, IndexAsk, index_ask, index_cap, is_index_exact, share_indexes,
 };
 use crate::engine::engine_state::{EngineState, PLACE_RUN, SEGMENT_NUMBER_BATCH, SlotFile};
-use crate::engine::open_segment::{RECORD_WINDOW_BYTES, RecordWindow, RowQueue, SegmentPhase, fits_a_segment_path};
+use crate::engine::open_segment::{RECORD_WINDOW_BYTES, RecordWindow, RowQueue, SegmentPhase, fits_a_segment_path, reserve_step, set_reserve_step};
 use crate::engine::ration::Ration;
 use crate::engine::ring_job::RingReaper;
 use crate::engine::read_only::{close_read_only, load_read_only};
@@ -890,7 +890,7 @@ pub fn entry_line(config: &StoreConfig, entries: &[Option<usize>]) -> ByteCount 
 
 /// Read the segment size a volume's entries plan at, from the rows a segment takes
 pub fn volume_segment_bytes(config: &StoreConfig, volume: usize, rows: RowCount) -> ByteCount {
-    assumed_segment_bytes(segment_bytes_for(config.memory_budget), rows, config.row_floor(volume))
+    assumed_segment_bytes(config.volumes[volume].segment_bytes.unwrap_or_else(|| segment_bytes_for(config.memory_budget)), rows, config.row_floor(volume))
 }
 
 /// Read the entries each volume's disk asks for at its segment size, or nothing for a volume with a disk of no known size
@@ -977,6 +977,11 @@ pub fn sizing_of(config: &StoreConfig, shape: StoreShape) -> Result<EngineSizing
 
 /// Refuse a config that can't work
 pub fn check_config(config: &StoreConfig) -> Result<(), StoreError> {
+    for volume in &config.volumes {
+        if let Some(asked) = volume.segment_bytes.filter(|asked| *asked < LEAST_SEGMENT_BYTES || *asked > MOST_SET_SEGMENT_BYTES) {
+            return Err(StoreError::SegmentSize { asked, least: LEAST_SEGMENT_BYTES, most: MOST_SET_SEGMENT_BYTES });
+        }
+    }
     for volume in &config.volumes {
         if !volume.roots.iter().all(|root| fits_a_segment_path(root)) {
             return Err(StoreError::Io {
@@ -1326,7 +1331,8 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         drop(hold(&window_copies[slot]));
     }
 
-    let largest_value = sizing.segment_bytes;
+    // a value reaches the largest segment any volume takes, which a set size can raise past the budget's rule
+    let largest_value = config.volumes.iter().filter_map(|volume| volume.segment_bytes).fold(sizing.segment_bytes, ByteCount::max);
     let most_shares = if has_lz4 && !sizing.is_read_only { sizing.lz4_stored_limit.0 as usize / SHARE_BYTES } else { 0 };
     let counts = sizing.counts;
     let mut encoders = Vec::with_capacity(counts.write_buffers);
@@ -1559,7 +1565,9 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         is_failed: AtomicBool::new(false),
         most_open: volume.most_open(),
         most_groups: volume.most_groups(),
-        segment_bytes: sizing.segment_bytes,
+        segment_bytes: volume.segment_bytes.unwrap_or(sizing.segment_bytes),
+        // a set size takes an eighth of itself a step, and the budget's rule keeps its floor
+        reserve_step: volume.segment_bytes.map_or_else(|| reserve_step(sizing.segment_bytes), set_reserve_step),
         segment_rows: volume_rows(config, index, sizing.segment_rows),
         walk_retries: AtomicU64::new(0),
         walks_waiting: AtomicU64::new(0),
@@ -1684,7 +1692,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         walk_claim_longest: AtomicU64::new(0),
         held_drain_blocks: AtomicU64::new(0),
         held_drain_bytes: AtomicU64::new(0),
-        reserve: ByteCount(sizing.segment_bytes.0 * 2),
+        reserve: ByteCount(volume.segment_bytes.unwrap_or(sizing.segment_bytes).0 * 2),
         summary: Mutex::new(summary.rows),
         open_place,
         open_segment,

@@ -51,7 +51,7 @@ inner_modules!(
     write_order,
 );
 
-pub use config::{ColumnConfig, DeviceClass, KeyShape, NO_WORKERS, StoreConfig, SyncPolicy, ThreadCounts, VolumeConfig};
+pub use config::{ColumnConfig, DeviceClass, KeyShape, LEAST_SEGMENT_BYTES, MOST_SET_SEGMENT_BYTES, NO_WORKERS, StoreConfig, SyncPolicy, ThreadCounts, VolumeConfig};
 pub use engine::reel_store::ReelStore;
 pub use io::Io;
 pub use io::plain::PlainIo;

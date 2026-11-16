@@ -7,7 +7,8 @@ use reel_core::units::{ByteCount, RowCount, VolumeId};
 
 use crate::engine::engine_sizing::OPEN_PER_ROOT;
 use crate::lifetime::MOST_LIFETIME_GROUPS;
-use crate::record::codec::Codec;
+use crate::record::codec::{CHUNK_BYTES, Codec};
+use crate::segment::segment_tail::MOST_SEGMENT_BYTES;
 use crate::record::record_head::SMALL_HEAD_BYTES;
 use crate::segment::footer_writer::SMALLEST_ROW_BYTES;
 
@@ -78,6 +79,11 @@ pub struct ColumnConfig {
     pub least_value: Option<ByteCount>,
 }
 
+/// The smallest segment a volume may set: a one-chunk record with its head and the window it lands through
+pub const LEAST_SEGMENT_BYTES: ByteCount = ByteCount(2 * CHUNK_BYTES as u64);
+/// The largest segment a volume may set, with room for its footer under the format's four-byte offsets
+pub const MOST_SET_SEGMENT_BYTES: ByteCount = ByteCount(MOST_SEGMENT_BYTES.0 / 2);
+
 /// One volume
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VolumeConfig {
@@ -89,12 +95,17 @@ pub struct VolumeConfig {
     /// MOST_LIFETIME_GROUPS groups. Each one held open takes write queues and read windows out of the budget, so a small store
     /// sets 1
     pub open_segments: Option<usize>,
+    /// The bytes each segment of this volume takes before it seals. None sizes them from the budget. A set size is at least
+    /// LEAST_SEGMENT_BYTES, which holds a whole one-chunk record with its head and the record window it lands through, and at
+    /// most MOST_SET_SEGMENT_BYTES, which leaves a segment's footer room under the format's four-byte offsets. The reservation
+    /// step then follows it, an eighth of the segment down to a page
+    pub segment_bytes: Option<ByteCount>,
 }
 
 impl VolumeConfig {
     /// Build a volume on these roots, with the device under the first root asked about
     pub fn new(name: impl Into<String>, roots: Vec<PathBuf>, sync: SyncPolicy) -> Self {
-        Self { name: name.into(), roots, sync, device: DeviceClass::Detect, open_segments: None }
+        Self { name: name.into(), roots, sync, device: DeviceClass::Detect, open_segments: None, segment_bytes: None }
     }
 
     /// Count the segments this volume's unmarked writes may take at once

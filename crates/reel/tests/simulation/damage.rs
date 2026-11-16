@@ -117,7 +117,7 @@ fn sized_config(budget: ByteCount) -> StoreConfig {
             name: "meta".to_string(),
             roots: vec![PathBuf::from(ROOT)],
             sync: SyncPolicy::Never,
-            device: Default::default(), open_segments: None,
+            device: Default::default(), open_segments: None, segment_bytes: None,
         }],
         columns: vec![
             ColumnConfig {

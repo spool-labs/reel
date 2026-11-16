@@ -82,6 +82,15 @@ pub fn reserve_step(segment_bytes: ByteCount) -> u64 {
     (segment_bytes.0 / RESERVE_STEP_SHARE).clamp(LEAST_RESERVE_STEP, RESERVE_STEP_BYTES)
 }
 
+/// The smallest step a set segment size reserves by: one page
+pub const LEAST_SET_RESERVE_STEP: u64 = 4096;
+
+/// Read the step a volume with a set segment size reserves by: an eighth of the segment, down to a page, with no 1 MiB floor
+pub const fn set_reserve_step(segment_bytes: ByteCount) -> u64 {
+    let step = segment_bytes.0 / RESERVE_STEP_SHARE;
+    if step < LEAST_SET_RESERVE_STEP { LEAST_SET_RESERVE_STEP } else { step }
+}
+
 /// Bytes of the file range a slot's small records fill before they reach the kernel in one write call
 pub const RECORD_WINDOW_BYTES: usize = 64 * 1024;
 /// The largest record that goes through a window, so bulk values are never copied into one

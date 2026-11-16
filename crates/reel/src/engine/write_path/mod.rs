@@ -9,7 +9,7 @@ use reel_core::store_error::StoreError;
 use reel_core::units::{ByteCount, DeathMark, Nanoseconds, RowCount};
 
 use crate::engine::open_segment::{
-    OpenSegment, RowQueue, reserve_step,
+    OpenSegment, RowQueue,
 };
 use crate::engine::volume::Volume;
 use crate::guard::hold;
@@ -153,6 +153,6 @@ pub fn check_seal_room<Backend: Io>(volume: &Volume<Backend>) -> Result<(), Stor
 /// bytes or the claim's end, whichever is further
 pub fn reserve_target<Backend: Io>(segment: &OpenSegment<Backend::File>, volume: &Volume<Backend>, end: u64) -> u64 {
     let limit = volume.segment_bytes.0.max(end);
-    (segment.reserved_end.0 + reserve_step(volume.segment_bytes)).max(end).min(limit)
+    (segment.reserved_end.0 + volume.reserve_step).max(end).min(limit)
 }
 

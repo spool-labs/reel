@@ -70,7 +70,7 @@ fn config() -> StoreConfig {
         name: name.to_string(),
         roots: vec![PathBuf::from(root)],
         sync: SyncPolicy::Never,
-        device: Default::default(), open_segments: None,
+        device: Default::default(), open_segments: None, segment_bytes: None,
     };
     let column = |id: ColumnId, name: &str, codec: Codec, volume: u8| ColumnConfig {
         id,

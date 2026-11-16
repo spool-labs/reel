@@ -37,6 +37,8 @@ pub enum StoreError {
     ThreadsPastBudget { maintenance_workers: usize, read_threads: usize, budget: ByteCount, least: ByteCount },
     #[error("the store runs no read threads, so it answers only the blocking calls")]
     NoAsyncReads,
+    #[error("a segment size of {asked:?} is outside the {least:?} to {most:?} a volume may set")]
+    SegmentSize { asked: ByteCount, least: ByteCount, most: ByteCount },
     #[error("batch touches more than one volume")]
     BatchAcrossVolumes,
     #[error("a record in column {column:?} failed its check")]

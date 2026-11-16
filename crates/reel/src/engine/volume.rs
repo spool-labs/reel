@@ -247,6 +247,8 @@ pub struct Volume<Backend: Io> {
     /// The lifetime groups marked writes may hold open at once
     pub most_groups: usize,
     pub segment_bytes: ByteCount,
+    /// The bytes a segment of this volume reserves past its writes at a time
+    pub reserve_step: u64,
     pub segment_rows: RowCount,
     pub walk_retries: AtomicU64,
     pub walks_waiting: AtomicU64,

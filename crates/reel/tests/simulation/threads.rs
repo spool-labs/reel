@@ -48,7 +48,7 @@ fn config_on(threads: ThreadCounts, device: DeviceClass) -> StoreConfig {
             roots: vec![PathBuf::from(ROOT)],
             sync: SyncPolicy::Never,
             device,
-            open_segments: None,
+            open_segments: None, segment_bytes: None,
         }],
         columns: vec![ColumnConfig {
             id: COLUMN,
@@ -274,7 +274,7 @@ fn two_volumes(threads: ThreadCounts) -> StoreConfig {
         name: name.to_string(),
         roots: vec![PathBuf::from(format!("{ROOT}-{name}"))],
         sync: SyncPolicy::Never,
-        device: DeviceClass::Detect, open_segments: None,
+        device: DeviceClass::Detect, open_segments: None, segment_bytes: None,
     };
     let column = |id: u8, volume: u8| ColumnConfig {
         id: ColumnId(id),

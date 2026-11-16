@@ -22,7 +22,7 @@ fn config(root: PathBuf) -> StoreConfig {
     StoreConfig {
         memory_budget: BUDGET,
         threads: ThreadCounts::default(),
-        volumes: vec![VolumeConfig { name: "volume".to_string(), roots: vec![root], sync: SyncPolicy::Never, device: DeviceClass::Detect, open_segments: None }],
+        volumes: vec![VolumeConfig { name: "volume".to_string(), roots: vec![root], sync: SyncPolicy::Never, device: DeviceClass::Detect, open_segments: None, segment_bytes: None }],
         columns: vec![ColumnConfig {
             id: COLUMN,
             name: "column".to_string(),
@@ -410,3 +410,47 @@ fn a_store_with_no_read_thread_answers_the_blocking_calls() -> Result<(), Box<dy
     std::fs::remove_dir_all(&root)?;
     Ok(())
 }
+
+// a volume of 256 KiB segments that wrote a few KB holds on disk within one reservation step of its data, and a set size past
+// the format's limit is refused by name
+#[test]
+fn a_set_segment_size_keeps_a_small_store_small() -> Result<(), Box<dyn std::error::Error>> {
+    use reel::{LEAST_SEGMENT_BYTES, MOST_SET_SEGMENT_BYTES};
+    use reel_core::store_error::StoreError;
+
+    let root = scratch_root().with_extension("small-segments");
+    let _gone = std::fs::remove_dir_all(&root);
+    let size = ByteCount(256 * 1024);
+    // a set size reserves an eighth of itself a step
+    let step = size.0 / 8;
+    let mut small = config(root.clone());
+    small.volumes[0].segment_bytes = Some(size);
+    let store = ReelStore::open(PlainIo::new(), &small)?;
+    for number in 0..64_u32 {
+        store.put(COLUMN, format!("key-{number:03}").as_bytes(), &[3_u8; 64])?;
+    }
+    store.close()?;
+    drop(store);
+    let mut files = Vec::new();
+    files_under(&root, &mut files)?;
+    let data: Vec<_> = files.iter().filter(|(path, _length, _held)| path.to_string_lossy().ends_with(".data")).collect();
+    let held: u64 = data.iter().map(|(_path, _length, held)| *held).sum();
+    println!("{} data files, {held} B held, a step of {step} B", data.len());
+    // the rows took one record window, which a segment counts whole once a writer lands in it, and the room a step past it
+    assert!(held <= WINDOW_BYTES + step, "{held} B held: {data:?}");
+    std::fs::remove_dir_all(&root)?;
+
+    for asked in [ByteCount(LEAST_SEGMENT_BYTES.0 - 1), ByteCount(MOST_SET_SEGMENT_BYTES.0 + 1)] {
+        let mut config = config(scratch_root().with_extension("refused-segments"));
+        config.volumes[0].segment_bytes = Some(asked);
+        let refused = ReelStore::open(PlainIo::new(), &config).map(|_store| ());
+        assert!(
+            matches!(refused, Err(StoreError::SegmentSize { asked: refused_size, least, most }) if refused_size == asked && least == LEAST_SEGMENT_BYTES && most == MOST_SET_SEGMENT_BYTES),
+            "{refused:?}"
+        );
+    }
+    Ok(())
+}
+
+// the file range a slot's small records fill before one write call, which a segment takes whole
+const WINDOW_BYTES: u64 = 64 * 1024;

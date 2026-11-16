@@ -1535,3 +1535,51 @@ fn seals_during_far_behind_merges_start_one_more() {
     assert!(segments <= 32, "{segments} segments over every key after the merges");
     store.close().expect("close");
 }
+
+const FINISH_WALL: std::time::Duration = std::time::Duration::from_secs(30);
+
+// run a finish on its own thread while this one steps the simulated jobs, and return what it said
+fn finish_stepped(store: &Store, io: &SimulatedIo) -> Result<(), StoreError> {
+    std::thread::scope(|scope| {
+        let finishing = scope.spawn(|| store.finish());
+        // the finish sleeps on the real clock between looks, so the jobs are stepped until it answers or the wall time runs out
+        let deadline = std::time::Instant::now() + FINISH_WALL;
+        while std::time::Instant::now() < deadline {
+            if finishing.is_finished() {
+                break;
+            }
+            if io.step_any().is_none() {
+                io.advance_clock(TICK);
+            }
+        }
+        assert!(finishing.is_finished(), "the finish never answered");
+        finishing.join().expect("the finish thread")
+    })
+}
+
+// a finish on a full disk answers with the error and leaves the store open, and once room comes back a second finish seals
+// everything, and the store reads every row after a reopen
+#[test]
+fn finish_on_a_full_disk_answers_and_leaves_the_store_open() {
+    let io = SimulatedIo::new(Seed(201));
+    let store = open(&io);
+    for number in 0..100_u32 {
+        store.put(COLUMN, format!("key-{number:03}").as_bytes(), b"value").expect("put");
+    }
+    io.fill_writes(OperationCount(u64::MAX));
+    let refused = finish_stepped(&store, &io);
+    assert!(
+        matches!(&refused, Err(StoreError::Io { source, .. }) if source.kind() == std::io::ErrorKind::StorageFull),
+        "{refused:?}"
+    );
+    assert!(store.check_open().is_ok(), "the store closed on a failed finish");
+    io.fill_writes(OperationCount(0));
+    finish_stepped(&store, &io).expect("a finish once room came back");
+    drop(store);
+    let store = open(&io);
+    let mut value = Vec::new();
+    for number in 0..100_u32 {
+        assert!(store.get(COLUMN, format!("key-{number:03}").as_bytes(), &mut value).expect("get"), "key {number}");
+    }
+    store.close().expect("close");
+}

@@ -389,6 +389,8 @@ pub struct Volume<Backend: Io> {
     pub scans_weighed_at: AtomicU64,
     /// Quiet open segments that gave their room ahead back
     pub rooms_given_back: AtomicU64,
+    /// Seals that waited for room, since a full disk makes a seal retry until room comes back
+    pub seal_full_waits: AtomicU64,
     /// The store's line writers wait on, which anything that clears a wait moves
     pub progress: Arc<WakeLine>,
     /// Picks refused because the park had no room for their inputs

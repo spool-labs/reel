@@ -646,6 +646,10 @@ impl<Backend: Io> SealJob<Backend> {
             self.volume().fail();
             return JobStep::Idle;
         }
+        if error.kind() == ErrorKind::StorageFull {
+            self.volume().seal_full_waits.fetch_add(1, Ordering::AcqRel);
+            self.volume().progress.wake();
+        }
 
         let now = self.state.io.now();
         JobStep::IdleUntil {

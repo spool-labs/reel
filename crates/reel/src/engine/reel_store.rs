@@ -473,15 +473,23 @@ impl<Backend: Io> ReelStore<Backend> {
     /// Seal every open segment, wait for the seals, and close. A finished store holds sealed segments alone: no open segment, no
     /// rows file, no room reserved past a segment's end and no spare made ahead, so a copy of its files opens anywhere, read-only
     /// as well. Its complete and sorted images are saved as close saves them, and a read-only open reads them and removes none.
-    /// A write made while it runs is sealed with the rest
+    /// The caller stops its writers first, since a write that lands after the last look leaves a segment open. A seal that waits
+    /// for room on a full disk returns the error and leaves the store open, so a finish after room comes back completes it
     pub fn finish(&self) -> Result<(), StoreError> {
         self.check_open()?;
         if self.state.is_read_only {
             return Err(StoreError::ReadOnly);
         }
+        let waits_before: Vec<u64> = self.state.volumes.iter().map(|volume| volume.seal_full_waits.load(Ordering::Acquire)).collect();
         loop {
-            let mut is_open = false;
-            for volume in self.state.volumes.iter().filter(|volume| !volume.has_failed()) {
+            let mut is_any_open = false;
+            for (volume, waits) in self.state.volumes.iter().zip(&waits_before).filter(|(volume, _waits)| !volume.has_failed()) {
+                if volume.seal_full_waits.load(Ordering::Acquire) > *waits {
+                    return Err(StoreError::Io {
+                        action: "finishing a store",
+                        source: Error::from(ErrorKind::StorageFull),
+                    });
+                }
                 let seen = volume.progress.seen();
                 let mut claims = hold(&volume.claims);
                 for index in 0..claims.open.len() {
@@ -489,13 +497,14 @@ impl<Backend: Io> ReelStore<Backend> {
                         self.state.seal_at(&mut claims, volume, index);
                     }
                 }
-                is_open |= !claims.open.is_empty();
+                let is_open = !claims.open.is_empty();
                 drop(claims);
                 if is_open {
+                    is_any_open = true;
                     volume.progress.wait(seen, FINISH_WAIT);
                 }
             }
-            if !is_open {
+            if !is_any_open {
                 break;
             }
         }
@@ -1586,6 +1595,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         scans_use_cache: AtomicBool::new(false),
         scans_weighed_at: AtomicU64::new(0),
         rooms_given_back: AtomicU64::new(0),
+        seal_full_waits: AtomicU64::new(0),
         progress: Arc::clone(progress),
         park_refusals: AtomicU64::new(0),
         overlap_beside: AtomicU64::new(0),

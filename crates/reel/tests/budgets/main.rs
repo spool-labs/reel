@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use reel::engine::engine_sizing::{COMPACT_JOB_BYTES, ENTRY_LINE_DIVISOR, LANE_JOB_BYTES, SEAL_JOB_BYTES, WALK_JOB_BYTES, floor_entries};
 use reel::engine::reel_store::{ReelStore, ring_fits, store_shape, volume_disks};
 use reel::segment::segment_table::TABLE_SHARDS;
+use reel::io::Io;
 use reel::io::plain::PlainIo;
 use reel_core::maintenance_report::MaintenanceReport;
 use reel_core::memory_report::MemoryReport;
@@ -182,7 +183,8 @@ fn check_job_plans(report: &MemoryReport, volumes: u64) -> u32 {
     0
 }
 
-// the least cell opens on the default and takes the ring exactly when it fits, with the least budget beside the ring and without
+// the least cell opens on the default and takes the ring exactly when it fits and the platform has one, with the least budget beside
+// the ring and without
 fn check_least_cell() -> u32 {
     let root = scratch_root();
     let budget = ByteCount(LEAST_CELL_MIB * MIB);
@@ -196,7 +198,9 @@ fn check_least_cell() -> u32 {
             let mut report = MaintenanceReport::new();
             store.maintenance_report(&mut report);
             println!("the default at {LEAST_CELL_MIB} MiB has_ring {}", report.has_ring);
-            failures += u32::from(report.has_ring != ring_fits(&config, &disks));
+            // a ring runs where the budget fits it and the platform gives one, which macOS never does
+            let has_platform_ring = PlainIo::new().open_ring().ok().flatten().is_some();
+            failures += u32::from(report.has_ring != (ring_fits(&config, &disks) && has_platform_ring));
             store.close().expect("close");
         },
         Err(error) => {

@@ -353,12 +353,18 @@ impl SortedKeys {
         }
     }
 
-    /// Take an image's head once its pages are in. The pages past the saved ones kept the chain the build wrote, which the saved
-    /// free chain runs into
+    /// Take an image's head into a pool of any size that holds its saved pages. Pages past the saved ones were never taken, so
+    /// the saved chain reaches them through the first of them, and they keep this pool's own chain. A pool larger than a full
+    /// saved one gets its extra pages linked ahead of the saved chain, which never reached them
     pub fn finish_image(&self, head: &ImageHead) {
         let mut free = hold(&self.free);
-        free.head = head.free_head;
-        free.count = head.free_count;
+        let pages = self.page_count();
+        let is_full_below = head.saved == head.pages && pages > head.pages;
+        if is_full_below {
+            self.store(pages - 1, 1, head.free_head);
+        }
+        free.head = if is_full_below { head.pages } else { head.free_head };
+        free.count = (i64::from(head.free_count) + i64::from(pages) - i64::from(head.pages)) as u32;
         for (part, tree) in head.parts.iter().enumerate() {
             *self.parts.write(part) = *tree;
             self.filled[part].store(tree.entries, Memory::Release);

@@ -1443,12 +1443,52 @@ fn a_kill_before_the_unlink_syncs_takes_the_image_again() {
     reopen_and_check(&io, CAPACITY, &model, if is_back { (1, 0) } else { (0, 0) }, 37);
 }
 
-// an image from an index of another capacity is refused, and open rebuilds
+// an image loads into a pool of another size that holds its saved pages, answers as it did, and takes rows past the old pool;
+// a pool too small for the saved pages refuses it, and open rebuilds
+fn image_into_a_pool(capacity: RowCount, expected: (u64, u64), (keys, seed): (u64, u64)) {
+    let io = SimulatedIo::new(Seed(seed));
+    let store = open(&io, CAPACITY);
+    let mut model = fill_for_image(&store, &io, keys);
+    let saved = store.state.sorted_index(COLUMN).expect("an index").high_water();
+    store.close().expect("close");
+    drop(store);
+    let store = open(&io, capacity);
+    let index = store.state.sorted_index(COLUMN).expect("an index");
+    assert_eq!(index.page_count() >= saved, expected == (1, 0), "{} pages for {saved} saved", index.page_count());
+    assert_eq!(image_counts(&store), expected, "{} pages for {saved} saved", index.page_count());
+    // a pool too small for the image is too small for its keys too, so it marks and answers through the footers
+    if expected == (0, 1) {
+        check(&store, &model, &(0..keys).map(key).collect::<Vec<_>>());
+        check_scans(&store, &model, &mut SeededRandom::new(Seed(seed + 1)));
+        store.close().expect("close");
+        return;
+    }
+    check_all(&store, &model, keys, seed + 1);
+    // rows past the old pool take pages the image never held
+    for number in keys..keys * 3 {
+        let value = format!("later-{number}").into_bytes();
+        store.put(COLUMN, &key(number), &value).expect("put");
+        model.insert(key(number), value);
+    }
+    seal_all(&store, &io);
+    assert_eq!(index.check(), Ok(()));
+    check_all(&store, &model, keys * 3, seed + 2);
+    store.close().expect("close");
+}
+
 #[test]
-fn an_image_of_another_capacity_is_refused() {
-    let io = SimulatedIo::new(Seed(38));
-    let model = closed_with_image(&io);
-    reopen_and_check(&io, RowCount(CAPACITY.0 * 4), &model, (0, 1), 39);
+fn an_image_loads_into_a_larger_pool() {
+    image_into_a_pool(RowCount(CAPACITY.0 * 4), (1, 0), (KEYS, 38));
+}
+
+#[test]
+fn an_image_loads_into_a_smaller_pool_that_holds_it() {
+    image_into_a_pool(RowCount(KEYS * 4), (1, 0), (KEYS, 138));
+}
+
+#[test]
+fn an_image_too_large_for_the_pool_is_refused() {
+    image_into_a_pool(RowCount(1), (0, 1), (KEYS * 20, 238));
 }
 
 // an image that lists a segment the volume no longer has is refused

@@ -215,7 +215,8 @@ pub fn read_sorted_image<File: IoFile>(
         *word = read_word(head_bytes, index * size_of::<u64>()).ok_or_else(bad)?;
     }
     let [magic, image_column, width, pages, saved, free_head, free_count, entries, sealed, count] = head_words;
-    let is_shape = magic == SORTED_IMAGE_MAGIC && image_column == u64::from(column.0) && width == sorted.width() as u64 && pages == u64::from(sorted.page_count());
+    // the pool may be another size than the one saved, as long as it holds every saved page
+    let is_shape = magic == SORTED_IMAGE_MAGIC && image_column == u64::from(column.0) && width == sorted.width() as u64 && saved <= u64::from(sorted.page_count());
     if !is_shape || saved > pages {
         return Err(bad());
     }
@@ -257,7 +258,7 @@ pub fn read_sorted_image<File: IoFile>(
         return Err(bad());
     }
     let as_page = |value: u64| u32::try_from(value).map_err(|_error| bad());
-    let head = ImageHead { width: sorted.width(), pages: sorted.page_count(), saved: as_page(saved)?, free_head: as_page(free_head)?, free_count: as_page(free_count)?, entries, parts };
+    let head = ImageHead { width: sorted.width(), pages: as_page(pages)?, saved: as_page(saved)?, free_head: as_page(free_head)?, free_count: as_page(free_count)?, entries, parts };
     sorted.finish_image(&head);
     Ok(())
 }

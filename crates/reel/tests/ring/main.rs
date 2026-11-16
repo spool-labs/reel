@@ -62,7 +62,7 @@ fn config(root: &Path) -> StoreConfig {
             name: "ring".to_string(),
             roots: vec![root.to_path_buf()],
             sync: SyncPolicy::Never,
-            device: Default::default(),
+            device: Default::default(), open_segments: None,
         }],
         columns: vec![ColumnConfig {
             id: COLUMN,

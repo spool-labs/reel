@@ -40,7 +40,7 @@ fn main() {
             name: "stall".to_string(),
             roots: vec![root.clone()],
             sync: SyncPolicy::Never,
-            device: Default::default(),
+            device: Default::default(), open_segments: None,
         }],
         columns: vec![ColumnConfig {
             id: COLUMN,

@@ -54,7 +54,7 @@ fn open_with(io: &SimulatedIo, budget: ByteCount, threads: ThreadCounts) -> Stor
             name: "reports".to_string(),
             roots: vec![PathBuf::from(ROOT)],
             sync: SyncPolicy::Never,
-            device: Default::default(),
+            device: Default::default(), open_segments: None,
         }],
         columns: vec![ColumnConfig {
             id: COLUMN,
@@ -653,7 +653,7 @@ fn open_mixed(io: &SimulatedIo) -> Store {
     let config = StoreConfig {
         memory_budget: BUDGET,
         threads: reel::config::NO_WORKERS,
-        volumes: vec![VolumeConfig { name: "mixed".to_string(), roots: vec![PathBuf::from(ROOT)], sync: SyncPolicy::Never, device: Default::default() }],
+        volumes: vec![VolumeConfig { name: "mixed".to_string(), roots: vec![PathBuf::from(ROOT)], sync: SyncPolicy::Never, device: Default::default(), open_segments: None }],
         columns: vec![column(COLUMN), column(WIDE_COLUMN)],
     };
     ReelStore::open(io.clone(), &config).expect("open")

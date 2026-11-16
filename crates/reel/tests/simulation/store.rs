@@ -173,7 +173,7 @@ fn config(sync: SyncPolicy) -> StoreConfig {
             name: "meta".to_string(),
             roots: vec![PathBuf::from(ROOT)],
             sync,
-            device: Default::default(),
+            device: Default::default(), open_segments: None,
         }],
         columns: vec![ColumnConfig {
             id: COLUMN,
@@ -1442,4 +1442,90 @@ fn reopen_keeps_the_open_segment() {
     }
     assert_eq!(read(&store, b"after"), Some(b"value".to_vec()));
     store.close().expect("close");
+}
+
+// a volume set to one open segment takes every writer into it, and its store's least budget is lower
+#[test]
+fn one_open_segment_takes_every_writer() {
+    let io = SimulatedIo::new(Seed(110));
+    let mut one = config(SyncPolicy::Never);
+    one.volumes[0].open_segments = Some(1);
+    let store = ReelStore::open(io.clone(), &one).expect("open");
+    store.put(COLUMN, b"key", b"value").expect("put");
+    let volume = &store.state.volumes[0];
+    let mut held = Vec::new();
+    for _writer in 0..OPEN_PER_ROOT as u32 * WRITES_PER_OPEN {
+        held.push(store.state.claim(volume, &ONE_ROW).expect("claim"));
+        settle_jobs(&io);
+    }
+    let claims = hold(&volume.claims);
+    let taking = claims.open.iter().filter(|segment| segment.phase == SegmentPhase::Taking).count();
+    assert_eq!(taking, 1);
+    drop(claims);
+    drop(held);
+    let (least, slots) = (store.memory_report().least_budget, store.memory_report().open_slots);
+    store.close().expect("close");
+    let full = ReelStore::open(SimulatedIo::new(Seed(110)), &config(SyncPolicy::Never)).expect("open");
+    println!("one open segment: {slots} slots, least {least:?}; default: {} slots, least {:?}", full.memory_report().open_slots, full.memory_report().least_budget);
+    assert!(slots < full.memory_report().open_slots && least < full.memory_report().least_budget);
+    full.close().expect("close");
+}
+
+// puts, deletes and marked puts on a volume of one open segment, sealed, closed and killed between rounds, read back as a model
+// holds them
+#[test]
+fn one_open_segment_matches_the_model() {
+    for seed in seeds(0..8) {
+        let io = SimulatedIo::new(Seed(300 + seed));
+        let mut random = SeededRandom::new(Seed(400 + seed));
+        let mut one = config(SyncPolicy::Never);
+        one.volumes[0].open_segments = Some(1);
+        let mut store = ReelStore::open(io.clone(), &one).expect("open");
+        let mut model = BTreeMap::new();
+        for round in 0..24 {
+            for write in 0..200 {
+                let key = format!("key-{}", random.below(400)).into_bytes();
+                match random.below(8) {
+                    0 => {
+                        store.delete(COLUMN, &key).expect("delete");
+                        model.remove(&key);
+                    },
+                    1 => {
+                        let value = format!("{seed}-{round}-{write}-marked").into_bytes();
+                        let mark = reel_api::units::DeathMark(1 + random.below(6) * 1_000_000);
+                        store.put_marked(COLUMN, &key, &value, mark).expect("put");
+                        model.insert(key, value);
+                    },
+                    _ => {
+                        let value = format!("{seed}-{round}-{write}").into_bytes();
+                        store.put(COLUMN, &key, &value).expect("put");
+                        model.insert(key, value);
+                    },
+                }
+            }
+            match random.below(4) {
+                0 => {
+                    store.seal_now();
+                    settle(&io);
+                },
+                1 => {
+                    store.close().expect("close");
+                    drop(store);
+                    store = ReelStore::open(io.clone(), &one).expect("open");
+                },
+                2 => {
+                    store.flush().expect("flush");
+                    io.kill();
+                    drop(store);
+                    store = ReelStore::open(io.clone(), &one).expect("open");
+                },
+                _ => settle(&io),
+            }
+            for number in 0..400 {
+                let key = format!("key-{number}").into_bytes();
+                assert_eq!(read(&store, &key), model.get(&key).cloned(), "seed {seed} round {round} key {number}");
+            }
+        }
+        store.close().expect("close");
+    }
 }

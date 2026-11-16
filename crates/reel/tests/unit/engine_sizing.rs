@@ -36,6 +36,8 @@ fn shape(budget: ByteCount, roots: usize) -> StoreShape {
     StoreShape {
         budget,
         roots,
+        open_segments: roots * OPEN_PER_ROOT,
+        lifetime_groups: reel::lifetime::MOST_LIFETIME_GROUPS,
         volumes: 1,
         has_lz4: false,
         widest_keys: 64,
@@ -65,6 +67,8 @@ fn documented_rows() {
         let store = StoreShape {
             budget: ByteCount(mib * 1024 * 1024),
             roots: 1,
+            open_segments: OPEN_PER_ROOT,
+            lifetime_groups: reel::lifetime::MOST_LIFETIME_GROUPS,
             volumes: 1,
             has_lz4: true,
             widest_keys: 64,
@@ -86,6 +90,8 @@ fn summary_holds_blocks() {
     let store = StoreShape {
         budget: ByteCount(512 * 1024 * 1024),
         roots: 1,
+        open_segments: OPEN_PER_ROOT,
+        lifetime_groups: reel::lifetime::MOST_LIFETIME_GROUPS,
         volumes: 1,
         has_lz4: true,
         widest_keys: 64,
@@ -110,6 +116,8 @@ fn documented_reserve() {
         let store = StoreShape {
             budget: ByteCount(mib * 1024 * 1024),
             roots: 1,
+            open_segments: OPEN_PER_ROOT,
+            lifetime_groups: reel::lifetime::MOST_LIFETIME_GROUPS,
             volumes: 1,
             has_lz4: true,
             widest_keys: 64,
@@ -267,7 +275,7 @@ fn box_churn_fits_the_table() {
     let config = StoreConfig {
         memory_budget: FULL_BUDGET,
         threads: ThreadCounts { maintenance_workers: Some(2), ..NO_WORKERS },
-        volumes: vec![VolumeConfig { name: "smoke".to_string(), roots: vec![PathBuf::from("/box")], sync: SyncPolicy::Never, device: DeviceClass::default() }],
+        volumes: vec![VolumeConfig { name: "smoke".to_string(), roots: vec![PathBuf::from("/box")], sync: SyncPolicy::Never, device: DeviceClass::default(), open_segments: None }],
         columns: vec![column(1, "meta", Codec::None), column(2, "bulk", Codec::Lz4)],
     };
     let disks = [Some(ByteCount(BOX_DISK_BYTES))];

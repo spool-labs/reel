@@ -25,7 +25,7 @@ fn config(root: &Path) -> StoreConfig {
         name: name.to_string(),
         roots: vec![root.join(name)],
         sync: SyncPolicy::Never,
-        device: Default::default(),
+        device: Default::default(), open_segments: None,
     };
     let column = |id: ColumnId, name: &str, volume: u8| ColumnConfig {
         id,

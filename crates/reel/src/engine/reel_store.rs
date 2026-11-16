@@ -852,6 +852,8 @@ pub fn store_shape(config: &StoreConfig, has_ring: bool, disks: &[Option<ByteCou
     let bare = StoreShape {
         budget: config.memory_budget,
         roots: root_count,
+        open_segments: config.volumes.iter().map(VolumeConfig::most_open).sum(),
+        lifetime_groups: config.volumes.iter().map(VolumeConfig::most_groups).sum(),
         volumes: config.volumes.len(),
         has_lz4: config.columns.iter().any(|column| column.codec == Codec::Lz4),
         widest_keys: (0..config.volumes.len()).map(|volume| config.widest_key(volume) as u64).sum(),
@@ -1537,6 +1539,8 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         highest_sealed: AtomicU64::new(0),
         sync: Mutex::new(SyncState::default()),
         is_failed: AtomicBool::new(false),
+        most_open: volume.most_open(),
+        most_groups: volume.most_groups(),
         segment_bytes: sizing.segment_bytes,
         segment_rows: volume_rows(config, index, sizing.segment_rows),
         walk_retries: AtomicU64::new(0),

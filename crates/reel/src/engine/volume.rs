@@ -242,6 +242,10 @@ pub struct Volume<Backend: Io> {
     pub highest_sealed: AtomicU64,
     pub sync: Mutex<SyncState>,
     pub is_failed: AtomicBool,
+    /// The segments unmarked writes may take at once
+    pub most_open: usize,
+    /// The lifetime groups marked writes may hold open at once
+    pub most_groups: usize,
     pub segment_bytes: ByteCount,
     pub segment_rows: RowCount,
     pub walk_retries: AtomicU64,

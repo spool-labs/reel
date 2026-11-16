@@ -12,7 +12,7 @@ use reel_api::units::{ByteCount, DeathMark, FileOffset, Nanoseconds, RootId, Row
 
 use crate::engine::claim::Claim;
 use crate::engine::ration::RATION_SPINS; use crate::engine::reserve_job::RoomAhead;
-use crate::engine::engine_sizing::{OPEN_PER_ROOT, SEAL_ROWS_EIGHTHS};
+use crate::engine::engine_sizing::SEAL_ROWS_EIGHTHS;
 use crate::engine::engine_state::{EngineState, IndexWait, SlotData};
 use crate::engine::open_segment::{
     OpenSegment, SegmentPhase, data_path, reserve_step,
@@ -22,7 +22,7 @@ use crate::engine::volume::{ClaimState, Volume};
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
 use crate::index::write_row::WriteRow;
-use crate::lifetime::{MOST_LIFETIME_GROUPS, MarkRange, ceiling_of, reach_of};
+use crate::lifetime::{MarkRange, ceiling_of, reach_of};
 use crate::io::{Io, IoFile, IoTask};
 use crate::rows::row_group::{RowEntry, row_size};
 use crate::segment::range_covers::MOST_RANGE_COVERS;
@@ -737,7 +737,7 @@ pub fn pick_unmarked<Backend: Io>(
         }
     }
 
-    let most_open = volume.roots.len() * OPEN_PER_ROOT;
+    let most_open = volume.most_open;
     let wants_more = best.is_some_and(|index| claims.open[index].in_flight >= WRITES_PER_OPEN) && taking < most_open;
     SegmentPick {
         best,
@@ -788,7 +788,7 @@ pub fn pick_group<Backend: Io>(
         Some((_ceiling, index)) if has_room(&claims.open[index], volume, request) => pick.best = Some(index),
         // a full group gives up its place to the one that follows it
         Some((_ceiling, index)) => pick.to_seal = Some(index),
-        None if groups < MOST_LIFETIME_GROUPS => {},
+        None if groups < volume.most_groups => {},
         None => {
             pick.to_seal = dies_first.map(|(_ceiling, index)| index);
             pick.must_wait = dies_first.is_none();

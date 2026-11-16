@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, RowCount, VolumeId};
 
+use crate::engine::engine_sizing::OPEN_PER_ROOT;
+use crate::lifetime::MOST_LIFETIME_GROUPS;
 use crate::record::codec::Codec;
 use crate::record::record_head::SMALL_HEAD_BYTES;
 use crate::segment::footer_writer::SMALLEST_ROW_BYTES;
@@ -83,12 +85,26 @@ pub struct VolumeConfig {
     pub roots: Vec<PathBuf>,
     pub sync: SyncPolicy,
     pub device: DeviceClass,
+    /// The most segments this volume writes into at once, lifetime groups among them. None runs OPEN_PER_ROOT a root and
+    /// MOST_LIFETIME_GROUPS groups. Each one held open takes write queues and read windows out of the budget, so a small store
+    /// sets 1
+    pub open_segments: Option<usize>,
 }
 
 impl VolumeConfig {
     /// Build a volume on these roots, with the device under the first root asked about
     pub fn new(name: impl Into<String>, roots: Vec<PathBuf>, sync: SyncPolicy) -> Self {
-        Self { name: name.into(), roots, sync, device: DeviceClass::Detect }
+        Self { name: name.into(), roots, sync, device: DeviceClass::Detect, open_segments: None }
+    }
+
+    /// Count the segments this volume's unmarked writes may take at once
+    pub fn most_open(&self) -> usize {
+        self.open_segments.map_or(self.roots.len() * OPEN_PER_ROOT, |most| most.max(1))
+    }
+
+    /// Count the lifetime groups this volume's marked writes may hold open at once
+    pub fn most_groups(&self) -> usize {
+        self.open_segments.map_or(MOST_LIFETIME_GROUPS, |most| most.clamp(1, MOST_LIFETIME_GROUPS))
     }
 }
 

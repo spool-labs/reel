@@ -24,7 +24,7 @@ fn config(root: PathBuf) -> StoreConfig {
     StoreConfig {
         memory_budget: BUDGET,
         threads: ThreadCounts::default(),
-        volumes: vec![VolumeConfig { name: "volume".to_string(), roots: vec![root], sync: SyncPolicy::Never, device: DeviceClass::Detect }],
+        volumes: vec![VolumeConfig { name: "volume".to_string(), roots: vec![root], sync: SyncPolicy::Never, device: DeviceClass::Detect, open_segments: None }],
         columns: vec![ColumnConfig {
             id: COLUMN,
             name: "column".to_string(),

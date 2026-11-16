@@ -42,7 +42,7 @@ fn config() -> StoreConfig {
             name: "marks".to_string(),
             roots: vec![PathBuf::from(ROOT)],
             sync: SyncPolicy::Never,
-            device: Default::default(),
+            device: Default::default(), open_segments: None,
         }],
         columns: vec![ColumnConfig {
             id: COLUMN,
@@ -447,5 +447,26 @@ fn range_delete_ends_a_lifetime() {
     store.maintenance_report(&mut report);
     assert!(report.segments_unlinked.0 >= 1, "{report:?}");
     assert_eq!(report.volumes[0].used_bytes, ByteCount(0), "{report:?}");
+    store.close().expect("close");
+}
+
+// a volume set to two open segments holds two lifetime groups, and the group that dies first seals for a third
+#[test]
+fn open_segments_cap_the_groups() {
+    let io = SimulatedIo::new(Seed(6));
+    let mut config = config();
+    config.volumes[0].open_segments = Some(2);
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let far = |group: u64| DeathMark((group + 1) * FAR_APART);
+    for group in 0..2 {
+        store.put_marked(COLUMN, &key(group), b"value", far(group)).expect("put");
+    }
+    assert_eq!(reading(&store).lifetime_groups, 2);
+    store.put_marked(COLUMN, b"late", b"value", DeathMark(100 * FAR_APART)).expect("put");
+    settle(&io);
+    assert_eq!(reading(&store).lifetime_groups, 2);
+    let sealed = sealed_marks(&store);
+    assert_eq!(sealed.len(), 1);
+    assert_eq!(sealed[0].1.highest, far(0));
     store.close().expect("close");
 }

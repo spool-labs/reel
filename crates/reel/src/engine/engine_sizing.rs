@@ -12,7 +12,6 @@ use crate::index::sorted_keys::planned_index_bytes;
 use crate::index::node_pool::{NODE_FANOUT, NodeCount};
 use crate::index::open_slots::MAX_OPEN_SLOTS;
 use crate::io::ring::{RING_READ_BYTES, RING_READS, RING_SLOT_BYTES, RING_SLOTS};
-use crate::lifetime::MOST_LIFETIME_GROUPS;
 use crate::index::write_index::SHARD_COUNT;
 use crate::index::write_shard::ShardSizing;
 use crate::record::codec::CHUNK_BYTES;
@@ -168,6 +167,10 @@ pub const WRITE_BUFFERS: usize = 8;
 pub struct StoreShape {
     pub budget: ByteCount,
     pub roots: usize,
+    /// The segments every volume's unmarked writes may take at once, added up
+    pub open_segments: usize,
+    /// The lifetime groups every volume may hold open at once, added up
+    pub lifetime_groups: usize,
     pub volumes: usize,
     pub has_lz4: bool,
     pub widest_keys: u64,
@@ -222,7 +225,7 @@ impl StoreShape {
 
     /// Count the open slots the roots and the lifetime groups can use
     pub fn open_slots(&self) -> usize {
-        (self.roots * OPEN_PER_ROOT * SLOTS_PER_OPEN + self.volumes * MOST_LIFETIME_GROUPS).min(MAX_OPEN_SLOTS)
+        (self.open_segments * SLOTS_PER_OPEN + self.lifetime_groups).min(MAX_OPEN_SLOTS)
     }
 
     /// Add up what a store holds whatever its budget: buffers, pools, stacks and the spans a summary must keep

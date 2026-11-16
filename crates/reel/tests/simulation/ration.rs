@@ -34,7 +34,7 @@ fn volume(name: &str, root: &str) -> VolumeConfig {
         name: name.to_string(),
         roots: vec![PathBuf::from(root)],
         sync: SyncPolicy::Never,
-        device: Default::default(),
+        device: Default::default(), open_segments: None,
     }
 }
 

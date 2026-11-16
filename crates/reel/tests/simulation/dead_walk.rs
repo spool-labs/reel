@@ -69,7 +69,7 @@ fn config(budget: ByteCount) -> StoreConfig {
             name: "walk".to_string(),
             roots: vec![PathBuf::from(ROOT)],
             sync: SyncPolicy::Never,
-            device: Default::default(),
+            device: Default::default(), open_segments: None,
         }],
         columns: vec![ColumnConfig {
             id: COLUMN,
@@ -518,7 +518,7 @@ fn turn_with(seed: Seed) {
         name: "second".to_string(),
         roots: vec![PathBuf::from(SECOND_ROOT)],
         sync: SyncPolicy::Never,
-        device: Default::default(),
+        device: Default::default(), open_segments: None,
     });
     config.columns.push(ColumnConfig {
         id: SECOND_COLUMN,

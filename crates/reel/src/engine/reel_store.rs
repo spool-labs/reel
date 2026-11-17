@@ -1751,11 +1751,15 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
 }
 
 
-/// Work out a volume's row limit: the budget's, or less when a complete column on it needs its row blocks addressable
+/// Work out a volume's row limit: the budget's, or less when its seal's list can't hold that many rows at the volume's widest key,
+/// or when a complete column on it needs its row blocks addressable. Wide keys cost rows: a segment of 1,056 byte keys seals at
+/// about 850,000 rows whatever the budget
 pub fn volume_rows(config: &StoreConfig, volume: usize, rows: RowCount) -> RowCount {
+    let listed = rows_within_blocks(seal_blocks(config, volume), config.widest_key(volume));
     let on_volume = config.columns.iter().filter(|column| column.volume.0 as usize == volume && column.complete_rows().is_some());
     let widest = on_volume.map(|column| column.key_shape.widest()).max();
-    widest.map_or(rows, |widest| RowCount(rows.0.min(complete_row_limit(widest).0)))
+    let addressable = widest.map_or(rows.0, |widest| complete_row_limit(widest).0);
+    RowCount(rows.0.min(listed).min(addressable))
 }
 
 /// Allocate and touch each complete column's table

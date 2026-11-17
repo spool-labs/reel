@@ -42,3 +42,4 @@ mod spot_index;
 mod staged;
 mod store;
 mod threads;
+mod wide_keys;

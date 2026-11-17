@@ -32,6 +32,7 @@ mod row_block;
 mod row_group;
 mod scan_tree;
 mod scan_window;
+mod seal_rows;
 mod segment_table;
 mod segment_tail;
 mod sorted_keys;

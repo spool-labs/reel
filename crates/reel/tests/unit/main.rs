@@ -41,6 +41,7 @@ mod summary;
 mod summary_orders;
 mod wake_line;
 mod superblock;
+mod torn_record;
 mod varint;
 mod workers;
 mod write_order;

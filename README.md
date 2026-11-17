@@ -97,10 +97,12 @@ it, since reel can't tell what those deletes hid once their footer is gone.
 
 ## How it compares
 
-Measured on 17 November 2026 on a Hetzner CCX33 (4 cores, 8 threads, 32 GB, local NVMe), one pass. Every engine gets a 2 GiB
-cache, 8 loader and 8 reader threads, and syncs its writes to disk every 4 MiB written. Keys are 16 bytes and values 100
-bytes, 10 million records loaded in batches of 1,000. Reel runs as a caller gets it by default: a sorted index on its
-fixed-width keys, and scans not told how many rows they take. The numbers are operations a second.
+Measured on 17 November 2026 at commit cc90e20 on a Hetzner CCX33 (4 cores, 8 threads, 32 GB, local NVMe), one pass, with
+transparent huge pages set to always and each run held to 8 GiB of memory. Every engine gets a 2 GiB cache, 8 loader and 8
+reader threads, and syncs its writes to disk every 4 MiB written: RocksDB syncs its log, fjall its journal, LMDB runs with its
+sync on each commit off and a forced sync at each 4 MiB, and redb can only sync at its next commit. Keys are 16 bytes and
+values 100 bytes, 10 million records loaded in batches of 1,000. Reel runs as a caller gets it by default: a sorted index on
+its fixed-width keys, and scans not told how many rows they take. The numbers are operations a second.
 
 The feed workload loads records as posts, 50 to a user, then reads each user's newest 20 posts and scans 10, 100 and 1,000
 keys in a row from random places:
@@ -125,7 +127,8 @@ the other 5:
 | redb | 58k | 240k | 122 us | 30.8 | 1.94 |
 
 Reel loads fastest of the five, answers point reads fastest, and writes the least to disk for each byte stored. It scans
-slower than LMDB and redb, which keep one B-tree, and slower than RocksDB on runs of 10 keys or more. A scan beside a writer
+slower than LMDB and redb, which keep one B-tree, and slower than RocksDB on runs of 10 keys or more. A scan that says how many
+rows it takes runs faster on the same store: 864k, 306k and 34k a second for 10, 100 and 1,000 keys. A scan beside a writer
 putting 20,000 records a second falls further behind: at 16 million keys reel scans 100 keys 80k times a second against
 RocksDB's 220k. RocksDB stores the feed workload in less space, since its keys share most of their bytes within a user.
 

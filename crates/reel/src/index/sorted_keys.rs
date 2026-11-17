@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as Memory};
 use reel_core::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
 use crate::guard::{Shards, hold};
-use crate::pool::ask_huge_pages;
+use crate::pool::{ask_huge_pages, touched_capacity};
 use crate::segment::segment_tail::SegmentNumber;
 
 /// Words of one page
@@ -206,11 +206,11 @@ impl PartTree {
 }
 
 impl KeyBatch {
-    /// Allocate a batch with room for this many entries of keys this wide
+    /// Allocate a batch with room for this many entries of keys this wide, every page of it written, since a scan fills it later
     pub fn new(width: usize, most: usize) -> Self {
         Self {
-            keys: Vec::with_capacity(width * most),
-            entries: Vec::with_capacity(most),
+            keys: touched_capacity(width * most, 0),
+            entries: touched_capacity(most, KeyEntry::default()),
             resume: [0; MOST_KEY_BYTES],
             is_with_graves: false,
             width,

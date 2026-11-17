@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 use reel_core::units::ByteCount;
 
 use crate::guard::hold;
-use crate::pool::{touched_capacity, touched_filled};
+use crate::pool::{touched_atomics, touched_capacity, touched_filled};
 use crate::index::key_hash::KeyHash;
 use crate::segment::block_filter::may_contain_bytes;
 use crate::segment::segment_tail::SegmentNumber;
@@ -147,7 +147,8 @@ impl FilterArena {
         let size = (most_segments.max(1) * 2).next_power_of_two();
         Self {
             words: touched_words(length as usize / WORD_BYTES),
-            numbers: (0..size).map(|_place| AtomicU64::new(NO_NUMBER)).collect(),
+            // NO_NUMBER is zero, and zeros collected come back as a zeroed allocation no page of which open has touched
+            numbers: touched_atomics(size),
             slots: touched_words(size),
             mask: size - 1,
             extents: touched_extents(most_segments),

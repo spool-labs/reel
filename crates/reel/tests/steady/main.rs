@@ -722,7 +722,20 @@ fn lock_touched_pages() {
     println!("touched pages unlocked");
 }
 
+// every block of a page or more gets a fresh mapping of its own, so a block open leaves unwritten shows on every run, whatever
+// the allocator held before it
+#[cfg(target_os = "linux")]
+fn map_every_block() {
+    // SAFETY: mallopt takes a setting and a value, and no memory of ours
+    let is_set = unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, PAGE_BYTES as i32) };
+    assert_eq!(is_set, 1, "the allocator refused a mapping threshold of a page");
+}
+
+#[cfg(not(target_os = "linux"))]
+fn map_every_block() {}
+
 fn main() {
+    map_every_block();
     lock_touched_pages();
     if let Some(root) = env::var_os(PREPARE_ROOT) {
         damage(Path::new(&root), &inputs());

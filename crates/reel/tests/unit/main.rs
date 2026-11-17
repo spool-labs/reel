@@ -16,6 +16,7 @@ mod filter_arena;
 mod job_tally;
 mod engine_sizing;
 mod lifetime;
+mod large_writers;
 mod lz4_block;
 mod open_segment;
 mod plain_io;

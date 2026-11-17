@@ -163,7 +163,8 @@ impl IoFile for PlainFile {
     }
 }
 
-/// Hold a file's space through an end, growing it there
+/// Hold a file's space through an end, growing it there. A fallocate of mode 0 never shrinks a file, so a writer that extended
+/// it past the end keeps its bytes. Both box passes ran on this call, and it stays until a Linux run can prove a change to it
 #[cfg(all(target_os = "linux", not(reel_plain_unix)))]
 pub fn reserve_descriptor_to(descriptor: RawFd, end: ByteCount) -> Result<()> {
     // SAFETY: the descriptor is open, and no pointer crosses the call
@@ -174,18 +175,21 @@ pub fn reserve_descriptor_to(descriptor: RawFd, end: ByteCount) -> Result<()> {
     Ok(())
 }
 
-/// Hold a file's space through an end, growing it there
+/// Hold a file's blocks through an end, leaving its length to the writes. A writer can extend the file past the end while this
+/// runs, and setting the length here would cut that writer's bytes off, so the blocks are held past the file's end and the next
+/// write past the length grows it
 #[cfg(all(target_vendor = "apple", not(reel_plain_unix)))]
 pub fn reserve_descriptor_to(descriptor: RawFd, end: ByteCount) -> Result<()> {
-    let length = descriptor_stats(descriptor)?.st_size as u64;
-    if end.0 <= length {
+    let held = descriptor_stats(descriptor)?.st_blocks as u64 * STAT_BLOCK_BYTES;
+    if end.0 <= held {
         return Ok(());
     }
+    // the blocks go on from the file's physical end, the last block it holds
     let mut store = libc::fstore_t {
         fst_flags: libc::F_ALLOCATEALL,
         fst_posmode: libc::F_PEOFPOSMODE,
         fst_offset: 0,
-        fst_length: (end.0 - length) as libc::off_t,
+        fst_length: (end.0 - held) as libc::off_t,
         fst_bytesalloc: 0,
     };
     // SAFETY: the descriptor is open, and the store outlives the call
@@ -193,26 +197,13 @@ pub fn reserve_descriptor_to(descriptor: RawFd, end: ByteCount) -> Result<()> {
     if status != 0 {
         return Err(Error::last_os_error());
     }
-    // SAFETY: the descriptor is open, and no pointer crosses the call
-    let status = unsafe { libc::ftruncate(descriptor, end.0 as libc::off_t) };
-    if status != 0 {
-        return Err(Error::last_os_error());
-    }
     Ok(())
 }
 
-/// Grow a file through an end, on a unix with no call that reserves its blocks: a full disk then shows at a write
+/// Hold nothing, on a unix with no call that reserves blocks without setting a length: the writes grow the file, and a full disk
+/// shows at a write
 #[cfg(any(reel_plain_unix, not(any(target_os = "linux", target_vendor = "apple"))))]
-pub fn reserve_descriptor_to(descriptor: RawFd, end: ByteCount) -> Result<()> {
-    let length = descriptor_stats(descriptor)?.st_size as u64;
-    if end.0 <= length {
-        return Ok(());
-    }
-    // SAFETY: the descriptor is open, and no pointer crosses the call
-    let status = unsafe { libc::ftruncate(descriptor, end.0 as libc::off_t) };
-    if status != 0 {
-        return Err(Error::last_os_error());
-    }
+pub fn reserve_descriptor_to(_descriptor: RawFd, _end: ByteCount) -> Result<()> {
     Ok(())
 }
 
@@ -396,7 +387,8 @@ pub fn reserve_space(file: &File, length: ByteCount) -> Result<()> {
 /// Size a new file, on a unix with no call that reserves its blocks: a full disk then shows at a write
 #[cfg(any(reel_plain_unix, not(any(target_os = "linux", target_vendor = "apple"))))]
 pub fn reserve_space(file: &File, length: ByteCount) -> Result<()> {
-    reserve_descriptor_to(file.as_raw_fd(), length)
+    // a new file has no writer yet, so setting its length here cuts nothing off
+    file.set_len(length.0)
 }
 
 /// Start a range's dirty pages for the device

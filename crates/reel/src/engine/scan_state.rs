@@ -110,12 +110,10 @@ pub const MOST_BATCH_RECORD: usize = 8 * 1024;
 pub const JOIN_GAP: u64 = 4 * 1024;
 
 /// Count the keys a scan's next batch locates: the told rows it still wants, the one asked for now among them, up to
-/// SCAN_BATCH_KEYS. A scan told no count starts at BATCH_KEYS and doubles with the rows it has taken, so a long one reaches
-/// SCAN_BATCH_KEYS and a short one locates no more than twice its rows and BATCH_KEYS past what it takes
+/// SCAN_BATCH_KEYS, and BATCH_KEYS for a scan told no count, as a get of many keys takes
 pub fn batch_room(wanted: u64, asked: u64) -> usize {
     if wanted == u64::MAX {
-        let taken = usize::try_from(asked).map_or(SCAN_BATCH_KEYS, |taken| taken.min(SCAN_BATCH_KEYS));
-        return taken.saturating_add(1).next_power_of_two().clamp(BATCH_KEYS, SCAN_BATCH_KEYS);
+        return BATCH_KEYS;
     }
     usize::try_from(wanted.saturating_sub(asked).saturating_add(1)).map_or(SCAN_BATCH_KEYS, |left| left.min(SCAN_BATCH_KEYS))
 }

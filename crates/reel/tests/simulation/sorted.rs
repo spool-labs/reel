@@ -2069,34 +2069,6 @@ fn hold_rebuilds_here(store: &Store) {
         volume.holds.rebuild.store(true, Ordering::Release);
     }
 }
-// a scan told no count starts at the small batch and doubles with the rows it takes: one that stops after 33 rows locates no
-// more than 96 keys from the index, one that takes 1,000 no more than 1,256, and both return the model's rows
-#[test]
-fn an_untold_scan_grows_its_batch_with_its_rows() {
-    let io = SimulatedIo::new(Seed(195));
-    let store = open(&io, CAPACITY);
-    let mut model = Model::new();
-    for number in 0..KEYS {
-        store.put(COLUMN, &key(number), format!("value-{number}").as_bytes()).expect("put");
-        model.insert(key(number), format!("value-{number}").into_bytes());
-    }
-    seal_all(&store, &io);
-    for (rows, most) in [(33_usize, 96_u64), (1_000, 1_256)] {
-        let before = report(&store).sorted_scan_keys;
-        let mut scan = store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan");
-        let (mut name, mut value) = (Vec::new(), Vec::new());
-        let mut taken = Vec::new();
-        while taken.len() < rows && scan.next_row(&mut name, &mut value).expect("step") == ScanStep::Found {
-            taken.push((name.clone(), value.clone()));
-        }
-        drop(scan);
-        let located = report(&store).sorted_scan_keys - before;
-        let expected: Rows = model.iter().take(rows).map(|(name, value)| (name.clone(), value.clone())).collect();
-        assert_eq!(taken, expected, "{rows} rows");
-        assert!(located <= most, "{rows} rows located {located} keys, past {most}");
-    }
-    store.close().expect("close");
-}
 
 // open a store whose index the store sizes from the keys it held, with no declared count
 fn open_sized(io: &SimulatedIo) -> Store {

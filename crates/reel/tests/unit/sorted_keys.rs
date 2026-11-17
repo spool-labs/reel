@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use reel::index::sorted_keys::{Floors, KeyBatch, KeyEntry, MOST_LOOKED, PAGE_BYTES, ScanFrom, SortedKeys, Upserted, planned_pages};
+use reel::index::sorted_keys::{Floors, KeyBatch, KeyEntry, MOST_LOOKED, ScanFrom, SortedKeys, Upserted};
 use reel::segment::segment_tail::SegmentNumber;
 use reel_core::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
@@ -448,57 +448,3 @@ fn planned_bytes_match_the_built_index() {
     }
 }
 
-// an index carried into a pool of exactly its saved pages, from a larger one: every free page can be taken, freed and taken
-// again, and the index checks at each step
-fn carried_into_its_saved_pages(is_freed: bool) {
-    let saved_from = SortedKeys::new(16, RowCount(100_000));
-    // keys go in until the pages taken match a pool size a row count gives, past every part's own page
-    let sizes: std::collections::BTreeMap<u32, u64> = (1..100_000).rev().map(|rows| (planned_pages(16, RowCount(rows)), rows)).collect();
-    let mut key = 0;
-    while key < 20_000 || !sizes.contains_key(&saved_from.high_water()) {
-        assert_eq!(saved_from.upsert(&ordered_key(key), entry(key + 1, false), Floors::at(WritePlace(0))), Upserted::Added);
-        key += 1;
-    }
-    if is_freed {
-        saved_from.remove_covered(&ordered_key(0), &ordered_key(key / 2), WritePlace(1_000_000));
-    }
-    let head = saved_from.image_head();
-    assert!(head.pages > head.saved, "the saved pool has pristine pages left");
-    let rows = sizes[&head.saved];
-    let index = SortedKeys::new(16, RowCount(rows));
-    assert_eq!(index.page_count(), head.saved);
-    let mut page = [0; PAGE_BYTES];
-    for number in 0..head.saved {
-        saved_from.page_bytes(number, &mut page);
-        index.fill_page(number, &page);
-    }
-    index.finish_image(&head);
-    assert_eq!(index.check(), Ok(()));
-    // take every free page, give some back, and take them again
-    let mut key = key + 10_000;
-    let first = key;
-    while index.upsert(&ordered_key(key), entry(key + 1, false), Floors::at(WritePlace(0))) != Upserted::NoRoom {
-        key += 1;
-    }
-    // a split takes a leaf and the inner pages above it at once, so the last pages can stay free when none of them fits
-    assert!(index.free_pages() < 8, "{} pages free past the last row that fit", index.free_pages());
-    assert_eq!(index.check(), Ok(()));
-    index.remove_covered(&ordered_key(first), &ordered_key(key), WritePlace(1_000_000));
-    assert!(index.free_pages() > 0);
-    assert_eq!(index.check(), Ok(()));
-    let mut again = key + 10_000;
-    while index.upsert(&ordered_key(again), entry(again + 1, false), Floors::at(WritePlace(0))) != Upserted::NoRoom {
-        again += 1;
-    }
-    assert_eq!(index.check(), Ok(()));
-}
-
-#[test]
-fn an_image_into_its_saved_pages_with_freed_pages() {
-    carried_into_its_saved_pages(true);
-}
-
-#[test]
-fn an_image_into_its_saved_pages_with_none_freed() {
-    carried_into_its_saved_pages(false);
-}

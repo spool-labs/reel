@@ -71,6 +71,7 @@ impl<Backend: Io> EngineState<Backend> {
 
             let running = SyncRun { volume };
             let outcome = self.run_sync(volume);
+            self.data_syncs.fetch_add(1, Ordering::Relaxed);
             drop(running);
             let mut sync = hold(&volume.sync);
             sync.is_running = false;

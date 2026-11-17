@@ -388,7 +388,7 @@ fn declared_indexes_come_out_of_the_budget() {
     assert!(declared_sizing.record_share < plain_sizing.record_share);
 }
 
-// a sorted index asks for twice its keys with the headroom past them, at least the pages its image saved, and an empty one with
+// a sorted index asks for twice its keys with the headroom past them, and an empty one with
 // no least asks for its part
 #[test]
 fn a_sorted_index_asks_by_its_keys() {
@@ -396,11 +396,10 @@ fn a_sorted_index_asks_by_its_keys() {
     use reel::index::sorted_keys::planned_index_bytes;
     const HEADROOM: ByteCount = ByteCount(30 * 1024 * 1024);
 
-    assert_eq!(index_ask(16, 0, None, ByteCount(0), HEADROOM), IndexAsk::Part);
+    assert_eq!(index_ask(16, 0, None, HEADROOM), IndexAsk::Part);
     let grown = planned_index_bytes(16, RowCount(1_000_000 * INDEX_GROWTH)).0 + HEADROOM.0;
-    assert_eq!(index_ask(16, 1_000_000, None, ByteCount(0), HEADROOM), IndexAsk::Bytes(ByteCount(grown)));
-    assert_eq!(index_ask(16, 1_000_000, Some(RowCount(10_000_000)), ByteCount(0), HEADROOM), IndexAsk::Bytes(ByteCount(planned_index_bytes(16, RowCount(10_000_000)).0 + HEADROOM.0)));
-    assert_eq!(index_ask(16, 10, None, ByteCount(grown * 2), HEADROOM), IndexAsk::Bytes(ByteCount(grown * 2)));
+    assert_eq!(index_ask(16, 1_000_000, None, HEADROOM), IndexAsk::Bytes(ByteCount(grown)));
+    assert_eq!(index_ask(16, 1_000_000, Some(RowCount(10_000_000)), HEADROOM), IndexAsk::Bytes(ByteCount(planned_index_bytes(16, RowCount(10_000_000)).0 + HEADROOM.0)));
 }
 
 // the indexes get their asks while they fit the cap, each the same fraction of its ask past it, and an empty one its part
@@ -444,11 +443,10 @@ fn sorted_config(budget: u64, columns: u8) -> StoreConfig {
 fn an_all_sorted_store_gives_its_spot_share_to_the_indexes() {
     use reel::engine::reel_store::size_sorted_indexes;
 
-    let io = reel_sim::simulated_io::SimulatedIo::new(reel_sim::seeded_random::Seed(1));
     for budget in [512 * 1024 * 1024, 2_048 * 1024 * 1024] {
         let config = sorted_config(budget, 1);
         let before = store_sizing(&config, false, &[None]).expect("sizing");
-        let (after, sizes) = size_sorted_indexes(&io, &config, &before, &[]);
+        let (after, sizes) = size_sorted_indexes(&config, &before, &[]);
         let held: u64 = sizes.iter().flatten().map(|size| size.got.0).sum();
         assert_eq!(after.spot_share, ByteCount(0), "{budget} B");
         assert_eq!(after.segment_rows, before.segment_rows, "the write index keeps its share at {budget} B");
@@ -466,7 +464,6 @@ fn a_grant_under_the_pool_floor_builds_no_index() {
     use reel::engine::reel_store::size_sorted_indexes;
     use reel::index::sorted_keys::planned_index_bytes;
 
-    let io = reel_sim::simulated_io::SimulatedIo::new(reel_sim::seeded_random::Seed(2));
     let floor = planned_index_bytes(16, RowCount(1)).0;
     // the least budget a store of three sorted columns runs at
     let least = match store_sizing(&sorted_config(1 << 20, 3), false, &[None]) {
@@ -477,7 +474,7 @@ fn a_grant_under_the_pool_floor_builds_no_index() {
         let config = sorted_config(least, columns);
         let before = store_sizing(&config, false, &[None]).expect("sizing");
         let caches = before.spot_share.0 + before.cache_share.0 + before.record_share.0;
-        let (after, sizes) = size_sorted_indexes(&io, &config, &before, &[]);
+        let (after, sizes) = size_sorted_indexes(&config, &before, &[]);
         let built: Vec<_> = sizes.iter().flatten().collect();
         assert_eq!(built.len(), usize::from(columns));
         for size in &built {
@@ -494,7 +491,6 @@ fn a_grant_under_the_pool_floor_builds_no_index() {
 // with: the fixed parts may move a small store's sizes and never these
 #[test]
 fn large_stores_keep_their_sizes() {
-    use reel::PlainIo;
     use reel::engine::reel_store::{size_sorted_indexes, store_shape};
     use reel::engine::scan_state::{MOST_SCANS, planned_scan_bytes};
     const GIB: u64 = 1024 * 1024 * 1024;
@@ -518,7 +514,7 @@ fn large_stores_keep_their_sizes() {
         let sizing = store_sizing(&config, true, &[None]).expect("sizing");
         let shape = store_shape(&config, true, &[None]).with_workers_settled();
         let scans = MOST_SCANS as u64 * planned_scan_bytes(shape.widest_keys, shape.open_slots());
-        let (shared, sizes) = size_sorted_indexes(&PlainIo::new(), &config, &sizing, &[]);
+        let (shared, sizes) = size_sorted_indexes(&config, &sizing, &[]);
         let index = sizes[1].expect("a sorted column");
         found.push([
             sizing.segment_bytes.0,

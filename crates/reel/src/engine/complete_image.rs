@@ -47,15 +47,6 @@ pub struct ImageWriter<'file, File> {
 }
 
 impl ImageFiles {
-    /// Name a sorted column's image files and allocate the buffer
-    pub fn sorted(root: &Path, column: ColumnId) -> Self {
-        Self {
-            path: root.join(format!("sorted-{}.image", column.0)),
-            new_path: root.join(format!("sorted-{}.image.new", column.0)),
-            chunk: touched_zeroes(IMAGE_CHUNK_BYTES),
-        }
-    }
-
     /// Name a column's files and allocate the buffer
     pub fn new(root: &Path, column: ColumnId) -> Self {
         Self {
@@ -67,11 +58,6 @@ impl ImageFiles {
 }
 
 impl<'file, File: IoFile> ImageWriter<'file, File> {
-    /// Start an image at the file's first byte, through a caller's chunk
-    pub fn new(file: &'file File, chunk: &'file mut [u8]) -> Self {
-        Self { file, chunk, used: 0, at: 0, sum: RunningSum::new(), outcome: Ok(()) }
-    }
-
     /// Add one word, sending the chunk when it fills. The first failure stands
     pub fn put(&mut self, bytes: &[u8]) {
         self.chunk[self.used..self.used + bytes.len()].copy_from_slice(bytes);
@@ -102,8 +88,8 @@ impl<'file, File: IoFile> ImageWriter<'file, File> {
 }
 
 impl<Backend: Io> EngineState<Backend> {
-    /// Remove the images of columns that have no slot of that kind now: a column sorted last run and plain or complete now left
-    /// one, and nothing would ever read or remove it. The read point refuses such a file anyway, so this only gives the space back
+    /// Remove the images of columns that have no complete table now: a column complete last run and plain or sorted now left one,
+    /// and nothing would ever read or remove it. The read point refuses such a file anyway, so this only gives the space back
     pub fn remove_stale_images(&self) -> Result<()> {
         for volume in &self.volumes {
             let Some(root) = volume.roots.first() else {
@@ -120,7 +106,7 @@ impl<Backend: Io> EngineState<Backend> {
                     let held = |slot: &PathBuf| slot.file_name() == path.file_name();
                     held(&files.path) || held(&files.new_path)
                 });
-                let is_image = (name.starts_with("sorted-") || name.starts_with("complete-")) && (name.ends_with(".image") || name.ends_with(".image.new"));
+                let is_image = name.starts_with("complete-") && (name.ends_with(".image") || name.ends_with(".image.new"));
                 if is_image && !is_held {
                     match self.io.remove_file(&path) {
                         Ok(()) => has_removed = true,

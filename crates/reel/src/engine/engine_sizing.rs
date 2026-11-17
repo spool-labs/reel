@@ -597,14 +597,14 @@ pub enum IndexAsk {
     Part,
 }
 
-/// Work out a sorted index's ask: the keys it held at open times the growth with the headroom past them, at least its least
-/// rows, and never less than the pages its image saved, so the image loads
-pub fn index_ask(width: usize, keys: u64, least_rows: Option<RowCount>, saved: ByteCount, headroom: ByteCount) -> IndexAsk {
-    if keys == 0 && least_rows.is_none() && saved.0 == 0 {
+/// Work out a sorted index's ask: the keys it held at open times the growth with the headroom past them, and at least its least
+/// rows
+pub fn index_ask(width: usize, keys: u64, least_rows: Option<RowCount>, headroom: ByteCount) -> IndexAsk {
+    if keys == 0 && least_rows.is_none() {
         return IndexAsk::Part;
     }
     let rows = keys.saturating_mul(INDEX_GROWTH).max(least_rows.map_or(0, |least| least.0));
-    IndexAsk::Bytes(ByteCount((planned_index_bytes(width, RowCount(rows)).0 + headroom.0).max(saved.0)))
+    IndexAsk::Bytes(ByteCount(planned_index_bytes(width, RowCount(rows)).0 + headroom.0))
 }
 
 /// Read the sorted indexes' cap: the spot, block and record caches past the floor they keep

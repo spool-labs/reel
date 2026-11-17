@@ -3,6 +3,7 @@
 use std::ops::{Deref, DerefMut};
 use std::io::Result as IoResult;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use reel_core::column_id::ColumnId;
 use reel_core::store_error::StoreError;
@@ -370,6 +371,7 @@ impl<Backend: Io> EngineState<Backend> {
     /// Fill every sorted index from the row blocks of every segment, in any order, since the newest place wins and a grave stays
     /// while nothing is dropped at open. Then take out what each live cover hides. A block that can't be read damages its segment
     pub fn fill_sorted_indexes(&self) -> IoResult<()> {
+        let started = Instant::now();
         for (id, index) in self.sorted.iter().enumerate() {
             let (Some(index), Some(info)) = (index, self.columns[id]) else {
                 continue;
@@ -377,31 +379,28 @@ impl<Backend: Io> EngineState<Backend> {
             let column = ColumnId(id as u8);
             let volume_index = info.volume.0 as usize;
             let volume = &self.volumes[volume_index];
-            // a clean close's image holds every segment's entries, and one that doesn't match leaves the index empty to fill
-            if !self.take_sorted_image(volume, column, index)? {
-                let mut numbers = Vec::new();
-                volume.table.for_each_segment(|number, _root, _file| numbers.push(number));
-                let mut run = SortedRun::new(index.width());
-                for number in numbers {
-                    if !self.fill_sorted_segment(volume, (column, index), number, &mut run)? {
-                        // the rows past the unread block have no entry, so the index sends reads of this segment on to the footers,
-                        // and a marked index saves no image
-                        index.mark_from(number);
-                        self.damage_unread(volume_index, number);
-                    }
+            let mut numbers = Vec::new();
+            volume.table.for_each_segment(|number, _root, _file| numbers.push(number));
+            let mut run = SortedRun::new(index.width());
+            for number in numbers {
+                if !self.fill_sorted_segment(volume, (column, index), number, &mut run)? {
+                    // the rows past the unread block have no entry, so the index sends reads of this segment on to the footers
+                    index.mark_from(number);
+                    self.damage_unread(volume_index, number);
                 }
             }
-            // a cover loaded at open may be newer than the image, so the pass runs whichever way the index filled
             volume.covers.read().visit(|cover, start, end| {
                 if cover.column == column {
                     index.remove_covered(start, end, cover.place);
                 }
             });
         }
+        self.sorted_fill_ns.store(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX), Ordering::Relaxed);
         Ok(())
     }
 
-    /// Give one segment's rows of a sorted column their entries, a block at a time, and say whether every block read clean
+    /// Give one segment's rows of a sorted column their entries, a block at a time, and say whether every block read clean. The
+    /// blocks go through the reader with nothing added to the row cache, since no get or scan of a sorted column reads them
     pub fn fill_sorted_segment(
         &self,
         volume: &Volume<Backend>,
@@ -412,33 +411,35 @@ impl<Backend: Io> EngineState<Backend> {
         let (Some((first, count)), Some(pin)) = (volume.table.column_blocks(number, column), volume.table.pin(number)) else {
             return Ok(true);
         };
+        let caches = FooterCaches {
+            resident: &self.filter_arena,
+            filters: &self.filter_cache,
+            rows: &self.row_cache,
+        };
+        let place_base = WritePlace(pin.head.place_base.0);
         self.footer_readers.with(|reader| {
-            let mut key = Vec::with_capacity(index.width());
             for block_index in first..first + count {
                 let Some((entry, _replacement)) = volume.table.block_line(number, block_index) else {
                     return Ok(false);
                 };
-                let block_key = BlockKey { segment: number, offset: entry.block_offset };
-                let block = match in_place(reader.load_block(&InPlace, &pin.file, block_key, &entry, &self.row_cache)) {
-                    Ok(Some(block)) => block,
-                    Ok(None) => return Ok(false),
+                match in_place(reader.hold_block(&InPlace, &pin.file, (number, place_base), &entry, &caches)) {
+                    Ok(true) => {},
+                    Ok(false) => return Ok(false),
                     Err(error) if is_device_error(&error) => return Ok(false),
                     Err(error) => return Err(error),
-                };
-                let Some(mut walk) = RowBlockWalk::open(block, WritePlace(pin.head.place_base.0)) else {
-                    return Ok(false);
-                };
+                }
+                self.sorted_fill_bytes.fetch_add(entry.block_length().0, Ordering::Relaxed);
                 // a key's versions sort newest first, so its first row in the block is the one that can win
-                while let Some(row) = walk.next_row(&mut key) {
-                    if row.kind == RowKind::RangeDelete || run.is_last(&key) {
-                        continue;
+                reader.visit_loaded(&entry, place_base, |key, row| {
+                    if row.kind == RowKind::RangeDelete || run.is_last(key) {
+                        return;
                     }
                     if run.entries.len() == HOLD_ROWS {
                         index.upsert_many(&run.keys, &run.entries, Floors::at(WritePlace(0)), |_row, _upserted| {});
                         run.clear();
                     }
-                    run.push(column, &key, number, &row);
-                }
+                    run.push(column, key, number, row);
+                });
                 index.upsert_many(&run.keys, &run.entries, Floors::at(WritePlace(0)), |_row, _upserted| {});
                 run.clear();
             }

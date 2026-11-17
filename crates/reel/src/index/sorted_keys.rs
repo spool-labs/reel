@@ -100,23 +100,6 @@ pub struct PagePath {
     pub depth: usize,
 }
 
-/// Bytes of one page
-pub const PAGE_BYTES: usize = PAGE_WORDS * size_of::<u32>();
-
-/// What an image needs beside the pages to rebuild an index: the shape, the pages saved, the free chain, the count and each
-/// part's tree
-#[derive(Clone, Copy, Debug)]
-pub struct ImageHead {
-    pub width: usize,
-    pub pages: u32,
-    /// Pages below the highest one ever taken. The rest were never written and keep the chain a new pool has
-    pub saved: u32,
-    pub free_head: u32,
-    pub free_count: u32,
-    pub entries: u64,
-    pub parts: [PartTree; PARTS],
-}
-
 /// One part's tree
 #[derive(Clone, Copy, Debug)]
 pub struct PartTree {
@@ -175,7 +158,6 @@ pub struct SortedKeys {
     past_capacity: AtomicU64,
     /// One past the highest page ever taken. Pages are chained in order at build and taken from the head, so every page at or
     /// past this one still holds the chain the build wrote
-    high_water: AtomicU32,
     /// The rows the column was told to hold, which sized the pool
     told_rows: RowCount,
 }
@@ -303,7 +285,6 @@ impl SortedKeys {
             mark: AtomicU64::new(NO_MARK),
             past_capacity: AtomicU64::new(0),
             told_rows: rows,
-            high_water: AtomicU32::new(0),
         }
         .chained()
     }
@@ -316,89 +297,6 @@ impl SortedKeys {
             self.store(page, 1, next);
         }
         self
-    }
-
-    /// Read the words that let an image rebuild the index: the shape, the pages in use, the free chain, the count and each part's
-    /// tree
-    pub fn image_head(&self) -> ImageHead {
-        let free = hold(&self.free);
-        let mut parts = [PartTree::empty(); PARTS];
-        for (part, tree) in parts.iter_mut().enumerate() {
-            *tree = *self.parts.read(part);
-        }
-        ImageHead {
-            width: self.width,
-            pages: self.page_count(),
-            saved: self.high_water.load(Memory::Acquire),
-            free_head: free.head,
-            free_count: free.count,
-            entries: self.entries.load(Memory::Acquire),
-            parts,
-        }
-    }
-
-    /// Copy one page's words out as little-endian bytes
-    pub fn page_bytes(&self, page: u32, bytes: &mut [u8; PAGE_BYTES]) {
-        let base = page as usize * PAGE_WORDS;
-        for (word, out) in self.words[base..base + PAGE_WORDS].iter().zip(bytes.chunks_exact_mut(size_of::<u32>())) {
-            out.copy_from_slice(&word.load(Memory::Relaxed).to_le_bytes());
-        }
-    }
-
-    /// Write one page's words from an image's bytes
-    pub fn fill_page(&self, page: u32, bytes: &[u8]) {
-        let base = page as usize * PAGE_WORDS;
-        for (word, from) in self.words[base..base + PAGE_WORDS].iter().zip(bytes.chunks_exact(size_of::<u32>())) {
-            word.store(u32::from_le_bytes([from[0], from[1], from[2], from[3]]), Memory::Relaxed);
-        }
-    }
-
-    /// Take an image's head into a pool of any size that holds its saved pages. Pages past the saved ones were never taken, so
-    /// the saved chain reaches them through the first of them, and they keep this pool's own chain. A pool larger than a full
-    /// saved one gets its extra pages linked ahead of the saved chain, which never reached them
-    pub fn finish_image(&self, head: &ImageHead) {
-        let mut free = hold(&self.free);
-        let pages = self.page_count();
-        let is_full_below = head.saved == head.pages && pages > head.pages;
-        if is_full_below {
-            self.store(pages - 1, 1, head.free_head);
-        }
-        free.head = if is_full_below { head.pages } else { head.free_head };
-        free.count = (i64::from(head.free_count) + i64::from(pages) - i64::from(head.pages)) as u32;
-        for (part, tree) in head.parts.iter().enumerate() {
-            *self.parts.write(part) = *tree;
-            self.filled[part].store(tree.entries, Memory::Release);
-        }
-        self.entries.store(head.entries, Memory::Release);
-        self.high_water.store(head.saved, Memory::Release);
-    }
-
-    /// Empty the index as a new one starts, its chain written again over pages an image may have filled
-    pub fn reset(&self) {
-        for part in 0..PARTS {
-            *self.parts.write(part) = PartTree::empty();
-            self.filled[part].store(0, Memory::Release);
-        }
-        let mut free = hold(&self.free);
-        *free = chain_pages(self.page_count());
-        for page in 0..free.count {
-            let next = if page + 1 == free.count { NO_PAGE } else { page + 1 };
-            self.store(page, 1, next);
-        }
-        self.entries.store(0, Memory::Release);
-        self.mark.store(NO_MARK, Memory::Release);
-        self.past_capacity.store(0, Memory::Release);
-        self.high_water.store(0, Memory::Release);
-    }
-
-    /// Read one past the highest page the index ever took
-    pub fn high_water(&self) -> u32 {
-        self.high_water.load(Memory::Acquire)
-    }
-
-    /// Check the index took no page and no entry since its build, so an image's free chain meets only the chain the build wrote
-    pub fn is_pristine(&self) -> bool {
-        self.entries.load(Memory::Acquire) == 0 && self.high_water.load(Memory::Acquire) == 0
     }
 
     /// Read the width of the index's keys
@@ -1358,7 +1256,6 @@ impl SortedKeys {
         for page in pages.iter_mut() {
             *page = free.head;
             free.head = self.load(free.head, 1);
-            self.high_water.fetch_max(*page + 1, Memory::Relaxed);
         }
         free.count -= pages.len() as u32;
         true

@@ -173,12 +173,11 @@ pub struct EngineState<Backend: Io> {
     pub sorted_runs: AtomicU64,
     /// Row blocks a merge's install couldn't read to move sorted entries, whose keys ask the footers once the inputs go
     pub sorted_moves_missed: AtomicU64,
-    /// Sorted images open took and refused, and the bytes closes saved
-    pub sorted_images_taken: AtomicU64,
-    pub sorted_images_refused: AtomicU64,
-    pub sorted_image_bytes: AtomicU64,
-    /// Sorted image saves a close gave up on, which cost the next open its fast fill
-    pub sorted_image_saves_failed: AtomicU64,
+    /// Time and footer bytes the open's fill of the sorted indexes took
+    pub sorted_fill_ns: AtomicU64,
+    pub sorted_fill_bytes: AtomicU64,
+    /// Syncs of the volumes' records, the row job's and a writer's own
+    pub data_syncs: AtomicU64,
     /// Caller operations, so maintenance can tell callers are busy
     pub caller_ops: CallerCounts,
     /// The line writers wait on, shared with every volume

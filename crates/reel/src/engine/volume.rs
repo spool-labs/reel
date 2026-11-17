@@ -223,8 +223,6 @@ pub struct TestHolds {
     pub lose_bits: AtomicBool,
     /// Picks read every segment's filters as missing from the arena
     pub filters_out: AtomicBool,
-    /// A close's sorted image save fails once its file is created and before anything is written to it
-    pub sorted_image_fails: AtomicBool,
 }
 
 /// One volume of a store

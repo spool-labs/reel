@@ -67,8 +67,7 @@ use crate::index::open_slots::OpenSlot;
 use crate::engine::complete_image::ImageFiles;
 use crate::index::complete_table::CompleteTable;
 use crate::index::complete_table::planned_table_bytes;
-use crate::index::sorted_keys::{MOST_KEY_BYTES, PAGE_BYTES as SORTED_PAGE_BYTES, SortedKeys, planned_index_bytes, rows_for_bytes};
-use crate::engine::sorted_image::sorted_image_size;
+use crate::index::sorted_keys::{MOST_KEY_BYTES, SortedKeys, planned_index_bytes, rows_for_bytes};
 use crate::index::spot_index::SpotIndex;
 use crate::index::write_index::WriteIndex;
 use crate::io::lock_outcome::LockOutcome;
@@ -143,7 +142,7 @@ impl<Backend: Io> ReelStore<Backend> {
         // the pools are built and touched here and as the jobs start, and open reports that time apart
         let touched_from = io.now();
         // the sorted indexes take their room from the caches before anything is built, by the keys they held at open
-        let (sizing, sorted_sizes) = size_sorted_indexes(&io, config, &sizing, &summaries);
+        let (sizing, sorted_sizes) = size_sorted_indexes(config, &sizing, &summaries);
         let mut state = build_state(OpenInputs { io, config, sizing: &sizing, disks: &disks, superblock, locks, scan: &scan, summaries });
         state.complete = complete_tables(config);
         state.sorted = sorted_indexes(config, &sorted_sizes);
@@ -491,7 +490,7 @@ impl<Backend: Io> ReelStore<Backend> {
 
     /// Seal every open segment, wait for the seals, and close. A finished store holds sealed segments alone: no open segment, no
     /// rows file, no room reserved past a segment's end and no spare made ahead, so a copy of its files opens anywhere, read-only
-    /// as well. Its complete and sorted images are saved as close saves them, and a read-only open reads them and removes none.
+    /// as well. Its complete tables' images are saved as close saves them, and a read-only open reads them and removes none.
     /// The caller stops its writers first, since a write that lands after the last look leaves a segment open. A seal that waits
     /// for room on a full disk returns the error and leaves the store open, so a finish after room comes back completes it
     pub fn finish(&self) -> Result<(), StoreError> {
@@ -575,7 +574,6 @@ impl<Backend: Io> ReelStore<Backend> {
             // an image only saves the next open time, so one that fails costs that and no more
             if !volume.has_failed() {
                 let _saved = self.state.save_images(volume.id.0 as usize);
-                let _saved = self.state.save_sorted_images(volume.id.0 as usize);
             }
             outcome = outcome.and(self.state.drop_prepared(volume).map_err(open_error("removing a spare segment")));
             self.state.close_volume(volume);
@@ -1501,10 +1499,9 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         sorted_scan_keys: AtomicU64::new(0),
         sorted_runs: AtomicU64::new(0),
         sorted_moves_missed: AtomicU64::new(0),
-        sorted_images_taken: AtomicU64::new(0),
-        sorted_images_refused: AtomicU64::new(0),
-        sorted_image_bytes: AtomicU64::new(0),
-        sorted_image_saves_failed: AtomicU64::new(0),
+        sorted_fill_ns: AtomicU64::new(0),
+        sorted_fill_bytes: AtomicU64::new(0),
+        data_syncs: AtomicU64::new(0),
         caller_ops: CallerCounts::default(),
         progress,
         is_arena_full: AtomicBool::new(false),
@@ -1801,9 +1798,10 @@ pub struct SortedSize {
     pub rows: RowCount,
 }
 
-/// Size each sorted column's index from the keys it held at open: its image's entries, or else its rows on disk. The indexes
-/// share the spot, block and record caches past their floor, and the caches give up what the indexes take
-pub fn size_sorted_indexes<Backend: Io>(io: &Backend, config: &StoreConfig, sizing: &EngineSizing, summaries: &[SummaryFound]) -> (EngineSizing, Vec<Option<SortedSize>>) {
+/// Size each sorted column's index from the keys it held at open: its rows on disk, every row counted, since a dead row counted
+/// costs room and a live row missed costs keys. The indexes share the spot, block and record caches past their floor, and the
+/// caches give up what the indexes take
+pub fn size_sorted_indexes(config: &StoreConfig, sizing: &EngineSizing, summaries: &[SummaryFound]) -> (EngineSizing, Vec<Option<SortedSize>>) {
     let mut rows_on_disk = [0_u64; MAX_COLUMNS];
     for summary in summaries {
         for row in summary.rows.rows() {
@@ -1833,10 +1831,7 @@ pub fn size_sorted_indexes<Backend: Io>(io: &Backend, config: &StoreConfig, sizi
             if is_index_exact() {
                 return IndexAsk::Bytes(planned_index_bytes(width, least.unwrap_or(RowCount(0))));
             }
-            let image = config.volumes[column.volume.0 as usize].roots.first().and_then(|root| sorted_image_size(io, root, column.id));
-            let keys = image.map_or(rows_on_disk[column.id.0 as usize], |(entries, _saved)| entries);
-            let saved = ByteCount(image.map_or(0, |(_entries, saved)| u64::from(saved) * SORTED_PAGE_BYTES as u64));
-            index_ask(width, keys, least, saved, headroom)
+            index_ask(width, rows_on_disk[column.id.0 as usize], least, headroom)
         })
         .collect();
     // an exact index asks for what it declared, and past the cap it gets its share as any index does
@@ -1880,13 +1875,12 @@ pub fn sorted_indexes(config: &StoreConfig, sizes: &[Option<SortedSize>]) -> Vec
     indexes
 }
 
-/// Name each complete and each sorted column's image files and allocate its buffer. A column is never both kinds
+/// Name each complete column's image files and allocate its buffer
 pub fn complete_images(config: &StoreConfig) -> Vec<Option<Mutex<ImageFiles>>> {
     let mut images: Vec<Option<Mutex<ImageFiles>>> = (0..MAX_COLUMNS).map(|_column| None).collect();
-    for column in config.columns.iter().filter(|column| column.complete_rows().is_some() || column.is_sorted()) {
+    for column in config.columns.iter().filter(|column| column.complete_rows().is_some()) {
         if let Some(root) = config.volumes[column.volume.0 as usize].roots.first() {
-            let files = if column.is_sorted() { ImageFiles::sorted(root, column.id) } else { ImageFiles::new(root, column.id) };
-            images[column.id.0 as usize] = Some(Mutex::new(files));
+            images[column.id.0 as usize] = Some(Mutex::new(ImageFiles::new(root, column.id)));
         }
     }
     images

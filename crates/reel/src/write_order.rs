@@ -7,6 +7,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use reel_core::units::{RowCount, WritePlace};
 
 use crate::guard::hold;
+use crate::pool::touched_filled;
 
 /// How many times a writer checks the mark before it sleeps: the writers ahead are usually a write call from done,
 /// and a sleep costs both sides a system call
@@ -114,8 +115,9 @@ impl WriteOrder {
         let order = Self {
             places,
             ring: Mutex::new(TicketRing {
-                is_in_flight: vec![false; MOST_IN_FLIGHT],
-                ends: vec![WritePlace(0); MOST_IN_FLIGHT],
+                // zeros filled straight into a list come back as a zeroed allocation no page of which open has touched
+                is_in_flight: touched_filled(MOST_IN_FLIGHT, false),
+                ends: touched_filled(MOST_IN_FLIGHT, WritePlace(0)),
                 head: 0,
                 tail: 0,
                 waiters: 0,

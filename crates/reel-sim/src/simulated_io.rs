@@ -587,6 +587,17 @@ impl Io for SimulatedIo {
         ByteCount(0)
     }
 
+    fn run_units(&self, _threads: usize, units: usize, unit: &(dyn Fn(usize) + Sync)) {
+        // one thread drives a simulation, so the units run here, in an order the seed draws
+        let mut order: Vec<usize> = (0..units).collect();
+        for at in (1..units).rev() {
+            order.swap(at, self.draw(at as u64 + 1) as usize);
+        }
+        for index in order {
+            unit(index);
+        }
+    }
+
     fn spawn_job<Work: Job>(&self, name: &'static str, job: Work) -> Result<SimulatedTask> {
         let process = hold(&self.disk).process;
         let mut slots = hold(&self.slots);

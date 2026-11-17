@@ -400,4 +400,13 @@ pub trait Io: Clone + Send + Sync + 'static {
 
     /// Read the stack a job's thread holds, which memory_report shows
     fn job_stack_bytes(&self) -> ByteCount;
+
+    /// Run each of open's units once, on up to this many threads. The units may run in any order and at once, so each must
+    /// give the same result whatever ran before it or beside it. Here they run on the caller's thread in order
+    fn run_units(&self, threads: usize, units: usize, unit: &(dyn Fn(usize) + Sync)) {
+        let _threads = threads;
+        for index in 0..units {
+            unit(index);
+        }
+    }
 }

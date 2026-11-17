@@ -10,6 +10,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread::{self, Builder};
 use std::time::{Duration, Instant};
@@ -246,6 +247,30 @@ impl Io for PlainIo {
 
     fn job_stack_bytes(&self) -> ByteCount {
         JOB_STACK_BYTES
+    }
+
+    fn run_units(&self, threads: usize, units: usize, unit: &(dyn Fn(usize) + Sync)) {
+        let threads = threads.min(units);
+        if threads <= 1 {
+            (0..units).for_each(unit);
+            return;
+        }
+        // each thread takes the next unit as it frees up, so a slow unit holds up its own thread alone
+        let next = AtomicUsize::new(0);
+        let take = || loop {
+            let index = next.fetch_add(1, Ordering::Relaxed);
+            if index >= units {
+                return;
+            }
+            unit(index);
+        };
+        thread::scope(|scope| {
+            for _thread in 1..threads {
+                // a thread that can't start leaves its units to the others, the caller among them
+                let _spawned = Builder::new().name("reel-fill".to_string()).stack_size(JOB_STACK_BYTES.0 as usize).spawn_scoped(scope, take);
+            }
+            take();
+        });
     }
 
     fn spawn_worker<Work: Job>(&self, name: &'static str, job: Work) -> Result<(PlainTask, WorkerPriority)> {

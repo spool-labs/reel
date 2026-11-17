@@ -2,8 +2,8 @@
 
 use std::ops::{Deref, DerefMut};
 use std::io::Result as IoResult;
-use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::sync::Mutex; use std::sync::atomic::Ordering;
+use std::mem;
 
 use reel_core::column_id::ColumnId;
 use reel_core::store_error::StoreError;
@@ -368,10 +368,13 @@ impl<Backend: Io> EngineState<Backend> {
         Ok(())
     }
 
-    /// Fill every sorted index from the row blocks of every segment, in any order, since the newest place wins and a grave stays
-    /// while nothing is dropped at open. Then take out what each live cover hides. A block that can't be read damages its segment
+    /// Fill every sorted index from the row blocks of every segment, in any order and on as many threads as the store keeps
+    /// workers, since the newest place wins and a grave stays while nothing is dropped at open. Then take out what each live cover
+    /// hides. A block that can't be read damages its segment
     pub fn fill_sorted_indexes(&self) -> IoResult<()> {
-        let started = Instant::now();
+        let started = self.io.now();
+        // a thread for each worker, and the opening thread alone in a store with none
+        let threads = self.sizing.workers.max(1);
         for (id, index) in self.sorted.iter().enumerate() {
             let (Some(index), Some(info)) = (index, self.columns[id]) else {
                 continue;
@@ -381,13 +384,33 @@ impl<Backend: Io> EngineState<Backend> {
             let volume = &self.volumes[volume_index];
             let mut numbers = Vec::new();
             volume.table.for_each_segment(|number, _root, _file| numbers.push(number));
-            let mut run = SortedRun::new(index.width());
-            for number in numbers {
-                if !self.fill_sorted_segment(volume, (column, index), number, &mut run)? {
-                    // the rows past the unread block have no entry, so the index sends reads of this segment on to the footers
-                    index.mark_from(number);
-                    self.damage_unread(volume_index, number);
+            // each segment's blocks split into a piece for each thread, and the units hand out one segment's pieces in turn, so
+            // threads at work at once read different key ranges and take different parts' locks
+            let failed = Mutex::new(Vec::new());
+            let error = Mutex::new(None);
+            self.io.run_units(threads, numbers.len() * threads, &|unit| {
+                if hold(&error).is_some() {
+                    return;
                 }
+                let number = numbers[unit / threads];
+                match self.fill_sorted_piece(volume, (column, index), number, (unit % threads, threads)) {
+                    Ok(true) => {},
+                    Ok(false) => hold(&failed).push(number),
+                    Err(fault) => {
+                        hold(&error).get_or_insert(fault);
+                    },
+                }
+            });
+            if let Some(fault) = hold(&error).take() {
+                return Err(fault);
+            }
+            let mut failed = mem::take(&mut *hold(&failed));
+            failed.sort_unstable();
+            failed.dedup();
+            for number in failed {
+                // the rows past the unread block have no entry, so the index sends reads of this segment on to the footers
+                index.mark_from(number);
+                self.damage_unread(volume_index, number);
             }
             volume.covers.read().visit(|cover, start, end| {
                 if cover.column == column {
@@ -395,30 +418,33 @@ impl<Backend: Io> EngineState<Backend> {
                 }
             });
         }
-        self.sorted_fill_ns.store(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX), Ordering::Relaxed);
+        self.sorted_fill_ns.store(self.io.now().0.saturating_sub(started.0), Ordering::Relaxed);
         Ok(())
     }
 
-    /// Give one segment's rows of a sorted column their entries, a block at a time, and say whether every block read clean. The
-    /// blocks go through the reader with nothing added to the row cache, since no get or scan of a sorted column reads them
-    pub fn fill_sorted_segment(
+    /// Give one piece of a segment's blocks of a sorted column their entries, a block at a time, and say whether every block read
+    /// clean. The blocks go through a job's reader with nothing added to the row cache, since no get or scan of a sorted column
+    /// reads them
+    pub fn fill_sorted_piece(
         &self,
         volume: &Volume<Backend>,
         (column, index): (ColumnId, &SortedKeys),
         number: SegmentNumber,
-        run: &mut SortedRun,
+        (piece, pieces): (usize, usize),
     ) -> IoResult<bool> {
         let (Some((first, count)), Some(pin)) = (volume.table.column_blocks(number, column), volume.table.pin(number)) else {
             return Ok(true);
         };
+        let (start, end) = (first + count * piece as u32 / pieces as u32, first + count * (piece as u32 + 1) / pieces as u32);
         let caches = FooterCaches {
             resident: &self.filter_arena,
             filters: &self.filter_cache,
             rows: &self.row_cache,
         };
         let place_base = WritePlace(pin.head.place_base.0);
-        self.footer_readers.with(|reader| {
-            for block_index in first..first + count {
+        let mut run = SortedRun::new(index.width());
+        self.job_footer_readers.with(|reader| {
+            for block_index in start..end {
                 let Some((entry, _replacement)) = volume.table.block_line(number, block_index) else {
                     return Ok(false);
                 };
@@ -446,6 +472,7 @@ impl<Backend: Io> EngineState<Backend> {
             Ok(true)
         })
     }
+
 
     /// Point the sorted entries of a merge output's rows at it, each where the entry is that row. The install calls this once the
     /// output is listed and before the inputs retire, so an entry points at a listed segment at every moment. The blocks go through

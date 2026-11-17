@@ -1,5 +1,5 @@
 //! How long a long batch holds a writing turn, the time another writer's rows would wait on a shared segment.
-//! Run with `cargo run --release -p reel --example turn_hold -- <budget MiB> <key bytes> <row share %> [root]`
+//! Run with `cargo run --release -p tape-reel --example turn_hold -- <budget MiB> <key bytes> <row share %> [root]`
 #![allow(clippy::expect_used, clippy::print_stdout)]
 
 use std::env;

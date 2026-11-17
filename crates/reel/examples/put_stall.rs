@@ -1,5 +1,5 @@
 //! The slowest small put at a thread count, and how often and how long writers waited for the write index.
-//! Run with `cargo run --release -p reel --example put_stall -- <budget MiB> <threads> <seconds> [root]`
+//! Run with `cargo run --release -p tape-reel --example put_stall -- <budget MiB> <threads> <seconds> [root]`
 #![allow(clippy::expect_used, clippy::print_stdout)]
 
 use std::env;

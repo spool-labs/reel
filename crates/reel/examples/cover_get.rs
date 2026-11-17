@@ -1,5 +1,5 @@
 //! What the cover check adds to a get, with the pool empty, with one cover and with the pool full.
-//! Run with `cargo run --release -p reel --example cover_get`
+//! Run with `cargo run --release -p tape-reel --example cover_get`
 #![allow(clippy::print_stdout)]
 
 use std::hint::black_box;

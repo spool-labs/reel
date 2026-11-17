@@ -6,6 +6,7 @@ license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 description = "The types tape-reel takes and gives: column ids, units, batches, reports and errors"
+readme = "README.md"
 
 [lib]
 name = "reel_core"

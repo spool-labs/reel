@@ -32,7 +32,9 @@ pub trait Store: Reads {
     /// Write a grave without reading any device
     fn delete(&self, column: ColumnId, key: &[u8]) -> Result<(), StoreError>;
 
-    /// Remove every key in [start, end) written before this call
+   
+    /// Remove every key in [start, end) written before this call. On a column of fixed-width keys both bounds are whole keys of
+    /// that width, and a shorter one is refused with KeyWidth
     fn delete_range(&self, column: ColumnId, start: &[u8], end: &[u8]) -> Result<(), StoreError>;
 
     /// Apply a batch whole, in batch order

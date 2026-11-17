@@ -84,7 +84,9 @@ impl WriteBatch {
         self.push(BatchKind::Delete, column, key, &[]);
     }
 
-    /// Add a range delete of [start, end)
+   
+    /// Add a range delete of [start, end). On a column of fixed-width keys both bounds are whole keys of that width, and the batch
+    /// is refused with KeyWidth when one is shorter
     pub fn delete_range(&mut self, column: ColumnId, start: &[u8], end: &[u8]) {
         self.push(BatchKind::DeleteRange, column, start, end);
     }

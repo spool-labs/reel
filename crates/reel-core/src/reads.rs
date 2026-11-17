@@ -41,10 +41,10 @@ pub trait Reads: Send + Sync {
     /// Check whether the key has a value, without reading the value
     fn contains(&self, column: ColumnId, key: &[u8]) -> Result<bool, StoreError>;
 
-    /// Walk rows from a key
+    /// Walk rows from a key. The start can be any length, a prefix included, and compares byte by byte with the keys
     fn iter_from(&self, column: ColumnId, start: &[u8], direction: Direction) -> Result<Self::Rows, StoreError>;
 
-    /// Walk rows in [start, end)
+    /// Walk rows in [start, end). Either bound can be any length and compares byte by byte with the keys
     fn iter_range(
         &self,
         column: ColumnId,
@@ -74,7 +74,7 @@ pub trait Reads: Send + Sync {
     /// Count the keys under a prefix, reading no values
     fn count_prefix(&self, column: ColumnId, prefix: &[u8]) -> Result<RowCount, StoreError>;
 
-    /// Add up the value bytes under a prefix, reading no values
+    /// Add up the bytes the records under a prefix take on disk, each head and its coding included, reading no values
     fn bytes_prefix(&self, column: ColumnId, prefix: &[u8]) -> Result<ByteCount, StoreError>;
 
     /// Run a get without blocking the caller's runtime thread

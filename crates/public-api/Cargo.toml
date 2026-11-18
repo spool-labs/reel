@@ -10,5 +10,8 @@ description = "Opens a store through tape-reel's public surface alone, as an out
 reel.workspace = true
 reel-core.workspace = true
 
+[dev-dependencies]
+libc.workspace = true
+
 [lints]
 workspace = true

@@ -194,8 +194,12 @@ fn roots_in_another_order_read_right() -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-// every file under a directory, with its length and the bytes the disk holds for it
-fn files_under(root: &std::path::Path, found: &mut Vec<(PathBuf, u64, u64)>) -> std::io::Result<()> {
+// a file's path, its length, the bytes the disk holds for it, and the bytes it holds past its end
+type FileRow = (PathBuf, u64, u64, u64);
+
+
+// every file under a directory, with its length, the bytes the disk holds for it, and the bytes it holds past its end
+fn files_under(root: &std::path::Path, found: &mut Vec<FileRow>) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
@@ -203,7 +207,7 @@ fn files_under(root: &std::path::Path, found: &mut Vec<(PathBuf, u64, u64)>) -> 
         if metadata.is_dir() {
             files_under(&entry.path(), found)?;
         } else {
-            found.push((entry.path(), metadata.len(), metadata.blocks() * 512));
+            found.push((entry.path(), metadata.len(), metadata.blocks() * 512, held_past_end(&entry.path())?));
         }
     }
     Ok(())
@@ -224,12 +228,12 @@ fn a_finished_store_holds_sealed_segments_alone() -> Result<(), Box<dyn std::err
     drop(store);
     let mut files = Vec::new();
     files_under(&root, &mut files)?;
-    for (path, length, held) in &files {
-        println!("{} {length} B long, {held} B held", path.display());
+    for (path, length, held, past) in &files {
+        println!("{} {length} B long, {held} B held, {past} B past its end", path.display());
     }
-    assert!(files.iter().all(|(path, _length, _held)| !path.to_string_lossy().ends_with(".rows")), "{files:?}");
-    // no room past a file's end: the disk holds the file's length, rounded to its blocks
-    assert!(files.iter().all(|(_path, length, held)| *held <= length.next_multiple_of(4_096)), "{files:?}");
+    assert!(files.iter().all(|(path, _length, _held, _past)| !path.to_string_lossy().ends_with(".rows")), "{files:?}");
+    // no room past a file's end: the disk holds nothing past the file's length, rounded to its blocks
+    assert!(files.iter().all(|(_path, _length, _held, past)| *past == 0), "{files:?}");
     let copy = root.with_extension("finished-copy");
     let _gone = std::fs::remove_dir_all(&copy);
     copy_tree(&root, &copy)?;
@@ -288,12 +292,12 @@ fn a_sealed_segment_holds_no_room_past_its_end() -> Result<(), Box<dyn std::erro
     drop(store);
     let mut files = Vec::new();
     files_under(&root, &mut files)?;
-    let segments: Vec<_> = files.iter().filter(|(path, _length, _held)| path.to_string_lossy().ends_with(".data")).collect();
-    for (path, length, held) in &segments {
-        println!("{} {length} B long, {held} B held", path.display());
+    let segments: Vec<_> = files.iter().filter(|(path, _length, _held, _past)| path.to_string_lossy().ends_with(".data")).collect();
+    for (path, length, held, past) in &segments {
+        println!("{} {length} B long, {held} B held, {past} B past its end", path.display());
     }
-    assert!(segments.iter().any(|(_path, length, _held)| *length > 8 * 1024 * 1024), "no segment passed one step: {segments:?}");
-    assert!(segments.iter().all(|(_path, length, held)| *held <= length.next_multiple_of(4_096)), "{segments:?}");
+    assert!(segments.iter().any(|(_path, length, _held, _past)| *length > 8 * 1024 * 1024), "no segment passed one step: {segments:?}");
+    assert!(segments.iter().all(|(_path, _length, _held, past)| *past == 0), "{segments:?}");
     std::fs::remove_dir_all(&root)?;
     Ok(())
 }
@@ -309,23 +313,32 @@ fn segments_sealed_by_filling_hold_no_room_past_their_ends() -> Result<(), Box<d
     for number in 0..4_000_u32 {
         store.put(COLUMN, format!("key-{number:05}").as_bytes(), &value)?;
     }
+    // close stops the jobs and leaves a filled segment whose seal hasn't finished for the next open, and finish is the call that
+    // seals them all, so the test waits for a seal before it closes. A slow disk takes longer over one. The mix test below holds the
+    // shape that kept blocks past a segment's end
+    let sealed_files = |root: &std::path::Path| -> std::io::Result<(Vec<FileRow>, Vec<FileRow>)> {
+        let mut files = Vec::new();
+        files_under(root, &mut files)?;
+        let rows: Vec<String> = files.iter().filter_map(|(path, _length, _held, _past)| path.to_string_lossy().strip_suffix(".rows").map(str::to_string)).collect();
+        let sealed = files
+            .iter()
+            .filter(|(path, _length, _held, _past)| path.to_string_lossy().strip_suffix(".data").is_some_and(|stem| !rows.iter().any(|open| open == stem)))
+            .cloned()
+            .collect();
+        Ok((files, sealed))
+    };
+    let waited = std::time::Instant::now();
+    while sealed_files(&root)?.1.is_empty() && waited.elapsed() < std::time::Duration::from_secs(60) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     store.close()?;
     drop(store);
-    let mut files = Vec::new();
-    files_under(&root, &mut files)?;
-    let rows: Vec<String> = files.iter().filter_map(|(path, _length, _held)| path.to_string_lossy().strip_suffix(".rows").map(str::to_string)).collect();
-    let sealed: Vec<_> = files
-        .iter()
-        .filter(|(path, _length, _held)| path.to_string_lossy().strip_suffix(".data").is_some_and(|stem| !rows.iter().any(|open| open == stem)))
-        .collect();
-    for (path, length, held) in &sealed {
-        println!("{} {length} B long, {held} B held", path.display());
+    let (files, sealed) = sealed_files(&root)?;
+    for (path, length, held, past) in &sealed {
+        println!("{} {length} B long, {held} B held, {past} B past its end", path.display());
     }
-    // close stops the jobs and leaves a filled segment whose seal hasn't finished for the next open, and finish is the call that
-    // seals them all, so one sealed segment is what close promises here. The mix test below holds the shape that kept blocks past a
-    // segment's end
-    assert!(!sealed.is_empty(), "no segment sealed: {files:?}");
-    assert!(sealed.iter().all(|(_path, length, held)| *held <= length.next_multiple_of(4_096)), "{sealed:?}");
+    assert!(!sealed.is_empty(), "no segment sealed in a minute: {files:?}");
+    assert!(sealed.iter().all(|(_path, _length, _held, past)| *past == 0), "{sealed:?}");
     std::fs::remove_dir_all(&root)?;
     Ok(())
 }
@@ -360,7 +373,7 @@ fn segments_filled_by_a_mix_hold_no_room_past_their_ends() -> Result<(), Box<dyn
     drop(store);
     let mut files = Vec::new();
     files_under(&root, &mut files)?;
-    let past: Vec<_> = files.iter().filter(|(path, length, held)| path.to_string_lossy().ends_with(".data") && *held > length.next_multiple_of(4_096)).collect();
+    let past: Vec<_> = files.iter().filter(|(path, _length, _held, past)| path.to_string_lossy().ends_with(".data") && *past > 0).collect();
     assert!(past.is_empty(), "segments holding blocks past their ends: {past:?}");
     std::fs::remove_dir_all(&root)?;
     Ok(())
@@ -433,8 +446,8 @@ fn a_set_segment_size_keeps_a_small_store_small() -> Result<(), Box<dyn std::err
     drop(store);
     let mut files = Vec::new();
     files_under(&root, &mut files)?;
-    let data: Vec<_> = files.iter().filter(|(path, _length, _held)| path.to_string_lossy().ends_with(".data")).collect();
-    let held: u64 = data.iter().map(|(_path, _length, held)| *held).sum();
+    let data: Vec<_> = files.iter().filter(|(path, _length, _held, _past)| path.to_string_lossy().ends_with(".data")).collect();
+    let held: u64 = data.iter().map(|(_path, _length, held, _past)| *held).sum();
     println!("{} data files, {held} B held, a step of {step} B", data.len());
     // the rows took one record window, which a segment counts whole once a writer lands in it, and the room a step past it
     assert!(held <= WINDOW_BYTES + step, "{held} B held: {data:?}");
@@ -575,12 +588,78 @@ fn a_finished_small_store_holds_little_past_its_rows() -> Result<(), Box<dyn std
     drop(store);
     let mut files = Vec::new();
     files_under(&root, &mut files)?;
-    let data: Vec<_> = files.iter().filter(|(path, _length, _held)| path.to_string_lossy().ends_with(".data")).collect();
-    let length: u64 = data.iter().map(|(_path, length, _held)| *length).sum();
-    let held: u64 = data.iter().map(|(_path, _length, held)| *held).sum();
+    let data: Vec<_> = files.iter().filter(|(path, _length, _held, _past)| path.to_string_lossy().ends_with(".data")).collect();
+    let length: u64 = data.iter().map(|(_path, length, _held, _past)| *length).sum();
+    let held: u64 = data.iter().map(|(_path, _length, held, _past)| *held).sum();
     println!("{} data files, {length} B long, {held} B held, for 64 rows of 64 B", data.len());
     // one data file of the rows in an 8 KiB window and the footer's fixed parts, which a segment of any size carries
     assert!(data.len() == 1 && length <= 176 * 1024 && held <= length.next_multiple_of(4_096), "{data:?}");
     std::fs::remove_dir_all(&root)?;
     Ok(())
+}
+
+// the bytes a file holds on disk past its length rounded to a block. Linux asks the extents, since ext4 counts the block of an extent
+// tree among a file's blocks once the file has more than four extents, and that block holds no room past the end
+#[cfg(target_os = "linux")]
+fn held_past_end(path: &std::path::Path) -> std::io::Result<u64> {
+    use std::os::fd::AsRawFd;
+    const FS_IOC_FIEMAP: libc::c_ulong = 0xC020_660B;
+    const FIEMAP_FLAG_SYNC: u32 = 1;
+    const FIEMAP_EXTENT_LAST: u32 = 1;
+    const EXTENTS: usize = 64;
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Extent {
+        logical: u64,
+        physical: u64,
+        length: u64,
+        reserved64: [u64; 2],
+        flags: u32,
+        reserved: [u32; 3],
+    }
+    #[repr(C)]
+    struct Map {
+        start: u64,
+        length: u64,
+        flags: u32,
+        mapped: u32,
+        count: u32,
+        reserved: u32,
+        extents: [Extent; EXTENTS],
+    }
+    let file = std::fs::File::open(path)?;
+    let end = file.metadata()?.len().next_multiple_of(4_096);
+    let mut past = 0;
+    let mut start = end;
+    loop {
+        let mut map = Map { start, length: u64::MAX - start, flags: FIEMAP_FLAG_SYNC, mapped: 0, count: EXTENTS as u32, reserved: 0, extents: [Extent::default(); EXTENTS] };
+        // SAFETY: the map is a fiemap header with room for `count` extents, which the kernel fills and never passes
+        let asked = unsafe { libc::ioctl(file.as_raw_fd(), FS_IOC_FIEMAP, &mut map) };
+        if asked != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EOPNOTSUPP) {
+                return Err(error);
+            }
+            // a filesystem with no extent map, as tmpfs, keeps no extent tree, so its blocks are the file's own
+            use std::os::unix::fs::MetadataExt;
+            return Ok((file.metadata()?.blocks() * 512).saturating_sub(end));
+        }
+        let extents = &map.extents[..map.mapped as usize];
+        for extent in extents {
+            let from = extent.logical.max(end);
+            past += (extent.logical + extent.length).saturating_sub(from);
+        }
+        match extents.last() {
+            Some(last) if last.flags & FIEMAP_EXTENT_LAST == 0 => start = last.logical + last.length,
+            _ => return Ok(past),
+        }
+    }
+}
+
+// the bytes a file holds on disk past its length rounded to a block
+#[cfg(not(target_os = "linux"))]
+fn held_past_end(path: &std::path::Path) -> std::io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(path)?;
+    Ok((metadata.blocks() * 512).saturating_sub(metadata.len().next_multiple_of(4_096)))
 }

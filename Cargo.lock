@@ -116,6 +116,7 @@ dependencies = [
 name = "tape-reel-public-api"
 version = "0.4.0"
 dependencies = [
+ "libc",
  "tape-reel",
  "tape-reel-core",
 ]

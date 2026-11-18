@@ -1,5 +1,4 @@
 use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process;
 
@@ -50,11 +49,6 @@ fn noise(number: u64) -> Vec<u8> {
     value
 }
 
-// the bytes a file holds on disk, and its length rounded up to the filesystem's block
-fn held_and_rounded(path: &Path) -> (u64, u64) {
-    let meta = fs::metadata(path).expect("a segment file");
-    (meta.blocks() * 512, meta.len().next_multiple_of(meta.blksize()))
-}
 
 // four writers put values of a segment's eighth to its quarter into one open segment, where each passes the reserved room and
 // the reserve runs beside the others' writes, and every value reads back whole. Once a reserve set the file's length and cut
@@ -92,8 +86,8 @@ fn writers_keep_their_tails(codec: Codec) {
 
     // a sealed segment gives back every block past its end
     for number in &sealed {
-        let (held, rounded) = held_and_rounded(&data_path(&root, *number));
-        assert!(held <= rounded, "{codec:?}: sealed segment {number:?} holds {held} B past its length rounded to {rounded}");
+        let past = held_past_end(&data_path(&root, *number));
+        assert!(past == 0, "{codec:?}: sealed segment {number:?} holds {past} B past its length rounded to a block");
     }
     // the open segment holds at most a step and a half past its writes, since the reserve job asks when half a step is left and
     // takes a step, and a spare holds a step
@@ -102,8 +96,8 @@ fn writers_keep_their_tails(codec: Codec) {
     for entry in fs::read_dir(&root).expect("read the root") {
         let path = entry.expect("an entry").path();
         if path.extension().is_some_and(|extension| extension == "data") {
-            let (held, rounded) = held_and_rounded(&path);
-            assert!(held <= rounded + ahead, "{codec:?}: {} holds {held} B, past its length {rounded} and {ahead} ahead", path.display());
+            let past = held_past_end(&path);
+            assert!(past <= ahead, "{codec:?}: {} holds {past} B past its length, more than {ahead} ahead", path.display());
         }
     }
     let _gone = fs::remove_dir_all(&root);
@@ -117,4 +111,68 @@ fn uncoded_writers_keep_their_tails() {
 #[test]
 fn lz4_writers_keep_their_tails() {
     writers_keep_their_tails(Codec::Lz4);
+}
+
+// the bytes a file holds on disk past its length rounded to a block. Linux asks the extents, since ext4 counts the block of an extent
+// tree among a file's blocks once the file has more than four extents, and that block holds no room past the end
+#[cfg(target_os = "linux")]
+fn held_past_end(path: &std::path::Path) -> u64 {
+    use std::os::fd::AsRawFd;
+    const FS_IOC_FIEMAP: libc::c_ulong = 0xC020_660B;
+    const FIEMAP_FLAG_SYNC: u32 = 1;
+    const FIEMAP_EXTENT_LAST: u32 = 1;
+    const EXTENTS: usize = 64;
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Extent {
+        logical: u64,
+        physical: u64,
+        length: u64,
+        reserved64: [u64; 2],
+        flags: u32,
+        reserved: [u32; 3],
+    }
+    #[repr(C)]
+    struct Map {
+        start: u64,
+        length: u64,
+        flags: u32,
+        mapped: u32,
+        count: u32,
+        reserved: u32,
+        extents: [Extent; EXTENTS],
+    }
+    let file = std::fs::File::open(path).expect("open a file to map");
+    let end = file.metadata().expect("a file's length").len().next_multiple_of(4_096);
+    let mut past = 0;
+    let mut start = end;
+    loop {
+        let mut map = Map { start, length: u64::MAX - start, flags: FIEMAP_FLAG_SYNC, mapped: 0, count: EXTENTS as u32, reserved: 0, extents: [Extent::default(); EXTENTS] };
+        // SAFETY: the map is a fiemap header with room for `count` extents, which the kernel fills and never passes
+        let asked = unsafe { libc::ioctl(file.as_raw_fd(), FS_IOC_FIEMAP, &mut map) };
+        if asked != 0 {
+            let error = std::io::Error::last_os_error();
+            assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP), "map {}'s extents: {error}", path.display());
+            // a filesystem with no extent map, as tmpfs, keeps no extent tree, so its blocks are the file's own
+            use std::os::unix::fs::MetadataExt;
+            return (file.metadata().expect("a file's blocks").blocks() * 512).saturating_sub(end);
+        }
+        let extents = &map.extents[..map.mapped as usize];
+        for extent in extents {
+            let from = extent.logical.max(end);
+            past += (extent.logical + extent.length).saturating_sub(from);
+        }
+        match extents.last() {
+            Some(last) if last.flags & FIEMAP_EXTENT_LAST == 0 => start = last.logical + last.length,
+            _ => return past,
+        }
+    }
+}
+
+// the bytes a file holds on disk past its length rounded to a block
+#[cfg(not(target_os = "linux"))]
+fn held_past_end(path: &std::path::Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(path).expect("a file's metadata");
+    (metadata.blocks() * 512).saturating_sub(metadata.len().next_multiple_of(4_096))
 }

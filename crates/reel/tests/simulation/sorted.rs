@@ -1914,6 +1914,100 @@ fn writes_beside_batches_match_the_model() {
     }
 }
 
+const DRAIN_PIECE: u64 = 40;
+
+/// The model a drained row answers: the one its batch was filled at, or the model now once a drain fills a new batch
+struct DrainCheck {
+    seen: Model,
+    last: Option<Vec<u8>>,
+    rows: u64,
+}
+
+impl DrainCheck {
+    // check a row is the next key of the batch's model, or of the model now when the drain moved to a batch filled since
+    fn take(&mut self, model: &Model, (name, value): (&[u8], &[u8]), direction: Direction) {
+        let row = Some((name.to_vec(), value.to_vec()));
+        if row != next_in(&self.seen, self.last.as_ref(), direction) {
+            self.seen = model.clone();
+            assert_eq!(row, next_in(&self.seen, self.last.as_ref(), direction), "after {:?} going {direction:?}", self.last);
+        }
+        self.last = Some(name.to_vec());
+        self.rows += 1;
+    }
+}
+
+// drain a walk in pieces of a few rows, a write between pieces, with every other piece a one-row step when mixed, and check each
+// row against the model as of its batch
+fn drain_beside_writer(store: &Store, model: &mut Model, random: &mut SeededRandom, fresh: &mut u64, (direction, write_odds, is_mixed): (Direction, Option<u64>, bool)) -> u64 {
+    let start = match direction {
+        Direction::Ascending => Vec::new(),
+        Direction::Descending => vec![0xFF; WIDTH as usize + 1],
+    };
+    let mut scan = store.iter_from(COLUMN, &start, direction).expect("scan");
+    let (mut name, mut value) = (Vec::new(), Vec::new());
+    let mut check = DrainCheck { seen: model.clone(), last: None, rows: 0 };
+    for piece in 0_u64.. {
+        let step = if is_mixed && piece % 2 == 1 {
+            let step = scan.next_row(&mut name, &mut value).expect("step");
+            if step == ScanStep::Found {
+                check.take(model, (&name, &value), direction);
+            }
+            step
+        } else {
+            let mut left = 1 + random.below(DRAIN_PIECE);
+            scan.drain((&mut name, &mut value), |row_name, row_value| {
+                check.take(model, (row_name, row_value), direction);
+                left -= 1;
+                left > 0
+            })
+            .expect("drain")
+        };
+        match step {
+            ScanStep::Found => {},
+            ScanStep::End => break,
+            ScanStep::Corrupt => panic!("a corrupt record"),
+        }
+        if write_odds.is_some_and(|odds| random.one_in(odds)) {
+            write_one(store, model, random, fresh);
+        }
+    }
+    // the end comes from a batch filled in the last drain, after every write
+    assert_eq!(next_in(model, check.last.as_ref(), direction), None, "the drain ended early going {direction:?}");
+    check.rows
+}
+
+// a drain lends the model's rows quiet and beside a writer, alone and mixed with one-row steps, over sealed rows and open ones
+#[test]
+fn drains_match_the_model() {
+    for seed in seeds(0..WRITER_SEEDS) {
+        let io = SimulatedIo::new(Seed(seed));
+        let store = open(&io, CAPACITY);
+        let mut model = Model::new();
+        let mut random = SeededRandom::new(Seed(seed));
+        for number in 0..WRITER_KEYS {
+            store.put(COLUMN, &key(number), format!("{number}").as_bytes()).expect("put");
+            model.insert(key(number), format!("{number}").into_bytes());
+        }
+        seal_all(&store, &io);
+        let mut fresh = WRITER_KEYS;
+        for _key in 0..OPEN_KEYS {
+            write_one(&store, &mut model, &mut random, &mut fresh);
+        }
+        for direction in [Direction::Ascending, Direction::Descending] {
+            for write_odds in [None, Some(DENSE_WRITE_ONE_IN), Some(STEP_WRITE_ONE_IN)] {
+                for is_mixed in [false, true] {
+                    let rows = drain_beside_writer(&store, &mut model, &mut random, &mut fresh, (direction, write_odds, is_mixed));
+                    if write_odds.is_none() {
+                        assert_eq!(rows, model.len() as u64, "a quiet drain missed rows");
+                    }
+                }
+            }
+        }
+        check_scans(&store, &model, &mut random);
+        store.close().expect("close");
+    }
+}
+
 const SEALED_UNDER: u64 = 600;
 const OPEN_UNDER: u64 = 400;
 const WIDE_ONE_IN: u64 = 5;

@@ -605,6 +605,13 @@ pub fn form_of(record: &[u8]) -> Option<RecordForm> {
     RecordForm::from_byte(*record.get(FORM_AT)?)
 }
 
+/// Check a one-chunk record and give its payload where it lies, still in the codec it was stored with
+pub fn checked_payload<'record>(record: &'record [u8], form: RecordForm, identity: &RecordIdentity<'_>) -> Option<&'record [u8]> {
+    let payload = record.get(SMALL_HEAD_BYTES..)?;
+    let check = place_check(record_check(identity, form, checksum(payload)), identity.record_key, identity.place);
+    (read_check(record) == Some(check)).then_some(payload)
+}
+
 /// Check a one-chunk record and hand its value over, restoring a compressed one through `decoded`
 pub fn open_small(
     record: &[u8],
@@ -613,14 +620,9 @@ pub fn open_small(
     decoded: &mut [u8],
     buf: &mut Vec<u8>,
 ) -> RecordRead {
-    let Some(payload) = record.get(SMALL_HEAD_BYTES..) else {
+    let Some(payload) = checked_payload(record, form, identity) else {
         return RecordRead::Failed;
     };
-    let check = place_check(record_check(identity, form, checksum(payload)), identity.record_key, identity.place);
-    if read_check(record) != Some(check) {
-        return RecordRead::Failed;
-    }
-
     buf.clear();
     match form.codec {
         Codec::None => buf.extend_from_slice(payload),

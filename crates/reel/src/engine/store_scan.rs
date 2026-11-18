@@ -55,6 +55,16 @@ impl<Backend: Io> StoreScan<Backend> {
         self.state.step_scan(scan, key, ScanWant::Value(value))
     }
 
+    /// Lend rows to a closure in order, each key and value as slices, until it says stop, the walk ends or a row is corrupt. The
+    /// buffers take a row the batch can't lend
+    pub fn drain(&mut self, buffers: (&mut Vec<u8>, &mut Vec<u8>), each: impl FnMut(&[u8], &[u8]) -> bool) -> Result<ScanStep, StoreError> {
+        self.state.caller_ops.note();
+        let Some(scan) = &mut self.scan else {
+            return Ok(ScanStep::End);
+        };
+        self.state.drain_scan(scan, buffers, each)
+    }
+
     /// Stream the next block of keys through the read workers, and say whether the walk has more. A walk dropped part way
     /// gives its buffers back when the worker ends, and a future dropped part way ends the walk
     pub async fn next_block(&mut self, keys: &mut ValueList) -> Result<bool, StoreError> {

@@ -27,7 +27,7 @@ use crate::index::write_shard::{HEAD_GROUP, HeadPlace, WalkBound, WriteShard, pl
 use crate::io::{DeviceReads, Io, ManyRead, ReadOn, in_place};
 use crate::record::record_check::RecordIdentity;
 use crate::record::codec::Codec;
-use crate::record::record_reader::{RecordRead, form_of, open_small};
+use crate::record::record_reader::{RecordRead, checked_payload, form_of, open_small};
 use crate::row_kind::RowKind;
 use crate::segment::footer_reader::RowAt;
 use crate::index::record_cache::CacheLookup;
@@ -851,6 +851,58 @@ impl<Backend: Io> EngineState<Backend> {
         scan.batch.next += 1;
         scan.batched += u64::from(held);
         Ok(Some(ScanStep::Found))
+    }
+
+    /// Lend the walk's rows to a closure in order, each key and value as slices. A row whose small plain record the batch holds
+    /// comes from where it lies once it checks out, and any other takes the one-row step. Ends after the row the closure says
+    /// stop on, at the walk's end, or at a corrupt row
+    pub fn drain_scan(
+        &self,
+        scan: &mut ScanState,
+        (key, value): (&mut Vec<u8>, &mut Vec<u8>),
+        mut each: impl FnMut(&[u8], &[u8]) -> bool,
+    ) -> Result<ScanStep, StoreError> {
+        let volume = &self.volumes[self.column(scan.column)?.volume.0 as usize];
+        loop {
+            while let Some(entry) = scan.batch.entries.get(scan.batch.next).copied() {
+                let Some((at, length)) = self.held_value(volume, scan, &entry) else {
+                    break;
+                };
+                scan.asked += 1;
+                scan.batch.next += 1;
+                scan.batched += 1;
+                if !each(scan.batch.key_of(&entry), &scan.batch.records[at..at + length]) {
+                    return Ok(ScanStep::Found);
+                }
+            }
+            match self.step_scan(scan, key, ScanWant::Value(value))? {
+                ScanStep::Found if each(key, value) => {},
+                step => return Ok(step),
+            }
+        }
+    }
+
+    /// Find where a batch row's value lies in the batch's buffer: a value from the cache as it stands, or a small plain record's
+    /// payload once the record checks out. Nothing for a row the one-row step answers
+    pub fn held_value(&self, volume: &Volume<Backend>, scan: &ScanState, entry: &BatchEntry) -> Option<(usize, usize)> {
+        let (at, length) = entry.record?;
+        let place = match entry.located {
+            Located::Sealed(_row) if entry.is_value => return Some((at, length)),
+            Located::Sealed(row) => row.row.place,
+            Located::Open(row) => row.place,
+            Located::Absent => return None,
+        };
+        let (record, name) = (&scan.batch.records[at..at + length], scan.batch.key_of(entry));
+        let identity = RecordIdentity { record_key: self.record_key, column: scan.column, key: name, kind: RowKind::Value, place };
+        let form = form_of(record).filter(|form| !form.is_chunked && form.codec == Codec::None)?;
+        let payload = checked_payload(record, form, &identity)?;
+        // a scan keeps what it read only while the cache can hold most of the volume, as a one-row step does
+        if let Located::Sealed(row) = entry.located
+            && volume.scans_use_cache.load(Ordering::Relaxed)
+        {
+            self.record_cache.admit(row.segment, row.row.offset, name, payload);
+        }
+        Some((at + length - payload.len(), payload.len()))
     }
 
     /// Check and open a small record the batch read, as the window does

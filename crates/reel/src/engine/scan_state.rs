@@ -95,7 +95,12 @@ pub struct ShardHead {
     pub is_placed: bool,
     /// Every place at or below this was in the index when the head was placed
     pub placed_at: WritePlace,
+    /// The shard's count of changes when the head was placed, or NO_CHANGES for a head placed with no look at the shard
+    pub changes: u64,
 }
+
+/// A head's count of changes when it was placed without a look at its shard, so the next batch places it again
+pub const NO_CHANGES: u64 = u64::MAX;
 
 /// The most keys a scan locates ahead of its caller at one point, and the bytes of records it reads for them in one go
 pub const BATCH_KEYS: usize = 32;
@@ -459,6 +464,7 @@ impl ShardHead {
             has_key: false,
             is_placed: false,
             placed_at: WritePlace(0),
+            changes: NO_CHANGES,
         }
     }
 }
@@ -695,6 +701,11 @@ impl ScanState {
             }
         }
         self.closest_head = closest;
+        self.mark_heads();
+    }
+
+    /// Take the oldest place any head stands for as the heads' mark
+    pub fn mark_heads(&mut self) {
         self.heads_mark = self.heads.iter().map(|head| head.placed_at).min().unwrap_or(WritePlace(0));
     }
 

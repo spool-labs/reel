@@ -31,4 +31,9 @@ impl ShardCursor {
     pub fn reset(&mut self) {
         self.trees.fill(TreeCursor::default());
     }
+
+    /// Check no tree has a place yet, so the next placement descends every tree
+    pub fn is_reset(&self) -> bool {
+        self.trees.iter().all(|tree| !tree.is_placed)
+    }
 }

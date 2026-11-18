@@ -1,11 +1,13 @@
 //! Keys, locations and graves of the open segments, sharded by a hash of the key
 
 use std::sync::RwLock;
+use std::sync::atomic::Ordering;
 
 use reel_core::column_id::ColumnId;
 use reel_core::units::{ByteCount, RowCount, WritePlace};
 
 use crate::index::key_hash::{KeyHash, hash_key};
+use crate::engine::caller_activity::PaddedCount;
 use crate::guard::Shards;
 use crate::index::open_slots::{OpenSlot, OpenSlots};
 use crate::index::shard_cursor::ShardCursor;
@@ -21,6 +23,8 @@ pub const SHARD_SHIFT: u32 = u64::BITS - SHARD_COUNT.trailing_zeros();
 #[derive(Debug)]
 pub struct WriteIndex {
     pub shards: Shards<WriteShard>,
+    /// Each shard's count of changes to its rows, which goes up under its write lock
+    pub changes: [PaddedCount; SHARD_COUNT],
 }
 
 impl WriteIndex {
@@ -30,7 +34,7 @@ impl WriteIndex {
         for _shard in 0..SHARD_COUNT {
             shards.push(RwLock::new(WriteShard::new(sizing)));
         }
-        Self { shards: Shards(shards) }
+        Self { shards: Shards(shards), changes: Default::default() }
     }
 
     /// Read the heap every shard holds
@@ -45,13 +49,21 @@ impl WriteIndex {
     /// Add a row, or return false when its shard ran out of room
     pub fn insert(&self, column: ColumnId, key: &[u8], row: &WriteRow) -> bool {
         let hash = hash_key(column, key);
-        self.shards.write(shard_of(hash)).insert(hash, column, key, row)
+        let shard = shard_of(hash);
+        let mut guard = self.shards.write(shard);
+        let is_in = guard.insert(hash, column, key, row);
+        self.count_change(shard, is_in);
+        is_in
     }
 
     /// Add a row of a batch that holds its room
     pub fn insert_held(&self, column: ColumnId, key: &[u8], row: &WriteRow) -> bool {
         let hash = hash_key(column, key);
-        self.shards.write(shard_of(hash)).insert_held(hash, column, key, row)
+        let shard = shard_of(hash);
+        let mut guard = self.shards.write(shard);
+        let is_in = guard.insert_held(hash, column, key, row);
+        self.count_change(shard, is_in);
+        is_in
     }
 
     /// Hold room for a batch in every shard it touches, or hold nothing
@@ -77,6 +89,18 @@ impl WriteIndex {
         needs.iter().enumerate().all(|(index, need)| self.shards.read(index).could_hold(need))
     }
 
+    /// Count a change to a shard's rows while its write lock is held
+    pub fn count_change(&self, shard: usize, is_changed: bool) {
+        if is_changed {
+            self.changes[shard].0.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    /// Read a shard's count of changes
+    pub fn change_count(&self, shard: usize) -> u64 {
+        self.changes[shard].0.load(Ordering::Acquire)
+    }
+
     /// Find the newest row a reader at a place can see
     pub fn lookup(&self, column: ColumnId, key: &[u8], read_point: WritePlace, view: OpenSlots) -> WriteLookup {
         let hash = hash_key(column, key);
@@ -93,7 +117,9 @@ impl WriteIndex {
     pub fn clean_slot(&self, slot: OpenSlot, limit: RowCount) -> bool {
         let mut is_clean = true;
         for index in 0..SHARD_COUNT {
-            is_clean &= self.shards.write(index).clean_slot(slot, limit);
+            let mut guard = self.shards.write(index);
+            is_clean &= guard.clean_slot(slot, limit);
+            self.count_change(index, true);
         }
         is_clean
     }

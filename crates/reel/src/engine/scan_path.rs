@@ -15,7 +15,7 @@ use crate::engine::engine_state::EngineState;
 use crate::engine::complete_path::sealed_of;
 use crate::engine::read_path::{HeldPin, KeyRead, Located, MOST_READ_TRIES, RecordWant, SealedRow, newest_of};
 use crate::engine::scan_state::{
-    BATCH_BYTES, BatchEntry, BlockTake, JOIN_GAP, MOST_BATCH_RECORD, MOST_BATCH_RUNS, MOST_WINDOW_RECORD, NO_GENERATION, SCAN_BATCH_KEYS, ScanBatch, batch_room,
+    BATCH_BYTES, BatchEntry, BlockTake, JOIN_GAP, MOST_BATCH_RECORD, MOST_BATCH_RUNS, MOST_WINDOW_RECORD, NO_GENERATION, NO_CHANGES, SCAN_BATCH_KEYS, ScanBatch, batch_room,
     SCAN_CACHE_PARTS, SCAN_CACHE_WEIGH_EVERY, SEAT_BATCH, ScanRange, ScanState, ScanWindows, SegmentSource, ShardHead,
     seek_together, under_prefix,
 };
@@ -376,12 +376,17 @@ impl<Backend: Io> EngineState<Backend> {
         scan.batch.clear();
         let point = scan.point.unwrap_or_else(|| self.read_point(volume));
         scan.batch.point = point;
-        // the heads of an index walk stand again at each batch's point, so the batch's runs see every row landed before it
+        // each head stands at the batch's point: a shard whose count read after the point hasn't moved keeps its head
         if scan.is_on_index && point > scan.heads_mark {
-            for head in &mut scan.heads {
+            for (shard, head) in scan.heads.iter_mut().enumerate() {
+                if head.is_placed && head.changes == self.index.change_count(shard) {
+                    head.placed_at = head.placed_at.max(point);
+                    continue;
+                }
                 head.cursor.reset();
                 head.is_placed = false;
             }
+            scan.mark_heads();
         }
         let mut key = mem::take(&mut scan.out_key);
         let mut outcome = Ok(());
@@ -800,6 +805,7 @@ impl<Backend: Io> EngineState<Backend> {
                 head.has_key = false;
                 head.is_placed = true;
                 head.placed_at = mark;
+                head.changes = NO_CHANGES;
             }
             scan.find_closest_head();
             return;
@@ -814,6 +820,12 @@ impl<Backend: Io> EngineState<Backend> {
             // the read locks go in shard order, as the shards came
             let guards: [Option<RwLockReadGuard<'_, WriteShard>>; HEAD_GROUP] =
                 std::array::from_fn(|index| group[index].as_ref().map(|(shard, _head)| self.index.shards.read(*shard)));
+            // a cursor that stood through a change can miss a row the change landed before it, so it descends fresh
+            for (shard, head) in group.iter_mut().flatten() {
+                if !head.cursor.is_reset() && head.changes != self.index.change_count(*shard) {
+                    head.cursor.reset();
+                }
+            }
             let mut places: [Option<HeadPlace<'_>>; HEAD_GROUP] = [const { None }; HEAD_GROUP];
             for ((member, guard), place) in group.iter_mut().zip(&guards).zip(&mut places) {
                 if let (Some((_shard, head)), Some(guard)) = (member.as_mut(), guard.as_ref()) {
@@ -822,6 +834,10 @@ impl<Backend: Io> EngineState<Backend> {
             }
             let descended = place_heads_together(&mut places, &bound, view);
             self.heads_together.fetch_add(descended as u64, Ordering::Relaxed);
+            // each count is read under its shard's lock, so it matches the rows the head saw
+            for (shard, head) in group.iter_mut().flatten() {
+                head.changes = self.index.change_count(*shard);
+            }
             drop(guards);
             for (_shard, head) in group.iter_mut().flatten() {
                 head.is_placed = true;

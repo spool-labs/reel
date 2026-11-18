@@ -6,6 +6,7 @@ use reel_core::column_id::ColumnId;
 use reel_core::units::{ByteCount, RowCount, VolumeId};
 
 use crate::engine::engine_sizing::OPEN_PER_ROOT;
+use crate::engine::scrub_job::DEFAULT_SCRUB_BYTES_PER_SECOND;
 use crate::lifetime::MOST_LIFETIME_GROUPS;
 use crate::record::codec::{CHUNK_BYTES, Codec};
 use crate::segment::segment_tail::MOST_SEGMENT_BYTES;
@@ -182,12 +183,15 @@ pub struct ThreadCounts {
     /// Threads that serve the async read forms. 0 runs none, for a caller that uses only the blocking forms: the async ones then
     /// return NoAsyncReads, and the store holds no read slot and no ring
     pub read_threads: usize,
+    /// The rate the background scrub checks sealed records at, in bytes a second. 0 runs no scrub
+    pub scrub_bytes_per_second: u64,
 }
 
 /// A planner alone on each volume, with no workers beside it
 pub const NO_WORKERS: ThreadCounts = ThreadCounts {
     maintenance_workers: Some(0),
     read_threads: DEFAULT_READ_THREADS,
+    scrub_bytes_per_second: 0,
 };
 
 impl Default for ThreadCounts {
@@ -195,6 +199,7 @@ impl Default for ThreadCounts {
         Self {
             maintenance_workers: None,
             read_threads: DEFAULT_READ_THREADS,
+            scrub_bytes_per_second: DEFAULT_SCRUB_BYTES_PER_SECOND,
         }
     }
 }

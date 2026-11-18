@@ -70,7 +70,7 @@ fn the_rest_of_the_surface_answers_from_outside() -> Result<(), Box<dyn std::err
     let mut config = config(root.clone());
     config.volumes = vec![VolumeConfig::new("volume", vec![root.clone()], SyncPolicy::Never)];
     // a planner alone on its volume and one read thread
-    config.threads = ThreadCounts { maintenance_workers: Some(0), read_threads: 1 };
+    config.threads = ThreadCounts { maintenance_workers: Some(0), read_threads: 1, scrub_bytes_per_second: 0 };
     let store = ReelStore::open(PlainIo::new(), &config)?;
     for number in 0..KEYS {
         store.put(COLUMN, format!("key-{number:03}").as_bytes(), b"value")?;
@@ -392,7 +392,7 @@ fn a_store_with_no_read_thread_answers_the_blocking_calls() -> Result<(), Box<dy
     let root = scratch_root().with_extension("blocking");
     let _gone = std::fs::remove_dir_all(&root);
     let mut config = config(root.clone());
-    config.threads = ThreadCounts { maintenance_workers: Some(0), read_threads: 0 };
+    config.threads = ThreadCounts { maintenance_workers: Some(0), read_threads: 0, scrub_bytes_per_second: 0 };
     let store = ReelStore::open(PlainIo::new(), &config)?;
     let mut batch = WriteBatch::new();
     for number in 0..KEYS {
@@ -515,7 +515,7 @@ fn the_least_budget_needs_no_trial_open() -> Result<(), Box<dyn std::error::Erro
         ("default", Box::new(config)),
         ("small", Box::new(|root| {
             let mut small = config(root);
-            small.threads = ThreadCounts { maintenance_workers: Some(0), read_threads: 0 };
+            small.threads = ThreadCounts { maintenance_workers: Some(0), read_threads: 0, scrub_bytes_per_second: 0 };
             small.volumes[0].open_segments = Some(1);
             small.volumes[0].segment_bytes = Some(ByteCount(256 * 1024));
             small.volumes[0].lifetime_groups = Some(0);

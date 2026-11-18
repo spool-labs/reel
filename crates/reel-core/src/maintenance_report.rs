@@ -633,6 +633,11 @@ pub struct MaintenanceReport {
     pub heads_together: u64,
     /// Records merges found failing their check as they copied them, each of which damaged its segment
     pub merge_check_failures: u64,
+    /// Bytes of sealed records the scrub checked, the passes it ended, and the records that failed their check, each of which
+    /// damaged its segment
+    pub scrub_bytes: u64,
+    pub scrub_passes: u64,
+    pub scrub_failures: u64,
     /// Values scans took from the record cache with no record read, while it could hold most of a volume
     pub scan_cache_hits: u64,
     /// Block cache inserts that found their shard held by a visit and kept nothing
@@ -757,6 +762,9 @@ impl MaintenanceReport {
             seats_together: 0,
             heads_together: 0,
             merge_check_failures: 0,
+            scrub_bytes: 0,
+            scrub_passes: 0,
+            scrub_failures: 0,
             scan_cache_hits: 0,
             cache_inserts_skipped: 0,
             sorted_answers: 0,

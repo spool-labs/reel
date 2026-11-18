@@ -36,6 +36,7 @@ pub mod row_job;
 pub mod scan_path;
 pub mod scan_pool;
 pub mod scan_state;
+pub mod scrub_job;
 pub mod seal_job;
 pub mod store_scan;
 pub mod store_traits;

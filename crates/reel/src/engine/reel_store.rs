@@ -55,6 +55,7 @@ use crate::engine::compact_job::{CompactJob, park};
 use crate::engine::cue::{Cue, CueTable};
 use crate::engine::filter_job::FilterLoader;
 use crate::engine::planner::Planner;
+use crate::engine::scrub_job::ScrubJob;
 use crate::engine::walk_job::{BlockCounter, WalkJob, WalkSlot, WalkWorker};
 use crate::engine::workers::Workers;
 use crate::engine::load_state::{LoadCell, PACE_PER_MILLE, PaceCell, SPACE_TARGET_PER_MILLE};
@@ -844,6 +845,7 @@ pub fn start_jobs<Backend: Io>(state: &Arc<EngineState<Backend>>) -> Result<(), 
         walks,
         compactions,
         filters: (0..state.volumes.len()).map(|volume| FilterLoader::new(Arc::clone(state), volume)).collect(),
+        scrubs: (0..state.volumes.len()).map(|volume| ScrubJob::new(Arc::clone(state), volume)).collect(),
         last: 0,
     };
     let task = state.io.spawn_job("reel-planner", planner).map_err(open_error("starting a job"))?;
@@ -1494,6 +1496,10 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         seats_together: AtomicU64::new(0),
         heads_together: AtomicU64::new(0),
         merge_check_failures: AtomicU64::new(0),
+        scrub_rate: config.threads.scrub_bytes_per_second,
+        scrub_bytes: AtomicU64::new(0),
+        scrub_passes: AtomicU64::new(0),
+        scrub_failures: AtomicU64::new(0),
         ahead_drops: AtomicU64::new(0),
         scan_cache_hits: AtomicU64::new(0),
         sorted_answers: AtomicU64::new(0),

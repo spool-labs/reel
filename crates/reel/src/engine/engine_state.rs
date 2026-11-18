@@ -164,6 +164,11 @@ pub struct EngineState<Backend: Io> {
     pub heads_together: AtomicU64,
     /// Records a merge found failing their check as it copied them, each of which damaged its segment
     pub merge_check_failures: AtomicU64,
+    /// The scrub's rate in bytes a second, 0 for none, and its bytes checked, passes ended and records that failed their check
+    pub scrub_rate: u64,
+    pub scrub_bytes: AtomicU64,
+    pub scrub_passes: AtomicU64,
+    pub scrub_failures: AtomicU64,
     /// Keys a head read ahead and dropped, since its shard changed before the run used them
     pub ahead_drops: AtomicU64,
     /// Values scans took from the record cache with no record read

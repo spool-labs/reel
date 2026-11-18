@@ -14,6 +14,7 @@ use crate::engine::compact_job::CompactJob;
 use crate::engine::engine_state::EngineState;
 use crate::engine::filter_job::FilterLoader;
 use crate::engine::open_segment::{OpenSegment, SegmentPhase};
+use crate::engine::scrub_job::ScrubJob;
 use crate::engine::volume::Volume;
 use crate::engine::walk_job::WalkJob;
 use crate::guard::hold;
@@ -38,6 +39,7 @@ pub struct Planner<Backend: Io> {
     pub walks: Vec<WalkJob<Backend>>,
     pub compactions: Vec<CompactJob<Backend>>,
     pub filters: Vec<FilterLoader<Backend>>,
+    pub scrubs: Vec<ScrubJob<Backend>>,
     pub last: usize,
 }
 
@@ -84,6 +86,16 @@ impl<Backend: Io> Planner<Backend> {
                 self.last = index;
                 return true;
             },
+            JobStep::Idle | JobStep::Finished => {},
+            JobStep::IdleUntil { deadline: at } => *soonest = Some(soonest.map_or(at, |other| Nanoseconds(other.0.min(at.0)))),
+        }
+        false
+    }
+
+    /// Note what a scrub step found, and say whether it worked
+    pub fn note_scrub(step: JobStep, soonest: &mut Option<Nanoseconds>) -> bool {
+        match step {
+            JobStep::Worked => return true,
             JobStep::Idle | JobStep::Finished => {},
             JobStep::IdleUntil { deadline: at } => *soonest = Some(soonest.map_or(at, |other| Nanoseconds(other.0.min(at.0)))),
         }
@@ -152,6 +164,13 @@ impl<Backend: Io> Job for Planner<Backend> {
         self.state.note_arena(has_filters_left);
         if has_filters_left {
             return JobStep::Worked;
+        }
+        // the scrub goes last, at its own rate, so it takes only what every other job leaves
+        for scrub in &mut self.scrubs {
+            let step = scrub.step_unit(now);
+            if Self::note_scrub(step, &mut soonest) {
+                return JobStep::Worked;
+            }
         }
         match soonest {
             Some(deadline) => JobStep::IdleUntil { deadline },

@@ -586,6 +586,7 @@ fn corrupt_record_goes_on() {
 
     let store = open(&io);
     hold_compaction(&store, true);
+    let errors = store.state.corruption_errors.load(Ordering::Relaxed);
     let mut scan = store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan");
     let (mut name, mut value) = (Vec::new(), Vec::new());
     assert_eq!(scan.next_row(&mut name, &mut value).expect("step"), ScanStep::Found);
@@ -595,6 +596,8 @@ fn corrupt_record_goes_on() {
     assert_eq!((name.as_slice(), value.as_slice()), (&b"c"[..], &b"third value"[..]));
     assert_eq!(scan.next_row(&mut name, &mut value).expect("step"), ScanStep::End);
     drop(scan);
+    // the scan keeps its count of corrupt steps and adds it to the store's total when it goes back
+    assert_eq!(store.state.corruption_errors.load(Ordering::Relaxed) - errors, 1, "the corrupt step went uncounted");
     store.close().expect("close");
 }
 

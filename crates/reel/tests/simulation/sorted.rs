@@ -1808,8 +1808,8 @@ fn write_one(store: &Store, model: &mut Model, random: &mut SeededRandom, fresh:
     }
 }
 
-// walk with a writer between steps, and check each answer is the model's next key as of its batch
-fn walk_beside_writer(store: &Store, io: &SimulatedIo, model: &mut Model, random: &mut SeededRandom, fresh: &mut u64, (direction, write_odds): (Direction, Option<u64>)) -> WalkTally {
+// walk for values or keys alone with a writer between steps, and check each answer is the model's next key as of its batch
+fn walk_beside_writer(store: &Store, io: &SimulatedIo, model: &mut Model, random: &mut SeededRandom, fresh: &mut u64, (direction, write_odds, is_key_walk): (Direction, Option<u64>, bool)) -> WalkTally {
     let is_writing = write_odds.is_some();
     let start = match direction {
         Direction::Ascending => Vec::new(),
@@ -1838,9 +1838,17 @@ fn walk_beside_writer(store: &Store, io: &SimulatedIo, model: &mut Model, random
             }
             seen = model.clone();
         }
-        let step = store.state.step_scan(&mut scan, &mut name, reel::engine::scan_path::ScanWant::Value(&mut value)).expect("step");
+        let want = match is_key_walk {
+            true => reel::engine::scan_path::ScanWant::Key,
+            false => reel::engine::scan_path::ScanWant::Value(&mut value),
+        };
+        let step = store.state.step_scan(&mut scan, &mut name, want).expect("step");
         let expected = next_in(&seen, last.as_ref(), direction);
         match step {
+            ScanStep::Found if is_key_walk => {
+                assert_eq!(Some(&name), expected.as_ref().map(|(expected, _value)| expected), "after {last:?} going {direction:?}");
+                last = Some(name.clone());
+            },
             ScanStep::Found => {
                 assert_eq!(Some((name.clone(), value.clone())), expected, "after {last:?} going {direction:?}");
                 last = Some(name.clone());
@@ -1885,17 +1893,17 @@ fn writes_beside_batches_match_the_model() {
         let shards = reel::index::write_index::SHARD_COUNT as u64;
         // a write between most steps reaches shards whose heads moved inside the batch, which the next batch places again
         for direction in [Direction::Ascending, Direction::Descending] {
-            let tally = walk_beside_writer(&store, &io, &mut model, &mut random, &mut fresh, (direction, Some(DENSE_WRITE_ONE_IN)));
+            let tally = walk_beside_writer(&store, &io, &mut model, &mut random, &mut fresh, (direction, Some(DENSE_WRITE_ONE_IN), false));
             println!("seed {seed} {direction:?} beside a busy writer: {tally:?}");
         }
         for direction in [Direction::Ascending, Direction::Descending] {
-            let tally = walk_beside_writer(&store, &io, &mut model, &mut random, &mut fresh, (direction, Some(STEP_WRITE_ONE_IN)));
+            let tally = walk_beside_writer(&store, &io, &mut model, &mut random, &mut fresh, (direction, Some(STEP_WRITE_ONE_IN), false));
             println!("seed {seed} {direction:?} beside a writer: {tally:?}");
             // a batch places again only the heads whose shard took a row, far fewer than every shard
             assert!(tally.heads_together < tally.fills * shards / 2, "{tally:?}");
         }
         // with no writer every head stays placed across batches, and moves only past a key it showed
-        let tally = walk_beside_writer(&store, &io, &mut model, &mut random, &mut fresh, (Direction::Ascending, None));
+        let tally = walk_beside_writer(&store, &io, &mut model, &mut random, &mut fresh, (Direction::Ascending, None, false));
         println!("seed {seed} quiet: {tally:?}");
         assert!(tally.heads_together <= 2 * shards, "{tally:?}");
         check_scans(&store, &model, &mut random);
@@ -2081,4 +2089,62 @@ fn records_out_of_file_order_read_as_the_model() {
             store.close().expect("close");
         }
     }
+}
+
+// a key walk beside a writer answers each key as of its batch's point, and locates its keys a batch at a time
+#[test]
+fn key_walks_beside_batches_match_the_model() {
+    for seed in seeds(0..WRITER_SEEDS) {
+        let io = SimulatedIo::new(Seed(seed));
+        let store = open(&io, CAPACITY);
+        let mut model = Model::new();
+        let mut random = SeededRandom::new(Seed(seed));
+        for number in 0..WRITER_KEYS {
+            store.put(COLUMN, &key(number), format!("{number}").as_bytes()).expect("put");
+            model.insert(key(number), format!("{number}").into_bytes());
+        }
+        seal_all(&store, &io);
+        let mut fresh = WRITER_KEYS;
+        for _key in 0..OPEN_KEYS {
+            write_one(&store, &mut model, &mut random, &mut fresh);
+        }
+        for write_odds in [DENSE_WRITE_ONE_IN, STEP_WRITE_ONE_IN] {
+            for direction in [Direction::Ascending, Direction::Descending] {
+                let tally = walk_beside_writer(&store, &io, &mut model, &mut random, &mut fresh, (direction, Some(write_odds), true));
+                println!("seed {seed} {direction:?} keys beside a writer one in {write_odds}: {tally:?}");
+            }
+        }
+        let tally = walk_beside_writer(&store, &io, &mut model, &mut random, &mut fresh, (Direction::Ascending, None, true));
+        println!("seed {seed} quiet keys: {tally:?}");
+        assert!(tally.fills * 4 < tally.asked, "the key walk located no batches: {tally:?}");
+        store.close().expect("close");
+    }
+}
+
+// a scan keeps its count of keys whose sealed row came from the index, and the store's total takes every one once the walk
+// ends, for a walk of keys and a walk of values alike
+#[test]
+fn sorted_scan_keys_reach_the_total() {
+    let io = SimulatedIo::new(Seed(34));
+    let store = open(&io, CAPACITY);
+    let mut model = Model::new();
+    for number in 0..KEYS {
+        store.put(COLUMN, &key(number), format!("{number}").as_bytes()).expect("put");
+        model.insert(key(number), format!("{number}").into_bytes());
+    }
+    seal_all(&store, &io);
+    let before = store.state.sorted_scan_keys.load(Ordering::Relaxed);
+    let mut scan = store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan");
+    let (mut name, mut names) = (Vec::new(), Vec::new());
+    while scan.next_key(&mut name).expect("step") == ScanStep::Found {
+        names.push(name.clone());
+    }
+    drop(scan);
+    assert_eq!(names, model.keys().cloned().collect::<Vec<_>>());
+    let after_keys = store.state.sorted_scan_keys.load(Ordering::Relaxed);
+    assert_eq!(after_keys - before, KEYS, "the key walk's count");
+    let found = rows(store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan"));
+    assert_eq!(found.len() as u64, KEYS);
+    assert_eq!(store.state.sorted_scan_keys.load(Ordering::Relaxed) - after_keys, KEYS, "the value walk's count");
+    store.close().expect("close");
 }

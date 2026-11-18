@@ -191,6 +191,8 @@ pub struct ScanBatch {
     pub spans: Vec<Option<(usize, usize)>>,
     /// Each record's order word, sorted when the records come out of file order
     pub words: Vec<u128>,
+    /// The batch reads its records, for a walk that wants values
+    pub is_reading: bool,
 }
 
 impl ScanBatch {
@@ -205,6 +207,7 @@ impl ScanBatch {
             rows: touched_capacity(SCAN_BATCH_KEYS, None),
             spans: touched_capacity(SCAN_BATCH_KEYS, None),
             words: touched_filled(SCAN_BATCH_KEYS, 0),
+            is_reading: true,
         }
     }
 
@@ -216,6 +219,11 @@ impl ScanBatch {
         self.records.clear();
         self.rows.clear();
         self.spans.clear();
+    }
+
+    /// Check the batch has room for another record, which only a batch that reads its records counts
+    pub fn has_room(&self, located_bytes: usize) -> bool {
+        !self.is_reading || located_bytes + MOST_BATCH_RECORD <= BATCH_BYTES
     }
 
     /// Check the batch has a key left to answer
@@ -274,6 +282,10 @@ pub struct ScanState {
     pub lookups: u64,
     /// Keys answered from a record the batch read in a joined run
     pub batched: u64,
+    /// Keys whose sealed row came from the index and steps that met a corrupt record, added to the store's totals once a batch
+    /// and when the scan goes back
+    pub sorted_scan_keys: u64,
+    pub corrupt_steps: u64,
     pub window: ScanWindows,
     /// A sorted column's sealed keys from its index, graves among them, the next at `sorted_next`
     pub sorted: KeyBatch,
@@ -548,6 +560,8 @@ impl ScanState {
             taken: 0,
             lookups: 0,
             batched: 0,
+            sorted_scan_keys: 0,
+            corrupt_steps: 0,
             window: ScanWindows::new(),
             batch: ScanBatch::new(widest_key),
             sorted: sorted_batch(widest_key),
@@ -573,6 +587,8 @@ impl ScanState {
         self.taken = 0;
         self.lookups = 0;
         self.batched = 0;
+        self.sorted_scan_keys = 0;
+        self.corrupt_steps = 0;
         for source in &mut self.sources {
             source.fills = 0;
             source.cache_steps = 0;

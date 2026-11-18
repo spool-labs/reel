@@ -16,7 +16,7 @@ use crate::engine::open_segment::MOST_WINDOW_RECORD_BYTES;
 use crate::engine::complete_path::sealed_of;
 use crate::engine::read_path::{HeldPin, KeyRead, Located, MOST_READ_TRIES, RecordWant, SealedRow, newest_of};
 use crate::engine::scan_state::{
-    BATCH_BYTES, BatchEntry, BatchRow, BlockTake, JOIN_GAP, MOST_BATCH_RECORD, MOST_BATCH_RUNS, MOST_WINDOW_RECORD, NO_GENERATION, NO_CHANGES, ScanBatch, batch_room,
+    BatchEntry, BatchRow, BlockTake, JOIN_GAP, MOST_BATCH_RECORD, MOST_BATCH_RUNS, MOST_WINDOW_RECORD, NO_GENERATION, NO_CHANGES, ScanBatch, batch_room,
     SCAN_CACHE_PARTS, SCAN_CACHE_WEIGH_EVERY, SEAT_BATCH, ScanRange, ScanState, ScanWindows, SegmentSource, ShardHead,
     index_of_word, seek_together, under_prefix,
 };
@@ -86,8 +86,10 @@ pub struct SeatAt<'key> {
 /// What a step does with the key it lands on
 #[derive(Debug)]
 pub enum ScanWant<'value> {
-    /// Count it
+    /// Answer it with no value read, as of the batch's point
     Key,
+    /// Count it, for a count over a prefix
+    Count,
     /// Read its value
     Value(&'value mut Vec<u8>),
     /// Keep its row in the scan's batch with no value read
@@ -135,9 +137,38 @@ impl<Backend: Io> EngineState<Backend> {
         Ok(scan)
     }
 
-    /// Hand a scan's buffers back
-    pub fn give_back_scan(&self, scan: ScanState) {
+    /// Hand a scan's buffers back, with the counts it kept
+    pub fn give_back_scan(&self, mut scan: ScanState) {
+        self.add_scan_counts(&mut scan);
         hold(&self.read_pool.scans).push(scan);
+    }
+
+    /// Add the counts a scan kept to the store's totals
+    pub fn add_scan_counts(&self, scan: &mut ScanState) {
+        if scan.sorted_scan_keys > 0 {
+            self.sorted_scan_keys.fetch_add(mem::take(&mut scan.sorted_scan_keys), Ordering::Relaxed);
+        }
+        if scan.corrupt_steps > 0 {
+            self.corruption_errors.fetch_add(mem::take(&mut scan.corrupt_steps), Ordering::Relaxed);
+        }
+    }
+
+    /// Count the step a batch answers, and locate the next batch when this one is used up, reading its records for a walk that
+    /// wants values. The caller's key buffer holds each key the locate steps on, since the answer writes it after
+    pub async fn ready_batch(
+        &self,
+        device: &impl DeviceReads<Backend::File>,
+        volume: &Volume<Backend>,
+        directory: Option<&ColumnDirectory>,
+        scan: &mut ScanState,
+        (key, is_reading): (&mut Vec<u8>, bool),
+    ) -> Result<(), StoreError> {
+        scan.asked += 1;
+        if scan.batch.has_next() {
+            return Ok(());
+        }
+        self.add_scan_counts(scan);
+        self.fill_batch(device, volume, directory, scan, (key, is_reading)).await
     }
 
     /// Take one step of a scan on this thread, through the ring as a blocking get reads, with a value buffer when it wants values.
@@ -157,15 +188,20 @@ impl<Backend: Io> EngineState<Backend> {
         let info = self.column(scan.column)?;
         let volume = &self.volumes[info.volume.0 as usize];
         let directory = self.directories[scan.column.0 as usize].as_ref();
-        // a walk for values answers a batch of keys located at one point, so a write landing while it lasts shows from the next
-        if let ScanWant::Value(value) = &mut want {
-            scan.asked += 1;
-            if !scan.batch.has_next() {
-                self.fill_batch(device, volume, directory, scan).await?;
-            }
-            if let Some(step) = self.answer_from_batch(ReadOn::new(device, volume), scan, key, value).await? {
-                return Ok(step);
-            }
+        // a walk for values or keys answers a batch of keys located at one point, so a write landing while it lasts shows from the next
+        let answer = match &mut want {
+            ScanWant::Value(value) => {
+                self.ready_batch(device, volume, directory, scan, (key, true)).await?;
+                self.answer_from_batch(ReadOn::new(device, volume), scan, key, value).await?
+            },
+            ScanWant::Key => {
+                self.ready_batch(device, volume, directory, scan, (key, false)).await?;
+                answer_key_from_batch(scan, key)
+            },
+            ScanWant::Count | ScanWant::Locate | ScanWant::Bytes => None,
+        };
+        if let Some(step) = answer {
+            return Ok(step);
         }
         let mut tries = 0;
         loop {
@@ -179,7 +215,7 @@ impl<Backend: Io> EngineState<Backend> {
             drop(held);
             match self.counted(outcome)? {
                 StepOutcome::Answer(step) => {
-                    self.corruption_errors.fetch_add(u64::from(step == ScanStep::Corrupt), Ordering::Relaxed);
+                    scan.corrupt_steps += u64::from(step == ScanStep::Corrupt);
                     return Ok(step);
                 },
                 StepOutcome::Passed => {},
@@ -272,7 +308,7 @@ impl<Backend: Io> EngineState<Backend> {
         &self,
         device: &impl DeviceReads<Backend::File>,
         volume: &Volume<Backend>,
-        scan: &ScanState,
+        scan: &mut ScanState,
         (candidate, is_reading): (&[u8], bool),
         read: &KeyRead<'_>,
     ) -> Result<Option<SealedRow>, StoreError> {
@@ -284,7 +320,7 @@ impl<Backend: Io> EngineState<Backend> {
             self.sorted_footer_asks.fetch_add(1, Ordering::Relaxed);
             return self.search_sealed(device, volume, read).await;
         }
-        self.sorted_scan_keys.fetch_add(1, Ordering::Relaxed);
+        scan.sorted_scan_keys += 1;
         Ok(Some(sealed_of(&entry)))
     }
 
@@ -335,7 +371,7 @@ impl<Backend: Io> EngineState<Backend> {
 
         let answer = match want {
             ScanWant::Value(value) => self.read_located(on, &read, &located, &mut scan.window, scan.direction, value).await,
-            ScanWant::Key => {
+            ScanWant::Key | ScanWant::Count => {
                 scan.counted += 1;
                 Ok(true)
             },
@@ -367,15 +403,18 @@ impl<Backend: Io> EngineState<Backend> {
         Ok(StepOutcome::Answer(step))
     }
 
-    /// Locate the walk's next keys at one point with no value read, then read their small sealed records in joined runs
+    /// Locate the walk's next keys at one point with no value read, then read their small sealed records in joined runs when the
+    /// walk wants values
     pub async fn fill_batch(
         &self,
         device: &impl DeviceReads<Backend::File>,
         volume: &Volume<Backend>,
         directory: Option<&ColumnDirectory>,
         scan: &mut ScanState,
+        (key, is_reading): (&mut Vec<u8>, bool),
     ) -> Result<(), StoreError> {
         scan.batch.clear();
+        scan.batch.is_reading = is_reading;
         let point = scan.point.unwrap_or_else(|| self.read_point(volume));
         scan.batch.point = point;
         // each head stands at the batch's point: a shard whose count read after the point hasn't moved keeps its head
@@ -390,15 +429,14 @@ impl<Backend: Io> EngineState<Backend> {
             }
             scan.mark_heads();
         }
-        let mut key = mem::take(&mut scan.out_key);
         let mut outcome = Ok(());
         // a batch takes keys while the records it reads still fit its buffer, so wide records read in batches of fewer keys
         let mut located_bytes = 0;
         // a caller that said how many rows it wants gets no more located than that, the one it asked for now among them
         let room = batch_room(scan.wanted, scan.asked);
-        while scan.batch.entries.len() < room && located_bytes + MOST_BATCH_RECORD <= BATCH_BYTES {
+        while scan.batch.entries.len() < room && scan.batch.has_room(located_bytes) {
             let entries = scan.batch.entries.len();
-            match self.counted(self.try_step(ReadOn::new(device, volume), directory, scan, Some(point), &mut key, ScanWant::Locate).await) {
+            match self.counted(self.try_step(ReadOn::new(device, volume), directory, scan, Some(point), key, ScanWant::Locate).await) {
                 Ok(StepOutcome::Answer(ScanStep::Found) | StepOutcome::Passed) => {
                     // open rows read with the batch as sealed ones do, so both count toward its buffer
                     if let Some(entry) = scan.batch.entries.get(entries)
@@ -420,12 +458,13 @@ impl<Backend: Io> EngineState<Backend> {
                 },
             }
         }
-        scan.out_key = key;
         // keys located before a failure answer first, and the next fill meets the failure again
         if scan.batch.entries.is_empty() {
             outcome?;
         }
-        self.read_batch(device, volume, scan).await;
+        if is_reading {
+            self.read_batch(device, volume, scan).await;
+        }
         Ok(())
     }
 
@@ -448,7 +487,7 @@ impl<Backend: Io> EngineState<Backend> {
         self.place_heads(volume, scan);
         let mut taken = 0;
         let mut key = [0; MOST_KEY_BYTES];
-        while scan.batch.entries.len() < room && *located_bytes + MOST_BATCH_RECORD <= BATCH_BYTES {
+        while scan.batch.entries.len() < room && scan.batch.has_room(*located_bytes) {
             // a row that landed since the heads were placed stands on no head, so a run needs heads placed at or above its point
             if directory.map_or(0, ColumnDirectory::generation) != scan.generation || point > scan.heads_mark {
                 break;
@@ -503,7 +542,7 @@ impl<Backend: Io> EngineState<Backend> {
                 self.place_heads(volume, scan);
             }
         }
-        self.sorted_scan_keys.fetch_add(taken, Ordering::Relaxed);
+        scan.sorted_scan_keys += taken;
         self.sorted_runs.fetch_add(u64::from(taken > 0), Ordering::Relaxed);
     }
 
@@ -1384,7 +1423,7 @@ impl<Backend: Io> EngineState<Backend> {
         let mut key = mem::take(&mut scan.out_key);
         let outcome = loop {
             let want = match kind {
-                ScanWantKind::Key => ScanWant::Key,
+                ScanWantKind::Key => ScanWant::Count,
                 ScanWantKind::Bytes => ScanWant::Bytes,
             };
             match self.step_scan(scan, &mut key, want) {
@@ -1492,6 +1531,7 @@ impl ScanWant<'_> {
     pub fn reborrow(&mut self) -> ScanWant<'_> {
         match self {
             ScanWant::Key => ScanWant::Key,
+            ScanWant::Count => ScanWant::Count,
             ScanWant::Value(value) => ScanWant::Value(value),
             ScanWant::Bytes => ScanWant::Bytes,
             ScanWant::Locate => ScanWant::Locate,
@@ -1523,6 +1563,15 @@ pub fn read_error(source: Error) -> StoreError {
         action: "reading a row block",
         source,
     }
+}
+
+/// Answer the batch's next key with no value read, as of the batch's point. Nothing when the batch is used up
+pub fn answer_key_from_batch(scan: &mut ScanState, key: &mut Vec<u8>) -> Option<ScanStep> {
+    let entry = scan.batch.entries.get(scan.batch.next).copied()?;
+    key.clear();
+    key.extend_from_slice(scan.batch.key_of(&entry));
+    scan.batch.next += 1;
+    Some(ScanStep::Found)
 }
 
 /// Bring a walk's batch of index entries to the first key it hasn't passed, reading the next batch from its position when the

@@ -76,6 +76,8 @@ pub enum KeyPlan {
     Spot(SealedRow, CacheLookup),
     /// A sealed record, which the batch reads unless the record cache holds it or it is too wide
     Sealed(SealedRow, CacheLookup),
+    /// An open record, which the batch takes from its slot's window or reads with the rest
+    Open(WriteRow),
 }
 
 /// What a read does with a record once it has found it
@@ -409,7 +411,8 @@ impl<Backend: Io> EngineState<Backend> {
         let volume = &self.volumes[self.column(column)?.volume.0 as usize];
         let mut plans = [KeyPlan::Own; BATCH_KEYS];
         let mut rows = [None; BATCH_KEYS];
-        for ((key, plan), row) in keys.iter().zip(&mut plans).zip(&mut rows) {
+        let mut spans = [None; BATCH_KEYS];
+        for ((key, plan), (row, span)) in keys.iter().zip(&mut plans).zip(rows.iter_mut().zip(&mut spans)) {
             let read = self.key_read(column, key, at.point, true)?;
             *plan = match self.locate(device, volume, &read).await {
                 // a cached record needs no read: the answer loop takes it from the cache
@@ -432,12 +435,19 @@ impl<Backend: Io> EngineState<Backend> {
                     }
                 },
                 Ok(KeyPlace::Row(Located::Absent)) => KeyPlan::Missing,
+                // an open value no cover hides reads with the batch, from its slot's window when the window holds it
+                Ok(KeyPlace::Row(Located::Open(open))) if open.kind == RowKind::Value && read.cover.is_none_or(|cover| cover <= open.place) => {
+                    *span = self.window_record(&open, records);
+                    if span.is_none() {
+                        *row = Some(BatchRow::open(&open));
+                    }
+                    KeyPlan::Open(open)
+                },
                 Ok(KeyPlace::Row(Located::Open(_row))) => KeyPlan::Own,
                 Err(StoreError::Corruption { .. }) => KeyPlan::Corrupt,
                 Err(error) => return Err(error),
             };
         }
-        let mut spans = [None; BATCH_KEYS];
         let mut words = [0; BATCH_KEYS];
         self.read_records(device, volume, &rows[..keys.len()], records, &mut spans, &mut words).await;
 
@@ -455,6 +465,18 @@ impl<Backend: Io> EngineState<Backend> {
                 },
                 KeyPlan::Own => {
                     self.read_key(device, &read, at.handovers, values, scratch).await?;
+                    continue;
+                },
+                KeyPlan::Open(open) => {
+                    // a record that fails its check may be from a slot that moved on, and the key's own read settles it
+                    if let Some((start, length)) = span
+                        && self.open_batched(device, (read.column, read.key), open.place, &records[start..start + length], scratch)
+                    {
+                        values.push_found(scratch);
+                        batched += 1;
+                    } else {
+                        self.read_key(device, &read, at.handovers, values, scratch).await?;
+                    }
                     continue;
                 },
                 KeyPlan::Spot(sealed, lookup) | KeyPlan::Sealed(sealed, lookup) => (sealed, lookup),

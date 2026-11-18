@@ -153,6 +153,33 @@ fn long_batch_in_turns() {
     store.close().expect("close");
 }
 
+const OPEN_KEYS: u64 = 400;
+const ASK_EVERY: usize = 7;
+
+// get_many_async reads open records with the sealed ones, and answers as get does over misses, a delete and keys asked twice
+#[test]
+fn many_async_over_open_and_sealed() {
+    let io = SimulatedIo::new(Seed(19));
+    let store = filled(&io);
+    for number in KEYS..KEYS + OPEN_KEYS {
+        store.put(COLUMN, &key(number), &value(number)).expect("put");
+    }
+    store.delete(COLUMN, &key(KEYS + 1)).expect("delete");
+    let mut names: Vec<Vec<u8>> = (0..KEYS + OPEN_KEYS).step_by(ASK_EVERY).map(key).collect();
+    names.extend([b"missing".to_vec(), key(KEYS + 1), key(3), key(KEYS + 2), key(3)]);
+    let keys: Vec<&[u8]> = names.iter().map(Vec::as_slice).collect();
+    let mut values = ValueList::new();
+    run(&io, Reads::get_many_async(&store, COLUMN, &keys, &mut values)).expect("many");
+    assert_eq!(values.len(), keys.len());
+    let mut buf = Vec::new();
+    for (index, name) in names.iter().enumerate() {
+        let is_found = run(&io, Reads::get_async(&store, COLUMN, name, &mut buf)).expect("get");
+        let expected = if is_found { ValueAnswer::Found(&buf) } else { ValueAnswer::Missing };
+        assert_eq!(values.answer(index), Some(expected), "key {name:?}");
+    }
+    store.close().expect("close");
+}
+
 // a cue's async reads see its point
 #[test]
 fn cue_forms() {

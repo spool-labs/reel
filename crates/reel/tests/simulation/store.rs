@@ -1267,6 +1267,72 @@ fn many_agrees_over_batches() {
     }
 }
 
+const JOINED_SEALED: u64 = 300;
+const JOINED_OPEN: u64 = 400;
+const JOINED_ROUNDS: u64 = 6;
+const JOINED_WRITES: u64 = 30;
+
+// check every answer get_many gives is the one get gives
+fn check_many_against_get(store: &Store, asked: &[&[u8]], values: &ValueList, seed: u64) {
+    assert_eq!(values.len(), asked.len());
+    for (index, key) in asked.iter().enumerate() {
+        let answer = values.answer(index).expect("an answer");
+        match read(store, key) {
+            Some(value) => assert_eq!(answer, ValueAnswer::Found(&value), "seed {seed}: key {key:?}"),
+            None => assert_eq!(answer, ValueAnswer::Missing, "seed {seed}: key {key:?}"),
+        }
+    }
+}
+
+// get_many reads open records with the sealed ones: over sealed keys, open ones, misses and keys asked twice, quiet and with a
+// writer between calls, every answer is get's, and open keys alone come from the batch's reads
+#[test]
+fn many_joins_open_and_sealed_reads() {
+    for seed in seeds(0..SEED_COUNT) {
+        let io = SimulatedIo::new(Seed(seed));
+        let store = open(&io);
+        let mut random = SeededRandom::new(Seed(seed));
+        for number in 0..JOINED_SEALED {
+            store.put(COLUMN, &key_of(number), &value_of(&mut random, number)).expect("put");
+        }
+        store.seal_now();
+        settle(&io);
+        for number in JOINED_SEALED..JOINED_SEALED + JOINED_OPEN {
+            store.put(COLUMN, &key_of(number), &value_of(&mut random, number)).expect("put");
+        }
+        let open_keys: Vec<Vec<u8>> = (JOINED_SEALED..JOINED_SEALED + JOINED_OPEN).map(key_of).collect();
+        let asked: Vec<&[u8]> = open_keys.iter().map(Vec::as_slice).collect();
+        let before = store.state.batched_gets.load(Ordering::Relaxed);
+        let mut values = ValueList::new();
+        store.get_many(COLUMN, &asked, &mut values).expect("get_many");
+        check_many_against_get(&store, &asked, &values, seed);
+        assert!(store.state.batched_gets.load(Ordering::Relaxed) > before, "seed {seed}: no open key came from a batch read");
+        for round in 0..JOINED_ROUNDS {
+            let mut keys: Vec<Vec<u8>> = (0..JOINED_SEALED + JOINED_OPEN).filter(|_number| random.below(3) == 0).map(key_of).collect();
+            keys.extend((0..MANY_ABSENT).map(|number| format!("absent-{number}").into_bytes()));
+            let twice: Vec<Vec<u8>> = keys.iter().take(keys.len() / 4).cloned().collect();
+            keys.extend(twice);
+            for index in (1..keys.len()).rev() {
+                keys.swap(index, random.below(index as u64 + 1) as usize);
+            }
+            let asked: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+            store.get_many(COLUMN, &asked, &mut values).expect("get_many");
+            check_many_against_get(&store, &asked, &values, seed);
+            // every other round a writer overwrites, deletes and adds keys before the next call
+            if round % 2 == 1 {
+                for _write in 0..JOINED_WRITES {
+                    let number = random.below(JOINED_SEALED + JOINED_OPEN + JOINED_WRITES);
+                    match random.below(3) {
+                        0 => store.delete(COLUMN, &key_of(number)).expect("delete"),
+                        _ => store.put(COLUMN, &key_of(number), &value_of(&mut random, number + round)).expect("put"),
+                    }
+                }
+            }
+        }
+        store.close().expect("close");
+    }
+}
+
 // an open segment holds a step of disk at create and gains the next step as its writes pass it, so a store never holds a whole
 // segment of disk ahead of what it wrote, and a spare holds a step alone
 #[test]

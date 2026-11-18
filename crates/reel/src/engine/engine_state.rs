@@ -162,6 +162,8 @@ pub struct EngineState<Backend: Io> {
     pub seats_together: AtomicU64,
     /// Open trees a scan's heads descended together
     pub heads_together: AtomicU64,
+    /// Records a merge found failing their check as it copied them, each of which damaged its segment
+    pub merge_check_failures: AtomicU64,
     /// Keys a head read ahead and dropped, since its shard changed before the run used them
     pub ahead_drops: AtomicU64,
     /// Values scans took from the record cache with no record read

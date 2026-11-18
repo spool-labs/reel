@@ -41,6 +41,7 @@ use reel_core::maintenance_report::{MaintenanceReport, PickOutcome, UnitKind, Wr
 use reel_core::scan::ScanStep;
 use reel_core::units::{ByteCount, FileOffset, Nanoseconds, RootId, VolumeId, WritePlace};
 use reel_core::write_batch::WriteBatch;
+use reel_sim::file_image::BitMask;
 use reel_sim::seeded_random::{Seed, SeededRandom};
 use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_file::SimulatedFile;
@@ -5221,4 +5222,58 @@ fn clean_pass_looks_on_from_its_end() {
     volume.holds.filters_out.store(false, Ordering::Release);
     io.hold_jobs("reel-planner", false);
     store.close().expect("close");
+}
+
+const CHECKED_SEED: u64 = 401;
+
+// a merge checks each record it copies: a flipped byte in a live sealed record stops the merge over it, so the record goes no
+// further, its segment is damaged, and the counter counts one. A clean merge counts none
+#[test]
+fn a_merge_damages_a_record_that_fails_its_check() {
+    for is_flipped in [false, true] {
+        let io = SimulatedIo::new(Seed(CHECKED_SEED));
+        let store = open(&io);
+        hold_compaction(&store, true);
+        for number in 0..SET_KEYS {
+            store.put(COLUMN, &set_key(number), &set_value(number, 1)).expect("put");
+        }
+        // half the keys again in the same segment, so the merge drops rows and copies the rest
+        for number in (0..SET_KEYS).filter(|number| number % 2 == 0) {
+            store.put(COLUMN, &set_key(number), &set_value(number, 2)).expect("put");
+        }
+        let only = seal(&store, &io);
+        let volume = &store.state.volumes[0];
+        if is_flipped {
+            let name = set_key(1);
+            let read = store.state.key_read(COLUMN, &name, store.state.read_point(volume), false).expect("read");
+            let row = in_place(store.state.search_sealed(&InPlace, volume, &read)).expect("search").expect("a sealed row");
+            let path = data_path(&volume.roots[0], row.segment);
+            io.rot(&path, FileOffset(row.row.offset.0 + row.row.length.0 - 1), BitMask(1)).expect("rot");
+        }
+        // a merge in key order copies record by record, where the check runs
+        let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+        job.rewrite.is_key_order_held = true;
+        job.rewrite.forced = Some(only);
+        assert!(start_merge(&mut job));
+        while job.rewrite.is_running() {
+            job.rewrite.step();
+        }
+        let failures = store.state.merge_check_failures.load(Ordering::Relaxed);
+        let is_damaged = hold(&volume.damaged).contains(&only);
+        if is_flipped {
+            assert_eq!(failures, 1, "the flipped record passed the merge's check");
+            assert!(is_damaged, "the segment the merge failed on is not damaged");
+            assert!(volume.table.holds(only), "the merge carried its input away past a failed record");
+        } else {
+            assert_eq!(failures, 0, "a clean merge counted a failure");
+            assert!(!is_damaged, "a clean merge damaged its input");
+            for number in 0..SET_KEYS {
+                assert_eq!(read(&store, &set_key(number)), Some(set_value(number, if number % 2 == 0 { 2 } else { 1 })));
+            }
+        }
+        let mut report = MaintenanceReport::default();
+        store.maintenance_report(&mut report);
+        assert_eq!(report.merge_check_failures, failures);
+        store.close().expect("close");
+    }
 }

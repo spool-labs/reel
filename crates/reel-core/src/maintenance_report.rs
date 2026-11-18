@@ -631,6 +631,8 @@ pub struct MaintenanceReport {
     pub seats_together: u64,
     /// Open trees a scan's heads descended together, their cache misses overlapped
     pub heads_together: u64,
+    /// Records merges found failing their check as they copied them, each of which damaged its segment
+    pub merge_check_failures: u64,
     /// Values scans took from the record cache with no record read, while it could hold most of a volume
     pub scan_cache_hits: u64,
     /// Block cache inserts that found their shard held by a visit and kept nothing
@@ -754,6 +756,7 @@ impl MaintenanceReport {
             scan_seats: 0,
             seats_together: 0,
             heads_together: 0,
+            merge_check_failures: 0,
             scan_cache_hits: 0,
             cache_inserts_skipped: 0,
             sorted_answers: 0,

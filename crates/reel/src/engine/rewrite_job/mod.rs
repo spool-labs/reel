@@ -18,6 +18,7 @@ use reel_core::maintenance_report::{
 use reel_core::units::{ByteCount, FileOffset, Nanoseconds, WritePlace};
 
 use crate::config::MAX_KEY_BYTES;
+use crate::engine::cue::JobCounts;
 use crate::engine::engine_state::EngineState;
 use crate::engine::seal_job::MOST_SEGMENT_BLOCKS;
 use crate::engine::volume::{MOST_MERGE_OUTPUTS, RewriteOutput, RowBytes, Volume};
@@ -418,6 +419,8 @@ pub struct RewriteJob<Backend: Io> {
     claimed: Option<(MergeTarget, bool)>,
     /// An input with a row block the device lost or that fails its check, which the give-up damages so no pick takes it again
     unreadable: Option<SegmentNumber>,
+    /// The job counts when the merge began deciding, so a record that fails its check after a free is no damage
+    started_counts: JobCounts,
     /// The need the region in hand was admitted with, which goes back at the job's end
     region_need: ByteCount,
     /// The forced segment a pick took, which goes back when admission turns the pick away
@@ -575,6 +578,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             admitted: None,
             claimed: None,
             unreadable: None,
+            started_counts: JobCounts { reclaims: 0, frees: 0 },
             region_need: ByteCount(0),
             forced_pick: None,
             is_paced: false,

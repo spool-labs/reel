@@ -22,7 +22,9 @@ use crate::engine::seal_job::MOST_SEGMENT_BLOCKS;
 use crate::engine::volume::{GRAVE_SLOT, MOST_MERGE_OUTPUTS, RewriteOutput, Volume};
 use crate::engine::walk_job::add_count;
 use crate::guard::hold;
-use crate::io::{Io, IoFile};
+use crate::io::{InPlace, Io, IoFile, in_place};
+use crate::record::record_check::RecordIdentity;
+use crate::record::record_reader::{RecordLocation, RecordRead, checked_payload, form_of};
 use crate::row_kind::RowKind;
 use crate::segment::footer_writer::ColumnStart;
 use crate::index::key_hash::hash_key;
@@ -536,7 +538,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             Some(offset) => offset,
             None => {
                 volume.keyed_copies.fetch_add(1, Ordering::Relaxed);
-                self.copy_record(&pin.file, &output.file, row).map_err(|error| self.note_lost(pin.head.segment, error))?
+                self.copy_record(&pin.file, &output.file, (column, row)).map_err(|error| self.note_lost(pin.head.segment, error))?
             },
         };
         let kept = FooterRow { offset, ..*row };
@@ -683,8 +685,9 @@ impl<Backend: Io> RewriteJob<Backend> {
         Ok(())
     }
 
-    /// Copy a record as stored, and return where it landed
-    pub fn copy_record(&mut self, from: &Backend::File, to: &Backend::File, row: &FooterRow) -> Result<FileOffset> {
+    /// Copy a record as stored once it checks out against the identity its row gives, and return where it landed. A record that
+    /// fails its check goes no further: the merge stops over it as unreadable, which damages its segment
+    pub fn copy_record(&mut self, from: &Backend::File, to: &Backend::File, (column, row): (ColumnId, &FooterRow)) -> Result<FileOffset> {
         let length = row.length.0 as usize;
         if length > self.buffer.len() - self.used {
             self.flush(to)?;
@@ -696,10 +699,16 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
         if length <= self.buffer.len() {
             from.read_exact_at(row.offset, &mut self.buffer[self.used..self.used + length])?;
+            if row.kind == RowKind::Value && !self.is_record_sound(from, (column, row), Some(&self.buffer[self.used..self.used + length])) {
+                return Err(self.failed_check());
+            }
             self.used += length;
             return Ok(at);
         }
 
+        if row.kind == RowKind::Value && !self.is_record_sound(from, (column, row), None) {
+            return Err(self.failed_check());
+        }
         let mut done = 0;
         while done < length {
             let part = (length - done).min(self.buffer.len());
@@ -709,6 +718,34 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
         self.records_end = FileOffset(at.0 + length as u64);
         Ok(at)
+    }
+
+    /// Check a record the merge copies against its row's identity: a one-chunk record where it lies in the buffer, and any other
+    /// through a reader, which checks a chunked record chunk by chunk
+    pub fn is_record_sound(&self, from: &Backend::File, (column, row): (ColumnId, &FooterRow), held: Option<&[u8]>) -> bool {
+        let identity = RecordIdentity { record_key: self.state.record_key, column, key: &self.key, kind: row.kind, place: row.place };
+        if let Some(record) = held
+            && let Some(form) = form_of(record).filter(|form| !form.is_chunked)
+        {
+            return checked_payload(record, form, &identity).is_some();
+        }
+        let Ok(info) = self.state.column(column) else {
+            return false;
+        };
+        let location = RecordLocation { offset: row.offset, length: row.length };
+        let mut value = Vec::new();
+        let mut reader = self.state.record_reader_for(&InPlace);
+        matches!(in_place(reader.read_value(&InPlace, from, location, &identity, info.codec, &mut value)), Ok(RecordRead::Valid))
+    }
+
+    /// Stop the merge over a record that failed its check. A free since the merge began can have punched a record it keeps, so
+    /// that stop is no damage
+    pub fn failed_check(&self) -> Error {
+        if !self.state.has_outlived(self.started_counts, true) {
+            return Error::from(ErrorKind::Interrupted);
+        }
+        self.state.merge_check_failures.fetch_add(1, Ordering::Relaxed);
+        Error::from(ErrorKind::InvalidData)
     }
 
     /// Write out the records the buffer holds

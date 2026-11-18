@@ -181,6 +181,7 @@ impl<Backend: Io> EngineState<Backend> {
         report.scan_seats = self.scan_seats.load(Ordering::Relaxed);
         report.seats_together = self.seats_together.load(Ordering::Relaxed);
         report.heads_together = self.heads_together.load(Ordering::Relaxed);
+        report.merge_check_failures = self.merge_check_failures.load(Ordering::Relaxed);
         report.scan_cache_hits = self.scan_cache_hits.load(Ordering::Relaxed);
         let caches = [Some(&self.row_cache), Some(&self.filter_cache), self.complete_cache.as_ref()];
         report.cache_inserts_skipped = caches.into_iter().flatten().map(BlockCache::skipped_inserts).sum();

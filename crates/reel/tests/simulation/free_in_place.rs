@@ -625,3 +625,47 @@ fn flipped_bytes_read_back_unchecked_while_counts_hold() {
     assert_ne!(found, b"small value", "the flipped byte was caught");
     store.close().expect("close");
 }
+
+const MERGE_ROUNDS: u64 = 6;
+const MERGED_KEYS: u64 = 4;
+
+// a merge that began before a free punched a record it keeps fails that record's check with the counts moved, which is no damage:
+// merges beside frees in place leave no segment damaged and count no failure
+#[test]
+fn merges_beside_frees_mark_no_damage() {
+    let io = SimulatedIo::new(Seed(43));
+    let store = open(&io);
+    keep_live(&store);
+    for round in 0..MERGE_ROUNDS {
+        for number in 0..MERGED_KEYS {
+            store.put(COLUMN, format!("key-{number}").as_bytes(), &large(round as u8)).expect("put");
+        }
+        // a dead row of its own, so a merge of the segment alone has something to drop
+        store.put(COLUMN, b"twice", b"first").expect("put");
+        store.put(COLUMN, b"twice", b"second").expect("put");
+        let segment = seal(&store, &io);
+        let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+        job.rewrite.forced = Some(segment);
+        let is_started = job.rewrite.start();
+        if is_started {
+            job.rewrite.step();
+        }
+        // the next round replaces this one's large records, and the walk frees them under the merge
+        for number in 0..MERGED_KEYS {
+            store.put(COLUMN, format!("key-{number}").as_bytes(), &large(round as u8 + 1)).expect("put");
+        }
+        seal(&store, &io);
+        while is_started && job.rewrite.is_running() {
+            job.rewrite.step();
+        }
+    }
+    let volume = &store.state.volumes[0];
+    assert!(volume.bytes_freed.load(Ordering::Acquire) > 0, "nothing was freed");
+    assert!(hold(&volume.damaged).is_empty(), "a merge beside frees damaged a segment");
+    assert_eq!(store.state.merge_check_failures.load(Ordering::Relaxed), 0);
+    for number in 0..MERGED_KEYS {
+        assert_eq!(read(&store, format!("key-{number}").as_bytes()), Some(large(MERGE_ROUNDS as u8)));
+    }
+    assert_eq!(read(&store, b"twice"), Some(b"second".to_vec()));
+    store.close().expect("close");
+}

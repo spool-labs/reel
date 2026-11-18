@@ -101,6 +101,8 @@ impl<Backend: Io> RewriteJob<Backend> {
         } else {
             volume.key_order_copies.fetch_add(1, Ordering::Relaxed);
         }
+        // a free after this can punch a record the merge keeps, and its check failing then is no damage
+        self.started_counts = self.state.cues.counts();
         self.marks.fill(0);
         self.cuts = 0;
         self.decide_bytes = 0;

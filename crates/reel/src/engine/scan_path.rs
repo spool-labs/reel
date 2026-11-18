@@ -959,7 +959,7 @@ impl<Backend: Io> EngineState<Backend> {
         let ReadOn { device, target: volume } = on;
         match located {
             Located::Absent => Ok(false),
-            Located::Open(row) => self.read_open(device, read, row, RecordWant::Whole, value).await,
+            Located::Open(row) => self.read_open(device, read, (row, volume.scans_use_cache.load(Ordering::Relaxed)), RecordWant::Whole, value).await,
             Located::Sealed(row) => {
                 if let Some(answer) = self.read_from_window(on, read, row, window, direction, value).await {
                     return Ok(answer);

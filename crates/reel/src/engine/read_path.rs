@@ -569,7 +569,7 @@ impl<Backend: Io> EngineState<Backend> {
                 if row.kind != RowKind::Value || is_hidden(row.place) {
                     return Ok(false);
                 }
-                if self.read_open(device, read, &row, want, buf).await? {
+                if self.read_open(device, read, (&row, true), want, buf).await? {
                     return Ok(true);
                 }
                 continue;
@@ -590,7 +590,7 @@ impl<Backend: Io> EngineState<Backend> {
                     if row.kind != RowKind::Value || is_hidden(row.place) {
                         return Ok(false);
                     }
-                    if self.read_open(device, read, &row, want, buf).await? {
+                    if self.read_open(device, read, (&row, true), want, buf).await? {
                         return Ok(true);
                     }
                 },
@@ -769,12 +769,14 @@ impl<Backend: Io> EngineState<Backend> {
         Ok(Some(outcome))
     }
 
-    /// Read a record from an open segment, and return false when the slot has moved on
+    /// Read a record from an open segment through the record cache, and return false when the slot has moved on. A record stays
+    /// at its segment and offset through the seal, so what the cache keeps answers after it too. A read that admits takes a
+    /// record in on its first miss
     pub async fn read_open(
         &self,
         device: &impl DeviceReads<Backend::File>,
         read: &KeyRead<'_>,
-        row: &WriteRow,
+        (row, is_admitting): (&WriteRow, bool),
         want: RecordWant,
         buf: &mut Vec<u8>,
     ) -> Result<bool, StoreError> {
@@ -787,12 +789,25 @@ impl<Backend: Io> EngineState<Backend> {
             Some(RecordRead::Failed) => return Err(corruption(read)),
             None => {},
         };
+        // the slot is pinned on the row's segment, and the cache holds each value with its key, so a hit is this row's record
+        let lookup = match want {
+            RecordWant::Whole => self.record_cache.get(row.segment, row.offset, read.key, buf),
+            RecordWant::Window(window) => self.record_cache.get_window(row.segment, row.offset, read.key, window.offset, window.length, buf),
+        };
+        if lookup == CacheLookup::Hit {
+            return Ok(true);
+        }
         let location = RecordLocation {
             offset: row.offset,
             length: row.length,
         };
         match self.read_record(ReadOn::new(device, &pin.file), location, row.place, read, want, buf).await? {
-            RecordRead::Valid => Ok(true),
+            RecordRead::Valid => {
+                if is_admitting && want == RecordWant::Whole {
+                    self.record_cache.admit(row.segment, row.offset, read.key, buf);
+                }
+                Ok(true)
+            },
             RecordRead::Failed => Err(corruption(read)),
         }
     }

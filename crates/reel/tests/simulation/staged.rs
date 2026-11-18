@@ -617,7 +617,7 @@ fn reused_slot() {
 
     let read_key: KeyRead = state.key_read(COLUMN, b"key", point, false).expect("key");
     let mut buf = Vec::new();
-    let is_read = in_place(state.read_open(&InPlace, &read_key, &row, RecordWant::Whole, &mut buf)).expect("no corruption");
+    let is_read = in_place(state.read_open(&InPlace, &read_key, (&row, false), RecordWant::Whole, &mut buf)).expect("no corruption");
 
     assert!(!is_read);
     assert_eq!(read(&store, b"key"), Some(b"value".to_vec()));
@@ -890,7 +890,7 @@ fn finish_get(state: &State, get: &StagedGet) -> Option<Vec<u8>> {
         if row.kind != RowKind::Value {
             return None;
         }
-        if in_place(state.read_open(&InPlace, &read, &row, RecordWant::Whole, &mut buf)).expect("read") {
+        if in_place(state.read_open(&InPlace, &read, (&row, false), RecordWant::Whole, &mut buf)).expect("read") {
             return Some(buf);
         }
     }

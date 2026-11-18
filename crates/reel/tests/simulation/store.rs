@@ -22,7 +22,9 @@ use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_io::SimulatedIo;
 use reel::record::codec::Codec;
 use reel_core::column_id::ColumnId;
+use reel_core::direction::Direction;
 use reel_core::reads::ValueWindow;
+use reel_core::scan::ScanStep;
 use reel_core::store_error::StoreError;
 use reel_core::units::{ByteCount, Nanoseconds, RootId, RowCount, VolumeId};
 use reel_core::value_list::{ReadBuffers, ValueAnswer, ValueList};
@@ -1329,6 +1331,131 @@ fn many_joins_open_and_sealed_reads() {
                 }
             }
         }
+        store.close().expect("close");
+    }
+}
+
+// a record the cache took while its segment was open is still a hit under the same segment and offset once the segment seals,
+// since a seal moves no record
+#[test]
+fn a_record_cached_open_stays_a_hit_after_its_seal() {
+    let io = SimulatedIo::new(Seed(71));
+    let store = open(&io);
+    store.put(COLUMN, b"cached", b"cached value").expect("put");
+    let volume = &store.state.volumes[0];
+    let row = store.state.index.lookup(COLUMN, b"cached", store.state.read_point(volume), volume.view()).row.expect("an open row");
+    store.state.record_cache.admit(row.segment, row.offset, b"cached", b"cached value");
+    store.seal_now();
+    settle(&io);
+    let after = store.state.index.lookup(COLUMN, b"cached", store.state.read_point(volume), volume.view());
+    assert!(after.row.is_none(), "the row is still open after the seal");
+    let hits = store.state.record_cache.hits.total();
+    assert_eq!(read(&store, b"cached").as_deref(), Some(&b"cached value"[..]));
+    assert!(store.state.record_cache.hits.total() > hits, "the sealed read missed the record cached while it was open");
+    store.close().expect("close");
+}
+
+const FILLER_VALUE: usize = 1024;
+const CACHE_KEYS: u64 = 400;
+const CACHE_OPS: u64 = 3_000;
+const CACHE_SEAL_EVERY: u64 = 700;
+
+// write past a slot's window, so the next get of an earlier record reads it from the file
+fn fill_past_window(store: &Store, tag: &str) {
+    for number in 0..(RECORD_WINDOW_BYTES / FILLER_VALUE + 2) as u64 {
+        store.put(COLUMN, format!("filler-{tag}-{number}").as_bytes(), &[number as u8; FILLER_VALUE]).expect("put");
+    }
+}
+
+// a get of an open record the window no longer holds takes it into the record cache, and a get after its seal is a hit
+#[test]
+fn an_open_get_caches_its_record_through_the_seal() {
+    let io = SimulatedIo::new(Seed(72));
+    let store = open(&io);
+    store.put(COLUMN, b"hot", b"hot value").expect("put");
+    fill_past_window(&store, "first");
+    let admits = store.state.record_cache.admits.total();
+    assert_eq!(read(&store, b"hot").as_deref(), Some(&b"hot value"[..]));
+    assert!(store.state.record_cache.admits.total() > admits, "the open get admitted nothing");
+    let hits = store.state.record_cache.hits.total();
+    assert_eq!(read(&store, b"hot").as_deref(), Some(&b"hot value"[..]));
+    assert!(store.state.record_cache.hits.total() > hits, "the second open get missed the cache");
+    store.seal_now();
+    settle(&io);
+    let hits = store.state.record_cache.hits.total();
+    assert_eq!(read(&store, b"hot").as_deref(), Some(&b"hot value"[..]));
+    assert!(store.state.record_cache.hits.total() > hits, "the get after the seal missed the cache");
+    store.close().expect("close");
+}
+
+// a key overwritten or deleted while open answers its newest row, whatever the cache took of the row before
+#[test]
+fn an_open_record_cached_gives_way_to_an_overwrite_and_a_delete() {
+    let io = SimulatedIo::new(Seed(73));
+    let store = open(&io);
+    store.put(COLUMN, b"changed", b"first").expect("put");
+    store.put(COLUMN, b"gone", b"here").expect("put");
+    fill_past_window(&store, "first");
+    assert_eq!(read(&store, b"changed").as_deref(), Some(&b"first"[..]));
+    assert_eq!(read(&store, b"gone").as_deref(), Some(&b"here"[..]));
+    store.put(COLUMN, b"changed", b"second").expect("put");
+    store.delete(COLUMN, b"gone").expect("delete");
+    assert_eq!(read(&store, b"changed").as_deref(), Some(&b"second"[..]));
+    assert_eq!(read(&store, b"gone"), None);
+    fill_past_window(&store, "second");
+    assert_eq!(read(&store, b"changed").as_deref(), Some(&b"second"[..]));
+    assert_eq!(read(&store, b"gone"), None);
+    store.seal_now();
+    settle(&io);
+    assert_eq!(read(&store, b"changed").as_deref(), Some(&b"second"[..]));
+    assert_eq!(read(&store, b"gone"), None);
+    store.close().expect("close");
+}
+
+// gets beside a writer over open and sealed rows, with seals between, answer the model while the cache takes open records, and
+// get_many and a whole walk agree at the end
+#[test]
+fn gets_beside_a_writer_match_the_model_with_open_records_cached() {
+    for seed in seeds(0..SEED_COUNT) {
+        let io = SimulatedIo::new(Seed(seed));
+        let store = open(&io);
+        let mut random = SeededRandom::new(Seed(seed));
+        let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        for operation in 0..CACHE_OPS {
+            let name = key_of(random.below(CACHE_KEYS));
+            match random.below(6) {
+                0..2 => {
+                    let value = value_of(&mut random, operation);
+                    store.put(COLUMN, &name, &value).expect("put");
+                    model.insert(name, value);
+                },
+                2 => {
+                    store.delete(COLUMN, &name).expect("delete");
+                    model.remove(&name);
+                },
+                _ => assert_eq!(read(&store, &name).as_ref(), model.get(&name), "seed {seed}: get of {name:?}"),
+            }
+            if operation % CACHE_SEAL_EVERY == CACHE_SEAL_EVERY - 1 {
+                store.seal_now();
+                settle(&io);
+            }
+        }
+        let names: Vec<Vec<u8>> = (0..CACHE_KEYS).map(key_of).collect();
+        let asked: Vec<&[u8]> = names.iter().map(Vec::as_slice).collect();
+        let mut values = ValueList::new();
+        store.get_many(COLUMN, &asked, &mut values).expect("get_many");
+        for (index, name) in names.iter().enumerate() {
+            let expected = model.get(name).map_or(ValueAnswer::Missing, |value| ValueAnswer::Found(value));
+            assert_eq!(values.answer(index), Some(expected), "seed {seed}: get_many of {name:?}");
+        }
+        let mut scan = store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan");
+        let (mut name, mut value, mut found) = (Vec::new(), Vec::new(), Vec::new());
+        while scan.next_row(&mut name, &mut value).expect("step") == ScanStep::Found {
+            found.push((name.clone(), value.clone()));
+        }
+        drop(scan);
+        let expected: Vec<(Vec<u8>, Vec<u8>)> = model.iter().map(|(name, value)| (name.clone(), value.clone())).collect();
+        assert!(found == expected, "seed {seed}: the walk's rows differ from the model");
         store.close().expect("close");
     }
 }

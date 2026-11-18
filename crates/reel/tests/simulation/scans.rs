@@ -1247,8 +1247,7 @@ fn scans_read_values_in_batches() {
     assert_eq!(rest[batch_keys as usize + 4], (key(batch_keys + 5), b"second".to_vec()));
     store.state.give_back_scan(scan);
 
-    // the segments leave while a batch stands in them: the records it read answer as of its point, and key 5, whose row sat in
-    // an open segment that sealed since, takes the walk back to locate again at the newer point
+    // the segments leave while a batch stands in them: the records it read, key 5's open one among them, answer as of its point
     let mut scan = store.state.take_scan(&range, None).expect("scan");
     let first = step_keys(&store, &mut scan, 1);
     for number in 0..BATCH_TEST_KEYS {
@@ -1260,7 +1259,7 @@ fn scans_read_values_in_batches() {
     let rest = step_keys(&store, &mut scan, u64::MAX);
     let keys: Vec<Vec<u8>> = first.iter().chain(&rest).map(|(found, _value)| found.clone()).collect();
     assert_eq!(keys, (0..BATCH_TEST_KEYS).map(key).collect::<Vec<_>>());
-    let held = 4;
+    let held = batch_keys as usize - 1;
     assert!(rest[..held].iter().all(|(_key, value)| value != b"third"));
     assert!(rest[held..].iter().all(|(_key, value)| value == b"third"));
     store.state.give_back_scan(scan);

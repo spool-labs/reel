@@ -643,6 +643,8 @@ pub struct MaintenanceReport {
     pub sorted_scan_keys: u64,
     /// Runs of index entries a batch located in one loop
     pub sorted_runs: u64,
+    /// Open records a scan batch copied from their slot's window
+    pub scan_window_records: u64,
     /// Output row blocks a merge's install couldn't read to move sorted entries
     pub sorted_moves_missed: u64,
     /// Time and footer bytes the last open's fill of the sorted indexes took
@@ -756,6 +758,7 @@ impl MaintenanceReport {
             sorted_footer_asks: 0,
             sorted_scan_keys: 0,
             sorted_runs: 0,
+            scan_window_records: 0,
             sorted_moves_missed: 0,
             sorted_fill_time: Nanoseconds(0),
             sorted_fill_bytes: ByteCount(0),

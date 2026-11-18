@@ -195,6 +195,18 @@ pub struct RowBytes {
     pub dead: u64,
 }
 
+/// Work a test runs from inside a scan
+#[cfg(feature = "test-hooks")]
+#[derive(Clone)]
+pub struct RunHook(pub Arc<dyn Fn() + Send + Sync>);
+
+#[cfg(feature = "test-hooks")]
+impl std::fmt::Debug for RunHook {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RunHook")
+    }
+}
+
 /// What a test holds off. A build without the test hooks has none of these, and every check reads false
 #[cfg(feature = "test-hooks")]
 #[derive(Debug, Default)]
@@ -213,6 +225,8 @@ pub struct TestHolds {
     pub low_estimate: AtomicBool,
     /// Walks and merges look keys up through the table alone, to compare against the cursor
     pub no_cursor: AtomicBool,
+    /// Work a scan's run does between its index entry for a head key and its write index lookup
+    pub between_run_looks: Mutex<Option<RunHook>>,
     /// Merges ask every row, to compare against the dead bits
     pub no_bits: AtomicBool,
     /// Merges ask one bit decision in so many, as a release build does, so a bench measures the bits and not the check
@@ -504,6 +518,19 @@ pub struct Volume<Backend: Io> {
 }
 
 impl<Backend: Io> Volume<Backend> {
+    /// Run the work a test set between a run's two looks at a head key
+    #[cfg(feature = "test-hooks")]
+    pub fn between_run_looks(&self) {
+        let hook = crate::guard::hold(&self.holds.between_run_looks).clone();
+        if let Some(RunHook(work)) = hook {
+            work();
+        }
+    }
+
+    /// Run nothing between a run's two looks, in a build without the hooks
+    #[cfg(not(feature = "test-hooks"))]
+    pub const fn between_run_looks(&self) {}
+
     /// Check a test holds compaction off
     #[cfg(feature = "test-hooks")]
     pub fn is_compaction_held(&self) -> bool {

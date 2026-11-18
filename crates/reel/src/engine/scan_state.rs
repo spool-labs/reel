@@ -9,7 +9,8 @@ use reel_core::units::{ByteCount, FileOffset, Nanoseconds, RowCount, WritePlace}
 use crate::index::shard_cursor::{ShardCursor, TreeCursor};
 use crate::index::sorted_keys::{KeyBatch, KeyEntry, MOST_KEY_BYTES};
 use crate::engine::read_path::{Located, SealedRow};
-use crate::index::open_slots::OpenSlots;
+use crate::index::open_slots::{OpenSlot, OpenSlots};
+use crate::index::write_row::WriteRow;
 use crate::index::write_index::SHARD_COUNT;
 use crate::pool::{touched_capacity, touched_filled};
 use crate::row_kind::RowKind;
@@ -126,6 +127,32 @@ pub fn batch_room(wanted: u64, asked: u64) -> usize {
 /// A batch entry that holds nothing, which the batch's room is written with at open
 pub const NO_BATCH_ENTRY: BatchEntry = BatchEntry { key_at: 0, key_length: 0, located: Located::Absent, record: None, is_value: false };
 
+/// A record a batch reads: its segment, the open slot that holds it while the segment is open, and where it sits
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BatchRow {
+    pub segment: SegmentNumber,
+    pub slot: Option<OpenSlot>,
+    pub offset: FileOffset,
+    pub length: ByteCount,
+}
+
+impl BatchRow {
+    /// Read a sealed row's record
+    pub fn sealed(row: &SealedRow) -> Self {
+        Self { segment: row.segment, slot: None, offset: row.row.offset, length: row.row.length }
+    }
+
+    /// Read an open row's record through its slot
+    pub fn open(row: &WriteRow) -> Self {
+        Self { segment: row.segment, slot: Some(row.slot), offset: row.offset, length: row.length }
+    }
+
+    /// Order records by file and offset, so neighbours join
+    pub fn order(&self) -> (SegmentNumber, bool, u64) {
+        (self.segment, self.slot.is_some(), self.offset.0)
+    }
+}
+
 /// One key a scan located ahead, and where its record sits in the batch's buffer once read
 #[derive(Clone, Copy, Debug)]
 pub struct BatchEntry {
@@ -146,8 +173,8 @@ pub struct ScanBatch {
     pub point: WritePlace,
     pub keys: Vec<u8>,
     pub records: Vec<u8>,
-    /// Each entry's sealed row for the batch's read, and the span its record landed at
-    pub rows: Vec<Option<SealedRow>>,
+    /// Each entry's record for the batch's read, and the span it landed at
+    pub rows: Vec<Option<BatchRow>>,
     pub spans: Vec<Option<(usize, usize)>>,
 }
 
@@ -187,7 +214,7 @@ impl ScanBatch {
 
     /// Read the heap the batch holds
     pub fn heap_bytes(&self) -> usize {
-        let rows = self.rows.capacity() * size_of::<Option<SealedRow>>() + self.spans.capacity() * size_of::<Option<(usize, usize)>>();
+        let rows = self.rows.capacity() * size_of::<Option<BatchRow>>() + self.spans.capacity() * size_of::<Option<(usize, usize)>>();
         self.entries.capacity() * size_of::<BatchEntry>() + self.keys.capacity() + self.records.capacity() + rows
     }
 }
@@ -839,7 +866,7 @@ pub fn planned_scan_bytes(widest_key: u64, open_slots: usize) -> u64 {
     let held = HELD_SOURCE_BLOCKS * ROW_BLOCK_BYTES;
     let tree = 2 * MOST_SCAN_SOURCES * size_of::<u16>();
     let sorted = SCAN_BATCH_KEYS * ((widest_key as usize).clamp(1, MOST_KEY_BYTES) + size_of::<KeyEntry>());
-    let rows = SCAN_BATCH_KEYS * (size_of::<Option<SealedRow>>() + size_of::<Option<(usize, usize)>>());
+    let rows = SCAN_BATCH_KEYS * (size_of::<Option<BatchRow>>() + size_of::<Option<(usize, usize)>>());
     let batch = SCAN_BATCH_KEYS * (widest_key as usize + size_of::<BatchEntry>()) + BATCH_BYTES + sorted + rows;
     keys + (sources + heads + held + tree + batch + MOST_SCAN_SOURCES * size_of::<SegmentNumber>() + SCAN_WINDOWS * SCAN_WINDOW_BYTES) as u64
 }

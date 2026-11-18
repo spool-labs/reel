@@ -13,7 +13,7 @@ use reel_core::units::{ByteCount, FileOffset, WritePlace};
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::cue::JobCounts;
 use crate::engine::engine_state::EngineState;
-use crate::engine::open_segment::MOST_WINDOW_RECORD_BYTES; use crate::engine::scan_state::{BATCH_BYTES, BATCH_KEYS};
+use crate::engine::open_segment::MOST_WINDOW_RECORD_BYTES; use crate::engine::scan_state::{BATCH_BYTES, BATCH_KEYS, BatchRow};
 use crate::engine::volume::Volume;
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::index::record_cache::CacheLookup;
@@ -416,7 +416,7 @@ impl<Backend: Io> EngineState<Backend> {
                 Ok(KeyPlace::Spot(sealed)) => {
                     let lookup = self.record_cache.get(sealed.segment, sealed.row.offset, read.key, scratch);
                     if lookup != CacheLookup::Hit {
-                        *row = Some(sealed);
+                        *row = Some(BatchRow::sealed(&sealed));
                     }
                     KeyPlan::Spot(sealed, lookup)
                 },
@@ -426,7 +426,7 @@ impl<Backend: Io> EngineState<Backend> {
                     } else {
                         let lookup = self.record_cache.get(sealed.segment, sealed.row.offset, read.key, scratch);
                         if lookup != CacheLookup::Hit {
-                            *row = Some(sealed);
+                            *row = Some(BatchRow::sealed(&sealed));
                         }
                         KeyPlan::Sealed(sealed, lookup)
                     }
@@ -459,7 +459,7 @@ impl<Backend: Io> EngineState<Backend> {
                 KeyPlan::Spot(sealed, lookup) | KeyPlan::Sealed(sealed, lookup) => (sealed, lookup),
             };
             if let Some((start, length)) = span
-                && self.open_batched(device, &read, &sealed, &records[start..start + length], scratch)
+                && self.open_batched(device, &read, sealed.row.place, &records[start..start + length], scratch)
             {
                 if lookup == (CacheLookup::Miss { is_admitted: true }) {
                     self.record_cache.admit(sealed.segment, sealed.row.offset, read.key, scratch);

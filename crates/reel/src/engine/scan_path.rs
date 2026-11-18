@@ -11,11 +11,12 @@ use reel_core::scan::ScanStep;
 use reel_core::store_error::StoreError;
 use reel_core::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
-use crate::engine::engine_state::EngineState;
+use crate::engine::engine_state::{EngineState, SlotPin};
+use crate::engine::open_segment::MOST_WINDOW_RECORD_BYTES;
 use crate::engine::complete_path::sealed_of;
 use crate::engine::read_path::{HeldPin, KeyRead, Located, MOST_READ_TRIES, RecordWant, SealedRow, newest_of};
 use crate::engine::scan_state::{
-    BATCH_BYTES, BatchEntry, BlockTake, JOIN_GAP, MOST_BATCH_RECORD, MOST_BATCH_RUNS, MOST_WINDOW_RECORD, NO_GENERATION, NO_CHANGES, SCAN_BATCH_KEYS, ScanBatch, batch_room,
+    BATCH_BYTES, BatchEntry, BatchRow, BlockTake, JOIN_GAP, MOST_BATCH_RECORD, MOST_BATCH_RUNS, MOST_WINDOW_RECORD, NO_GENERATION, NO_CHANGES, SCAN_BATCH_KEYS, ScanBatch, batch_room,
     SCAN_CACHE_PARTS, SCAN_CACHE_WEIGH_EVERY, SEAT_BATCH, ScanRange, ScanState, ScanWindows, SegmentSource, ShardHead,
     seek_together, under_prefix,
 };
@@ -32,7 +33,8 @@ use crate::segment::footer_reader::RowAt;
 use crate::index::record_cache::CacheLookup;
 use crate::segment::block_cache::{BlockKey, NO_BLOCK};
 use crate::segment::block_entry::{BlockEntry, KeyBound, SHARED_HEAD_BYTES};
-use crate::segment::segment_table::Seat;
+use crate::segment::segment_table::{Seat, SegmentPin};
+use crate::index::write_row::WriteRow;
 use crate::segment::column_directory::ColumnDirectory;
 use crate::segment::damage_list::KeyRange;
 use crate::segment::segment_tail::{ColumnTail, SegmentNumber};
@@ -398,10 +400,11 @@ impl<Backend: Io> EngineState<Backend> {
             let entries = scan.batch.entries.len();
             match self.counted(self.try_step(ReadOn::new(device, volume), directory, scan, Some(point), &mut key, ScanWant::Locate).await) {
                 Ok(StepOutcome::Answer(ScanStep::Found) | StepOutcome::Passed) => {
-                    if let Some(BatchEntry { located: Located::Sealed(row), .. }) = scan.batch.entries.get(entries)
-                        && row.row.length.0 as usize <= MOST_BATCH_RECORD
+                    // open rows read with the batch as sealed ones do, so both count toward its buffer
+                    if let Some(entry) = scan.batch.entries.get(entries)
+                        && entry.located.length().0 as usize <= MOST_BATCH_RECORD
                     {
-                        located_bytes += row.row.length.0 as usize;
+                        located_bytes += entry.located.length().0 as usize;
                     }
                     self.take_sorted_run(volume, directory, scan, (point, room), &mut located_bytes);
                 },
@@ -426,9 +429,7 @@ impl<Backend: Io> EngineState<Backend> {
         Ok(())
     }
 
-    /// Locate the index batch's next keys in one loop while nothing else can answer them: no head stands before them, no cover or
-    /// damage lies on the volume, the list is the one the walk was placed under, and each entry is at or under the point. Any
-    /// other key ends the run, and the step that answers one key at a time takes it
+    /// Locate the walk's next index and head keys in one loop while no cover, damage, new list or newer entry needs a step
     pub fn take_sorted_run(
         &self,
         volume: &Volume<Backend>,
@@ -440,40 +441,67 @@ impl<Backend: Io> EngineState<Backend> {
         let Some(index) = self.sorted_index(scan.column).filter(|_index| scan.is_on_index) else {
             return;
         };
-        // a row that landed since the heads were placed stands on no head, so a run needs heads placed at or above its point
-        if !volume.covers.is_empty() || !volume.damage.is_empty() || point > scan.heads_mark {
+        if !volume.covers.is_empty() || !volume.damage.is_empty() {
             return;
         }
+        // the step before the run passed a key, and a head that showed it moves on before the run reads the heads
+        self.place_heads(volume, scan);
         let mut taken = 0;
         let mut key = [0; MOST_KEY_BYTES];
         while scan.batch.entries.len() < room && *located_bytes + MOST_BATCH_RECORD <= BATCH_BYTES {
-            if directory.map_or(0, ColumnDirectory::generation) != scan.generation {
+            // a row that landed since the heads were placed stands on no head, so a run needs heads placed at or above its point
+            if directory.map_or(0, ColumnDirectory::generation) != scan.generation || point > scan.heads_mark {
                 break;
             }
             fill_sorted(index, scan);
-            let Some(next) = scan.sorted_key() else {
-                break;
-            };
+            let sorted = scan.sorted_key();
             let head = scan.closest_head.map(|head| scan.heads[head].key.as_slice());
-            if scan.is_past_limit(next) || head.is_some_and(|head| !scan.is_before(next, head)) {
-                break;
-            }
-            let entry = scan.sorted.entries[scan.sorted_next];
-            if entry.place > point {
+            // the nearer of the index's next key and the heads' goes first, and a key both show steps both
+            let (next, is_head, is_sorted) = match (sorted, head) {
+                (None, None) => break,
+                (Some(sorted), None) => (sorted, false, true),
+                (None, Some(head)) => (head, true, false),
+                (Some(sorted), Some(head)) if sorted == head => (sorted, true, true),
+                (Some(sorted), Some(head)) if scan.is_before(sorted, head) => (sorted, false, true),
+                (Some(_sorted), Some(head)) => (head, true, false),
+            };
+            if scan.is_past_limit(next) {
                 break;
             }
             let length = next.len();
             key[..length].copy_from_slice(next);
-            if !entry.is_grave {
-                let key_at = scan.batch.keys.len();
-                scan.batch.keys.extend_from_slice(&key[..length]);
-                scan.batch.entries.push(BatchEntry { key_at, key_length: length, located: Located::Sealed(sealed_of(&entry)), record: None, is_value: false });
-                if entry.length.0 as usize <= MOST_BATCH_RECORD {
-                    *located_bytes += entry.length.0 as usize;
-                }
-                taken += 1;
+            let sealed = match is_sorted.then(|| scan.sorted.entries[scan.sorted_next]) {
+                // an entry newer than the point asks the footers, in the step that answers one key at a time
+                Some(entry) if entry.place > point => break,
+                Some(entry) => Some(sealed_of(&entry)),
+                None => None,
+            };
+            let name = &key[..length];
+            let open = if is_head {
+                volume.between_run_looks();
+                scan.lookups += 1;
+                self.index.lookup(scan.column, name, point, volume.view()).row
+            } else {
+                None
+            };
+            // a seal between the two looks moves the row out of the view, so the step that answers one key at a time takes the key
+            if directory.map_or(0, ColumnDirectory::generation) != scan.generation {
+                break;
             }
-            scan.pass(&key[..length]);
+            let located = newest_of(open, sealed);
+            if located.has_value() {
+                let key_at = scan.batch.keys.len();
+                scan.batch.keys.extend_from_slice(name);
+                scan.batch.entries.push(BatchEntry { key_at, key_length: length, located, record: None, is_value: false });
+                if located.length().0 as usize <= MOST_BATCH_RECORD {
+                    *located_bytes += located.length().0 as usize;
+                }
+                taken += u64::from(matches!(located, Located::Sealed(_)));
+            }
+            scan.pass(name);
+            if is_head {
+                self.place_heads(volume, scan);
+            }
         }
         self.sorted_scan_keys.fetch_add(taken, Ordering::Relaxed);
         self.sorted_runs.fetch_add(u64::from(taken > 0), Ordering::Relaxed);
@@ -496,9 +524,7 @@ impl<Backend: Io> EngineState<Backend> {
         volume.scans_use_cache.load(Ordering::Relaxed)
     }
 
-    /// Read the batch's sealed records together. When the record cache can hold most of the volume, a value it holds comes from
-    /// there with no read. A record left out takes its own read when its key is answered. The rows and spans live in the batch,
-    /// at full size from open, and a batch clears only as many as it holds
+    /// Read the batch's records together, from the record cache, a slot's window or joined reads, and leave the rest to own reads
     pub async fn read_batch(&self, device: &impl DeviceReads<Backend::File>, volume: &Volume<Backend>, scan: &mut ScanState) {
         let is_cached = self.scans_use_cache(volume);
         let ScanBatch { entries, keys, records, rows, spans, .. } = &mut scan.batch;
@@ -506,8 +532,16 @@ impl<Backend: Io> EngineState<Backend> {
         rows.resize(entries.len(), None);
         let mut hits = 0;
         for (row, entry) in rows.iter_mut().zip(entries.iter_mut()) {
-            let Located::Sealed(sealed) = entry.located else {
-                continue;
+            let sealed = match entry.located {
+                Located::Sealed(sealed) => sealed,
+                Located::Open(open) => {
+                    entry.record = self.window_record(&open, records);
+                    if entry.record.is_none() {
+                        *row = Some(BatchRow::open(&open));
+                    }
+                    continue;
+                },
+                Located::Absent => continue,
             };
             // a value is no longer than its record, so a record's room in the buffer holds it with no allocation
             let at = records.len();
@@ -519,7 +553,7 @@ impl<Backend: Io> EngineState<Backend> {
                 hits += 1;
                 continue;
             }
-            *row = Some(sealed);
+            *row = Some(BatchRow::sealed(&sealed));
         }
         if hits > 0 {
             self.scan_cache_hits.fetch_add(hits, Ordering::Relaxed);
@@ -534,18 +568,32 @@ impl<Backend: Io> EngineState<Backend> {
         }
     }
 
-    /// Read small sealed records in segment and offset order, one read for each run of neighbours. A round sends up to
-    /// MOST_BATCH_RUNS runs before it waits for any, and the rounds go on until every small record has a span or the buffer is
-    /// full, so a batch over many segments leaves no record to its own read for want of a run. A record left out has no span
+    /// Copy an open record its slot's window still holds into the batch's buffer, with the slot held on the record's segment
+    pub fn window_record(&self, open: &WriteRow, records: &mut Vec<u8>) -> Option<(usize, usize)> {
+        let (at, length) = (records.len(), open.length.0 as usize);
+        if self.is_read_only || length > MOST_WINDOW_RECORD_BYTES || at + length > records.capacity() {
+            return None;
+        }
+        let _pin = self.slot_files[open.slot.0 as usize].pin(open.segment)?;
+        records.resize(at + length, 0);
+        if self.windows[open.slot.0 as usize].iter().any(|window| window.read(open.offset, &mut records[at..])) {
+            self.scan_window_records.fetch_add(1, Ordering::Relaxed);
+            return Some((at, length));
+        }
+        records.truncate(at);
+        None
+    }
+
+    /// Read small records in file and offset order, one read for each run of neighbours in one segment, sealed or open
     pub async fn read_records(
         &self,
         device: &impl DeviceReads<Backend::File>,
         volume: &Volume<Backend>,
-        rows: &[Option<SealedRow>],
+        rows: &[Option<BatchRow>],
         records: &mut Vec<u8>,
         spans: &mut [Option<(usize, usize)>],
     ) {
-        let small = |index: u16| rows[index as usize].filter(|row| row.row.length.0 as usize <= MOST_BATCH_RECORD);
+        let small = |index: u16| rows[index as usize].filter(|row| row.length.0 as usize <= MOST_BATCH_RECORD);
         let mut order = [0_u16; SCAN_BATCH_KEYS];
         let mut count = 0;
         for index in 0..rows.len().min(SCAN_BATCH_KEYS) as u16 {
@@ -555,26 +603,28 @@ impl<Backend: Io> EngineState<Backend> {
             }
         }
         let order = &mut order[..count];
-        order.sort_unstable_by_key(|index| small(*index).map(|row| (row.segment, row.row.offset.0)));
+        order.sort_unstable_by_key(|index| small(*index).map(|row| row.order()));
         let mut at = 0;
         let mut is_full = false;
         while at < order.len() && !is_full {
             // each run: its first and last place in the order, its file offset and its length
             let mut runs = [(0_usize, 0_usize, 0_u64, 0_u64); MOST_BATCH_RUNS];
-            let mut pins: [Option<_>; MOST_BATCH_RUNS] = std::array::from_fn(|_| None);
+            let mut sealed_pins: [Option<SegmentPin<'_, Backend::File>>; MOST_BATCH_RUNS] = std::array::from_fn(|_| None);
+            let mut slot_pins: [Option<SlotPin<'_, Backend::File>>; MOST_BATCH_RUNS] = std::array::from_fn(|_| None);
             let (mut run_count, mut planned) = (0, 0_u64);
             let room = (records.capacity() - records.len()) as u64;
             while at < order.len() && run_count < MOST_BATCH_RUNS {
                 let Some(first) = small(order[at]) else {
                     break;
                 };
-                let start = first.row.offset.0;
-                let mut end = start + first.row.length.0;
+                let start = first.offset.0;
+                let mut end = start + first.length.0;
                 let mut last = at;
                 let left = room - planned;
                 while let Some(next) = order.get(last + 1).and_then(|index| small(*index)) {
-                    let next_end = next.row.offset.0 + next.row.length.0;
-                    if next.segment != first.segment || next.row.offset.0 > end + JOIN_GAP || next_end.max(end) - start > left {
+                    let next_end = next.offset.0 + next.length.0;
+                    let is_other_file = next.segment != first.segment || next.slot != first.slot;
+                    if is_other_file || next.offset.0 > end + JOIN_GAP || next_end.max(end) - start > left {
                         break;
                     }
                     end = end.max(next_end);
@@ -584,9 +634,19 @@ impl<Backend: Io> EngineState<Backend> {
                     is_full = true;
                     break;
                 }
-                if let Some(pin) = volume.table.pin(first.segment) {
+                // an open segment's file is held through its slot, which lets go of a segment once it seals
+                let is_pinned = match first.slot {
+                    None => {
+                        sealed_pins[run_count] = volume.table.pin(first.segment);
+                        sealed_pins[run_count].is_some()
+                    },
+                    Some(slot) => {
+                        slot_pins[run_count] = self.slot_files[slot.0 as usize].pin(first.segment);
+                        slot_pins[run_count].is_some()
+                    },
+                };
+                if is_pinned {
                     runs[run_count] = (at, last, start, end - start);
-                    pins[run_count] = Some(pin);
                     run_count += 1;
                     planned += end - start;
                 }
@@ -599,10 +659,11 @@ impl<Backend: Io> EngineState<Backend> {
             records.resize(base + planned as usize, 0);
             let mut reads: [Option<ManyRead<'_, Backend::File>>; MOST_BATCH_RUNS] = std::array::from_fn(|_| None);
             let mut rest = &mut records[base..];
-            for ((read, &(_at, _last, start, length)), pin) in reads.iter_mut().zip(&runs).zip(&pins).take(run_count) {
+            for (index, (read, &(_at, _last, start, length))) in reads.iter_mut().zip(&runs).enumerate().take(run_count) {
                 let (buf, tail) = mem::take(&mut rest).split_at_mut(length as usize);
                 rest = tail;
-                *read = pin.as_ref().map(|pin| ManyRead { file: &pin.file, offset: FileOffset(start), buf, is_done: false });
+                let file = sealed_pins[index].as_ref().map(|pin| &pin.file).or_else(|| slot_pins[index].as_ref().map(|pin| &pin.file));
+                *read = file.map(|file| ManyRead { file, offset: FileOffset(start), buf, is_done: false });
             }
             device.read_many(&mut reads[..run_count]).await;
             let filled: [bool; MOST_BATCH_RUNS] = std::array::from_fn(|index| reads[index].as_ref().is_some_and(|read| read.is_done));
@@ -611,7 +672,7 @@ impl<Backend: Io> EngineState<Backend> {
                 if is_filled {
                     for &index in &order[first..=last] {
                         if let Some(row) = small(index) {
-                            spans[index as usize] = Some((from + (row.row.offset.0 - start) as usize, row.row.length.0 as usize));
+                            spans[index as usize] = Some((from + (row.offset.0 - start) as usize, row.length.0 as usize));
                         }
                     }
                 }
@@ -642,13 +703,15 @@ impl<Backend: Io> EngineState<Backend> {
                 true
             },
             (Some((at, length)), Located::Sealed(row)) => {
-                let is_open = self.open_batched(on.device, &read, &row, &batch.records[at..at + length], value);
+                let is_open = self.open_batched(on.device, &read, row.row.place, &batch.records[at..at + length], value);
                 // a scan keeps what it read only while the cache can hold most of the volume, so gets keep theirs otherwise
                 if is_open && on.target.scans_use_cache.load(Ordering::Relaxed) {
                     self.record_cache.admit(row.segment, row.row.offset, read.key, value);
                 }
                 is_open
             },
+            // a record that fails its check here takes its own read, which says whether its slot moved on
+            (Some((at, length)), Located::Open(row)) => self.open_batched(on.device, &read, row.place, &batch.records[at..at + length], value),
             _other => false,
         };
         let is_found = held
@@ -673,13 +736,13 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Check and open a small record the batch read, as the window does
-    pub fn open_batched(&self, device: &impl DeviceReads<Backend::File>, read: &KeyRead<'_>, sealed: &SealedRow, record: &[u8], value: &mut Vec<u8>) -> bool {
+    pub fn open_batched(&self, device: &impl DeviceReads<Backend::File>, read: &KeyRead<'_>, place: WritePlace, record: &[u8], value: &mut Vec<u8>) -> bool {
         let identity = RecordIdentity {
             record_key: self.record_key,
             column: read.column,
             key: read.key,
             kind: RowKind::Value,
-            place: sealed.row.place,
+            place,
         };
         let Some(form) = form_of(record).filter(|form| !form.is_chunked) else {
             return false;

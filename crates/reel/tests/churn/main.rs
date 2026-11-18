@@ -220,6 +220,7 @@ const KEY_SPACE: u64 = 40_000;
 const PRELOADED: u64 = 4_000;
 const FIXED_WIDTH: u16 = 16;
 const MODEL_VALUE_BYTES: usize = 48;
+const WIDE_MODEL_VALUE_BYTES: usize = 6 * 1024;
 const MODEL_COLUMN: ColumnId = ColumnId(1);
 const SMALL_SEGMENT: ByteCount = ByteCount(4 << 20);
 const MODEL_BUDGET: ByteCount = ByteCount(256 << 20);
@@ -234,10 +235,10 @@ fn spread_key(number: u64) -> Vec<u8> {
 }
 
 // a value that says its key's number and the version the writer gave it
-fn versioned(number: u64, version: u64) -> Vec<u8> {
+fn versioned(number: u64, version: u64, value_bytes: usize) -> Vec<u8> {
     let mut value = number.to_be_bytes().to_vec();
     value.extend_from_slice(&version.to_be_bytes());
-    value.resize(MODEL_VALUE_BYTES, b'.');
+    value.resize(value_bytes, b'.');
     value
 }
 
@@ -277,7 +278,7 @@ fn new_keys_show_to_every_read() {
             scope.spawn(|| {
                 let mut number = 1;
                 while !is_done.load(Ordering::Acquire) && number < KEY_SPACE {
-                    store.put(MODEL_COLUMN, &spread_key(number), &versioned(number, 1)).expect("put");
+                    store.put(MODEL_COLUMN, &spread_key(number), &versioned(number, 1, MODEL_VALUE_BYTES)).expect("put");
                     mark.store(number, Ordering::Release);
                     number += 1;
                 }
@@ -361,13 +362,23 @@ fn catch_up(log: &WriteLog, read: &mut usize, known: &mut BTreeMap<Vec<u8>, u64>
 // every batch of a scan beside a writer and seals gives each key told in before it, once, in order, at that version or newer
 #[test]
 fn scans_beside_a_writer_see_every_acknowledged_key() {
-    let root = scratch_root().join("scan-model");
+    scan_model(MODEL_VALUE_BYTES);
+}
+
+// the same, with open records too wide for a slot's window, which a batch reads from the slot file in joined runs
+#[test]
+fn scans_beside_a_writer_read_wide_open_rows() {
+    scan_model(WIDE_MODEL_VALUE_BYTES);
+}
+
+fn scan_model(value_bytes: usize) {
+    let root = scratch_root().join(format!("scan-model-{value_bytes}"));
     fs::create_dir_all(&root).expect("create");
     let store = model_store(&root, ColumnIndex::Sorted);
     let log = WriteLog { entries: (0..LOG_ENTRIES).map(|_entry| AtomicU64::new(0)).collect(), length: AtomicUsize::new(0) };
     let mut versions = vec![0_u64; KEY_SPACE as usize];
     for number in 0..PRELOADED {
-        store.put(MODEL_COLUMN, &spread_key(number), &versioned(number, 1)).expect("put");
+        store.put(MODEL_COLUMN, &spread_key(number), &versioned(number, 1, value_bytes)).expect("put");
         versions[number as usize] = 1;
         assert!(log.push(number, 1));
     }
@@ -375,6 +386,7 @@ fn scans_beside_a_writer_see_every_acknowledged_key() {
     store.seal_now();
     wait_for_seal(&store, before);
     let (is_done, scans, fills, rows) = (AtomicBool::new(false), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
+    let (asked, batched, lookups) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
     let heads_before = store.state.heads_together.load(Ordering::Relaxed);
     thread::scope(|scope| {
         scope.spawn(|| {
@@ -391,7 +403,7 @@ fn scans_beside_a_writer_see_every_acknowledged_key() {
                     seed % fresh
                 };
                 let version = versions[number as usize] + 1;
-                store.put(MODEL_COLUMN, &spread_key(number), &versioned(number, version)).expect("put");
+                store.put(MODEL_COLUMN, &spread_key(number), &versioned(number, version, value_bytes)).expect("put");
                 versions[number as usize] = version;
                 if !log.push(number, version) {
                     break;
@@ -406,6 +418,7 @@ fn scans_beside_a_writer_see_every_acknowledged_key() {
         });
         for scanner in 0..SCANNERS {
             let (store, log, is_done, scans, fills, rows) = (&store, &log, &is_done, &scans, &fills, &rows);
+            let (asked, batched, lookups) = (&asked, &batched, &lookups);
             scope.spawn(move || {
                 let (mut name, mut value) = (Vec::new(), Vec::new());
                 let mut known = BTreeMap::new();
@@ -452,6 +465,9 @@ fn scans_beside_a_writer_see_every_acknowledged_key() {
                         last = Some(name.clone());
                         rows.fetch_add(1, Ordering::Relaxed);
                     }
+                    asked.fetch_add(scan.asked, Ordering::Relaxed);
+                    batched.fetch_add(scan.batched, Ordering::Relaxed);
+                    lookups.fetch_add(scan.lookups, Ordering::Relaxed);
                     store.state.give_back_scan(scan);
                     scans.fetch_add(1, Ordering::Relaxed);
                     walks += 1;
@@ -463,7 +479,8 @@ fn scans_beside_a_writer_see_every_acknowledged_key() {
     });
     let heads = store.state.heads_together.load(Ordering::Relaxed) - heads_before;
     let (scans, fills, rows) = (scans.load(Ordering::Relaxed), fills.load(Ordering::Relaxed), rows.load(Ordering::Relaxed));
-    println!("{scans} scans, {fills} batches, {rows} rows beside the writer, {heads} heads placed together");
+    let (asked, batched, lookups) = (asked.load(Ordering::Relaxed), batched.load(Ordering::Relaxed), lookups.load(Ordering::Relaxed));
+    println!("{value_bytes} byte values: {scans} scans, {fills} batches, {rows} rows, {heads} heads placed together, {batched} of {asked} rows batched, {lookups} lookups");
     assert!(scans > 0);
     store.close().expect("close");
     drop(store);

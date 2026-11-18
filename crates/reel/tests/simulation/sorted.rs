@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::seed_sets::seeds;
 
@@ -1899,6 +1899,126 @@ fn writes_beside_batches_match_the_model() {
         println!("seed {seed} quiet: {tally:?}");
         assert!(tally.heads_together <= 2 * shards, "{tally:?}");
         check_scans(&store, &model, &mut random);
+        store.close().expect("close");
+    }
+}
+
+const SEALED_UNDER: u64 = 600;
+const OPEN_UNDER: u64 = 400;
+const WIDE_ONE_IN: u64 = 5;
+const WIDE_VALUE: usize = 6 * 1024;
+const HUGE_VALUE: usize = 12 * 1024;
+
+// a value whose size says how its record reads: in the window, by a joined read of the slot file, or alone
+fn open_value(number: u64) -> Vec<u8> {
+    let mut value = format!("open-{number}").into_bytes();
+    match number % WIDE_ONE_IN {
+        0 => value.resize(WIDE_VALUE, b'w'),
+        1 => value.resize(HUGE_VALUE, b'h'),
+        _ => {},
+    }
+    value
+}
+
+// sealed keys with open overwrites and new keys among them, small, wide and too wide for a batch
+fn open_rows_store(io: &SimulatedIo) -> (Store, Model) {
+    let store = open(io, CAPACITY);
+    let mut model = Model::new();
+    for number in 0..SEALED_UNDER {
+        store.put(COLUMN, &key(number), format!("{number}").as_bytes()).expect("put");
+        model.insert(key(number), format!("{number}").into_bytes());
+    }
+    seal_all(&store, io);
+    for number in (0..SEALED_UNDER).step_by(3).chain(SEALED_UNDER..SEALED_UNDER + OPEN_UNDER) {
+        store.put(COLUMN, &key(number), &open_value(number)).expect("put");
+        model.insert(key(number), open_value(number));
+    }
+    (store, model)
+}
+
+// a seal after a batch reads its open rows, or inside the read, leaves every answer the model's
+#[test]
+fn a_seal_under_a_batch_of_open_rows() {
+    for is_in_read in [false, true] {
+        let io = SimulatedIo::new(Seed(31));
+        let (store, model) = open_rows_store(&io);
+        let range = reel::engine::scan_state::from_key(COLUMN, b"", Direction::Ascending);
+        let mut scan = store.state.take_scan(&range.wanting(RowCount(SEALED_UNDER + OPEN_UNDER)), None).expect("scan");
+        let (mut name, mut value) = (Vec::new(), Vec::new());
+        let mut found = Vec::new();
+        let windowed = store.state.scan_window_records.load(Ordering::Relaxed);
+        let (state, disk, is_done) = (Arc::clone(&store.state), io.clone(), Arc::new(AtomicBool::new(!is_in_read)));
+        let hook_done = Arc::clone(&is_done);
+        io.on_every_read(Some(Arc::new(move || {
+            if !hook_done.swap(true, Ordering::AcqRel) {
+                state.seal_fullest(&state.volumes[0]);
+                for _step in 0..STEPS {
+                    if disk.step_any().is_none() {
+                        break;
+                    }
+                }
+            }
+        })));
+        let step = |scan: &mut reel::engine::scan_state::ScanState, name: &mut Vec<u8>, value: &mut Vec<u8>| {
+            store.state.step_scan(scan, name, reel::engine::scan_path::ScanWant::Value(value)).expect("step")
+        };
+        assert_eq!(step(&mut scan, &mut name, &mut value), ScanStep::Found);
+        found.push((name.clone(), value.clone()));
+        let open_read = scan.batch.entries.iter().filter(|entry| matches!(entry.located, reel::engine::read_path::Located::Open(_)) && entry.record.is_some()).count();
+        assert!(open_read > 0, "the batch read none of its open rows");
+        if !is_in_read {
+            seal_all(&store, &io);
+        }
+        while step(&mut scan, &mut name, &mut value) == ScanStep::Found {
+            found.push((name.clone(), value.clone()));
+        }
+        io.on_every_read(None);
+        assert!(is_done.load(Ordering::Acquire), "the seal never ran");
+        let expected: Rows = model.iter().map(|(name, value)| (name.clone(), value.clone())).collect();
+        assert_eq!(found.len(), expected.len());
+        assert!(found == expected, "the walk's rows differ from the model, in read {is_in_read}");
+        println!("in read {is_in_read}: {open_read} open rows read in the first batch, {} from windows, {} of {} batched", store.state.scan_window_records.load(Ordering::Relaxed) - windowed, scan.batched, scan.asked);
+        store.state.give_back_scan(scan);
+        check_scans(&store, &model, &mut SeededRandom::new(Seed(31)));
+        store.close().expect("close");
+    }
+}
+
+// a seal between a run's index entry and its write index lookup for a head key sends the key to a step, which reads its newest value
+#[test]
+fn a_seal_between_a_runs_two_looks() {
+    const AT: usize = 10;
+    for is_new in [true, false] {
+        let io = SimulatedIo::new(Seed(32));
+        let store = open(&io, CAPACITY);
+        let mut model = Model::new();
+        for number in 0..SEALED_UNDER {
+            store.put(COLUMN, &key(number), format!("old-{number}").as_bytes()).expect("put");
+            model.insert(key(number), format!("old-{number}").into_bytes());
+        }
+        seal_all(&store, &io);
+        // one open row inside the first batch, the only key a head shows: a key never seen, or an overwrite of a sealed one
+        let name = if is_new { key(SEALED_UNDER) } else { model.keys().nth(AT).expect("a key").clone() };
+        store.put(COLUMN, &name, b"newest").expect("put");
+        model.insert(name, b"newest".to_vec());
+        let (state, disk, is_fired) = (Arc::clone(&store.state), io.clone(), Arc::new(AtomicBool::new(false)));
+        let fired = Arc::clone(&is_fired);
+        *hold(&store.state.volumes[0].holds.between_run_looks) = Some(reel::engine::volume::RunHook(Arc::new(move || {
+            if !fired.swap(true, Ordering::AcqRel) {
+                state.seal_fullest(&state.volumes[0]);
+                for _step in 0..STEPS {
+                    if disk.step_any().is_none() {
+                        break;
+                    }
+                }
+            }
+        })));
+        let found = rows(store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan"));
+        *hold(&store.state.volumes[0].holds.between_run_looks) = None;
+        assert!(is_fired.load(Ordering::Acquire), "no run took the head key");
+        let expected: Rows = model.iter().map(|(name, value)| (name.clone(), value.clone())).collect();
+        assert_eq!(found.len(), expected.len(), "new key {is_new}");
+        assert!(found == expected, "the walk's rows differ from the model, new key {is_new}");
         store.close().expect("close");
     }
 }

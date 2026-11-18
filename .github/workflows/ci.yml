@@ -16,9 +16,14 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # a run takes about 15 minutes, so a hung test fails the job well short of the runner's 6 hours
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - run: cargo xtask ci
+      # steady locks every page it maps, thread stacks too, which a runner's default memlock limit can't hold
+      - run: |
+          if [ "$RUNNER_OS" = Linux ]; then sudo prlimit --pid $$ --memlock=unlimited:unlimited; fi
+          cargo xtask ci
 
   sweep:
     if: github.event_name == 'schedule'

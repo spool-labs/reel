@@ -12,6 +12,7 @@ use std::thread::{self, Thread};
 
 use reel::config::{ColumnConfig, ColumnIndex, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
+use reel::io::Io;
 use reel::io::plain::PlainIo;
 use reel::record::codec::Codec;
 use reel_core::column_id::ColumnId;
@@ -96,9 +97,14 @@ fn filled(root: &Path) -> Store {
     ReelStore::open(PlainIo::new(), &config(root)).expect("open")
 }
 
-// this kernel gives the store a ring, so every test here reads through it
+// a kernel that gives a ring gives it to the store, so every test here reads through it. A host with io_uring off, as a CI
+// runner can be, leaves the store on its blocking pool, and the tests below still answer through that
 #[test]
 fn store_has_a_ring() {
+    if PlainIo::new().open_ring().expect("ask for a ring").is_none() {
+        println!("this host gives no ring");
+        return;
+    }
     let root = root("has");
     let store = filled(&root);
     assert!(store.state.ring.is_some());

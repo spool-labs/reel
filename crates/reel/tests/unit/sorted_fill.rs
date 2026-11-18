@@ -195,7 +195,8 @@ fn a_read_only_open_fills_the_sorted_index_a_writer_open_does() {
     let reader = ReelStore::open_read_only(PlainIo::new(), &config(&root, 0)).expect("open read-only");
     assert!(index_entries(&reader) == entries, "the read-only fill gave other entries than the writer's");
     let reading = sorted_reading(&reader);
-    let counts = |reading: &SortedReading| (reading.used, reading.rows_past_capacity, reading.is_marked);
+    // used counts graves, and a merge between the two opens can drop some, so only the live entries above must agree
+    let counts = |reading: &SortedReading| (reading.rows_past_capacity, reading.is_marked);
     assert_eq!(counts(&reading), counts(&writer_reading));
     assert_eq!(reading.used, RowCount(all_entries(&reader)), "used counts every entry the index holds");
     assert!(!reading.is_marked && reading.rows_past_capacity.0 == 0, "the index ran out of room: {reading:?}");

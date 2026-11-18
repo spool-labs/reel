@@ -735,6 +735,12 @@ fn map_every_block() {
 fn map_every_block() {}
 
 fn main() {
+    // a panic on one thread leaves a scope waiting on readers that loop until it's done, so any panic ends the run
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        report(info);
+        process::abort();
+    }));
     map_every_block();
     lock_touched_pages();
     if let Some(root) = env::var_os(PREPARE_ROOT) {

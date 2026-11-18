@@ -98,6 +98,7 @@ pub struct ShardHead {
     pub placed_at: WritePlace,
     /// The shard's count of changes when the head was placed, or NO_CHANGES for a head placed with no look at the shard
     pub changes: u64,
+    pub ahead: HeadAhead,
 }
 
 /// A head's count of changes when it was placed without a look at its shard, so the next batch places it again
@@ -513,6 +514,77 @@ fn finish_down(walk: &mut RowBlockWalk<'_>, restart: usize, source: &mut Segment
     walk.row_in_run(restart, rows - 1, &mut source.key)
 }
 
+/// Keys a head reads past its own under one hold of its shard's lock
+pub const AHEAD_KEYS: usize = 8;
+
+/// A head's own key and the keys past it in its shard, read under one hold of the shard's lock, each with the row a lookup at
+/// the batch's point gives. They stand while the shard's count of changes, the point and the view do
+#[derive(Clone, Debug)]
+pub struct HeadAhead {
+    pub keys: Vec<u8>,
+    pub ends: [usize; AHEAD_KEYS],
+    pub rows: [Option<WriteRow>; AHEAD_KEYS],
+    pub count: usize,
+    /// The entry of the key the head shows
+    pub next: usize,
+    /// The last look past the keys found none, which leaves the cursor past the last key
+    pub is_cursor_past: bool,
+    pub changes: u64,
+    pub point: WritePlace,
+    pub view: OpenSlots,
+}
+
+impl HeadAhead {
+    /// Allocate room for the keys
+    pub fn new(widest_key: usize) -> Self {
+        Self {
+            keys: touched_capacity(AHEAD_KEYS * widest_key, 0),
+            ends: [0; AHEAD_KEYS],
+            rows: [None; AHEAD_KEYS],
+            count: 0,
+            next: 0,
+            is_cursor_past: false,
+            changes: NO_CHANGES,
+            point: WritePlace(0),
+            view: OpenSlots(0),
+        }
+    }
+
+    /// Drop every key
+    pub fn clear(&mut self) {
+        self.keys.clear();
+        self.count = 0;
+        self.next = 0;
+        self.is_cursor_past = false;
+    }
+
+    /// Add a key and its row, and say whether there is room for another
+    pub fn push(&mut self, key: &[u8], row: Option<WriteRow>) -> bool {
+        self.keys.extend_from_slice(key);
+        self.ends[self.count] = self.keys.len();
+        self.rows[self.count] = row;
+        self.count += 1;
+        self.count < AHEAD_KEYS
+    }
+
+    /// Read one entry's key
+    pub fn key(&self, index: usize) -> &[u8] {
+        let start = index.checked_sub(1).map_or(0, |before| self.ends[before]);
+        &self.keys[start..self.ends[index]]
+    }
+
+    /// Check the cursor stands past the key the head shows
+    pub fn is_running_ahead(&self) -> bool {
+        self.next + 1 < self.count || self.is_cursor_past
+    }
+
+    /// Find the row of the key the head shows, while the keys stand for this count, point and view
+    pub fn row_for(&self, key: &[u8], (changes, point, view): (u64, WritePlace, OpenSlots)) -> Option<Option<WriteRow>> {
+        let is_standing = self.next < self.count && self.changes == changes && self.point == point && self.view == view;
+        (is_standing && self.key(self.next) == key).then_some(self.rows[self.next])
+    }
+}
+
 impl ShardHead {
     /// Allocate a head's cursor and key buffer
     pub fn new(widest_key: usize, open_slots: usize) -> Self {
@@ -523,7 +595,16 @@ impl ShardHead {
             is_placed: false,
             placed_at: WritePlace(0),
             changes: NO_CHANGES,
+            ahead: HeadAhead::new(widest_key),
         }
+    }
+
+    /// Drop the keys read ahead, and the cursor's places too when they stand past the head's own key
+    pub fn forget_ahead(&mut self) {
+        if self.ahead.is_running_ahead() {
+            self.cursor.reset();
+        }
+        self.ahead.clear();
     }
 }
 
@@ -650,6 +731,7 @@ impl ScanState {
         self.forget_held();
         for head in &mut self.heads {
             head.cursor.reset();
+            head.ahead.clear();
             head.is_placed = false;
             head.has_key = false;
         }
@@ -767,6 +849,23 @@ impl ScanState {
         self.mark_heads();
     }
 
+    /// Move a passed head on to the next key it read ahead, and say whether it had one
+    pub fn step_ahead(&mut self, shard: usize) -> bool {
+        let head = &mut self.heads[shard];
+        // a cursor past the last key stands where a head placed past that key would
+        if head.ahead.next + 1 >= head.ahead.count {
+            head.ahead.clear();
+            return false;
+        }
+        head.ahead.next += 1;
+        head.key.clear();
+        head.key.extend_from_slice(head.ahead.key(head.ahead.next));
+        head.has_key = true;
+        head.is_placed = true;
+        self.find_closest_head();
+        true
+    }
+
     /// Take the oldest place any head stands for as the heads' mark
     pub fn mark_heads(&mut self) {
         self.heads_mark = self.heads.iter().map(|head| head.placed_at).min().unwrap_or(WritePlace(0));
@@ -826,7 +925,7 @@ impl ScanState {
     pub fn heap_bytes(&self) -> ByteCount {
         let source = size_of::<SegmentSource>() as u64;
         let keys: usize = self.sources.iter().map(|source| source.key.capacity() + source.held.capacity()).sum();
-        let heads: usize = self.heads.iter().map(|head| head.key.capacity() + head.cursor.heap_bytes()).sum();
+        let heads: usize = self.heads.iter().map(|head| head.key.capacity() + head.ahead.keys.capacity() + head.cursor.heap_bytes()).sum();
         let own = self.position.capacity() + self.limit.capacity() + self.key.capacity() + self.spill.key.capacity() + self.origin.capacity() + self.out_key.capacity();
         let found = self.found.capacity() * size_of::<SegmentNumber>() + (self.losers.capacity() + self.winners.capacity()) * size_of::<u16>();
         let head = self.heads.capacity() * size_of::<ShardHead>();
@@ -896,7 +995,7 @@ pub fn next_prefix(prefix: &mut Vec<u8>) -> bool {
 
 /// Plan the heap one scan holds
 pub fn planned_scan_bytes(widest_key: u64, open_slots: usize) -> u64 {
-    let keys = (MOST_SCAN_SOURCES + SHARD_COUNT + 6) as u64 * widest_key;
+    let keys = (MOST_SCAN_SOURCES + SHARD_COUNT * (1 + AHEAD_KEYS) + 6) as u64 * widest_key;
     let sources = (MOST_SCAN_SOURCES + 1) * size_of::<SegmentSource>();
     let heads = SHARD_COUNT * (size_of::<ShardHead>() + open_slots * size_of::<TreeCursor>());
     let held = HELD_SOURCE_BLOCKS * ROW_BLOCK_BYTES;

@@ -34,6 +34,8 @@ use crate::index::record_cache::CacheLookup;
 use crate::segment::block_cache::{BlockKey, NO_BLOCK};
 use crate::segment::block_entry::{BlockEntry, KeyBound, SHARED_HEAD_BYTES};
 use crate::segment::segment_table::{Seat, SegmentPin};
+use crate::index::entry_slab::EntryAddress;
+use crate::index::key_hash::hash_key;
 use crate::index::write_row::WriteRow;
 use crate::segment::column_directory::ColumnDirectory;
 use crate::segment::damage_list::KeyRange;
@@ -425,6 +427,7 @@ impl<Backend: Io> EngineState<Backend> {
                     continue;
                 }
                 head.cursor.reset();
+                head.ahead.clear();
                 head.is_placed = false;
             }
             scan.mark_heads();
@@ -516,12 +519,23 @@ impl<Backend: Io> EngineState<Backend> {
                 None => None,
             };
             let name = &key[..length];
-            let open = if is_head {
-                volume.between_run_looks();
-                scan.lookups += 1;
-                self.index.lookup(scan.column, name, point, volume.view()).row
-            } else {
-                None
+            let shown = scan.closest_head.filter(|_head| is_head);
+            let open = match shown {
+                Some(head) => {
+                    volume.between_run_looks();
+                    match self.ahead_row(volume, scan, head, name, point) {
+                        Some(row) => row,
+                        // the shard changed since its head read ahead, so the head descends fresh from the walk's place
+                        None => {
+                            self.ahead_drops.fetch_add(1, Ordering::Relaxed);
+                            scan.heads[head].forget_ahead();
+                            scan.heads[head].is_placed = false;
+                            self.place_heads(volume, scan);
+                            continue;
+                        },
+                    }
+                },
+                None => None,
             };
             // a seal between the two looks moves the row out of the view, so the step that answers one key at a time takes the key
             if directory.map_or(0, ColumnDirectory::generation) != scan.generation {
@@ -538,12 +552,64 @@ impl<Backend: Io> EngineState<Backend> {
                 taken += u64::from(matches!(located, Located::Sealed(_)));
             }
             scan.pass(name);
-            if is_head {
+            // a head with keys read ahead moves to the next one, and only a head that ran out places again
+            if let Some(head) = shown
+                && !scan.step_ahead(head)
+            {
                 self.place_heads(volume, scan);
             }
         }
         scan.sorted_scan_keys += taken;
         self.sorted_runs.fetch_add(u64::from(taken > 0), Ordering::Relaxed);
+    }
+
+    /// Give the row of the key a head shows from the keys it read ahead, or read that key and the next few with their rows under
+    /// one hold of the shard's lock when it has none. Nothing when the shard changed since they were read
+    pub fn ahead_row(&self, volume: &Volume<Backend>, scan: &mut ScanState, shard: usize, name: &[u8], point: WritePlace) -> Option<Option<WriteRow>> {
+        let (column, direction, view) = (scan.column, scan.direction, volume.view());
+        let head = &mut scan.heads[shard];
+        if head.ahead.count > 0 {
+            let ahead = &mut head.ahead;
+            let is_same_keys = ahead.next < ahead.count && ahead.changes == self.index.change_count(shard) && ahead.view == view;
+            // a later batch's point keeps the keys of a shard that hasn't changed, and reads their rows again at the new point
+            if is_same_keys && ahead.point != point && ahead.key(ahead.next) == name {
+                let guard = self.index.shards.read(shard);
+                if self.index.change_count(shard) == ahead.changes {
+                    for index in ahead.next..ahead.count {
+                        let next = ahead.key(index);
+                        ahead.rows[index] = guard.lookup(hash_key(column, next), column, next, point, view).row;
+                    }
+                    ahead.point = point;
+                    scan.lookups += (ahead.count - ahead.next) as u64;
+                }
+            }
+            return scan.heads[shard].ahead.row_for(name, (self.index.change_count(shard), point, view));
+        }
+        let guard = self.index.shards.read(shard);
+        // the count is read under the lock, so it matches the rows read
+        let changes = self.index.change_count(shard);
+        // a cursor that stood through a change can miss a row the change landed before it, so it descends fresh
+        if head.changes != changes {
+            head.cursor.reset();
+        }
+        let ahead = &mut head.ahead;
+        (ahead.changes, ahead.point, ahead.view) = (changes, point, view);
+        let mut has_room = ahead.push(name, guard.lookup(hash_key(column, name), column, name, point, view).row);
+        let mut last: Option<EntryAddress> = None;
+        while has_room {
+            let bound = WalkBound { column, key: last.map_or(name, |entry| guard.slab.key(entry)), is_inclusive: false, direction };
+            let Some(entry) = guard.next_entry(&mut head.cursor, &bound, view) else {
+                ahead.is_cursor_past = true;
+                break;
+            };
+            let next = guard.slab.key(entry);
+            has_room = ahead.push(next, guard.lookup(hash_key(column, next), column, next, point, view).row);
+            last = Some(entry);
+        }
+        drop(guard);
+        head.changes = changes;
+        scan.lookups += head.ahead.count as u64;
+        Some(head.ahead.rows[0])
     }
 
     /// Say whether the record cache can hold most of a volume's live records, weighed again at most once a period. Scans read
@@ -917,6 +983,7 @@ impl<Backend: Io> EngineState<Backend> {
         if !self.is_read_only && volume.rows_in_index.load(Ordering::Acquire) == 0 {
             for head in scan.heads.iter_mut().filter(|head| !head.is_placed || is_new_view) {
                 head.cursor.reset();
+                head.ahead.clear();
                 head.has_key = false;
                 head.is_placed = true;
                 head.placed_at = mark;
@@ -937,6 +1004,7 @@ impl<Backend: Io> EngineState<Backend> {
                 std::array::from_fn(|index| group[index].as_ref().map(|(shard, _head)| self.index.shards.read(*shard)));
             // a cursor that stood through a change can miss a row the change landed before it, so it descends fresh
             for (shard, head) in group.iter_mut().flatten() {
+                head.forget_ahead();
                 if !head.cursor.is_reset() && head.changes != self.index.change_count(*shard) {
                     head.cursor.reset();
                 }

@@ -421,6 +421,18 @@ impl WriteShard {
         view: OpenSlots,
         key: &mut Vec<u8>,
     ) -> bool {
+        match self.next_entry(cursor, bound, view) {
+            Some(entry) => {
+                key.clear();
+                key.extend_from_slice(self.slab.key(entry));
+                true
+            },
+            None => false,
+        }
+    }
+
+    /// Find the entry of the next key past a bound in the view's open trees, stepping where a cursor still stands
+    pub fn next_entry(&self, cursor: &mut ShardCursor, bound: &WalkBound, view: OpenSlots) -> Option<EntryAddress> {
         let mut best: Option<EntryAddress> = None;
         for (index, tree) in self.trees.iter().enumerate() {
             if !view.contains(OpenSlot(index as u8)) {
@@ -433,15 +445,7 @@ impl WriteShard {
                 best = Some(self.closer(best, entry, bound.direction));
             }
         }
-
-        match best {
-            Some(entry) => {
-                key.clear();
-                key.extend_from_slice(self.slab.key(entry));
-                true
-            },
-            None => false,
-        }
+        best
     }
 
     /// Answer a bound outside a tree's span with no descent: when the tree's last row in the walk's direction isn't past the

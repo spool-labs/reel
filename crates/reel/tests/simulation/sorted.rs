@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::seed_sets::seeds;
 
@@ -23,7 +23,7 @@ use reel_core::direction::Direction;
 use reel_core::scan::ScanStep;
 use reel_core::maintenance_report::MaintenanceReport;
 use reel::segment::segment_tail::SegmentNumber;
-use reel_core::units::{ByteCount, DeathMark, Nanoseconds, RowCount, VolumeId};
+use reel_core::units::{ByteCount, DeathMark, Nanoseconds, RowCount, VolumeId, WritePlace};
 use reel_core::write_batch::WriteBatch;
 use reel_sim::seeded_random::{Seed, SeededRandom};
 use reel_sim::simulated_io::SimulatedIo;
@@ -1809,13 +1809,16 @@ fn write_one(store: &Store, model: &mut Model, random: &mut SeededRandom, fresh:
 }
 
 // walk for values or keys alone with a writer between steps, and check each answer is the model's next key as of its batch
-fn walk_beside_writer(store: &Store, io: &SimulatedIo, model: &mut Model, random: &mut SeededRandom, fresh: &mut u64, (direction, write_odds, is_key_walk): (Direction, Option<u64>, bool)) -> WalkTally {
+fn walk_beside_writer(store: &Store, io: &SimulatedIo, model: &mut Model, random: &mut SeededRandom, fresh: &mut u64, (direction, write_odds, is_key_walk, told): (Direction, Option<u64>, bool, Option<u64>)) -> WalkTally {
     let is_writing = write_odds.is_some();
     let start = match direction {
         Direction::Ascending => Vec::new(),
         Direction::Descending => vec![0xFF; WIDTH as usize + 1],
     };
-    let range = reel::engine::scan_state::from_key(COLUMN, &start, direction);
+    let mut range = reel::engine::scan_state::from_key(COLUMN, &start, direction);
+    if let Some(rows) = told {
+        range = range.wanting(RowCount(rows));
+    }
     let mut scan = store.state.take_scan(&range, None).expect("scan");
     let (mut name, mut value) = (Vec::new(), Vec::new());
     let mut tally = WalkTally::default();
@@ -1893,17 +1896,17 @@ fn writes_beside_batches_match_the_model() {
         let shards = reel::index::write_index::SHARD_COUNT as u64;
         // a write between most steps reaches shards whose heads moved inside the batch, which the next batch places again
         for direction in [Direction::Ascending, Direction::Descending] {
-            let tally = walk_beside_writer(&store, &io, &mut model, &mut random, &mut fresh, (direction, Some(DENSE_WRITE_ONE_IN), false));
+            let tally = walk_beside_writer(&store, &io, &mut model, &mut random, &mut fresh, (direction, Some(DENSE_WRITE_ONE_IN), false, None));
             println!("seed {seed} {direction:?} beside a busy writer: {tally:?}");
         }
         for direction in [Direction::Ascending, Direction::Descending] {
-            let tally = walk_beside_writer(&store, &io, &mut model, &mut random, &mut fresh, (direction, Some(STEP_WRITE_ONE_IN), false));
+            let tally = walk_beside_writer(&store, &io, &mut model, &mut random, &mut fresh, (direction, Some(STEP_WRITE_ONE_IN), false, None));
             println!("seed {seed} {direction:?} beside a writer: {tally:?}");
             // a batch places again only the heads whose shard took a row, far fewer than every shard
             assert!(tally.heads_together < tally.fills * shards / 2, "{tally:?}");
         }
         // with no writer every head stays placed across batches, and moves only past a key it showed
-        let tally = walk_beside_writer(&store, &io, &mut model, &mut random, &mut fresh, (Direction::Ascending, None, false));
+        let tally = walk_beside_writer(&store, &io, &mut model, &mut random, &mut fresh, (Direction::Ascending, None, false, None));
         println!("seed {seed} quiet: {tally:?}");
         assert!(tally.heads_together <= 2 * shards, "{tally:?}");
         check_scans(&store, &model, &mut random);
@@ -2031,6 +2034,102 @@ fn a_seal_between_a_runs_two_looks() {
     }
 }
 
+const TOLD_ROWS: u64 = 256;
+
+// a walk told 256 rows beside a writer, over dense open keys in two open trees, answers each row as of its batch's point while
+// its heads read their next keys ahead
+#[test]
+fn told_walks_beside_a_writer_over_two_open_trees() {
+    for seed in seeds(0..WRITER_SEEDS) {
+        let io = SimulatedIo::new(Seed(seed));
+        let store = open(&io, CAPACITY);
+        let mut model = Model::new();
+        let mut random = SeededRandom::new(Seed(seed));
+        for number in 0..WRITER_KEYS {
+            store.put(COLUMN, &key(number), format!("{number}").as_bytes()).expect("put");
+            model.insert(key(number), format!("{number}").into_bytes());
+        }
+        seal_all(&store, &io);
+        let mut fresh = WRITER_KEYS;
+        for _key in 0..OPEN_KEYS / 2 {
+            write_one(&store, &mut model, &mut random, &mut fresh);
+        }
+        // a seal left unsettled keeps the first open tree in the view beside the one the rest of the keys go to
+        store.seal_now();
+        for _key in 0..OPEN_KEYS / 2 {
+            write_one(&store, &mut model, &mut random, &mut fresh);
+        }
+        for direction in [Direction::Ascending, Direction::Descending] {
+            for write_odds in [Some(DENSE_WRITE_ONE_IN), None] {
+                let tally = walk_beside_writer(&store, &io, &mut model, &mut random, &mut fresh, (direction, write_odds, false, Some(TOLD_ROWS)));
+                println!("seed {seed} {direction:?} told {TOLD_ROWS} beside a writer one in {write_odds:?}: {tally:?}");
+            }
+        }
+        check_scans(&store, &model, &mut random);
+        store.close().expect("close");
+    }
+}
+
+const REWRITTEN: u64 = 64;
+const HOOK_AT: u64 = 2;
+
+// walk a whole column for values at a fixed point
+fn walk_at(store: &Store, point: WritePlace) -> Rows {
+    let range = reel::engine::scan_state::from_key(COLUMN, b"", Direction::Ascending);
+    let mut scan = store.state.take_scan(&range, Some(point)).expect("scan");
+    let (mut name, mut value, mut found) = (Vec::new(), Vec::new(), Rows::new());
+    loop {
+        match store.state.step_scan(&mut scan, &mut name, reel::engine::scan_path::ScanWant::Value(&mut value)).expect("step") {
+            ScanStep::Found => found.push((name.clone(), value.clone())),
+            ScanStep::Corrupt => panic!("a corrupt record"),
+            ScanStep::End => break,
+        }
+    }
+    store.state.give_back_scan(scan);
+    found
+}
+
+// a write into the shards between a head's read ahead and its use moves their counts, so the run drops the keys read ahead and
+// descends fresh. A quiet walk drops none, and both give the model's rows
+#[test]
+fn a_write_between_a_read_ahead_and_its_use_drops_it() {
+    let io = SimulatedIo::new(Seed(33));
+    let store = open(&io, CAPACITY);
+    let mut model = Model::new();
+    for number in 0..SEALED_UNDER {
+        store.put(COLUMN, &key(number), format!("old-{number}").as_bytes()).expect("put");
+        model.insert(key(number), format!("old-{number}").into_bytes());
+    }
+    seal_all(&store, &io);
+    // dense open keys, so each head reads several keys ahead
+    for number in SEALED_UNDER..SEALED_UNDER + OPEN_KEYS {
+        store.put(COLUMN, &key(number), format!("open-{number}").as_bytes()).expect("put");
+        model.insert(key(number), format!("open-{number}").into_bytes());
+    }
+    let expected: Rows = model.iter().map(|(name, value)| (name.clone(), value.clone())).collect();
+    let point = store.state.read_point(&store.state.volumes[0]);
+    let drops = || store.state.ahead_drops.load(Ordering::Relaxed);
+    let before = drops();
+    assert!(walk_at(&store, point) == expected, "the quiet walk's rows differ from the model");
+    assert_eq!(drops(), before, "a quiet walk at a fixed point dropped keys read ahead");
+    // the hook rewrites open keys in every shard with their own values, after the heads have read ahead
+    let (state, calls) = (Arc::clone(&store.state), Arc::new(AtomicU64::new(0)));
+    let called = Arc::clone(&calls);
+    store.state.volumes[0].holds.set_between_run_looks(Some(reel::engine::volume::RunHook(Arc::new(move || {
+        if called.fetch_add(1, Ordering::AcqRel) == HOOK_AT {
+            for number in SEALED_UNDER..SEALED_UNDER + REWRITTEN {
+                state.write_value(COLUMN, &key(number), format!("open-{number}").as_bytes(), None).expect("put");
+            }
+        }
+    }))));
+    let found = walk_at(&store, point);
+    store.state.volumes[0].holds.set_between_run_looks(None);
+    assert!(calls.load(Ordering::Acquire) > HOOK_AT, "the run took too few head keys");
+    assert!(drops() > before, "a write between the read ahead and its use left the keys standing");
+    assert!(found == expected, "the walk's rows differ from the model");
+    store.close().expect("close");
+}
+
 // walk a whole column for values, and return its rows and the batches it filled
 fn walk_counting_fills(store: &Store, direction: Direction) -> (Rows, u64) {
     let start = match direction {
@@ -2110,11 +2209,11 @@ fn key_walks_beside_batches_match_the_model() {
         }
         for write_odds in [DENSE_WRITE_ONE_IN, STEP_WRITE_ONE_IN] {
             for direction in [Direction::Ascending, Direction::Descending] {
-                let tally = walk_beside_writer(&store, &io, &mut model, &mut random, &mut fresh, (direction, Some(write_odds), true));
+                let tally = walk_beside_writer(&store, &io, &mut model, &mut random, &mut fresh, (direction, Some(write_odds), true, None));
                 println!("seed {seed} {direction:?} keys beside a writer one in {write_odds}: {tally:?}");
             }
         }
-        let tally = walk_beside_writer(&store, &io, &mut model, &mut random, &mut fresh, (Direction::Ascending, None, true));
+        let tally = walk_beside_writer(&store, &io, &mut model, &mut random, &mut fresh, (Direction::Ascending, None, true, None));
         println!("seed {seed} quiet keys: {tally:?}");
         assert!(tally.fills * 4 < tally.asked, "the key walk located no batches: {tally:?}");
         store.close().expect("close");

@@ -438,7 +438,8 @@ impl<Backend: Io> EngineState<Backend> {
             };
         }
         let mut spans = [None; BATCH_KEYS];
-        self.read_records(device, volume, &rows[..keys.len()], records, &mut spans).await;
+        let mut words = [0; BATCH_KEYS];
+        self.read_records(device, volume, &rows[..keys.len()], records, &mut spans, &mut words).await;
 
         let mut batched = 0;
         for ((key, plan), span) in keys.iter().zip(plans).zip(spans) {

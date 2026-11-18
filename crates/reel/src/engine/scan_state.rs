@@ -147,10 +147,23 @@ impl BatchRow {
         Self { segment: row.segment, slot: Some(row.slot), offset: row.offset, length: row.length }
     }
 
-    /// Order records by file and offset, so neighbours join
-    pub fn order(&self) -> (SegmentNumber, bool, u64) {
-        (self.segment, self.slot.is_some(), self.offset.0)
+    /// Pack the record's segment, whether it is open, its offset and its index in the batch into one word, so a plain sort
+    /// orders records by file and offset and neighbours join
+    pub fn word(&self, index: u16) -> u128 {
+        debug_assert!(self.offset.0 < 1 << ORDER_OFFSET_BITS, "an offset past the word's room");
+        let is_open = u128::from(self.slot.is_some());
+        (u128::from(self.segment.0) << 64) | (is_open << 63) | (u128::from(self.offset.0) << ORDER_INDEX_BITS) | u128::from(index)
     }
+}
+
+/// Bits of a record's order word that hold its index in the batch
+pub const ORDER_INDEX_BITS: u32 = 16;
+/// Bits of a record's order word that hold its offset, room for any segment's
+pub const ORDER_OFFSET_BITS: u32 = 63 - ORDER_INDEX_BITS;
+
+/// Read a record's index in the batch back from its order word
+pub fn index_of_word(word: u128) -> u16 {
+    word as u16
 }
 
 /// One key a scan located ahead, and where its record sits in the batch's buffer once read
@@ -176,6 +189,8 @@ pub struct ScanBatch {
     /// Each entry's record for the batch's read, and the span it landed at
     pub rows: Vec<Option<BatchRow>>,
     pub spans: Vec<Option<(usize, usize)>>,
+    /// Each record's order word, sorted when the records come out of file order
+    pub words: Vec<u128>,
 }
 
 impl ScanBatch {
@@ -189,6 +204,7 @@ impl ScanBatch {
             records: touched_capacity(BATCH_BYTES, 0),
             rows: touched_capacity(SCAN_BATCH_KEYS, None),
             spans: touched_capacity(SCAN_BATCH_KEYS, None),
+            words: touched_filled(SCAN_BATCH_KEYS, 0),
         }
     }
 
@@ -214,7 +230,8 @@ impl ScanBatch {
 
     /// Read the heap the batch holds
     pub fn heap_bytes(&self) -> usize {
-        let rows = self.rows.capacity() * size_of::<Option<BatchRow>>() + self.spans.capacity() * size_of::<Option<(usize, usize)>>();
+        let rows = self.rows.capacity() * size_of::<Option<BatchRow>>() + self.spans.capacity() * size_of::<Option<(usize, usize)>>()
+            + self.words.capacity() * size_of::<u128>();
         self.entries.capacity() * size_of::<BatchEntry>() + self.keys.capacity() + self.records.capacity() + rows
     }
 }
@@ -866,7 +883,7 @@ pub fn planned_scan_bytes(widest_key: u64, open_slots: usize) -> u64 {
     let held = HELD_SOURCE_BLOCKS * ROW_BLOCK_BYTES;
     let tree = 2 * MOST_SCAN_SOURCES * size_of::<u16>();
     let sorted = SCAN_BATCH_KEYS * ((widest_key as usize).clamp(1, MOST_KEY_BYTES) + size_of::<KeyEntry>());
-    let rows = SCAN_BATCH_KEYS * (size_of::<Option<BatchRow>>() + size_of::<Option<(usize, usize)>>());
+    let rows = SCAN_BATCH_KEYS * (size_of::<Option<BatchRow>>() + size_of::<Option<(usize, usize)>>() + size_of::<u128>());
     let batch = SCAN_BATCH_KEYS * (widest_key as usize + size_of::<BatchEntry>()) + BATCH_BYTES + sorted + rows;
     keys + (sources + heads + held + tree + batch + MOST_SCAN_SOURCES * size_of::<SegmentNumber>() + SCAN_WINDOWS * SCAN_WINDOW_BYTES) as u64
 }

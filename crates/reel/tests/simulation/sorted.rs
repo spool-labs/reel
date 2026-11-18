@@ -2022,3 +2022,63 @@ fn a_seal_between_a_runs_two_looks() {
         store.close().expect("close");
     }
 }
+
+// walk a whole column for values, and return its rows and the batches it filled
+fn walk_counting_fills(store: &Store, direction: Direction) -> (Rows, u64) {
+    let start = match direction {
+        Direction::Ascending => Vec::new(),
+        Direction::Descending => vec![0xFF; WIDTH as usize + 1],
+    };
+    let range = reel::engine::scan_state::from_key(COLUMN, &start, direction);
+    let mut scan = store.state.take_scan(&range, None).expect("scan");
+    let (mut name, mut value, mut found, mut fills) = (Vec::new(), Vec::new(), Vec::new(), 0);
+    loop {
+        fills += u64::from(!scan.batch.has_next());
+        match store.state.step_scan(&mut scan, &mut name, reel::engine::scan_path::ScanWant::Value(&mut value)).expect("step") {
+            ScanStep::Found => found.push((name.clone(), value.clone())),
+            ScanStep::Corrupt => panic!("a corrupt record"),
+            ScanStep::End => break,
+        }
+    }
+    store.state.give_back_scan(scan);
+    (found, fills)
+}
+
+// a batch reads its records in file order however the walk meets them: keys written in key order skip the sort going up, and
+// the walk down over them or over keys written out of order takes the sort. Every walk gives the model's rows
+#[test]
+fn records_out_of_file_order_read_as_the_model() {
+    for is_in_order in [true, false] {
+        for direction in [Direction::Ascending, Direction::Descending] {
+            let io = SimulatedIo::new(Seed(33));
+            let store = open(&io, CAPACITY);
+            let mut model = Model::new();
+            // the key of a number is a hash of it, so writes by number land out of key order
+            let mut names: Vec<Vec<u8>> = (0..KEYS).map(key).collect();
+            if is_in_order {
+                names.sort();
+            }
+            for (number, name) in names.iter().enumerate() {
+                store.put(COLUMN, name, format!("value-{number}").as_bytes()).expect("put");
+                model.insert(name.clone(), format!("value-{number}").into_bytes());
+            }
+            seal_all(&store, &io);
+            let skipped = report(&store).scan_batches_presorted;
+            let (found, fills) = walk_counting_fills(&store, direction);
+            let skipped = report(&store).scan_batches_presorted - skipped;
+            let mut expected: Rows = model.iter().map(|(name, value)| (name.clone(), value.clone())).collect();
+            if direction == Direction::Descending {
+                expected.reverse();
+            }
+            assert!(found == expected, "the walk's rows differ from the model, in order {is_in_order} going {direction:?}");
+            println!("in order {is_in_order} going {direction:?}: {skipped} of {fills} batches skipped the sort");
+            match (is_in_order, direction) {
+                (true, Direction::Ascending) => assert!(skipped * 2 > fills, "{skipped} of {fills} batches skipped the sort"),
+                (true, Direction::Descending) | (false, Direction::Ascending | Direction::Descending) => {
+                    assert!(skipped * 10 < fills, "{skipped} of {fills} batches out of order skipped the sort");
+                },
+            }
+            store.close().expect("close");
+        }
+    }
+}

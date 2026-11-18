@@ -16,9 +16,9 @@ use crate::engine::open_segment::MOST_WINDOW_RECORD_BYTES;
 use crate::engine::complete_path::sealed_of;
 use crate::engine::read_path::{HeldPin, KeyRead, Located, MOST_READ_TRIES, RecordWant, SealedRow, newest_of};
 use crate::engine::scan_state::{
-    BATCH_BYTES, BatchEntry, BatchRow, BlockTake, JOIN_GAP, MOST_BATCH_RECORD, MOST_BATCH_RUNS, MOST_WINDOW_RECORD, NO_GENERATION, NO_CHANGES, SCAN_BATCH_KEYS, ScanBatch, batch_room,
+    BATCH_BYTES, BatchEntry, BatchRow, BlockTake, JOIN_GAP, MOST_BATCH_RECORD, MOST_BATCH_RUNS, MOST_WINDOW_RECORD, NO_GENERATION, NO_CHANGES, ScanBatch, batch_room,
     SCAN_CACHE_PARTS, SCAN_CACHE_WEIGH_EVERY, SEAT_BATCH, ScanRange, ScanState, ScanWindows, SegmentSource, ShardHead,
-    seek_together, under_prefix,
+    index_of_word, seek_together, under_prefix,
 };
 use crate::engine::volume::Volume;
 use crate::guard::hold;
@@ -527,7 +527,7 @@ impl<Backend: Io> EngineState<Backend> {
     /// Read the batch's records together, from the record cache, a slot's window or joined reads, and leave the rest to own reads
     pub async fn read_batch(&self, device: &impl DeviceReads<Backend::File>, volume: &Volume<Backend>, scan: &mut ScanState) {
         let is_cached = self.scans_use_cache(volume);
-        let ScanBatch { entries, keys, records, rows, spans, .. } = &mut scan.batch;
+        let ScanBatch { entries, keys, records, rows, spans, words, .. } = &mut scan.batch;
         rows.clear();
         rows.resize(entries.len(), None);
         let mut hits = 0;
@@ -560,7 +560,9 @@ impl<Backend: Io> EngineState<Backend> {
         }
         spans.clear();
         spans.resize(entries.len(), None);
-        self.read_records(device, volume, rows, records, spans).await;
+        if self.read_records(device, volume, rows, records, spans, words).await {
+            self.scan_batches_presorted.fetch_add(1, Ordering::Relaxed);
+        }
         for (entry, span) in entries.iter_mut().zip(spans.iter()) {
             if span.is_some() {
                 entry.record = *span;
@@ -584,7 +586,8 @@ impl<Backend: Io> EngineState<Backend> {
         None
     }
 
-    /// Read small records in file and offset order, one read for each run of neighbours in one segment, sealed or open
+    /// Read small records in file and offset order, one read for each run of neighbours in one segment, sealed or open. Records
+    /// already in that order skip the sort, and the answer says whether two or more did
     pub async fn read_records(
         &self,
         device: &impl DeviceReads<Backend::File>,
@@ -592,18 +595,24 @@ impl<Backend: Io> EngineState<Backend> {
         rows: &[Option<BatchRow>],
         records: &mut Vec<u8>,
         spans: &mut [Option<(usize, usize)>],
-    ) {
+        words: &mut [u128],
+    ) -> bool {
         let small = |index: u16| rows[index as usize].filter(|row| row.length.0 as usize <= MOST_BATCH_RECORD);
-        let mut order = [0_u16; SCAN_BATCH_KEYS];
         let mut count = 0;
-        for index in 0..rows.len().min(SCAN_BATCH_KEYS) as u16 {
-            if small(index).is_some() {
-                order[count] = index;
+        for index in 0..rows.len().min(words.len()) as u16 {
+            if let Some(row) = small(index) {
+                words[count] = row.word(index);
                 count += 1;
             }
         }
-        let order = &mut order[..count];
-        order.sort_unstable_by_key(|index| small(*index).map(|row| row.order()));
+        let order = &mut words[..count];
+        // a run reads from its first record's offset, so records taken as ordered are checked by the word the sort uses
+        let is_presorted = order.is_sorted();
+        if !is_presorted {
+            order.sort_unstable();
+        }
+        let order = &*order;
+        let small = |word: u128| small(index_of_word(word));
         let mut at = 0;
         let mut is_full = false;
         while at < order.len() && !is_full {
@@ -621,7 +630,7 @@ impl<Backend: Io> EngineState<Backend> {
                 let mut end = start + first.length.0;
                 let mut last = at;
                 let left = room - planned;
-                while let Some(next) = order.get(last + 1).and_then(|index| small(*index)) {
+                while let Some(next) = order.get(last + 1).and_then(|word| small(*word)) {
                     let next_end = next.offset.0 + next.length.0;
                     let is_other_file = next.segment != first.segment || next.slot != first.slot;
                     if is_other_file || next.offset.0 > end + JOIN_GAP || next_end.max(end) - start > left {
@@ -670,15 +679,16 @@ impl<Backend: Io> EngineState<Backend> {
             let mut from = base;
             for (&(first, last, start, length), is_filled) in runs.iter().zip(filled).take(run_count) {
                 if is_filled {
-                    for &index in &order[first..=last] {
-                        if let Some(row) = small(index) {
-                            spans[index as usize] = Some((from + (row.offset.0 - start) as usize, row.length.0 as usize));
+                    for &word in &order[first..=last] {
+                        if let Some(row) = small(word) {
+                            spans[index_of_word(word) as usize] = Some((from + (row.offset.0 - start) as usize, row.length.0 as usize));
                         }
                     }
                 }
                 from += length as usize;
             }
         }
+        is_presorted && count > 1
     }
 
     /// Answer the batch's next key from its record, or by its own read when the batch holds none. Nothing when the batch is

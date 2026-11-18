@@ -426,7 +426,7 @@ impl WriteShard {
             if !view.contains(OpenSlot(index as u8)) {
                 continue;
             }
-            let Some(entry) = self.place_cursor(&mut cursor.trees[index], tree, bound) else {
+            let Some(entry) = self.place_cursor(cursor.tree(index), tree, bound) else {
                 continue;
             };
             if self.slab.column(entry) == bound.column {
@@ -589,7 +589,7 @@ pub fn place_heads_together(heads: &mut [Option<HeadPlace<'_>>], bound: &WalkBou
             if !view.contains(OpenSlot(index as u8)) {
                 continue;
             }
-            let cursor = &mut place.cursor.trees[index];
+            let cursor = place.cursor.tree(index);
             if cursor.is_placed && shard.is_cursor_standing(cursor) {
                 fold(shard, best, shard.place_cursor(cursor, tree, bound));
                 continue;
@@ -633,7 +633,7 @@ pub fn place_heads_together(heads: &mut [Option<HeadPlace<'_>>], bound: &WalkBou
                 None => shard.trees[index].last_position(&shard.nodes),
             };
         }
-        let entry = shard.stand(&mut place.cursor.trees[index], position);
+        let entry = shard.stand(place.cursor.tree(index), position);
         fold(shard, &mut best[usize::from(descent.head)], entry);
     }
     for (place, best) in heads.iter_mut().zip(best).take(HEAD_GROUP) {

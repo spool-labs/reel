@@ -298,6 +298,8 @@ pub struct ScanState {
     pub wanted: u64,
     pub asked: u64,
     pub batch: ScanBatch,
+    /// The pool slot the scan came from, which it goes back to
+    pub pool_slot: usize,
 }
 
 impl SegmentSource {
@@ -570,6 +572,7 @@ impl ScanState {
             is_on_index: false,
             wanted: u64::MAX,
             asked: 0,
+            pool_slot: 0,
         }
     }
 
@@ -823,7 +826,7 @@ impl ScanState {
     pub fn heap_bytes(&self) -> ByteCount {
         let source = size_of::<SegmentSource>() as u64;
         let keys: usize = self.sources.iter().map(|source| source.key.capacity() + source.held.capacity()).sum();
-        let heads: usize = self.heads.iter().map(|head| head.key.capacity() + head.cursor.trees.capacity() * size_of::<TreeCursor>()).sum();
+        let heads: usize = self.heads.iter().map(|head| head.key.capacity() + head.cursor.heap_bytes()).sum();
         let own = self.position.capacity() + self.limit.capacity() + self.key.capacity() + self.spill.key.capacity() + self.origin.capacity() + self.out_key.capacity();
         let found = self.found.capacity() * size_of::<SegmentNumber>() + (self.losers.capacity() + self.winners.capacity()) * size_of::<u16>();
         let head = self.heads.capacity() * size_of::<ShardHead>();

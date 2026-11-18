@@ -130,7 +130,7 @@ impl<Backend: Io> EngineState<Backend> {
     /// Take a scan's buffers from the pool and start it
     pub fn take_scan(&self, range: &ScanRange, point: Option<WritePlace>) -> Result<ScanState, StoreError> {
         self.column(range.column)?;
-        let Some(mut scan) = hold(&self.read_pool.scans).pop() else {
+        let Some(mut scan) = self.read_pool.scans.take() else {
             return Err(StoreError::ScansFull { limit: self.read_pool.scan_count as u64 });
         };
         scan.start(range, point);
@@ -140,7 +140,7 @@ impl<Backend: Io> EngineState<Backend> {
     /// Hand a scan's buffers back, with the counts it kept
     pub fn give_back_scan(&self, mut scan: ScanState) {
         self.add_scan_counts(&mut scan);
-        hold(&self.read_pool.scans).push(scan);
+        self.read_pool.scans.give_back(scan);
     }
 
     /// Add the counts a scan kept to the store's totals

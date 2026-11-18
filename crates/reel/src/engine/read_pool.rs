@@ -19,6 +19,7 @@ use reel_core::value_list::ValueList;
 use crate::engine::engine_state::EngineState;
 use crate::engine::read_path::{ReadAt, RecordWant};
 use crate::engine::scan_path::ScanWant;
+use crate::engine::scan_pool::ScanPool;
 use crate::engine::scan_state::ScanState;
 use crate::guard::hold;
 use crate::io::job::{Job, JobStep};
@@ -81,7 +82,7 @@ pub struct ReadPool {
     waiters: Mutex<VecDeque<Waker>>,
     next_worker: AtomicUsize,
     workers: usize,
-    pub scans: Mutex<Vec<ScanState>>,
+    pub scans: ScanPool,
     /// The scans the store runs at once, which a caller past them is refused
     pub scan_count: usize,
 }
@@ -137,7 +138,7 @@ impl ReadPool {
             next_worker: AtomicUsize::new(0),
             workers,
             scan_count: scans.len(),
-            scans: Mutex::new(scans),
+            scans: ScanPool::new(scans),
         }
     }
 
@@ -192,7 +193,7 @@ impl ReadPool {
         drop(slot);
         // a walk whose caller went away still gives its buffers back
         if let ReadWork::Block { scan, .. } = work {
-            hold(&self.scans).push(scan);
+            self.scans.give_back(scan);
         }
         hold(&self.free).push(index);
         if let Some(waiter) = hold(&self.waiters).pop_front() {

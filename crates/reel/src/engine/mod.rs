@@ -34,6 +34,7 @@ pub mod rewrite_job;
 pub mod ring_job;
 pub mod row_job;
 pub mod scan_path;
+pub mod scan_pool;
 pub mod scan_state;
 pub mod seal_job;
 pub mod store_scan;

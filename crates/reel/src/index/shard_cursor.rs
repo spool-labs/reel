@@ -16,7 +16,9 @@ pub struct TreeCursor {
 /// A walk's place in every open segment of one shard
 #[derive(Clone, Debug)]
 pub struct ShardCursor {
-    pub trees: Vec<TreeCursor>,
+    trees: Vec<TreeCursor>,
+    /// A bit for each tree a walk took for placing since the last reset, so a reset touches only those
+    touched: u64,
 }
 
 impl ShardCursor {
@@ -24,16 +26,33 @@ impl ShardCursor {
     pub fn new(open_slots: usize) -> Self {
         Self {
             trees: vec![TreeCursor::default(); open_slots],
+            touched: 0,
         }
+    }
+
+    /// Take one tree's cursor to place, which the next reset clears
+    pub fn tree(&mut self, index: usize) -> &mut TreeCursor {
+        self.touched |= 1 << index;
+        &mut self.trees[index]
     }
 
     /// Start a new walk in the same buffer
     pub fn reset(&mut self) {
-        self.trees.fill(TreeCursor::default());
+        let mut touched = self.touched;
+        while touched != 0 {
+            self.trees[touched.trailing_zeros() as usize] = TreeCursor::default();
+            touched &= touched - 1;
+        }
+        self.touched = 0;
     }
 
     /// Check no tree has a place yet, so the next placement descends every tree
     pub fn is_reset(&self) -> bool {
-        self.trees.iter().all(|tree| !tree.is_placed)
+        self.touched == 0
+    }
+
+    /// Read the heap the cursor holds
+    pub fn heap_bytes(&self) -> usize {
+        self.trees.capacity() * size_of::<TreeCursor>()
     }
 }

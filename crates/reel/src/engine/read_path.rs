@@ -460,7 +460,7 @@ impl<Backend: Io> EngineState<Backend> {
                 KeyPlan::Spot(sealed, lookup) | KeyPlan::Sealed(sealed, lookup) => (sealed, lookup),
             };
             if let Some((start, length)) = span
-                && self.open_batched(device, &read, sealed.row.place, &records[start..start + length], scratch)
+                && self.open_batched(device, (read.column, read.key), sealed.row.place, &records[start..start + length], scratch)
             {
                 if lookup == (CacheLookup::Miss { is_admitted: true }) {
                     self.record_cache.admit(sealed.segment, sealed.row.offset, read.key, scratch);

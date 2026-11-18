@@ -743,7 +743,7 @@ impl<Backend: Io> EngineState<Backend> {
         let Some(entry) = batch.entries.get(batch.next).copied() else {
             return Ok(None);
         };
-        let read = self.key_read(*column, batch.key_of(&entry), batch.point, true)?;
+        let name = batch.key_of(&entry);
         let held = match (entry.record, entry.located) {
             // the cache holds a value with its key, so a value from it answers as it stands
             (Some((at, length)), Located::Sealed(_row)) if entry.is_value => {
@@ -752,23 +752,26 @@ impl<Backend: Io> EngineState<Backend> {
                 true
             },
             (Some((at, length)), Located::Sealed(row)) => {
-                let is_open = self.open_batched(on.device, &read, row.row.place, &batch.records[at..at + length], value);
+                let is_open = self.open_batched(on.device, (*column, name), row.row.place, &batch.records[at..at + length], value);
                 // a scan keeps what it read only while the cache can hold most of the volume, so gets keep theirs otherwise
                 if is_open && on.target.scans_use_cache.load(Ordering::Relaxed) {
-                    self.record_cache.admit(row.segment, row.row.offset, read.key, value);
+                    self.record_cache.admit(row.segment, row.row.offset, name, value);
                 }
                 is_open
             },
             // a record that fails its check here takes its own read, which says whether its slot moved on
-            (Some((at, length)), Located::Open(row)) => self.open_batched(on.device, &read, row.place, &batch.records[at..at + length], value),
+            (Some((at, length)), Located::Open(row)) => self.open_batched(on.device, (*column, name), row.place, &batch.records[at..at + length], value),
             _other => false,
         };
-        let is_found = held
-            || match self.read_located(on, &read, &entry.located, window, *direction, value).await {
+        // only a row the batch doesn't hold needs the key's checks and cover for its own read
+        let is_found = held || {
+            let read = self.key_read(*column, name, batch.point, true)?;
+            match self.read_located(on, &read, &entry.located, window, *direction, value).await {
                 Ok(is_found) => is_found,
                 Err(StoreError::Corruption { .. }) => false,
                 Err(error) => return Err(error),
-            };
+            }
+        };
         if !is_found {
             scan.position.clear();
             scan.position.extend_from_slice(scan.batch.key_of(&entry));
@@ -785,11 +788,11 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Check and open a small record the batch read, as the window does
-    pub fn open_batched(&self, device: &impl DeviceReads<Backend::File>, read: &KeyRead<'_>, place: WritePlace, record: &[u8], value: &mut Vec<u8>) -> bool {
+    pub fn open_batched(&self, device: &impl DeviceReads<Backend::File>, (column, key): (ColumnId, &[u8]), place: WritePlace, record: &[u8], value: &mut Vec<u8>) -> bool {
         let identity = RecordIdentity {
             record_key: self.record_key,
-            column: read.column,
-            key: read.key,
+            column,
+            key,
             kind: RowKind::Value,
             place,
         };

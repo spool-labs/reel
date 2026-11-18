@@ -368,13 +368,21 @@ impl<Backend: Io> EngineState<Backend> {
         Ok(())
     }
 
-    /// Fill every sorted index from the row blocks of every segment, in any order and on as many threads as the store keeps
-    /// workers, since the newest place wins and a grave stays while nothing is dropped at open. Then take out what each live cover
+    /// Pick the threads a sorted fill runs on and the footer readers they take: a writer's workers with the job readers, or the
+    /// opening thread alone in a store with none, and a reader's read threads with the caller readers no call holds yet
+    pub fn fill_threads(&self) -> (usize, &Pool<FooterReader>) {
+        if self.is_read_only {
+            return (self.read_tasks.len().max(1), &self.footer_readers);
+        }
+        (self.sizing.workers.max(1), &self.job_footer_readers)
+    }
+
+    /// Fill every sorted index from the row blocks of every segment, in any order and on as many threads as fill_threads gives,
+    /// since the newest place wins and a grave stays while nothing is dropped at open. Then take out what each live cover
     /// hides. A block that can't be read damages its segment
     pub fn fill_sorted_indexes(&self) -> IoResult<()> {
         let started = self.io.now();
-        // a thread for each worker, and the opening thread alone in a store with none
-        let threads = self.sizing.workers.max(1);
+        let (threads, readers) = self.fill_threads();
         for (id, index) in self.sorted.iter().enumerate() {
             let (Some(index), Some(info)) = (index, self.columns[id]) else {
                 continue;
@@ -393,7 +401,7 @@ impl<Backend: Io> EngineState<Backend> {
                     return;
                 }
                 let number = numbers[unit / threads];
-                match self.fill_sorted_piece(volume, (column, index), number, (unit % threads, threads)) {
+                match self.fill_sorted_piece(volume, (column, index), number, (unit % threads, threads), readers) {
                     Ok(true) => {},
                     Ok(false) => hold(&failed).push(number),
                     Err(fault) => {
@@ -431,6 +439,7 @@ impl<Backend: Io> EngineState<Backend> {
         (column, index): (ColumnId, &SortedKeys),
         number: SegmentNumber,
         (piece, pieces): (usize, usize),
+        readers: &Pool<FooterReader>,
     ) -> IoResult<bool> {
         let (Some((first, count)), Some(pin)) = (volume.table.column_blocks(number, column), volume.table.pin(number)) else {
             return Ok(true);
@@ -443,7 +452,7 @@ impl<Backend: Io> EngineState<Backend> {
         };
         let place_base = WritePlace(pin.head.place_base.0);
         let mut run = SortedRun::new(index.width());
-        self.job_footer_readers.with(|reader| {
+        readers.with(|reader| {
             for block_index in start..end {
                 let Some((entry, _replacement)) = volume.table.block_line(number, block_index) else {
                     return Ok(false);

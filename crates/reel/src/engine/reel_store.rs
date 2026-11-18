@@ -1700,7 +1700,8 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         is_over_bound: AtomicBool::new(true),
         overlap_changes: AtomicU64::new(0),
         walk_slots: (0..sizing.walk_slots).map(|_slot| WalkSlot::new()).collect(),
-        can_free_blocks: volume.roots.iter().all(|root| io.can_free_blocks(root)),
+        // the probe writes a file in each root, and a reader frees nothing
+        can_free_blocks: !sizing.is_read_only && volume.roots.iter().all(|root| io.can_free_blocks(root)),
         bytes_freed: AtomicU64::new(0),
         has_held_frees: AtomicBool::new(false),
         seals_done: AtomicU64::new(0),

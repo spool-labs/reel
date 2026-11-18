@@ -19,7 +19,9 @@ use crate::engine::recovery::{
     scan_roots,
     pass_open_rows, walk_rows,
 };
-use crate::engine::reel_store::{OpenInputs, build_state, open_error, read_only_sizing, read_superblock, volume_disks};
+use crate::engine::reel_store::{
+    OpenInputs, build_state, open_error, read_only_sizing, read_superblock, size_sorted_indexes, sorted_indexes, volume_disks,
+};
 use crate::engine::volume::Volume;
 use crate::guard::hold;
 use crate::io::Io;
@@ -55,8 +57,12 @@ pub fn try_load<Backend: Io>(io: &Backend, config: &StoreConfig) -> Result<Arc<E
     let mode = OpenMode::ReadOnly;
     let mut scan = scan_roots(io, superblock.record_key, &listings, mode).map_err(open_error("reading a tail"))?;
     let locks = config.volumes.iter().map(|_volume| Vec::new()).collect();
+    // the sorted indexes take their room from the caches by the same rule a writer's open uses
+    let (sizing, sorted_sizes) = size_sorted_indexes(config, &sizing, &summaries);
     let mut state = build_state(OpenInputs { io: io.clone(), config, sizing: &sizing, disks: &disks, superblock, locks, scan: &scan, summaries });
     state.is_read_only = true;
+    state.sorted = sorted_indexes(config, &sorted_sizes);
+    state.sorted_sizes = sorted_sizes;
     let state = Arc::new(state);
     let outcome = bring_up_read_only(&state, &mut scan);
     match outcome {
@@ -95,6 +101,8 @@ pub fn bring_up_read_only<Backend: Io>(
             return Err(open_error("reading a rows file")(error));
         }
     }
+    // the sealed segments fill the sorted indexes, and a writer's open rows stay in the write index
+    state.fill_sorted_indexes().map_err(open_error("filling a sorted index"))?;
 
     for cell in &state.read_tasks {
         let worker = ReadWorker {

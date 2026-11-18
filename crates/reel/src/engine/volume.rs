@@ -226,7 +226,9 @@ pub struct TestHolds {
     /// Walks and merges look keys up through the table alone, to compare against the cursor
     pub no_cursor: AtomicBool,
     /// Work a scan's run does between its index entry for a head key and its write index lookup
-    pub between_run_looks: Mutex<Option<RunHook>>,
+    between_run_looks: Mutex<Option<RunHook>>,
+    /// Set while between_run_looks holds a hook, so a scan with none skips its lock
+    is_run_hooked: AtomicBool,
     /// Merges ask every row, to compare against the dead bits
     pub no_bits: AtomicBool,
     /// Merges ask one bit decision in so many, as a release build does, so a bench measures the bits and not the check
@@ -237,6 +239,16 @@ pub struct TestHolds {
     pub lose_bits: AtomicBool,
     /// Picks read every segment's filters as missing from the arena
     pub filters_out: AtomicBool,
+}
+
+#[cfg(feature = "test-hooks")]
+impl TestHolds {
+    /// Install the work a scan runs between a run's two looks at a head key, or remove it with None
+    pub fn set_between_run_looks(&self, hook: Option<RunHook>) {
+        let mut slot = hold(&self.between_run_looks);
+        self.is_run_hooked.store(hook.is_some(), Ordering::Release);
+        *slot = hook;
+    }
 }
 
 /// One volume of a store
@@ -521,7 +533,10 @@ impl<Backend: Io> Volume<Backend> {
     /// Run the work a test set between a run's two looks at a head key
     #[cfg(feature = "test-hooks")]
     pub fn between_run_looks(&self) {
-        let hook = crate::guard::hold(&self.holds.between_run_looks).clone();
+        if !self.holds.is_run_hooked.load(Ordering::Acquire) {
+            return;
+        }
+        let hook = hold(&self.holds.between_run_looks).clone();
         if let Some(RunHook(work)) = hook {
             work();
         }

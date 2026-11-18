@@ -2011,7 +2011,7 @@ fn a_seal_between_a_runs_two_looks() {
         model.insert(name, b"newest".to_vec());
         let (state, disk, is_fired) = (Arc::clone(&store.state), io.clone(), Arc::new(AtomicBool::new(false)));
         let fired = Arc::clone(&is_fired);
-        *hold(&store.state.volumes[0].holds.between_run_looks) = Some(reel::engine::volume::RunHook(Arc::new(move || {
+        store.state.volumes[0].holds.set_between_run_looks(Some(reel::engine::volume::RunHook(Arc::new(move || {
             if !fired.swap(true, Ordering::AcqRel) {
                 state.seal_fullest(&state.volumes[0]);
                 for _step in 0..STEPS {
@@ -2020,9 +2020,9 @@ fn a_seal_between_a_runs_two_looks() {
                     }
                 }
             }
-        })));
+        }))));
         let found = rows(store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan"));
-        *hold(&store.state.volumes[0].holds.between_run_looks) = None;
+        store.state.volumes[0].holds.set_between_run_looks(None);
         assert!(is_fired.load(Ordering::Acquire), "no run took the head key");
         let expected: Rows = model.iter().map(|(name, value)| (name.clone(), value.clone())).collect();
         assert_eq!(found.len(), expected.len(), "new key {is_new}");

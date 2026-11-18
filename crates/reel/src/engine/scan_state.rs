@@ -126,7 +126,16 @@ pub fn batch_room(wanted: u64, asked: u64) -> usize {
 }
 
 /// A batch entry that holds nothing, which the batch's room is written with at open
-pub const NO_BATCH_ENTRY: BatchEntry = BatchEntry { key_at: 0, key_length: 0, located: Located::Absent, record: None, is_value: false };
+pub const NO_BATCH_ENTRY: BatchEntry = BatchEntry { key_at: 0, key_length: 0, key_from: KeyFrom::Batch, located: Located::Absent, record: None, is_value: false };
+
+/// Where a batch entry's key lies
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyFrom {
+    /// In the batch's own keys, at `key_at`
+    Batch,
+    /// In the index batch of this turn, as its entry `key_at`
+    Sorted(u32),
+}
 
 /// A record a batch reads: its segment, the open slot that holds it while the segment is open, and where it sits
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -172,6 +181,7 @@ pub fn index_of_word(word: u128) -> u16 {
 pub struct BatchEntry {
     pub key_at: usize,
     pub key_length: usize,
+    pub key_from: KeyFrom,
     pub located: Located,
     pub record: Option<(usize, usize)>,
     /// The span in the batch's buffer holds the value itself, from the record cache, where it would hold the record
@@ -232,11 +242,6 @@ impl ScanBatch {
         self.next < self.entries.len()
     }
 
-    /// Read an entry's key
-    pub fn key_of(&self, entry: &BatchEntry) -> &[u8] {
-        &self.keys[entry.key_at..entry.key_at + entry.key_length]
-    }
-
     /// Read the heap the batch holds
     pub fn heap_bytes(&self) -> usize {
         let rows = self.rows.capacity() * size_of::<Option<BatchRow>>() + self.spans.capacity() * size_of::<Option<(usize, usize)>>()
@@ -290,6 +295,9 @@ pub struct ScanState {
     pub window: ScanWindows,
     /// A sorted column's sealed keys from its index, graves among them, the next at `sorted_next`
     pub sorted: KeyBatch,
+    /// The index batch before this one, which entries of the scan's batch may still stand in, and the count of index reads
+    pub sorted_spare: KeyBatch,
+    pub sorted_turn: u32,
     pub sorted_next: usize,
     /// The index holds nothing past the batch
     pub is_sorted_done: bool,
@@ -648,6 +656,8 @@ impl ScanState {
             window: ScanWindows::new(),
             batch: ScanBatch::new(widest_key),
             sorted: sorted_batch(widest_key),
+            sorted_spare: sorted_batch(widest_key),
+            sorted_turn: 0,
             sorted_next: 0,
             is_sorted_done: false,
             is_on_index: false,
@@ -737,8 +747,46 @@ impl ScanState {
         }
     }
 
+    /// Read a batch entry's key, wherever it lies
+    pub fn batch_key(&self, entry: &BatchEntry) -> &[u8] {
+        key_in(&self.batch.keys, (&self.sorted, &self.sorted_spare, self.sorted_turn), entry)
+    }
+
+    /// Copy into the batch's own keys the keys its entries keep in the spare index batch, or in both index batches
+    pub fn keep_sorted_keys(&mut self, is_both: bool) {
+        let ScanState { batch, sorted, sorted_spare, sorted_turn, .. } = self;
+        let ScanBatch { entries, keys, .. } = batch;
+        for entry in entries.iter_mut() {
+            let KeyFrom::Sorted(turn) = entry.key_from else {
+                continue;
+            };
+            if turn == *sorted_turn && !is_both {
+                continue;
+            }
+            let key = if turn == *sorted_turn { sorted.key(entry.key_at) } else { sorted_spare.key(entry.key_at) };
+            entry.key_at = keys.len();
+            keys.extend_from_slice(key);
+            entry.key_from = KeyFrom::Batch;
+        }
+    }
+
+    /// Make the spare index batch the one the next read fills, and keep the current one for the entries that stand in it
+    pub fn turn_sorted(&mut self) {
+        self.keep_sorted_keys(false);
+        mem::swap(&mut self.sorted, &mut self.sorted_spare);
+        self.sorted_turn = self.sorted_turn.wrapping_add(1);
+    }
+
+    /// Stand past an index batch key no head shows
+    pub fn pass_sorted(&mut self, index: usize) {
+        self.position.clear();
+        self.position.extend_from_slice(self.sorted.key(index));
+        self.is_inclusive = false;
+    }
+
     /// Drop the index's batch, so the next step reads it again from the walk's position
     pub fn forget_sorted(&mut self) {
+        self.keep_sorted_keys(true);
         self.sorted.clear();
         self.sorted_next = 0;
         self.is_sorted_done = false;
@@ -929,7 +977,7 @@ impl ScanState {
         let own = self.position.capacity() + self.limit.capacity() + self.key.capacity() + self.spill.key.capacity() + self.origin.capacity() + self.out_key.capacity();
         let found = self.found.capacity() * size_of::<SegmentNumber>() + (self.losers.capacity() + self.winners.capacity()) * size_of::<u16>();
         let head = self.heads.capacity() * size_of::<ShardHead>();
-        let batches = self.batch.heap_bytes() + self.sorted.heap_bytes();
+        let batches = self.batch.heap_bytes() + self.sorted.heap_bytes() + self.sorted_spare.heap_bytes();
         ByteCount(self.sources.capacity() as u64 * source + (keys + heads + own + found + head + self.window.heap_bytes() + batches) as u64)
     }
 }
@@ -1002,7 +1050,7 @@ pub fn planned_scan_bytes(widest_key: u64, open_slots: usize) -> u64 {
     let tree = 2 * MOST_SCAN_SOURCES * size_of::<u16>();
     let sorted = SCAN_BATCH_KEYS * ((widest_key as usize).clamp(1, MOST_KEY_BYTES) + size_of::<KeyEntry>());
     let rows = SCAN_BATCH_KEYS * (size_of::<Option<BatchRow>>() + size_of::<Option<(usize, usize)>>() + size_of::<u128>());
-    let batch = SCAN_BATCH_KEYS * (widest_key as usize + size_of::<BatchEntry>()) + BATCH_BYTES + sorted + rows;
+    let batch = SCAN_BATCH_KEYS * (widest_key as usize + size_of::<BatchEntry>()) + BATCH_BYTES + 2 * sorted + rows;
     keys + (sources + heads + held + tree + batch + MOST_SCAN_SOURCES * size_of::<SegmentNumber>() + SCAN_WINDOWS * SCAN_WINDOW_BYTES) as u64
 }
 
@@ -1169,4 +1217,13 @@ pub fn sorted_batch(widest_key: usize) -> KeyBatch {
     let mut batch = KeyBatch::new(widest_key.clamp(1, MOST_KEY_BYTES), SCAN_BATCH_KEYS);
     batch.is_with_graves = true;
     batch
+}
+
+/// Read a batch entry's key from the batch's own keys or the index batch of its turn
+pub fn key_in<'scan>(keys: &'scan [u8], (sorted, spare, turn): (&'scan KeyBatch, &'scan KeyBatch, u32), entry: &BatchEntry) -> &'scan [u8] {
+    match entry.key_from {
+        KeyFrom::Batch => &keys[entry.key_at..entry.key_at + entry.key_length],
+        KeyFrom::Sorted(at) if at == turn => sorted.key(entry.key_at),
+        KeyFrom::Sorted(_at) => spare.key(entry.key_at),
+    }
 }

@@ -916,7 +916,7 @@ fn walk_around(store: &Store, change: impl FnOnce(&reel::engine::scan_state::Sca
     };
     assert_eq!(step(&mut scan, &mut found), ScanStep::Found);
     let last = scan.batch.entries.last().expect("a located batch");
-    let batch_end = scan.batch.keys[last.key_at..last.key_at + last.key_length].to_vec();
+    let batch_end = scan.batch_key(last).to_vec();
     change(&scan);
     while step(&mut scan, &mut found) == ScanStep::Found {}
     store.state.give_back_scan(scan);
@@ -2222,6 +2222,53 @@ fn a_write_between_a_read_ahead_and_its_use_drops_it() {
     assert!(drops() > before, "a write between the read ahead and its use left the keys standing");
     assert!(found == expected, "the walk's rows differ from the model");
     store.close().expect("close");
+}
+
+const RANGE_WALKS: u64 = 12;
+const DELETE_ONE_IN: u64 = 3;
+
+// a run keeps its index keys by their place in the index batch: walks over graves, open keys and a limit, up and down, untold and
+// told, give the model's rows
+#[test]
+fn runs_over_graves_heads_and_a_limit_match_the_model() {
+    for seed in seeds(0..WRITER_SEEDS) {
+        let io = SimulatedIo::new(Seed(seed));
+        let store = open(&io, CAPACITY);
+        let mut model = Model::new();
+        let mut random = SeededRandom::new(Seed(seed));
+        for number in 0..WRITER_KEYS {
+            store.put(COLUMN, &key(number), format!("{number}").as_bytes()).expect("put");
+            model.insert(key(number), format!("{number}").into_bytes());
+        }
+        seal_all(&store, &io);
+        // sealed graves stand in the index among the values
+        for number in (0..WRITER_KEYS).filter(|number| number % DELETE_ONE_IN == 0) {
+            store.delete(COLUMN, &key(number)).expect("delete");
+            model.remove(&key(number));
+        }
+        seal_all(&store, &io);
+        let mut fresh = WRITER_KEYS;
+        for _key in 0..OPEN_KEYS {
+            write_one(&store, &mut model, &mut random, &mut fresh);
+        }
+        let names: Vec<Vec<u8>> = model.keys().cloned().collect();
+        for _walk in 0..RANGE_WALKS {
+            let (first, second) = (&names[random.below(names.len() as u64) as usize], &names[random.below(names.len() as u64) as usize]);
+            let (low, high) = if first <= second { (first.clone(), second.clone()) } else { (second.clone(), first.clone()) };
+            let up: Rows = model.range(low.clone()..high.clone()).map(|(name, value)| (name.clone(), value.clone())).collect();
+            assert_eq!(rows(store.iter_range(COLUMN, &low, &high, Direction::Ascending).expect("scan")), up, "up over [{low:?}, {high:?})");
+            let down: Rows = up.iter().rev().cloned().collect();
+            assert_eq!(rows(store.iter_range(COLUMN, &low, &high, Direction::Descending).expect("scan")), down, "down over [{low:?}, {high:?})");
+            for direction in [Direction::Ascending, Direction::Descending] {
+                let range = ScanRange { wanted: Some(RowCount(TOLD_ROWS)), ..reel::engine::scan_state::in_range(COLUMN, &low, &high, direction) };
+                let found = rows(StoreScan::new(Arc::clone(&store.state), &range).expect("scan"));
+                let expected = if direction == Direction::Ascending { &up } else { &down };
+                assert!(&found == expected, "told {TOLD_ROWS} {direction:?} over [{low:?}, {high:?})");
+            }
+        }
+        check_scans(&store, &model, &mut random);
+        store.close().expect("close");
+    }
 }
 
 // walk a whole column for values, and return its rows and the batches it filled

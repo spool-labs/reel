@@ -18,7 +18,7 @@ use crate::engine::read_path::{HeldPin, KeyRead, Located, MOST_READ_TRIES, Recor
 use crate::engine::scan_state::{
     BatchEntry, BatchRow, BlockTake, JOIN_GAP, MOST_BATCH_RECORD, MOST_BATCH_RUNS, MOST_WINDOW_RECORD, NO_GENERATION, NO_CHANGES, ScanBatch, batch_room,
     SCAN_CACHE_PARTS, SCAN_CACHE_WEIGH_EVERY, SEAT_BATCH, ScanRange, ScanState, ScanWindows, SegmentSource, ShardHead,
-    index_of_word, seek_together, under_prefix,
+    KeyFrom, index_of_word, key_in, seek_together, under_prefix,
 };
 use crate::engine::volume::Volume;
 use crate::guard::hold;
@@ -380,7 +380,7 @@ impl<Backend: Io> EngineState<Backend> {
             ScanWant::Locate => {
                 let key_at = scan.batch.keys.len();
                 scan.batch.keys.extend_from_slice(candidate);
-                scan.batch.entries.push(BatchEntry { key_at, key_length: candidate.len(), located, record: None, is_value: false });
+                scan.batch.entries.push(BatchEntry { key_at, key_length: candidate.len(), key_from: KeyFrom::Batch, located, record: None, is_value: false });
                 Ok(true)
             },
             ScanWant::Bytes => {
@@ -490,10 +490,17 @@ impl<Backend: Io> EngineState<Backend> {
         self.place_heads(volume, scan);
         let mut taken = 0;
         let mut key = [0; MOST_KEY_BYTES];
+        // the index key the run passed last, which the walk's position takes before a read of the index or a head placing
+        let mut passed: Option<usize> = None;
         while scan.batch.entries.len() < room && scan.batch.has_room(*located_bytes) {
             // a row that landed since the heads were placed stands on no head, so a run needs heads placed at or above its point
             if directory.map_or(0, ColumnDirectory::generation) != scan.generation || point > scan.heads_mark {
                 break;
+            }
+            if scan.sorted_next >= scan.sorted.len()
+                && let Some(at) = passed.take()
+            {
+                scan.pass_sorted(at);
             }
             fill_sorted(index, scan);
             let sorted = scan.sorted_key();
@@ -511,31 +518,44 @@ impl<Backend: Io> EngineState<Backend> {
                 break;
             }
             let length = next.len();
-            key[..length].copy_from_slice(next);
             let sealed = match is_sorted.then(|| scan.sorted.entries[scan.sorted_next]) {
                 // an entry newer than the point asks the footers, in the step that answers one key at a time
                 Some(entry) if entry.place > point => break,
                 Some(entry) => Some(sealed_of(&entry)),
                 None => None,
             };
-            let name = &key[..length];
-            let shown = scan.closest_head.filter(|_head| is_head);
-            let open = match shown {
-                Some(head) => {
-                    volume.between_run_looks();
-                    match self.ahead_row(volume, scan, head, name, point) {
-                        Some(row) => row,
-                        // the shard changed since its head read ahead, so the head descends fresh from the walk's place
-                        None => {
-                            self.ahead_drops.fetch_add(1, Ordering::Relaxed);
-                            scan.heads[head].forget_ahead();
-                            scan.heads[head].is_placed = false;
-                            self.place_heads(volume, scan);
-                            continue;
-                        },
+            // no head shows an index key here, so its entry keeps the key where the index batch holds it
+            let Some(shown) = scan.closest_head.filter(|_head| is_head) else {
+                let located = newest_of(None, sealed);
+                let at = scan.sorted_next;
+                if located.has_value() {
+                    let from = KeyFrom::Sorted(scan.sorted_turn);
+                    scan.batch.entries.push(BatchEntry { key_at: at, key_length: length, key_from: from, located, record: None, is_value: false });
+                    if located.length().0 as usize <= MOST_BATCH_RECORD {
+                        *located_bytes += located.length().0 as usize;
                     }
+                    taken += 1;
+                }
+                scan.sorted_next += 1;
+                passed = Some(at);
+                continue;
+            };
+            key[..length].copy_from_slice(next);
+            let name = &key[..length];
+            volume.between_run_looks();
+            let open = match self.ahead_row(volume, scan, shown, name, point) {
+                Some(row) => row,
+                // the shard changed since its head read ahead, so the head descends fresh from the walk's place
+                None => {
+                    self.ahead_drops.fetch_add(1, Ordering::Relaxed);
+                    if let Some(at) = passed.take() {
+                        scan.pass_sorted(at);
+                    }
+                    scan.heads[shown].forget_ahead();
+                    scan.heads[shown].is_placed = false;
+                    self.place_heads(volume, scan);
+                    continue;
                 },
-                None => None,
             };
             // a seal between the two looks moves the row out of the view, so the step that answers one key at a time takes the key
             if directory.map_or(0, ColumnDirectory::generation) != scan.generation {
@@ -545,19 +565,21 @@ impl<Backend: Io> EngineState<Backend> {
             if located.has_value() {
                 let key_at = scan.batch.keys.len();
                 scan.batch.keys.extend_from_slice(name);
-                scan.batch.entries.push(BatchEntry { key_at, key_length: length, located, record: None, is_value: false });
+                scan.batch.entries.push(BatchEntry { key_at, key_length: length, key_from: KeyFrom::Batch, located, record: None, is_value: false });
                 if located.length().0 as usize <= MOST_BATCH_RECORD {
                     *located_bytes += located.length().0 as usize;
                 }
                 taken += u64::from(matches!(located, Located::Sealed(_)));
             }
             scan.pass(name);
+            passed = None;
             // a head with keys read ahead moves to the next one, and only a head that ran out places again
-            if let Some(head) = shown
-                && !scan.step_ahead(head)
-            {
+            if !scan.step_ahead(shown) {
                 self.place_heads(volume, scan);
             }
+        }
+        if let Some(at) = passed {
+            scan.pass_sorted(at);
         }
         scan.sorted_scan_keys += taken;
         self.sorted_runs.fetch_add(u64::from(taken > 0), Ordering::Relaxed);
@@ -632,7 +654,7 @@ impl<Backend: Io> EngineState<Backend> {
     /// Read the batch's records together, from the record cache, a slot's window or joined reads, and leave the rest to own reads
     pub async fn read_batch(&self, device: &impl DeviceReads<Backend::File>, volume: &Volume<Backend>, scan: &mut ScanState) {
         let is_cached = self.scans_use_cache(volume);
-        let ScanBatch { entries, keys, records, rows, spans, words, .. } = &mut scan.batch;
+        let ScanState { batch: ScanBatch { entries, keys, records, rows, spans, words, .. }, sorted, sorted_spare, sorted_turn, .. } = scan;
         rows.clear();
         rows.resize(entries.len(), None);
         let mut hits = 0;
@@ -651,7 +673,7 @@ impl<Backend: Io> EngineState<Backend> {
             // a value is no longer than its record, so a record's room in the buffer holds it with no allocation
             let at = records.len();
             let is_room = at + sealed.row.length.0 as usize <= records.capacity();
-            let key = &keys[entry.key_at..entry.key_at + entry.key_length];
+            let key = key_in(keys, (sorted, sorted_spare, *sorted_turn), entry);
             if is_cached && is_room && self.record_cache.get_onto(sealed.segment, sealed.row.offset, key, records) == CacheLookup::Hit {
                 entry.record = Some((at, records.len() - at));
                 entry.is_value = true;
@@ -805,11 +827,11 @@ impl<Backend: Io> EngineState<Backend> {
         key: &mut Vec<u8>,
         value: &mut Vec<u8>,
     ) -> Result<Option<ScanStep>, StoreError> {
-        let ScanState { batch, window, direction, column, .. } = scan;
+        let ScanState { batch, window, direction, column, sorted, sorted_spare, sorted_turn, .. } = scan;
         let Some(entry) = batch.entries.get(batch.next).copied() else {
             return Ok(None);
         };
-        let name = batch.key_of(&entry);
+        let name = key_in(&batch.keys, (sorted, sorted_spare, *sorted_turn), &entry);
         let held = match (entry.record, entry.located) {
             // the cache holds a value with its key, so a value from it answers as it stands
             (Some((at, length)), Located::Sealed(_row)) if entry.is_value => {
@@ -840,14 +862,14 @@ impl<Backend: Io> EngineState<Backend> {
         };
         if !is_found {
             scan.position.clear();
-            scan.position.extend_from_slice(scan.batch.key_of(&entry));
+            scan.position.extend_from_slice(key_in(&scan.batch.keys, (&scan.sorted, &scan.sorted_spare, scan.sorted_turn), &entry));
             scan.is_inclusive = true;
             scan.generation = NO_GENERATION;
             scan.batch.clear();
             return Ok(None);
         }
         key.clear();
-        key.extend_from_slice(scan.batch.key_of(&entry));
+        key.extend_from_slice(scan.batch_key(&entry));
         scan.batch.next += 1;
         scan.batched += u64::from(held);
         Ok(Some(ScanStep::Found))
@@ -871,7 +893,7 @@ impl<Backend: Io> EngineState<Backend> {
                 scan.asked += 1;
                 scan.batch.next += 1;
                 scan.batched += 1;
-                if !each(scan.batch.key_of(&entry), &scan.batch.records[at..at + length]) {
+                if !each(scan.batch_key(&entry), &scan.batch.records[at..at + length]) {
                     return Ok(ScanStep::Found);
                 }
             }
@@ -892,7 +914,7 @@ impl<Backend: Io> EngineState<Backend> {
             Located::Open(row) => row.place,
             Located::Absent => return None,
         };
-        let (record, name) = (&scan.batch.records[at..at + length], scan.batch.key_of(entry));
+        let (record, name) = (&scan.batch.records[at..at + length], scan.batch_key(entry));
         let identity = RecordIdentity { record_key: self.record_key, column: scan.column, key: name, kind: RowKind::Value, place };
         let form = form_of(record).filter(|form| !form.is_chunked && form.codec == Codec::None)?;
         let payload = checked_payload(record, form, &identity)?;
@@ -1692,7 +1714,7 @@ pub fn read_error(source: Error) -> StoreError {
 pub fn answer_key_from_batch(scan: &mut ScanState, key: &mut Vec<u8>) -> Option<ScanStep> {
     let entry = scan.batch.entries.get(scan.batch.next).copied()?;
     key.clear();
-    key.extend_from_slice(scan.batch.key_of(&entry));
+    key.extend_from_slice(scan.batch_key(&entry));
     scan.batch.next += 1;
     Some(ScanStep::Found)
 }
@@ -1701,7 +1723,9 @@ pub fn answer_key_from_batch(scan: &mut ScanState, key: &mut Vec<u8>) -> Option<
 /// batch runs out and the index holds more
 pub fn fill_sorted(index: &SortedKeys, scan: &mut ScanState) {
     if scan.sorted.width() != index.width() {
+        scan.keep_sorted_keys(true);
         scan.sorted.set_width(index.width());
+        scan.sorted_spare.set_width(index.width());
         scan.sorted_next = 0;
         scan.is_sorted_done = false;
     }
@@ -1717,6 +1741,8 @@ pub fn fill_sorted(index: &SortedKeys, scan: &mut ScanState) {
         }
         // the index hands out no more entries than the caller still wants, the one asked for now among them
         let most = batch_room(scan.wanted, scan.asked).max(1);
+        // the read fills the spare, so the batch's entries keep their keys in the index batch it read last
+        scan.turn_sorted();
         let ScanState { sorted, position, is_inclusive, direction, .. } = scan;
         let from = ScanFrom::Key { key: position, is_inclusive: *is_inclusive };
         let is_done = match direction {

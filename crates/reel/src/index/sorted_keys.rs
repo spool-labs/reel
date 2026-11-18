@@ -1110,9 +1110,13 @@ impl SortedKeys {
         if entry.is_grave && !batch.is_with_graves {
             return;
         }
-        let mut key = [0; MOST_KEY_BYTES];
-        self.unpack_key(leaf, self.leaf_entry(index), &mut key);
-        batch.keys.extend_from_slice(&key[..self.width]);
+        // the key goes straight into the batch, a word at a time
+        let at = batch.keys.len();
+        batch.keys.resize(at + self.width, 0);
+        let base = self.leaf_entry(index);
+        for (word, bytes) in batch.keys[at..].chunks_mut(size_of::<u32>()).enumerate() {
+            bytes.copy_from_slice(&self.load(leaf, base + word).to_be_bytes()[..bytes.len()]);
+        }
         batch.entries.push(entry);
     }
 

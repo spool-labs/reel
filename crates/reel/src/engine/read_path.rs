@@ -99,6 +99,8 @@ pub struct KeyRead<'key> {
     pub read_point: WritePlace,
     pub cover: Option<WritePlace>,
     pub is_cue: bool,
+    /// The job counts taken before the read point, when a sealed record's read may skip its check while they hold
+    pub trust: Option<JobCounts>,
 }
 
 /// A key being read at the newest point, with the counts its answer has to outlive
@@ -280,7 +282,9 @@ impl<Backend: Io> EngineState<Backend> {
         let info = self.column(column)?;
         let counts = self.cues.counts();
         let handovers = self.volumes[info.volume.0 as usize].handover_count();
-        let read = self.key_read_now(column, key)?;
+        let mut read = self.key_read_now(column, key)?;
+        // a reader follows a writer whose frees its counts can't see
+        read.trust = (!self.is_read_only).then_some(counts);
         Ok(LatestRead { read, counts, handovers })
     }
 
@@ -683,6 +687,7 @@ impl<Backend: Io> EngineState<Backend> {
             read_point,
             cover,
             is_cue: false,
+            trust: None,
         })
     }
 
@@ -704,6 +709,7 @@ impl<Backend: Io> EngineState<Backend> {
             read_point,
             cover: self.volumes[info.volume.0 as usize].covers.newest_over(column, key, read_point),
             is_cue,
+            trust: None,
         })
     }
 
@@ -729,7 +735,7 @@ impl<Backend: Io> EngineState<Backend> {
             length: spot.length,
         };
         // a failed check here means another key or a moved record: a miss
-        let is_valid = self.read_cached(device, &pin.file, spot.segment, location, spot.place, read, want, buf).await?;
+        let is_valid = self.read_cached(device, &pin.file, spot.segment, location, (spot.place, None), read, want, buf).await?;
         Ok(is_valid.then_some(true))
     }
 
@@ -801,7 +807,7 @@ impl<Backend: Io> EngineState<Backend> {
             offset: row.offset,
             length: row.length,
         };
-        match self.read_record(ReadOn::new(device, &pin.file), location, row.place, read, want, buf).await? {
+        match self.read_record(ReadOn::new(device, &pin.file), location, (row.place, None), read, want, buf).await? {
             RecordRead::Valid => {
                 if is_admitting && want == RecordWant::Whole {
                     self.record_cache.admit(row.segment, row.offset, read.key, buf);
@@ -830,7 +836,7 @@ impl<Backend: Io> EngineState<Backend> {
             length: sealed.row.length,
         };
         // a sealed record never changes where it sits, so the cache answers for its place while the segment is pinned
-        let is_valid = self.read_cached(device, &pin.file, sealed.segment, location, sealed.row.place, read, want, buf).await?;
+        let is_valid = self.read_cached(device, &pin.file, sealed.segment, location, (sealed.row.place, read.trust), read, want, buf).await?;
         if !is_valid {
             return Err(corruption(read));
         }
@@ -846,7 +852,7 @@ impl<Backend: Io> EngineState<Backend> {
         file: &Backend::File,
         segment: SegmentNumber,
         location: RecordLocation,
-        place: WritePlace,
+        (place, trust): (WritePlace, Option<JobCounts>),
         read: &KeyRead<'_>,
         want: RecordWant,
         buf: &mut Vec<u8>,
@@ -858,7 +864,7 @@ impl<Backend: Io> EngineState<Backend> {
         if lookup == CacheLookup::Hit {
             return Ok(true);
         }
-        match self.read_record(ReadOn::new(device, file), location, place, read, want, buf).await? {
+        match self.read_record(ReadOn::new(device, file), location, (place, trust), read, want, buf).await? {
             RecordRead::Valid => {
                 if lookup == (CacheLookup::Miss { is_admitted: true }) {
                     self.record_cache.admit(segment, location.offset, read.key, buf);
@@ -869,12 +875,13 @@ impl<Backend: Io> EngineState<Backend> {
         }
     }
 
-    /// Read and check one record through a pooled reader
+    /// Read and check one record through a pooled reader. A read with counts taken before its point skips a small record's
+    /// check while they hold once the bytes are in, since only a free changes a sealed record's bytes and it moves the count first
     pub async fn read_record(
         &self,
         on: ReadOn<'_, impl DeviceReads<Backend::File>, Backend::File>,
         location: RecordLocation,
-        place: WritePlace,
+        (place, trust): (WritePlace, Option<JobCounts>),
         read: &KeyRead<'_>,
         want: RecordWant,
         buf: &mut Vec<u8>,
@@ -889,7 +896,15 @@ impl<Backend: Io> EngineState<Backend> {
         };
         let mut reader = self.record_reader_for(device);
         let outcome = match want {
-            RecordWant::Whole => reader.read_value(device, file, location, &identity, read.info.codec, buf).await,
+            RecordWant::Whole => match trust {
+                Some(counts) => match reader.read_trusted(device, file, location, buf).await {
+                    Ok(Some(answer)) if self.has_outlived(counts, true) => Ok(answer),
+                    Ok(Some(_answer)) => Ok(reader.check_trusted(&identity, buf)),
+                    Ok(None) => reader.read_value(device, file, location, &identity, read.info.codec, buf).await,
+                    Err(error) => Err(error),
+                },
+                None => reader.read_value(device, file, location, &identity, read.info.codec, buf).await,
+            },
             RecordWant::Window(window) => reader.read_window(device, file, location, &identity, read.info.codec, window, buf).await,
         };
         let damaged = reader.take_damaged_sums();

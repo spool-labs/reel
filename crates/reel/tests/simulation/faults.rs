@@ -155,6 +155,11 @@ impl Versions {
         self.refused_at = Some(self.history.len());
     }
 
+    // a get trusts a sealed record its counts vouch for, so rot it reads back is no version the key ever held
+    fn is_rot(&self, found: &Option<Vec<u8>>) -> bool {
+        found.is_some() && !self.history.contains(found)
+    }
+
     // a flush covers whatever a key holds, so a flush while it's unknown lands on the version a read finds
     fn note_flush(&mut self) {
         if self.is_unknown() {
@@ -640,6 +645,7 @@ impl Run {
         let (column, key) = random_key(&mut self.streams.read);
         let versions = self.model.entry((column, key.clone())).or_default();
         match read(store, column, &key) {
+            Ok(found) if self.has_rot && versions.is_rot(&found) => versions.note_refusal(),
             Ok(found) => assert!(versions.check_live(Some(&found)), "seed {}: get of {key:?} read {found:?}, in {versions:?}", self.seed),
             Err(StoreError::Corruption { .. }) if self.has_rot => {},
             Err(_crashed) if self.io.is_crashed() => {},
@@ -708,6 +714,10 @@ impl Run {
         assert_eq!(report.unlinks_refused, SegmentCount(0), "seed {}: the counts called a live row dead", self.seed);
         for ((column, key), versions) in &mut self.model {
             let found = match read(store, *column, key) {
+                Ok(found) if self.has_rot && versions.is_rot(&found) => {
+                    versions.note_refusal();
+                    continue;
+                },
                 Ok(found) => found,
                 Err(StoreError::Corruption { .. }) if self.has_rot => {
                     versions.note_refusal();

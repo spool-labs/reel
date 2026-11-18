@@ -69,6 +69,8 @@ pub struct RecordReader {
     decoded: Vec<u8>,
     /// Chunks whose stored piece sums didn't match their entry while the chunk's bytes did, since the engine last took the count
     damaged_sums: u64,
+    /// The form and length of a record `read_trusted` handed over unchecked, whose bytes stay in `first`
+    trusted: Option<(RecordForm, usize)>,
 }
 
 impl RecordReader {
@@ -80,6 +82,7 @@ impl RecordReader {
             chunk: touched_zeroes(CHUNK_BYTES),
             decoded: touched_zeroes(CHUNK_BYTES),
             damaged_sums: 0,
+            trusted: None,
         }
     }
 
@@ -164,6 +167,48 @@ impl RecordReader {
             length: head.value_length,
         };
         self.read_chunks(device, file, location, &head, window, buf).await
+    }
+
+    /// Read a one-chunk record whose bytes nothing changed since the caller located it, and hand its value over with no payload
+    /// sum or record check: its form still parses, and the read takes the located length. Nothing for any other record, which
+    /// takes `read_value`. The bytes stay held, so `check_trusted` can check them after
+    pub async fn read_trusted<File: IoFile>(
+        &mut self,
+        device: &impl DeviceReads<File>,
+        file: &File,
+        location: RecordLocation,
+        buf: &mut Vec<u8>,
+    ) -> Result<Option<RecordRead>> {
+        self.trusted = None;
+        let length = location.length.0 as usize;
+        if length < SMALL_HEAD_BYTES || length > self.first.len() {
+            return Ok(None);
+        }
+        device.read_exact(file, location.offset, &mut self.first[..length]).await?;
+        let Some(form) = self.form().filter(|form| !form.is_chunked) else {
+            return Ok(None);
+        };
+        let payload = &self.first[SMALL_HEAD_BYTES..length];
+        buf.clear();
+        match form.codec {
+            Codec::None => buf.extend_from_slice(payload),
+            Codec::Lz4 => {
+                let Some(restored) = decompress(payload, &mut self.decoded) else {
+                    return Ok(None);
+                };
+                buf.extend_from_slice(&self.decoded[..restored]);
+            },
+        }
+        self.trusted = Some((form, length));
+        Ok(Some(RecordRead::Valid))
+    }
+
+    /// Check the record `read_trusted` handed over last, for a read whose counts moved while it read
+    pub fn check_trusted(&mut self, identity: &RecordIdentity<'_>, buf: &mut Vec<u8>) -> RecordRead {
+        match self.trusted.take() {
+            Some((form, length)) => self.finish_small(form, length, identity, buf),
+            None => RecordRead::Valid,
+        }
     }
 
     /// Fill the buffer with a window of the value, cut at the value's end
@@ -596,6 +641,7 @@ impl HollowItem for RecordReader {
             chunk: Vec::new(),
             decoded: Vec::new(),
             damaged_sums: 0,
+            trusted: None,
         }
     }
 }

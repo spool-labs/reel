@@ -7,17 +7,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use reel::config::{ColumnConfig, ColumnIndex, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::compact_job::CompactJob;
 use reel::engine::cue::MOST_CUES;
-use reel::engine::read_path::{MOST_READ_TRIES, RecordWant};
+use reel::engine::open_segment::data_path;
+use reel::engine::read_path::{MOST_READ_TRIES, RecordWant, SealedRow};
 use reel::engine::reel_store::ReelStore;
 use reel::engine::rewrite_job::freed_in_place;
 use reel::engine::walk_job::{FREE_BLOCK_BYTES, FREE_IN_PLACE_BYTES, FreeRecord, MOST_BLOCK_FREES};
 use reel::guard::hold;
 use reel::io::{InPlace, in_place};
 use reel::record::codec::Codec;
+use reel::record::record_head::SMALL_HEAD_BYTES;
 use reel::segment::segment_tail::SegmentNumber;
 use reel_core::column_id::ColumnId;
+use reel_core::direction::Direction;
+use reel_core::scan::ScanStep;
 use reel_core::units::{ByteCount, FileOffset, Nanoseconds, VolumeId, WritePlace};
 use reel_core::value_list::{ReadBuffers, ValueList};
+use reel_sim::file_image::BitMask;
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_io::SimulatedIo;
@@ -548,4 +553,75 @@ fn cool(store: &Store, io: &SimulatedIo) {
     let until = store.state.quiet_at(io.clock_reading());
     io.advance_clock(Nanoseconds(until.0.saturating_sub(io.clock_reading().0)));
     settle(io);
+}
+
+// find where a key's newest sealed row sits, with its segment's data file
+fn sealed_row(store: &Store, key: &[u8]) -> (SealedRow, PathBuf) {
+    let volume = &store.state.volumes[0];
+    let read = store.state.key_read(COLUMN, key, store.state.read_point(volume), false).expect("read");
+    let row = in_place(store.state.search_sealed(&InPlace, volume, &read)).expect("search").expect("a sealed row");
+    let path = data_path(&volume.roots[0], row.segment).to_path_buf();
+    (row, path)
+}
+
+// a large record freed under a get that took its counts first fails its full check, and the get starts over. Counts taken after
+// the free read the replacement
+#[test]
+fn a_free_under_a_gets_counts_starts_it_over() {
+    let io = SimulatedIo::new(Seed(40));
+    let store = open(&io);
+    keep_live(&store);
+    store.put(COLUMN, b"key", &large(1)).expect("put");
+    seal(&store, &io);
+    let before = store.state.latest_read(COLUMN, b"key").expect("read");
+    store.put(COLUMN, b"key", &large(2)).expect("put");
+    seal(&store, &io);
+    assert!(store.state.cues.counts().frees > before.counts.frees, "nothing was freed");
+
+    let mut buf = Vec::new();
+    assert!(crate::latest::answer(&store, &before, RecordWant::Whole, &mut buf).is_none(), "the crossed get kept its answer");
+    let after = store.state.latest_read(COLUMN, b"key").expect("read");
+    let answer = crate::latest::answer(&store, &after, RecordWant::Whole, &mut buf).expect("an answer");
+    assert!(answer.expect("get"));
+    assert_eq!(buf, large(2));
+    store.close().expect("close");
+}
+
+// a scan's batch that located a large row before the row was freed reads it with the full check, which fails, and the walk
+// seeks again and finds the replacement
+#[test]
+fn a_scan_batch_across_a_free_seeks_again() {
+    let io = SimulatedIo::new(Seed(41));
+    let store = open(&io);
+    keep_live(&store);
+    store.put(COLUMN, b"a", &large(1)).expect("put");
+    store.put(COLUMN, b"b", &large(1)).expect("put");
+    seal(&store, &io);
+    let mut scan = store.iter_from(COLUMN, b"a", Direction::Ascending).expect("scan");
+    let (mut name, mut value) = (Vec::new(), Vec::new());
+    assert_eq!(scan.next_row(&mut name, &mut value).expect("step"), ScanStep::Found);
+    assert_eq!((name.as_slice(), value.clone()), (&b"a"[..], large(1)));
+    let frees = store.state.cues.counts().frees;
+    store.put(COLUMN, b"b", &large(2)).expect("put");
+    seal(&store, &io);
+    assert!(store.state.cues.counts().frees > frees, "nothing was freed");
+    assert_eq!(scan.next_row(&mut name, &mut value).expect("step"), ScanStep::Found);
+    assert_eq!((name.as_slice(), value), (&b"b"[..], large(2)));
+    store.close().expect("close");
+}
+
+// the price of the skipped check: a small sealed record whose payload bytes flipped on the disk reads back flipped, since nothing
+// moved the get's counts
+#[test]
+fn flipped_bytes_read_back_unchecked_while_counts_hold() {
+    let io = SimulatedIo::new(Seed(42));
+    let store = open(&io);
+    store.put(COLUMN, b"small", b"small value").expect("put");
+    seal(&store, &io);
+    let (row, path) = sealed_row(&store, b"small");
+    io.rot(&path, FileOffset(row.row.offset.0 + SMALL_HEAD_BYTES as u64), BitMask(1)).expect("rot");
+    let found = read(&store, b"small").expect("a value");
+    assert_eq!(found.len(), b"small value".len());
+    assert_ne!(found, b"small value", "the flipped byte was caught");
+    store.close().expect("close");
 }

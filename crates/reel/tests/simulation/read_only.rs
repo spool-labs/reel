@@ -7,15 +7,18 @@ use reel::engine::engine_sizing::shard_for_rows;
 use reel::guard::hold;
 use reel::index::write_index::SHARD_COUNT;
 use reel::config::{ColumnConfig, ColumnIndex, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::engine::open_segment::data_path;
 use reel::engine::reel_store::ReelStore;
-use reel::io::Io;
+use reel::io::{InPlace, Io, in_place};
 use reel::record::codec::{CHUNK_BYTES, Codec};
+use reel::record::record_head::SMALL_HEAD_BYTES;
 use reel_core::column_id::ColumnId;
 use reel_core::direction::Direction;
 use reel_core::scan::ScanStep;
 use reel_core::store_error::StoreError;
-use reel_core::units::{ByteCount, Nanoseconds, RowCount, VolumeId};
+use reel_core::units::{ByteCount, FileOffset, Nanoseconds, RowCount, VolumeId};
 use reel_core::write_batch::WriteBatch;
+use reel_sim::file_image::BitMask;
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_io::SimulatedIo;
@@ -465,4 +468,27 @@ fn a_reader_with_no_groups_seals_nothing() {
     assert_eq!(io.write_count(), writes, "the reader wrote");
     assert_eq!(io.list_directory(ROOT.as_ref()).expect("list"), before, "the reader changed the files");
     store.close().expect("close");
+}
+
+// a reader's counts can't see its writer's frees, so it checks every record it reads, and bytes changed under it report the
+// failure
+#[test]
+fn a_reader_checks_a_record_changed_under_it() {
+    let io = SimulatedIo::new(Seed(90));
+    let writer = open(&io);
+    writer.put(COLUMN, &key(1), b"value").expect("put");
+    seal(&writer, &io);
+    land_rows(&io);
+    let viewer = view(&io);
+    let volume = &viewer.state.volumes[0];
+    let name = key(1);
+    let read = viewer.state.key_read(COLUMN, &name, viewer.state.read_point(volume), false).expect("read");
+    let row = in_place(viewer.state.search_sealed(&InPlace, volume, &read)).expect("search").expect("a sealed row");
+    let path = data_path(&volume.roots[0], row.segment);
+    io.rot(&path, FileOffset(row.row.offset.0 + SMALL_HEAD_BYTES as u64), BitMask(1)).expect("rot");
+    let mut buf = Vec::new();
+    let answer = viewer.get(COLUMN, &key(1), &mut buf);
+    assert!(matches!(answer, Err(StoreError::Corruption { .. })), "the reader took changed bytes: {answer:?}");
+    viewer.close().expect("close");
+    writer.close().expect("close");
 }

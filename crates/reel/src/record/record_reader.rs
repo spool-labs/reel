@@ -126,6 +126,20 @@ impl RecordReader {
         declared: Codec,
         buf: &mut Vec<u8>,
     ) -> Result<RecordRead> {
+        self.read_value_trusting(device, file, location, (identity, declared), buf, || false).await
+    }
+
+    /// Fill the buffer with the whole value, and skip the sums of a value read in one go as written while `holds` says nothing
+    /// could have changed its bytes since the read began. The head is still checked against the record's identity
+    pub async fn read_value_trusting<File: IoFile>(
+        &mut self,
+        device: &impl DeviceReads<File>,
+        file: &File,
+        location: RecordLocation,
+        (identity, declared): (&RecordIdentity<'_>, Codec),
+        buf: &mut Vec<u8>,
+        holds: impl Fn() -> bool,
+    ) -> Result<RecordRead> {
         if declared == Codec::None
             && let Some(shape) = written_shape(location.length)
             && shape.front_length <= FIRST_READ_BYTES
@@ -144,6 +158,9 @@ impl RecordReader {
                 if head.value_length != shape.value_length {
                     return Ok(RecordRead::Failed);
                 }
+                if holds() {
+                    return Ok(RecordRead::Valid);
+                }
                 return self.check_payload(device, file, location, &head, buf).await;
             }
         }
@@ -160,7 +177,12 @@ impl RecordReader {
             return Ok(RecordRead::Failed);
         };
         if head.codec == Codec::None {
-            return self.read_payload(device, file, location, &head, buf).await;
+            buf.resize(head.value_length.0 as usize, 0);
+            device.read_exact(file, FileOffset(location.offset.0 + payload_start(&head)), buf).await?;
+            if holds() {
+                return Ok(RecordRead::Valid);
+            }
+            return self.check_payload(device, file, location, &head, buf).await;
         }
         let window = ValueWindow {
             offset: ByteCount(0),
@@ -381,20 +403,6 @@ impl RecordReader {
     }
 
     /// Read a value stored as written in one read, past a table the first read couldn't hold
-    pub async fn read_payload<File: IoFile>(
-        &mut self,
-        device: &impl DeviceReads<File>,
-        file: &File,
-        location: RecordLocation,
-        head: &ChunkedHead,
-        buf: &mut Vec<u8>,
-    ) -> Result<RecordRead> {
-        buf.resize(head.value_length.0 as usize, 0);
-        let payload_start = payload_start(head);
-        device.read_exact(file, FileOffset(location.offset.0 + payload_start), buf).await?;
-        self.check_payload(device, file, location, head, buf).await
-    }
-
     /// Check each chunk of a value stored as written where it sits in the buffer, and its stored pieces' sums when the first
     /// read brought them in. Sums that don't match an entry whose chunk passed are counted, and the read goes on
     pub async fn check_payload<File: IoFile>(

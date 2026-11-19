@@ -122,6 +122,24 @@ fn window(offset: usize, length: usize) -> ValueWindow {
     }
 }
 
+// a value stored as written in a column that declares lz4 skips its sums only while the reader is told nothing changed: the same
+// flipped byte reads back flipped when trusted, and fails when not
+#[test]
+fn a_trusted_read_skips_the_sums_of_a_declared_lz4_value() {
+    let value = noise(3 * CHUNK_BYTES + 5);
+    let stored = store(Codec::Lz4, &value);
+    rot_at(&stored, &stored.path, stored.location.length.0 - 1);
+    let file = open(&stored);
+    let mut reader = RecordReader::new();
+    let mut buf = Vec::new();
+    let trusted = in_place(reader.read_value_trusting(&InPlace, &file, stored.location, (&identity(), Codec::Lz4), &mut buf, || true));
+    assert_eq!(trusted.expect("read"), RecordRead::Valid);
+    assert_eq!(buf.len(), value.len());
+    assert_ne!(buf, value, "the flipped byte was caught");
+    let (checked, _restored) = read_declared(&stored, &identity(), Codec::Lz4);
+    assert_eq!(checked, RecordRead::Failed);
+}
+
 // values of every shape come back whole on both codecs
 #[test]
 fn value_shapes() {

@@ -900,7 +900,10 @@ impl<Backend: Io> EngineState<Backend> {
                 Some(counts) => match reader.read_trusted(device, file, location, buf).await {
                     Ok(Some(answer)) if self.has_outlived(counts, true) => Ok(answer),
                     Ok(Some(_answer)) => Ok(reader.check_trusted(&identity, buf)),
-                    Ok(None) => reader.read_value(device, file, location, &identity, read.info.codec, buf).await,
+                    Ok(None) => {
+                        let holds = || self.has_outlived(counts, true);
+                        reader.read_value_trusting(device, file, location, (&identity, read.info.codec), buf, holds).await
+                    },
                     Err(error) => Err(error),
                 },
                 None => reader.read_value(device, file, location, &identity, read.info.codec, buf).await,

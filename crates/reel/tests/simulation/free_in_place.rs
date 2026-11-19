@@ -626,6 +626,22 @@ fn flipped_bytes_read_back_unchecked_while_counts_hold() {
     store.close().expect("close");
 }
 
+// the same price on a large record read in one go: its piece sums are skipped while the get's counts hold, so a flipped byte at
+// the value's end reads back flipped
+#[test]
+fn flipped_bytes_in_a_large_record_read_back_unchecked_while_counts_hold() {
+    let io = SimulatedIo::new(Seed(43));
+    let store = open(&io);
+    store.put(COLUMN, b"large", &large(1)).expect("put");
+    seal(&store, &io);
+    let (row, path) = sealed_row(&store, b"large");
+    io.rot(&path, FileOffset(row.row.offset.0 + row.row.length.0 - 1), BitMask(1)).expect("rot");
+    let found = read(&store, b"large").expect("a value");
+    assert_eq!(found.len(), large(1).len());
+    assert_ne!(found, large(1), "the flipped byte was caught");
+    store.close().expect("close");
+}
+
 const MERGE_ROUNDS: u64 = 6;
 const MERGED_KEYS: u64 = 4;
 

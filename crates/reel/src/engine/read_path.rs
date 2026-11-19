@@ -12,7 +12,7 @@ use reel_core::units::{ByteCount, FileOffset, WritePlace};
 
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::cue::JobCounts;
-use crate::engine::engine_state::EngineState;
+use crate::engine::engine_state::{EngineState, SlotPin};
 use crate::engine::open_segment::MOST_WINDOW_RECORD_BYTES; use crate::engine::scan_state::{BATCH_BYTES, BATCH_KEYS, BatchRow};
 use crate::engine::volume::Volume;
 use crate::index::key_hash::{KeyHash, hash_key};
@@ -87,6 +87,24 @@ pub enum RecordWant {
     Whole,
     /// A window of the value
     Window(ValueWindow),
+}
+
+/// How far a read trusts the bytes it reads to be the record its row names
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Trust {
+    /// Check every sum
+    Check,
+    /// Skip the payload's sums while these counts, taken before the read point, still hold once the bytes are in
+    While(JobCounts),
+    /// Skip the payload's sums: nothing can have changed the bytes under the pin the read holds
+    Whole,
+}
+
+impl Trust {
+    /// Trust a read's counts when it took them
+    pub fn of(counts: Option<JobCounts>) -> Self {
+        counts.map_or(Self::Check, Self::While)
+    }
 }
 
 /// One key being read
@@ -735,7 +753,7 @@ impl<Backend: Io> EngineState<Backend> {
             length: spot.length,
         };
         // a failed check here means another key or a moved record: a miss
-        let is_valid = self.read_cached(device, &pin.file, spot.segment, location, (spot.place, None), read, want, buf).await?;
+        let is_valid = self.read_cached(device, &pin.file, spot.segment, location, (spot.place, Trust::Check), read, want, buf).await?;
         Ok(is_valid.then_some(true))
     }
 
@@ -807,7 +825,7 @@ impl<Backend: Io> EngineState<Backend> {
             offset: row.offset,
             length: row.length,
         };
-        match self.read_record(ReadOn::new(device, &pin.file), location, (row.place, None), read, want, buf).await? {
+        match self.read_record(ReadOn::new(device, &pin.file), location, (row.place, self.open_trust(&pin, row)), read, want, buf).await? {
             RecordRead::Valid => {
                 if is_admitting && want == RecordWant::Whole {
                     self.record_cache.admit(row.segment, row.offset, read.key, buf);
@@ -816,6 +834,14 @@ impl<Backend: Io> EngineState<Backend> {
             },
             RecordRead::Failed => Err(corruption(read)),
         }
+    }
+
+    /// Say how far an open row's record is trusted. A row this run wrote enters the write index only once its record's bytes are
+    /// in the file or in a window that reaches the file before it resets, and nothing frees in place in an open segment, so
+    /// under the slot's pin the bytes are the record. A record open brought back may have rotted since its sync, and a reader
+    /// follows a writer in another process, so both check everything
+    pub fn open_trust(&self, pin: &SlotPin<'_, Backend::File>, row: &WriteRow) -> Trust {
+        if self.is_read_only || row.offset < pin.recovered_end { Trust::Check } else { Trust::Whole }
     }
 
     /// Read a record from a sealed segment, and return false when the segment has left the table
@@ -836,7 +862,7 @@ impl<Backend: Io> EngineState<Backend> {
             length: sealed.row.length,
         };
         // a sealed record never changes where it sits, so the cache answers for its place while the segment is pinned
-        let is_valid = self.read_cached(device, &pin.file, sealed.segment, location, (sealed.row.place, read.trust), read, want, buf).await?;
+        let is_valid = self.read_cached(device, &pin.file, sealed.segment, location, (sealed.row.place, Trust::of(read.trust)), read, want, buf).await?;
         if !is_valid {
             return Err(corruption(read));
         }
@@ -852,7 +878,7 @@ impl<Backend: Io> EngineState<Backend> {
         file: &Backend::File,
         segment: SegmentNumber,
         location: RecordLocation,
-        (place, trust): (WritePlace, Option<JobCounts>),
+        (place, trust): (WritePlace, Trust),
         read: &KeyRead<'_>,
         want: RecordWant,
         buf: &mut Vec<u8>,
@@ -881,7 +907,7 @@ impl<Backend: Io> EngineState<Backend> {
         &self,
         on: ReadOn<'_, impl DeviceReads<Backend::File>, Backend::File>,
         location: RecordLocation,
-        (place, trust): (WritePlace, Option<JobCounts>),
+        (place, trust): (WritePlace, Trust),
         read: &KeyRead<'_>,
         want: RecordWant,
         buf: &mut Vec<u8>,
@@ -895,19 +921,19 @@ impl<Backend: Io> EngineState<Backend> {
             place,
         };
         let mut reader = self.record_reader_for(device);
+        let holds = || match trust {
+            Trust::Check => false,
+            Trust::While(counts) => self.has_outlived(counts, true),
+            Trust::Whole => true,
+        };
         let outcome = match want {
-            RecordWant::Whole => match trust {
-                Some(counts) => match reader.read_trusted(device, file, location, buf).await {
-                    Ok(Some(answer)) if self.has_outlived(counts, true) => Ok(answer),
-                    Ok(Some(_answer)) => Ok(reader.check_trusted(&identity, buf)),
-                    Ok(None) => {
-                        let holds = || self.has_outlived(counts, true);
-                        reader.read_value_trusting(device, file, location, (&identity, read.info.codec), buf, holds).await
-                    },
-                    Err(error) => Err(error),
-                },
-                None => reader.read_value(device, file, location, &identity, read.info.codec, buf).await,
+            RecordWant::Whole if trust != Trust::Check => match reader.read_trusted(device, file, location, buf).await {
+                Ok(Some(answer)) if holds() => Ok(answer),
+                Ok(Some(_answer)) => Ok(reader.check_trusted(&identity, buf)),
+                Ok(None) => reader.read_value_trusting(device, file, location, (&identity, read.info.codec), buf, holds).await,
+                Err(error) => Err(error),
             },
+            RecordWant::Whole => reader.read_value(device, file, location, &identity, read.info.codec, buf).await,
             RecordWant::Window(window) => reader.read_window(device, file, location, &identity, read.info.codec, window, buf).await,
         };
         let damaged = reader.take_damaged_sums();

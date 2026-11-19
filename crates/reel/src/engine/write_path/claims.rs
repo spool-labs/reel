@@ -668,6 +668,7 @@ impl<Backend: Io> EngineState<Backend> {
         self.slot_files[slot.0 as usize].set(Some(SlotData {
             segment: number,
             file: data.clone(),
+            recovered_end: FileOffset(0),
         }));
         Ok(OpenSegment {
             number,

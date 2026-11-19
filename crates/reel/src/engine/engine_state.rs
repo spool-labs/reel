@@ -72,6 +72,8 @@ pub const PLACE_RUN: u64 = 1 << 32;
 pub struct SlotData<File> {
     pub segment: SegmentNumber,
     pub file: File,
+    /// Where the records open brought back from the rows file end, so a read below it checks what no run of this process wrote
+    pub recovered_end: FileOffset,
 }
 
 /// One open slot's file, kept under a short lock
@@ -235,6 +237,7 @@ pub struct EngineState<Backend: Io> {
 #[derive(Debug)]
 pub struct SlotPin<'state, File> {
     pub file: File,
+    pub recovered_end: FileOffset,
     slot: &'state SlotFile<File>,
 }
 
@@ -277,9 +280,9 @@ impl<File: Clone> SlotFile<File> {
         if held.segment != segment {
             return None;
         }
-        let file = held.file.clone();
+        let (file, recovered_end) = (held.file.clone(), held.recovered_end);
         self.pins.fetch_add(1, Ordering::AcqRel);
-        Some(SlotPin { file, slot: self })
+        Some(SlotPin { file, recovered_end, slot: self })
     }
 
     /// Set the slot's file

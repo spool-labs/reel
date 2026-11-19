@@ -2,7 +2,7 @@
 
 use std::pin::pin;
 use std::task::{Context, Poll, Waker};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -142,6 +142,8 @@ struct Run {
     has_rot: bool,
     policy: SyncPolicy,
     steps_left: u64,
+    // every value a set was written with, so rot a get reads back in one key of a set is told from a set that landed in part
+    set_values: BTreeSet<Vec<u8>>,
 }
 
 impl Versions {
@@ -352,6 +354,7 @@ impl Run {
                 _other => SyncPolicy::EveryBytes(POLICY_BYTES),
             },
             steps_left: STEPS,
+            set_values: BTreeSet::new(),
         }
     }
 
@@ -532,6 +535,7 @@ impl Run {
         if is_large {
             bytes.resize(LARGE_VALUE_BYTES, b'x');
         }
+        self.set_values.insert(bytes.clone());
         let value = (!is_grave).then_some(bytes);
         let written = match &value {
             Some(value) if has_marks(self.seed) => store.put_marked(column, &key, value, mark_of(&key)),
@@ -626,7 +630,11 @@ impl Run {
     fn check_sets(&self, store: &Store) {
         for column in COLUMNS {
             for set in 0..BATCH_SETS {
-                let answers: Vec<_> = (0..SET_KEYS).filter_map(|number| read(store, column, &set_key(set, number)).ok()).collect();
+                let answers: Vec<_> = (0..SET_KEYS)
+                    .filter_map(|number| read(store, column, &set_key(set, number)).ok())
+                    // a value no set was written with is rot an unchecked read served, the price of trusting a record, and says nothing
+                    .filter(|answer| !self.has_rot || answer.as_ref().is_none_or(|value| value == b"overwritten" || self.set_values.contains(value)))
+                    .collect();
                 let is_whole = answers.iter().all(|answer| *answer == answers[0]);
                 assert!(is_whole, "seed {}: set {set} landed in part: {answers:?}", self.seed);
             }

@@ -685,3 +685,21 @@ fn merges_beside_frees_mark_no_damage() {
     assert_eq!(read(&store, b"twice"), Some(b"second".to_vec()));
     store.close().expect("close");
 }
+
+// an open row's record is the bytes its row names once it's in the file, so a get reads it with no sum, and a byte flipped on
+// the disk under it reads back flipped
+#[test]
+fn an_open_record_reads_back_unchecked() {
+    let io = SimulatedIo::new(Seed(44));
+    let store = open(&io);
+    store.put(COLUMN, b"open", b"open value").expect("put");
+    store.flush().expect("flush");
+    let volume = &store.state.volumes[0];
+    let row = store.state.index.lookup(COLUMN, b"open", store.state.read_point(volume), volume.view()).row.expect("an open row");
+    let path = data_path(&volume.roots[0], row.segment).to_path_buf();
+    io.rot(&path, FileOffset(row.offset.0 + SMALL_HEAD_BYTES as u64), BitMask(1)).expect("rot");
+    let found = read(&store, b"open").expect("a value");
+    assert_eq!(found.len(), b"open value".len());
+    assert_ne!(found, b"open value", "the flipped byte was caught");
+    store.close().expect("close");
+}

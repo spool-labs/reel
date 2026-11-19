@@ -402,7 +402,6 @@ impl RecordReader {
         })
     }
 
-    /// Read a value stored as written in one read, past a table the first read couldn't hold
     /// Check each chunk of a value stored as written where it sits in the buffer, and its stored pieces' sums when the first
     /// read brought them in. Sums that don't match an entry whose chunk passed are counted, and the read goes on
     pub async fn check_payload<File: IoFile>(

@@ -161,6 +161,7 @@ impl<Backend: Io> EngineState<Backend> {
         self.slot_files[slot.0 as usize].set(Some(SlotData {
             segment: found.number,
             file: found.data.clone(),
+            recovered_end: FileOffset(u64::MAX),
         }));
         volume.open_slot(slot);
         hold(&volume.claims).open.push(OpenSegment {

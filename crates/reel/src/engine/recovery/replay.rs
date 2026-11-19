@@ -178,6 +178,7 @@ impl<Backend: Io> EngineState<Backend> {
         self.slot_files[slot.0 as usize].set(Some(SlotData {
             segment: found.number,
             file: found.data.clone(),
+            recovered_end: recovered.write_end,
         }));
         volume.open_slot(slot);
         volume.rows_in_index.fetch_add(recovered.row_count.0, Ordering::Relaxed);

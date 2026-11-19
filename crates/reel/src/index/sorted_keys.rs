@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as Memory};
 use reel_core::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
 use crate::guard::{Shards, hold};
-use crate::index::value_pages::{ClockPick, HeldChain, MOST_HELD_VALUE, NO_VALUE_PAGE, ValuePages};
+use crate::index::value_pages::{HeldChain, MOST_HELD_VALUE, NO_VALUE_PAGE, ValuePages};
 use crate::pool::{ask_huge_pages, touched_capacity};
 use crate::segment::segment_tail::SegmentNumber;
 
@@ -760,8 +760,7 @@ impl SortedKeys {
         is_found && self.names_row(leaf, index, row) && self.values.read(self.chain_of(leaf), index, out)
     }
 
-    /// Keep a value a read checked beside its key's entry, when the entry still names the row it was read from. A pool with no free
-    /// page clears one chain nobody read lately, in this part or one whose lock is free, and tries once more
+    /// Keep a value a read checked beside its key's entry, when the entry still names the row it was read from, and the pool has room
     pub fn hold_value(&self, key: &[u8], row: (WritePlace, SegmentNumber, FileOffset), value: &[u8]) -> bool {
         self.hold_values([(key, row, value)].into_iter()) > 0
     }
@@ -800,15 +799,9 @@ impl SortedKeys {
             if !self.names_row(leaf, index, row) {
                 continue;
             }
-            for attempt in 0..2 {
-                if let Some(chain) = self.values.fill(leaf, self.chain_of(leaf), (index, self.leaf_capacity), value) {
-                    self.set_chain(leaf, chain);
-                    held += 1;
-                    break;
-                }
-                if attempt == 1 || !self.evict_one(part) {
-                    break;
-                }
+            if let Some(chain) = self.values.fill(leaf, self.chain_of(leaf), (index, self.leaf_capacity), value) {
+                self.set_chain(leaf, chain);
+                held += 1;
             }
         }
         held
@@ -838,36 +831,6 @@ impl SortedKeys {
         let leaf = self.descend(tree, packed, &mut PagePath::new());
         let (index, is_found) = self.leaf_search(leaf, packed);
         is_found.then_some((leaf, index))
-    }
-
-    /// Clear one chain the clock picks, taking its part's lock unless it's the part this caller holds or another caller has it
-    fn evict_one(&self, holding: usize) -> bool {
-        let Some(pick) = self.values.clock_pick() else {
-            return false;
-        };
-        let owner_part = self.part_of_leaf(pick.owner);
-        if owner_part == holding {
-            return self.evict_held(pick);
-        }
-        match self.parts.try_write(owner_part) {
-            Some(_owner) => self.evict_held(pick),
-            None => false,
-        }
-    }
-
-    /// Clear a picked chain once its part is held, when its leaf still names it
-    fn evict_held(&self, pick: ClockPick) -> bool {
-        if self.chain_of(pick.owner) != pick.chain {
-            return false;
-        }
-        self.values.evict(pick);
-        self.set_chain(pick.owner, HeldChain::NONE);
-        true
-    }
-
-    /// Read the part a leaf's keys are in, from its first key's first byte
-    fn part_of_leaf(&self, leaf: u32) -> usize {
-        (self.load(leaf, self.leaf_entry(0)) >> 24) as usize
     }
 
     /// Check an entry still names a row: its place, segment and offset

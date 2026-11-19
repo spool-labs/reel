@@ -54,25 +54,20 @@ fn a_dropped_chain_reads_nothing() {
     assert_eq!(out, value(9, 500));
 }
 
-// with the pool full a fill finds no page, the clock picks a chain nobody read, and once it goes the fill succeeds
+// a full pool takes no more values, and a dropped chain gives its pages back for the next fill
 #[test]
-fn the_clock_frees_an_unread_chain() {
+fn a_full_pool_fills_again_once_a_chain_drops() {
     let pages = ValuePages::new(2);
     let mut first = HeldChain::NONE;
     let mut second = HeldChain::NONE;
-    // three values of 1,000 bytes beside a slot table fill most of a page, so each leaf takes one
     for index in 0..3 {
         first = pages.fill(LEAF, first, (index, ENTRIES), &value(index, 1_000)).expect("a fill");
         second = pages.fill(LEAF + 1, second, (index, ENTRIES), &value(index, 1_000)).expect("a fill");
     }
     assert_eq!(pages.fill(LEAF + 2, HeldChain::NONE, (0, ENTRIES), &value(2, 100)), None);
     let mut out = Vec::new();
-    assert!(pages.read(second, 0, &mut out));
-    // the clock passes the chain just read once, and picks the other
-    let pick = pages.clock_pick().expect("a pick");
-    assert_eq!((pick.chain, pick.owner), (first, LEAF));
-    pages.evict(pick);
-    assert!(!pages.read(first, 0, &mut out));
+    assert!(pages.read(second, 0, &mut out), "a full pool lost a held value");
+    pages.drop_chain(first);
     let third = pages.fill(LEAF + 2, HeldChain::NONE, (0, ENTRIES), &value(2, 100)).expect("a fill");
     out.clear();
     assert!(pages.read(third, 0, &mut out));
@@ -115,7 +110,7 @@ mod in_an_index {
         format!("value-{number}-{version}").into_bytes()
     }
 
-    // a pool far smaller than the keys evicts as it fills, and every held answer is the value of the row the entry names: an entry
+    // a pool far smaller than the keys fills until it's full, and every held answer is the value of the row the entry names: an entry
     // replaced since its fill, or a leaf split under it, answers nothing until filled again
     #[test]
     fn held_answers_are_always_the_entrys_row() {
@@ -154,6 +149,5 @@ mod in_an_index {
             check(&newest, &mut answered);
         }
         assert!(answered > 0, "nothing was held");
-        assert!(index.values.evictions.load(std::sync::atomic::Ordering::Relaxed) > 0, "a small pool never evicted");
     }
 }

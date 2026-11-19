@@ -4,7 +4,8 @@
 //! with a slot for each of the leaf's entries, and every page takes value bytes from where its last value ended. Words are atomics,
 //! so a page passes between leaves with no unsafe code. Each page carries a generation that moves before the page is given back, and
 //! a leaf keeps the generation of its first page, so a reader that copied bytes and still sees that generation copied a live value.
-//! A fill, a drop and an eviction run under the owning part's write lock, and a read under its read lock.
+//! A fill and a drop run under the owning part's write lock, and a read under its read lock. A full pool takes no more values
+//! until a change to some leaf gives pages back: with keys read evenly, clearing one held value for another gains nothing.
 //!
 //! Based on calculations:
 //! - A leaf's chain is whole pages. Each page has 24 B of head, the first has a 4 B slot for every position of the leaf's
@@ -17,7 +18,7 @@
 //!   HELD_BYTES_PER_ENTRY for each entry, so values past that share ride its batch as misses.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use reel_core::units::ByteCount;
 
@@ -33,17 +34,13 @@ pub const VALUE_PAGE_BYTES: usize = VALUE_PAGE_WORDS * size_of::<u64>();
 pub const NO_VALUE_PAGE: u32 = u32::MAX;
 /// The largest value a leaf holds
 pub const MOST_HELD_VALUE: usize = 1024;
-/// Words at the head of a page: the owner and next page, the generation, and the used bytes with the clock bit and table length
+/// Words at the head of a page: the owner and next page, the generation, and the used bytes with the table length
 pub const VALUE_HEAD_WORDS: usize = 3;
-/// Pages a clock looks at for one chain to clear before it gives up
-pub const MOST_CLOCK_LOOKS: u32 = 64;
 /// Longest chain a leaf keeps
 pub const MOST_CHAIN_PAGES: usize = 64;
 /// The bit of an owner that marks a page past its chain's first, which holds no slot table
 pub const FOLLOW_BIT: u32 = 1 << 31;
 
-/// The bit of a page's used word that the clock clears and a read sets
-const REFERENCED_BIT: u64 = 1 << 32;
 /// Where a first page's used word keeps its slot table's length in words
 const TABLE_SHIFT: u32 = 40;
 /// Bits of a slot that hold a value's length plus one, so a zero slot holds nothing
@@ -70,24 +67,15 @@ impl HeldChain {
     pub const NONE: Self = Self { first: NO_VALUE_PAGE, generation: 0 };
 }
 
-/// A chain the clock found nobody read since its last pass, with the leaf that owns it
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ClockPick {
-    pub chain: HeldChain,
-    pub owner: u32,
-}
-
 /// The value pages of one sorted index
 #[derive(Debug)]
 pub struct ValuePages {
     words: Vec<AtomicU64>,
     free: Mutex<FreeValuePages>,
-    clock: AtomicU32,
-    /// Values held now, and the fills, drops and evictions so far, for the report
+    /// Values held now, and the fills and drops so far, for the report
     pub held: AtomicU64,
     pub fills: AtomicU64,
     pub drops: AtomicU64,
-    pub evictions: AtomicU64,
 }
 
 impl ValuePages {
@@ -97,11 +85,9 @@ impl ValuePages {
         let pool = Self {
             words,
             free: Mutex::new(FreeValuePages { head: if pages == 0 { NO_VALUE_PAGE } else { 0 }, count: pages }),
-            clock: AtomicU32::new(0),
             held: AtomicU64::new(0),
             fills: AtomicU64::new(0),
             drops: AtomicU64::new(0),
-            evictions: AtomicU64::new(0),
         };
         for page in 0..pages {
             let next = if page + 1 == pages { NO_VALUE_PAGE } else { page + 1 };
@@ -151,12 +137,11 @@ impl ValuePages {
             out.truncate(start);
             return false;
         }
-        self.mark_referenced(chain.first);
         true
     }
 
     /// Put a value in a leaf's chain for its entry, starting a chain when the leaf has none, and return the chain the leaf keeps now.
-    /// Nothing when the value is too long or the pool has no free page, and then the caller may clear a chain and ask again
+    /// Nothing when the value is too long or the pool has no free page
     pub fn fill(&self, owner: u32, chain: HeldChain, (index, entries): (usize, usize), value: &[u8]) -> Option<HeldChain> {
         let table = slot_table_words(entries);
         if value.len() > MOST_HELD_VALUE || index >= entries || VALUE_HEAD_WORDS + table >= VALUE_PAGE_WORDS {
@@ -190,33 +175,6 @@ impl ValuePages {
         self.held.fetch_sub(self.count_slots(chain.first), Ordering::Relaxed);
         self.give_chain(chain.first);
         self.drops.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Give back a chain the clock picked, once its owner's part is held and the owner still names it
-    pub fn evict(&self, pick: ClockPick) {
-        if !self.is_live(pick.chain) {
-            return;
-        }
-        self.held.fetch_sub(self.count_slots(pick.chain.first), Ordering::Relaxed);
-        self.give_chain(pick.chain.first);
-        self.evictions.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Turn the clock to a chain nobody read since its last pass, clearing the marks it passes
-    pub fn clock_pick(&self) -> Option<ClockPick> {
-        let pages = self.page_count();
-        if pages == 0 {
-            return None;
-        }
-        for _look in 0..MOST_CLOCK_LOOKS {
-            let page = self.clock.fetch_add(1, Ordering::Relaxed) % pages;
-            let owner = self.owner(page);
-            if owner == NO_VALUE_PAGE || owner & FOLLOW_BIT != 0 || self.take_referenced(page) {
-                continue;
-            }
-            return Some(ClockPick { chain: HeldChain { first: page, generation: self.generation(page) }, owner });
-        }
-        None
     }
 
     /// Find room for a value of this length at the end of a chain, adding a page when the last is full
@@ -323,17 +281,6 @@ impl ValuePages {
         }
     }
 
-    fn take_referenced(&self, page: u32) -> bool {
-        self.word(page, 2).fetch_and(!REFERENCED_BIT, Ordering::Relaxed) & REFERENCED_BIT != 0
-    }
-
-    fn mark_referenced(&self, page: u32) {
-        let word = self.word(page, 2);
-        if word.load(Ordering::Relaxed) & REFERENCED_BIT == 0 {
-            word.fetch_or(REFERENCED_BIT, Ordering::Relaxed);
-        }
-    }
-
     fn used(&self, page: u32) -> usize {
         (self.word(page, 2).load(Ordering::Relaxed) & 0xFFFF_FFFF) as usize
     }
@@ -343,9 +290,7 @@ impl ValuePages {
     }
 
     fn set_used(&self, page: u32, used: usize, table: usize) {
-        let word = self.word(page, 2);
-        let referenced = word.load(Ordering::Relaxed) & REFERENCED_BIT;
-        word.store(((table as u64) << TABLE_SHIFT) | referenced | used as u64, Ordering::Relaxed);
+        self.word(page, 2).store(((table as u64) << TABLE_SHIFT) | used as u64, Ordering::Relaxed);
     }
 
     fn generation(&self, page: u32) -> u32 {

@@ -641,6 +641,8 @@ pub struct MaintenanceReport {
     /// Values scans took from the record cache with no record read, while it could hold most of a volume
     pub scan_cache_hits: u64,
     /// Scan rows answered from a value their index leaf held, the values the leaves hold now, and the fills and drops
+    /// Scan heads stood on a bound with no lock or descent, since their shard showed no open key near the walk
+    pub heads_skipped: u64,
     pub scan_held_values: u64,
     pub held_values: u64,
     pub value_fills: u64,
@@ -772,6 +774,7 @@ impl MaintenanceReport {
             scrub_failures: 0,
             scan_cache_hits: 0,
             scan_held_values: 0,
+            heads_skipped: 0,
             held_values: 0,
             value_fills: 0,
             value_drops: 0,

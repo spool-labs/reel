@@ -23,6 +23,8 @@ use crate::engine::scan_state::{
 use crate::engine::volume::Volume;
 use crate::guard::hold;
 use crate::index::sorted_keys::{MOST_KEY_BYTES, ScanFrom, SortedKeys};
+use crate::config::KeyShape;
+use crate::index::open_counts::OpenBound;
 use crate::index::write_shard::{HEAD_GROUP, HeadPlace, WalkBound, WriteShard, place_heads_together};
 use crate::io::{DeviceReads, Io, ManyRead, ReadOn, in_place};
 use crate::record::record_check::RecordIdentity;
@@ -519,6 +521,10 @@ impl<Backend: Io> EngineState<Backend> {
                 (Some(sorted), Some(head)) if scan.is_before(sorted, head) => (sorted, false, true),
                 (Some(_sorted), Some(head)) => (head, true, false),
             };
+            // a head standing on a bound has no key of its own there, so the step that answers one key at a time takes it from here
+            if is_head && scan.closest_head.is_some_and(|head| scan.heads[head].is_bound) {
+                break;
+            }
             if scan.is_past_limit(next) {
                 break;
             }
@@ -1098,12 +1104,6 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// Bring each shard whose head was used up to its next key
     pub fn place_heads(&self, volume: &Volume<Backend>, scan: &mut ScanState) {
-        let bound = WalkBound {
-            column: scan.column,
-            key: &scan.position,
-            is_inclusive: scan.is_inclusive,
-            direction: scan.direction,
-        };
         // every place at or below the mark is in the index before the heads look
         let mark = self.read_point(volume);
         let view = volume.view();
@@ -1117,6 +1117,7 @@ impl<Backend: Io> EngineState<Backend> {
                 head.cursor.reset();
                 head.ahead.clear();
                 head.has_key = false;
+                head.is_bound = false;
                 head.is_placed = true;
                 head.placed_at = mark;
                 head.changes = NO_CHANGES;
@@ -1124,7 +1125,50 @@ impl<Backend: Io> EngineState<Backend> {
             scan.find_closest_head();
             return;
         }
-        let mut wanted = scan.heads.iter_mut().enumerate().filter(|(_shard, head)| !head.is_placed || is_new_view).peekable();
+        // a shard whose open counts show no open key near the walk takes no lock and no descent: its head stands on a bound the
+        // walk places for real once it gets there. The count of changes is read first, so a write landing after it moves the count
+        if !self.is_read_only {
+            let ScanState { heads, position, direction, column: column_of, .. } = &mut *scan;
+            let mut skipped = 0;
+            let width = self.column(*column_of).map_or(KeyShape::Variable { most: 0 }, |info| info.key_shape);
+            for (shard, head) in heads.iter_mut().enumerate().filter(|(_shard, head)| !head.is_placed || is_new_view) {
+                let changes = self.index.change_count(shard);
+                let Some(open) = self.index.counts[shard].bound(position, *direction) else {
+                    continue;
+                };
+                head.cursor.reset();
+                head.ahead.clear();
+                head.key.clear();
+                head.has_key = matches!(open, OpenBound::Key(_));
+                head.is_bound = head.has_key;
+                if let OpenBound::Key(bytes) = open {
+                    match width {
+                        // every key of a fixed width sorts at or past the bound padded with zeros to that width
+                        KeyShape::Fixed { width } => {
+                            let width = width as usize;
+                            head.key.extend_from_slice(&bytes[..width.min(bytes.len())]);
+                            head.key.resize(width, 0);
+                        },
+                        // a key shorter than the bound's eight bytes still sorts at or past its trimmed form
+                        KeyShape::Variable { .. } => {
+                            let length = bytes.iter().rposition(|byte| *byte != 0).map_or(1, |last| last + 1);
+                            head.key.extend_from_slice(&bytes[..length]);
+                        },
+                    }
+                }
+                head.is_placed = true;
+                head.placed_at = mark;
+                head.changes = changes;
+                has_moved = true;
+                skipped += 1;
+            }
+            if skipped > 0 {
+                self.heads_skipped.fetch_add(skipped, Ordering::Relaxed);
+            }
+        }
+        let ScanState { heads, position, is_inclusive, direction, column, .. } = &mut *scan;
+        let bound = WalkBound { column: *column, key: position, is_inclusive: *is_inclusive, direction: *direction };
+        let mut wanted = heads.iter_mut().enumerate().filter(|(_shard, head)| !head.is_placed || is_new_view).peekable();
         // a few shards a batch, so their tree descents overlap and writers wait on no more than those shards' locks
         while wanted.peek().is_some() {
             let mut group: [Option<(usize, &mut ShardHead)>; HEAD_GROUP] = [const { None }; HEAD_GROUP];
@@ -1156,6 +1200,7 @@ impl<Backend: Io> EngineState<Backend> {
             drop(guards);
             for (_shard, head) in group.iter_mut().flatten() {
                 head.is_placed = true;
+                head.is_bound = false;
                 head.placed_at = mark;
                 has_moved = true;
             }

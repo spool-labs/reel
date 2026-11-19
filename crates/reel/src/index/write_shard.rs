@@ -10,6 +10,7 @@ use reel_core::units::{ByteCount, RowCount, WritePlace};
 use crate::index::entry_slab::{ENTRY_ALIGNMENT, EntryAddress, EntrySlab, NO_ENTRY, PAGE_BYTES, PageCount, PageIndex, entry_size};
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::index::key_table::{KeyTable, TableSlot};
+use crate::index::open_counts::OpenCounts;
 use crate::index::node_pool::{NO_NODE, NODE_FANOUT, NodeCount, NodeIndex, NodePool, TreeNode};
 use crate::index::open_slots::{MAX_OPEN_SLOTS, OpenSlot, OpenSlots};
 use crate::index::seek_target::SeekTarget;
@@ -31,6 +32,8 @@ pub struct ShardSizing {
     pub nodes: NodeCount,
     pub table_slots: usize,
     pub open_slots: usize,
+    /// Buckets of the shard's open counts, so a scan can pass a shard with no open key near it
+    pub buckets: usize,
 }
 
 impl ShardSizing {
@@ -40,7 +43,7 @@ impl ShardSizing {
         let nodes = u64::from(self.nodes.0) * size_of::<TreeNode>() as u64;
         let table = (self.table_slots.next_power_of_two() * size_of::<TableSlot>()) as u64;
         let trees = (self.open_slots * size_of::<WriteTree>()) as u64;
-        ByteCount(pages + nodes + table + trees)
+        ByteCount(pages + nodes + table + trees + self.buckets.max(1).next_power_of_two() as u64)
     }
 }
 
@@ -342,7 +345,7 @@ impl WriteShard {
     }
 
     /// Take up to a limit of a closed slot's rows out of the table, and free the slot at the end
-    pub fn clean_slot(&mut self, slot: OpenSlot, limit: RowCount) -> bool {
+    pub fn clean_slot(&mut self, slot: OpenSlot, limit: RowCount, counts: &OpenCounts) -> bool {
         let tree = self.trees[slot.0 as usize];
         let mut position = match tree.cleanup {
             Some(position) => Some(position),
@@ -361,7 +364,7 @@ impl WriteShard {
                 position = step_forward(&self.nodes, current);
                 count += 1;
             }
-            self.unlink_run(&entries[..count]);
+            self.unlink_run(&entries[..count], counts);
             left -= count as u64;
         }
 
@@ -379,11 +382,12 @@ impl WriteShard {
     }
 
     /// Take a run of rows out of their chains. Each row's cold reads come first, side by side, so they overlap
-    pub fn unlink_run(&mut self, entries: &[EntryAddress]) {
+    pub fn unlink_run(&mut self, entries: &[EntryAddress], counts: &OpenCounts) {
         let mut hashes = [KeyHash::default(); CLEAN_RUN_ROWS];
         let mut touched = 0;
         for (hash, &entry) in hashes.iter_mut().zip(entries) {
             *hash = hash_key(self.slab.column(entry), self.slab.key(entry));
+            counts.remove(self.slab.key(entry));
             touched ^= self.table.home_tag(*hash);
         }
         hint::black_box(touched);

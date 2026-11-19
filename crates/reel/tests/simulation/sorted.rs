@@ -2427,3 +2427,43 @@ fn sorted_scan_keys_reach_the_total() {
     assert_eq!(store.state.sorted_scan_keys.load(Ordering::Relaxed) - after_keys, KEYS, "the value walk's count");
     store.close().expect("close");
 }
+
+// with a few open keys spread over many sealed ones, most shards show no open key near a walk and their heads stand on bounds
+// with no descent; told walks up and down from every kind of start still read as the model does, and writes between walks land
+#[test]
+fn heads_skip_shards_with_no_open_key_near() {
+    let io = SimulatedIo::new(Seed(4_300));
+    let store = open(&io, CAPACITY);
+    let mut model = Model::new();
+    for number in 0..KEYS {
+        let value = format!("sealed-{number}").into_bytes();
+        store.put(COLUMN, &key(number), &value).expect("put");
+        model.insert(key(number), value);
+    }
+    seal_all(&store, &io);
+    let mut random = SeededRandom::new(Seed(4_301));
+    for round in 0..20_u64 {
+        for _write in 0..4 {
+            let number = random.below(KEYS);
+            let value = format!("open-{round}-{number}").into_bytes();
+            store.put(COLUMN, &key(number), &value).expect("put");
+            model.insert(key(number), value);
+        }
+        for _walk in 0..20 {
+            let start = key(random.below(KEYS));
+            for direction in [Direction::Ascending, Direction::Descending] {
+                let range = from_key(COLUMN, &start, direction).wanting(RowCount(10));
+                let found = first_rows(store.iter(&range).expect("scan"), 10);
+                let expected: Rows = match direction {
+                    Direction::Ascending => model.range(start.clone()..).take(10).map(|(name, value)| (name.clone(), value.clone())).collect(),
+                    Direction::Descending => model.range(..=start.clone()).rev().take(10).map(|(name, value)| (name.clone(), value.clone())).collect(),
+                };
+                assert_eq!(found, expected, "round {round} from {start:?} {direction:?}");
+            }
+        }
+    }
+    let skipped = report(&store).heads_skipped;
+    println!("{skipped} heads stood on bounds");
+    assert!(skipped > 0, "no head stood on a bound");
+    store.close().expect("close");
+}

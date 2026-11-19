@@ -346,12 +346,14 @@ fn shrink_keeps_a_quarter() {
     assert!(huge.record_share > planned.record_share);
 }
 
-// a shard's sizing reads the heap the built shard holds, so what the index frees is what it really gave up
+// a shard's sizing reads the heap the built shard holds with the open counts the index keeps beside it, so what the index frees
+// is what it really gave up
 #[test]
 fn shard_sizing_reads_the_built_heap() {
     let planned = EngineSizing::for_store(&shape(ByteCount(256 * 1024 * 1024), 1));
     let built = reel::index::write_shard::WriteShard::new(&planned.shard);
-    assert_eq!(planned.shard.heap_bytes(), built.heap_bytes());
+    let counts = reel::index::open_counts::OpenCounts::new(planned.shard.buckets);
+    assert_eq!(planned.shard.heap_bytes().0, built.heap_bytes().0 + counts.heap_bytes().0);
 }
 
 // with every filter in the arena, the filter cache keeps one stripe and the row cache takes the rest, up to the row blocks on

@@ -460,8 +460,12 @@ pub fn shard_for_rows(rows_total: u64, open_slots: usize) -> ShardSizing {
         nodes: NodeCount(nodes as u32),
         table_slots: (rows_per_shard as usize * 2).next_power_of_two(),
         open_slots,
+        buckets: (rows_per_shard as usize * OPEN_BUCKETS_PER_ROW).next_power_of_two(),
     }
 }
+
+/// Buckets of a shard's open counts for each row it holds, so most buckets near a scan are empty
+pub const OPEN_BUCKETS_PER_ROW: usize = 4;
 
 /// Read one share of what the fixed parts, the room and the entries leave, scaled so the shares together take the whole
 pub const fn share_of(shared: u64, sixteenths: u64) -> u64 {

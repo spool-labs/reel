@@ -99,6 +99,9 @@ pub struct ShardHead {
     /// The shard's count of changes when the head was placed, or NO_CHANGES for a head placed with no look at the shard
     pub changes: u64,
     pub ahead: HeadAhead,
+    /// The key holds a bound, not an open key: the shard's open counts showed no open key between the walk and it, so the head
+    /// took no descent. A walk that reaches it places the head for real
+    pub is_bound: bool,
 }
 
 /// A head's count of changes when it was placed without a look at its shard, so the next batch places it again
@@ -604,6 +607,7 @@ impl ShardHead {
             placed_at: WritePlace(0),
             changes: NO_CHANGES,
             ahead: HeadAhead::new(widest_key),
+            is_bound: false,
         }
     }
 

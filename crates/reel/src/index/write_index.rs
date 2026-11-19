@@ -9,6 +9,7 @@ use reel_core::units::{ByteCount, RowCount, WritePlace};
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::engine::caller_activity::PaddedCount;
 use crate::guard::Shards;
+use crate::index::open_counts::OpenCounts;
 use crate::index::open_slots::{OpenSlot, OpenSlots};
 use crate::index::shard_cursor::ShardCursor;
 use crate::index::write_row::{WriteLookup, WriteRow};
@@ -23,6 +24,8 @@ pub const SHARD_SHIFT: u32 = u64::BITS - SHARD_COUNT.trailing_zeros();
 #[derive(Debug)]
 pub struct WriteIndex {
     pub shards: Shards<WriteShard>,
+    /// Each shard's open counts, read with no lock
+    pub counts: Vec<OpenCounts>,
     /// Each shard's count of changes to its rows, which goes up under its write lock
     pub changes: [PaddedCount; SHARD_COUNT],
 }
@@ -34,7 +37,8 @@ impl WriteIndex {
         for _shard in 0..SHARD_COUNT {
             shards.push(RwLock::new(WriteShard::new(sizing)));
         }
-        Self { shards: Shards(shards), changes: Default::default() }
+        let counts = (0..SHARD_COUNT).map(|_shard| OpenCounts::new(sizing.buckets)).collect();
+        Self { shards: Shards(shards), counts, changes: Default::default() }
     }
 
     /// Read the heap every shard holds
@@ -42,6 +46,7 @@ impl WriteIndex {
         let mut total = 0;
         for index in 0..SHARD_COUNT {
             total += self.shards.read(index).heap_bytes().0;
+            total += self.counts[index].heap_bytes().0;
         }
         ByteCount(total)
     }
@@ -52,6 +57,9 @@ impl WriteIndex {
         let shard = shard_of(hash);
         let mut guard = self.shards.write(shard);
         let is_in = guard.insert(hash, column, key, row);
+        if is_in {
+            self.counts[shard].add(key);
+        }
         self.count_change(shard, is_in);
         is_in
     }
@@ -62,6 +70,9 @@ impl WriteIndex {
         let shard = shard_of(hash);
         let mut guard = self.shards.write(shard);
         let is_in = guard.insert_held(hash, column, key, row);
+        if is_in {
+            self.counts[shard].add(key);
+        }
         self.count_change(shard, is_in);
         is_in
     }
@@ -118,7 +129,7 @@ impl WriteIndex {
         let mut is_clean = true;
         for index in 0..SHARD_COUNT {
             let mut guard = self.shards.write(index);
-            is_clean &= guard.clean_slot(slot, limit);
+            is_clean &= guard.clean_slot(slot, limit, &self.counts[index]);
             self.count_change(index, true);
         }
         is_clean

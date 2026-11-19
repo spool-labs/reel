@@ -1504,6 +1504,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         ahead_drops: AtomicU64::new(0),
         scan_cache_hits: AtomicU64::new(0),
         scan_held_values: AtomicU64::new(0),
+        heads_skipped: AtomicU64::new(0),
         sorted_answers: AtomicU64::new(0),
         sorted_footer_asks: AtomicU64::new(0),
         sorted_scan_keys: AtomicU64::new(0),

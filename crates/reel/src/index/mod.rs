@@ -5,6 +5,7 @@ pub mod entry_slab;
 pub mod key_hash;
 pub mod key_table;
 pub mod node_pool;
+pub mod open_counts;
 pub mod open_slots;
 pub mod record_cache;
 pub mod seal_walk;

@@ -176,6 +176,7 @@ pub struct EngineState<Backend: Io> {
     /// Values scans took from the record cache with no record read
     pub scan_cache_hits: AtomicU64,
     pub scan_held_values: AtomicU64,
+    pub heads_skipped: AtomicU64,
     /// Gets a sorted index answered, and gets on a sorted column that asked the footers
     pub sorted_answers: AtomicU64,
     pub sorted_footer_asks: AtomicU64,

@@ -32,18 +32,21 @@ const SIZING: ShardSizing = ShardSizing {
     nodes: NodeCount(512),
     table_slots: 2_048,
     open_slots: 4,
+    buckets: 4_096,
 };
 const TIGHT: ShardSizing = ShardSizing {
     pages: PageCount(8),
     nodes: NodeCount(64),
     table_slots: 8_192,
     open_slots: 4,
+    buckets: 4_096,
 };
 const SMALL_TABLE: ShardSizing = ShardSizing {
     pages: PageCount(256),
     nodes: NodeCount(512),
     table_slots: 64,
     open_slots: 4,
+    buckets: 4_096,
 };
 const LATEST: WritePlace = WritePlace(u64::MAX - 1);
 const MANY_VERSIONS: u64 = 3_000;
@@ -57,6 +60,7 @@ const BATCH_SIZING: ShardSizing = ShardSizing {
     nodes: NodeCount(256),
     table_slots: 8_192,
     open_slots: 4,
+    buckets: 4_096,
 };
 
 fn row(place: u64, slot: OpenSlot, kind: RowKind) -> WriteRow {

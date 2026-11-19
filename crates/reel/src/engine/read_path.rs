@@ -861,8 +861,24 @@ impl<Backend: Io> EngineState<Backend> {
             offset: sealed.row.offset,
             length: sealed.row.length,
         };
+        let trust = (sealed.row.place, Trust::of(read.trust));
+        // a sorted column's leaf keeps the values it read beside their entries, in place of the record cache. While the volume has
+        // damage marked, a held value could be bytes the scrub found bad, so gets read and check the record
+        let holder = self.sorted_index(read.column).filter(|index| want == RecordWant::Whole && index.values.page_count() > 0 && volume.damage.is_empty());
+        if let Some(index) = holder {
+            let row = (sealed.row.place, sealed.segment, sealed.row.offset);
+            buf.clear();
+            if index.held_value(read.key, row, buf) {
+                return Ok(true);
+            }
+            if self.read_record(ReadOn::new(device, &pin.file), location, trust, read, want, buf).await? == RecordRead::Failed {
+                return Err(corruption(read));
+            }
+            index.hold_value(read.key, row, buf);
+            return Ok(true);
+        }
         // a sealed record never changes where it sits, so the cache answers for its place while the segment is pinned
-        let is_valid = self.read_cached(device, &pin.file, sealed.segment, location, (sealed.row.place, Trust::of(read.trust)), read, want, buf).await?;
+        let is_valid = self.read_cached(device, &pin.file, sealed.segment, location, trust, read, want, buf).await?;
         if !is_valid {
             return Err(corruption(read));
         }

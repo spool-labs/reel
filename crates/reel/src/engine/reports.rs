@@ -186,6 +186,13 @@ impl<Backend: Io> EngineState<Backend> {
         report.scrub_passes = self.scrub_passes.load(Ordering::Relaxed);
         report.scrub_failures = self.scrub_failures.load(Ordering::Relaxed);
         report.scan_cache_hits = self.scan_cache_hits.load(Ordering::Relaxed);
+        report.scan_held_values = self.scan_held_values.load(Ordering::Relaxed);
+        for index in self.sorted.iter().flatten() {
+            report.held_values += index.values.held.load(Ordering::Relaxed);
+            report.value_fills += index.values.fills.load(Ordering::Relaxed);
+            report.value_drops += index.values.drops.load(Ordering::Relaxed);
+            report.value_evictions += index.values.evictions.load(Ordering::Relaxed);
+        }
         let caches = [Some(&self.row_cache), Some(&self.filter_cache), self.complete_cache.as_ref()];
         report.cache_inserts_skipped = caches.into_iter().flatten().map(BlockCache::skipped_inserts).sum();
         report.sorted_answers = self.sorted_answers.load(Ordering::Relaxed);

@@ -37,6 +37,9 @@ pub const OPEN_PER_ROOT: usize = 4;
 pub const SLOTS_PER_OPEN: usize = 2;
 /// The write index's sixteenths of what the fixed parts and the room leave
 pub const WRITE_INDEX_SIXTEENTHS: u64 = 6;
+/// The write index's sixteenths the sorted indexes' leaves keep values in on a full budget, so a scan or get of a held key
+/// reads no record. A smaller budget keeps them in the write index, and a store with no sorted column gives them to the record cache
+pub const HELD_VALUE_SIXTEENTHS: u64 = 2;
 /// The spot cache's sixteenths of what the fixed parts and the room leave
 pub const SPOT_SIXTEENTHS: u64 = 2;
 /// The block caches' sixteenths of what the fixed parts and the room leave
@@ -221,6 +224,7 @@ pub struct EngineSizing {
     pub spot_share: ByteCount,
     pub cache_share: ByteCount,
     pub record_share: ByteCount,
+    pub value_share: ByteCount,
     pub summary_share: ByteCount,
     pub table_share: ByteCount,
     pub lz4_stored_limit: ByteCount,
@@ -351,7 +355,8 @@ impl EngineSizing {
         // the room and the entries come out before the shares
         let shared = budget.0.saturating_sub(shape.fixed_bytes().0 + shape.room().0 + shape.entry_line().0);
         let (spot_share, cache_share) = (share_of(shared, SPOT_SIXTEENTHS), share_of(shared, BLOCK_CACHE_SIXTEENTHS));
-        let index_share = share_of(shared, WRITE_INDEX_SIXTEENTHS);
+        let held = if budget >= FULL_BUDGET { HELD_VALUE_SIXTEENTHS } else { 0 };
+        let index_share = share_of(shared, WRITE_INDEX_SIXTEENTHS - held);
         let rows_total = index_share / PLANNED_ROW_BYTES;
         Self {
             segment_bytes: segment_bytes_for(budget),
@@ -360,6 +365,7 @@ impl EngineSizing {
             spot_share: ByteCount(spot_share),
             cache_share: ByteCount(cache_share),
             record_share: ByteCount(share_of(shared, RECORD_CACHE_SIXTEENTHS)),
+            value_share: ByteCount(share_of(shared, held)),
             summary_share: ByteCount(share_of(shared, SUMMARY_SIXTEENTHS)),
             table_share: ByteCount(share_of(shared, TABLE_SIXTEENTHS)),
             lz4_stored_limit: LZ4_STORED_LIMIT,

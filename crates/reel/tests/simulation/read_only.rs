@@ -448,7 +448,7 @@ fn open_rows_past_the_budget_refuse_the_view() {
 const GROWN_KEYS: u64 = 20_000;
 // open rows past what a view's write index holds at BUDGET, from a writer that holds them all unsealed
 const MANY_KEYS: u64 = 400_000;
-const WRITER_BUDGET: u64 = 512 * 1024 * 1024;
+const WRITER_BUDGET: u64 = 768 * 1024 * 1024;
 
 // a reader set to no lifetime group beside a writer with a marked open segment reads it and leaves it: the recovery seal of a
 // marked group is the writer's, and a reader writes nothing and seals nothing

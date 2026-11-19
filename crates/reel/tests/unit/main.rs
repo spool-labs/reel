@@ -39,6 +39,7 @@ mod sorted_keys;
 mod sorted_fill;
 mod summary;
 mod summary_orders;
+mod value_pages;
 mod wake_line;
 mod superblock;
 mod torn_record;

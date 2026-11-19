@@ -640,6 +640,12 @@ pub struct MaintenanceReport {
     pub scrub_failures: u64,
     /// Values scans took from the record cache with no record read, while it could hold most of a volume
     pub scan_cache_hits: u64,
+    /// Scan rows answered from a value their index leaf held, the values the leaves hold now, and the fills, drops and evictions
+    pub scan_held_values: u64,
+    pub held_values: u64,
+    pub value_fills: u64,
+    pub value_drops: u64,
+    pub value_evictions: u64,
     /// Block cache inserts that found their shard held by a visit and kept nothing
     pub cache_inserts_skipped: u64,
     /// Gets a sorted index answered with no footer search, and gets on a sorted column that asked the footers: behind the
@@ -766,6 +772,11 @@ impl MaintenanceReport {
             scrub_passes: 0,
             scrub_failures: 0,
             scan_cache_hits: 0,
+            scan_held_values: 0,
+            held_values: 0,
+            value_fills: 0,
+            value_drops: 0,
+            value_evictions: 0,
             cache_inserts_skipped: 0,
             sorted_answers: 0,
             sorted_footer_asks: 0,

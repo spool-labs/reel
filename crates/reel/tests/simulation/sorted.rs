@@ -32,6 +32,7 @@ const ROOT: &str = "/disk/sorted";
 const COLUMN: ColumnId = ColumnId(1);
 const WIDTH: u16 = 16;
 const BUDGET: ByteCount = ByteCount(128 * 1024 * 1024);
+const HELD_BUDGET: ByteCount = ByteCount(1024 * 1024 * 1024);
 const TICK: Nanoseconds = Nanoseconds(1_000_000);
 const STEPS: u64 = 400_000;
 const KEYS: u64 = 2_000;
@@ -59,11 +60,16 @@ type Store = ReelStore<SimulatedIo>;
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
 type Rows = Vec<(Vec<u8>, Vec<u8>)>;
 
+thread_local! {
+    // the budget a store these sims open runs at, which a full one raises so the leaves hold values
+    static SIM_BUDGET: std::cell::Cell<ByteCount> = const { std::cell::Cell::new(BUDGET) };
+}
+
 // every store these sims open gives its index exactly the rows it declared, so a small one fills and marks
 fn config(capacity: RowCount) -> StoreConfig {
     reel::engine::engine_sizing::EXACT_INDEX_ROWS.with(|exact| exact.set(true));
     StoreConfig {
-        memory_budget: BUDGET,
+        memory_budget: SIM_BUDGET.with(std::cell::Cell::get),
         threads: crate::shape::threads(),
         volumes: vec![VolumeConfig {
             name: "sorted".to_string(),
@@ -465,6 +471,28 @@ fn churn_in_one_part_matches_the_model() {
     }
 }
 
+// the same churn on a full budget, whose index leaves keep the values reads take, so gets and scans answer from them
+#[test]
+fn churn_with_held_values_matches_the_model() {
+    SIM_BUDGET.with(|budget| budget.set(HELD_BUDGET));
+    let (mut fills, mut held_rows) = (0, 0);
+    for seed in seeds(0..CHURN_SEEDS) {
+        HELD_SEEN.with(|seen| seen.set((0, 0)));
+        churn(seed, Arm { capacity: CAPACITY, key_of: key, extra: 0, is_sized: false });
+        let (seed_fills, seed_rows) = HELD_SEEN.with(std::cell::Cell::get);
+        fills += seed_fills;
+        held_rows += seed_rows;
+    }
+    SIM_BUDGET.with(|budget| budget.set(BUDGET));
+    println!("held values: {fills} fills, {held_rows} scan rows from leaves");
+    assert!(fills > 0 && held_rows > 0, "no value was held and served");
+}
+
+thread_local! {
+    // value fills and scan rows answered from leaves, summed over a seed's stores before each close
+    static HELD_SEEN: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 // opens that resized an index in the sized churn, over every seed
 static SIZED_RESIZES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -589,6 +617,7 @@ fn churn(seed: u64, Arm { capacity, key_of, extra, is_sized }: Arm) -> (bool, bo
             was_marked |= is_marked(&store);
             check(&store, &model, &written);
             check_scans(&store, &model, &mut random);
+            note_held(&store);
             // a count keeps to the segments and takes nothing from the index, and counts what the model holds
             let prefix = [random.below(256) as u8];
             let scan_keys = store.state.sorted_scan_keys.load(Ordering::Relaxed);
@@ -613,6 +642,7 @@ fn churn(seed: u64, Arm { capacity, key_of, extra, is_sized }: Arm) -> (bool, bo
         }
         // a seed whose rounds all end in a reopen seals nothing until here, so the walks run once more over sealed keys
         check_scans(&store, &model, &mut random);
+        note_held(&store);
         // with a mark standing every get and scan reads the footers, so only an index with no mark answers on its own
         if is_cleared {
             assert!(store.state.sorted_answers.load(Ordering::Relaxed) > 0);
@@ -625,6 +655,15 @@ fn churn(seed: u64, Arm { capacity, key_of, extra, is_sized }: Arm) -> (bool, bo
         }
         (was_marked, is_cleared)
     }
+}
+
+// add a store's value fills and scan rows from leaves to the seed's count, once before a store goes
+fn note_held(store: &Store) {
+    let report = report(store);
+    HELD_SEEN.with(|seen| {
+        let (fills, rows) = seen.get();
+        seen.set((fills.max(report.value_fills), rows.max(report.scan_held_values)));
+    });
 }
 
 // seal every open segment with rows but one

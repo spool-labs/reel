@@ -69,6 +69,7 @@ use crate::engine::complete_image::ImageFiles;
 use crate::index::complete_table::CompleteTable;
 use crate::index::complete_table::planned_table_bytes;
 use crate::index::sorted_keys::{MOST_KEY_BYTES, SortedKeys, planned_index_bytes, rows_for_bytes};
+use crate::index::value_pages::VALUE_PAGE_BYTES;
 use crate::index::spot_index::SpotIndex;
 use crate::index::write_index::WriteIndex;
 use crate::io::lock_outcome::LockOutcome;
@@ -1502,6 +1503,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         scrub_failures: AtomicU64::new(0),
         ahead_drops: AtomicU64::new(0),
         scan_cache_hits: AtomicU64::new(0),
+        scan_held_values: AtomicU64::new(0),
         sorted_answers: AtomicU64::new(0),
         sorted_footer_asks: AtomicU64::new(0),
         sorted_scan_keys: AtomicU64::new(0),
@@ -1811,6 +1813,8 @@ pub struct SortedSize {
     pub asked: ByteCount,
     pub got: ByteCount,
     pub rows: RowCount,
+    /// Value pages its leaves keep values in: its share of the held values by the rows it holds
+    pub value_pages: u32,
 }
 
 /// Size each sorted column's index from the keys it held at open: its rows on disk, every row counted, since a dead row counted
@@ -1864,7 +1868,7 @@ pub fn size_sorted_indexes(config: &StoreConfig, sizing: &EngineSizing, summarie
         // the caches give up what the pool holds, which a grant rounds down to
         let held = if rows.0 == 0 { 0 } else { planned_index_bytes(width, rows).0 };
         taken += held;
-        sizes[column.id.0 as usize] = Some(SortedSize { asked, got: ByteCount(held), rows });
+        sizes[column.id.0 as usize] = Some(SortedSize { asked, got: ByteCount(held), rows, value_pages: 0 });
     }
     // in a store of sorted columns the spot share pays first, and what it has left goes to the block and record caches
     let (from_caches, to_caches) = if is_all_sorted { (taken.saturating_sub(spot), spot.saturating_sub(taken)) } else { (taken, 0) };
@@ -1872,10 +1876,17 @@ pub fn size_sorted_indexes(config: &StoreConfig, sizing: &EngineSizing, summarie
     let caches = if is_all_sorted { block + record } else { spot + block + record };
     let by_size = |share: u64, bytes: u64| (u128::from(share) * u128::from(bytes) / u128::from(caches.max(1))) as u64;
     let changed = |share: u64| (share + by_size(share, to_caches)).saturating_sub(by_size(share, from_caches));
+    // the held values go to the sorted columns by the rows each holds, and to the record cache where no column holds any
+    let all_rows: u64 = sizes.iter().flatten().map(|size| size.rows.0).sum();
+    for size in sizes.iter_mut().flatten() {
+        let bytes = u128::from(sizing.value_share.0) * u128::from(size.rows.0) / u128::from(all_rows.max(1));
+        size.value_pages = (bytes / VALUE_PAGE_BYTES as u128).min(u128::from(u32::MAX - 1)) as u32;
+    }
+    let unheld = if all_rows == 0 { sizing.value_share.0 } else { 0 };
     let shared = EngineSizing {
         spot_share: ByteCount(if is_all_sorted { 0 } else { changed(spot) }),
         cache_share: ByteCount(changed(block)),
-        record_share: ByteCount(changed(record)),
+        record_share: ByteCount(changed(record) + unheld),
         ..*sizing
     };
     (shared, sizes)
@@ -1885,7 +1896,7 @@ pub fn size_sorted_indexes(config: &StoreConfig, sizing: &EngineSizing, summarie
 pub fn sorted_indexes(config: &StoreConfig, sizes: &[Option<SortedSize>]) -> Vec<Option<SortedKeys>> {
     let mut indexes: Vec<Option<SortedKeys>> = (0..MAX_COLUMNS).map(|_column| None).collect();
     for column in &config.columns {
-        indexes[column.id.0 as usize] = sizes[column.id.0 as usize].filter(|size| size.rows.0 > 0).map(|size| SortedKeys::new(column.key_shape.widest(), size.rows));
+        indexes[column.id.0 as usize] = sizes[column.id.0 as usize].filter(|size| size.rows.0 > 0).map(|size| SortedKeys::new(column.key_shape.widest(), size.rows).holding_values(size.value_pages));
     }
     indexes
 }

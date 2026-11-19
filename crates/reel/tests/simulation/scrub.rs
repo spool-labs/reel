@@ -207,3 +207,68 @@ fn a_scrub_beside_writers_and_merges_finds_no_false_damage() {
     assert!(hold(&store.state.volumes[0].damaged).is_empty(), "the scrub damaged a sound segment");
     store.close().expect("close");
 }
+
+// a value read unchecked and held in its index leaf stops answering once the scrub marks its record bad: the next get refuses
+#[test]
+fn a_held_rotted_value_stops_answering_after_the_scrub() {
+    let io = SimulatedIo::new(Seed(5));
+    let mut config = sorted_config();
+    config.threads = ThreadCounts { scrub_bytes_per_second: 0, ..NO_WORKERS };
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    for number in 0..KEYS {
+        store.put(SORTED, &sorted_key(number), &value(number, 0)).expect("put");
+    }
+    seal(&store, &io);
+    let volume = &store.state.volumes[0];
+    let name = sorted_key(KEYS / 2);
+    let read_at = store.state.key_read(SORTED, &name, store.state.read_point(volume), false).expect("read");
+    let row = in_place(store.state.search_sealed(&InPlace, volume, &read_at)).expect("search").expect("a sealed row");
+    io.rot(&data_path(&volume.roots[0], row.segment), FileOffset(row.row.offset.0 + SMALL_HEAD_BYTES as u64), BitMask(1)).expect("rot");
+    let mut buf = Vec::new();
+    // the get trusts the sealed record its counts vouch for, reads the rotted bytes and holds them
+    assert!(store.get(SORTED, &name, &mut buf).expect("get"));
+    assert_ne!(buf, value(KEYS / 2, 0));
+    assert!(store.state.sorted_index(SORTED).expect("an index").values.held.load(Ordering::Relaxed) > 0, "nothing was held");
+
+    let mut job = ScrubJob::new(Arc::clone(&store.state), 0);
+    job.rate = RATE;
+    scrub_one_pass(&store, &io, &mut job);
+    assert_eq!(store.state.scrub_failures.load(Ordering::Relaxed), 1);
+    buf.clear();
+    let again = store.get(SORTED, &name, &mut buf);
+    assert!(!matches!(again, Ok(true)) || buf == value(KEYS / 2, 0), "the held rotted value answered after the scrub: {again:?} {buf:?}");
+    store.close().expect("close");
+}
+
+const SORTED: ColumnId = ColumnId(2);
+const FULL_BUDGET_BYTES: ByteCount = ByteCount(1024 * 1024 * 1024);
+
+fn sorted_key(number: u64) -> Vec<u8> {
+    let mut key = [0_u8; 16];
+    key[8..].copy_from_slice(&number.to_be_bytes());
+    key.to_vec()
+}
+
+// a store on a full budget with a sorted column, so its index leaves hold values
+fn sorted_config() -> StoreConfig {
+    StoreConfig {
+        memory_budget: FULL_BUDGET_BYTES,
+        threads: NO_WORKERS,
+        volumes: vec![VolumeConfig {
+            name: "scrub".to_string(),
+            roots: vec![PathBuf::from(ROOT)],
+            sync: SyncPolicy::Never,
+            device: Default::default(), open_segments: None, segment_bytes: None, lifetime_groups: None,
+        }],
+        columns: vec![ColumnConfig {
+            id: SORTED,
+            name: "sorted".to_string(),
+            key_shape: KeyShape::Fixed { width: 16 },
+            codec: Codec::None,
+            volume: VolumeId(0),
+            index: ColumnIndex::Sorted,
+            least_rows: None,
+            least_value: None,
+        }],
+    }
+}

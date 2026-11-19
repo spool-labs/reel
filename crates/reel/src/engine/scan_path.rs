@@ -18,7 +18,7 @@ use crate::engine::read_path::{HeldPin, KeyRead, Located, MOST_READ_TRIES, Recor
 use crate::engine::scan_state::{
     BatchEntry, BatchRow, BlockTake, JOIN_GAP, MOST_BATCH_RECORD, MOST_BATCH_RUNS, MOST_WINDOW_RECORD, NO_GENERATION, NO_CHANGES, ScanBatch, batch_room,
     SCAN_CACHE_PARTS, SCAN_CACHE_WEIGH_EVERY, SEAT_BATCH, ScanRange, ScanState, ScanWindows, SegmentSource, ShardHead,
-    KeyFrom, index_of_word, key_in, seek_together, under_prefix,
+    KeyFrom, SCAN_BATCH_KEYS, held_in, index_of_word, key_in, seek_together, under_prefix,
 };
 use crate::engine::volume::Volume;
 use crate::guard::hold;
@@ -380,7 +380,12 @@ impl<Backend: Io> EngineState<Backend> {
             ScanWant::Locate => {
                 let key_at = scan.batch.keys.len();
                 scan.batch.keys.extend_from_slice(candidate);
-                scan.batch.entries.push(BatchEntry { key_at, key_length: candidate.len(), key_from: KeyFrom::Batch, located, record: None, is_value: false });
+                // a sealed row the index entry named comes with the value its leaf held, as a run's rows do
+                let record = held_for(scan, candidate, &located);
+                scan.batch.entries.push(BatchEntry { key_at, key_length: candidate.len(), key_from: KeyFrom::Batch, located, record, is_value: record.is_some() });
+                if record.is_some() {
+                    self.scan_held_values.fetch_add(1, Ordering::Relaxed);
+                }
                 Ok(true)
             },
             ScanWant::Bytes => {
@@ -654,11 +659,16 @@ impl<Backend: Io> EngineState<Backend> {
     /// Read the batch's records together, from the record cache, a slot's window or joined reads, and leave the rest to own reads
     pub async fn read_batch(&self, device: &impl DeviceReads<Backend::File>, volume: &Volume<Backend>, scan: &mut ScanState) {
         let is_cached = self.scans_use_cache(volume);
-        let ScanState { batch: ScanBatch { entries, keys, records, rows, spans, words, .. }, sorted, sorted_spare, sorted_turn, .. } = scan;
+        let ScanState { batch: ScanBatch { entries, keys, records, rows, spans, words, .. }, sorted, sorted_spare, sorted_turn, column, .. } = scan;
         rows.clear();
         rows.resize(entries.len(), None);
         let mut hits = 0;
+        let mut held_rows = 0;
         for (row, entry) in rows.iter_mut().zip(entries.iter_mut()) {
+            // a row its index leaf already answered takes no read
+            if entry.is_value {
+                continue;
+            }
             let sealed = match entry.located {
                 Located::Sealed(sealed) => sealed,
                 Located::Open(open) => {
@@ -673,6 +683,14 @@ impl<Backend: Io> EngineState<Backend> {
             // a value is no longer than its record, so a record's room in the buffer holds it with no allocation
             let at = records.len();
             let is_room = at + sealed.row.length.0 as usize <= records.capacity();
+            // a value the index entry's leaf held came with the entry, so the row takes no read and no check
+            if let Some(value) = held_in((sorted, sorted_spare, *sorted_turn), entry).filter(|value| at + value.len() <= records.capacity()) {
+                records.extend_from_slice(value);
+                entry.record = Some((at, value.len()));
+                entry.is_value = true;
+                held_rows += 1;
+                continue;
+            }
             let key = key_in(keys, (sorted, sorted_spare, *sorted_turn), entry);
             if is_cached && is_room && self.record_cache.get_onto(sealed.segment, sealed.row.offset, key, records) == CacheLookup::Hit {
                 entry.record = Some((at, records.len() - at));
@@ -685,6 +703,9 @@ impl<Backend: Io> EngineState<Backend> {
         if hits > 0 {
             self.scan_cache_hits.fetch_add(hits, Ordering::Relaxed);
         }
+        if held_rows > 0 {
+            self.scan_held_values.fetch_add(held_rows, Ordering::Relaxed);
+        }
         spans.clear();
         spans.resize(entries.len(), None);
         if self.read_records(device, volume, rows, records, spans, words).await {
@@ -695,6 +716,35 @@ impl<Backend: Io> EngineState<Backend> {
                 entry.record = *span;
             }
         }
+        // a column whose leaves hold values checks the sealed records it read here, and keeps them a leaf at a time
+        let Some(index) = self.sorted_index(*column).filter(|index| index.values.page_count() > 0) else {
+            return;
+        };
+        let mut is_fresh = [false; SCAN_BATCH_KEYS];
+        for (at, entry) in entries.iter_mut().enumerate() {
+            let (Some((start, length)), Located::Sealed(sealed), false) = (entry.record, entry.located, entry.is_value) else {
+                continue;
+            };
+            let record = &records[start..start + length];
+            let key = key_in(keys, (sorted, sorted_spare, *sorted_turn), entry);
+            let identity = RecordIdentity { record_key: self.record_key, column: *column, key, kind: RowKind::Value, place: sealed.row.place };
+            let Some(payload) = form_of(record).filter(|form| !form.is_chunked && form.codec == Codec::None).and_then(|form| checked_payload(record, form, &identity)) else {
+                continue;
+            };
+            entry.record = Some((start + length - payload.len(), payload.len()));
+            entry.is_value = true;
+            if let Some(fresh) = is_fresh.get_mut(at) {
+                *fresh = true;
+            }
+        }
+        let fresh = entries.iter().enumerate().filter(|(at, _entry)| is_fresh.get(*at).copied().unwrap_or(false));
+        index.hold_values(fresh.filter_map(|(_at, entry)| {
+            let (Located::Sealed(sealed), Some((start, length))) = (entry.located, entry.record) else {
+                return None;
+            };
+            let key = key_in(keys, (sorted, sorted_spare, *sorted_turn), entry);
+            Some((key, (sealed.row.place, sealed.segment, sealed.row.offset), &records[start..start + length]))
+        }));
     }
 
     /// Copy an open record its slot's window still holds into the batch's buffer, with the slot held on the record's segment
@@ -841,9 +891,8 @@ impl<Backend: Io> EngineState<Backend> {
             },
             (Some((at, length)), Located::Sealed(row)) => {
                 let is_open = self.open_batched(on.device, (*column, name), row.row.place, &batch.records[at..at + length], value);
-                // a scan keeps what it read only while the cache can hold most of the volume, so gets keep theirs otherwise
-                if is_open && on.target.scans_use_cache.load(Ordering::Relaxed) {
-                    self.record_cache.admit(row.segment, row.row.offset, name, value);
+                if is_open {
+                    self.keep_scanned(on.target, (*column, name), &row, value);
                 }
                 is_open
             },
@@ -918,13 +967,22 @@ impl<Backend: Io> EngineState<Backend> {
         let identity = RecordIdentity { record_key: self.record_key, column: scan.column, key: name, kind: RowKind::Value, place };
         let form = form_of(record).filter(|form| !form.is_chunked && form.codec == Codec::None)?;
         let payload = checked_payload(record, form, &identity)?;
-        // a scan keeps what it read only while the cache can hold most of the volume, as a one-row step does
-        if let Located::Sealed(row) = entry.located
-            && volume.scans_use_cache.load(Ordering::Relaxed)
-        {
-            self.record_cache.admit(row.segment, row.row.offset, name, payload);
+        if let Located::Sealed(row) = entry.located {
+            self.keep_scanned(volume, (scan.column, name), &row, payload);
         }
         Some((at + length - payload.len(), payload.len()))
+    }
+
+    /// Keep a value a scan read and checked: in its index leaf when the column's leaves hold values, else in the record cache
+    /// while the cache can hold most of the volume, so gets keep theirs otherwise
+    pub fn keep_scanned(&self, volume: &Volume<Backend>, (column, name): (ColumnId, &[u8]), row: &SealedRow, value: &[u8]) {
+        // a column whose leaves hold values keeps them a batch at a time, in the batch's read
+        if self.sorted_index(column).is_some_and(|index| index.values.page_count() > 0) {
+            return;
+        }
+        if volume.scans_use_cache.load(Ordering::Relaxed) {
+            self.record_cache.admit(row.segment, row.row.offset, name, value);
+        }
     }
 
     /// Check and open a small record the batch read, as the window does
@@ -1766,4 +1824,26 @@ pub fn can_cross_unread<Backend: Io>(volume: &Volume<Backend>, segment: SegmentN
         volume.zero_lines_read.fetch_add(1, Ordering::Relaxed);
     }
     is_exact
+}
+
+/// Copy the value the index batch held for a located sealed row into the scan's records, when the walk's index entry is the row's
+fn held_for(scan: &mut ScanState, candidate: &[u8], located: &Located) -> Option<(usize, usize)> {
+    let Located::Sealed(sealed) = located else {
+        return None;
+    };
+    if !scan.is_on_index || scan.sorted_key() != Some(candidate) {
+        return None;
+    }
+    let entry = scan.sorted.entries[scan.sorted_next];
+    if entry.place != sealed.row.place || entry.segment != sealed.segment || entry.offset != sealed.row.offset {
+        return None;
+    }
+    let value = scan.sorted.held_value(scan.sorted_next)?;
+    let records = &mut scan.batch.records;
+    let at = records.len();
+    if at + value.len() > records.capacity() {
+        return None;
+    }
+    records.extend_from_slice(value);
+    Some((at, value.len()))
 }

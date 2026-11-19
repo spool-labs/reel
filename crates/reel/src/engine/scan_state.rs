@@ -1220,6 +1220,15 @@ pub fn sorted_batch(widest_key: usize) -> KeyBatch {
 }
 
 /// Read a batch entry's key from the batch's own keys or the index batch of its turn
+/// Read the value an entry's index batch held for it, when its key came from one
+pub fn held_in<'scan>((sorted, spare, turn): (&'scan KeyBatch, &'scan KeyBatch, u32), entry: &BatchEntry) -> Option<&'scan [u8]> {
+    match entry.key_from {
+        KeyFrom::Batch => None,
+        KeyFrom::Sorted(at) if at == turn => sorted.held_value(entry.key_at),
+        KeyFrom::Sorted(_at) => spare.held_value(entry.key_at),
+    }
+}
+
 pub fn key_in<'scan>(keys: &'scan [u8], (sorted, spare, turn): (&'scan KeyBatch, &'scan KeyBatch, u32), entry: &BatchEntry) -> &'scan [u8] {
     match entry.key_from {
         KeyFrom::Batch => &keys[entry.key_at..entry.key_at + entry.key_length],

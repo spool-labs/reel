@@ -7,21 +7,33 @@
 
 use std::cmp::Ordering;
 use std::hint::black_box;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLockWriteGuard};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as Memory};
 
 use reel_core::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
 use crate::guard::{Shards, hold};
+use crate::index::value_pages::{ClockPick, HeldChain, MOST_HELD_VALUE, NO_VALUE_PAGE, ValuePages};
 use crate::pool::{ask_huge_pages, touched_capacity};
 use crate::segment::segment_tail::SegmentNumber;
 
 /// Words of one page
 pub const PAGE_WORDS: usize = 1024;
+/// Bytes a scan's index batch keeps for held values, a share an entry, so a batch of small values carries them all
+pub const HELD_BYTES_PER_ENTRY: usize = 128;
+/// The span of an entry that came with no held value
+pub const NO_HELD: (u32, u32) = (u32::MAX, 0);
 /// Parts of an index, one for each first byte of a key
 pub const PARTS: usize = 256;
-/// Words at the head of a page: the count, the next leaf, the previous leaf, and one spare
-pub const HEAD_WORDS: usize = 4;
+/// Words at the head of a page: the count, the next leaf, the previous leaf, and a leaf's held values: its chain's first page and
+/// that page's generation
+pub const HEAD_WORDS: usize = 5;
+/// The head word of a leaf that names its value chain's first page
+const CHAIN_WORD: usize = 3;
+/// The head word of a leaf that keeps its value chain's generation, with LIVE_CHAIN set while it names one
+const GENERATION_WORD: usize = 4;
+/// The bit of a generation word that says the leaf names a chain, so a page never set up for values names none
+const LIVE_CHAIN: u32 = 1 << 31;
 /// Words of an entry after its key: the place's two halves, the segment, the offset and the length
 pub const ENTRY_TAIL_WORDS: usize = 5;
 /// The widest key an index holds
@@ -132,6 +144,9 @@ pub enum ScanFrom<'key> {
 pub struct KeyBatch {
     pub keys: Vec<u8>,
     pub entries: Vec<KeyEntry>,
+    /// Values the entries' leaves held when the batch was copied, and where each entry's sits, NO_HELD for none
+    pub values: Vec<u8>,
+    pub held: Vec<(u32, u32)>,
     /// The last key a call looked at, which the next call starts after
     resume: [u8; MOST_KEY_BYTES],
     /// The batch takes graves too, as a scan does: a grave hides an older open row of its key
@@ -156,6 +171,8 @@ pub struct SortedKeys {
     entries: AtomicU64,
     mark: AtomicU64,
     past_capacity: AtomicU64,
+    /// Values the leaves keep, from a pool sized at open, which holds no page unless a share was given to it
+    pub values: ValuePages,
     /// One past the highest page ever taken. Pages are chained in order at build and taken from the head, so every page at or
     /// past this one still holds the chain the build wrote
     /// The rows the column was told to hold, which sized the pool
@@ -211,6 +228,8 @@ impl KeyBatch {
         Self {
             keys: touched_capacity(width * most, 0),
             entries: touched_capacity(most, KeyEntry::default()),
+            values: touched_capacity(most * HELD_BYTES_PER_ENTRY, 0),
+            held: touched_capacity(most, NO_HELD),
             resume: [0; MOST_KEY_BYTES],
             is_with_graves: false,
             width,
@@ -224,7 +243,7 @@ impl KeyBatch {
 
     /// Read the heap the batch holds
     pub fn heap_bytes(&self) -> usize {
-        self.keys.capacity() + self.entries.capacity() * size_of::<KeyEntry>()
+        self.keys.capacity() + self.entries.capacity() * size_of::<KeyEntry>() + self.values.capacity() + self.held.capacity() * size_of::<(u32, u32)>()
     }
 
     /// Empty the batch for keys of another width, which its room holds
@@ -253,10 +272,18 @@ impl KeyBatch {
         &self.keys[index * self.width..(index + 1) * self.width]
     }
 
+    /// Read the value an entry's leaf held when the batch was copied
+    pub fn held_value(&self, index: usize) -> Option<&[u8]> {
+        let &(at, length) = self.held.get(index)?;
+        (at != NO_HELD.0).then(|| &self.values[at as usize..(at + length) as usize])
+    }
+
     /// Empty the batch and keep its room
     pub fn clear(&mut self) {
         self.keys.clear();
         self.entries.clear();
+        self.values.clear();
+        self.held.clear();
     }
 }
 
@@ -284,6 +311,7 @@ impl SortedKeys {
             entries: AtomicU64::new(0),
             mark: AtomicU64::new(NO_MARK),
             past_capacity: AtomicU64::new(0),
+            values: ValuePages::new(0),
             told_rows: rows,
         }
         .chained()
@@ -311,7 +339,7 @@ impl SortedKeys {
 
     /// Read the heap the index holds
     pub fn heap_bytes(&self) -> ByteCount {
-        ByteCount((self.words.capacity() * size_of::<AtomicU32>()) as u64)
+        ByteCount((self.words.capacity() * size_of::<AtomicU32>()) as u64 + self.values.heap_bytes().0)
     }
 
     /// Count the pages the pool has
@@ -709,6 +737,172 @@ impl SortedKeys {
         let leaf = self.descend(&tree, &packed, &mut PagePath::new());
         let (index, is_found) = self.leaf_search(leaf, &packed);
         is_found.then(|| self.read_entry(leaf, index))
+    }
+
+    /// Give the leaves a pool of value pages to keep values in
+    pub fn holding_values(mut self, pages: u32) -> Self {
+        self.values = ValuePages::new(pages);
+        self
+    }
+
+    /// Copy the value a key's entry holds onto the end of `out`, when the entry still names this row and its leaf holds the value
+    pub fn held_value(&self, key: &[u8], row: (WritePlace, SegmentNumber, FileOffset), out: &mut Vec<u8>) -> bool {
+        if self.values.page_count() == 0 || key.len() > self.width {
+            return false;
+        }
+        let tree = self.parts.read(self.part_of(key));
+        if tree.levels == 0 {
+            return false;
+        }
+        let packed = PackedKey::new(key);
+        let leaf = self.descend(&tree, &packed, &mut PagePath::new());
+        let (index, is_found) = self.leaf_search(leaf, &packed);
+        is_found && self.names_row(leaf, index, row) && self.values.read(self.chain_of(leaf), index, out)
+    }
+
+    /// Keep a value a read checked beside its key's entry, when the entry still names the row it was read from. A pool with no free
+    /// page clears one chain nobody read lately, in this part or one whose lock is free, and tries once more
+    pub fn hold_value(&self, key: &[u8], row: (WritePlace, SegmentNumber, FileOffset), value: &[u8]) -> bool {
+        self.hold_values([(key, row, value)].into_iter()) > 0
+    }
+
+    /// Keep values a read checked, under one hold of each part's lock for the run of keys in it. A part whose lock another caller
+    /// has takes none: the rows were answered already, and a fill never waits. Say how many went in
+    pub fn hold_values<'value>(&self, items: impl Iterator<Item = (&'value [u8], (WritePlace, SegmentNumber, FileOffset), &'value [u8])>) -> u64 {
+        if self.values.page_count() == 0 {
+            return 0;
+        }
+        let mut held = 0;
+        let mut current: Option<(usize, Option<RwLockWriteGuard<'_, PartTree>>)> = None;
+        // a batch's keys run in order, so after one descent each key is in the leaf the last one was in, or the next
+        let mut cursor = NO_PAGE;
+        for (key, row, value) in items {
+            if key.len() > self.width {
+                continue;
+            }
+            let part = self.part_of(key);
+            if current.as_ref().is_none_or(|(at, _guard)| *at != part) {
+                drop(current.take());
+                current = Some((part, self.parts.try_write(part)));
+                cursor = NO_PAGE;
+            }
+            let Some((_part, Some(tree))) = current.as_ref() else {
+                continue;
+            };
+            if tree.levels == 0 {
+                continue;
+            }
+            let packed = PackedKey::new(key);
+            let Some((leaf, index)) = self.leaf_near(tree, cursor, &packed) else {
+                continue;
+            };
+            cursor = leaf;
+            if !self.names_row(leaf, index, row) {
+                continue;
+            }
+            for attempt in 0..2 {
+                if let Some(chain) = self.values.fill(leaf, self.chain_of(leaf), (index, self.leaf_capacity), value) {
+                    self.set_chain(leaf, chain);
+                    held += 1;
+                    break;
+                }
+                if attempt == 1 || !self.evict_one(part) {
+                    break;
+                }
+            }
+        }
+        held
+    }
+
+    /// Find a key's leaf and place from the leaf the last key of a run was in: that leaf, then its next, then a descent. Nothing
+    /// when the key has no entry. The caller holds the part's lock
+    fn leaf_near(&self, tree: &PartTree, cursor: u32, packed: &PackedKey) -> Option<(u32, usize)> {
+        if cursor != NO_PAGE {
+            for leaf in [cursor, self.next(cursor)] {
+                if leaf == NO_PAGE {
+                    break;
+                }
+                let (index, is_found) = self.leaf_search(leaf, packed);
+                if is_found {
+                    return Some((leaf, index));
+                }
+                // a key that sorts inside this leaf and isn't there has no entry, and one before its first may sit in an earlier leaf
+                if index == 0 {
+                    break;
+                }
+                if index < self.count(leaf) {
+                    return None;
+                }
+            }
+        }
+        let leaf = self.descend(tree, packed, &mut PagePath::new());
+        let (index, is_found) = self.leaf_search(leaf, packed);
+        is_found.then_some((leaf, index))
+    }
+
+    /// Clear one chain the clock picks, taking its part's lock unless it's the part this caller holds or another caller has it
+    fn evict_one(&self, holding: usize) -> bool {
+        let Some(pick) = self.values.clock_pick() else {
+            return false;
+        };
+        let owner_part = self.part_of_leaf(pick.owner);
+        if owner_part == holding {
+            return self.evict_held(pick);
+        }
+        match self.parts.try_write(owner_part) {
+            Some(_owner) => self.evict_held(pick),
+            None => false,
+        }
+    }
+
+    /// Clear a picked chain once its part is held, when its leaf still names it
+    fn evict_held(&self, pick: ClockPick) -> bool {
+        if self.chain_of(pick.owner) != pick.chain {
+            return false;
+        }
+        self.values.evict(pick);
+        self.set_chain(pick.owner, HeldChain::NONE);
+        true
+    }
+
+    /// Read the part a leaf's keys are in, from its first key's first byte
+    fn part_of_leaf(&self, leaf: u32) -> usize {
+        (self.load(leaf, self.leaf_entry(0)) >> 24) as usize
+    }
+
+    /// Check an entry still names a row: its place, segment and offset
+    fn names_row(&self, leaf: u32, index: usize, (place, segment, offset): (WritePlace, SegmentNumber, FileOffset)) -> bool {
+        let entry = self.read_entry(leaf, index);
+        !entry.is_grave && entry.place == place && entry.segment == segment && entry.offset == offset
+    }
+
+    /// Read the chain a leaf's head names
+    fn chain_of(&self, leaf: u32) -> HeldChain {
+        let generation = self.load(leaf, GENERATION_WORD);
+        if generation & LIVE_CHAIN == 0 {
+            return HeldChain::NONE;
+        }
+        HeldChain { first: self.load(leaf, CHAIN_WORD), generation: generation & !LIVE_CHAIN }
+    }
+
+    /// Name a chain in a leaf's head, or none
+    fn set_chain(&self, leaf: u32, chain: HeldChain) {
+        if chain == HeldChain::NONE {
+            self.store(leaf, GENERATION_WORD, 0);
+            self.store(leaf, CHAIN_WORD, NO_VALUE_PAGE);
+            return;
+        }
+        self.store(leaf, CHAIN_WORD, chain.first);
+        self.store(leaf, GENERATION_WORD, chain.generation | LIVE_CHAIN);
+    }
+
+    /// Give a leaf's held values back, as any change to its entries does
+    fn drop_values(&self, page: u32) {
+        let chain = self.chain_of(page);
+        if chain != HeldChain::NONE {
+            self.values.drop_chain(chain);
+            self.set_chain(page, HeldChain::NONE);
+        }
     }
 
     /// Copy the live entries after a start into a batch until it holds this many, in ascending key order, and say whether the
@@ -1118,6 +1312,12 @@ impl SortedKeys {
             bytes.copy_from_slice(&self.load(leaf, base + word).to_be_bytes()[..bytes.len()]);
         }
         batch.entries.push(entry);
+        // a held value comes with its entry under the same lock, while the batch has room for the largest one
+        let start = batch.values.len();
+        let is_held = !entry.is_grave
+            && batch.values.capacity() - start >= MOST_HELD_VALUE
+            && self.values.read(self.chain_of(leaf), index, &mut batch.values);
+        batch.held.push(if is_held { (start as u32, (batch.values.len() - start) as u32) } else { NO_HELD });
     }
 
     /// Read an entry
@@ -1153,6 +1353,7 @@ impl SortedKeys {
 
     /// Write the words of an entry after its key
     fn write_tail(&self, leaf: u32, index: usize, words: &EntryWords) {
+        self.drop_values(leaf);
         let tail = self.leaf_entry(index) + self.key_words;
         let grave = if words.is_grave { GRAVE_BIT } else { 0 };
         self.store(leaf, tail, (words.place >> 32) as u32 | grave);
@@ -1240,6 +1441,8 @@ impl SortedKeys {
 
     /// Clear a page's head for a new leaf or inner page
     fn init_page(&self, page: u32) {
+        self.store(page, GENERATION_WORD, 0);
+        self.store(page, CHAIN_WORD, NO_VALUE_PAGE);
         self.set_count(page, 0);
         self.set_next(page, NO_PAGE);
         self.set_previous(page, NO_PAGE);
@@ -1267,6 +1470,9 @@ impl SortedKeys {
 
     /// Give pages back to the pool
     fn give_back(&self, pages: &[u32]) {
+        for &page in pages {
+            self.drop_values(page);
+        }
         let mut free = hold(&self.free);
         for &page in pages {
             self.store(page, 1, free.head);
@@ -1280,8 +1486,9 @@ impl SortedKeys {
         self.load(page, 0) as usize
     }
 
-    /// Set a page's count
+    /// Set a page's count. Entries move with it, so a leaf's held values go first
     fn set_count(&self, page: u32, count: usize) {
+        self.drop_values(page);
         self.store(page, 0, count as u32);
     }
 

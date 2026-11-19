@@ -2084,3 +2084,114 @@ fn old_segments_under_a_small_seal_list() {
     store.close().expect("close");
     assert_eq!(reel::fixed_list::lists_full(), full_before, "a list filled over the old segments");
 }
+
+// one writer's batches past many rows-group rollovers leave no gap: a claim that found its group full gives its bytes back, so
+// the open segment's bytes are exactly its records
+#[test]
+fn a_full_rows_group_leaves_no_gap() {
+    let io = SimulatedIo::new(Seed(4_102));
+    let store = open(&io);
+    let value = vec![7_u8; 100];
+    let mut batch = reel_core::write_batch::WriteBatch::new();
+    let mut rows = 0_u64;
+    for round in 0..40_u64 {
+        batch.clear();
+        for number in 0..1_000_u64 {
+            batch.put(COLUMN, format!("key-{round:03}-{number:04}").as_bytes(), &value);
+        }
+        store.write_batch(&batch).expect("batch");
+        rows += 1_000;
+    }
+    let volume = &store.state.volumes[0];
+    assert_eq!(volume.unlanded_bytes.load(Ordering::Acquire), 0, "a full rows group left a gap");
+    let written: u64 = hold(&volume.claims).open.iter().map(|open| open.write_end.0).sum();
+    let sealed = volume.table.segment_count();
+    assert_eq!(sealed, 0, "a seal moved records out of the open segment");
+    let record = (reel::record::record_head::SMALL_HEAD_BYTES + value.len()) as u64;
+    assert_eq!(written, rows * record, "the open segment holds more than its records: {written} for {rows} rows");
+    store.close().expect("close");
+}
+
+// read the open segment's write end
+fn write_end(store: &Store) -> u64 {
+    hold(&store.state.volumes[0].claims).open[0].write_end.0
+}
+
+// two claims dropped unlanded, newest first, both give their bytes back. Oldest first, the older stays a gap the gauge counts,
+// since the newer stood past it when it went
+#[test]
+fn dropped_claims_give_back_only_the_newest() {
+    let io = SimulatedIo::new(Seed(4_103));
+    let store = open(&io);
+    store.put(COLUMN, b"first", b"value").expect("put");
+    let volume = &store.state.volumes[0];
+    let start = write_end(&store);
+    let older = store.state.claim(volume, &ONE_ROW).expect("claim");
+    let newer = store.state.claim(volume, &ONE_ROW).expect("claim");
+    drop(newer);
+    drop(older);
+    assert_eq!((write_end(&store), volume.unlanded_bytes.load(Ordering::Acquire)), (start, 0), "newest first left a gap");
+
+    let older = store.state.claim(volume, &ONE_ROW).expect("claim");
+    let newer = store.state.claim(volume, &ONE_ROW).expect("claim");
+    drop(older);
+    drop(newer);
+    assert_eq!((write_end(&store), volume.unlanded_bytes.load(Ordering::Acquire)), (start + 1, 1), "oldest first lost its gap");
+    store.close().expect("close");
+}
+
+// a claim dropped once its segment turned to sealing keeps its bytes as a counted gap, since the seal may hold the end already
+#[test]
+fn a_claim_dropped_while_sealing_keeps_its_gap() {
+    let io = SimulatedIo::new(Seed(4_104));
+    let store = open(&io);
+    store.put(COLUMN, b"first", b"value").expect("put");
+    let volume = &store.state.volumes[0];
+    let claim = store.state.claim(volume, &ONE_ROW).expect("claim");
+    let end = write_end(&store);
+    hold(&volume.claims).open[0].phase = SegmentPhase::Sealing;
+    drop(claim);
+    assert_eq!((write_end(&store), volume.unlanded_bytes.load(Ordering::Acquire)), (end, 1), "a sealing segment took its bytes back");
+    store.close().expect("close");
+}
+
+const CRASH_STEPS: u64 = 60;
+const BIG_VALUE: usize = 5_000;
+
+// a write that failed gives its bytes back and the next write reuses them; a seal killed at any step after that opens the segment
+// sealed or brings it back from its rows, never damaged, and every flushed key reads its own value while the failed one reads none
+#[test]
+fn a_reused_range_survives_a_seal_killed_at_any_step() {
+    for crash_at in 1..=CRASH_STEPS {
+        let io = SimulatedIo::new(Seed(4_200 + crash_at));
+        let store = open(&io);
+        let value = |number: u64| vec![number as u8 ^ 0x5a; BIG_VALUE];
+        for number in 0..20 {
+            store.put(COLUMN, &key_of(number), &value(number)).expect("put");
+        }
+        io.fail_writes_to(".data", OperationCount(0));
+        assert!(store.put(COLUMN, b"failed", &value(99)).is_err(), "the aimed write landed");
+        store.put(COLUMN, &key_of(20), &value(20)).expect("put after the failure");
+        assert_eq!(store.state.volumes[0].unlanded_bytes.load(Ordering::Acquire), 0, "the failed write left a gap");
+        // bytes a write left part way stand past the segment's end, where the next seal's footer and cut must cover them
+        let (data, end) = {
+            let claims = hold(&store.state.volumes[0].claims);
+            (claims.open[0].data.clone(), claims.open[0].write_end)
+        };
+        data.write_at(end, &[std::io::IoSlice::new(&[0xEE; 300])]).expect("junk past the end");
+        store.flush().expect("flush");
+        io.arm_crash(OperationCount(crash_at));
+        store.seal_now();
+        settle(&io);
+        io.kill();
+        drop(store);
+
+        let store = open(&io);
+        assert_eq!(store.damaged_segments(), 0, "crash at {crash_at} left a damaged segment");
+        for number in 0..=20 {
+            assert_eq!(read(&store, &key_of(number)), Some(value(number)), "crash at {crash_at}: key {number}");
+        }
+        assert_eq!(read(&store, b"failed"), None, "crash at {crash_at}: the failed write read back");
+        store.close().expect("close");
+    }
+}

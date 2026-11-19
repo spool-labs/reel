@@ -23,7 +23,7 @@ pub struct Claim<'state, Backend: Io> {
     pub offset: FileOffset,
     pub ticket: Ticket,
     /// The rows, covers and bytes the claim added to its segment. A claim that ends without landing gives the rows and covers
-    /// back, and its bytes stay behind as a gap the gauge counts
+    /// back, and its bytes go back too when nothing claimed past them, or stay behind as a gap the gauge counts
     pub rows: RowCount,
     pub covers: usize,
     pub bytes: ByteCount,
@@ -62,7 +62,14 @@ impl<Backend: Io> Claim<'_, Backend> {
                     segment.row_count = RowCount(segment.row_count.0 - self.rows.0);
                     segment.cover_rows -= self.covers;
                     self.volume.rows_in_index.fetch_sub(self.rows.0, Ordering::Relaxed);
-                    self.volume.unlanded_bytes.fetch_add(self.bytes.0, Ordering::Relaxed);
+                    // no row points into bytes a claim never landed, so the last claim's bytes go back for the next one while the
+                    // segment still takes writes. A range a later claim stands past, or a seal already took its end from, stays a gap
+                    let is_taking = matches!(segment.phase, SegmentPhase::Taking | SegmentPhase::Alone);
+                    if is_taking && segment.write_end.0 == self.offset.0 + self.bytes.0 {
+                        segment.write_end = self.offset;
+                    } else {
+                        self.volume.unlanded_bytes.fetch_add(self.bytes.0, Ordering::Relaxed);
+                    }
                 }
                 self.volume.progress.wake();
                 if self.is_alone && segment.phase == SegmentPhase::Alone {

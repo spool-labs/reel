@@ -39,6 +39,10 @@ pub const SLOTS_PER_OPEN: usize = 2;
 pub const WRITE_INDEX_SIXTEENTHS: u64 = 6;
 /// The write index's sixteenths the sorted indexes' leaves keep values in on a full budget, so a scan or get of a held key
 /// reads no record. A smaller budget keeps them in the write index, and a store with no sorted column gives them to the record cache
+///
+/// Based on calculations: a held value costs about its length rounded to 8 B plus (4 x leaf capacity + 2,048) / entries a leaf,
+/// as value_pages.rs works out, so a column is held whole once this share of the shared budget is that cost times its keys. A
+/// larger share holds more and leaves the write index fewer rows, so it seals sooner
 pub const HELD_VALUE_SIXTEENTHS: u64 = 2;
 /// The spot cache's sixteenths of what the fixed parts and the room leave
 pub const SPOT_SIXTEENTHS: u64 = 2;

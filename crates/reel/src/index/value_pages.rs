@@ -5,6 +5,16 @@
 //! so a page passes between leaves with no unsafe code. Each page carries a generation that moves before the page is given back, and
 //! a leaf keeps the generation of its first page, so a reader that copied bytes and still sees that generation copied a live value.
 //! A fill, a drop and an eviction run under the owning part's write lock, and a read under its read lock.
+//!
+//! Based on calculations:
+//! - A leaf's chain is whole pages. Each page has 24 B of head, the first has a 4 B slot for every position of the leaf's
+//!   capacity, and each value takes its length rounded up to 8 B, with no value crossing a page.
+//! - A leaf of e entries of v bytes, v8 rounded, takes ceil((24 x pages + 4 x capacity + e x v8) / 4,096) pages, and half a page
+//!   sits unused on average.
+//! - So a held value costs about v8 + (4 x capacity + 2,048) / e bytes, and a column is held whole once the pool is that times its
+//!   keys.
+//! - A value over MOST_HELD_VALUE is never held, a chain stops at MOST_CHAIN_PAGES, and a scan's index batch carries
+//!   HELD_BYTES_PER_ENTRY for each entry, so values past that share ride its batch as misses.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};

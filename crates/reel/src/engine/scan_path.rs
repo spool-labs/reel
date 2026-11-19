@@ -384,7 +384,7 @@ impl<Backend: Io> EngineState<Backend> {
                 scan.batch.keys.extend_from_slice(candidate);
                 // a sealed row the index entry named comes with the value its leaf held, as a run's rows do
                 let record = held_for(scan, candidate, &located);
-                scan.batch.entries.push(BatchEntry { key_at, key_length: candidate.len(), key_from: KeyFrom::Batch, located, record, is_value: record.is_some() });
+                scan.batch.entries.push(BatchEntry { key_at, key_length: candidate.len(), key_from: KeyFrom::Batch, located, record, is_value: record.is_some(), is_lent: false });
                 if record.is_some() {
                     self.scan_held_values.fetch_add(1, Ordering::Relaxed);
                 }
@@ -541,7 +541,7 @@ impl<Backend: Io> EngineState<Backend> {
                 let at = scan.sorted_next;
                 if located.has_value() {
                     let from = KeyFrom::Sorted(scan.sorted_turn);
-                    scan.batch.entries.push(BatchEntry { key_at: at, key_length: length, key_from: from, located, record: None, is_value: false });
+                    scan.batch.entries.push(BatchEntry { key_at: at, key_length: length, key_from: from, located, record: None, is_value: false, is_lent: false });
                     if located.length().0 as usize <= MOST_BATCH_RECORD {
                         *located_bytes += located.length().0 as usize;
                     }
@@ -576,7 +576,7 @@ impl<Backend: Io> EngineState<Backend> {
             if located.has_value() {
                 let key_at = scan.batch.keys.len();
                 scan.batch.keys.extend_from_slice(name);
-                scan.batch.entries.push(BatchEntry { key_at, key_length: length, key_from: KeyFrom::Batch, located, record: None, is_value: false });
+                scan.batch.entries.push(BatchEntry { key_at, key_length: length, key_from: KeyFrom::Batch, located, record: None, is_value: false, is_lent: false });
                 if located.length().0 as usize <= MOST_BATCH_RECORD {
                     *located_bytes += located.length().0 as usize;
                 }
@@ -689,11 +689,10 @@ impl<Backend: Io> EngineState<Backend> {
             // a value is no longer than its record, so a record's room in the buffer holds it with no allocation
             let at = records.len();
             let is_room = at + sealed.row.length.0 as usize <= records.capacity();
-            // a value the index entry's leaf held came with the entry, so the row takes no read and no check
-            if let Some(value) = held_in((sorted, sorted_spare, *sorted_turn), entry).filter(|value| at + value.len() <= records.capacity()) {
-                records.extend_from_slice(value);
-                entry.record = Some((at, value.len()));
+            // a value the index entry's leaf held came with the entry, so the row takes no read and no check, and stays where it lies
+            if held_in((sorted, sorted_spare, *sorted_turn), entry).is_some() {
                 entry.is_value = true;
+                entry.is_lent = true;
                 held_rows += 1;
                 continue;
             }
@@ -888,7 +887,13 @@ impl<Backend: Io> EngineState<Backend> {
             return Ok(None);
         };
         let name = key_in(&batch.keys, (sorted, sorted_spare, *sorted_turn), &entry);
+        let lent = entry.is_lent.then(|| held_in((sorted, sorted_spare, *sorted_turn), &entry)).flatten();
         let held = match (entry.record, entry.located) {
+            _lent if let Some(lent) = lent => {
+                value.clear();
+                value.extend_from_slice(lent);
+                true
+            },
             // the cache holds a value with its key, so a value from it answers as it stands
             (Some((at, length)), Located::Sealed(_row)) if entry.is_value => {
                 value.clear();
@@ -942,13 +947,19 @@ impl<Backend: Io> EngineState<Backend> {
         let volume = &self.volumes[self.column(scan.column)?.volume.0 as usize];
         loop {
             while let Some(entry) = scan.batch.entries.get(scan.batch.next).copied() {
-                let Some((at, length)) = self.held_value(volume, scan, &entry) else {
+                let is_lent = entry.is_lent && held_in((&scan.sorted, &scan.sorted_spare, scan.sorted_turn), &entry).is_some();
+                let span = if is_lent { None } else { self.held_value(volume, scan, &entry) };
+                if !is_lent && span.is_none() {
                     break;
-                };
+                }
                 scan.asked += 1;
                 scan.batch.next += 1;
                 scan.batched += 1;
-                if !each(scan.batch_key(&entry), &scan.batch.records[at..at + length]) {
+                let row = match span {
+                    Some((at, length)) => &scan.batch.records[at..at + length],
+                    None => held_in((&scan.sorted, &scan.sorted_spare, scan.sorted_turn), &entry).unwrap_or_default(),
+                };
+                if !each(scan.batch_key(&entry), row) {
                     return Ok(ScanStep::Found);
                 }
             }

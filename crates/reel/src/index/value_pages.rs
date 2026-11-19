@@ -280,14 +280,12 @@ impl ValuePages {
     }
 
     fn copy_out(&self, page: u32, offset: usize, length: usize, out: &mut Vec<u8>) {
-        let mut left = length;
-        let mut at = offset / size_of::<u64>();
-        while left > 0 {
-            let bytes = self.word(page, at).load(Ordering::Relaxed).to_le_bytes();
-            let take = left.min(size_of::<u64>());
-            out.extend_from_slice(&bytes[..take]);
-            left -= take;
-            at += 1;
+        // the room is sized once, and each word fills its own eight bytes
+        let start = out.len();
+        out.resize(start + length, 0);
+        let first = offset / size_of::<u64>();
+        for (index, bytes) in out[start..].chunks_mut(size_of::<u64>()).enumerate() {
+            bytes.copy_from_slice(&self.word(page, first + index).load(Ordering::Relaxed).to_le_bytes()[..bytes.len()]);
         }
     }
 

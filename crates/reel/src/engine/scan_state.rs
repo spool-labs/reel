@@ -129,7 +129,7 @@ pub fn batch_room(wanted: u64, asked: u64) -> usize {
 }
 
 /// A batch entry that holds nothing, which the batch's room is written with at open
-pub const NO_BATCH_ENTRY: BatchEntry = BatchEntry { key_at: 0, key_length: 0, key_from: KeyFrom::Batch, located: Located::Absent, record: None, is_value: false };
+pub const NO_BATCH_ENTRY: BatchEntry = BatchEntry { key_at: 0, key_length: 0, key_from: KeyFrom::Batch, located: Located::Absent, record: None, is_value: false, is_lent: false };
 
 /// Where a batch entry's key lies
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -189,6 +189,8 @@ pub struct BatchEntry {
     pub record: Option<(usize, usize)>,
     /// The span in the batch's buffer holds the value itself, from the record cache, where it would hold the record
     pub is_value: bool,
+    /// The value lies in the index batch the key came from, held by the entry's leaf, and the batch's buffer has no copy
+    pub is_lent: bool,
 }
 
 /// Keys a scan located ahead at one point, answered in order. Each answer stands as of that point, so a write that lands

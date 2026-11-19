@@ -636,7 +636,7 @@ impl<Backend: Io> EngineState<Backend> {
                 break;
             };
             let next = guard.slab.key(entry);
-            has_room = ahead.push(next, guard.lookup(hash_key(column, next), column, next, point, view).row);
+            has_room = ahead.push(next, guard.lookup_from(entry, (column, next), point, view).row);
             last = Some(entry);
         }
         drop(guard);

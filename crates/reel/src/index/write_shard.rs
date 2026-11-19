@@ -260,6 +260,26 @@ impl WriteShard {
         self.search_trees(column, key, read_point, view)
     }
 
+    /// Find the newest row a reader at a place can see from one of the key's versions in a tree, as lookup does, with no hash and no
+    /// table probe: a version's newer links lead to the head the table would name
+    pub fn lookup_from(&self, entry: EntryAddress, (column, key): (ColumnId, &[u8]), read_point: WritePlace, view: OpenSlots) -> WriteLookup {
+        let mut head = entry;
+        loop {
+            let newer = self.slab.newer(head);
+            if newer == NO_ENTRY {
+                break;
+            }
+            head = newer;
+        }
+        if self.slab.place(head) <= read_point && view.contains(self.slab.slot(head)) {
+            return WriteLookup {
+                row: self.row_of(head),
+                should_ask_footers: self.slab.has_newer_sealed(head),
+            };
+        }
+        self.search_trees(column, key, read_point, view)
+    }
+
     /// Read a row with the segment of the tree that holds it
     pub fn row_of(&self, entry: EntryAddress) -> Option<WriteRow> {
         let mut row = self.slab.row(entry)?;

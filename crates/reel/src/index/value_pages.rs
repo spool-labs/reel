@@ -72,6 +72,8 @@ impl HeldChain {
 pub struct ValuePages {
     words: Vec<AtomicU64>,
     free: Mutex<FreeValuePages>,
+    /// The free list's count, readable with no lock, so a fill that would find no page takes no part's lock
+    free_count: AtomicU64,
     /// Values held now, and the fills and drops so far, for the report
     pub held: AtomicU64,
     pub fills: AtomicU64,
@@ -85,6 +87,7 @@ impl ValuePages {
         let pool = Self {
             words,
             free: Mutex::new(FreeValuePages { head: if pages == 0 { NO_VALUE_PAGE } else { 0 }, count: pages }),
+            free_count: AtomicU64::new(u64::from(pages)),
             held: AtomicU64::new(0),
             fills: AtomicU64::new(0),
             drops: AtomicU64::new(0),
@@ -109,6 +112,11 @@ impl ValuePages {
     /// Count the pages no leaf holds
     pub fn free_pages(&self) -> u32 {
         hold(&self.free).count
+    }
+
+    /// Check the pool has no free page, so no fill can start a chain or add a page
+    pub fn is_full(&self) -> bool {
+        self.free_count.load(Ordering::Relaxed) == 0
     }
 
     /// Check a chain a leaf names is still the one it filled
@@ -212,6 +220,7 @@ impl ValuePages {
             let page = free.head;
             free.head = self.next(page);
             free.count -= 1;
+            self.free_count.store(u64::from(free.count), Ordering::Relaxed);
             page
         };
         self.set_links(page, owner, NO_VALUE_PAGE);
@@ -239,6 +248,7 @@ impl ValuePages {
             free.head = page;
             free.count += 1;
         }
+        self.free_count.store(u64::from(free.count), Ordering::Relaxed);
     }
 
     fn count_slots(&self, first: u32) -> u64 {

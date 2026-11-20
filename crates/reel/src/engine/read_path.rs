@@ -24,7 +24,9 @@ use crate::pool::PoolLease;
 use crate::io::device_error::is_device_error;
 use crate::io::ring::RingWait;
 use crate::record::record_check::RecordIdentity;
-use crate::record::record_reader::{RecordLocation, RecordRead, RecordReader};
+use crate::record::codec::Codec;
+use crate::record::record_head::SMALL_HEAD_BYTES;
+use crate::record::record_reader::{RecordLocation, RecordRead, RecordReader, checks_split, form_of};
 use crate::row_kind::RowKind;
 use crate::segment::column_directory::ColumnDirectory;
 use crate::segment::footer_reader::{FooterAnswer, FooterCaches, FooterQuery, FooterReader, RowAt, WindowRead};
@@ -777,11 +779,6 @@ impl<Backend: Io> EngineState<Backend> {
         if !windows.iter().any(|window| window.may_hold(row.offset, length)) {
             return Ok(None);
         }
-        let mut held = [0; MOST_WINDOW_RECORD_BYTES];
-        if !windows.iter().any(|window| window.read(row.offset, &mut held[..length])) {
-            return Ok(None);
-        }
-
         let identity = RecordIdentity {
             record_key: self.record_key,
             column: read.column,
@@ -789,6 +786,28 @@ impl<Backend: Io> EngineState<Backend> {
             kind: RowKind::Value,
             place: row.place,
         };
+        // a whole plain value comes out in one copy: the head to the stack and the payload straight into the caller's buffer
+        if matches!(want, RecordWant::Whole) && length > SMALL_HEAD_BYTES {
+            let mut head = [0; SMALL_HEAD_BYTES];
+            buf.clear();
+            buf.resize(length - SMALL_HEAD_BYTES, 0);
+            if !windows.iter().any(|window| window.read_split(row.offset, (&mut head, buf))) {
+                buf.clear();
+                return Ok(None);
+            }
+            if let Some(form) = form_of(&head).filter(|form| !form.is_chunked && form.codec == Codec::None) {
+                if checks_split(&head, buf, form, &identity) {
+                    return Ok(Some(RecordRead::Valid));
+                }
+                buf.clear();
+                return Ok(Some(RecordRead::Failed));
+            }
+            buf.clear();
+        }
+        let mut held = [0; MOST_WINDOW_RECORD_BYTES];
+        if !windows.iter().any(|window| window.read(row.offset, &mut held[..length])) {
+            return Ok(None);
+        }
         let window = match want {
             RecordWant::Whole => None,
             RecordWant::Window(window) => Some(window),

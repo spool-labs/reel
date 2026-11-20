@@ -21,7 +21,7 @@ use crate::engine::scan_state::{
 };
 use crate::engine::volume::Volume;
 use crate::guard::hold;
-use crate::index::sorted_keys::{MOST_KEY_BYTES, ScanFrom, SortedKeys};
+use crate::index::sorted_keys::{ScanFrom, SortedKeys};
 use crate::config::KeyShape;
 use crate::index::open_counts::OpenBound;
 use crate::index::write_shard::{HEAD_GROUP, HeadPlace, WalkBound, WriteShard, place_heads_together};
@@ -506,7 +506,6 @@ impl<Backend: Io> EngineState<Backend> {
         // the step before the run passed a key, and a head that showed it moves on before the run reads the heads
         self.place_heads(volume, scan);
         let mut taken = 0;
-        let mut key = [0; MOST_KEY_BYTES];
         // the index key the run passed last, which the walk's position takes before a read of the index or a head placing
         let mut passed: Option<usize> = None;
         while scan.batch.entries.len() < room && scan.batch.has_room(*located_bytes) {
@@ -561,38 +560,45 @@ impl<Backend: Io> EngineState<Backend> {
                 passed = Some(at);
                 continue;
             };
-            key[..length].copy_from_slice(next);
-            let name = &key[..length];
+            // the key goes into the batch once, and the batch lends it to the looks below while the scan is borrowed
+            let key_at = scan.batch.keys.len();
+            let ScanState { batch, heads, .. } = &mut *scan;
+            batch.keys.extend_from_slice(&heads[shown].key);
+            let mut keys = mem::take(&mut scan.batch.keys);
+            let name = &keys[key_at..];
             volume.between_run_looks();
-            let open = match self.ahead_row(volume, scan, shown, name, point) {
-                Some(row) => row,
-                // the shard changed since its head read ahead, so the head descends fresh from the walk's place
-                None => {
-                    self.ahead_drops.fetch_add(1, Ordering::Relaxed);
-                    if let Some(at) = passed.take() {
-                        scan.pass_sorted(at);
-                    }
-                    scan.heads[shown].forget_ahead();
-                    scan.heads[shown].is_placed = false;
-                    self.place_heads(volume, scan);
-                    continue;
-                },
-            };
+            let open = self.ahead_row(volume, scan, shown, name, point);
             // a seal between the two looks moves the row out of the view, so the step that answers one key at a time takes the key
-            if directory.map_or(0, ColumnDirectory::generation) != scan.generation {
-                break;
+            let is_moved = directory.map_or(0, ColumnDirectory::generation) != scan.generation;
+            let located = open.filter(|_open| !is_moved).map(|open| newest_located(open, sealed.unwrap_or(Located::Absent)));
+            if located.is_some() {
+                scan.pass(name);
             }
-            let located = newest_located(open, sealed.unwrap_or(Located::Absent));
+            if !located.is_some_and(|located| located.has_value()) {
+                keys.truncate(key_at);
+            }
+            scan.batch.keys = keys;
+            // the shard changed since its head read ahead, so the head descends fresh from the walk's place
+            if open.is_none() {
+                self.ahead_drops.fetch_add(1, Ordering::Relaxed);
+                if let Some(at) = passed.take() {
+                    scan.pass_sorted(at);
+                }
+                scan.heads[shown].forget_ahead();
+                scan.heads[shown].is_placed = false;
+                self.place_heads(volume, scan);
+                continue;
+            }
+            let Some(located) = located else {
+                break;
+            };
             if located.has_value() {
-                let key_at = scan.batch.keys.len();
-                scan.batch.keys.extend_from_slice(name);
                 scan.batch.entries.push(BatchEntry { key_at, key_length: length, key_from: KeyFrom::Batch, located, record: None, is_value: false, is_lent: false, is_trusted: false });
                 if located.length().0 as usize <= MOST_BATCH_RECORD {
                     *located_bytes += located.length().0 as usize;
                 }
                 taken += u64::from(matches!(located, Located::Sealed(_)));
             }
-            scan.pass(name);
             passed = None;
             // a head with keys read ahead moves to the next one, and only a head that ran out places again
             if !scan.step_ahead(shown) {

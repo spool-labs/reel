@@ -197,6 +197,26 @@ impl RecordWindow {
         offset.0.checked_sub(self.start().0).is_some_and(|at| at as usize + length <= self.used())
     }
 
+    /// Copy a record out with no lock in two parts, its head and its tail, so the tail can land where its reader keeps the value.
+    /// False when the window doesn't hold it whole
+    pub fn read_split(&self, offset: FileOffset, (head, tail): (&mut [u8], &mut [u8])) -> bool {
+        let before = self.generation.load(Ordering::Acquire);
+        if !before.is_multiple_of(2) {
+            return false;
+        }
+        let Some(at) = offset.0.checked_sub(self.start().0).map(|at| at as usize) else {
+            return false;
+        };
+        if at + head.len() + tail.len() > self.used() {
+            return false;
+        }
+        for (byte, stored) in head.iter_mut().chain(tail.iter_mut()).zip(&self.bytes[at..]) {
+            *byte = stored.load(Ordering::Relaxed);
+        }
+        fence(Ordering::Acquire);
+        self.generation.load(Ordering::Relaxed) == before
+    }
+
     /// Copy a record out with no lock, or return false when the window doesn't hold it whole
     pub fn read(&self, offset: FileOffset, record: &mut [u8]) -> bool {
         let before = self.generation.load(Ordering::Acquire);

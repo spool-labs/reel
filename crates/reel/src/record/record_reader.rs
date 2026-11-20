@@ -662,6 +662,12 @@ pub fn form_of(record: &[u8]) -> Option<RecordForm> {
     RecordForm::from_byte(*record.get(FORM_AT)?)
 }
 
+/// Check a one-chunk record read in two parts, its head and its payload, with the payload already where its reader wants it
+pub fn checks_split(head: &[u8], payload: &[u8], form: RecordForm, identity: &RecordIdentity<'_>) -> bool {
+    let check = place_check(record_check(identity, form, checksum(payload)), identity.record_key, identity.place);
+    read_check(head) == Some(check)
+}
+
 /// Check a one-chunk record and give its payload where it lies, still in the codec it was stored with
 pub fn checked_payload<'record>(record: &'record [u8], form: RecordForm, identity: &RecordIdentity<'_>) -> Option<&'record [u8]> {
     let payload = record.get(SMALL_HEAD_BYTES..)?;

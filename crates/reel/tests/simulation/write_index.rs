@@ -686,7 +686,7 @@ fn need_pages() {
 
         for (place, key) in keys.iter().enumerate() {
             let hash = hash_key(COLUMN, key);
-            assert!(shard.insert_held(hash, COLUMN, key, &held_row(place as u64 + 1)), "seed {seed}");
+            assert!(shard.insert_held(hash, COLUMN, key, &held_row(place as u64 + 1), true), "seed {seed}");
         }
 
         assert!(shard.trees[STAYING.0 as usize].batch_pages.pages <= need.pages(), "seed {seed}");
@@ -707,7 +707,7 @@ fn node_limit() {
 
     for (place, key) in keys.iter().enumerate() {
         let hash = hash_key(COLUMN, key);
-        assert!(shard.insert_held(hash, COLUMN, key, &held_row(place as u64 + 1)));
+        assert!(shard.insert_held(hash, COLUMN, key, &held_row(place as u64 + 1), true));
     }
 
     assert_eq!(shard.trees[STAYING.0 as usize].row_count, RowCount(limit));

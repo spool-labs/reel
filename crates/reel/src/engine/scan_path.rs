@@ -1200,7 +1200,13 @@ impl<Backend: Io> EngineState<Backend> {
             let width = self.column(*column_of).map_or(KeyShape::Variable { most: 0 }, |info| info.key_shape);
             for (shard, head) in heads.iter_mut().enumerate().filter(|(_shard, head)| !head.is_placed || is_new_view) {
                 let changes = self.index.change_count(shard);
-                let Some(open) = self.index.counts[shard].bound(position, *direction) else {
+                // a shard with no open row of the column its index lacks stands its head past the end, whatever the keys look like
+                let counts = self.index.shard_counts(shard);
+                let open = match counts.is_column_quiet(*column_of) {
+                    true => Some(OpenBound::End),
+                    false => counts.of(*column_of).and_then(|counts| counts.bound(position, *direction)),
+                };
+                let Some(open) = open else {
                     continue;
                 };
                 head.cursor.reset();

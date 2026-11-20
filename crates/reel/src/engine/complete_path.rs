@@ -117,6 +117,7 @@ impl<Backend: Io> EngineState<Backend> {
         if self.is_read_only {
             return 0;
         }
+        self.stop_counting_full_indexes();
         let mut floors = [None; MAX_OPEN_SLOTS];
         for volume in &self.volumes {
             if volume.has_failed() || !volume.covers.is_empty() || !volume.damage.is_empty() {
@@ -142,7 +143,19 @@ impl<Backend: Io> EngineState<Backend> {
         let index_of = |column: ColumnId| self.sorted_index(column).filter(|index| index.mark().is_none());
         let entered: u64 = (0..SHARD_COUNT).map(|shard| self.index.enter_shard(shard, &floors, index_of, run)).sum();
         self.rows_entered.fetch_add(entered, Ordering::Relaxed);
+        // an entering can fill an index, which marks it
+        self.stop_counting_full_indexes();
         entered
+    }
+
+    /// Stop counting the open rows of a sorted column whose index is missing or full. They stay open, and out of the counts they
+    /// hold no other sorted column's buckets open, so those walks can still skip heads
+    pub fn stop_counting_full_indexes(&self) {
+        for column in (0..self.columns.len()).map(|column| ColumnId(column as u8)) {
+            if self.index.is_sorted_counted(column) && self.sorted_index(column).is_none_or(|index| index.mark().is_some()) {
+                self.index.stop_counting(column);
+            }
+        }
     }
 
     /// Find a key's newest sealed row: through the table on a complete column, and through the footers on any other

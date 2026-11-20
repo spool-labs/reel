@@ -1425,6 +1425,11 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
     let reserved = superblock.next_segment.0;
     let first_number = reserved.saturating_sub(SEGMENT_NUMBER_BATCH);
 
+    // a sorted column's rows count apart from the start, so its walks see only the rows its index lacks
+    let index = WriteIndex::new(&sizing.shard);
+    for column in config.columns.iter().filter(|column| column.is_sorted()) {
+        index.mark_sorted(column.id);
+    }
     let opened_at = io.now();
     EngineState {
         io,
@@ -1434,7 +1439,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         directories,
         volumes,
         places,
-        index: WriteIndex::new(&sizing.shard),
+        index,
         spot: SpotIndex::new(sizing.spot_share),
         filter_cache: BlockCache::new(ByteCount(split.filter_cache), FILTER_SLOT_BYTES),
         filter_arena: FilterArena::new(arena_share, planned.iter().map(|table| table.segments_per_shard * TABLE_SHARDS).sum()),

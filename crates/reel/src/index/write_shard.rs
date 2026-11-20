@@ -10,7 +10,7 @@ use reel_core::units::{ByteCount, RowCount, WritePlace};
 use crate::index::entry_slab::{ENTRY_ALIGNMENT, EntryAddress, EntrySlab, NO_ENTRY, PAGE_BYTES, PageCount, PageIndex, entry_size};
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::index::key_table::{KeyTable, TableSlot};
-use crate::index::open_counts::OpenCounts;
+use crate::index::write_index::ShardCounts;
 use crate::index::node_pool::{NO_NODE, NODE_FANOUT, NodeCount, NodeIndex, NodePool, TreeNode};
 use crate::index::open_slots::{MAX_OPEN_SLOTS, OpenSlot, OpenSlots};
 use crate::index::seek_target::SeekTarget;
@@ -169,27 +169,31 @@ impl WriteShard {
     }
 
     /// Add a row, or return false when a pool ran out
-    pub fn insert(&mut self, hash: KeyHash, column: ColumnId, key: &[u8], row: &WriteRow) -> bool {
+    pub fn insert(&mut self, hash: KeyHash, column: ColumnId, key: &[u8], row: &WriteRow, is_counted: bool) -> bool {
         if !self.has_room(row.slot, key.len()) {
             return false;
         }
 
-        self.link_row(hash, column, key, row, false)
+        self.link_row(hash, column, key, row, (false, is_counted))
     }
 
     /// Add a row of a batch that holds its room
-    pub fn insert_held(&mut self, hash: KeyHash, column: ColumnId, key: &[u8], row: &WriteRow) -> bool {
-        self.link_row(hash, column, key, row, true)
+    pub fn insert_held(&mut self, hash: KeyHash, column: ColumnId, key: &[u8], row: &WriteRow, is_counted: bool) -> bool {
+        self.link_row(hash, column, key, row, (true, is_counted))
     }
 
     /// Store a row and link it, keeping a batch's rows on their own pages so a put beside it can't use up their room
-    pub fn link_row(&mut self, hash: KeyHash, column: ColumnId, key: &[u8], row: &WriteRow, is_held: bool) -> bool {
+    pub fn link_row(&mut self, hash: KeyHash, column: ColumnId, key: &[u8], row: &WriteRow, (is_held, is_counted): (bool, bool)) -> bool {
         let tree = &mut self.trees[row.slot.0 as usize];
         tree.segment = row.segment;
         let chain = if is_held { &mut tree.batch_pages } else { &mut tree.pages };
         let Some(address) = self.slab.store(chain, column, key, row) else {
             return false;
         };
+        // a row no count holds reads as entered, so a clean counts nothing out for it
+        if !is_counted {
+            self.slab.mark_entered(address);
+        }
 
         let target = SeekTarget::new(column, key, row.place);
         tree.link(&mut self.nodes, &self.slab, &target, address);
@@ -365,7 +369,7 @@ impl WriteShard {
     }
 
     /// Take up to a limit of a closed slot's rows out of the table, and free the slot at the end
-    pub fn clean_slot(&mut self, slot: OpenSlot, limit: RowCount, counts: &OpenCounts) -> bool {
+    pub fn clean_slot(&mut self, slot: OpenSlot, limit: RowCount, counts: &ShardCounts<'_>) -> bool {
         let tree = self.trees[slot.0 as usize];
         let mut position = match tree.cleanup {
             Some(position) => Some(position),
@@ -402,14 +406,14 @@ impl WriteShard {
     }
 
     /// Take a run of rows out of their chains. Each row's cold reads come first, side by side, so they overlap
-    pub fn unlink_run(&mut self, entries: &[EntryAddress], counts: &OpenCounts) {
+    pub fn unlink_run(&mut self, entries: &[EntryAddress], counts: &ShardCounts<'_>) {
         let mut hashes = [KeyHash::default(); CLEAN_RUN_ROWS];
         let mut touched = 0;
         for (hash, &entry) in hashes.iter_mut().zip(entries) {
             *hash = hash_key(self.slab.column(entry), self.slab.key(entry));
             // a row entered in its sorted index left the counts then
             if !self.slab.is_entered(entry) {
-                counts.remove(self.slab.key(entry));
+                counts.remove(self.slab.column(entry), self.slab.key(entry));
             }
             touched ^= self.table.home_tag(*hash);
         }

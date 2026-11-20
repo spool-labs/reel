@@ -1,7 +1,7 @@
 //! Keys, locations and graves of the open segments, sharded by a hash of the key
 
 use std::sync::RwLock;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 use reel_core::column_id::ColumnId;
 use reel_core::units::{ByteCount, RowCount, WritePlace};
@@ -29,8 +29,12 @@ pub const SHARD_SHIFT: u32 = u64::BITS - SHARD_COUNT.trailing_zeros();
 #[derive(Debug)]
 pub struct WriteIndex {
     pub shards: Shards<WriteShard>,
-    /// Each shard's open counts, read with no lock
+    /// Each shard's open counts, read with no lock. A row of a sorted column leaves them once its index holds it
     pub counts: Vec<OpenCounts>,
+    /// Where each column's open rows count: PLAIN_COUNTS, SORTED_COUNTS or NO_COUNTS
+    pub classes: [AtomicU8; COLUMN_SLOTS],
+    /// Each shard's open rows of each sorted column its index doesn't hold yet. At 0 a walk of the column needs no head there
+    pub column_open: Vec<[AtomicU32; COLUMN_SLOTS]>,
     /// Each shard's count of changes to its rows, which goes up under its write lock
     pub changes: [PaddedCount; SHARD_COUNT],
 }
@@ -43,7 +47,9 @@ impl WriteIndex {
             shards.push(RwLock::new(WriteShard::new(sizing)));
         }
         let counts = (0..SHARD_COUNT).map(|_shard| OpenCounts::new(sizing.buckets)).collect();
-        Self { shards: Shards(shards), counts, changes: Default::default() }
+        let classes = std::array::from_fn(|_column| AtomicU8::new(PLAIN_COUNTS));
+        let column_open = (0..SHARD_COUNT).map(|_shard| std::array::from_fn(|_column| AtomicU32::new(0))).collect();
+        Self { shards: Shards(shards), counts, classes, column_open, changes: Default::default() }
     }
 
     /// Read the heap every shard holds
@@ -56,14 +62,59 @@ impl WriteIndex {
         ByteCount(total)
     }
 
+    /// Count a column's rows in the sorted counts, before any row of it comes in
+    pub fn mark_sorted(&self, column: ColumnId) {
+        self.classes[column.0 as usize].store(SORTED_COUNTS, Ordering::Release);
+    }
+
+    /// Read the open counts a column's rows go in, or nothing for a column that counts none
+    pub fn counts_for(&self, shard: usize, column: ColumnId) -> Option<&OpenCounts> {
+        self.shard_counts(shard).of(column)
+    }
+
+    /// Read both of a shard's open counts, for a clean that counts out rows of every column
+    pub fn shard_counts(&self, shard: usize) -> ShardCounts<'_> {
+        ShardCounts { buckets: &self.counts[shard], classes: &self.classes, column_open: &self.column_open[shard] }
+    }
+
+    /// Stop counting a sorted column whose index can't take its open rows, which would hold every other sorted column's buckets
+    /// open. Its walks go off the index, where no head stands on a bound, so its rows need no count. Every shard is held at once
+    /// while its rows leave the counts, so no insert counts one in between
+    pub fn stop_counting(&self, column: ColumnId) {
+        let mut guards: Vec<_> = (0..SHARD_COUNT).map(|shard| self.shards.write(shard)).collect();
+        if self.classes[column.0 as usize].swap(NO_COUNTS, Ordering::AcqRel) != SORTED_COUNTS {
+            return;
+        }
+        for (shard, guard) in guards.iter_mut().enumerate() {
+            for slot in 0..guard.trees.len() {
+                let mut position = guard.trees[slot].first_position(&guard.nodes);
+                while let Some(at) = position {
+                    let address = entry_at(&guard.nodes, at);
+                    position = step_forward(&guard.nodes, at);
+                    if guard.slab.column(address) == column && !guard.slab.is_entered(address) {
+                        self.counts[shard].remove(guard.slab.key(address));
+                        guard.slab.mark_entered(address);
+                    }
+                }
+            }
+            self.column_open[shard][column.0 as usize].store(0, Ordering::Release);
+        }
+    }
+
+    /// Read whether a column's rows count in the sorted counts
+    pub fn is_sorted_counted(&self, column: ColumnId) -> bool {
+        self.classes[column.0 as usize].load(Ordering::Acquire) == SORTED_COUNTS
+    }
+
     /// Add a row, or return false when its shard ran out of room
     pub fn insert(&self, column: ColumnId, key: &[u8], row: &WriteRow) -> bool {
         let hash = hash_key(column, key);
         let shard = shard_of(hash);
         let mut guard = self.shards.write(shard);
-        let is_in = guard.insert(hash, column, key, row);
+        let counts = self.shard_counts(shard);
+        let is_in = guard.insert(hash, column, key, row, counts.of(column).is_some());
         if is_in {
-            self.counts[shard].add(key);
+            counts.add(column, key);
         }
         self.count_change(shard, is_in);
         is_in
@@ -74,9 +125,10 @@ impl WriteIndex {
         let hash = hash_key(column, key);
         let shard = shard_of(hash);
         let mut guard = self.shards.write(shard);
-        let is_in = guard.insert_held(hash, column, key, row);
+        let counts = self.shard_counts(shard);
+        let is_in = guard.insert_held(hash, column, key, row, counts.of(column).is_some());
         if is_in {
-            self.counts[shard].add(key);
+            counts.add(column, key);
         }
         self.count_change(shard, is_in);
         is_in
@@ -134,7 +186,7 @@ impl WriteIndex {
         let mut is_clean = true;
         for index in 0..SHARD_COUNT {
             let mut guard = self.shards.write(index);
-            is_clean &= guard.clean_slot(slot, limit, &self.counts[index]);
+            is_clean &= guard.clean_slot(slot, limit, &self.shard_counts(index));
             self.count_change(index, true);
         }
         is_clean
@@ -215,7 +267,7 @@ impl WriteIndex {
                     match newest.map(|(_first, state)| state) {
                         Some(Newest::In) if !guard.slab.is_entered(address) => {
                             guard.slab.mark_entered(address);
-                            self.counts[shard].remove(guard.slab.key(address));
+                            self.shard_counts(shard).remove(guard.slab.column(address), guard.slab.key(address));
                             entered += 1;
                         },
                         // past the run's room an older row stays counted, which only places a real head over it
@@ -265,14 +317,14 @@ impl WriteIndex {
             for (&address, is_in) in run.addresses.iter().zip(is_in) {
                 if is_in {
                     guard.slab.mark_entered(address);
-                    self.counts[shard].remove(guard.slab.key(address));
+                    self.shard_counts(shard).remove(guard.slab.column(address), guard.slab.key(address));
                     entered += 1;
                 }
             }
             for &(row, address) in &run.older {
                 if is_in[row] && !guard.slab.is_entered(address) {
                     guard.slab.mark_entered(address);
-                    self.counts[shard].remove(guard.slab.key(address));
+                    self.shard_counts(shard).remove(guard.slab.column(address), guard.slab.key(address));
                     entered += 1;
                 }
             }
@@ -323,3 +375,59 @@ impl Default for EnterRun {
         Self::new()
     }
 }
+
+/// Every column id a store can hold
+pub const COLUMN_SLOTS: usize = u8::MAX as usize + 1;
+
+/// A shard's two open counts, and which columns go in which
+#[derive(Clone, Copy, Debug)]
+pub struct ShardCounts<'counts> {
+    pub buckets: &'counts OpenCounts,
+    pub classes: &'counts [AtomicU8; COLUMN_SLOTS],
+    pub column_open: &'counts [AtomicU32; COLUMN_SLOTS],
+}
+
+impl<'counts> ShardCounts<'counts> {
+    /// Read the counts a column's rows go in, or nothing for a column that counts none
+    pub fn of(self, column: ColumnId) -> Option<&'counts OpenCounts> {
+        match self.classes[column.0 as usize].load(Ordering::Acquire) {
+            PLAIN_COUNTS | SORTED_COUNTS => Some(self.buckets),
+            _none => None,
+        }
+    }
+
+    /// Count an open row in, under its shard's write lock
+    pub fn add(self, column: ColumnId, key: &[u8]) {
+        let Some(counts) = self.of(column) else {
+            return;
+        };
+        counts.add(key);
+        if self.classes[column.0 as usize].load(Ordering::Acquire) == SORTED_COUNTS {
+            self.column_open[column.0 as usize].fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Count an open row out, under its shard's write lock
+    pub fn remove(self, column: ColumnId, key: &[u8]) {
+        let Some(counts) = self.of(column) else {
+            return;
+        };
+        counts.remove(key);
+        if self.classes[column.0 as usize].load(Ordering::Acquire) == SORTED_COUNTS {
+            let open = &self.column_open[column.0 as usize];
+            let _was = open.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| Some(count.saturating_sub(1)));
+        }
+    }
+
+    /// Check a sorted column has no open row its index lacks in this shard
+    pub fn is_column_quiet(self, column: ColumnId) -> bool {
+        self.classes[column.0 as usize].load(Ordering::Acquire) == SORTED_COUNTS && self.column_open[column.0 as usize].load(Ordering::Acquire) == 0
+    }
+}
+
+/// A column whose open rows count in the buckets
+pub const PLAIN_COUNTS: u8 = 0;
+/// A sorted column whose open rows count in the buckets and its own count until its index holds them
+pub const SORTED_COUNTS: u8 = 1;
+/// A sorted column whose index can't take its open rows, which no count holds
+pub const NO_COUNTS: u8 = 2;

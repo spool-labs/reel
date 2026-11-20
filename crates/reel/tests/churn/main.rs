@@ -117,7 +117,9 @@ struct JobsRun {
 }
 
 fn churn(has_cue: bool) -> JobsRun {
-    let root = scratch_root();
+    // a folder of its own, since its removal at the end would take the folders of the tests running beside it
+    let root = scratch_root().join(format!("walks-{has_cue}"));
+    fs::create_dir_all(&root).expect("create");
     let store = ReelStore::open(PlainIo::new(), &config(&root, BUDGET)).expect("open");
     for number in 0..KEPT_KEYS {
         let key = kept(number);

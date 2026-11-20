@@ -380,6 +380,19 @@ pub fn touched_queue<Item: Clone>(capacity: usize, filler: Item) -> VecDeque<Ite
     items
 }
 
+/// Build a buffer of items no clone can make, each from a closure, with every page written so open faults them in
+pub fn touched_from<Item>(length: usize, mut make: impl FnMut() -> Item) -> Vec<Item> {
+    let mut items: Vec<Item> = Vec::with_capacity(length);
+    ask_huge_pages(items.as_mut_ptr(), length);
+    // the room has to count as seen, or a compiler can turn the writes into a zeroed allocation
+    black_box(items.as_mut_ptr());
+    for _item in 0..length {
+        items.push(make());
+    }
+    black_box(items.as_mut_slice());
+    items
+}
+
 /// Allocate an empty list with room for its items and every page of that room written
 pub fn touched_capacity<Item: Clone>(capacity: usize, filler: Item) -> Vec<Item> {
     let mut items: Vec<Item> = Vec::with_capacity(capacity);

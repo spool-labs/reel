@@ -373,7 +373,6 @@ impl SortedKeys {
         self.told_rows
     }
 
-    /// Read how many rows found no room
     /// Note open rows went in ahead of their seal. It comes before they leave the open counts, so a walk that sees them gone
     /// sees this and reads its index batch again
     pub fn note_entered(&self) {
@@ -385,6 +384,7 @@ impl SortedKeys {
         self.entered.load(Memory::Acquire)
     }
 
+    /// Read how many rows found no room
     pub fn past_capacity(&self) -> RowCount {
         RowCount(self.past_capacity.load(Memory::Acquire))
     }

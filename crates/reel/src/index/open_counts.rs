@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use reel_core::direction::Direction;
 use reel_core::units::ByteCount;
 
+use crate::pool::touched_from;
+
 /// A count that stays at its top
 const STUCK: u8 = u8::MAX;
 /// Buckets a scan looks over from its own for the first that holds an open key, so a head stands on that bucket's first key
@@ -36,7 +38,7 @@ impl OpenCounts {
     /// Allocate and touch counts for this many buckets, rounded to a power of two
     pub fn new(buckets: usize) -> Self {
         let buckets = buckets.max(1).next_power_of_two();
-        let counts = (0..buckets).map(|_bucket| AtomicU8::new(0)).collect();
+        let counts = touched_from(buckets, || AtomicU8::new(0));
         Self { counts, shift: u64::BITS - buckets.trailing_zeros() }
     }
 

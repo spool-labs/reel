@@ -16,7 +16,7 @@ use crate::index::write_row::{WriteLookup, WriteRow};
 use crate::index::write_shard::{ShardNeed, ShardSizing, WalkBound, WriteShard};
 use crate::index::entry_slab::{EntryAddress, NO_ENTRY};
 use crate::index::sorted_keys::{Floors, KeyEntry, MOST_KEY_BYTES, SortedKeys, Upserted};
-use crate::pool::touched_capacity;
+use crate::pool::{touched_capacity, touched_from};
 use crate::index::write_tree::{entry_at, step_forward};
 use crate::row_kind::RowKind;
 
@@ -48,7 +48,7 @@ impl WriteIndex {
         }
         let counts = (0..SHARD_COUNT).map(|_shard| OpenCounts::new(sizing.buckets)).collect();
         let classes = std::array::from_fn(|_column| AtomicU8::new(PLAIN_COUNTS));
-        let column_open = (0..SHARD_COUNT).map(|_shard| std::array::from_fn(|_column| AtomicU32::new(0))).collect();
+        let column_open = touched_from(SHARD_COUNT, || std::array::from_fn(|_column| AtomicU32::new(0)));
         Self { shards: Shards(shards), counts, classes, column_open, changes: Default::default() }
     }
 

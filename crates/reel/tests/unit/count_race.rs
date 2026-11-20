@@ -10,6 +10,10 @@ use reel_core::units::ByteCount;
 
 const COLUMN: ColumnId = ColumnId(1);
 const KEYS: u64 = 60_000;
+// Rounds a reader runs at least, so a fast writer can't finish before the race is run
+const LEAST_RUNS: u64 = 12;
+// Keys a writer puts at most while it waits for the reader's rounds
+const MOST_KEYS: u64 = 20 * KEYS;
 
 // spread keys over every shard, so sealed and open ones mix along the walk
 fn key(number: u64) -> [u8; 8] {
@@ -36,15 +40,19 @@ fn counts_beside_seals_stay_in_bounds() {
     let store = ReelStore::open(PlainIo::new(), &config).expect("open");
     let written = AtomicU64::new(0);
     let done = AtomicBool::new(false);
+    let runs = AtomicU64::new(0);
     let counts = std::thread::scope(|scope| {
-        let (store, written, done) = (&store, &written, &done);
+        let (store, written, done, runs) = (&store, &written, &done, &runs);
         scope.spawn(move || {
-            for number in 0..KEYS {
+            let mut number = 0;
+            // the writer goes on past KEYS until the reader has run enough rounds to have raced it
+            while number < KEYS || (runs.load(Ordering::Acquire) < LEAST_RUNS && number < MOST_KEYS) {
                 store.put(COLUMN, &key(number), &[5_u8; 100]).expect("put");
                 written.store(number + 1, Ordering::Release);
                 if number % 5_000 == 4_999 {
                     store.seal_now();
                 }
+                number += 1;
             }
             done.store(true, Ordering::Release);
         });
@@ -56,13 +64,14 @@ fn counts_beside_seals_stay_in_bounds() {
                 let high = written.load(Ordering::Acquire);
                 assert!(low <= count && count <= high, "count {count} outside {low}..={high}");
                 counts += 1;
+                runs.fetch_add(1, Ordering::Release);
             }
             counts
         });
         counter.join().expect("counter")
     });
     assert!(counts > 10, "only {counts} counts ran");
-    assert_eq!(store.count_prefix(COLUMN, &[]).expect("count").0, KEYS);
+    assert_eq!(store.count_prefix(COLUMN, &[]).expect("count").0, written.load(Ordering::Acquire));
     store.close().expect("close");
     let _gone = fs::remove_dir_all(&root);
 }
@@ -90,15 +99,19 @@ fn walks_beside_seals(with_values: bool) {
     let (store, root) = race_store(if with_values { "walk-values" } else { "walk-keys" });
     let written = AtomicU64::new(0);
     let done = AtomicBool::new(false);
+    let runs = AtomicU64::new(0);
     let walks = std::thread::scope(|scope| {
-        let (store, written, done) = (&store, &written, &done);
+        let (store, written, done, runs) = (&store, &written, &done, &runs);
         scope.spawn(move || {
-            for number in 0..KEYS {
+            let mut number = 0;
+            // the writer goes on past KEYS until the reader has run enough rounds to have raced it
+            while number < KEYS || (runs.load(Ordering::Acquire) < LEAST_RUNS && number < MOST_KEYS) {
                 store.put(COLUMN, &key(number), &[5_u8; 100]).expect("put");
                 written.store(number + 1, Ordering::Release);
                 if number % 5_000 == 4_999 {
                     store.seal_now();
                 }
+                number += 1;
             }
             done.store(true, Ordering::Release);
         });
@@ -120,6 +133,7 @@ fn walks_beside_seals(with_values: bool) {
                 let missing: Vec<u64> = (0..low).filter(|number| !seen.contains(key(*number).as_slice())).collect();
                 assert!(missing.is_empty(), "values {with_values}: {} of {low} landed keys missing, first {:?}", missing.len(), missing.first());
                 walks += 1;
+                runs.fetch_add(1, Ordering::Release);
             }
             walks
         });
@@ -159,10 +173,13 @@ fn cue_counts_beside_deleting_seals_match_their_walks() {
     };
     let store = ReelStore::open(PlainIo::new(), &config).expect("open");
     let done = AtomicBool::new(false);
+    let runs = AtomicU64::new(0);
     let counts = std::thread::scope(|scope| {
-        let (store, done) = (&store, &done);
+        let (store, done, runs) = (&store, &done, &runs);
         scope.spawn(move || {
-            for number in 0..KEYS {
+            let mut number = 0;
+            // the writer goes on past KEYS until the reader has run enough rounds to have raced it
+            while number < KEYS || (runs.load(Ordering::Acquire) < LEAST_RUNS && number < MOST_KEYS) {
                 store.put(COLUMN, &key(number), &[5_u8; 100]).expect("put");
                 if number >= 500 && number % 3 == 0 {
                     store.delete(COLUMN, &key(number - 500)).expect("delete");
@@ -172,6 +189,7 @@ fn cue_counts_beside_deleting_seals_match_their_walks() {
                     // a pause lets the row job enter what landed, so counts take the index
                     std::thread::sleep(std::time::Duration::from_millis(80));
                 }
+                number += 1;
             }
             done.store(true, Ordering::Release);
         });
@@ -194,6 +212,7 @@ fn cue_counts_beside_deleting_seals_match_their_walks() {
                     panic!("count {counted} walk {walked} gets {} walked keys a get misses {} out of order {:?}", live.len(), walked_dead.len(), twice.iter().map(|(at, name)| (*at, names[at - 1].clone(), (*name).clone())).collect::<Vec<_>>());
                 }
                 counts += 1;
+                runs.fetch_add(1, Ordering::Release);
             }
             counts
         });

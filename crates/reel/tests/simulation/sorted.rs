@@ -63,6 +63,8 @@ type Rows = Vec<(Vec<u8>, Vec<u8>)>;
 thread_local! {
     // the budget a store these sims open runs at, which a full one raises so the leaves hold values
     static SIM_BUDGET: std::cell::Cell<ByteCount> = const { std::cell::Cell::new(BUDGET) };
+    // the codec the column declares, which a compressed run sets so scans restore what their leaves hold
+    static SIM_CODEC: std::cell::Cell<Codec> = const { std::cell::Cell::new(Codec::None) };
 }
 
 // every store these sims open gives its index exactly the rows it declared, so a small one fills and marks
@@ -81,7 +83,7 @@ fn config(capacity: RowCount) -> StoreConfig {
             id: COLUMN,
             name: "column".to_string(),
             key_shape: KeyShape::Fixed { width: WIDTH },
-            codec: Codec::None,
+            codec: SIM_CODEC.with(std::cell::Cell::get),
             volume: VolumeId(0),
             index: ColumnIndex::Sorted,
             least_rows: Some(capacity),
@@ -493,6 +495,40 @@ thread_local! {
     static HELD_SEEN: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
 }
 
+// compressed values a scan restored and held, the most any store of a run saw
+static RESTORED_SEEN: AtomicU64 = AtomicU64::new(0);
+
+// a scan over a compressed column restores each sealed value once and its leaf holds what a get would read, so a second walk
+// answers from the leaves, and walks and gets give the values written
+#[test]
+fn compressed_values_restore_once_into_their_leaves() {
+    SIM_BUDGET.with(|budget| budget.set(HELD_BUDGET));
+    SIM_CODEC.with(|codec| codec.set(Codec::Lz4));
+    let io = SimulatedIo::new(Seed(5_103));
+    let store = open(&io, CAPACITY);
+    let value = |number: u64| format!("{number:08}-").repeat(30).into_bytes();
+    let mut model = BTreeMap::new();
+    for number in 0..KEYS {
+        store.put(COLUMN, &key(number), &value(number)).expect("put");
+        model.insert(key(number), value(number));
+    }
+    seal_all(&store, &io);
+    let first = walk_rows(&mut store.iter_from(COLUMN, &[], Direction::Ascending).expect("scan"));
+    let restored = store.state.scan_restored_values.load(Ordering::Relaxed);
+    let held = report(&store).scan_held_values;
+    let second = walk_rows(&mut store.iter_from(COLUMN, &[], Direction::Ascending).expect("scan"));
+    let held_after = report(&store).scan_held_values;
+    SIM_CODEC.with(|codec| codec.set(Codec::None));
+    SIM_BUDGET.with(|budget| budget.set(BUDGET));
+    assert!(first == model && second == model, "a walk gave other values");
+    for number in 0..KEYS {
+        assert_eq!(read(&store, &key(number)), Some(value(number)), "key {number}");
+    }
+    assert!(restored > 0, "no compressed value was restored");
+    assert!(held_after > held, "the second walk took nothing from the leaves");
+    store.close().expect("close");
+}
+
 // opens that resized an index in the sized churn, over every seed
 static SIZED_RESIZES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -664,6 +700,7 @@ fn note_held(store: &Store) {
         let (fills, rows) = seen.get();
         seen.set((fills.max(report.value_fills), rows.max(report.scan_held_values)));
     });
+    RESTORED_SEEN.fetch_max(store.state.scan_restored_values.load(Ordering::Relaxed), Ordering::Relaxed);
 }
 
 // seal every open segment with rows but one

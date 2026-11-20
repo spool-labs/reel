@@ -28,7 +28,9 @@ use crate::index::write_shard::{HEAD_GROUP, HeadPlace, WalkBound, WriteShard, pl
 use crate::io::{DeviceReads, Io, ManyRead, ReadOn, in_place};
 use crate::record::record_check::RecordIdentity;
 use crate::record::codec::Codec;
+use crate::record::lz4_block::decompress;
 use crate::record::record_reader::{RecordRead, checked_payload, form_of, open_small, trusted_payload};
+use crate::index::value_pages::MOST_HELD_VALUE;
 use crate::row_kind::RowKind;
 use crate::segment::footer_reader::RowAt;
 use crate::index::record_cache::CacheLookup;
@@ -742,10 +744,32 @@ impl<Backend: Io> EngineState<Backend> {
             let record = &records[start..start + length];
             let key = key_in(keys, (sorted, sorted_spare, *sorted_turn), entry);
             let identity = RecordIdentity { record_key: self.record_key, column: *column, key, kind: RowKind::Value, place: sealed.row.place };
-            let Some(payload) = form_of(record).filter(|form| !form.is_chunked && form.codec == Codec::None).and_then(|form| checked_payload(record, form, &identity)) else {
+            let Some(form) = form_of(record).filter(|form| !form.is_chunked) else {
                 continue;
             };
-            entry.record = Some((start + length - payload.len(), payload.len()));
+            let Some(payload) = checked_payload(record, form, &identity).map(|payload| payload.len()) else {
+                continue;
+            };
+            let payload_at = start + length - payload;
+            entry.record = match form.codec {
+                Codec::None => Some((payload_at, payload)),
+                // a compressed value is restored once into the buffer's spare room, so its leaf holds the value a get would read
+                Codec::Lz4 => {
+                    let at = records.len();
+                    if at + MOST_HELD_VALUE > records.capacity() {
+                        continue;
+                    }
+                    records.resize(at + MOST_HELD_VALUE, 0);
+                    let (read, room) = records.split_at_mut(at);
+                    let Some(restored) = decompress(&read[payload_at..payload_at + payload], room) else {
+                        records.truncate(at);
+                        continue;
+                    };
+                    records.truncate(at + restored);
+                    self.scan_restored_values.fetch_add(1, Ordering::Relaxed);
+                    Some((at, restored))
+                },
+            };
             entry.is_value = true;
             if let Some(fresh) = is_fresh.get_mut(at) {
                 *fresh = true;

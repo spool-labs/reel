@@ -193,6 +193,8 @@ pub struct EngineState<Backend: Io> {
     pub scan_window_records: AtomicU64,
     /// Open records a scan batch read from their file and answered with no sum, since this run wrote them
     pub scan_trusted_records: AtomicU64,
+    /// Compressed values a scan batch restored and held in their leaves
+    pub scan_restored_values: AtomicU64,
     /// Counts a sorted index answered alone
     pub index_counts: AtomicU64,
     /// Open rows entered in their sorted index ahead of their seal

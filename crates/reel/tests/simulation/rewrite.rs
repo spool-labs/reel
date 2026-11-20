@@ -215,6 +215,7 @@ fn rewrites() {
     let rows = hold(&volume.summary);
     let row = rows.get(output).expect("a row");
     assert!(row.facts.is_walked());
+    assert_eq!(reel::segment::summary_orders::row_gap_bytes(&row), 0, "a rewrite output counts a gap");
     assert_eq!(row.cursor().column().expect("a column").row_count.0, 1);
     drop(rows);
     assert_eq!(dead_rows(&store, output), 0);

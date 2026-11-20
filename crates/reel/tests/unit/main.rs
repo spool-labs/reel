@@ -17,6 +17,7 @@ mod job_tally;
 mod engine_sizing;
 mod lifetime;
 mod large_writers;
+mod window_gaps;
 mod lz4_block;
 mod open_segment;
 mod plain_io;

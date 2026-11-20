@@ -26,7 +26,7 @@ use crate::segment::block_entry::KeyBound;
 use crate::segment::column_directory::ColumnDirectory;
 use crate::segment::segment_tail::{MOST_MERGE_SEGMENTS, SegmentNumber};
 use crate::segment::summary::{SummaryRow, SummaryRows};
-use crate::segment::summary_orders::{COVERS_LIST, ROW_FOOTER_BYTES, SHARE_BUCKETS, SHARE_SCALE, WalkList, is_wholly_dead, reclaim_share, share_bucket};
+use crate::segment::summary_orders::{COVERS_LIST, ROW_FOOTER_BYTES, SHARE_BUCKETS, SHARE_SCALE, WalkList, is_wholly_dead, reclaim_share, row_gap_bytes, share_bucket};
 
 use crate::engine::compact_job::can_unlink;
 use crate::engine::load_state::{Load, OverlapLanes, Owed, is_capped, is_deferring, is_over_target, is_paced, overlap_lanes, record_bar};
@@ -519,6 +519,9 @@ pub fn is_rewrite_ready<Backend: Io>(volume: &Volume<Backend>, row: &SummaryRow<
         bytes += column.live_bytes.0 + column.dead_bytes.0;
         dead_bytes += column.dead_bytes.0;
     }
+    // data no record holds is dead too, and only a rewrite wins it back
+    let gap = row_gap_bytes(row);
+    let (bytes, dead_bytes) = (bytes + gap, dead_bytes + gap);
     let won_back = dead_bytes.saturating_sub(freed_bytes) + (dead_rows + live_graves) * ROW_FOOTER_BYTES;
     won_back > 0 && BAR_SCALE * won_back >= held_bar(row.facts.marks, current, plain) * (bytes + rows * ROW_FOOTER_BYTES)
 }

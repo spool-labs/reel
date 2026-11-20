@@ -259,7 +259,15 @@ impl<Backend: Io> SealJob<Backend> {
     pub fn start_writing(&mut self, target: &SealTarget<Backend::File>) -> Result<()> {
         self.end_step(|steps| &steps.drain);
         self.state.write_out(target.slot)?;
-        self.writer.start(target.data_end, target.lowest_place);
+        // every window is sent here, so the last range's unused end goes back and the footer starts where the records end
+        let mut data_end = target.data_end;
+        if let Some(end) = self.state.trim_window_end(self.volume(), target.slot) {
+            data_end = end;
+            if let Some(held) = &mut self.target {
+                held.data_end = end;
+            }
+        }
+        self.writer.start(data_end, target.lowest_place);
         // the sealed place rises before the walk withholds or removes a sorted entry under a cover, so a cue below the cover reads by
         // the footers from here on. The rows stay in the write index until the switch, and a seal that stops later only sends a few
         // more reads to the footers

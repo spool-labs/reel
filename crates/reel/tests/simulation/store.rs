@@ -1820,9 +1820,9 @@ fn a_small_segment_holds_a_small_window() {
         finishing.join().expect("thread").expect("finish");
     });
     let store = ReelStore::open(io.clone(), &small).expect("reopen");
+    assert_eq!(store.state.volumes[0].window_bytes, 8 * 1024);
     for row in hold(&store.state.volumes[0].summary).rows() {
-        let facts = &row.facts;
-        assert_eq!(facts.data_end, reel_core::units::FileOffset(8 * 1024), "segment {:?}: {:?}", facts.segment, facts.file_length);
+        assert_eq!(reel::segment::summary_orders::row_gap_bytes(&row), 0, "segment {:?}", row.facts.segment);
     }
     store.close().expect("close");
 }
@@ -1857,10 +1857,11 @@ fn each_volume_takes_its_own_window() {
         finishing.join().expect("thread").expect("finish");
     });
     let store = ReelStore::open(io.clone(), &two_volumes()).expect("reopen");
-    for (volume, window) in [(0, 8 * 1024_u64), (1, 64 * 1024)] {
+    for (volume, window) in [(0, 8 * 1024_usize), (1, 64 * 1024)] {
+        assert_eq!(store.state.volumes[volume].window_bytes, window, "volume {volume}");
         let rows = hold(&store.state.volumes[volume].summary);
-        let ends: Vec<u64> = rows.rows().map(|row| row.facts.data_end.0).collect();
-        assert_eq!(ends, vec![window], "volume {volume}");
+        let gaps: Vec<u64> = rows.rows().map(|row| reel::segment::summary_orders::row_gap_bytes(&row)).collect();
+        assert_eq!(gaps, vec![0], "volume {volume}");
     }
     store.close().expect("close");
 }
@@ -2194,4 +2195,169 @@ fn a_reused_range_survives_a_seal_killed_at_any_step() {
         assert_eq!(read(&store, b"failed"), None, "crash at {crash_at}: the failed write read back");
         store.close().expect("close");
     }
+}
+
+// read each sealed segment's gap: data no record holds
+fn sealed_gaps(store: &Store) -> Vec<u64> {
+    let summary = hold(&store.state.volumes[0].summary);
+    summary.rows().map(|row| reel::segment::summary_orders::row_gap_bytes(&row)).collect()
+}
+
+// batches and single puts seal with no gap, and a large record claimed past a window leaves the window's end as a gap the
+// summary counts for compaction
+#[test]
+fn a_sealed_segment_counts_its_gap() {
+    let io = SimulatedIo::new(Seed(4_500));
+    let store = open(&io);
+    let value = vec![5_u8; 3_000];
+    let mut batch = reel_core::write_batch::WriteBatch::new();
+    for round in 0..10_u64 {
+        batch.clear();
+        for number in 0..100_u64 {
+            batch.put(COLUMN, format!("batch-{round:03}-{number:04}").as_bytes(), &value);
+        }
+        store.write_batch(&batch).expect("batch");
+    }
+    store.seal_now();
+    settle(&io);
+    let gaps = sealed_gaps(&store);
+    assert!(!gaps.is_empty(), "nothing sealed");
+    assert!(gaps.iter().all(|gap| *gap == 0), "batches left a gap: {gaps:?}");
+
+    for number in 0..2_000_u64 {
+        store.put(COLUMN, format!("single-{number:05}").as_bytes(), &value).expect("put");
+    }
+    store.seal_now();
+    settle(&io);
+    let gaps = sealed_gaps(&store);
+    assert!(gaps.iter().all(|gap| *gap == 0), "single puts left a gap: {gaps:?}");
+
+    let large = vec![6_u8; 200_000];
+    for number in 0..200_u64 {
+        store.put(COLUMN, format!("mixed-{number:05}").as_bytes(), &value).expect("put");
+        if number % 50 == 0 {
+            store.put(COLUMN, format!("large-{number:05}").as_bytes(), &large).expect("put");
+        }
+    }
+    store.seal_now();
+    settle(&io);
+    let gaps = sealed_gaps(&store);
+    assert!(gaps.iter().any(|gap| *gap > 0), "a window left behind a large record counted no gap: {gaps:?}");
+    store.close().expect("close");
+}
+
+// a segment of range deletes counts no gap, though its delete records have no row bytes
+#[test]
+fn covers_count_no_gap() {
+    let io = SimulatedIo::new(Seed(4_600));
+    let store = open(&io);
+    for number in 0..20_u64 {
+        store.put(COLUMN, &key_of(number), b"value").expect("put");
+    }
+    for number in 0..200_u64 {
+        let (start, end) = (format!("gone-{number:04}-a"), format!("gone-{number:04}-z"));
+        store.delete_range(COLUMN, start.as_bytes(), end.as_bytes()).expect("delete");
+    }
+    store.seal_now();
+    settle(&io);
+    let gaps = sealed_gaps(&store);
+    assert!(!gaps.is_empty(), "nothing sealed");
+    assert!(gaps.iter().all(|gap| *gap == 0), "covers counted a gap: {gaps:?}");
+    store.close().expect("close");
+}
+
+// a seal killed at any step after its end was trimmed reopens with every row, and seals again with no gap
+#[test]
+fn a_trimmed_seal_survives_a_kill_at_any_step() {
+    for crash_at in 1..=CRASH_STEPS {
+        let io = SimulatedIo::new(Seed(4_700 + crash_at));
+        let store = open(&io);
+        let value = |number: u64| vec![number as u8 ^ 0x3c; 700];
+        for number in 0..300 {
+            store.put(COLUMN, &key_of(number), &value(number)).expect("put");
+        }
+        store.flush().expect("flush");
+        io.arm_crash(OperationCount(crash_at));
+        store.seal_now();
+        settle(&io);
+        io.kill();
+        drop(store);
+
+        let store = open(&io);
+        assert_eq!(store.damaged_segments(), 0, "crash at {crash_at} left a damaged segment");
+        for number in 0..300 {
+            assert_eq!(read(&store, &key_of(number)), Some(value(number)), "crash at {crash_at}: key {number}");
+        }
+        store.seal_now();
+        settle(&io);
+        let gaps = sealed_gaps(&store);
+        assert!(gaps.iter().all(|gap| *gap == 0), "crash at {crash_at}: a gap after the reseal: {gaps:?}");
+        store.close().expect("close");
+    }
+}
+
+// a seal killed after overwrites reopens with rows recovery rebuilt from the blocks, and once walked each counts its tenth of dead
+// bytes, no gap, and a share well under half
+#[test]
+fn a_rebuilt_row_counts_no_gap_after_its_walk() {
+    // with the summary kept, kills 9 to 14 land between the footer and the summary save and rebuild a forward row, which takes the
+    // spread. With it lost, kills 9 to 60 rebuild one
+    for loses_summary in [false, true] {
+        rebuilt_rows_count_no_gap(loses_summary);
+    }
+}
+
+fn rebuilt_rows_count_no_gap(loses_summary: bool) {
+    let mut checked = 0;
+    for crash_at in 1..=CRASH_STEPS {
+        let io = SimulatedIo::new(Seed(4_800 + crash_at));
+        let store = open(&io);
+        let value = |number: u64, round: u8| vec![number as u8 ^ round; 700];
+        for number in 0..300 {
+            store.put(COLUMN, &key_of(number), &value(number, 1)).expect("put");
+        }
+        for number in (0..300).filter(|number| number % 10 == 0) {
+            store.put(COLUMN, &key_of(number), &value(number, 2)).expect("overwrite");
+        }
+        store.flush().expect("flush");
+        io.arm_crash(OperationCount(crash_at));
+        store.seal_now();
+        settle(&io);
+        io.kill();
+        drop(store);
+        if loses_summary {
+            let paths = reel::segment::summary::SummaryPaths::new(std::path::Path::new(ROOT));
+            let _gone = io.remove_file(&paths.current);
+            let _gone = io.remove_file(&paths.second);
+        }
+
+        let store = open(&io);
+        // no rewrite takes the segment before its walk ends
+        store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
+        let rebuilt: Vec<reel::segment::segment_tail::SegmentNumber> = hold(&store.state.volumes[0].summary)
+            .rows()
+            .filter(|row| !row.facts.is_walked() && row.column_count > 0)
+            .map(|row| row.facts.segment)
+            .collect();
+        settle(&io);
+        for number in 0..300 {
+            let round = if number % 10 == 0 { 2 } else { 1 };
+            assert_eq!(read(&store, &key_of(number)), Some(value(number, round)), "crash at {crash_at}: key {number}");
+        }
+        let summary = hold(&store.state.volumes[0].summary);
+        for segment in &rebuilt {
+            let row = summary.get(*segment).expect("the rebuilt row stays");
+            checked += 1;
+            assert!(row.facts.is_walked(), "crash at {crash_at}: segment {segment:?} is unwalked after settle");
+            assert!(reel::segment::summary_orders::row_record_bytes(&row) > 0, "crash at {crash_at}: the walk counted no bytes");
+            let records = reel::segment::summary_orders::row_record_bytes(&row);
+            assert!(records <= row.facts.data_end.0, "crash at {crash_at}, lost summary {loses_summary}: {records} record bytes past the data end {}", row.facts.data_end.0);
+            assert_eq!(reel::segment::summary_orders::row_gap_bytes(&row), 0, "crash at {crash_at}: segment {segment:?} counts a gap");
+            let share = reel::segment::summary_orders::reclaim_share(&row);
+            assert!(share < reel::segment::summary_orders::SHARE_SCALE / 2, "crash at {crash_at}: a tenth dead reads as share {share}");
+        }
+        drop(summary);
+        store.close().expect("close");
+    }
+    assert!(checked > 0, "lost summary {loses_summary}: no rebuilt row stayed to be checked");
 }

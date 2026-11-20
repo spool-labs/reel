@@ -466,6 +466,8 @@ pub fn reclaim_share(row: &SummaryRow<'_>) -> u64 {
         bytes += column.live_bytes.0 + column.dead_bytes.0;
         dead_bytes += column.dead_bytes.0;
     }
+    let gap = row_gap_bytes(row);
+    let (bytes, dead_bytes) = (bytes + gap, dead_bytes + gap);
     SHARE_SCALE * (dead_bytes + dead_rows * ROW_FOOTER_BYTES) / (bytes + rows * ROW_FOOTER_BYTES).max(1)
 }
 
@@ -478,10 +480,22 @@ pub fn is_wholly_dead(row: &SummaryRow<'_>) -> bool {
     (0..row.column_count).all(|_column| cursor.column().is_some_and(|column| column.dead_rows == column.row_count))
 }
 
-/// Add up the dead bytes a row's columns count
+/// Add up the dead bytes a row's columns count. A gap holds no row, so the walk has nothing to find there, and only the rewrite
+/// weighs it
 pub fn row_dead_bytes(row: &SummaryRow<'_>) -> u64 {
     let mut cursor = row.cursor();
     (0..row.column_count).filter_map(|_column| cursor.column()).map(|column| column.dead_bytes.0).sum()
+}
+
+/// Read the bytes of a segment's data no record holds: ranges a write claimed and never filled. No row names them, so only a
+/// rewrite wins them back
+pub fn row_gap_bytes(row: &SummaryRow<'_>) -> u64 {
+    // range deletes have records under the data end and no row bytes, so a segment with covers counts no gap. A backward walk
+    // holds part sums until it ends
+    if row.facts.has_covers || (row.facts.is_backward && !row.facts.is_walked()) {
+        return 0;
+    }
+    row.facts.data_end.0.saturating_sub(row_record_bytes(row))
 }
 
 /// Read an entry's dead bytes only a rewrite can win back: none in a segment an unlink frees whole, and none the walk freed in place

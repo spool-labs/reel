@@ -230,19 +230,43 @@ impl<Backend: Io> EngineState<Backend> {
         if guard.has_kept_window {
             return WindowSwitch::OtherBusy;
         }
-        let left = volume.segment_bytes.0.saturating_sub(segment.write_end.0) as usize;
+        // with nothing claimed past the live range, the next range starts where its records end, so the unused end isn't left as a gap
+        let window = &self.windows[index][live];
+        let is_last = window.start().0 + guard.window_room as u64 == segment.write_end.0;
+        let start = if is_last { window.end() } else { segment.write_end };
+        let left = volume.segment_bytes.0.saturating_sub(start.0) as usize;
         let room = left.min(volume.window_bytes);
         if room < length {
             return WindowSwitch::NoRoom;
         }
 
-        let start = segment.write_end;
         segment.write_end = FileOffset(start.0 + room as u64);
         self.windows[index][1 - live].reset(start);
         guard.live_window = 1 - live;
         guard.window_room = room;
         guard.has_kept_window = !self.windows[index][live].is_empty();
         WindowSwitch::Switched
+    }
+
+    /// Give back the unused end of a drained slot's last range when nothing was claimed past it, and return where the segment's
+    /// data ends
+    pub fn trim_window_end(&self, volume: &Volume<Backend>, slot: OpenSlot) -> Option<FileOffset> {
+        let index = slot.0 as usize;
+        let mut claims = hold(&volume.claims);
+        let segment = claims.open.iter_mut().find(|segment| segment.slot == slot)?;
+        if segment.phase != SegmentPhase::Sealing || segment.in_flight != 0 {
+            return None;
+        }
+        let guard = hold(&self.queues[index]);
+        if guard.has_kept_window {
+            return None;
+        }
+        let window = &self.windows[index][guard.live_window];
+        if window.start().0 + guard.window_room as u64 != segment.write_end.0 {
+            return None;
+        }
+        segment.write_end = window.end();
+        Some(segment.write_end)
     }
 
     /// Write a one-chunk value as it stands, with its head on the stack, so no writer waits for a shared encoder

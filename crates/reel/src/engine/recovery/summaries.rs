@@ -341,6 +341,10 @@ pub fn settle_sealed<Backend: Io>(
         keys.push((kept_lowest, bound));
     }
 
+    // the blocks give no byte counts. A forward row spreads the data over its columns by rows, so live and dead add up to the data
+    // end as a seal's counts do and the walk moves bytes to dead from there. A backward walk rebuilds live from 0
+    let total_rows = found.columns.iter().map(|column| column.row_count.0).sum::<u64>().max(1);
+    let data_bytes = if facts.is_backward { 0 } else { facts.data_end.0 };
     let columns = found.columns.iter().zip(keys.iter()).map(|(column, edges)| ColumnFacts {
         column: column.column,
         lowest: &edges.0,
@@ -349,7 +353,7 @@ pub fn settle_sealed<Backend: Io>(
         grave_count: column.grave_count,
         dead_rows: RowCount(0),
         dead_graves: RowCount(0),
-        live_bytes: ByteCount(0),
+        live_bytes: ByteCount((u128::from(data_bytes) * u128::from(column.row_count.0) / u128::from(total_rows)) as u64),
         dead_bytes: ByteCount(0),
     });
     let mut ranges = Vec::new();

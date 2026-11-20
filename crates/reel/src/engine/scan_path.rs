@@ -1981,6 +1981,8 @@ pub fn fill_sorted(index: &SortedKeys, scan: &mut ScanState, passed: &mut Option
         // the read fills the spare, so the batch's entries keep their keys in the index batch it read last
         scan.turn_sorted();
         scan.sorted_entered = entered;
+        // a walk for keys alone takes no held value
+        scan.sorted.is_with_values = scan.batch.is_reading;
         let ScanState { sorted, position, is_inclusive, direction, .. } = scan;
         let from = ScanFrom::Key { key: position, is_inclusive: *is_inclusive };
         let is_done = match direction {

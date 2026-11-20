@@ -151,6 +151,8 @@ pub struct KeyBatch {
     resume: [u8; MOST_KEY_BYTES],
     /// The batch takes graves too, as a scan does: a grave hides an older open row of its key
     pub is_with_graves: bool,
+    /// The batch takes the values the leaves hold beside their entries, which a walk for keys alone leaves
+    pub is_with_values: bool,
     width: usize,
 }
 
@@ -234,6 +236,7 @@ impl KeyBatch {
             held: touched_capacity(most, NO_HELD),
             resume: [0; MOST_KEY_BYTES],
             is_with_graves: false,
+            is_with_values: true,
             width,
         }
     }
@@ -1336,6 +1339,7 @@ impl SortedKeys {
         // a held value comes with its entry under the same lock, while the batch has room for the largest one
         let start = batch.values.len();
         let is_held = !entry.is_grave
+            && batch.is_with_values
             && batch.values.capacity() - start >= MOST_HELD_VALUE
             && self.values.read(self.chain_of(leaf), index, &mut batch.values);
         batch.held.push(if is_held { (start as u32, (batch.values.len() - start) as u32) } else { NO_HELD });

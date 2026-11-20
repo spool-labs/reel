@@ -13,16 +13,21 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as Memory};
 use reel_core::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
 use crate::guard::{Shards, hold};
-use crate::index::value_pages::{HeldChain, MOST_HELD_VALUE, NO_VALUE_PAGE, ValuePages};
+use crate::index::value_pages::{HeldChain, NO_VALUE_PAGE, ValuePages};
 use crate::pool::{ask_huge_pages, touched_capacity};
 use crate::segment::segment_tail::SegmentNumber;
 
 /// Words of one page
 pub const PAGE_WORDS: usize = 1024;
-/// Bytes a scan's index batch keeps for held values, a share an entry, so a batch of small values carries them all
-pub const HELD_BYTES_PER_ENTRY: usize = 128;
 /// The span of an entry that came with no held value
-pub const NO_HELD: (u32, u32) = (u32::MAX, 0);
+pub const NO_HELD: HeldRef = HeldRef { chain: HeldChain::NONE, slot: u32::MAX };
+
+/// Where a leaf holds an entry's value: its chain and the entry's slot in it
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HeldRef {
+    pub chain: HeldChain,
+    pub slot: u32,
+}
 /// Parts of an index, one for each first byte of a key
 pub const PARTS: usize = 256;
 /// Words at the head of a page: the count, the next leaf, the previous leaf, and a leaf's held values: its chain's first page and
@@ -144,9 +149,9 @@ pub enum ScanFrom<'key> {
 pub struct KeyBatch {
     pub keys: Vec<u8>,
     pub entries: Vec<KeyEntry>,
-    /// Values the entries' leaves held when the batch was copied, and where each entry's sits, NO_HELD for none
-    pub values: Vec<u8>,
-    pub held: Vec<(u32, u32)>,
+    /// Where each entry's leaf held its value when the batch was copied, NO_HELD for none. The value stays in its page, and a reader
+    /// copies it once into its own buffer
+    pub held: Vec<HeldRef>,
     /// The last key a call looked at, which the next call starts after
     resume: [u8; MOST_KEY_BYTES],
     /// The batch takes graves too, as a scan does: a grave hides an older open row of its key
@@ -232,7 +237,6 @@ impl KeyBatch {
         Self {
             keys: touched_capacity(width * most, 0),
             entries: touched_capacity(most, KeyEntry::default()),
-            values: touched_capacity(most * HELD_BYTES_PER_ENTRY, 0),
             held: touched_capacity(most, NO_HELD),
             resume: [0; MOST_KEY_BYTES],
             is_with_graves: false,
@@ -248,7 +252,7 @@ impl KeyBatch {
 
     /// Read the heap the batch holds
     pub fn heap_bytes(&self) -> usize {
-        self.keys.capacity() + self.entries.capacity() * size_of::<KeyEntry>() + self.values.capacity() + self.held.capacity() * size_of::<(u32, u32)>()
+        self.keys.capacity() + self.entries.capacity() * size_of::<KeyEntry>() + self.held.capacity() * size_of::<HeldRef>()
     }
 
     /// Empty the batch for keys of another width, which its room holds
@@ -277,17 +281,15 @@ impl KeyBatch {
         &self.keys[index * self.width..(index + 1) * self.width]
     }
 
-    /// Read the value an entry's leaf held when the batch was copied
-    pub fn held_value(&self, index: usize) -> Option<&[u8]> {
-        let &(at, length) = self.held.get(index)?;
-        (at != NO_HELD.0).then(|| &self.values[at as usize..(at + length) as usize])
+    /// Read where an entry's leaf held its value when the batch was copied
+    pub fn held_value(&self, index: usize) -> Option<HeldRef> {
+        self.held.get(index).copied().filter(|held| *held != NO_HELD)
     }
 
     /// Empty the batch and keep its room
     pub fn clear(&mut self) {
         self.keys.clear();
         self.entries.clear();
-        self.values.clear();
         self.held.clear();
     }
 }
@@ -763,6 +765,11 @@ impl SortedKeys {
     }
 
     /// Copy the value a key's entry holds onto the end of `out`, when the entry still names this row and its leaf holds the value
+    /// Copy a value a batch noted held onto the end of `out`, or say the leaf let it go since
+    pub fn read_held(&self, held: HeldRef, out: &mut Vec<u8>) -> bool {
+        self.values.read(held.chain, held.slot as usize, out)
+    }
+
     pub fn held_value(&self, key: &[u8], row: (WritePlace, SegmentNumber, FileOffset), out: &mut Vec<u8>) -> bool {
         if self.values.page_count() == 0 || key.len() > self.width {
             return false;
@@ -1336,13 +1343,10 @@ impl SortedKeys {
             bytes.copy_from_slice(&self.load(leaf, base + word).to_be_bytes()[..bytes.len()]);
         }
         batch.entries.push(entry);
-        // a held value comes with its entry under the same lock, while the batch has room for the largest one
-        let start = batch.values.len();
-        let is_held = !entry.is_grave
-            && batch.is_with_values
-            && batch.values.capacity() - start >= MOST_HELD_VALUE
-            && self.values.read(self.chain_of(leaf), index, &mut batch.values);
-        batch.held.push(if is_held { (start as u32, (batch.values.len() - start) as u32) } else { NO_HELD });
+        // a held value stays in its page, and the batch keeps where it is, so a reader copies it once
+        let chain = self.chain_of(leaf);
+        let is_held = !entry.is_grave && batch.is_with_values && self.values.holds(chain, index);
+        batch.held.push(if is_held { HeldRef { chain, slot: index as u32 } } else { NO_HELD });
     }
 
     /// Read an entry

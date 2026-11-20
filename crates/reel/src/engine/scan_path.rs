@@ -388,13 +388,15 @@ impl<Backend: Io> EngineState<Backend> {
                 Ok(true)
             },
             ScanWant::Locate => {
-                let key_at = scan.batch.keys.len();
-                scan.batch.keys.extend_from_slice(candidate);
-                // a sealed row the index entry named comes with the value its leaf held, as a run's rows do
-                let record = held_for(scan, candidate, &located);
-                scan.batch.entries.push(BatchEntry { key_at, key_length: candidate.len(), key_from: KeyFrom::Batch, located, record, is_value: record.is_some(), is_lent: false, is_trusted: false });
-                if record.is_some() {
+                // a row the walk's index entry names lends the value its leaf held, as a run's rows do, copied once when answered
+                if is_held_for(scan, candidate, &located) {
+                    let entry = BatchEntry { key_at: scan.sorted_next, key_length: candidate.len(), key_from: KeyFrom::Sorted(scan.sorted_turn), located, record: None, is_value: true, is_lent: true, is_trusted: false };
+                    scan.batch.entries.push(entry);
                     self.scan_held_values.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    let key_at = scan.batch.keys.len();
+                    scan.batch.keys.extend_from_slice(candidate);
+                    scan.batch.entries.push(BatchEntry { key_at, key_length: candidate.len(), key_from: KeyFrom::Batch, located, record: None, is_value: false, is_lent: false, is_trusted: false });
                 }
                 Ok(true)
             },
@@ -932,10 +934,10 @@ impl<Backend: Io> EngineState<Backend> {
         let name = key_in(&batch.keys, (sorted, sorted_spare, *sorted_turn), &entry);
         let lent = entry.is_lent.then(|| held_in((sorted, sorted_spare, *sorted_turn), &entry)).flatten();
         let held = match (entry.record, entry.located) {
+            // a held value is copied once, from its page into the caller's buffer, and a leaf that let it go sends the row to its own read
             _lent if let Some(lent) = lent => {
                 value.clear();
-                value.extend_from_slice(lent);
-                true
+                self.sorted_index(*column).is_some_and(|index| index.read_held(lent, value))
             },
             // a value from the cache or a leaf's hold answers as it stands
             (Some((at, length)), Located::Sealed(_) | Located::Open(_)) if entry.is_value => {
@@ -990,17 +992,24 @@ impl<Backend: Io> EngineState<Backend> {
         let volume = &self.volumes[self.column(scan.column)?.volume.0 as usize];
         loop {
             while let Some(entry) = scan.batch.entries.get(scan.batch.next).copied() {
-                let is_lent = entry.is_lent && held_in((&scan.sorted, &scan.sorted_spare, scan.sorted_turn), &entry).is_some();
-                let span = if is_lent { None } else { self.held_value(volume, scan, &entry) };
-                if !is_lent && span.is_none() {
+                let held = entry.is_lent.then(|| held_in((&scan.sorted, &scan.sorted_spare, scan.sorted_turn), &entry)).flatten();
+                let span = if held.is_some() { None } else { self.held_value(volume, scan, &entry) };
+                if held.is_none() && span.is_none() {
                     break;
+                }
+                // a held value is copied once into the value buffer, and a leaf that let it go sends the row to the one-row step
+                if let Some(held) = held {
+                    value.clear();
+                    if !self.sorted_index(scan.column).is_some_and(|index| index.read_held(held, value)) {
+                        break;
+                    }
                 }
                 scan.asked += 1;
                 scan.batch.next += 1;
                 scan.batched += 1;
-                let row = match span {
+                let row: &[u8] = match span {
                     Some((at, length)) => &scan.batch.records[at..at + length],
-                    None => held_in((&scan.sorted, &scan.sorted_spare, scan.sorted_turn), &entry).unwrap_or_default(),
+                    None => value,
                 };
                 if !each(scan.batch_key(&entry), row) {
                     return Ok(ScanStep::Found);
@@ -2012,26 +2021,13 @@ pub fn can_cross_unread<Backend: Io>(volume: &Volume<Backend>, segment: SegmentN
     is_exact
 }
 
-/// Copy the value the index batch held for a located sealed row into the scan's records, when the walk's index entry is the row's
-fn held_for(scan: &mut ScanState, candidate: &[u8], located: &Located) -> Option<(usize, usize)> {
-    let Located::Sealed(sealed) = located else {
-        return None;
-    };
+/// Check the index batch holds the value of a located row, when the walk's index entry is the row's
+fn is_held_for(scan: &ScanState, candidate: &[u8], located: &Located) -> bool {
     if !scan.is_on_index || scan.sorted_key() != Some(candidate) {
-        return None;
+        return false;
     }
     let entry = scan.sorted.entries[scan.sorted_next];
-    if entry.place != sealed.row.place || entry.segment != sealed.segment || entry.offset != sealed.row.offset {
-        return None;
-    }
-    let value = scan.sorted.held_value(scan.sorted_next)?;
-    let records = &mut scan.batch.records;
-    let at = records.len();
-    if at + value.len() > records.capacity() {
-        return None;
-    }
-    records.extend_from_slice(value);
-    Some((at, value.len()))
+    held_row(located) == Some((entry.place, entry.segment, entry.offset)) && scan.sorted.held_value(scan.sorted_next).is_some()
 }
 
 /// Read the place, segment and offset a leaf's held value answers for, for an open or a sealed row

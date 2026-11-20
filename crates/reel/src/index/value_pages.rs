@@ -124,6 +124,11 @@ impl ValuePages {
         chain.first != NO_VALUE_PAGE && (chain.first as usize) < self.words.len() / VALUE_PAGE_WORDS && self.generation(chain.first) == chain.generation
     }
 
+    /// Check a leaf's entry holds a value, with no copy
+    pub fn holds(&self, chain: HeldChain, index: usize) -> bool {
+        self.is_live(chain) && index < self.table_words(chain.first) * 2 && unpack_slot(self.slot(chain.first, index)).is_some()
+    }
+
     /// Copy the value a leaf's entry holds onto the end of `out`, and say whether it held one
     pub fn read(&self, chain: HeldChain, index: usize, out: &mut Vec<u8>) -> bool {
         if !self.is_live(chain) || index >= self.table_words(chain.first) * 2 {

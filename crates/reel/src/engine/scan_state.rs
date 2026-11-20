@@ -7,7 +7,7 @@ use reel_core::direction::Direction;
 use reel_core::units::{ByteCount, FileOffset, Nanoseconds, RowCount, WritePlace};
 
 use crate::index::shard_cursor::{ShardCursor, TreeCursor};
-use crate::index::sorted_keys::{KeyBatch, KeyEntry, MOST_KEY_BYTES};
+use crate::index::sorted_keys::{HeldRef, KeyBatch, KeyEntry, MOST_KEY_BYTES};
 use crate::engine::read_path::{Located, SealedRow};
 use crate::index::open_slots::{OpenSlot, OpenSlots};
 use crate::index::write_row::WriteRow;
@@ -1237,7 +1237,7 @@ pub fn sorted_batch(widest_key: usize) -> KeyBatch {
 
 /// Read a batch entry's key from the batch's own keys or the index batch of its turn
 /// Read the value an entry's index batch held for it, when its key came from one
-pub fn held_in<'scan>((sorted, spare, turn): (&'scan KeyBatch, &'scan KeyBatch, u32), entry: &BatchEntry) -> Option<&'scan [u8]> {
+pub fn held_in((sorted, spare, turn): (&KeyBatch, &KeyBatch, u32), entry: &BatchEntry) -> Option<HeldRef> {
     match entry.key_from {
         KeyFrom::Batch => None,
         KeyFrom::Sorted(at) if at == turn => sorted.held_value(entry.key_at),

@@ -1328,3 +1328,56 @@ fn wide_records_read_in_batches() {
     store.close().expect("close");
 }
 
+
+// collect a key walk's keys one step at a time
+fn stepped_keys(store: &Store, start: &[u8]) -> Vec<Vec<u8>> {
+    let mut scan = store.iter_from(COLUMN, start, Direction::Ascending).expect("scan");
+    let (mut keys, mut key) = (Vec::new(), Vec::new());
+    while scan.next_key(&mut key).expect("step") == ScanStep::Found {
+        keys.push(key.clone());
+    }
+    keys
+}
+
+// a drain lends the same keys a key walk steps through, over sealed, open, overwritten and deleted rows, and stops where the
+// closure says, with the walk going on from the next key
+#[test]
+fn drained_keys_match_stepped_keys() {
+    let io = SimulatedIo::new(Seed(4_950));
+    let store = open(&io);
+    let key = |number: u64| format!("key-{number:05}").into_bytes();
+    for number in (0..3_000).filter(|number| number % 2 == 0) {
+        store.put(COLUMN, &key(number), b"sealed").expect("put");
+    }
+    seal(&store, &io);
+    for number in (0..3_000).filter(|number| number % 2 == 1) {
+        store.put(COLUMN, &key(number), b"open").expect("put");
+    }
+    for number in (0..3_000).filter(|number| number % 13 == 0) {
+        store.delete(COLUMN, &key(number)).expect("delete");
+    }
+    for start in [&b""[..], b"key-01", b"key-02999", b"zzz"] {
+        let stepped = stepped_keys(&store, start);
+        let mut drained = Vec::new();
+        let mut scan = store.iter_from(COLUMN, start, Direction::Ascending).expect("scan");
+        let mut buffer = Vec::new();
+        assert_eq!(scan.drain_keys(&mut buffer, |name| {
+            drained.push(name.to_vec());
+            true
+        }).expect("drain"), ScanStep::End);
+        assert_eq!(drained, stepped, "start {start:?}");
+    }
+
+    // stop after 100 keys, then step on: the walk goes on from the 101st
+    let stepped = stepped_keys(&store, b"");
+    let mut scan = store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan");
+    let (mut taken, mut buffer) = (Vec::new(), Vec::new());
+    assert_eq!(scan.drain_keys(&mut buffer, |name| {
+        taken.push(name.to_vec());
+        taken.len() < 100
+    }).expect("drain"), ScanStep::Found);
+    assert_eq!(scan.next_key(&mut buffer).expect("step"), ScanStep::Found);
+    taken.push(buffer.clone());
+    assert_eq!(taken.as_slice(), &stepped[..101]);
+    store.close().expect("close");
+}

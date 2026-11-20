@@ -30,6 +30,17 @@ pub trait KeyScan: Send {
     /// Fill the buffer with the next key
     fn next_key(&mut self, key: &mut Vec<u8>) -> Result<ScanStep, StoreError>;
 
+    /// Lend keys to a closure in order until it says stop, the walk ends or a key is corrupt. The buffer takes a key the walk
+    /// can't lend
+    fn drain_keys(&mut self, key: &mut Vec<u8>, mut each: impl FnMut(&[u8]) -> bool) -> Result<ScanStep, StoreError> {
+        loop {
+            match self.next_key(key)? {
+                ScanStep::Found if each(key) => {},
+                step => return Ok(step),
+            }
+        }
+    }
+
     /// Stream the next block of keys, and say whether the walk has more
     fn next_key_block(&mut self, keys: &mut ValueList) -> impl Future<Output = Result<bool, StoreError>> + Send;
 }

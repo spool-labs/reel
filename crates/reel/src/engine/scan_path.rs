@@ -979,6 +979,25 @@ impl<Backend: Io> EngineState<Backend> {
         }
     }
 
+    /// Lend a key walk's keys to a closure in order from its batch, stepping for the next batch when one runs out. Ends after
+    /// the key the closure says stop on, at the walk's end, or at a corrupt key
+    pub fn drain_key_scan(&self, scan: &mut ScanState, key: &mut Vec<u8>, mut each: impl FnMut(&[u8]) -> bool) -> Result<ScanStep, StoreError> {
+        loop {
+            while let Some(entry) = scan.batch.entries.get(scan.batch.next).copied() {
+                scan.batch.next += 1;
+                scan.asked += 1;
+                scan.batched += 1;
+                if !each(scan.batch_key(&entry)) {
+                    return Ok(ScanStep::Found);
+                }
+            }
+            match self.step_scan(scan, key, ScanWant::Key)? {
+                ScanStep::Found if each(key) => {},
+                step => return Ok(step),
+            }
+        }
+    }
+
     /// Find where a batch row's value lies in the batch's buffer: a value from the cache as it stands, or a small plain record's
     /// payload once the record checks out. Nothing for a row the one-row step answers
     pub fn held_value(&self, volume: &Volume<Backend>, scan: &ScanState, entry: &BatchEntry) -> Option<(usize, usize)> {

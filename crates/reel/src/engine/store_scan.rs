@@ -112,6 +112,15 @@ impl<Backend: Io> StoreScan<Backend> {
         answer
     }
 
+    /// Lend keys to a closure in order, straight from the walk's batch, until it says stop, the walk ends or a key is corrupt
+    pub fn drain_keys(&mut self, key: &mut Vec<u8>, each: impl FnMut(&[u8]) -> bool) -> Result<ScanStep, StoreError> {
+        self.state.caller_ops.note();
+        let Some(scan) = &mut self.scan else {
+            return Ok(ScanStep::End);
+        };
+        self.state.drain_key_scan(scan, key, each)
+    }
+
     /// Fill the buffer with the next key
     pub fn next_key(&mut self, key: &mut Vec<u8>) -> Result<ScanStep, StoreError> {
         // every step counts, so a long scan reads as a busy caller to maintenance

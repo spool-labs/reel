@@ -36,6 +36,10 @@ impl<Backend: Io> KeyScan for StoreScan<Backend> {
         StoreScan::next_key(self, key)
     }
 
+    fn drain_keys(&mut self, key: &mut Vec<u8>, each: impl FnMut(&[u8]) -> bool) -> Result<ScanStep, StoreError> {
+        StoreScan::drain_keys(self, key, each)
+    }
+
     fn next_key_block(&mut self, keys: &mut ValueList) -> impl Future<Output = Result<bool, StoreError>> + Send {
         StoreScan::next_block(self, keys)
     }

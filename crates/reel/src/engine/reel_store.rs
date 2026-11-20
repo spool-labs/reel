@@ -1517,6 +1517,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         sorted_runs: AtomicU64::new(0),
         scan_window_records: AtomicU64::new(0),
         scan_trusted_records: AtomicU64::new(0),
+        index_counts: AtomicU64::new(0),
         rows_entered: AtomicU64::new(0),
         scan_batches_presorted: AtomicU64::new(0),
         sorted_moves_missed: AtomicU64::new(0),

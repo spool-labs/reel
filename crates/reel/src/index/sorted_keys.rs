@@ -976,6 +976,50 @@ impl SortedKeys {
         true
     }
 
+    /// Count the live entries under a prefix a part's lock at a time, or nothing when one is newer than the point, since then the
+    /// key's row at the point may be another
+    pub fn count_live(&self, prefix: &[u8], point: WritePlace) -> Option<u64> {
+        let mut key = [0; MOST_KEY_BYTES];
+        let mut live = 0;
+        let first_part = if prefix.is_empty() { 0 } else { self.part_of(prefix) };
+        let mut start = (!prefix.is_empty()).then(|| PackedKey::new(prefix));
+        for part in first_part..PARTS {
+            if self.filled[part].load(Memory::Acquire) == 0 {
+                start = None;
+                continue;
+            }
+            let tree = self.parts.read(part);
+            if tree.levels == 0 {
+                start = None;
+                continue;
+            }
+            let (mut leaf, mut index) = match start.take() {
+                None => (tree.first_leaf, 0),
+                Some(packed) => {
+                    let leaf = self.descend(&tree, &packed, &mut PagePath::new());
+                    (leaf, self.leaf_search(leaf, &packed).0)
+                },
+            };
+            while leaf != NO_PAGE {
+                for at in index..self.count(leaf) {
+                    if !prefix.is_empty() {
+                        self.unpack_key(leaf, self.leaf_entry(at), &mut key);
+                        if !key[..self.width].starts_with(prefix) {
+                            return Some(live);
+                        }
+                    }
+                    let entry = self.read_entry(leaf, at);
+                    if entry.place > point {
+                        return None;
+                    }
+                    live += u64::from(!entry.is_grave);
+                }
+                (leaf, index) = (self.next(leaf), 0);
+            }
+        }
+        Some(live)
+    }
+
     /// Visit every entry of every part in key order, a part's lock at a time, for checks and counts
     pub fn visit(&self, mut visit: impl FnMut(&[u8], &KeyEntry)) {
         let mut key = [0; MOST_KEY_BYTES];

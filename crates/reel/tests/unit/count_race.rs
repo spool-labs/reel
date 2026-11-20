@@ -139,3 +139,68 @@ fn key_walks_beside_seals_see_every_key_once() {
 fn value_walks_beside_seals_see_every_key_once() {
     walks_beside_seals(true);
 }
+
+// a writer puts, deletes and seals a sorted column while cues count it: each cue's count equals its own walk's keys, so a seal
+// dropping an entry during a count from the index never shows
+#[test]
+fn cue_counts_beside_deleting_seals_match_their_walks() {
+    let root = std::env::temp_dir().join(format!("reel-count-sorted-{}", process::id()));
+    let _gone = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("root");
+    let config = StoreConfig {
+        memory_budget: ByteCount(512 * 1024 * 1024),
+        threads: ThreadCounts::default(),
+        volumes: vec![VolumeConfig {
+            open_segments: Some(2),
+            segment_bytes: Some(ByteCount(2 * 1024 * 1024)),
+            ..VolumeConfig::new("sorted", vec![root.clone()], SyncPolicy::Never)
+        }],
+        columns: vec![ColumnConfig { index: ColumnIndex::Sorted, ..ColumnConfig::new(COLUMN, "sorted", KeyShape::Fixed { width: 8 }) }],
+    };
+    let store = ReelStore::open(PlainIo::new(), &config).expect("open");
+    let done = AtomicBool::new(false);
+    let counts = std::thread::scope(|scope| {
+        let (store, done) = (&store, &done);
+        scope.spawn(move || {
+            for number in 0..KEYS {
+                store.put(COLUMN, &key(number), &[5_u8; 100]).expect("put");
+                if number >= 500 && number % 3 == 0 {
+                    store.delete(COLUMN, &key(number - 500)).expect("delete");
+                }
+                if number % 5_000 == 4_999 {
+                    store.seal_now();
+                    // a pause lets the row job enter what landed, so counts take the index
+                    std::thread::sleep(std::time::Duration::from_millis(80));
+                }
+            }
+            done.store(true, Ordering::Release);
+        });
+        let counter = scope.spawn(move || {
+            let mut counts = 0;
+            while !done.load(Ordering::Acquire) {
+                let cue = store.cue().expect("cue");
+                let counted = cue.count_prefix(COLUMN, &[]).expect("count").0;
+                let mut scan = cue.iter_from(COLUMN, &[], reel_core::direction::Direction::Ascending).expect("scan");
+                let (mut walked, mut name, mut names) = (0, Vec::new(), Vec::new());
+                while scan.next_key(&mut name).expect("step") == reel_core::scan::ScanStep::Found {
+                    walked += 1;
+                    names.push(name.clone());
+                }
+                if counted != walked {
+                    let mut value = Vec::new();
+                    let live: Vec<u64> = (0..KEYS).filter(|number| cue.get(COLUMN, &key(*number), &mut value).expect("get")).collect();
+                    let walked_dead: Vec<&Vec<u8>> = names.iter().filter(|name| !cue.get(COLUMN, name, &mut value).expect("get")).collect();
+                    let twice: Vec<(usize, &Vec<u8>)> = names.iter().enumerate().skip(1).filter(|(at, name)| names[at - 1] >= **name).collect();
+                    panic!("count {counted} walk {walked} gets {} walked keys a get misses {} out of order {:?}", live.len(), walked_dead.len(), twice.iter().map(|(at, name)| (*at, names[at - 1].clone(), (*name).clone())).collect::<Vec<_>>());
+                }
+                counts += 1;
+            }
+            counts
+        });
+        counter.join().expect("counter")
+    });
+    assert!(counts > 10, "only {counts} counts ran");
+    assert!(store.state.index_counts.load(Ordering::Relaxed) > 0, "no count came from the index");
+    store.close().expect("close");
+    let _gone = fs::remove_dir_all(&root);
+}

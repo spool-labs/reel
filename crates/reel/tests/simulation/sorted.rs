@@ -2503,6 +2503,10 @@ fn check_against(store: &Store, model: &BTreeMap<Vec<u8>, Vec<u8>>, when: &str) 
     descending.reverse();
     assert!(descending.iter().eq(model.keys()), "{when}: the descending walk differs");
     assert_eq!(store.count_prefix(COLUMN, &[]).expect("count"), RowCount(model.len() as u64), "{when}: the count");
+    for first in [0x00_u8, 0x3c, 0x9e, 0xff] {
+        let wanted = model.keys().filter(|name| name[0] == first).count() as u64;
+        assert_eq!(store.count_prefix(COLUMN, &[first]).expect("count"), RowCount(wanted), "{when}: the count under {first:#x}");
+    }
     for number in 0..KEYS + KEYS / 4 {
         assert_eq!(read(store, &key(number)), model.get(&key(number)).cloned(), "{when}: key {number}");
     }
@@ -2540,9 +2544,10 @@ fn entered_rows_answer_as_the_model() {
     quiet(&io);
     let entered = report(&store).rows_entered;
     assert!(entered > 0, "no row was entered");
-    let skipped = report(&store).heads_skipped;
+    let (skipped, index_counts) = (report(&store).heads_skipped, store.state.index_counts.load(Ordering::Relaxed));
     check_against(&store, &model, "entered");
     assert!(report(&store).heads_skipped > skipped, "no head was skipped over entered rows");
+    assert!(store.state.index_counts.load(Ordering::Relaxed) > index_counts, "no count came from the index");
 
     // rows past the entering stay counted, so their shards place real heads
     for number in (1..KEYS).step_by(5) {
@@ -2611,6 +2616,7 @@ fn a_cue_reads_under_an_entered_grave() {
     assert!(report(&store).rows_entered > entered, "the graves were not entered");
     let rows = walk_rows(&mut cue.iter_from(COLUMN, &[], Direction::Ascending).expect("scan"));
     assert_eq!(rows.len() as u64, KEYS, "the cue's walk lost deleted keys");
+    assert_eq!(cue.count_prefix(COLUMN, &[]).expect("count"), RowCount(KEYS), "the cue's count lost deleted keys");
     let mut value = Vec::new();
     for number in 0..KEYS {
         assert!(cue.get(COLUMN, &key(number), &mut value).expect("get"), "the cue's get lost key {number}");

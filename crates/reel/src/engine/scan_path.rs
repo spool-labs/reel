@@ -38,6 +38,7 @@ use crate::segment::segment_table::{Seat, SegmentPin};
 use crate::index::entry_slab::EntryAddress;
 use crate::index::key_hash::hash_key;
 use crate::index::write_row::WriteRow;
+use crate::index::write_index::SHARD_COUNT;
 use crate::segment::column_directory::ColumnDirectory;
 use crate::segment::damage_list::KeyRange;
 use crate::segment::segment_tail::{ColumnTail, SegmentNumber};
@@ -263,7 +264,7 @@ impl<Backend: Io> EngineState<Backend> {
         }
         self.place_heads(volume, scan);
         match (index, directory) {
-            (Some(index), _directory) => fill_sorted(index, scan),
+            (Some(index), _directory) => fill_sorted(index, scan, &mut None),
             (None, Some(directory)) => self.join_segments(device, volume, directory, scan, point).await?,
             (None, None) => {},
         }
@@ -509,13 +510,12 @@ impl<Backend: Io> EngineState<Backend> {
             if directory.map_or(0, ColumnDirectory::generation) != scan.generation || point > scan.heads_mark {
                 break;
             }
-            // a batch read again starts from the walk's position, which takes the key the run passed last first
-            if (scan.sorted_next >= scan.sorted.len() || index.entered() != scan.sorted_entered)
+            if scan.sorted_next >= scan.sorted.len()
                 && let Some(at) = passed.take()
             {
                 scan.pass_sorted(at);
             }
-            fill_sorted(index, scan);
+            fill_sorted(index, scan, &mut passed);
             let sorted = scan.sorted_key();
             let head = scan.closest_head.map(|head| scan.heads[head].key.as_slice());
             // the nearer of the index's next key and the heads' goes first, and a key both show steps both
@@ -1722,12 +1722,36 @@ impl<Backend: Io> EngineState<Backend> {
     pub fn count_at(&self, column: ColumnId, prefix: &[u8], point: WritePlace) -> Result<RowCount, StoreError> {
         let info = self.column(column)?;
         let volume = &self.volumes[info.volume.0 as usize];
+        if let Some(count) = self.count_on_index(volume, column, prefix, point) {
+            self.index_counts.fetch_add(1, Ordering::Relaxed);
+            return Ok(RowCount(count));
+        }
         let mut scan = self.take_scan(&under_prefix(column, prefix), Some(point))?;
         scan.is_counting = volume.covers.is_empty() && volume.damage.is_empty();
         let outcome = self.walk_prefix(&mut scan, ScanWantKind::Key);
         let count = RowCount(scan.counted);
         self.give_back_scan(scan);
         outcome.map(|()| count)
+    }
+
+    /// Count a prefix from its column's sorted index alone, when the index holds every row at the point: it has no mark, every
+    /// shard holds no open row of the column it lacks, and no cover, damage or newer sealed row stands over the point. Nothing
+    /// when it can't, and the walk counts
+    pub fn count_on_index(&self, volume: &Volume<Backend>, column: ColumnId, prefix: &[u8], point: WritePlace) -> Option<u64> {
+        let index = self.sorted_index(column).filter(|index| index.mark().is_none())?;
+        if !volume.covers.is_empty() || !volume.damage.is_empty() || volume.may_hide_under_sealed(point) {
+            return None;
+        }
+        // rows at or below the point are in the write index already, so a quiet column read after the point holds them all
+        if !(0..SHARD_COUNT).all(|shard| self.index.shard_counts(shard).is_column_quiet(column)) {
+            return None;
+        }
+        let count = index.count_live(prefix, point)?;
+        // a seal that started during the count can drop an entry under a grave, and it marks the volume before it does
+        if !volume.covers.is_empty() || !volume.damage.is_empty() || volume.may_hide_under_sealed(point) {
+            return None;
+        }
+        Some(count)
     }
 
     /// Add up the stored bytes of the values under a prefix at a point, stepping rows and reading no record
@@ -1900,7 +1924,7 @@ pub fn answer_key_from_batch(scan: &mut ScanState, key: &mut Vec<u8>) -> Option<
 
 /// Bring a walk's batch of index entries to the first key it hasn't passed, reading the next batch from its position when the
 /// batch runs out and the index holds more
-pub fn fill_sorted(index: &SortedKeys, scan: &mut ScanState) {
+pub fn fill_sorted(index: &SortedKeys, scan: &mut ScanState, passed: &mut Option<usize>) {
     if scan.sorted.width() != index.width() {
         scan.keep_sorted_keys(true);
         scan.sorted.set_width(index.width());
@@ -1912,6 +1936,10 @@ pub fn fill_sorted(index: &SortedKeys, scan: &mut ScanState) {
     // position. The count is read before the read, so a later entering shows as a change
     let entered = index.entered();
     if entered != scan.sorted_entered {
+        // the batch read again starts from the walk's position, which first takes the key a run passed last
+        if let Some(at) = passed.take() {
+            scan.pass_sorted(at);
+        }
         scan.forget_sorted();
     }
     loop {

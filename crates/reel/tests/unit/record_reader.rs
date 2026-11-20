@@ -27,3 +27,18 @@ fn shape_math() {
         assert_eq!(plain_length(value_length).0, front + value as u64, "{value} bytes");
     }
 }
+
+// a buffer sized for a read with no fill keeps its length only once the read says it wrote every byte, and is empty when
+// dropped before, as a failed read or a dropped read future leaves it
+#[test]
+fn an_unfilled_read_clears_unless_filled() {
+    let mut buf = vec![7_u8; 3];
+    drop(reel::record::record_reader::UnfilledRead::new(&mut buf, 4_096));
+    assert!(buf.is_empty(), "a dropped read left {} bytes", buf.len());
+
+    let mut unfilled = reel::record::record_reader::UnfilledRead::new(&mut buf, 4_096);
+    unfilled.buf().fill(9);
+    unfilled.filled();
+    assert_eq!(buf.len(), 4_096);
+    assert!(buf.iter().all(|byte| *byte == 9));
+}

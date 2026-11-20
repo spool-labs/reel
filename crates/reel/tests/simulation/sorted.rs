@@ -2666,3 +2666,40 @@ fn a_cue_reads_under_an_entered_grave() {
     drop(cue);
     store.close().expect("close");
 }
+
+// open rows entered in the index hold their values in their leaves too: a second walk over rows that never sealed takes them
+// from the leaves, and walks and gets give the values written, plain and compressed
+#[test]
+fn entered_open_rows_hold_their_values() {
+    for codec in [Codec::None, Codec::Lz4] {
+        SIM_BUDGET.with(|budget| budget.set(HELD_BUDGET));
+        SIM_CODEC.with(|cell| cell.set(codec));
+        let io = SimulatedIo::new(Seed(5_104));
+        let store = open(&io, CAPACITY);
+        let value = |number: u64| format!("{number:08}-").repeat(20).into_bytes();
+        let mut model = BTreeMap::new();
+        for number in 0..KEYS {
+            store.put(COLUMN, &key(number), &value(number)).expect("put");
+            model.insert(key(number), value(number));
+        }
+        quiet(&io);
+        let open: u64 = hold(&store.state.volumes[0].claims).open.iter().map(|segment| segment.row_count.0).sum();
+        let first = walk_rows(&mut store.iter_from(COLUMN, &[], Direction::Ascending).expect("scan"));
+        let held = report(&store).scan_held_values;
+        let second = walk_rows(&mut store.iter_from(COLUMN, &[], Direction::Ascending).expect("scan"));
+        let held_after = report(&store).scan_held_values;
+        SIM_CODEC.with(|cell| cell.set(Codec::None));
+        SIM_BUDGET.with(|budget| budget.set(BUDGET));
+        assert!(open >= KEYS, "{codec:?}: the rows sealed, {open} open");
+        assert!(first == model && second == model, "{codec:?}: a walk gave other values");
+        for number in 0..KEYS {
+            assert_eq!(read(&store, &key(number)), Some(value(number)), "{codec:?}: key {number}");
+        }
+        assert!(held_after > held, "{codec:?}: the second walk took nothing from the leaves");
+        // the held values stay right once their rows seal
+        seal_all(&store, &io);
+        let sealed = walk_rows(&mut store.iter_from(COLUMN, &[], Direction::Ascending).expect("scan"));
+        assert!(sealed == model, "{codec:?}: a walk after the seal gave other values");
+        store.close().expect("close");
+    }
+}

@@ -683,6 +683,13 @@ impl<Backend: Io> EngineState<Backend> {
             if entry.is_value {
                 continue;
             }
+            // a value the index entry's leaf held came with the entry, open or sealed, so the row takes no read and no check
+            if !matches!(entry.located, Located::Absent) && held_in((sorted, sorted_spare, *sorted_turn), entry).is_some() {
+                entry.is_value = true;
+                entry.is_lent = true;
+                held_rows += 1;
+                continue;
+            }
             let sealed = match entry.located {
                 Located::Sealed(sealed) => sealed,
                 Located::Open(open) => {
@@ -697,13 +704,6 @@ impl<Backend: Io> EngineState<Backend> {
             // a value is no longer than its record, so a record's room in the buffer holds it with no allocation
             let at = records.len();
             let is_room = at + sealed.row.length.0 as usize <= records.capacity();
-            // a value the index entry's leaf held came with the entry, so the row takes no read and no check, and stays where it lies
-            if held_in((sorted, sorted_spare, *sorted_turn), entry).is_some() {
-                entry.is_value = true;
-                entry.is_lent = true;
-                held_rows += 1;
-                continue;
-            }
             let key = key_in(keys, (sorted, sorted_spare, *sorted_turn), entry);
             if is_cached && is_room && self.record_cache.get_onto(sealed.segment, sealed.row.offset, key, records) == CacheLookup::Hit {
                 entry.record = Some((at, records.len() - at));
@@ -732,22 +732,26 @@ impl<Backend: Io> EngineState<Backend> {
                 entry.is_trusted = *is_trusted;
             }
         }
-        // a column whose leaves hold values checks the sealed records it read here, and keeps them a leaf at a time
+        // a column whose leaves hold values checks the records it read here, open and sealed, and keeps them a leaf at a time. An open
+        // row's value stays right after its seal, since a seal moves no record
         let Some(index) = self.sorted_index(*column).filter(|index| index.values.page_count() > 0) else {
             return;
         };
         let mut is_fresh = [false; SCAN_BATCH_KEYS];
         for (at, entry) in entries.iter_mut().enumerate() {
-            let (Some((start, length)), Located::Sealed(sealed), false) = (entry.record, entry.located, entry.is_value) else {
+            let (Some((start, length)), Some(row), false) = (entry.record, held_row(&entry.located), entry.is_value) else {
                 continue;
             };
             let record = &records[start..start + length];
             let key = key_in(keys, (sorted, sorted_spare, *sorted_turn), entry);
-            let identity = RecordIdentity { record_key: self.record_key, column: *column, key, kind: RowKind::Value, place: sealed.row.place };
+            let identity = RecordIdentity { record_key: self.record_key, column: *column, key, kind: RowKind::Value, place: row.0 };
             let Some(form) = form_of(record).filter(|form| !form.is_chunked) else {
                 continue;
             };
-            let Some(payload) = checked_payload(record, form, &identity).map(|payload| payload.len()) else {
+            // an open record this run read from its file is trusted, as a get trusts it
+            let is_trusted = entry.is_trusted && matches!(entry.located, Located::Open(_));
+            let payload = if is_trusted { trusted_payload(record) } else { checked_payload(record, form, &identity) };
+            let Some(payload) = payload.map(|payload| payload.len()) else {
                 continue;
             };
             let payload_at = start + length - payload;
@@ -777,11 +781,11 @@ impl<Backend: Io> EngineState<Backend> {
         }
         let fresh = entries.iter().enumerate().filter(|(at, _entry)| is_fresh.get(*at).copied().unwrap_or(false));
         index.hold_values(fresh.filter_map(|(_at, entry)| {
-            let (Located::Sealed(sealed), Some((start, length))) = (entry.located, entry.record) else {
+            let (Some(row), Some((start, length))) = (held_row(&entry.located), entry.record) else {
                 return None;
             };
             let key = key_in(keys, (sorted, sorted_spare, *sorted_turn), entry);
-            Some((key, (sealed.row.place, sealed.segment, sealed.row.offset), &records[start..start + length]))
+            Some((key, row, &records[start..start + length]))
         }));
     }
 
@@ -933,8 +937,8 @@ impl<Backend: Io> EngineState<Backend> {
                 value.extend_from_slice(lent);
                 true
             },
-            // the cache holds a value with its key, so a value from it answers as it stands
-            (Some((at, length)), Located::Sealed(_row)) if entry.is_value => {
+            // a value from the cache or a leaf's hold answers as it stands
+            (Some((at, length)), Located::Sealed(_) | Located::Open(_)) if entry.is_value => {
                 value.clear();
                 value.extend_from_slice(&batch.records[at..at + length]);
                 true
@@ -1033,7 +1037,7 @@ impl<Backend: Io> EngineState<Backend> {
     pub fn held_value(&self, volume: &Volume<Backend>, scan: &ScanState, entry: &BatchEntry) -> Option<(usize, usize)> {
         let (at, length) = entry.record?;
         let place = match entry.located {
-            Located::Sealed(_row) if entry.is_value => return Some((at, length)),
+            Located::Sealed(_) | Located::Open(_) if entry.is_value => return Some((at, length)),
             Located::Sealed(row) => row.row.place,
             Located::Open(row) => row.place,
             Located::Absent => return None,
@@ -2028,4 +2032,13 @@ fn held_for(scan: &mut ScanState, candidate: &[u8], located: &Located) -> Option
     }
     records.extend_from_slice(value);
     Some((at, value.len()))
+}
+
+/// Read the place, segment and offset a leaf's held value answers for, for an open or a sealed row
+pub fn held_row(located: &Located) -> Option<(WritePlace, SegmentNumber, FileOffset)> {
+    match located {
+        Located::Sealed(sealed) => Some((sealed.row.place, sealed.segment, sealed.row.offset)),
+        Located::Open(open) => Some((open.place, open.segment, open.offset)),
+        Located::Absent => None,
+    }
 }

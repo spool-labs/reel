@@ -349,3 +349,50 @@ fn random_against_a_walk() {
         store.close().expect("close");
     }
 }
+
+// counts over open keys a seal left between sealed ones, with overwrites and deletes on both sides, match a model
+#[test]
+fn open_stretches_count_exactly() {
+    let io = SimulatedIo::new(Seed(4_900));
+    let store = open(&io);
+    let mut model = std::collections::BTreeSet::new();
+    let key = |number: u64| format!("key-{number:05}").into_bytes();
+    for number in (0..4_000).filter(|number| number % 3 == 0) {
+        store.put(COLUMN, &key(number), b"sealed").expect("put");
+        model.insert(number);
+    }
+    seal(&store, &io);
+    for number in (0..4_000).filter(|number| number % 3 != 0) {
+        store.put(COLUMN, &key(number), b"open").expect("put");
+        model.insert(number);
+    }
+    // a sealed key overwritten open, an open one deleted, and a sealed one deleted open
+    for number in (0..4_000).filter(|number| number % 7 == 0) {
+        store.put(COLUMN, &key(number), b"again").expect("put");
+        model.insert(number);
+    }
+    for number in (0..4_000).filter(|number| number % 11 == 0) {
+        store.delete(COLUMN, &key(number)).expect("delete");
+        model.remove(&number);
+    }
+    assert_eq!(store.count_prefix(COLUMN, b"key-").expect("count"), RowCount(model.len() as u64));
+    for prefix in ["key-0", "key-01", "key-012", "key-3", "key-39"] {
+        let wanted = model.iter().filter(|number| key(**number).starts_with(prefix.as_bytes())).count() as u64;
+        assert_eq!(store.count_prefix(COLUMN, prefix.as_bytes()).expect("count"), RowCount(wanted), "prefix {prefix}");
+    }
+    store.close().expect("close");
+}
+
+// a range delete over open keys hides them from the count
+#[test]
+fn a_cover_hides_open_keys_from_a_count() {
+    let io = SimulatedIo::new(Seed(4_901));
+    let store = open(&io);
+    let key = |number: u64| format!("key-{number:05}").into_bytes();
+    for number in 0..2_000 {
+        store.put(COLUMN, &key(number), b"open").expect("put");
+    }
+    store.delete_range(COLUMN, &key(500), &key(1_500)).expect("delete");
+    assert_eq!(store.count_prefix(COLUMN, b"key-").expect("count"), RowCount(1_000));
+    store.close().expect("close");
+}

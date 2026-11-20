@@ -144,12 +144,9 @@ impl RecordReader {
             && let Some(shape) = written_shape(location.length)
             && shape.front_length <= FIRST_READ_BYTES
         {
-            let mut unfilled = UnfilledRead::new(buf, shape.value_length.0 as usize);
-            {
-                let mut parts = [IoSliceMut::new(&mut self.first[..shape.front_length]), IoSliceMut::new(unfilled.buf())];
-                device.read_parts(file, location.offset, &mut parts).await?;
-            }
-            unfilled.filled();
+            buf.resize(shape.value_length.0 as usize, 0);
+            let mut parts = [IoSliceMut::new(&mut self.first[..shape.front_length]), IoSliceMut::new(buf)];
+            device.read_parts(file, location.offset, &mut parts).await?;
 
             if let Some(form) = self.form()
                 && form.is_chunked
@@ -180,9 +177,8 @@ impl RecordReader {
             return Ok(RecordRead::Failed);
         };
         if head.codec == Codec::None {
-            let mut unfilled = UnfilledRead::new(buf, head.value_length.0 as usize);
-            device.read_exact(file, FileOffset(location.offset.0 + payload_start(&head)), unfilled.buf()).await?;
-            unfilled.filled();
+            buf.resize(head.value_length.0 as usize, 0);
+            device.read_exact(file, FileOffset(location.offset.0 + payload_start(&head)), buf).await?;
             if holds() {
                 return Ok(RecordRead::Valid);
             }
@@ -667,44 +663,6 @@ pub fn checked_payload<'record>(record: &'record [u8], form: RecordForm, identit
     let payload = record.get(SMALL_HEAD_BYTES..)?;
     let check = place_check(record_check(identity, form, checksum(payload)), identity.record_key, identity.place);
     (read_check(record) == Some(check)).then_some(payload)
-}
-
-/// A buffer sized for a read that writes every byte of it, with no fill first. Until the read finishes whole it clears the buffer
-/// when dropped, so a read that fails, or whose future is dropped part way, leaves no byte it didn't write
-pub struct UnfilledRead<'buf> {
-    buf: &'buf mut Vec<u8>,
-    is_filled: bool,
-}
-
-impl<'buf> UnfilledRead<'buf> {
-    /// Size the buffer for the read
-    #[allow(clippy::uninit_vec, reason = "the read that follows writes every byte, and the guard clears the buffer when it doesn't")]
-    pub fn new(buf: &'buf mut Vec<u8>, length: usize) -> Self {
-        buf.clear();
-        buf.reserve(length);
-        // SAFETY: a u8 has no invalid value, and no byte is read before the read wrote all of them: until filled() the drop clears
-        // the buffer
-        unsafe { buf.set_len(length) };
-        Self { buf, is_filled: false }
-    }
-
-    /// Lend the buffer to the read
-    pub fn buf(&mut self) -> &mut Vec<u8> {
-        self.buf
-    }
-
-    /// Say the read wrote every byte
-    pub fn filled(mut self) {
-        self.is_filled = true;
-    }
-}
-
-impl Drop for UnfilledRead<'_> {
-    fn drop(&mut self) {
-        if !self.is_filled {
-            self.buf.clear();
-        }
-    }
 }
 
 /// Give a one-chunk record's payload where it lies, with no check, for a record its reader trusts

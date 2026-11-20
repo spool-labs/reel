@@ -7,7 +7,7 @@
 
 use std::cmp::Ordering;
 use std::hint::black_box;
-use std::sync::{Mutex, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, RwLockWriteGuard};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as Memory};
 
 use reel_core::units::{ByteCount, FileOffset, RowCount, WritePlace};
@@ -180,8 +180,10 @@ pub struct SortedKeys {
     past_capacity: AtomicU64,
     /// Goes up each time open rows go in ahead of their seal, before they leave the open counts
     entered: AtomicU64,
-    /// Values the leaves keep, from a pool sized at open, which holds no page unless a share was given to it
-    pub values: ValuePages,
+    /// Values the leaves keep, from one pool every sorted index of the store shares, sized at open
+    pub values: Arc<ValuePages>,
+    /// This index counts the shared pool's memory and fills, so the store counts them once
+    owns_values: bool,
     /// One past the highest page ever taken. Pages are chained in order at build and taken from the head, so every page at or
     /// past this one still holds the chain the build wrote
     /// The rows the column was told to hold, which sized the pool
@@ -319,7 +321,8 @@ impl SortedKeys {
             mark: AtomicU64::new(NO_MARK),
             past_capacity: AtomicU64::new(0),
             entered: AtomicU64::new(0),
-            values: ValuePages::new(0),
+            values: Arc::new(ValuePages::new(0)),
+            owns_values: false,
             told_rows: rows,
         }
         .chained()
@@ -347,7 +350,7 @@ impl SortedKeys {
 
     /// Read the heap the index holds
     pub fn heap_bytes(&self) -> ByteCount {
-        ByteCount((self.words.capacity() * size_of::<AtomicU32>()) as u64 + self.values.heap_bytes().0)
+        ByteCount((self.words.capacity() * size_of::<AtomicU32>()) as u64 + if self.owns_values { self.values.heap_bytes().0 } else { 0 })
     }
 
     /// Count the pages the pool has
@@ -758,18 +761,24 @@ impl SortedKeys {
         is_found.then(|| self.read_entry(leaf, index))
     }
 
-    /// Give the leaves a pool of value pages to keep values in
-    pub fn holding_values(mut self, pages: u32) -> Self {
-        self.values = ValuePages::new(pages);
+    /// Give the leaves the store's pool of value pages to keep values in, which one index owns for the counts
+    pub fn holding_values(mut self, pool: Arc<ValuePages>, owns: bool) -> Self {
+        self.values = pool;
+        self.owns_values = owns;
         self
     }
 
-    /// Copy the value a key's entry holds onto the end of `out`, when the entry still names this row and its leaf holds the value
+    /// Check this index counts the shared pool's memory and fills
+    pub fn owns_values(&self) -> bool {
+        self.owns_values
+    }
+
     /// Copy a value a batch noted held onto the end of `out`, or say the leaf let it go since
     pub fn read_held(&self, held: HeldRef, out: &mut Vec<u8>) -> bool {
         self.values.read(held.chain, held.slot as usize, out)
     }
 
+    /// Copy the value a key's entry holds onto the end of `out`, when the entry still names this row and its leaf holds the value
     pub fn held_value(&self, key: &[u8], row: (WritePlace, SegmentNumber, FileOffset), out: &mut Vec<u8>) -> bool {
         if self.values.page_count() == 0 || key.len() > self.width {
             return false;

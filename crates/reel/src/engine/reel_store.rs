@@ -69,7 +69,7 @@ use crate::engine::complete_image::ImageFiles;
 use crate::index::complete_table::CompleteTable;
 use crate::index::complete_table::planned_table_bytes;
 use crate::index::sorted_keys::{MOST_KEY_BYTES, SortedKeys, planned_index_bytes, rows_for_bytes};
-use crate::index::value_pages::VALUE_PAGE_BYTES;
+use crate::index::value_pages::{VALUE_PAGE_BYTES, ValuePages};
 use crate::index::spot_index::SpotIndex;
 use crate::index::write_index::WriteIndex;
 use crate::io::lock_outcome::LockOutcome;
@@ -1906,8 +1906,16 @@ pub fn size_sorted_indexes(config: &StoreConfig, sizing: &EngineSizing, summarie
 /// Allocate and touch each sorted column's index at the rows open sized it for
 pub fn sorted_indexes(config: &StoreConfig, sizes: &[Option<SortedSize>]) -> Vec<Option<SortedKeys>> {
     let mut indexes: Vec<Option<SortedKeys>> = (0..MAX_COLUMNS).map(|_column| None).collect();
+    // every index's share of value pages goes in one pool, so the columns walks read take what the others leave
+    let pages: u64 = sizes.iter().flatten().filter(|size| size.rows.0 > 0).map(|size| u64::from(size.value_pages)).sum();
+    let pool = Arc::new(ValuePages::new(u32::try_from(pages).unwrap_or(u32::MAX - 1)));
+    let mut has_owner = false;
     for column in &config.columns {
-        indexes[column.id.0 as usize] = sizes[column.id.0 as usize].filter(|size| size.rows.0 > 0).map(|size| SortedKeys::new(column.key_shape.widest(), size.rows).holding_values(size.value_pages));
+        indexes[column.id.0 as usize] = sizes[column.id.0 as usize].filter(|size| size.rows.0 > 0).map(|size| {
+            let index = SortedKeys::new(column.key_shape.widest(), size.rows).holding_values(Arc::clone(&pool), !has_owner);
+            has_owner = true;
+            index
+        });
     }
     indexes
 }

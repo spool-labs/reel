@@ -114,7 +114,7 @@ mod in_an_index {
     // replaced since its fill, or a leaf split under it, answers nothing until filled again
     #[test]
     fn held_answers_are_always_the_entrys_row() {
-        let index = SortedKeys::new(WIDTH, RowCount(KEYS * 2)).holding_values(8);
+        let index = SortedKeys::new(WIDTH, RowCount(KEYS * 2)).holding_values(std::sync::Arc::new(reel::index::value_pages::ValuePages::new(8)), true);
         for number in 0..KEYS {
             index.upsert(&key(number), entry(row(number, 0)), Floors::at(WritePlace(0)));
         }

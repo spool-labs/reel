@@ -285,13 +285,26 @@ impl ValuePages {
     }
 
     fn copy_out(&self, page: u32, offset: usize, length: usize, out: &mut Vec<u8>) {
-        // the room is sized once, and each word fills its own eight bytes
+        // the page's words are found once, and each lands in the buffer's spare room with no fill before it
+        let first = page as usize * VALUE_PAGE_WORDS + offset / size_of::<u64>();
+        let words = &self.words[first..first + length.div_ceil(size_of::<u64>())];
         let start = out.len();
-        out.resize(start + length, 0);
-        let first = offset / size_of::<u64>();
-        for (index, bytes) in out[start..].chunks_mut(size_of::<u64>()).enumerate() {
-            bytes.copy_from_slice(&self.word(page, first + index).load(Ordering::Relaxed).to_le_bytes()[..bytes.len()]);
+        out.reserve(length);
+        let room = out.spare_capacity_mut();
+        let (whole, tail) = (length / size_of::<u64>(), length % size_of::<u64>());
+        for (word, bytes) in words.iter().zip(room.chunks_exact_mut(size_of::<u64>())).take(whole) {
+            for (byte, value) in bytes.iter_mut().zip(word.load(Ordering::Relaxed).to_le_bytes()) {
+                byte.write(value);
+            }
         }
+        if tail > 0 {
+            let last = words[whole].load(Ordering::Relaxed).to_le_bytes();
+            for (byte, value) in room[whole * size_of::<u64>()..length].iter_mut().zip(last) {
+                byte.write(value);
+            }
+        }
+        // SAFETY: the loops above wrote each of the `length` bytes past `start`, and the room holds them
+        unsafe { out.set_len(start + length) };
     }
 
     fn used(&self, page: u32) -> usize {

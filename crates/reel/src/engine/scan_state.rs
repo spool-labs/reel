@@ -312,6 +312,9 @@ pub struct ScanState {
     pub sorted_next: usize,
     /// The index holds nothing past the batch
     pub is_sorted_done: bool,
+    /// The sorted index's count of enterings when the batch was read, so a batch read before open rows left the counts is
+    /// read again
+    pub sorted_entered: u64,
     /// The walk takes its sealed keys from the column's sorted index, and seats no segment
     pub is_on_index: bool,
     /// The rows the caller said it wants, and the rows it has asked for with a value
@@ -672,6 +675,7 @@ impl ScanState {
             sorted_turn: 0,
             sorted_next: 0,
             is_sorted_done: false,
+            sorted_entered: u64::MAX,
             is_on_index: false,
             wanted: u64::MAX,
             asked: 0,

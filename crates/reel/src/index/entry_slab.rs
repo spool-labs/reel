@@ -35,6 +35,8 @@ pub const SLOT_AT: usize = 28;
 pub const KEY_AT: usize = 29;
 /// Set beside the kind when a newer version of this key is in a sealed segment
 pub const NEWER_SEALED_FLAG: u8 = 0x80;
+/// The bit of a row's kind byte that says the row is in its column's sorted index and out of the open counts
+pub const ENTERED_FLAG: u8 = 0x40;
 
 /// The id of one page
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -208,7 +210,7 @@ impl EntrySlab {
             place: WritePlace(self.word(start + PLACE_AT)),
             offset: FileOffset(u64::from(self.half(start + OFFSET_AT))),
             length: ByteCount(u64::from(self.half(start + LENGTH_AT))),
-            kind: RowKind::from_byte(self.bytes[start + KIND_AT] & !NEWER_SEALED_FLAG)?,
+            kind: RowKind::from_byte(self.bytes[start + KIND_AT] & !(NEWER_SEALED_FLAG | ENTERED_FLAG))?,
             slot: self.slot(address),
             segment: SegmentNumber(0),
             has_newer_sealed: self.has_newer_sealed(address),
@@ -245,6 +247,16 @@ impl EntrySlab {
     /// Note that a newer version of this row's key sits in a sealed segment
     pub fn mark_newer_sealed(&mut self, address: EntryAddress) {
         self.bytes[byte_of(address) + KIND_AT] |= NEWER_SEALED_FLAG;
+    }
+
+    /// Check a row went into its column's sorted index before its seal
+    pub fn is_entered(&self, address: EntryAddress) -> bool {
+        self.bytes[byte_of(address) + KIND_AT] & ENTERED_FLAG != 0
+    }
+
+    /// Note a row went into its column's sorted index before its seal
+    pub fn mark_entered(&mut self, address: EntryAddress) {
+        self.bytes[byte_of(address) + KIND_AT] |= ENTERED_FLAG;
     }
 
     /// Read one little-endian word

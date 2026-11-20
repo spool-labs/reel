@@ -76,6 +76,9 @@ pub struct SlotData<File> {
     pub recovered_end: FileOffset,
 }
 
+/// What a slot's segment reads when it holds none
+pub const NO_SLOT_SEGMENT: u64 = u64::MAX;
+
 /// One open slot's file, kept under a short lock
 #[derive(Debug)]
 pub struct SlotFile<File> {
@@ -83,6 +86,8 @@ pub struct SlotFile<File> {
     pub leaving_rows: Mutex<Option<File>>,
     pub pins: AtomicU32,
     pub volume: AtomicUsize,
+    /// The segment the slot holds, read with no lock, or NO_SLOT_SEGMENT
+    pub segment: AtomicU64,
 }
 
 /// The state every store handle and job shares
@@ -188,6 +193,8 @@ pub struct EngineState<Backend: Io> {
     pub scan_window_records: AtomicU64,
     /// Open records a scan batch read from their file and answered with no sum, since this run wrote them
     pub scan_trusted_records: AtomicU64,
+    /// Open rows entered in their sorted index ahead of their seal
+    pub rows_entered: AtomicU64,
     /// Scan batches whose two or more records came in file order and skipped the sort
     pub scan_batches_presorted: AtomicU64,
     /// Row blocks a merge's install couldn't read to move sorted entries, whose keys ask the footers once the inputs go
@@ -259,6 +266,7 @@ impl<File: Clone> SlotFile<File> {
             leaving_rows: Mutex::new(None),
             pins: AtomicU32::new(0),
             volume: AtomicUsize::new(0),
+            segment: AtomicU64::new(NO_SLOT_SEGMENT),
         };
         // some platforms set a lock up at its first use, and that's a job for open
         drop(hold(&slot.leaving_rows));
@@ -295,6 +303,7 @@ impl<File: Clone> SlotFile<File> {
             Ok(guard) => guard,
             Err(poisoned) => crate::guard::recover(poisoned),
         };
+        self.segment.store(file.as_ref().map_or(NO_SLOT_SEGMENT, |data| data.segment.0), Ordering::Release);
         *guard = file;
     }
 

@@ -407,7 +407,10 @@ impl WriteShard {
         let mut touched = 0;
         for (hash, &entry) in hashes.iter_mut().zip(entries) {
             *hash = hash_key(self.slab.column(entry), self.slab.key(entry));
-            counts.remove(self.slab.key(entry));
+            // a row entered in its sorted index left the counts then
+            if !self.slab.is_entered(entry) {
+                counts.remove(self.slab.key(entry));
+            }
             touched ^= self.table.home_tag(*hash);
         }
         hint::black_box(touched);

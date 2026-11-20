@@ -10,6 +10,7 @@ use crate::engine::engine_state::EngineState;
 use crate::engine::open_segment::{OpenSegment, SegmentPhase};
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
+use crate::index::write_index::{EnterRun, SHARD_COUNT};
 use crate::io::{Io, IoFile, IoTask};
 use crate::io::job::{Job, JobStep};
 
@@ -22,9 +23,26 @@ pub const IDLE_SEAL_AFTER: Nanoseconds = Nanoseconds(3_000_000_000);
 /// How old a segment's oldest delete gets before the segment seals, idle or not, so a trickle of writes can't hold space back
 pub const DELETE_SEAL_AFTER: Nanoseconds = Nanoseconds(60_000_000_000);
 
+/// How long the write index sits with no change before its open rows go into their sorted indexes. A test build enters at every
+/// quiet step, so every simulation runs its walks over entered rows
+pub const ENTER_QUIET: Nanoseconds = if cfg!(feature = "test-hooks") { Nanoseconds(0) } else { Nanoseconds(50_000_000) };
+
+/// What the row job watches to enter open rows once the write index is quiet
+#[derive(Debug, Default)]
+pub struct EnterWatch {
+    /// The write index's count of changes when the job last looked, and when it last moved
+    pub changes: u64,
+    pub moved_at: Nanoseconds,
+    /// The count of changes the last entering saw, so a quiet index enters once
+    pub entered_at: u64,
+    /// The entering's buffers, sized at open
+    pub run: EnterRun,
+}
+
 /// The job that sends waiting rows to the kernel
 pub struct RowJob<Backend: Io> {
     pub state: Arc<EngineState<Backend>>,
+    pub entering: EnterWatch,
 }
 
 impl<Backend: Io> RowJob<Backend> {
@@ -138,6 +156,28 @@ impl<Backend: Io> RowJob<Backend> {
         false
     }
 
+    /// Enter the open rows into their sorted indexes once the write index sat with no change for a while, so quiet walks need
+    /// no heads. Says when to look again while the index is still settling
+    pub fn enter_when_quiet(&mut self) -> Option<Nanoseconds> {
+        let now = self.state.io.now();
+        let changes: u64 = (0..SHARD_COUNT).map(|shard| self.state.index.change_count(shard)).sum();
+        let watch = &mut self.entering;
+        if changes != watch.changes {
+            watch.changes = changes;
+            watch.moved_at = now;
+        }
+        if changes == watch.entered_at {
+            return None;
+        }
+        let due = Nanoseconds(watch.moved_at.0 + ENTER_QUIET.0);
+        if now.0 < due.0 {
+            return Some(due);
+        }
+        watch.entered_at = changes;
+        let _entered = self.state.enter_open_rows(&mut watch.run);
+        None
+    }
+
     /// Check any slot has rows waiting
     pub fn has_rows(&self) -> bool {
         for slot in 0..self.state.queues.len() {
@@ -168,9 +208,9 @@ impl<Backend: Io> Job for RowJob<Backend> {
             // a busy store still has quiet segments, and each goes by its own last write
             let _deadline = self.seal_idle_segments();
             while self.give_back_room() {}
-            return JobStep::IdleUntil {
-                deadline: Nanoseconds(now.0 + WRITE_OUT_PERIOD.0),
-            };
+            let next = Nanoseconds(now.0 + WRITE_OUT_PERIOD.0);
+            let deadline = self.enter_when_quiet().map_or(next, |due| due.min(next));
+            return JobStep::IdleUntil { deadline };
         }
 
         // a row that lands after this store wakes the job, and one that landed before it is seen here
@@ -181,6 +221,10 @@ impl<Backend: Io> Job for RowJob<Backend> {
         }
         let deadline = self.seal_idle_segments();
         while self.give_back_room() {}
+        let deadline = match self.enter_when_quiet() {
+            Some(due) => Some(deadline.map_or(due, |soonest| soonest.min(due))),
+            None => deadline,
+        };
         match deadline {
             Some(deadline) => JobStep::IdleUntil { deadline },
             None => JobStep::Idle,

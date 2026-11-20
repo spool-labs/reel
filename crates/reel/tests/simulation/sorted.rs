@@ -2467,3 +2467,159 @@ fn heads_skip_shards_with_no_open_key_near() {
     assert!(skipped > 0, "no head stood on a bound");
     store.close().expect("close");
 }
+
+// let the jobs run through a write-out period, as the clock would, so a row job waiting on its period enters what landed
+fn quiet(io: &SimulatedIo) {
+    settle(io);
+    io.advance_clock(reel::engine::row_job::WRITE_OUT_PERIOD);
+    settle(io);
+}
+
+// every row of a walk, keys and values, from a start
+fn walk_rows(scan: &mut StoreScan<SimulatedIo>) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    let (mut rows, mut name, mut value) = (BTreeMap::new(), Vec::new(), Vec::new());
+    while scan.next_row(&mut name, &mut value).expect("step") == ScanStep::Found {
+        assert!(rows.insert(name.clone(), value.clone()).is_none(), "a key twice in one walk");
+    }
+    rows
+}
+
+// every key of a walk
+fn walk_keys(scan: &mut StoreScan<SimulatedIo>) -> Vec<Vec<u8>> {
+    let (mut keys, mut name) = (Vec::new(), Vec::new());
+    while scan.next_key(&mut name).expect("step") == ScanStep::Found {
+        keys.push(name.clone());
+    }
+    keys
+}
+
+// check a store's walks, keys, counts and gets against a model
+fn check_against(store: &Store, model: &BTreeMap<Vec<u8>, Vec<u8>>, when: &str) {
+    let rows = walk_rows(&mut store.iter_from(COLUMN, &[], Direction::Ascending).expect("scan"));
+    assert!(rows == *model, "{when}: the value walk has {} rows, the model {}", rows.len(), model.len());
+    let keys = walk_keys(&mut store.iter_from(COLUMN, &[], Direction::Ascending).expect("scan"));
+    assert!(keys.iter().eq(model.keys()), "{when}: the key walk differs");
+    let mut descending = walk_keys(&mut store.iter_from(COLUMN, &[0xFF; WIDTH as usize], Direction::Descending).expect("scan"));
+    descending.reverse();
+    assert!(descending.iter().eq(model.keys()), "{when}: the descending walk differs");
+    assert_eq!(store.count_prefix(COLUMN, &[]).expect("count"), RowCount(model.len() as u64), "{when}: the count");
+    for number in 0..KEYS + KEYS / 4 {
+        assert_eq!(read(store, &key(number)), model.get(&key(number)).cloned(), "{when}: key {number}");
+    }
+}
+
+// open rows entered in the sorted index ahead of their seal answer walks, keys, counts and gets as the model holds them, with
+// heads skipped while quiet; rows written after the entering, and a seal after, change nothing the model doesn't
+#[test]
+fn entered_rows_answer_as_the_model() {
+    let io = SimulatedIo::new(Seed(5_100));
+    let store = open(&io, CAPACITY);
+    let mut model = BTreeMap::new();
+    for number in 0..KEYS {
+        store.put(COLUMN, &key(number), b"sealed").expect("put");
+        model.insert(key(number), b"sealed".to_vec());
+    }
+    seal_all(&store, &io);
+    for number in (0..KEYS).step_by(3) {
+        store.put(COLUMN, &key(number), b"open").expect("put");
+        model.insert(key(number), b"open".to_vec());
+    }
+    for number in (0..KEYS).step_by(7) {
+        store.delete(COLUMN, &key(number)).expect("delete");
+        model.remove(&key(number));
+    }
+    for number in KEYS..KEYS + KEYS / 4 {
+        store.put(COLUMN, &key(number), b"new").expect("put");
+        model.insert(key(number), b"new".to_vec());
+    }
+    // a key put, deleted and put again in one segment goes in as its newest row
+    store.put(COLUMN, &key(5), b"once").expect("put");
+    store.delete(COLUMN, &key(5)).expect("delete");
+    store.put(COLUMN, &key(5), b"twice").expect("put");
+    model.insert(key(5), b"twice".to_vec());
+    quiet(&io);
+    let entered = report(&store).rows_entered;
+    assert!(entered > 0, "no row was entered");
+    let skipped = report(&store).heads_skipped;
+    check_against(&store, &model, "entered");
+    assert!(report(&store).heads_skipped > skipped, "no head was skipped over entered rows");
+
+    // rows past the entering stay counted, so their shards place real heads
+    for number in (1..KEYS).step_by(5) {
+        store.put(COLUMN, &key(number), b"later").expect("put");
+        model.insert(key(number), b"later".to_vec());
+    }
+    for number in (2..KEYS).step_by(11) {
+        store.delete(COLUMN, &key(number)).expect("delete");
+        model.remove(&key(number));
+    }
+    check_against(&store, &model, "written after");
+    quiet(&io);
+    check_against(&store, &model, "entered again");
+    seal_all(&store, &io);
+    check_against(&store, &model, "sealed");
+    store.close().expect("close");
+    let store = open(&io, CAPACITY);
+    check_against(&store, &model, "reopened");
+    store.close().expect("close");
+}
+
+// a cue taken before open rows were overwritten and entered reads the rows of its point: an entry newer than the cue stands over
+// an older row still open, and the write index answers it
+#[test]
+fn a_cue_reads_under_newer_entered_rows() {
+    let io = SimulatedIo::new(Seed(5_101));
+    let store = open(&io, CAPACITY);
+    let mut before = BTreeMap::new();
+    for number in 0..KEYS {
+        store.put(COLUMN, &key(number), b"first").expect("put");
+        before.insert(key(number), b"first".to_vec());
+    }
+    settle(&io);
+    let cue = store.cue().expect("cue");
+    for number in (0..KEYS).step_by(2) {
+        store.put(COLUMN, &key(number), b"second").expect("put");
+    }
+    for number in (1..KEYS).step_by(9) {
+        store.delete(COLUMN, &key(number)).expect("delete");
+    }
+    let entered = report(&store).rows_entered;
+    quiet(&io);
+    assert!(report(&store).rows_entered > entered, "the overwrites were not entered");
+    let rows = walk_rows(&mut cue.iter_from(COLUMN, &[], Direction::Ascending).expect("scan"));
+    assert!(rows == before, "the cue's walk has {} rows, its point {}", rows.len(), before.len());
+    drop(cue);
+    store.close().expect("close");
+}
+
+// a cue taken before a delete reads the deleted key's sealed value after the open grave is entered: the grave goes in as an
+// entry newer than the cue's point, and the cue's read goes past it to the sealed row
+#[test]
+fn a_cue_reads_under_an_entered_grave() {
+    let io = SimulatedIo::new(Seed(5_102));
+    let store = open(&io, CAPACITY);
+    for number in 0..KEYS {
+        store.put(COLUMN, &key(number), b"sealed").expect("put");
+    }
+    seal_all(&store, &io);
+    let cue = store.cue().expect("cue");
+    for number in (0..KEYS).step_by(3) {
+        store.delete(COLUMN, &key(number)).expect("delete");
+    }
+    let entered = report(&store).rows_entered;
+    quiet(&io);
+    assert!(report(&store).rows_entered > entered, "the graves were not entered");
+    let rows = walk_rows(&mut cue.iter_from(COLUMN, &[], Direction::Ascending).expect("scan"));
+    assert_eq!(rows.len() as u64, KEYS, "the cue's walk lost deleted keys");
+    let mut value = Vec::new();
+    for number in 0..KEYS {
+        assert!(cue.get(COLUMN, &key(number), &mut value).expect("get"), "the cue's get lost key {number}");
+        assert_eq!(value, b"sealed");
+    }
+    for number in 0..KEYS {
+        let wanted = (number % 3 != 0).then(|| b"sealed".to_vec());
+        assert_eq!(read(&store, &key(number)), wanted, "key {number} now");
+    }
+    drop(cue);
+    store.close().expect("close");
+}

@@ -13,8 +13,7 @@ use reel_core::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
 use crate::engine::engine_state::{EngineState, SlotPin};
 use crate::engine::open_segment::MOST_WINDOW_RECORD_BYTES;
-use crate::engine::complete_path::sealed_of;
-use crate::engine::read_path::{HeldPin, KeyRead, Located, MOST_READ_TRIES, RecordWant, SealedRow, newest_of};
+use crate::engine::read_path::{HeldPin, KeyRead, Located, MOST_READ_TRIES, RecordWant, SealedRow, newest_located, newest_of};
 use crate::engine::scan_state::{
     BatchEntry, BatchRow, BlockTake, JOIN_GAP, MOST_BATCH_RECORD, MOST_BATCH_RUNS, MOST_WINDOW_RECORD, NO_GENERATION, NO_CHANGES, ScanBatch, batch_room,
     SCAN_CACHE_PARTS, SCAN_CACHE_WEIGH_EVERY, SEAT_BATCH, ScanRange, ScanState, ScanWindows, SegmentSource, ShardHead,
@@ -308,24 +307,29 @@ impl<Backend: Io> EngineState<Backend> {
     /// Take a key's newest sealed row from the index batch, when the batch stands on the key. An entry newer than the read point,
     /// or a value whose segment left when the step reads the value itself, sends the key to the footers. A located batch meets a
     /// segment that left at its own read, and sends that key back through a step that reads it
-    pub async fn sorted_sealed(
+    pub async fn sorted_located(
         &self,
         device: &impl DeviceReads<Backend::File>,
         volume: &Volume<Backend>,
         scan: &mut ScanState,
         (candidate, is_reading): (&[u8], bool),
         read: &KeyRead<'_>,
-    ) -> Result<Option<SealedRow>, StoreError> {
+    ) -> Result<Located, StoreError> {
         if scan.sorted_key() != Some(candidate) {
-            return Ok(None);
+            return Ok(Located::Absent);
         }
         let entry = scan.sorted.entries[scan.sorted_next];
-        if entry.place > read.read_point || (is_reading && !entry.is_grave && volume.table.pin(entry.segment).is_none()) {
+        let located = self.located_entry(&entry);
+        let is_gone = is_reading && !entry.is_grave && matches!(located, Located::Sealed(_)) && volume.table.pin(entry.segment).is_none();
+        if entry.place > read.read_point || is_gone {
             self.sorted_footer_asks.fetch_add(1, Ordering::Relaxed);
-            return self.search_sealed(device, volume, read).await;
+            // an entry newer than the point can stand over an older row still open, which the write index holds at the point
+            let open = self.index.lookup(scan.column, candidate, read.read_point, volume.view()).row;
+            let sealed = self.search_sealed(device, volume, read).await?;
+            return Ok(newest_of(open, sealed));
         }
         scan.sorted_scan_keys += 1;
-        Ok(Some(sealed_of(&entry)))
+        Ok(located)
     }
 
     /// Answer the walk's next key at a point
@@ -354,11 +358,12 @@ impl<Backend: Io> EngineState<Backend> {
                 self.index.lookup(scan.column, candidate, read.read_point, volume.view()).row
             },
         };
-        let sealed = if scan.is_on_index {
-            self.sorted_sealed(device, volume, scan, (candidate, matches!(want, ScanWant::Value(_))), &read).await?
+        let other = if scan.is_on_index {
+            self.sorted_located(device, volume, scan, (candidate, matches!(want, ScanWant::Value(_))), &read).await?
         } else {
             let taken = self.take_rows(device, volume, scan, candidate, read.read_point).await?;
-            if scan.is_spilled { self.search_sealed(device, volume, &read).await? } else { taken }
+            let sealed = if scan.is_spilled { self.search_sealed(device, volume, &read).await? } else { taken };
+            sealed.map_or(Located::Absent, Located::Sealed)
         };
         // a seal moves rows from the index to a segment this walk hasn't seated, and both of its looks must see one list
         let is_same_list = at.directory.is_none_or(|directory| directory.generation() == at.generation);
@@ -366,7 +371,7 @@ impl<Backend: Io> EngineState<Backend> {
             return Ok(StepOutcome::Moved);
         }
 
-        let located = newest_of(found, sealed);
+        let located = newest_located(found, other);
         let is_hidden = located.place().is_some_and(|place| read.cover.is_some_and(|cover| cover > place));
         if !located.has_value() || is_hidden {
             scan.pass(candidate);
@@ -504,7 +509,8 @@ impl<Backend: Io> EngineState<Backend> {
             if directory.map_or(0, ColumnDirectory::generation) != scan.generation || point > scan.heads_mark {
                 break;
             }
-            if scan.sorted_next >= scan.sorted.len()
+            // a batch read again starts from the walk's position, which takes the key the run passed last first
+            if (scan.sorted_next >= scan.sorted.len() || index.entered() != scan.sorted_entered)
                 && let Some(at) = passed.take()
             {
                 scan.pass_sorted(at);
@@ -532,12 +538,12 @@ impl<Backend: Io> EngineState<Backend> {
             let sealed = match is_sorted.then(|| scan.sorted.entries[scan.sorted_next]) {
                 // an entry newer than the point asks the footers, in the step that answers one key at a time
                 Some(entry) if entry.place > point => break,
-                Some(entry) => Some(sealed_of(&entry)),
+                Some(entry) => Some(self.located_entry(&entry)),
                 None => None,
             };
             // no head shows an index key here, so its entry keeps the key where the index batch holds it
             let Some(shown) = scan.closest_head.filter(|_head| is_head) else {
-                let located = newest_of(None, sealed);
+                let located = sealed.unwrap_or(Located::Absent);
                 let at = scan.sorted_next;
                 if located.has_value() {
                     let from = KeyFrom::Sorted(scan.sorted_turn);
@@ -572,7 +578,7 @@ impl<Backend: Io> EngineState<Backend> {
             if directory.map_or(0, ColumnDirectory::generation) != scan.generation {
                 break;
             }
-            let located = newest_of(open, sealed);
+            let located = newest_located(open, sealed.unwrap_or(Located::Absent));
             if located.has_value() {
                 let key_at = scan.batch.keys.len();
                 scan.batch.keys.extend_from_slice(name);
@@ -1186,7 +1192,9 @@ impl<Backend: Io> EngineState<Backend> {
         }
         // a shard whose open counts show no open key near the walk takes no lock and no descent: its head stands on a bound the
         // walk places for real once it gets there. The count of changes is read first, so a write landing after it moves the count
-        if !self.is_read_only {
+        // Rows entered in a sorted index ahead of their seal left the counts, so only a walk that reads that index may skip them
+        let may_bound = scan.is_on_index || self.sorted_index(scan.column).is_none();
+        if !self.is_read_only && may_bound {
             let ScanState { heads, position, direction, column: column_of, .. } = &mut *scan;
             let mut skipped = 0;
             let width = self.column(*column_of).map_or(KeyShape::Variable { most: 0 }, |info| info.key_shape);
@@ -1894,6 +1902,12 @@ pub fn fill_sorted(index: &SortedKeys, scan: &mut ScanState) {
         scan.sorted_next = 0;
         scan.is_sorted_done = false;
     }
+    // open rows entered since the batch was read may have left the open counts, so the batch is read again from the walk's
+    // position. The count is read before the read, so a later entering shows as a change
+    let entered = index.entered();
+    if entered != scan.sorted_entered {
+        scan.forget_sorted();
+    }
     loop {
         while let Some(key) = scan.sorted_key() {
             if scan.is_ahead(key) {
@@ -1908,6 +1922,7 @@ pub fn fill_sorted(index: &SortedKeys, scan: &mut ScanState) {
         let most = batch_room(scan.wanted, scan.asked).max(1);
         // the read fills the spare, so the batch's entries keep their keys in the index batch it read last
         scan.turn_sorted();
+        scan.sorted_entered = entered;
         let ScanState { sorted, position, is_inclusive, direction, .. } = scan;
         let from = ScanFrom::Key { key: position, is_inclusive: *is_inclusive };
         let is_done = match direction {

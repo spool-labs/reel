@@ -11,13 +11,16 @@ use reel_core::units::{RowCount, WritePlace};
 
 use crate::config::MAX_KEY_BYTES;
 use crate::engine::engine_state::EngineState;
-use crate::engine::read_path::{KeyRead, SealedRow, WalkAsk, corruption};
+use crate::engine::read_path::{KeyRead, Located, SealedRow, WalkAsk, corruption};
+use crate::index::write_row::WriteRow;
 use crate::engine::recovery::{whole_columns, widen_row};
 use crate::engine::volume::{NO_SEAL, Volume};
 use crate::fixed_list::{FixedList, ListFull, ListOut, full};
 use crate::guard::hold;
 use crate::index::complete_table::{CompleteSlot, CompleteTable, TagMatches, tag_of};
 use crate::index::open_slots::OpenSlot;
+use crate::index::open_slots::MAX_OPEN_SLOTS;
+use crate::index::write_index::{EnterRun, SHARD_COUNT};
 use crate::engine::seal_job::SortedRun;
 use crate::index::sorted_keys::{Floors, HOLD_ROWS, KeyEntry, SortedKeys};
 use crate::index::key_hash::{KeyHash, hash_key};
@@ -72,6 +75,24 @@ impl<Backend: Io> EngineState<Backend> {
         self.sorted.get(column.0 as usize).and_then(Option::as_ref)
     }
 
+    /// Read where an index entry's row lies: an open row while an open slot holds its segment, which an entry made before its seal
+    /// names, and a sealed row once the segment sealed
+    pub fn located_entry(&self, entry: &KeyEntry) -> Located {
+        let open = self.slot_files.iter().position(|slot| slot.segment.load(Ordering::Acquire) == entry.segment.0);
+        match open {
+            Some(slot) => Located::Open(WriteRow {
+                place: entry.place,
+                offset: entry.offset,
+                length: entry.length,
+                kind: if entry.is_grave { RowKind::Grave } else { RowKind::Value },
+                slot: OpenSlot(slot as u8),
+                segment: entry.segment,
+                has_newer_sealed: false,
+            }),
+            None => Located::Sealed(sealed_of(entry)),
+        }
+    }
+
     /// Read the floors a seal gives a sorted index. A seal hands the index one row a key, the key's newest in its segment, so an
     /// older row of a key in the sealing segment never comes, and the drop floor is the lowest place in the other open segments.
     /// The sealing segment's rows of other keys are not in the index yet, so the purge floor counts them too. Past a mark, sealed
@@ -87,6 +108,41 @@ impl<Backend: Io> EngineState<Backend> {
             open.map(|segment| segment.lowest_place).min().unwrap_or(next).min(next)
         };
         Floors { drops: lowest(true), purges: lowest(false) }
+    }
+
+    /// Enter every open row of a sorted column into its index ahead of its seal, and say how many went in. A volume with a cover
+    /// or damage keeps its rows counted, since its walks take the step that answers one key at a time. Each slot's floors are
+    /// read before the shards' locks, and a floor read early is lower, so it drops fewer graves
+    pub fn enter_open_rows(&self, run: &mut EnterRun) -> u64 {
+        if self.is_read_only {
+            return 0;
+        }
+        let mut floors = [None; MAX_OPEN_SLOTS];
+        for volume in &self.volumes {
+            if volume.has_failed() || !volume.covers.is_empty() || !volume.damage.is_empty() {
+                continue;
+            }
+            let claims = hold(&volume.claims);
+            let next = WritePlace(self.places.last_given().0.saturating_add(1));
+            let lowest = |skip: Option<OpenSlot>| {
+                let open = claims.open.iter().filter(|segment| Some(segment.slot) != skip && segment.row_count.0 > 0);
+                open.map(|segment| segment.lowest_place).min().unwrap_or(next).min(next)
+            };
+            for segment in &claims.open {
+                if let Some(floor) = floors.get_mut(segment.slot.0 as usize) {
+                    // an entering never drops: a grave dropped here would take its key's sealed entry out while a cue under it still
+                    // reads by the index, and nothing sends that cue to the footers until the seal. The grave goes in as an entry
+                    *floor = Some(Floors { drops: WritePlace(0), purges: lowest(None) });
+                }
+            }
+        }
+        if floors.iter().all(Option::is_none) {
+            return 0;
+        }
+        let index_of = |column: ColumnId| self.sorted_index(column).filter(|index| index.mark().is_none());
+        let entered: u64 = (0..SHARD_COUNT).map(|shard| self.index.enter_shard(shard, &floors, index_of, run)).sum();
+        self.rows_entered.fetch_add(entered, Ordering::Relaxed);
+        entered
     }
 
     /// Find a key's newest sealed row: through the table on a complete column, and through the footers on any other

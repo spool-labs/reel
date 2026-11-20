@@ -1421,6 +1421,15 @@ pub fn newest_of(open: Option<WriteRow>, sealed: Option<SealedRow>) -> Located {
     }
 }
 
+/// Take the newer of a write-index row and the row an index entry gave, open or sealed
+pub fn newest_located(open: Option<WriteRow>, other: Located) -> Located {
+    match (open, other.place()) {
+        (Some(row), Some(place)) if row.place < place => other,
+        (Some(row), _) => Located::Open(row),
+        (None, _) => other,
+    }
+}
+
 /// Build the error for a key's damaged record
 pub fn corruption(read: &KeyRead<'_>) -> StoreError {
     StoreError::Corruption {

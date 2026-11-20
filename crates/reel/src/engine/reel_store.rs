@@ -47,7 +47,7 @@ use crate::engine::recovery::{
     settle_summaries,
 };
 use crate::engine::reserve_job::ReserveJob;
-use crate::engine::row_job::RowJob;
+use crate::engine::row_job::{EnterWatch, RowJob};
 use crate::engine::scan_state::{ScanRange, ScanState, from_key, in_range, under_prefix};
 use crate::engine::seal_job::{MOST_SEGMENT_BLOCKS, SealJob};
 use crate::engine::store_scan::StoreScan;
@@ -802,6 +802,7 @@ pub fn start_jobs<Backend: Io>(state: &Arc<EngineState<Backend>>) -> Result<(), 
     }
     let row_job = RowJob {
         state: Arc::clone(state),
+        entering: EnterWatch::default(),
     };
     let task = state.io.spawn_job("reel-rows", row_job).map_err(open_error("starting a job"))?;
     // the cell is empty until here, so this set can't fail
@@ -1511,6 +1512,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         sorted_runs: AtomicU64::new(0),
         scan_window_records: AtomicU64::new(0),
         scan_trusted_records: AtomicU64::new(0),
+        rows_entered: AtomicU64::new(0),
         scan_batches_presorted: AtomicU64::new(0),
         sorted_moves_missed: AtomicU64::new(0),
         sorted_fill_ns: AtomicU64::new(0),

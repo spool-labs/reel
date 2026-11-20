@@ -171,6 +171,8 @@ pub struct SortedKeys {
     entries: AtomicU64,
     mark: AtomicU64,
     past_capacity: AtomicU64,
+    /// Goes up each time open rows go in ahead of their seal, before they leave the open counts
+    entered: AtomicU64,
     /// Values the leaves keep, from a pool sized at open, which holds no page unless a share was given to it
     pub values: ValuePages,
     /// One past the highest page ever taken. Pages are chained in order at build and taken from the head, so every page at or
@@ -311,6 +313,7 @@ impl SortedKeys {
             entries: AtomicU64::new(0),
             mark: AtomicU64::new(NO_MARK),
             past_capacity: AtomicU64::new(0),
+            entered: AtomicU64::new(0),
             values: ValuePages::new(0),
             told_rows: rows,
         }
@@ -368,6 +371,17 @@ impl SortedKeys {
     }
 
     /// Read how many rows found no room
+    /// Note open rows went in ahead of their seal. It comes before they leave the open counts, so a walk that sees them gone
+    /// sees this and reads its index batch again
+    pub fn note_entered(&self) {
+        self.entered.fetch_add(1, Memory::AcqRel);
+    }
+
+    /// Read how many times open rows went in ahead of their seal
+    pub fn entered(&self) -> u64 {
+        self.entered.load(Memory::Acquire)
+    }
+
     pub fn past_capacity(&self) -> RowCount {
         RowCount(self.past_capacity.load(Memory::Acquire))
     }

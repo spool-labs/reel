@@ -507,6 +507,12 @@ thread_local! {
     static THREAD_WAKER: Waker = Waker::from(Arc::new(Unpark(std::thread::current())));
 }
 
+/// Make this thread's waker on its first read through the ring, whether or not that read waits, so a thread's warm-up reads make it
+/// and no later read, waiting for the first time, allocates
+fn ready_waker() {
+    THREAD_WAKER.with(|_waker| ());
+}
+
 /// Reads that wait for a ring on the calling thread, for a blocking get. What the kernel holds answers with no submit, and a read
 /// it doesn't hold goes to the ring, and the caller waits on its slot until the reaper lands it. A store with no ring reads in place
 #[derive(Debug)]
@@ -697,14 +703,20 @@ impl<Driver> RingLease<'_, Driver> {
 impl<File: IoFile, Driver: RingDriver<File>> DeviceReads<File> for RingWait<'_, Driver> {
     fn read_exact(&self, file: &File, offset: FileOffset, buf: &mut [u8]) -> impl Future<Output = Result<()>> + Send {
         std::future::ready(match self.0 {
-            Some(ring) => ring.read_into_now(file, offset, buf),
+            Some(ring) => {
+                ready_waker();
+                ring.read_into_now(file, offset, buf)
+            },
             None => file.read_exact_at(offset, buf),
         })
     }
 
     fn read_parts(&self, file: &File, offset: FileOffset, parts: &mut [IoSliceMut<'_>]) -> impl Future<Output = Result<()>> + Send {
         std::future::ready(match self.0 {
-            Some(ring) => ring.read_parts_now(file, offset, parts),
+            Some(ring) => {
+                ready_waker();
+                ring.read_parts_now(file, offset, parts)
+            },
             None => file.read_parts_at(offset, parts),
         })
     }
@@ -714,7 +726,10 @@ impl<File: IoFile, Driver: RingDriver<File>> DeviceReads<File> for RingWait<'_, 
         File: Sync,
     {
         match self.0 {
-            Some(ring) => ring.read_many_now(reads),
+            Some(ring) => {
+                ready_waker();
+                ring.read_many_now(reads)
+            },
             None => {
                 for read in reads.iter_mut().flatten() {
                     read.is_done = read.file.read_exact_at(read.offset, read.buf).is_ok();

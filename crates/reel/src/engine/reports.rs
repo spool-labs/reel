@@ -200,6 +200,7 @@ impl<Backend: Io> EngineState<Backend> {
         report.sorted_scan_keys = self.sorted_scan_keys.load(Ordering::Relaxed);
         report.sorted_runs = self.sorted_runs.load(Ordering::Relaxed);
         report.scan_window_records = self.scan_window_records.load(Ordering::Relaxed);
+        report.scan_trusted_records = self.scan_trusted_records.load(Ordering::Relaxed);
         report.scan_batches_presorted = self.scan_batches_presorted.load(Ordering::Relaxed);
         report.sorted_moves_missed = self.sorted_moves_missed.load(Ordering::Relaxed);
         report.sorted_fill_time = Nanoseconds(self.sorted_fill_ns.load(Ordering::Relaxed));

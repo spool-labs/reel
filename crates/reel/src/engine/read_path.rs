@@ -471,7 +471,7 @@ impl<Backend: Io> EngineState<Backend> {
             };
         }
         let mut words = [0; BATCH_KEYS];
-        self.read_records(device, volume, &rows[..keys.len()], records, &mut spans, &mut words).await;
+        self.read_records(device, volume, &rows[..keys.len()], records, (&mut spans, &mut []), &mut words).await;
 
         let mut batched = 0;
         for ((key, plan), span) in keys.iter().zip(plans).zip(spans) {
@@ -492,7 +492,7 @@ impl<Backend: Io> EngineState<Backend> {
                 KeyPlan::Open(open) => {
                     // a record that fails its check may be from a slot that moved on, and the key's own read settles it
                     if let Some((start, length)) = span
-                        && self.open_batched(device, (read.column, read.key), open.place, &records[start..start + length], scratch)
+                        && self.open_batched(device, (read.column, read.key), (open.place, false), &records[start..start + length], scratch)
                     {
                         values.push_found(scratch);
                         batched += 1;
@@ -504,7 +504,7 @@ impl<Backend: Io> EngineState<Backend> {
                 KeyPlan::Spot(sealed, lookup) | KeyPlan::Sealed(sealed, lookup) => (sealed, lookup),
             };
             if let Some((start, length)) = span
-                && self.open_batched(device, (read.column, read.key), sealed.row.place, &records[start..start + length], scratch)
+                && self.open_batched(device, (read.column, read.key), (sealed.row.place, false), &records[start..start + length], scratch)
             {
                 if lookup == (CacheLookup::Miss { is_admitted: true }) {
                     self.record_cache.admit(sealed.segment, sealed.row.offset, read.key, scratch);
@@ -772,8 +772,12 @@ impl<Backend: Io> EngineState<Backend> {
             return Ok(None);
         }
 
-        let mut held = [0; MOST_WINDOW_RECORD_BYTES];
         let windows = &self.windows[row.slot.0 as usize];
+        // the windows hold the last few records, so most gets miss here before the stack copy is zeroed
+        if !windows.iter().any(|window| window.may_hold(row.offset, length)) {
+            return Ok(None);
+        }
+        let mut held = [0; MOST_WINDOW_RECORD_BYTES];
         if !windows.iter().any(|window| window.read(row.offset, &mut held[..length])) {
             return Ok(None);
         }

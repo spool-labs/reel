@@ -378,6 +378,7 @@ fn partial_goes_at_open() {
 
 // a crash at any step keeps every read, leaves no partial file and no damage, and the row below the input stays counted
 // once: an output rebuilt at open holds rows its input's walk already counted
+// Crashes 74 to 79 rebuild an output's row from its blocks to walk backward, which counts no gap and no more bytes than its data
 #[test]
 fn crashes() {
     let mut rebuilt = 0;
@@ -429,6 +430,11 @@ fn crashes() {
             settle(&io);
             check_reads(&store);
             assert_eq!(dead_rows(&store, lowest), 1, "crash at {crash_at}");
+            for row in hold(&state.volumes[0].summary).rows().filter(|row| row.facts.is_walked()) {
+                let records = reel::segment::summary_orders::row_record_bytes(&row);
+                assert!(records <= row.facts.data_end.0, "crash at {crash_at}: {records} record bytes past the data end {}", row.facts.data_end.0);
+                assert_eq!(reel::segment::summary_orders::row_gap_bytes(&row), 0, "crash at {crash_at}: segment {:?} counts a gap", row.facts.segment);
+            }
             assert!(hold(&state.volumes[0].damaged).is_empty(), "crash at {crash_at}");
             assert_eq!(state.dropped_summary_rows.load(Ordering::Acquire), 0, "crash at {crash_at}");
             store.close().expect("close");

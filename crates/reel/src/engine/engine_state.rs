@@ -186,6 +186,8 @@ pub struct EngineState<Backend: Io> {
     pub sorted_runs: AtomicU64,
     /// Open records a scan batch copied from their slot's window
     pub scan_window_records: AtomicU64,
+    /// Open records a scan batch read from their file and answered with no sum, since this run wrote them
+    pub scan_trusted_records: AtomicU64,
     /// Scan batches whose two or more records came in file order and skipped the sort
     pub scan_batches_presorted: AtomicU64,
     /// Row blocks a merge's install couldn't read to move sorted entries, whose keys ask the footers once the inputs go

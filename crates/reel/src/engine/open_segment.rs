@@ -192,6 +192,11 @@ impl RecordWindow {
         used
     }
 
+    /// Check the window may hold a record whole, with no copy. A read still checks it
+    pub fn may_hold(&self, offset: FileOffset, length: usize) -> bool {
+        offset.0.checked_sub(self.start().0).is_some_and(|at| at as usize + length <= self.used())
+    }
+
     /// Copy a record out with no lock, or return false when the window doesn't hold it whole
     pub fn read(&self, offset: FileOffset, record: &mut [u8]) -> bool {
         let before = self.generation.load(Ordering::Acquire);

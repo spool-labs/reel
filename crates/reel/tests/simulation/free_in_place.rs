@@ -703,3 +703,73 @@ fn an_open_record_reads_back_unchecked() {
     assert_ne!(found, b"open value", "the flipped byte was caught");
     store.close().expect("close");
 }
+
+// put a key with a small value, then enough after it that the slot's window no longer holds its record, and flip a byte of the
+// record's payload on the disk
+fn rot_open_record(store: &Store, io: &SimulatedIo) {
+    for number in 0..50_u32 {
+        store.put(COLUMN, format!("aaa-{number:04}").as_bytes(), b"open value").expect("put");
+    }
+    for number in 0..200_u32 {
+        store.put(COLUMN, format!("zzz-{number:04}").as_bytes(), &[7_u8; 1_000]).expect("put");
+    }
+    store.flush().expect("flush");
+    let volume = &store.state.volumes[0];
+    let row = store.state.index.lookup(COLUMN, b"aaa-0025", store.state.read_point(volume), volume.view()).row.expect("an open row");
+    let path = data_path(&volume.roots[0], row.segment).to_path_buf();
+    io.rot(&path, FileOffset(row.offset.0 + SMALL_HEAD_BYTES as u64), BitMask(1)).expect("rot");
+}
+
+// read the value a scan from the start answers for a key, which the batch holds past the walk's first row, or nothing when the
+// scan stops first
+fn scanned(store: &Store, wanted: &[u8]) -> Option<Vec<u8>> {
+    let mut scan = store.iter_from(COLUMN, b"a", Direction::Ascending).expect("scan");
+    let (mut name, mut value) = (Vec::new(), Vec::new());
+    while let Ok(ScanStep::Found) = scan.next_row(&mut name, &mut value) {
+        if name == wanted {
+            return Some(value);
+        }
+    }
+    None
+}
+
+// a scan reads an open record this run wrote from its batch with no sum, as a get does, so a byte flipped on the disk under it
+// reads back flipped
+#[test]
+fn a_scanned_open_record_reads_back_unchecked() {
+    let io = SimulatedIo::new(Seed(45));
+    let store = open(&io);
+    rot_open_record(&store, &io);
+    let trusted = store.state.scan_trusted_records.load(Ordering::Relaxed);
+    let value = scanned(&store, b"aaa-0025").expect("the row");
+    assert!(store.state.scan_trusted_records.load(Ordering::Relaxed) > trusted, "the batch checked every open record");
+    assert_eq!(value.len(), b"open value".len());
+    assert_ne!(value, b"open value", "the flipped byte was caught");
+    store.close().expect("close");
+}
+
+// an open record a reopen replayed is checked: a scan never answers its flipped bytes
+#[test]
+fn a_scanned_replayed_record_is_checked() {
+    let io = SimulatedIo::new(Seed(46));
+    let store = open(&io);
+    for number in 0..50_u32 {
+        store.put(COLUMN, format!("aaa-{number:04}").as_bytes(), b"open value").expect("put");
+    }
+    for number in 0..200_u32 {
+        store.put(COLUMN, format!("zzz-{number:04}").as_bytes(), &[7_u8; 1_000]).expect("put");
+    }
+    store.flush().expect("flush");
+    io.kill();
+    drop(store);
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    let row = store.state.index.lookup(COLUMN, b"aaa-0025", store.state.read_point(volume), volume.view()).row.expect("an open row");
+    let path = data_path(&volume.roots[0], row.segment).to_path_buf();
+    io.rot(&path, FileOffset(row.offset.0 + SMALL_HEAD_BYTES as u64), BitMask(1)).expect("rot");
+    if let Some(value) = scanned(&store, b"aaa-0025") {
+        assert_eq!(value, b"open value", "a replayed record's flipped bytes were answered");
+    }
+    assert_eq!(store.state.scan_trusted_records.load(Ordering::Relaxed), 0, "the batch trusted a replayed record");
+    store.close().expect("close");
+}

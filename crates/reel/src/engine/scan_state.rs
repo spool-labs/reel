@@ -129,7 +129,7 @@ pub fn batch_room(wanted: u64, asked: u64) -> usize {
 }
 
 /// A batch entry that holds nothing, which the batch's room is written with at open
-pub const NO_BATCH_ENTRY: BatchEntry = BatchEntry { key_at: 0, key_length: 0, key_from: KeyFrom::Batch, located: Located::Absent, record: None, is_value: false, is_lent: false };
+pub const NO_BATCH_ENTRY: BatchEntry = BatchEntry { key_at: 0, key_length: 0, key_from: KeyFrom::Batch, located: Located::Absent, record: None, is_value: false, is_lent: false, is_trusted: false };
 
 /// Where a batch entry's key lies
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -191,6 +191,8 @@ pub struct BatchEntry {
     pub is_value: bool,
     /// The value lies in the index batch the key came from, held by the entry's leaf, and the batch's buffer has no copy
     pub is_lent: bool,
+    /// The record is an open one this run wrote, read from its file under the slot's pin, so it takes no check
+    pub is_trusted: bool,
 }
 
 /// Keys a scan located ahead at one point, answered in order. Each answer stands as of that point, so a write that lands
@@ -205,6 +207,8 @@ pub struct ScanBatch {
     /// Each entry's record for the batch's read, and the span it landed at
     pub rows: Vec<Option<BatchRow>>,
     pub spans: Vec<Option<(usize, usize)>>,
+    /// Each read record is trusted, by the rule an open get uses
+    pub trusted: Vec<bool>,
     /// Each record's order word, sorted when the records come out of file order
     pub words: Vec<u128>,
     /// The batch reads its records, for a walk that wants values
@@ -222,6 +226,7 @@ impl ScanBatch {
             records: touched_capacity(BATCH_BYTES, 0),
             rows: touched_capacity(SCAN_BATCH_KEYS, None),
             spans: touched_capacity(SCAN_BATCH_KEYS, None),
+            trusted: touched_capacity(SCAN_BATCH_KEYS, false),
             words: touched_filled(SCAN_BATCH_KEYS, 0),
             is_reading: true,
         }
@@ -235,6 +240,7 @@ impl ScanBatch {
         self.records.clear();
         self.rows.clear();
         self.spans.clear();
+        self.trusted.clear();
     }
 
     /// Check the batch has room for another record, which only a batch that reads its records counts

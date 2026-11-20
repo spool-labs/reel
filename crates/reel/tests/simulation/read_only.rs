@@ -492,3 +492,29 @@ fn a_reader_checks_a_record_changed_under_it() {
     viewer.close().expect("close");
     writer.close().expect("close");
 }
+
+// a view trusts no record: its scan over open rows a writer left checks every one
+#[test]
+fn a_view_scan_trusts_no_record() {
+    let io = SimulatedIo::new(Seed(77));
+    let store = open(&io);
+    for number in 0..50_u32 {
+        store.put(COLUMN, format!("aaa-{number:04}").as_bytes(), b"open value").expect("put");
+    }
+    for number in 0..200_u32 {
+        store.put(COLUMN, format!("zzz-{number:04}").as_bytes(), &[7_u8; 1_000]).expect("put");
+    }
+    store.flush().expect("flush");
+
+    let viewer = view(&io);
+    let mut scan = viewer.iter_from(COLUMN, b"a", Direction::Ascending).expect("scan");
+    let (mut name, mut value, mut found) = (Vec::new(), Vec::new(), 0);
+    while scan.next_row(&mut name, &mut value).expect("step") == ScanStep::Found {
+        found += 1;
+    }
+    assert_eq!(found, 250);
+    assert_eq!(viewer.state.scan_trusted_records.load(Ordering::Relaxed), 0, "a view trusted a record");
+    drop(scan);
+    drop(viewer);
+    store.close().expect("close");
+}

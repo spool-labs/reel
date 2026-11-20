@@ -659,6 +659,8 @@ pub struct MaintenanceReport {
     pub sorted_runs: u64,
     /// Open records a scan batch copied from their slot's window
     pub scan_window_records: u64,
+    /// Open records a scan batch read from their file and answered with no sum, since this run wrote them
+    pub scan_trusted_records: u64,
     /// Scan batches whose two or more records came in file order and skipped the sort
     pub scan_batches_presorted: u64,
     /// Output row blocks a merge's install couldn't read to move sorted entries
@@ -784,6 +786,7 @@ impl MaintenanceReport {
             sorted_scan_keys: 0,
             sorted_runs: 0,
             scan_window_records: 0,
+            scan_trusted_records: 0,
             scan_batches_presorted: 0,
             sorted_moves_missed: 0,
             sorted_fill_time: Nanoseconds(0),

@@ -665,6 +665,11 @@ pub fn checked_payload<'record>(record: &'record [u8], form: RecordForm, identit
     (read_check(record) == Some(check)).then_some(payload)
 }
 
+/// Give a one-chunk record's payload where it lies, with no check, for a record its reader trusts
+pub fn trusted_payload(record: &[u8]) -> Option<&[u8]> {
+    record.get(SMALL_HEAD_BYTES..)
+}
+
 /// Check a one-chunk record and hand its value over, restoring a compressed one through `decoded`
 pub fn open_small(
     record: &[u8],

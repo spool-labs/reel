@@ -29,7 +29,7 @@ use crate::index::write_shard::{HEAD_GROUP, HeadPlace, WalkBound, WriteShard, pl
 use crate::io::{DeviceReads, Io, ManyRead, ReadOn, in_place};
 use crate::record::record_check::RecordIdentity;
 use crate::record::codec::Codec;
-use crate::record::record_reader::{RecordRead, checked_payload, form_of, open_small};
+use crate::record::record_reader::{RecordRead, checked_payload, form_of, open_small, trusted_payload};
 use crate::row_kind::RowKind;
 use crate::segment::footer_reader::RowAt;
 use crate::index::record_cache::CacheLookup;
@@ -384,7 +384,7 @@ impl<Backend: Io> EngineState<Backend> {
                 scan.batch.keys.extend_from_slice(candidate);
                 // a sealed row the index entry named comes with the value its leaf held, as a run's rows do
                 let record = held_for(scan, candidate, &located);
-                scan.batch.entries.push(BatchEntry { key_at, key_length: candidate.len(), key_from: KeyFrom::Batch, located, record, is_value: record.is_some(), is_lent: false });
+                scan.batch.entries.push(BatchEntry { key_at, key_length: candidate.len(), key_from: KeyFrom::Batch, located, record, is_value: record.is_some(), is_lent: false, is_trusted: false });
                 if record.is_some() {
                     self.scan_held_values.fetch_add(1, Ordering::Relaxed);
                 }
@@ -541,7 +541,7 @@ impl<Backend: Io> EngineState<Backend> {
                 let at = scan.sorted_next;
                 if located.has_value() {
                     let from = KeyFrom::Sorted(scan.sorted_turn);
-                    scan.batch.entries.push(BatchEntry { key_at: at, key_length: length, key_from: from, located, record: None, is_value: false, is_lent: false });
+                    scan.batch.entries.push(BatchEntry { key_at: at, key_length: length, key_from: from, located, record: None, is_value: false, is_lent: false, is_trusted: false });
                     if located.length().0 as usize <= MOST_BATCH_RECORD {
                         *located_bytes += located.length().0 as usize;
                     }
@@ -576,7 +576,7 @@ impl<Backend: Io> EngineState<Backend> {
             if located.has_value() {
                 let key_at = scan.batch.keys.len();
                 scan.batch.keys.extend_from_slice(name);
-                scan.batch.entries.push(BatchEntry { key_at, key_length: length, key_from: KeyFrom::Batch, located, record: None, is_value: false, is_lent: false });
+                scan.batch.entries.push(BatchEntry { key_at, key_length: length, key_from: KeyFrom::Batch, located, record: None, is_value: false, is_lent: false, is_trusted: false });
                 if located.length().0 as usize <= MOST_BATCH_RECORD {
                     *located_bytes += located.length().0 as usize;
                 }
@@ -665,7 +665,7 @@ impl<Backend: Io> EngineState<Backend> {
     /// Read the batch's records together, from the record cache, a slot's window or joined reads, and leave the rest to own reads
     pub async fn read_batch(&self, device: &impl DeviceReads<Backend::File>, volume: &Volume<Backend>, scan: &mut ScanState) {
         let is_cached = self.scans_use_cache(volume);
-        let ScanState { batch: ScanBatch { entries, keys, records, rows, spans, words, .. }, sorted, sorted_spare, sorted_turn, column, .. } = scan;
+        let ScanState { batch: ScanBatch { entries, keys, records, rows, spans, trusted, words, .. }, sorted, sorted_spare, sorted_turn, column, .. } = scan;
         rows.clear();
         rows.resize(entries.len(), None);
         let mut hits = 0;
@@ -713,12 +713,15 @@ impl<Backend: Io> EngineState<Backend> {
         }
         spans.clear();
         spans.resize(entries.len(), None);
-        if self.read_records(device, volume, rows, records, spans, words).await {
+        trusted.clear();
+        trusted.resize(entries.len(), false);
+        if self.read_records(device, volume, rows, records, (spans, trusted), words).await {
             self.scan_batches_presorted.fetch_add(1, Ordering::Relaxed);
         }
-        for (entry, span) in entries.iter_mut().zip(spans.iter()) {
+        for ((entry, span), is_trusted) in entries.iter_mut().zip(spans.iter()).zip(trusted.iter()) {
             if span.is_some() {
                 entry.record = *span;
+                entry.is_trusted = *is_trusted;
             }
         }
         // a column whose leaves hold values checks the sealed records it read here, and keeps them a leaf at a time
@@ -776,7 +779,7 @@ impl<Backend: Io> EngineState<Backend> {
         volume: &Volume<Backend>,
         rows: &[Option<BatchRow>],
         records: &mut Vec<u8>,
-        spans: &mut [Option<(usize, usize)>],
+        (spans, trusted): RecordSpans<'_>,
         words: &mut [u128],
     ) -> bool {
         let small = |index: u16| rows[index as usize].filter(|row| row.length.0 as usize <= MOST_BATCH_RECORD);
@@ -859,11 +862,17 @@ impl<Backend: Io> EngineState<Backend> {
             device.read_many(&mut reads[..run_count]).await;
             let filled: [bool; MOST_BATCH_RUNS] = std::array::from_fn(|index| reads[index].as_ref().is_some_and(|read| read.is_done));
             let mut from = base;
-            for (&(first, last, start, length), is_filled) in runs.iter().zip(filled).take(run_count) {
+            for (index, (&(first, last, start, length), is_filled)) in runs.iter().zip(filled).enumerate().take(run_count) {
                 if is_filled {
+                    // an open record past what recovery replayed was written by this run, as an open get trusts it
+                    let recovered_end = slot_pins[index].as_ref().filter(|_pin| !self.is_read_only).map(|pin| pin.recovered_end);
                     for &word in &order[first..=last] {
                         if let Some(row) = small(word) {
-                            spans[index_of_word(word) as usize] = Some((from + (row.offset.0 - start) as usize, row.length.0 as usize));
+                            let at = index_of_word(word) as usize;
+                            spans[at] = Some((from + (row.offset.0 - start) as usize, row.length.0 as usize));
+                            if let Some(is_trusted) = trusted.get_mut(at) {
+                                *is_trusted = recovered_end.is_some_and(|end| row.offset >= end);
+                            }
                         }
                     }
                 }
@@ -901,14 +910,14 @@ impl<Backend: Io> EngineState<Backend> {
                 true
             },
             (Some((at, length)), Located::Sealed(row)) => {
-                let is_open = self.open_batched(on.device, (*column, name), row.row.place, &batch.records[at..at + length], value);
+                let is_open = self.open_batched(on.device, (*column, name), (row.row.place, false), &batch.records[at..at + length], value);
                 if is_open {
                     self.keep_scanned(on.target, (*column, name), &row, value);
                 }
                 is_open
             },
             // a record that fails its check here takes its own read, which says whether its slot moved on
-            (Some((at, length)), Located::Open(row)) => self.open_batched(on.device, (*column, name), row.place, &batch.records[at..at + length], value),
+            (Some((at, length)), Located::Open(row)) => self.open_batched(on.device, (*column, name), (row.place, entry.is_trusted), &batch.records[at..at + length], value),
             _other => false,
         };
         // only a row the batch doesn't hold needs the key's checks and cover for its own read
@@ -983,7 +992,11 @@ impl<Backend: Io> EngineState<Backend> {
         let (record, name) = (&scan.batch.records[at..at + length], scan.batch_key(entry));
         let identity = RecordIdentity { record_key: self.record_key, column: scan.column, key: name, kind: RowKind::Value, place };
         let form = form_of(record).filter(|form| !form.is_chunked && form.codec == Codec::None)?;
-        let payload = checked_payload(record, form, &identity)?;
+        let is_trusted = entry.is_trusted && matches!(entry.located, Located::Open(_));
+        let payload = if is_trusted { trusted_payload(record)? } else { checked_payload(record, form, &identity)? };
+        if is_trusted {
+            self.scan_trusted_records.fetch_add(1, Ordering::Relaxed);
+        }
         if let Located::Sealed(row) = entry.located {
             self.keep_scanned(volume, (scan.column, name), &row, payload);
         }
@@ -1003,7 +1016,14 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Check and open a small record the batch read, as the window does
-    pub fn open_batched(&self, device: &impl DeviceReads<Backend::File>, (column, key): (ColumnId, &[u8]), place: WritePlace, record: &[u8], value: &mut Vec<u8>) -> bool {
+    pub fn open_batched(
+        &self,
+        device: &impl DeviceReads<Backend::File>,
+        (column, key): (ColumnId, &[u8]),
+        (place, is_trusted): (WritePlace, bool),
+        record: &[u8],
+        value: &mut Vec<u8>,
+    ) -> bool {
         let identity = RecordIdentity {
             record_key: self.record_key,
             column,
@@ -1015,6 +1035,15 @@ impl<Backend: Io> EngineState<Backend> {
             return false;
         };
         let opened = match form.codec {
+            Codec::None if is_trusted => {
+                let Some(payload) = trusted_payload(record) else {
+                    return false;
+                };
+                self.scan_trusted_records.fetch_add(1, Ordering::Relaxed);
+                value.clear();
+                value.extend_from_slice(payload);
+                RecordRead::Valid
+            },
             Codec::None => open_small(record, form, &identity, &mut [], value),
             Codec::Lz4 => self.record_reader_for(device).check_held(record, form, &identity, value),
         };
@@ -1797,6 +1826,9 @@ impl ScanWant<'_> {
         }
     }
 }
+
+/// Where each read record landed in the batch's buffer, and whether its reader trusts it
+pub type RecordSpans<'spans> = (&'spans mut [Option<(usize, usize)>], &'spans mut [bool]);
 
 /// Check a segment's row says a column holds no live grave and no cover, so a block's live rows are all values
 pub fn has_no_live_graves<Backend: Io>(volume: &Volume<Backend>, segment: SegmentNumber, column: ColumnId) -> bool {

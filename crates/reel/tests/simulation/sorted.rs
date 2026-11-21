@@ -3141,3 +3141,77 @@ fn batched_noise_in_an_lz4_column_matches_single_gets() {
     }
     store.close().expect("close");
 }
+
+// a batch that passes a key whose put is still in flight, at a point below its row, and runs to the end, leaves the walk able to
+// take the key once the put returns: the next step answers it, and the walk doesn't end past it. A walk does go back for such a key,
+// and never goes back over keys it swept and found dead
+#[test]
+fn a_key_in_flight_past_a_batch_still_comes() {
+    walk_meets_a_key_in_flight(Direction::Ascending, Seed(31));
+}
+
+// the same at the bottom of a walk downward
+#[test]
+fn a_key_in_flight_below_a_batch_still_comes() {
+    walk_meets_a_key_in_flight(Direction::Descending, Seed(32));
+}
+
+// seal some keys, put the far end's key in the write index with its put held in flight, walk to the end, land the put, and walk on
+fn walk_meets_a_key_in_flight(direction: Direction, seed: Seed) {
+    const SEALED: u64 = 100;
+    let io = SimulatedIo::new(seed);
+    let store = open(&io, CAPACITY);
+    // key 0 is all zeros, the far key of a walk downward
+    for number in 1..=SEALED {
+        store.put(COLUMN, &key(number), b"sealed").expect("put");
+    }
+    seal_all(&store, &io);
+    settle(&io);
+
+    // the row goes into the write index as a put's does, ahead of its ticket finishing
+    let volume = &store.state.volumes[0];
+    let request = reel::engine::write_path::ClaimRequest {
+        bytes: ByteCount(0),
+        rows: RowCount(1),
+        is_alone: false,
+        has_records: false,
+        covers: 0,
+        mark: None,
+        has_deletes: false,
+    };
+    let claim = store.state.claim(volume, &request).expect("claim");
+    let (start, far) = match direction {
+        Direction::Ascending => (Vec::new(), vec![0xFF; WIDTH as usize]),
+        Direction::Descending => (vec![0xFF; WIDTH as usize], vec![0; WIDTH as usize]),
+    };
+    let row = reel::index::write_row::WriteRow {
+        place: claim.first_place(),
+        offset: claim.offset,
+        length: ByteCount(0),
+        kind: reel::row_kind::RowKind::Value,
+        slot: claim.slot,
+        segment: claim.segment,
+        has_newer_sealed: false,
+    };
+    assert!(store.state.index.insert(COLUMN, &far, &row, None));
+
+    let range = from_key(COLUMN, &start, direction).wanting(RowCount(SEALED + 10));
+    let mut scan = store.state.take_scan(&range, None).expect("scan");
+    let mut name = Vec::new();
+    let step = |scan: &mut reel::engine::scan_state::ScanState, name: &mut Vec<u8>| {
+        store.state.step_scan(scan, name, reel::engine::scan_path::ScanWant::Key).expect("step")
+    };
+    assert_eq!(step(&mut scan, &mut name), ScanStep::Found);
+    // the put returns, and every later step sees its row
+    claim.land();
+    let mut found = 1;
+    while step(&mut scan, &mut name) == ScanStep::Found {
+        found += 1;
+        if name == far {
+            break;
+        }
+    }
+    assert_eq!(name, far, "the walk ended past a key that landed before its last step, after {found} keys");
+    assert_eq!(found, SEALED + 1, "the walk took every sealed key and the landed one, once each");
+    store.state.give_back_scan(scan);
+}

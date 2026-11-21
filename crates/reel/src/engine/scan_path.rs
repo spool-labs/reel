@@ -378,6 +378,10 @@ impl<Backend: Io> EngineState<Backend> {
         let located = newest_located(found, other);
         let is_hidden = located.place().is_some_and(|place| read.cover.is_some_and(|cover| cover > place));
         if !located.has_value() || is_hidden {
+            // a head shows the key and a live batch's point sees no row of it, so its put is still in flight
+            if is_pinned && scan.point.is_none() && found.is_none() && !located.has_value() && scan.is_head_key(candidate) {
+                scan.note_newer_passed(candidate);
+            }
             scan.pass(candidate);
             return Ok(StepOutcome::Passed);
         }
@@ -434,6 +438,8 @@ impl<Backend: Io> EngineState<Backend> {
         (key, is_reading): (&mut Vec<u8>, bool),
     ) -> Result<(), StoreError> {
         scan.batch.clear();
+        // a pass a pinned single step noted belongs to no fill, so each fill notes its own
+        scan.newer_passed_at = None;
         scan.batch.is_reading = is_reading;
         // the counts come before the batch locates a row, as a get takes them before its point. A read-only store checks every record
         scan.batch.counts = (!self.is_read_only).then(|| self.cues.counts());
@@ -481,6 +487,7 @@ impl<Backend: Io> EngineState<Backend> {
                 },
             }
         }
+        scan.end_batch();
         // keys located before a failure answer first, and the next fill meets the failure again
         if scan.batch.entries.is_empty() {
             outcome?;
@@ -575,6 +582,10 @@ impl<Backend: Io> EngineState<Backend> {
             let is_moved = directory.map_or(0, ColumnDirectory::generation) != scan.generation;
             let located = open.filter(|_open| !is_moved).map(|open| newest_located(open, sealed.unwrap_or(Located::Absent)));
             if located.is_some() {
+                // the head shows the key and a live run's point sees no row of it, so its put is still in flight
+                if scan.point.is_none() && matches!(open, Some(None)) && located.is_some_and(|located| !located.has_value()) {
+                    scan.note_newer_passed(name);
+                }
                 scan.pass(name);
             }
             if !located.is_some_and(|located| located.has_value()) {

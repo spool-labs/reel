@@ -323,6 +323,10 @@ pub struct ScanState {
     pub sorted_entered: u64,
     /// The walk takes its sealed keys from the column's sorted index, and seats no segment
     pub is_on_index: bool,
+    /// The first key a batch passed for an open row newer than its point, and the batch's length then. A batch that located nothing
+    /// after it goes back to it, so the walk takes the key once its put returns
+    pub newer_passed: Vec<u8>,
+    pub newer_passed_at: Option<usize>,
     /// The rows the caller said it wants, and the rows it has asked for with a value
     pub wanted: u64,
     pub asked: u64,
@@ -683,6 +687,8 @@ impl ScanState {
             is_sorted_done: false,
             sorted_entered: u64::MAX,
             is_on_index: false,
+            newer_passed: touched_capacity(widest_key, 0),
+            newer_passed_at: None,
             wanted: u64::MAX,
             asked: 0,
             pool_slot: 0,
@@ -698,6 +704,7 @@ impl ScanState {
         self.is_inclusive = range.is_start_inclusive;
         self.origin.clear();
         self.origin.extend_from_slice(range.start);
+        self.newer_passed_at = None;
         self.is_counting = false;
         self.counted = 0;
         self.taken = 0;
@@ -804,6 +811,33 @@ impl ScanState {
         self.position.clear();
         self.position.extend_from_slice(self.sorted.key(index));
         self.is_inclusive = false;
+    }
+
+    /// Note a batch passed a key a head shows whose open row is newer than the batch's point. The first such key since the batch's
+    /// last entry is the one kept
+    pub fn note_newer_passed(&mut self, key: &[u8]) {
+        let length = self.batch.entries.len();
+        if self.newer_passed_at == Some(length) {
+            return;
+        }
+        self.newer_passed.clear();
+        self.newer_passed.extend_from_slice(key);
+        self.newer_passed_at = Some(length);
+    }
+
+    /// Check a batch key is the real key of the closest head, so a lookup that finds no row of it found one newer than its point
+    pub fn is_head_key(&self, key: &[u8]) -> bool {
+        self.closest_head.is_some_and(|head| !self.heads[head].is_bound && self.heads[head].key == key)
+    }
+
+    /// End a batch: one that passed a key for a row newer than its point and located nothing after it takes the walk back to that
+    /// key, since the walk would otherwise end past a key whose put returned before the walk's next step
+    pub fn end_batch(&mut self) {
+        if self.newer_passed_at.take() == Some(self.batch.entries.len()) {
+            mem::swap(&mut self.position, &mut self.newer_passed);
+            self.is_inclusive = true;
+            self.reseat(self.generation);
+        }
     }
 
     /// Drop the index's batch, so the next step reads it again from the walk's position

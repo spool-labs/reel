@@ -168,6 +168,23 @@ impl RecordReader {
             }
         }
 
+        // a one-chunk record's payload lands straight in the buffer and is checked there, and only a compressed one is copied as
+        // it is restored. A chunked record that short is read again below
+        let whole = location.length.0 as usize;
+        if (SMALL_HEAD_BYTES..=SMALL_RECORD_BYTES).contains(&whole) {
+            let mut unfilled = UnfilledRead::new(buf, whole - SMALL_HEAD_BYTES);
+            {
+                let mut parts = [IoSliceMut::new(&mut self.first[..SMALL_HEAD_BYTES]), IoSliceMut::new(unfilled.buf())];
+                device.read_parts(file, location.offset, &mut parts).await?;
+            }
+            unfilled.filled();
+            if let Some(form) = self.form()
+                && !form.is_chunked
+            {
+                return Ok(self.open_split(form, identity, buf));
+            }
+        }
+
         let length = self.read_front(device, file, location).await?;
         let Some(form) = self.form() else {
             return Ok(RecordRead::Failed);
@@ -383,6 +400,23 @@ impl RecordReader {
         buf: &mut Vec<u8>,
     ) -> RecordRead {
         open_small(&self.first[..length], form, identity, &mut self.decoded, buf)
+    }
+
+    /// Check a one-chunk record whose head sits in `first` and whose payload sits in the buffer, and restore a compressed one
+    fn open_split(&mut self, form: RecordForm, identity: &RecordIdentity<'_>, buf: &mut Vec<u8>) -> RecordRead {
+        if !checks_split(&self.first[..SMALL_HEAD_BYTES], buf, form, identity) {
+            buf.clear();
+            return RecordRead::Failed;
+        }
+        if form.codec == Codec::Lz4 {
+            let Some(restored) = decompress(buf, &mut self.decoded) else {
+                buf.clear();
+                return RecordRead::Failed;
+            };
+            buf.clear();
+            buf.extend_from_slice(&self.decoded[..restored]);
+        }
+        RecordRead::Valid
     }
 
     /// Check a chunked record's head against the record check

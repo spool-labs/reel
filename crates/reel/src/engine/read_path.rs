@@ -13,7 +13,7 @@ use reel_core::units::{ByteCount, FileOffset, WritePlace};
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::cue::JobCounts;
 use crate::engine::engine_state::{EngineState, SlotPin};
-use crate::engine::open_segment::MOST_WINDOW_RECORD_BYTES; use crate::engine::scan_state::{BATCH_BYTES, BATCH_KEYS, BatchRow};
+use crate::engine::open_segment::MOST_WINDOW_RECORD_BYTES; use crate::engine::scan_state::{BATCH_BYTES, BATCH_KEYS, BatchRow, MOST_BATCH_RECORD};
 use crate::engine::volume::Volume;
 use crate::index::entry_slab::MOST_INLINE_VALUE;
 use crate::index::key_hash::{KeyHash, hash_key};
@@ -182,6 +182,8 @@ pub struct ManyRead {
 pub struct ReadAt {
     pub point: WritePlace,
     pub handovers: u64,
+    /// The job counts taken before the point, when the keys' long sealed values may read under them as a single get does
+    pub trust: Option<JobCounts>,
 }
 
 impl Located {
@@ -372,7 +374,7 @@ impl<Backend: Io> EngineState<Backend> {
     ) -> Option<Result<(), StoreError>> {
         values.clear();
         let held = many.pin.map(|slot| HeldPin { state: self, slot, counts: many.counts });
-        let answer = self.read_keys(device, column, keys, ReadAt { point: many.point, handovers: many.handovers }, values, buffers).await;
+        let answer = self.read_keys(device, column, keys, ReadAt { point: many.point, handovers: many.handovers, trust: (!self.is_read_only).then_some(many.counts) }, values, buffers).await;
         if held.is_none() {
             return self.has_outlived(many.counts, values.has_corrupt()).then_some(answer);
         }
@@ -393,8 +395,9 @@ impl<Backend: Io> EngineState<Backend> {
     ) -> Result<(), StoreError> {
         let ReadBuffers { value, records } = buffers;
         if let [key] = keys {
-            // a value read below the newest must stay out of the spot cache, as a cue's does
-            let read = self.key_read(column, key, at.point, true)?;
+            // a value read below the newest must stay out of the spot cache, as a cue's does, and reads under the counts as a single get
+            let mut read = self.key_read(column, key, at.point, true)?;
+            read.trust = at.trust;
             return self.read_key(device, &read, at.handovers, values, value).await;
         }
         for batch in keys.chunks(BATCH_KEYS) {
@@ -435,7 +438,7 @@ impl<Backend: Io> EngineState<Backend> {
         scratch: &mut Vec<u8>,
     ) -> Result<(), StoreError> {
         match self.get_at(device, read, handovers, RecordWant::Whole, scratch).await {
-            Ok(true) => values.push_found(scratch),
+            Ok(true) => values.push_filled(scratch),
             Ok(false) => values.push_missing(),
             Err(StoreError::Corruption { .. }) => values.push_corrupt(),
             Err(error) => return Err(error),
@@ -541,7 +544,7 @@ impl<Backend: Io> EngineState<Backend> {
                     if let Some((start, length)) = span
                         && self.open_batched(device, (read.column, read.key), (open.place, false), &records[start..start + length], scratch)
                     {
-                        values.push_found(scratch);
+                        values.push_filled(scratch);
                         batched += 1;
                     } else {
                         self.read_key(device, &read, at.handovers, values, scratch).await?;
@@ -556,22 +559,30 @@ impl<Backend: Io> EngineState<Backend> {
                 if lookup == (CacheLookup::Miss { is_admitted: true }) {
                     self.record_cache.admit(sealed.segment, sealed.row.offset, read.key, scratch);
                 }
-                values.push_found(scratch);
+                values.push_filled(scratch);
                 batched += 1;
                 continue;
             }
             // the cache holds the value with its key, so a hit at plan time answers with no second locate, and one evicted since
             // takes the key's own read below
             if lookup == CacheLookup::Hit && self.record_cache.get(sealed.segment, sealed.row.offset, read.key, scratch) == CacheLookup::Hit {
-                values.push_found(scratch);
+                values.push_filled(scratch);
                 continue;
             }
             // a wide sealed record reads on its own. A spot's record that fails its check may have moved, and so may a
-            // batched one, and the key's own read settles both
+            // batched one, and the key's own read settles both. A record too long for the batch reads under the batch's counts as a
+            // single get does, on a column whose leaves hold values and a volume with no damage marked, and lands in a buffer
+            // the list keeps with no copy
             if span.is_none() && matches!(plan, KeyPlan::Sealed(..)) {
-                match self.read_sealed(device, volume, &read, &sealed, RecordWant::Whole, scratch).await {
+                let mut own = read;
+                let is_long = sealed.row.length.0 as usize > MOST_BATCH_RECORD;
+                let is_passing = self.sorted_index(column).is_some_and(|index| index.values.page_count() > 0) && volume.damage.is_empty();
+                if is_long && is_passing {
+                    own.trust = at.trust;
+                }
+                match self.read_sealed(device, volume, &own, &sealed, RecordWant::Whole, scratch).await {
                     Ok(true) => {
-                        values.push_found(scratch);
+                        values.push_filled(scratch);
                         continue;
                     },
                     Ok(false) => {},

@@ -1167,7 +1167,7 @@ fn many_old_point() {
     let mut values = ValueList::new();
     let mut buffers = ReadBuffers::default();
     let handovers = store.state.volumes[0].handover_count();
-    in_place(store.state.read_keys(&InPlace, COLUMN, &[b"key"], ReadAt { point, handovers }, &mut values, &mut buffers)).expect("read");
+    in_place(store.state.read_keys(&InPlace, COLUMN, &[b"key"], ReadAt { point, handovers, trust: None }, &mut values, &mut buffers)).expect("read");
 
     assert_eq!(values.answer(0), Some(ValueAnswer::Found(b"older")));
     let mut buf = Vec::new();

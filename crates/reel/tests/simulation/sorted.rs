@@ -2992,3 +2992,152 @@ fn kept_values_hold_at_their_edges_and_under_covers() {
     }
     store.close().expect("close");
 }
+
+const MANY_KEYS: u64 = 60;
+const MANY_SEEDS: u64 = 4;
+
+// a value of one of three widths by key: short, longer than a batch reads, and many chunks long
+fn many_value(number: u64, round: u64) -> Vec<u8> {
+    let mut value = format!("many-{number}-{round}").into_bytes();
+    match number % 3 {
+        0 => {},
+        1 => value.resize(16 * 1024, (number % 251) as u8),
+        _ => value.resize(200 * 1024, (round % 251) as u8),
+    }
+    value
+}
+
+// the answers a batched get gives for every key, as the single gets would read them
+fn many_answers(store: &Store, names: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
+    let asked: Vec<&[u8]> = names.iter().map(Vec::as_slice).collect();
+    let mut values = ValueList::new();
+    store.get_many(COLUMN, &asked, &mut values).expect("get many");
+    (0..names.len())
+        .map(|at| match values.answer(at).expect("an answer") {
+            ValueAnswer::Found(value) => Some(value.to_vec()),
+            ValueAnswer::Missing => None,
+            ValueAnswer::Corrupt => panic!("key {at} read corrupt"),
+        })
+        .collect()
+}
+
+// batched gets of short, long and many-chunk values, sealed and open, overwritten and deleted, beside seals, answer as single gets
+// and the model do
+#[test]
+fn batched_long_values_match_single_gets() {
+    for seed in seeds(0..MANY_SEEDS) {
+        SIM_BUDGET.with(|budget| budget.set(HELD_BUDGET));
+        let io = SimulatedIo::new(Seed(seed));
+        let store = open(&io, CAPACITY);
+        SIM_BUDGET.with(|budget| budget.set(BUDGET));
+        let mut random = SeededRandom::new(Seed(seed));
+        let mut model = Model::new();
+        let names: Vec<Vec<u8>> = (0..MANY_KEYS + 5).map(key).collect();
+        for round in 0..4 {
+            for number in 0..MANY_KEYS {
+                match random.below(5) {
+                    0 => {
+                        store.delete(COLUMN, &key(number)).expect("delete");
+                        model.remove(&key(number));
+                    },
+                    1 => {},
+                    _ => {
+                        store.put(COLUMN, &key(number), &many_value(number, round)).expect("put");
+                        model.insert(key(number), many_value(number, round));
+                    },
+                }
+            }
+            if round % 2 == 0 {
+                seal_all(&store, &io);
+            }
+            let batched = many_answers(&store, &names);
+            for (name, answer) in names.iter().zip(&batched) {
+                assert_eq!(*answer, read(&store, name), "seed {seed} round {round}: a batched answer differs from a single get");
+                assert_eq!(answer.as_ref(), model.get(name), "seed {seed} round {round}: a batched answer differs from the model");
+            }
+        }
+        store.close().expect("close");
+    }
+}
+
+// a rotted long value answers in a batch as a single get does: under counts that held, both unchecked, and once a job moved them
+// while it read, the batch reads it again with every check and answers corrupt
+#[test]
+fn a_batched_rotten_long_value_answers_as_a_get_does() {
+    let io = SimulatedIo::new(Seed(54));
+    let size = TRUSTED_VALUE_BYTES[0];
+    let store = rotted_large_values(&io, size);
+    let names: Vec<Vec<u8>> = (0..LARGE_KEYS).map(key).collect();
+    let rotted = ROTTED_KEY as usize;
+    let batched = many_answers(&store, &names);
+    assert_eq!(batched[rotted], read(&store, &key(ROTTED_KEY)), "a batch read a rotten value other than a get does");
+    assert_ne!(batched[rotted], Some(large_value(ROTTED_KEY, size)), "the flipped byte was caught under counts that held");
+
+    let state = Arc::clone(&store.state);
+    io.on_every_read(Some(Arc::new(move || state.cues.note_free())));
+    let asked: Vec<&[u8]> = names.iter().map(Vec::as_slice).collect();
+    let mut values = ValueList::new();
+    store.get_many(COLUMN, &asked, &mut values).expect("get many");
+    io.on_every_read(None);
+    assert_eq!(values.answer(rotted), Some(ValueAnswer::Corrupt), "a rotten value came back when the counts moved");
+    for (at, name) in names.iter().enumerate().filter(|(at, _name)| *at != rotted) {
+        let number = at as u64;
+        assert_eq!(values.answer(at), Some(ValueAnswer::Found(&large_value(number, size))), "key {name:?} misread under moving counts");
+    }
+    store.close().expect("close");
+}
+
+// with damage marked on the volume, a batch reads a rotted long value with every check and answers it corrupt, though the counts
+// held, and answers every other key right
+#[test]
+fn a_batch_beside_marked_damage_checks_long_values() {
+    let io = SimulatedIo::new(Seed(55));
+    let size = TRUSTED_VALUE_BYTES[0];
+    let store = rotted_large_values(&io, size);
+    store.state.volumes[0].damage.add(&reel::segment::damage_list::DamagedRange {
+        column: COLUMN,
+        segment: SegmentNumber(u64::MAX),
+        highest_place: WritePlace(0),
+        start: Vec::new(),
+        end: None,
+    });
+    let names: Vec<Vec<u8>> = (0..LARGE_KEYS).map(key).collect();
+    let asked: Vec<&[u8]> = names.iter().map(Vec::as_slice).collect();
+    let mut values = ValueList::new();
+    store.get_many(COLUMN, &asked, &mut values).expect("get many");
+    for at in 0..LARGE_KEYS as usize {
+        let expected = if at == ROTTED_KEY as usize { ValueAnswer::Corrupt } else { ValueAnswer::Found(&large_value(at as u64, size)) };
+        assert_eq!(values.answer(at), Some(expected), "key {at} beside marked damage");
+    }
+    store.close().expect("close");
+}
+
+// the node's shape: an lz4 column of noise slices long enough to chunk, so a run of them turns the one-read guess on and the
+// batch reads them trusted in one read, with a text value in the middle that breaks the run, all answering as single gets do
+#[test]
+fn batched_noise_in_an_lz4_column_matches_single_gets() {
+    SIM_CODEC.with(|codec| codec.set(Codec::Lz4));
+    SIM_BUDGET.with(|budget| budget.set(HELD_BUDGET));
+    let io = SimulatedIo::new(Seed(56));
+    let store = open(&io, CAPACITY);
+    SIM_BUDGET.with(|budget| budget.set(BUDGET));
+    SIM_CODEC.with(|codec| codec.set(Codec::None));
+    let value_of = |number: u64| if number == 6 { text(number) } else { noise(number) };
+    let names: Vec<Vec<u8>> = (0..12).map(key).collect();
+    for (number, name) in names.iter().enumerate() {
+        store.put(COLUMN, name, &value_of(number as u64)).expect("put");
+    }
+    seal_all(&store, &io);
+    // a run of noise reads turns the guess on, so the batch below reads noise in one read and falls back at the text value
+    for number in [0_u64, 1, 2] {
+        assert_eq!(read(&store, &names[number as usize]), Some(value_of(number)));
+    }
+    assert!(store.state.guesses_plain(COLUMN), "a run of noise reads left the guess off");
+    for round in 0..3 {
+        let batched = many_answers(&store, &names);
+        for (number, answer) in batched.iter().enumerate() {
+            assert_eq!(answer.as_ref(), Some(&value_of(number as u64)), "round {round}: key {number} misread in a batch");
+        }
+    }
+    store.close().expect("close");
+}

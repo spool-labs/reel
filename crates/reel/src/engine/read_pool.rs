@@ -376,7 +376,7 @@ impl<Backend: Io> EngineState<Backend> {
         }
         values.clear();
         let mut buffers = values.take_buffers();
-        let warm = poll_once(self.read_keys(&OnlyWarm(None), column, keys, ReadAt { point, handovers }, values, &mut buffers));
+        let warm = poll_once(self.read_keys(&OnlyWarm(None), column, keys, ReadAt { point, handovers, trust: None }, values, &mut buffers));
         values.put_buffers(buffers);
         if let Some(answer) = warm {
             self.corruption_errors.fetch_add(values.corrupt_count(), Ordering::Relaxed);
@@ -415,7 +415,7 @@ impl<Backend: Io> EngineState<Backend> {
             return Err(StoreError::Closed);
         };
         let mut buffers = values.take_buffers();
-        let answer = self.read_keys(&OnRing(ring, None), column, keys, ReadAt { point, handovers }, values, &mut buffers).await;
+        let answer = self.read_keys(&OnRing(ring, None), column, keys, ReadAt { point, handovers, trust: None }, values, &mut buffers).await;
         values.put_buffers(buffers);
         self.corruption_errors.fetch_add(values.corrupt_count(), Ordering::Relaxed);
         answer
@@ -433,7 +433,7 @@ impl<Backend: Io> EngineState<Backend> {
                 let mut buffers = values.take_buffers();
                 let (mut start, mut answer) = (0, Ok(()));
                 for end in ends {
-                    answer = answer.and_then(|()| in_place(self.read_keys(&InPlace, *column, &[&keys[start..*end]], ReadAt { point: *point, handovers: *handovers }, values, &mut buffers)));
+                    answer = answer.and_then(|()| in_place(self.read_keys(&InPlace, *column, &[&keys[start..*end]], ReadAt { point: *point, handovers: *handovers, trust: None }, values, &mut buffers)));
                     start = *end;
                 }
                 values.put_buffers(buffers);

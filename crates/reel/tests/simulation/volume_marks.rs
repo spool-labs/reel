@@ -7,6 +7,7 @@ use std::thread;
 use reel::config::{ColumnConfig, ColumnIndex, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::cue::Cue;
 use reel::engine::reel_store::ReelStore;
+use reel::engine::volume::NO_SEAL;
 use reel::engine::walk_job::FREE_IN_PLACE_BYTES;
 use reel::engine::write_path::ClaimRequest;
 use reel::guard::hold;
@@ -460,5 +461,46 @@ fn flush_locks_its_own_volume() {
         wait_until(|| is_pinned.load(Ordering::Acquire), "a meta flush waited on the bulk volume's lock");
     });
     drop(bulk_claims);
+    store.close().expect("close");
+}
+
+// a claim in flight when a seal picks its segment, which then ends without landing, leaves the volume counting the rows it holds:
+// the seal takes back only its drained rows, so a row that lands in the next segment stays counted and every scan finds it
+#[test]
+fn a_claim_dropped_under_a_seal_leaves_the_count_whole() {
+    let io = SimulatedIo::new(Seed(9));
+    let config = StoreConfig {
+        memory_budget: BUDGET,
+        threads: reel::config::NO_WORKERS,
+        volumes: vec![VolumeConfig { open_segments: Some(1), ..volume("bulk", BULK_ROOT) }, volume("meta", META_ROOT)],
+        columns: vec![column(BULK, "bulk", 0), column(META, "meta", 1)],
+    };
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let bulk = &store.state.volumes[0];
+    for number in 0..100_u64 {
+        store.put(BULK, &number.to_be_bytes(), b"value").expect("put");
+    }
+    let claim = store.state.claim(bulk, &ONE_ROW).expect("claim");
+    store.seal_now();
+    for _step in 0..STEPS {
+        if bulk.sealing.load(Ordering::Acquire) != NO_SEAL {
+            break;
+        }
+        if io.step_any().is_none() {
+            io.advance_clock(TICK);
+        }
+    }
+    assert_ne!(bulk.sealing.load(Ordering::Acquire), NO_SEAL, "the seal never picked its segment");
+    drop(claim);
+    store.put(BULK, b"later", b"value").expect("put");
+    settle(&io);
+    assert_eq!(bulk.seals_done.load(Ordering::Acquire), 1);
+    assert_eq!(bulk.rows_in_index.load(Ordering::Acquire), 1, "the volume counts the one open row");
+
+    let mut scan = store.iter_from(BULK, b"later", reel_core::direction::Direction::Ascending).expect("scan");
+    let mut name = Vec::new();
+    assert_eq!(scan.next_key(&mut name).expect("step"), reel_core::scan::ScanStep::Found);
+    assert_eq!(name, b"later");
+    drop(scan);
     store.close().expect("close");
 }

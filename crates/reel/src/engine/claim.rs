@@ -61,7 +61,9 @@ impl<Backend: Io> Claim<'_, Backend> {
                 if !self.is_landed {
                     segment.row_count = RowCount(segment.row_count.0 - self.rows.0);
                     segment.cover_rows -= self.covers;
-                    self.volume.rows_in_index.fetch_sub(self.rows.0, Ordering::Relaxed);
+                    let _counted = self.volume.rows_in_index.fetch_sub(self.rows.0, Ordering::Relaxed);
+                    #[cfg(feature = "test-hooks")]
+                    assert!(_counted >= self.rows.0, "a claim gives back {} rows to a volume counting {_counted}", self.rows.0);
                     // no row points into bytes a claim never landed, so the last claim's bytes go back for the next one while the
                     // segment still takes writes. A range a later claim stands past, or a seal already took its end from, stays a gap
                     let is_taking = matches!(segment.phase, SegmentPhase::Taking | SegmentPhase::Alone);

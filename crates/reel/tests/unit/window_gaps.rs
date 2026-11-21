@@ -55,10 +55,12 @@ fn single_puts_racing_seals_leave_no_gap() {
                 std::thread::yield_now();
             }
         });
-        for writer in writers {
-            writer.join().expect("writer");
-        }
+        // the sealer stops before a writer's panic is raised, so a failed put fails the test and doesn't hang it
+        let joined: Vec<_> = writers.into_iter().map(|writer| writer.join()).collect();
         done.store(true, Ordering::Release);
+        for result in joined {
+            result.expect("writer");
+        }
     });
     store.seal_now();
 

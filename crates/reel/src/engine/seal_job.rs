@@ -55,6 +55,7 @@ pub struct SealTarget<File> {
     pub data: File,
     pub rows: File,
     pub data_end: FileOffset,
+    /// The segment's rows: at most this at the pick, while claims may still give rows back, and exact once its writers drain
     pub row_count: RowCount,
     pub lowest_place: WritePlace,
     pub highest_place: WritePlace,
@@ -213,7 +214,9 @@ impl<Backend: Io> SealJob<Backend> {
         }
         if let Some(target) = &self.target {
             let volume = self.volume();
-            volume.rows_in_index.fetch_sub(target.row_count.0, Ordering::Relaxed);
+            let _counted = volume.rows_in_index.fetch_sub(target.row_count.0, Ordering::Relaxed);
+            #[cfg(feature = "test-hooks")]
+            assert!(_counted >= target.row_count.0, "a seal takes back {} rows from a volume counting {_counted}", target.row_count.0);
             volume.ration.clear();
         }
         self.target = None;
@@ -253,6 +256,11 @@ impl<Backend: Io> SealJob<Backend> {
             }
         }
         true
+    }
+
+    /// Read the rows a drained segment holds
+    pub fn drained_rows(&self, slot: OpenSlot) -> Option<RowCount> {
+        hold(&self.volume().claims).open.iter().find(|segment| segment.slot == slot).map(|segment| segment.row_count)
     }
 
     /// Send the target's last rows out and start its footer
@@ -683,7 +691,12 @@ impl<Backend: Io> SealJob<Backend> {
                 if !self.is_ready(target) {
                     return Ok(());
                 }
-                if target.row_count.0 == 0 {
+                // a claim in flight at the pick that ended without landing gave its rows back, so the seal counts what its writers left
+                let rows = self.drained_rows(target.slot).unwrap_or(target.row_count);
+                if let Some(held) = &mut self.target {
+                    held.row_count = rows;
+                }
+                if rows.0 == 0 {
                     self.drop_empty(target)?;
                     self.end_seal();
                     return Ok(());

@@ -14,6 +14,9 @@ const KEYS: u64 = 60_000;
 const LEAST_RUNS: u64 = 12;
 // Keys a writer puts at most while it waits for the reader's rounds
 const MOST_KEYS: u64 = 20 * KEYS;
+// Keys a writer past KEYS stays ahead of the reader's finished rounds, so every round sees writes and seals land and none outlasts
+// the writer
+const PACE_KEYS: u64 = 20_000;
 
 // spread keys over every shard, so sealed and open ones mix along the walk
 fn key(number: u64) -> [u8; 8] {
@@ -44,6 +47,8 @@ fn counts_beside_seals_stay_in_bounds() {
     let counts = std::thread::scope(|scope| {
         let (store, written, done, runs) = (&store, &written, &done, &runs);
         scope.spawn(move || {
+            // a writer that panics still stops the counter, so the test fails and doesn't hang
+            let _stops = StopOnDrop(done);
             let mut number = 0;
             // the writer goes on past KEYS until the reader has run enough rounds to have raced it
             while number < KEYS || (runs.load(Ordering::Acquire) < LEAST_RUNS && number < MOST_KEYS) {
@@ -53,10 +58,12 @@ fn counts_beside_seals_stay_in_bounds() {
                     store.seal_now();
                 }
                 number += 1;
+                pace(number, runs, done);
             }
-            done.store(true, Ordering::Release);
         });
         let counter = scope.spawn(move || {
+            // a reader that panics stops the writer waiting on it
+            let _stops = StopOnDrop(done);
             let mut counts = 0;
             while !done.load(Ordering::Acquire) {
                 let low = written.load(Ordering::Acquire);
@@ -103,6 +110,8 @@ fn walks_beside_seals(with_values: bool) {
     let walks = std::thread::scope(|scope| {
         let (store, written, done, runs) = (&store, &written, &done, &runs);
         scope.spawn(move || {
+            // a writer that panics still stops the counter, so the test fails and doesn't hang
+            let _stops = StopOnDrop(done);
             let mut number = 0;
             // the writer goes on past KEYS until the reader has run enough rounds to have raced it
             while number < KEYS || (runs.load(Ordering::Acquire) < LEAST_RUNS && number < MOST_KEYS) {
@@ -112,10 +121,12 @@ fn walks_beside_seals(with_values: bool) {
                     store.seal_now();
                 }
                 number += 1;
+                pace(number, runs, done);
             }
-            done.store(true, Ordering::Release);
         });
         let walker = scope.spawn(move || {
+            // a reader that panics stops the writer waiting on it
+            let _stops = StopOnDrop(done);
             let mut walks = 0;
             let mut seen = std::collections::HashSet::new();
             while !done.load(Ordering::Acquire) {
@@ -177,6 +188,8 @@ fn cue_counts_beside_deleting_seals_match_their_walks() {
     let counts = std::thread::scope(|scope| {
         let (store, done, runs) = (&store, &done, &runs);
         scope.spawn(move || {
+            // a writer that panics still stops the counter, so the test fails and doesn't hang
+            let _stops = StopOnDrop(done);
             let mut number = 0;
             // the writer goes on past KEYS until the reader has run enough rounds to have raced it
             while number < KEYS || (runs.load(Ordering::Acquire) < LEAST_RUNS && number < MOST_KEYS) {
@@ -190,10 +203,12 @@ fn cue_counts_beside_deleting_seals_match_their_walks() {
                     std::thread::sleep(std::time::Duration::from_millis(80));
                 }
                 number += 1;
+                pace(number, runs, done);
             }
-            done.store(true, Ordering::Release);
         });
         let counter = scope.spawn(move || {
+            // a reader that panics stops the writer waiting on it
+            let _stops = StopOnDrop(done);
             let mut counts = 0;
             while !done.load(Ordering::Acquire) {
                 let cue = store.cue().expect("cue");
@@ -222,4 +237,24 @@ fn cue_counts_beside_deleting_seals_match_their_walks() {
     assert!(store.state.index_counts.load(Ordering::Relaxed) > 0, "no count came from the index");
     store.close().expect("close");
     let _gone = fs::remove_dir_all(&root);
+}
+
+/// Sets a flag when dropped, so the threads waiting on a writer stop when it ends, panic or not
+struct StopOnDrop<'flag>(&'flag AtomicBool);
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// Wait while the writer is a pace ahead of the reader, until the reader has run its rounds or stopped
+fn pace(number: u64, runs: &AtomicU64, done: &AtomicBool) {
+    while number >= KEYS
+        && number >= KEYS + (runs.load(Ordering::Acquire) + 1) * PACE_KEYS
+        && runs.load(Ordering::Acquire) < LEAST_RUNS
+        && !done.load(Ordering::Acquire)
+    {
+        std::thread::yield_now();
+    }
 }

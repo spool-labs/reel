@@ -1992,21 +1992,30 @@ fn writes_beside_batches_match_the_model() {
 
 const DRAIN_PIECE: u64 = 40;
 
-/// The model a drained row answers: the one its batch was filled at, or the model now once a drain fills a new batch
+/// The models a drained row may answer: the model after each write since the drain began. A row comes from a batch filled at
+/// one of them, and batches fill in order, so each row answers the model its batch saw or a later one, never an earlier one
 struct DrainCheck {
-    seen: Model,
+    models: Vec<Model>,
+    at: usize,
     last: Option<Vec<u8>>,
     rows: u64,
 }
 
 impl DrainCheck {
-    // check a row is the next key of the batch's model, or of the model now when the drain moved to a batch filled since
-    fn take(&mut self, model: &Model, (name, value): (&[u8], &[u8]), direction: Direction) {
+    // keep the model after a write, which a batch filled from here on sees
+    fn wrote(&mut self, model: &Model) {
+        self.models.push(model.clone());
+    }
+
+    // check a row is the next key of the model its batch saw: the earliest model from the last row's on that it matches
+    fn take(&mut self, (name, value): (&[u8], &[u8]), direction: Direction) {
         let row = Some((name.to_vec(), value.to_vec()));
-        if row != next_in(&self.seen, self.last.as_ref(), direction) {
-            self.seen = model.clone();
-            assert_eq!(row, next_in(&self.seen, self.last.as_ref(), direction), "after {:?} going {direction:?}", self.last);
-        }
+        let Some(found) = (self.at..self.models.len()).find(|at| row == next_in(&self.models[*at], self.last.as_ref(), direction)) else {
+            let newest = self.models.last().expect("a model");
+            assert_eq!(row, next_in(newest, self.last.as_ref(), direction), "after {:?} going {direction:?}", self.last);
+            unreachable!("the newest model matched no row it was asked for");
+        };
+        self.at = found;
         self.last = Some(name.to_vec());
         self.rows += 1;
     }
@@ -2021,18 +2030,18 @@ fn drain_beside_writer(store: &Store, model: &mut Model, random: &mut SeededRand
     };
     let mut scan = store.iter_from(COLUMN, &start, direction).expect("scan");
     let (mut name, mut value) = (Vec::new(), Vec::new());
-    let mut check = DrainCheck { seen: model.clone(), last: None, rows: 0 };
+    let mut check = DrainCheck { models: vec![model.clone()], at: 0, last: None, rows: 0 };
     for piece in 0_u64.. {
         let step = if is_mixed && piece % 2 == 1 {
             let step = scan.next_row(&mut name, &mut value).expect("step");
             if step == ScanStep::Found {
-                check.take(model, (&name, &value), direction);
+                check.take((&name, &value), direction);
             }
             step
         } else {
             let mut left = 1 + random.below(DRAIN_PIECE);
             scan.drain((&mut name, &mut value), |row_name, row_value| {
-                check.take(model, (row_name, row_value), direction);
+                check.take((row_name, row_value), direction);
                 left -= 1;
                 left > 0
             })
@@ -2045,10 +2054,12 @@ fn drain_beside_writer(store: &Store, model: &mut Model, random: &mut SeededRand
         }
         if write_odds.is_some_and(|odds| random.one_in(odds)) {
             write_one(store, model, random, fresh);
+            check.wrote(model);
         }
     }
-    // the end comes from a batch filled in the last drain, after every write
-    assert_eq!(next_in(model, check.last.as_ref(), direction), None, "the drain ended early going {direction:?}");
+    // the end comes from the last row's batch or a later one, so some model from the last row's on has no key past it
+    let is_end = (check.at..check.models.len()).any(|at| next_in(&check.models[at], check.last.as_ref(), direction).is_none());
+    assert!(is_end, "the drain ended early going {direction:?}: {:?}", next_in(model, check.last.as_ref(), direction));
     check.rows
 }
 

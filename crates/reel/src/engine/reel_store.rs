@@ -1475,6 +1475,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         index_waits: AtomicU64::new(0),
         longest_index_wait: AtomicU64::new(0),
         values_under_least: (0..MAX_COLUMNS).map(|_column| AtomicU64::new(0)).collect(),
+        large_plain: (0..MAX_COLUMNS).map(|_column| AtomicBool::new(false)).collect(),
         open_time: AtomicU64::new(0),
         prefault_time: AtomicU64::new(0),
         huge_pages: AtomicU64::new(0),

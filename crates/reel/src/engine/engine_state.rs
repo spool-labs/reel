@@ -121,6 +121,8 @@ pub struct EngineState<Backend: Io> {
     pub index_waits: AtomicU64,
     pub longest_index_wait: AtomicU64,
     pub values_under_least: Vec<AtomicU64>,
+    /// Each column's last chunked record was stored as written, so a read of an lz4 column's large value tries one read for it
+    pub large_plain: Vec<AtomicBool>,
     pub open_time: AtomicU64,
     pub prefault_time: AtomicU64,
     pub huge_pages: AtomicU64,

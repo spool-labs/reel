@@ -304,6 +304,9 @@ impl<Backend: Io> EngineState<Backend> {
             place: WritePlace(0),
         };
         let shape = self.encode_value(encoder, &identity, write.codec, write.value)?;
+        if shape.table_length > 0 {
+            self.note_large_form(write.column, shape.sums_length > 0);
+        }
 
         let length = shape.total_length();
         let landed = self.land_record(volume, write, length, |claim| {
@@ -521,6 +524,14 @@ impl<Backend: Io> EngineState<Backend> {
                     self.wait_for_index(column, start, slot)?;
                 },
             }
+        }
+    }
+
+    /// Note whether a column's newest chunked record was stored as written, writing the hint only when it changes
+    pub fn note_large_form(&self, column: ColumnId, is_plain: bool) {
+        let hint = &self.large_plain[column.0 as usize];
+        if hint.load(Ordering::Relaxed) != is_plain {
+            hint.store(is_plain, Ordering::Relaxed);
         }
     }
 

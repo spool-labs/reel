@@ -26,6 +26,7 @@ use crate::io::device_error::is_device_error;
 use crate::io::ring::RingWait;
 use crate::record::record_check::RecordIdentity;
 use crate::record::codec::Codec;
+use crate::index::value_pages::MOST_HELD_VALUE;
 use crate::record::record_head::SMALL_HEAD_BYTES;
 use crate::record::record_reader::{RecordLocation, RecordRead, RecordReader, checks_split, form_of};
 use crate::row_kind::RowKind;
@@ -939,14 +940,18 @@ impl<Backend: Io> EngineState<Backend> {
         let holder = self.sorted_index(read.column).filter(|index| want == RecordWant::Whole && index.values.page_count() > 0 && volume.damage.is_empty());
         if let Some(index) = holder {
             let row = (sealed.row.place, sealed.segment, sealed.row.offset);
+            // a record whose payload is longer than a leaf holds, a slice, takes no leaf lookup and no hold
+            let is_holdable = sealed.row.length.0 as usize <= MOST_HELD_VALUE + SMALL_HEAD_BYTES;
             buf.clear();
-            if index.held_value(read.key, row, buf) {
+            if is_holdable && index.held_value(read.key, row, buf) {
                 return Ok(true);
             }
             if self.read_record(ReadOn::new(device, &pin.file), location, trust, read, want, buf).await? == RecordRead::Failed {
                 return Err(corruption(read));
             }
-            index.hold_value(read.key, row, buf);
+            if is_holdable {
+                index.hold_value(read.key, row, buf);
+            }
             return Ok(true);
         }
         // a sealed record never changes where it sits, so the cache answers for its place while the segment is pinned
@@ -1014,16 +1019,29 @@ impl<Backend: Io> EngineState<Backend> {
             Trust::While(counts) => self.has_outlived(counts, true),
             Trust::Whole => true,
         };
+        // an lz4 column whose large records come out as written, a column of noise, reads one in a single read as a none column
+        // does. A record that did shrink falls back to its two reads
+        let is_guessed = read.info.codec == Codec::Lz4;
+        let declared = if is_guessed && self.large_plain[read.column.0 as usize].load(Ordering::Relaxed) { Codec::None } else { read.info.codec };
         let outcome = match want {
             RecordWant::Whole if trust != Trust::Check => match reader.read_trusted(device, file, location, buf).await {
                 Ok(Some(answer)) if holds() => Ok(answer),
                 Ok(Some(_answer)) => Ok(reader.check_trusted(&identity, buf)),
-                Ok(None) => reader.read_value_trusting(device, file, location, (&identity, read.info.codec), buf, holds).await,
+                Ok(None) => reader.read_value_trusting(device, file, location, (&identity, declared), buf, holds).await,
                 Err(error) => Err(error),
             },
-            RecordWant::Whole => reader.read_value(device, file, location, &identity, read.info.codec, buf).await,
+            RecordWant::Whole => reader.read_value(device, file, location, &identity, declared, buf).await,
             RecordWant::Window(window) => reader.read_window(device, file, location, &identity, read.info.codec, window, buf).await,
         };
+        // a whole read put the record's head in the reader, so a chunked record's form says how the column stores large values now
+        if is_guessed
+            && want == RecordWant::Whole
+            && matches!(outcome, Ok(RecordRead::Valid))
+            && let Some(form) = reader.form()
+            && form.is_chunked
+        {
+            self.note_large_form(read.column, form.codec == Codec::None);
+        }
         let damaged = reader.take_damaged_sums();
         drop(reader);
         if damaged > 0 {

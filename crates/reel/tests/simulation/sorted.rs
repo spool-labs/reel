@@ -2834,3 +2834,52 @@ fn open_rows_answer_their_kept_values() {
     assert_eq!(report(&store).kept_values - kept - single, found, "a batched get read a kept value's record");
     store.close().expect("close");
 }
+
+const LARGE_RECORD_BYTES: usize = 200 * 1024;
+
+// a value no codec shrinks, of a given seed
+fn noise(seed: u64) -> Vec<u8> {
+    let mut state = seed | 1;
+    (0..LARGE_RECORD_BYTES)
+        .map(|_byte| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect()
+}
+
+// a value lz4 shrinks well
+fn text(seed: u64) -> Vec<u8> {
+    format!("text value {seed} ").into_bytes().into_iter().cycle().take(LARGE_RECORD_BYTES).collect()
+}
+
+// an lz4 column's large records turn from noise to text and back: the hint of how they're stored follows each write and each
+// read, a read the hint guessed wrong falls back, and every value reads back as written
+#[test]
+fn large_records_steer_their_reads_as_they_change() {
+    SIM_CODEC.with(|codec| codec.set(Codec::Lz4));
+    let io = SimulatedIo::new(Seed(50));
+    let store = open(&io, CAPACITY);
+    SIM_CODEC.with(|codec| codec.set(Codec::None));
+    let hint = || store.state.large_plain[COLUMN.0 as usize].load(Ordering::Relaxed);
+
+    store.put(COLUMN, &key(1), &noise(1)).expect("put");
+    assert!(hint(), "a noise record left the hint off");
+    store.put(COLUMN, &key(2), &text(2)).expect("put");
+    assert!(!hint(), "a text record left the hint on");
+    seal_all(&store, &io);
+    assert_eq!(read(&store, &key(1)), Some(noise(1)), "a noise record read under a text hint");
+    assert!(hint(), "a read of a noise record left the hint off");
+    assert_eq!(read(&store, &key(2)), Some(text(2)), "a text record read under a noise hint");
+    assert!(!hint(), "a read of a text record left the hint on");
+
+    store.put(COLUMN, &key(3), &noise(3)).expect("put");
+    assert!(hint());
+    for number in [2_u64, 1, 3, 2] {
+        let expected = if number == 2 { text(2) } else { noise(number) };
+        assert_eq!(read(&store, &key(number)), Some(expected), "key {number}");
+    }
+    store.close().expect("close");
+}

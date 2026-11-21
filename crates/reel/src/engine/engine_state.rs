@@ -3,7 +3,7 @@
 use std::io::{Error, ErrorKind, IoSlice};
 use std::path::Path;
 use std::mem;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use reel_core::column_id::ColumnId;
@@ -121,8 +121,9 @@ pub struct EngineState<Backend: Io> {
     pub index_waits: AtomicU64,
     pub longest_index_wait: AtomicU64,
     pub values_under_least: Vec<AtomicU64>,
-    /// Each column's last chunked record was stored as written, so a read of an lz4 column's large value tries one read for it
-    pub large_plain: Vec<AtomicBool>,
+    /// How many of each column's chunked records in a row came out as written, up to PLAIN_STREAK, so a read of an lz4
+    /// column's large value tries one read for it once a run of them says the column holds noise
+    pub large_plain: Vec<AtomicU8>,
     pub open_time: AtomicU64,
     pub prefault_time: AtomicU64,
     pub huge_pages: AtomicU64,

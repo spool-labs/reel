@@ -184,8 +184,8 @@ pub struct SortedKeys {
     pub values: Arc<ValuePages>,
     /// This index counts the shared pool's memory and fills, so the store counts them once
     owns_values: bool,
-    /// One past the highest page ever taken. Pages are chained in order at build and taken from the head, so every page at or
-    /// past this one still holds the chain the build wrote
+    /// This index's place among the pool's sharers, whose floor of pages it may always take
+    sharer: usize,
     /// The rows the column was told to hold, which sized the pool
     told_rows: RowCount,
 }
@@ -323,6 +323,7 @@ impl SortedKeys {
             entered: AtomicU64::new(0),
             values: Arc::new(ValuePages::new(0)),
             owns_values: false,
+            sharer: 0,
             told_rows: rows,
         }
         .chained()
@@ -762,8 +763,9 @@ impl SortedKeys {
     }
 
     /// Give the leaves the store's pool of value pages to keep values in, which one index owns for the counts
-    pub fn holding_values(mut self, pool: Arc<ValuePages>, owns: bool) -> Self {
+    pub fn holding_values(mut self, pool: Arc<ValuePages>, (sharer, owns): (usize, bool)) -> Self {
         self.values = pool;
+        self.sharer = sharer;
         self.owns_values = owns;
         self
     }
@@ -832,7 +834,7 @@ impl SortedKeys {
             if !self.names_row(leaf, index, row) {
                 continue;
             }
-            if let Some(chain) = self.values.fill(leaf, self.chain_of(leaf), (index, self.leaf_capacity), value) {
+            if let Some(chain) = self.values.fill((self.sharer, leaf), self.chain_of(leaf), (index, self.leaf_capacity), value) {
                 self.set_chain(leaf, chain);
                 held += 1;
             }
@@ -896,7 +898,7 @@ impl SortedKeys {
     fn drop_values(&self, page: u32) {
         let chain = self.chain_of(page);
         if chain != HeldChain::NONE {
-            self.values.drop_chain(chain);
+            self.values.drop_chain(self.sharer, chain);
             self.set_chain(page, HeldChain::NONE);
         }
     }

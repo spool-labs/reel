@@ -3,7 +3,7 @@
 use std::io::{Error, ErrorKind};
 use std::mem;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -1475,7 +1475,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         index_waits: AtomicU64::new(0),
         longest_index_wait: AtomicU64::new(0),
         values_under_least: (0..MAX_COLUMNS).map(|_column| AtomicU64::new(0)).collect(),
-        large_plain: (0..MAX_COLUMNS).map(|_column| AtomicBool::new(false)).collect(),
+        large_plain: (0..MAX_COLUMNS).map(|_column| AtomicU8::new(0)).collect(),
         open_time: AtomicU64::new(0),
         prefault_time: AtomicU64::new(0),
         huge_pages: AtomicU64::new(0),
@@ -1920,16 +1920,15 @@ pub fn size_sorted_indexes(config: &StoreConfig, sizing: &EngineSizing, summarie
 /// Allocate and touch each sorted column's index at the rows open sized it for
 pub fn sorted_indexes(config: &StoreConfig, sizes: &[Option<SortedSize>]) -> Vec<Option<SortedKeys>> {
     let mut indexes: Vec<Option<SortedKeys>> = (0..MAX_COLUMNS).map(|_column| None).collect();
-    // every index's share of value pages goes in one pool, so the columns walks read take what the others leave
-    let pages: u64 = sizes.iter().flatten().filter(|size| size.rows.0 > 0).map(|size| u64::from(size.value_pages)).sum();
-    let pool = Arc::new(ValuePages::new(u32::try_from(pages).unwrap_or(u32::MAX - 1)));
-    let mut has_owner = false;
-    for column in &config.columns {
-        indexes[column.id.0 as usize] = sizes[column.id.0 as usize].filter(|size| size.rows.0 > 0).map(|size| {
-            let index = SortedKeys::new(column.key_shape.widest(), size.rows).holding_values(Arc::clone(&pool), !has_owner);
-            has_owner = true;
-            index
-        });
+    // every index's share of value pages goes in one pool, so the columns walks read take what the others leave, and each index
+    // may always take its own share
+    let sized: Vec<(&ColumnConfig, SortedSize)> =
+        config.columns.iter().filter_map(|column| sizes[column.id.0 as usize].filter(|size| size.rows.0 > 0).map(|size| (column, size))).collect();
+    let floors: Vec<u32> = sized.iter().map(|(_column, size)| size.value_pages).collect();
+    let pool = Arc::new(ValuePages::shared(&floors));
+    for (sharer, (column, size)) in sized.into_iter().enumerate() {
+        let index = SortedKeys::new(column.key_shape.widest(), size.rows).holding_values(Arc::clone(&pool), (sharer, sharer == 0));
+        indexes[column.id.0 as usize] = Some(index);
     }
     indexes
 }

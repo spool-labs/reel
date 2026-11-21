@@ -15,7 +15,7 @@ fn fills_read_back() {
     let pages = ValuePages::new(16);
     let mut chain = HeldChain::NONE;
     for index in (0..ENTRIES).step_by(2) {
-        chain = pages.fill(LEAF, chain, (index, ENTRIES), &value(index, 100)).expect("a fill");
+        chain = pages.fill((0, LEAF), chain, (index, ENTRIES), &value(index, 100)).expect("a fill");
     }
     for index in 0..ENTRIES {
         let mut out = Vec::new();
@@ -33,7 +33,7 @@ fn fills_read_back() {
 #[test]
 fn long_values_stay_out() {
     let pages = ValuePages::new(4);
-    assert_eq!(pages.fill(LEAF, HeldChain::NONE, (0, ENTRIES), &value(0, MOST_HELD_VALUE + 1)), None);
+    assert_eq!(pages.fill((0, LEAF), HeldChain::NONE, (0, ENTRIES), &value(0, MOST_HELD_VALUE + 1)), None);
     assert_eq!(pages.free_pages(), 4);
 }
 
@@ -41,14 +41,14 @@ fn long_values_stay_out() {
 #[test]
 fn a_dropped_chain_reads_nothing() {
     let pages = ValuePages::new(8);
-    let chain = pages.fill(LEAF, HeldChain::NONE, (3, ENTRIES), &value(3, 500)).expect("a fill");
-    pages.drop_chain(chain);
+    let chain = pages.fill((0, LEAF), HeldChain::NONE, (3, ENTRIES), &value(3, 500)).expect("a fill");
+    pages.drop_chain(0, chain);
     let mut out = Vec::new();
     assert!(!pages.read(chain, 3, &mut out));
     assert!(out.is_empty());
     assert_eq!(pages.free_pages(), 8);
     // the same pages filled for another leaf don't answer for the old chain
-    let other = pages.fill(LEAF + 1, HeldChain::NONE, (3, ENTRIES), &value(9, 500)).expect("a fill");
+    let other = pages.fill((0, LEAF + 1), HeldChain::NONE, (3, ENTRIES), &value(9, 500)).expect("a fill");
     assert!(!pages.read(chain, 3, &mut out));
     assert!(pages.read(other, 3, &mut out));
     assert_eq!(out, value(9, 500));
@@ -61,14 +61,14 @@ fn a_full_pool_fills_again_once_a_chain_drops() {
     let mut first = HeldChain::NONE;
     let mut second = HeldChain::NONE;
     for index in 0..3 {
-        first = pages.fill(LEAF, first, (index, ENTRIES), &value(index, 1_000)).expect("a fill");
-        second = pages.fill(LEAF + 1, second, (index, ENTRIES), &value(index, 1_000)).expect("a fill");
+        first = pages.fill((0, LEAF), first, (index, ENTRIES), &value(index, 1_000)).expect("a fill");
+        second = pages.fill((0, LEAF + 1), second, (index, ENTRIES), &value(index, 1_000)).expect("a fill");
     }
-    assert_eq!(pages.fill(LEAF + 2, HeldChain::NONE, (0, ENTRIES), &value(2, 100)), None);
+    assert_eq!(pages.fill((0, LEAF + 2), HeldChain::NONE, (0, ENTRIES), &value(2, 100)), None);
     let mut out = Vec::new();
     assert!(pages.read(second, 0, &mut out), "a full pool lost a held value");
-    pages.drop_chain(first);
-    let third = pages.fill(LEAF + 2, HeldChain::NONE, (0, ENTRIES), &value(2, 100)).expect("a fill");
+    pages.drop_chain(0, first);
+    let third = pages.fill((0, LEAF + 2), HeldChain::NONE, (0, ENTRIES), &value(2, 100)).expect("a fill");
     out.clear();
     assert!(pages.read(third, 0, &mut out));
     assert_eq!(out, value(2, 100));
@@ -78,8 +78,8 @@ fn a_full_pool_fills_again_once_a_chain_drops() {
 #[test]
 fn a_second_fill_keeps_the_first() {
     let pages = ValuePages::new(4);
-    let chain = pages.fill(LEAF, HeldChain::NONE, (5, ENTRIES), b"first").expect("a fill");
-    let again = pages.fill(LEAF, chain, (5, ENTRIES), b"second").expect("a fill");
+    let chain = pages.fill((0, LEAF), HeldChain::NONE, (5, ENTRIES), b"first").expect("a fill");
+    let again = pages.fill((0, LEAF), chain, (5, ENTRIES), b"second").expect("a fill");
     assert_eq!(chain, again);
     let mut out = Vec::new();
     assert!(pages.read(chain, 5, &mut out));
@@ -114,7 +114,7 @@ mod in_an_index {
     // replaced since its fill, or a leaf split under it, answers nothing until filled again
     #[test]
     fn held_answers_are_always_the_entrys_row() {
-        let index = SortedKeys::new(WIDTH, RowCount(KEYS * 2)).holding_values(std::sync::Arc::new(reel::index::value_pages::ValuePages::new(8)), true);
+        let index = SortedKeys::new(WIDTH, RowCount(KEYS * 2)).holding_values(std::sync::Arc::new(reel::index::value_pages::ValuePages::new(8)), (0, true));
         for number in 0..KEYS {
             index.upsert(&key(number), entry(row(number, 0)), Floors::at(WritePlace(0)));
         }
@@ -150,4 +150,26 @@ mod in_an_index {
         }
         assert!(answered > 0, "nothing was held");
     }
+}
+
+// two indexes share a pool with four pages each: one walking every leaf takes its own four and half the other's, the other
+// still takes the half it's owed, and a page given back goes to the one still under its floor
+#[test]
+fn a_sharer_never_takes_another_sharer_floor() {
+    let pages = ValuePages::shared(&[4, 4]);
+    let mut walked = Vec::new();
+    for leaf in 0..8 {
+        if let Some(chain) = pages.fill((0, LEAF + leaf), HeldChain::NONE, (0, ENTRIES), &value(leaf as usize, 100)) {
+            walked.push(chain);
+        }
+    }
+    assert_eq!(walked.len(), 6, "the walking index took past half the other's share");
+    let owed: Vec<HeldChain> = (0..2)
+        .map(|leaf| pages.fill((1, LEAF + 100 + leaf), HeldChain::NONE, (0, ENTRIES), &value(leaf as usize, 100)).expect("the other's share"))
+        .collect();
+    assert_eq!(owed.len(), 2);
+    assert_eq!(pages.fill((1, LEAF + 200), HeldChain::NONE, (0, ENTRIES), &value(0, 100)), None, "a full pool gave a page");
+    pages.drop_chain(1, owed[0]);
+    assert!(pages.fill((0, LEAF + 300), HeldChain::NONE, (0, ENTRIES), &value(0, 100)).is_none(), "a page the other is owed went to the walker");
+    assert!(pages.fill((1, LEAF + 301), HeldChain::NONE, (0, ENTRIES), &value(0, 100)).is_some(), "the owed page didn't come back");
 }

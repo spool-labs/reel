@@ -53,6 +53,8 @@ const OFFSET_BITS: u32 = 12;
 struct FreeValuePages {
     head: u32,
     count: u32,
+    /// The pages each index sharing the pool holds now
+    taken: Vec<u32>,
 }
 
 /// A leaf's held values: the chain's first page and its generation, as the leaf keeps them in its head
@@ -72,6 +74,10 @@ impl HeldChain {
 pub struct ValuePages {
     words: Vec<AtomicU64>,
     free: Mutex<FreeValuePages>,
+    /// The pages each index sharing the pool may always take, its share of the whole. Past it, an index takes a page only while
+    /// half of every other index's unused share stays free, so a busy column uses what idle ones leave and a walk of a cold
+    /// column never starves a hot one of more than half its share
+    floors: Vec<u32>,
     /// The free list's count, readable with no lock, so a fill that would find no page takes no part's lock
     free_count: AtomicU64,
     /// Values held now, and the fills and drops so far, for the report
@@ -81,12 +87,19 @@ pub struct ValuePages {
 }
 
 impl ValuePages {
-    /// Allocate and touch a pool of this many pages, every one free
+    /// Allocate and touch a pool of this many pages, every one free, for one index
     pub fn new(pages: u32) -> Self {
+        Self::shared(&[pages])
+    }
+
+    /// Allocate and touch a pool for indexes that share it, each with the pages it may always take, every page free
+    pub fn shared(floors: &[u32]) -> Self {
+        let pages = floors.iter().fold(0_u32, |total, floor| total.saturating_add(*floor)).min(u32::MAX - 1);
         let words = touched_words(pages as usize * VALUE_PAGE_WORDS);
         let pool = Self {
             words,
-            free: Mutex::new(FreeValuePages { head: if pages == 0 { NO_VALUE_PAGE } else { 0 }, count: pages }),
+            free: Mutex::new(FreeValuePages { head: if pages == 0 { NO_VALUE_PAGE } else { 0 }, count: pages, taken: vec![0; floors.len()] }),
+            floors: floors.to_vec(),
             free_count: AtomicU64::new(u64::from(pages)),
             held: AtomicU64::new(0),
             fills: AtomicU64::new(0),
@@ -164,7 +177,7 @@ impl ValuePages {
 
     /// Put a value in a leaf's chain for its entry, starting a chain when the leaf has none, and return the chain the leaf keeps now.
     /// Nothing when the value is too long or the pool has no free page
-    pub fn fill(&self, owner: u32, chain: HeldChain, (index, entries): (usize, usize), value: &[u8]) -> Option<HeldChain> {
+    pub fn fill(&self, (sharer, owner): (usize, u32), chain: HeldChain, (index, entries): (usize, usize), value: &[u8]) -> Option<HeldChain> {
         let table = slot_table_words(entries);
         if value.len() > MOST_HELD_VALUE || index >= entries || VALUE_HEAD_WORDS + table >= VALUE_PAGE_WORDS {
             return None;
@@ -172,14 +185,14 @@ impl ValuePages {
         let chain = if self.is_live(chain) && self.table_words(chain.first) >= table {
             chain
         } else {
-            let first = self.take(owner)?;
+            let first = self.take(sharer, owner)?;
             self.set_used(first, (VALUE_HEAD_WORDS + table) * size_of::<u64>(), table);
             HeldChain { first, generation: self.generation(first) }
         };
         if self.slot(chain.first, index) != 0 {
             return Some(chain);
         }
-        let (link, page) = self.room_for(owner, chain, value.len())?;
+        let (link, page) = self.room_for((sharer, owner), chain, value.len())?;
         let offset = self.used(page);
         self.copy_in(page, offset, value);
         self.set_used(page, align(offset + value.len()), self.table_words(page));
@@ -190,17 +203,17 @@ impl ValuePages {
     }
 
     /// Give a leaf's whole chain back, moving every page's generation first
-    pub fn drop_chain(&self, chain: HeldChain) {
+    pub fn drop_chain(&self, sharer: usize, chain: HeldChain) {
         if !self.is_live(chain) {
             return;
         }
         self.held.fetch_sub(self.count_slots(chain.first), Ordering::Relaxed);
-        self.give_chain(chain.first);
+        self.give_chain(sharer, chain.first);
         self.drops.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Find room for a value of this length at the end of a chain, adding a page when the last is full
-    fn room_for(&self, owner: u32, chain: HeldChain, length: usize) -> Option<(usize, u32)> {
+    fn room_for(&self, (sharer, owner): (usize, u32), chain: HeldChain, length: usize) -> Option<(usize, u32)> {
         let mut page = chain.first;
         let mut link = 0;
         loop {
@@ -218,18 +231,31 @@ impl ValuePages {
         if link + 1 >= MOST_CHAIN_PAGES {
             return None;
         }
-        let added = self.take(owner | FOLLOW_BIT)?;
+        let added = self.take(sharer, owner | FOLLOW_BIT)?;
         self.set_used(added, VALUE_HEAD_WORDS * size_of::<u64>(), 0);
         self.set_links(page, self.owner(page), added);
         Some((link + 1, added))
     }
 
-    /// Take a free page for a leaf
-    fn take(&self, owner: u32) -> Option<u32> {
+    /// Take a free page for a leaf of an index, past its floor only while half of every other index's unused share stays free
+    fn take(&self, sharer: usize, owner: u32) -> Option<u32> {
         let page = {
             let mut free = hold(&self.free);
             if free.head == NO_VALUE_PAGE {
                 return None;
+            }
+            let taken = free.taken.get(sharer).copied().unwrap_or(0);
+            if taken >= self.floors.get(sharer).copied().unwrap_or(0) {
+                let owed: u64 = (0..self.floors.len())
+                    .filter(|other| *other != sharer)
+                    .map(|other| u64::from(self.floors[other].saturating_sub(free.taken[other])) / 2)
+                    .sum();
+                if u64::from(free.count) <= owed {
+                    return None;
+                }
+            }
+            if let Some(taken) = free.taken.get_mut(sharer) {
+                *taken += 1;
             }
             let page = free.head;
             free.head = self.next(page);
@@ -245,8 +271,8 @@ impl ValuePages {
         Some(page)
     }
 
-    /// Move each page's generation, then give the chain to the free list
-    fn give_chain(&self, first: u32) {
+    /// Move each page's generation, then give the chain to the free list and take its pages off the index's count
+    fn give_chain(&self, sharer: usize, first: u32) {
         let mut pages = [NO_VALUE_PAGE; MOST_CHAIN_PAGES];
         let mut count = 0;
         let mut page = first;
@@ -261,6 +287,9 @@ impl ValuePages {
             self.set_links(page, NO_VALUE_PAGE, free.head);
             free.head = page;
             free.count += 1;
+        }
+        if let Some(taken) = free.taken.get_mut(sharer) {
+            *taken = taken.saturating_sub(count as u32);
         }
         self.free_count.store(u64::from(free.count), Ordering::Relaxed);
     }

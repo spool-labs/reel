@@ -1038,7 +1038,7 @@ impl<Backend: Io> EngineState<Backend> {
         // an lz4 column whose large records come out as written, a column of noise, reads one in a single read as a none column
         // does. A record that did shrink falls back to its two reads
         let is_guessed = read.info.codec == Codec::Lz4;
-        let declared = if is_guessed && self.large_plain[read.column.0 as usize].load(Ordering::Relaxed) { Codec::None } else { read.info.codec };
+        let declared = if is_guessed && self.guesses_plain(read.column) { Codec::None } else { read.info.codec };
         let outcome = match want {
             RecordWant::Whole if trust != Trust::Check => match reader.read_trusted(device, file, location, buf).await {
                 Ok(Some(answer)) if holds() => Ok(answer),

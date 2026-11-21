@@ -30,6 +30,9 @@ use crate::segment::range_covers::Cover;
 
 use crate::engine::write_path::{ClaimRequest, LandOutcome, ValueWrite, WINDOW_SPINS, WINDOW_SPIN_ROUNDS, WindowSwitch, WritingTurn, check_value_size, check_writable, store_error};
 
+/// Chunked records in a row a column stores as written before a read guesses its next one is too
+pub const PLAIN_STREAK: u8 = 3;
+
 impl<Backend: Io> EngineState<Backend> {
     /// Write a value
     pub fn write_value(&self, column: ColumnId, key: &[u8], value: &[u8], mark: Option<DeathMark>) -> Result<(), StoreError> {
@@ -527,12 +530,20 @@ impl<Backend: Io> EngineState<Backend> {
         }
     }
 
-    /// Note whether a column's newest chunked record was stored as written, writing the hint only when it changes
+    /// Note whether a column's newest chunked record was stored as written: one more in the run, or the run over. The count is
+    /// written only when it changes
     pub fn note_large_form(&self, column: ColumnId, is_plain: bool) {
-        let hint = &self.large_plain[column.0 as usize];
-        if hint.load(Ordering::Relaxed) != is_plain {
-            hint.store(is_plain, Ordering::Relaxed);
+        let streak = &self.large_plain[column.0 as usize];
+        let now = streak.load(Ordering::Relaxed);
+        let next = if is_plain { now.saturating_add(1).min(PLAIN_STREAK) } else { 0 };
+        if next != now {
+            streak.store(next, Ordering::Relaxed);
         }
+    }
+
+    /// Check a run of a column's chunked records came out as written, so its next large value is read in one read
+    pub fn guesses_plain(&self, column: ColumnId) -> bool {
+        self.large_plain[column.0 as usize].load(Ordering::Relaxed) >= PLAIN_STREAK
     }
 
     /// Count a value under the least its column declares. It lands as any other, and only leaves its volume's row floor high

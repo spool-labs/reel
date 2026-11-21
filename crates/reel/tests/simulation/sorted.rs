@@ -2870,29 +2870,31 @@ fn text(seed: u64) -> Vec<u8> {
     format!("text value {seed} ").into_bytes().into_iter().cycle().take(LARGE_RECORD_BYTES).collect()
 }
 
-// an lz4 column's large records turn from noise to text and back: the hint of how they're stored follows each write and each
-// read, a read the hint guessed wrong falls back, and every value reads back as written
+// an lz4 column's large records turn from noise to text and back: a run of noise records turns the guess on, one text record
+// turns it off, writes and reads both count, a read the guess got wrong falls back, and every value reads back as written
 #[test]
 fn large_records_steer_their_reads_as_they_change() {
     SIM_CODEC.with(|codec| codec.set(Codec::Lz4));
     let io = SimulatedIo::new(Seed(50));
     let store = open(&io, CAPACITY);
     SIM_CODEC.with(|codec| codec.set(Codec::None));
-    let hint = || store.state.large_plain[COLUMN.0 as usize].load(Ordering::Relaxed);
+    let guess = || store.state.guesses_plain(COLUMN);
 
     store.put(COLUMN, &key(1), &noise(1)).expect("put");
-    assert!(hint(), "a noise record left the hint off");
-    store.put(COLUMN, &key(2), &text(2)).expect("put");
-    assert!(!hint(), "a text record left the hint on");
-    seal_all(&store, &io);
-    assert_eq!(read(&store, &key(1)), Some(noise(1)), "a noise record read under a text hint");
-    assert!(hint(), "a read of a noise record left the hint off");
-    assert_eq!(read(&store, &key(2)), Some(text(2)), "a text record read under a noise hint");
-    assert!(!hint(), "a read of a text record left the hint on");
-
     store.put(COLUMN, &key(3), &noise(3)).expect("put");
-    assert!(hint());
-    for number in [2_u64, 1, 3, 2] {
+    assert!(!guess(), "two noise records turned the guess on");
+    store.put(COLUMN, &key(5), &noise(5)).expect("put");
+    assert!(guess(), "a run of noise records left the guess off");
+    store.put(COLUMN, &key(2), &text(2)).expect("put");
+    assert!(!guess(), "a text record left the guess on");
+    seal_all(&store, &io);
+    for number in [1_u64, 3, 5] {
+        assert_eq!(read(&store, &key(number)), Some(noise(number)), "a noise record read under a text guess");
+    }
+    assert!(guess(), "a run of noise reads left the guess off");
+    assert_eq!(read(&store, &key(2)), Some(text(2)), "a text record read under a noise guess");
+    assert!(!guess(), "a read of a text record left the guess on");
+    for number in [2_u64, 1, 3, 2, 5] {
         let expected = if number == 2 { text(2) } else { noise(number) };
         assert_eq!(read(&store, &key(number)), Some(expected), "key {number}");
     }
@@ -2926,11 +2928,13 @@ fn lz4_records_read_right_in_every_shape() {
     assert_eq!(read(&store, &key(1)), Some(text(1)));
     assert!(io.read_count().0 - reads <= 2, "a short chunked record took {} reads", io.read_count().0 - reads);
 
-    // the noise record turns the hint on, so the half record is first read as if plain
-    assert_eq!(read(&store, &key(4)), Some(noise(4)));
-    assert!(store.state.large_plain[COLUMN.0 as usize].load(Ordering::Relaxed));
+    // a run of noise reads turns the guess on, so the half record is first read as if plain
+    for _read in 0..3 {
+        assert_eq!(read(&store, &key(4)), Some(noise(4)));
+    }
+    assert!(store.state.guesses_plain(COLUMN));
     assert_eq!(read(&store, &key(2)), Some(half_noise(2)), "a shrunk record past one chunk misread under a plain guess");
-    assert!(!store.state.large_plain[COLUMN.0 as usize].load(Ordering::Relaxed));
+    assert!(!store.state.guesses_plain(COLUMN));
 
     let state = Arc::clone(&store.state);
     io.on_every_read(Some(Arc::new(move || state.cues.note_free())));

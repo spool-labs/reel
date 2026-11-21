@@ -458,6 +458,18 @@ impl<Backend: Io> ReelStore<Backend> {
         Ok(())
     }
 
+    /// Make every write to one volume that returned before this call durable, so a caller can order two volumes' batches on disk
+    pub fn flush_volume(&self, volume: VolumeId) -> Result<(), StoreError> {
+        self.check_open()?;
+        if self.state.is_read_only {
+            return Err(StoreError::ReadOnly);
+        }
+        let Some(state) = self.state.volumes.get(volume.0 as usize) else {
+            return Err(StoreError::UnknownVolume { volume });
+        };
+        self.state.sync_volume(state)
+    }
+
     /// Set every volume's pace: the copy bytes busy callers' rewrites under half dead may make for each thousand dead bytes the
     /// walk counts. Zero leaves them for quiet time
     pub fn set_pace_per_mille(&self, per_mille: u64) {

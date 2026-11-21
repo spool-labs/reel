@@ -45,6 +45,8 @@ pub enum StoreError {
     NoLifetimeGroups { volume: VolumeId },
     #[error("batch touches more than one volume")]
     BatchAcrossVolumes,
+    #[error("the store has no volume {volume:?}")]
+    UnknownVolume { volume: VolumeId },
     #[error("a record in column {column:?} failed its check")]
     Corruption { column: ColumnId },
     #[error("the damage pool of volume {volume:?} is full, so a clear that splits a span has to wait")]

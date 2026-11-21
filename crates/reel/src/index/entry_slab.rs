@@ -37,6 +37,10 @@ pub const KEY_AT: usize = 29;
 pub const NEWER_SEALED_FLAG: u8 = 0x80;
 /// The bit of a row's kind byte that says the row is in its column's sorted index and out of the open counts
 pub const ENTERED_FLAG: u8 = 0x40;
+/// The bit of a row's kind byte that says the row keeps its value after its key, a two-byte length and then the bytes
+pub const INLINE_FLAG: u8 = 0x20;
+/// The longest value a row keeps after its key, so a get of an open row reads it with the row
+pub const MOST_INLINE_VALUE: usize = 256;
 
 /// The id of one page
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -109,6 +113,11 @@ impl EntrySlab {
         ByteCount((self.bytes.capacity() + links) as u64)
     }
 
+    /// Count the free pages
+    pub fn free_pages(&self) -> PageCount {
+        self.free_pages
+    }
+
     /// Check this many pages are free
     pub fn has_free_pages(&self, pages: PageCount) -> bool {
         self.free_pages >= pages
@@ -121,7 +130,12 @@ impl EntrySlab {
 
     /// Check a row of this key length could be stored
     pub fn has_room(&self, chain: &PageChain, key_length: usize, held: PageCount) -> bool {
-        chain.used + entry_size(key_length) <= PAGE_BYTES || self.free_pages > held
+        self.has_room_for(chain, entry_size(key_length), held)
+    }
+
+    /// Check a row of this many bytes could be stored
+    pub fn has_room_for(&self, chain: &PageChain, size: usize, held: PageCount) -> bool {
+        chain.used + size <= PAGE_BYTES || self.free_pages > held
     }
 
     /// Store a row and return where it went, or nothing when the pages ran out
@@ -131,16 +145,23 @@ impl EntrySlab {
         column: ColumnId,
         key: &[u8],
         row: &WriteRow,
+        inline: Option<&[u8]>,
     ) -> Option<EntryAddress> {
-        let start = self.claim(chain, entry_size(key.len()))?;
-        let bytes = &mut self.bytes[start..start + KEY_AT + key.len()];
+        let size = inline.map_or(entry_size(key.len()), |value| inline_entry_size(key.len(), value.len()));
+        let start = self.claim(chain, size)?;
+        let value_at = start + KEY_AT + key.len();
+        if let Some(value) = inline {
+            self.bytes[value_at..value_at + INLINE_LENGTH_BYTES].copy_from_slice(&(value.len() as u16).to_le_bytes());
+            self.bytes[value_at + INLINE_LENGTH_BYTES..value_at + INLINE_LENGTH_BYTES + value.len()].copy_from_slice(value);
+        }
+        let bytes = &mut self.bytes[start..value_at];
         bytes[PLACE_AT..OFFSET_AT].copy_from_slice(&row.place.0.to_le_bytes());
         bytes[OFFSET_AT..LENGTH_AT].copy_from_slice(&(row.offset.0 as u32).to_le_bytes());
         bytes[LENGTH_AT..OLDER_AT].copy_from_slice(&(row.length.0 as u32).to_le_bytes());
         bytes[OLDER_AT..NEWER_AT].copy_from_slice(&NO_ENTRY.0.to_le_bytes());
         bytes[NEWER_AT..COLUMN_AT].copy_from_slice(&NO_ENTRY.0.to_le_bytes());
         bytes[COLUMN_AT] = column.0;
-        let flag = if row.has_newer_sealed { NEWER_SEALED_FLAG } else { 0 };
+        let flag = if row.has_newer_sealed { NEWER_SEALED_FLAG } else { 0 } | if inline.is_some() { INLINE_FLAG } else { 0 };
         bytes[KIND_AT] = row.kind.as_byte() | flag;
         bytes[KEY_LENGTH_AT..SLOT_AT].copy_from_slice(&(key.len() as u16).to_le_bytes());
         bytes[SLOT_AT] = row.slot.0;
@@ -210,11 +231,22 @@ impl EntrySlab {
             place: WritePlace(self.word(start + PLACE_AT)),
             offset: FileOffset(u64::from(self.half(start + OFFSET_AT))),
             length: ByteCount(u64::from(self.half(start + LENGTH_AT))),
-            kind: RowKind::from_byte(self.bytes[start + KIND_AT] & !(NEWER_SEALED_FLAG | ENTERED_FLAG))?,
+            kind: RowKind::from_byte(self.bytes[start + KIND_AT] & !(NEWER_SEALED_FLAG | ENTERED_FLAG | INLINE_FLAG))?,
             slot: self.slot(address),
             segment: SegmentNumber(0),
             has_newer_sealed: self.has_newer_sealed(address),
         })
+    }
+
+    /// Read the value a row keeps after its key, when it keeps one
+    pub fn inline_value(&self, address: EntryAddress) -> Option<&[u8]> {
+        let start = byte_of(address);
+        if self.bytes[start + KIND_AT] & INLINE_FLAG == 0 {
+            return None;
+        }
+        let at = start + KEY_AT + usize::from(u16::from_le_bytes([self.bytes[start + KEY_LENGTH_AT], self.bytes[start + KEY_LENGTH_AT + 1]]));
+        let length = usize::from(u16::from_le_bytes([self.bytes[at], self.bytes[at + 1]]));
+        Some(&self.bytes[at + INLINE_LENGTH_BYTES..at + INLINE_LENGTH_BYTES + length])
     }
 
     /// Read the next older version of a row's key
@@ -282,4 +314,12 @@ pub fn byte_of(address: EntryAddress) -> usize {
 /// Size a row with its key, rounded up to the alignment
 pub fn entry_size(key_length: usize) -> usize {
     (KEY_AT + key_length).next_multiple_of(ENTRY_ALIGNMENT)
+}
+
+/// Bytes the length of a row's kept value takes
+pub const INLINE_LENGTH_BYTES: usize = 2;
+
+/// Size a row with its key and the value it keeps, rounded up to the alignment
+pub fn inline_entry_size(key_length: usize, value_length: usize) -> usize {
+    (KEY_AT + key_length + INLINE_LENGTH_BYTES + value_length).next_multiple_of(ENTRY_ALIGNMENT)
 }

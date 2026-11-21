@@ -88,7 +88,7 @@ fn key_of(number: u64) -> Vec<u8> {
 }
 
 fn add(index: &WriteIndex, key: &[u8], written: WriteRow) {
-    assert!(index.insert(COLUMN, key, &written));
+    assert!(index.insert(COLUMN, key, &written, None));
 }
 
 fn drained(walk: &mut SealWalk, index: &WriteIndex) -> Vec<(Vec<u8>, u64)> {
@@ -410,7 +410,7 @@ fn full_shard() {
     let mut taken = Vec::new();
     for number in 0..ROWS * 8 {
         let key = key_of(number);
-        if !index.insert(COLUMN, &key, &row(number + 1, SEALED, RowKind::Value)) {
+        if !index.insert(COLUMN, &key, &row(number + 1, SEALED, RowKind::Value), None) {
             break;
         }
         taken.push((key, number + 1));
@@ -465,7 +465,7 @@ fn walk_keys() {
         expected.insert(key);
     }
     let other = ColumnId(COLUMN.0 + 1);
-    assert!(index.insert(other, b"key-99999", &row(ROWS + 1, SEALED, RowKind::Value)));
+    assert!(index.insert(other, b"key-99999", &row(ROWS + 1, SEALED, RowKind::Value), None));
 
     let mut cursors = vec![ShardCursor::new(SIZING.open_slots); SHARD_COUNT];
     let mut walked = Vec::new();
@@ -523,7 +523,7 @@ fn bound_at_every_edge() {
             expected.insert(key);
         }
         for (other, place) in [(ColumnId(COLUMN.0 - 1), ROWS + 1), (ColumnId(COLUMN.0 + 1), ROWS + 2)] {
-            assert!(index.insert(other, &key_of(KEY_SPACE / 2), &row(place, SEALED, RowKind::Value)));
+            assert!(index.insert(other, &key_of(KEY_SPACE / 2), &row(place, SEALED, RowKind::Value), None));
         }
         for _ask in 0..KEY_SPACE {
             let start = key_of(random.below(KEY_SPACE));
@@ -550,7 +550,7 @@ fn table_limit() {
     let index = WriteIndex::new(&SMALL_TABLE);
     let mut taken = 0;
     for number in 0..ROWS {
-        if index.insert(COLUMN, &key_of(number), &row(number + 1, SEALED, RowKind::Value)) {
+        if index.insert(COLUMN, &key_of(number), &row(number + 1, SEALED, RowKind::Value), None) {
             taken += 1;
         }
     }

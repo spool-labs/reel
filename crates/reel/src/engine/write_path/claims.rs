@@ -106,8 +106,8 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Put a row in the write index and the rows queue, or in neither, with room held for it
-    pub fn land_reserved(&self, column: ColumnId, key: &[u8], row: &WriteRow) -> LandOutcome {
-        if !self.index.insert(column, key, row) {
+    pub fn land_reserved(&self, column: ColumnId, key: &[u8], row: &WriteRow, value: Option<&[u8]>) -> LandOutcome {
+        if !self.index.insert(column, key, row, value) {
             return LandOutcome::IndexFull;
         }
 
@@ -133,7 +133,7 @@ impl<Backend: Io> EngineState<Backend> {
             queue: &self.queues[row.slot.0 as usize],
             size,
         };
-        let landed = self.land_reserved(column, key, row);
+        let landed = self.land_reserved(column, key, row, None);
         drop(room);
         Ok(landed)
     }

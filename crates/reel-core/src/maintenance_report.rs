@@ -644,6 +644,8 @@ pub struct MaintenanceReport {
     /// Scan heads stood on a bound with no lock or descent, since their shard showed no open key near the walk
     pub heads_skipped: u64,
     pub scan_held_values: u64,
+    /// Gets of open rows answered from the value the row keeps in the write index, with no record read
+    pub kept_values: u64,
     pub held_values: u64,
     pub value_fills: u64,
     pub value_drops: u64,
@@ -778,6 +780,7 @@ impl MaintenanceReport {
             scrub_failures: 0,
             scan_cache_hits: 0,
             scan_held_values: 0,
+            kept_values: 0,
             heads_skipped: 0,
             held_values: 0,
             value_fills: 0,

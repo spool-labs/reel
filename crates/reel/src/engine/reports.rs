@@ -187,6 +187,7 @@ impl<Backend: Io> EngineState<Backend> {
         report.scrub_failures = self.scrub_failures.load(Ordering::Relaxed);
         report.scan_cache_hits = self.scan_cache_hits.load(Ordering::Relaxed);
         report.scan_held_values = self.scan_held_values.load(Ordering::Relaxed);
+        report.kept_values = self.kept_values.load(Ordering::Relaxed);
         report.heads_skipped = self.heads_skipped.load(Ordering::Relaxed);
         for index in self.sorted.iter().flatten() {
             if !index.owns_values() {

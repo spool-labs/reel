@@ -7,7 +7,7 @@ use reel_core::column_id::ColumnId;
 use reel_core::direction::Direction;
 use reel_core::units::{ByteCount, RowCount, WritePlace};
 
-use crate::index::entry_slab::{ENTRY_ALIGNMENT, EntryAddress, EntrySlab, NO_ENTRY, PAGE_BYTES, PageCount, PageIndex, entry_size};
+use crate::index::entry_slab::{ENTRY_ALIGNMENT, EntryAddress, EntrySlab, MOST_INLINE_VALUE, NO_ENTRY, PAGE_BYTES, PageCount, PageIndex, entry_size, inline_entry_size};
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::index::key_table::{KeyTable, TableSlot};
 use crate::index::write_index::ShardCounts;
@@ -24,6 +24,9 @@ use crate::row_kind::RowKind;
 
 /// A cleanup takes this many rows at a time, so their cold reads overlap
 pub const CLEAN_RUN_ROWS: usize = 16;
+
+/// Slab bytes a shard's sizing gives each row it plans for: shard_for_rows gives two pages for each page of 64-byte rows
+pub const SLAB_BYTES_PER_ROW: u64 = 128;
 
 /// Sizes of one shard's pools, fixed at open
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -169,25 +172,41 @@ impl WriteShard {
     }
 
     /// Add a row, or return false when a pool ran out
-    pub fn insert(&mut self, hash: KeyHash, column: ColumnId, key: &[u8], row: &WriteRow, is_counted: bool) -> bool {
+    pub fn insert(&mut self, hash: KeyHash, column: ColumnId, key: &[u8], row: &WriteRow, value: Option<&[u8]>, is_counted: bool) -> bool {
         if !self.has_room(row.slot, key.len()) {
             return false;
         }
 
-        self.link_row(hash, column, key, row, (false, is_counted))
+        let inline = value.filter(|value| self.has_inline_room(row.slot, key.len(), value.len()));
+        self.link_row(hash, column, key, row, inline, (false, is_counted))
+    }
+
+    /// Check a row could keep a value of this length after its key: a short one, while the free pages past what batches hold
+    /// still cover every row the shard was planned for at this key's plain size, so kept values use only true spare and the shard
+    /// holds its planned rows
+    pub fn has_inline_room(&self, slot: OpenSlot, key_length: usize, value_length: usize) -> bool {
+        if value_length > MOST_INLINE_VALUE {
+            return false;
+        }
+        let size = inline_entry_size(key_length, value_length);
+        let planned = u64::from(self.slab.total_pages().0) * PAGE_BYTES as u64 / SLAB_BYTES_PER_ROW;
+        let rows_left = planned.saturating_sub(self.table.used() as u64 + self.held.rows);
+        let free = u64::from(self.slab.free_pages().0.saturating_sub(self.held.pages.0)) * PAGE_BYTES as u64;
+        free >= size as u64 + rows_left * entry_size(key_length) as u64
+            && self.slab.has_room_for(&self.trees[slot.0 as usize].pages, size, self.held.pages)
     }
 
     /// Add a row of a batch that holds its room
     pub fn insert_held(&mut self, hash: KeyHash, column: ColumnId, key: &[u8], row: &WriteRow, is_counted: bool) -> bool {
-        self.link_row(hash, column, key, row, (true, is_counted))
+        self.link_row(hash, column, key, row, None, (true, is_counted))
     }
 
     /// Store a row and link it, keeping a batch's rows on their own pages so a put beside it can't use up their room
-    pub fn link_row(&mut self, hash: KeyHash, column: ColumnId, key: &[u8], row: &WriteRow, (is_held, is_counted): (bool, bool)) -> bool {
+    pub fn link_row(&mut self, hash: KeyHash, column: ColumnId, key: &[u8], row: &WriteRow, inline: Option<&[u8]>, (is_held, is_counted): (bool, bool)) -> bool {
         let tree = &mut self.trees[row.slot.0 as usize];
         tree.segment = row.segment;
         let chain = if is_held { &mut tree.batch_pages } else { &mut tree.pages };
-        let Some(address) = self.slab.store(chain, column, key, row) else {
+        let Some(address) = self.slab.store(chain, column, key, row, inline) else {
             return false;
         };
         // a row no count holds reads as entered, so a clean counts nothing out for it
@@ -262,6 +281,31 @@ impl WriteShard {
             };
         }
         self.search_trees(column, key, read_point, view)
+    }
+
+    /// Find the newest row a reader at a place can see, as lookup does, and copy the value it keeps onto the end of the buffer when
+    /// it is the key's newest row and keeps one. Say whether the value went in
+    pub fn lookup_value(
+        &self,
+        hash: KeyHash,
+        (column, key): (ColumnId, &[u8]),
+        read_point: WritePlace,
+        view: OpenSlots,
+        out: &mut Vec<u8>,
+    ) -> (WriteLookup, bool) {
+        let head = self.table.head(self.table.probe(hash, column, key, &self.slab));
+        if head == NO_ENTRY {
+            return (WriteLookup { row: None, should_ask_footers: true }, false);
+        }
+        if self.slab.place(head) <= read_point && view.contains(self.slab.slot(head)) {
+            let found = WriteLookup { row: self.row_of(head), should_ask_footers: self.slab.has_newer_sealed(head) };
+            let Some(value) = self.slab.inline_value(head) else {
+                return (found, false);
+            };
+            out.extend_from_slice(value);
+            return (found, true);
+        }
+        (self.search_trees(column, key, read_point, view), false)
     }
 
     /// Find the newest row a reader at a place can see from one of the key's versions in a tree, as lookup does, with no hash and no

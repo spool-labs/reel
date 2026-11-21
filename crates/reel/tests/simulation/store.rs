@@ -1367,23 +1367,25 @@ fn fill_past_window(store: &Store, tag: &str) {
     }
 }
 
-// a get of an open record the window no longer holds takes it into the record cache, and a get after its seal is a hit
+// a get of an open record the window no longer holds takes it into the record cache, and a get after its seal is a hit. The value is too
+// long for its row to keep, so the get reads the record
 #[test]
 fn an_open_get_caches_its_record_through_the_seal() {
     let io = SimulatedIo::new(Seed(72));
     let store = open(&io);
-    store.put(COLUMN, b"hot", b"hot value").expect("put");
+    let hot = vec![b'h'; reel::index::entry_slab::MOST_INLINE_VALUE + 1];
+    store.put(COLUMN, b"hot", &hot).expect("put");
     fill_past_window(&store, "first");
     let admits = store.state.record_cache.admits.total();
-    assert_eq!(read(&store, b"hot").as_deref(), Some(&b"hot value"[..]));
+    assert_eq!(read(&store, b"hot").as_deref(), Some(hot.as_slice()));
     assert!(store.state.record_cache.admits.total() > admits, "the open get admitted nothing");
     let hits = store.state.record_cache.hits.total();
-    assert_eq!(read(&store, b"hot").as_deref(), Some(&b"hot value"[..]));
+    assert_eq!(read(&store, b"hot").as_deref(), Some(hot.as_slice()));
     assert!(store.state.record_cache.hits.total() > hits, "the second open get missed the cache");
     store.seal_now();
     settle(&io);
     let hits = store.state.record_cache.hits.total();
-    assert_eq!(read(&store, b"hot").as_deref(), Some(&b"hot value"[..]));
+    assert_eq!(read(&store, b"hot").as_deref(), Some(hot.as_slice()));
     assert!(store.state.record_cache.hits.total() > hits, "the get after the seal missed the cache");
     store.close().expect("close");
 }

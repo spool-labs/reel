@@ -15,6 +15,7 @@ use crate::engine::cue::JobCounts;
 use crate::engine::engine_state::{EngineState, SlotPin};
 use crate::engine::open_segment::MOST_WINDOW_RECORD_BYTES; use crate::engine::scan_state::{BATCH_BYTES, BATCH_KEYS, BatchRow};
 use crate::engine::volume::Volume;
+use crate::index::entry_slab::MOST_INLINE_VALUE;
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::index::record_cache::CacheLookup;
 use crate::index::spot_index::SpotLocation;
@@ -80,6 +81,8 @@ pub enum KeyPlan {
     Sealed(SealedRow, CacheLookup),
     /// An open record, which the batch takes from its slot's window or reads with the rest
     Open(WriteRow),
+    /// The value the key's open row keeps, copied into the batch's buffer at this span
+    Kept((usize, usize)),
 }
 
 /// What a read does with a record once it has found it
@@ -401,6 +404,25 @@ impl<Backend: Io> EngineState<Backend> {
         Ok(())
     }
 
+    /// Copy the value a key's newest open row keeps onto the end of the batch's buffer, when the row is visible at the read point,
+    /// nothing sealed is newer and no cover hides it. Say where it went
+    pub fn kept_value(&self, volume: &Volume<Backend>, read: &KeyRead<'_>, records: &mut Vec<u8>) -> Option<(usize, usize)> {
+        let at = records.len();
+        if at + MOST_INLINE_VALUE > records.capacity() {
+            return None;
+        }
+        let (found, is_kept) = self.index.lookup_value(read.column, read.key, read.read_point, volume.view(), records);
+        let is_answer = is_kept
+            && !found.should_ask_footers
+            && found.row.is_some_and(|row| row.kind == RowKind::Value && read.cover.is_none_or(|cover| cover <= row.place));
+        if !is_answer {
+            records.truncate(at);
+            return None;
+        }
+        self.kept_values.fetch_add(1, Ordering::Relaxed);
+        Some((at, records.len() - at))
+    }
+
     /// Answer one key by its own read
     pub async fn read_key(
         &self,
@@ -438,6 +460,19 @@ impl<Backend: Io> EngineState<Backend> {
         let mut spans = [None; BATCH_KEYS];
         for ((key, plan), (row, span)) in keys.iter().zip(&mut plans).zip(rows.iter_mut().zip(&mut spans)) {
             let read = self.key_read(column, key, at.point, true)?;
+            // a short value its open row keeps goes into the batch's buffer as the key is located, and needs no read
+            match self.check_damage(volume, &read, read.cover) {
+                Ok(()) => {},
+                Err(StoreError::Corruption { .. }) => {
+                    *plan = KeyPlan::Corrupt;
+                    continue;
+                },
+                Err(error) => return Err(error),
+            }
+            if let Some(kept) = self.kept_value(volume, &read, records) {
+                *plan = KeyPlan::Kept(kept);
+                continue;
+            }
             *plan = match self.locate(device, volume, &read).await {
                 // a cached record needs no read: the answer loop takes it from the cache
                 Ok(KeyPlace::Spot(sealed)) => {
@@ -489,6 +524,11 @@ impl<Backend: Io> EngineState<Backend> {
                 },
                 KeyPlan::Own => {
                     self.read_key(device, &read, at.handovers, values, scratch).await?;
+                    continue;
+                },
+                KeyPlan::Kept((start, length)) => {
+                    values.push_found(&records[start..start + length]);
+                    batched += 1;
                     continue;
                 },
                 KeyPlan::Open(open) => {
@@ -586,12 +626,21 @@ impl<Backend: Io> EngineState<Backend> {
         let is_hidden = |place: WritePlace| cover.is_some_and(|cover| cover > place);
 
         for _try in 0..MOST_READ_TRIES {
-            let found = self.index.lookup(read.column, read.key, read.read_point, volume.view());
+            // a short value its open row keeps comes back with the row, with no record read
+            buf.clear();
+            let (found, is_kept) = match want {
+                RecordWant::Whole => self.index.lookup_value(read.column, read.key, read.read_point, volume.view(), buf),
+                RecordWant::Window(_) => (self.index.lookup(read.column, read.key, read.read_point, volume.view()), false),
+            };
             if let Some(row) = found.row
                 && !found.should_ask_footers
             {
                 if row.kind != RowKind::Value || is_hidden(row.place) {
                     return Ok(false);
+                }
+                if is_kept {
+                    self.kept_values.fetch_add(1, Ordering::Relaxed);
+                    return Ok(true);
                 }
                 if self.read_open(device, read, (&row, true), want, buf).await? {
                     return Ok(true);

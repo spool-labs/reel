@@ -2778,3 +2778,59 @@ fn a_read_only_scan_checks_a_large_sealed_value() {
     }
     assert_eq!(report(&view).scan_trusted_records, 0, "a view trusted a record");
 }
+
+use reel::index::entry_slab::MOST_INLINE_VALUE;
+use reel_core::value_list::{ValueAnswer, ValueList};
+
+const KEPT_KEYS: u64 = 300;
+
+// an open row keeps a short value, so gets and batched gets answer from the row: an overwrite answers the new value, a delete
+// answers nothing, a value too long to keep reads its record, and every answer matches what was written
+#[test]
+fn open_rows_answer_their_kept_values() {
+    let io = SimulatedIo::new(Seed(49));
+    let store = open(&io, CAPACITY);
+    let long = vec![7_u8; MOST_INLINE_VALUE + 1];
+    for number in 0..KEPT_KEYS {
+        store.put(COLUMN, &key(number), format!("first-{number}").as_bytes()).expect("put");
+    }
+    for number in (0..KEPT_KEYS).step_by(3) {
+        store.put(COLUMN, &key(number), format!("second-{number}").as_bytes()).expect("put");
+    }
+    for number in (1..KEPT_KEYS).step_by(5) {
+        store.delete(COLUMN, &key(number)).expect("delete");
+    }
+    store.put(COLUMN, &key(KEPT_KEYS), &long).expect("put");
+    let expected = |number: u64| -> Option<Vec<u8>> {
+        if number == KEPT_KEYS {
+            return Some(long.clone());
+        }
+        if number % 5 == 1 {
+            return None;
+        }
+        Some(if number.is_multiple_of(3) { format!("second-{number}") } else { format!("first-{number}") }.into_bytes())
+    };
+
+    let kept = report(&store).kept_values;
+    for number in 0..=KEPT_KEYS {
+        assert_eq!(read(&store, &key(number)), expected(number), "key {number}");
+    }
+    let single = report(&store).kept_values - kept;
+    let found = (0..KEPT_KEYS).filter(|number| number % 5 != 1).count() as u64;
+    assert_eq!(single, found, "a short open value took a record read, or a long one was kept");
+
+    let names: Vec<Vec<u8>> = (0..=KEPT_KEYS).map(key).collect();
+    let asked: Vec<&[u8]> = names.iter().map(Vec::as_slice).collect();
+    let mut values = ValueList::new();
+    store.get_many(COLUMN, &asked, &mut values).expect("get many");
+    for number in 0..=KEPT_KEYS {
+        let answer = match values.answer(number as usize).expect("an answer") {
+            ValueAnswer::Found(value) => Some(value.to_vec()),
+            ValueAnswer::Missing => None,
+            ValueAnswer::Corrupt => panic!("key {number} read corrupt"),
+        };
+        assert_eq!(answer, expected(number), "batched key {number}");
+    }
+    assert_eq!(report(&store).kept_values - kept - single, found, "a batched get read a kept value's record");
+    store.close().expect("close");
+}

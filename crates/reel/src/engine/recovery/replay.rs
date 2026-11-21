@@ -351,7 +351,7 @@ impl<Backend: Io> EngineState<Backend> {
             segment: target.segment,
             has_newer_sealed: target.volume.may_hide_under_sealed(row.place),
         };
-        if !self.index.insert(row.column, row.key, &write_row) {
+        if !self.index.insert(row.column, row.key, &write_row, None) {
             return false;
         }
         if row.kind == RowKind::RangeDelete {

@@ -106,13 +106,13 @@ impl WriteIndex {
         self.classes[column.0 as usize].load(Ordering::Acquire) == SORTED_COUNTS
     }
 
-    /// Add a row, or return false when its shard ran out of room
-    pub fn insert(&self, column: ColumnId, key: &[u8], row: &WriteRow) -> bool {
+    /// Add a row, keeping a short value with it while its shard has room to spare, or return false when the shard ran out of room
+    pub fn insert(&self, column: ColumnId, key: &[u8], row: &WriteRow, value: Option<&[u8]>) -> bool {
         let hash = hash_key(column, key);
         let shard = shard_of(hash);
         let mut guard = self.shards.write(shard);
         let counts = self.shard_counts(shard);
-        let is_in = guard.insert(hash, column, key, row, counts.of(column).is_some());
+        let is_in = guard.insert(hash, column, key, row, value, counts.of(column).is_some());
         if is_in {
             counts.add(column, key);
         }
@@ -173,6 +173,13 @@ impl WriteIndex {
     pub fn lookup(&self, column: ColumnId, key: &[u8], read_point: WritePlace, view: OpenSlots) -> WriteLookup {
         let hash = hash_key(column, key);
         self.shards.read(shard_of(hash)).lookup(hash, column, key, read_point, view)
+    }
+
+    /// Find a key's newest row at a read point, and copy the value it keeps onto the end of the buffer when it keeps one. Say
+    /// whether the value went in
+    pub fn lookup_value(&self, column: ColumnId, key: &[u8], read_point: WritePlace, view: OpenSlots, out: &mut Vec<u8>) -> (WriteLookup, bool) {
+        let hash = hash_key(column, key);
+        self.shards.read(shard_of(hash)).lookup_value(hash, (column, key), read_point, view, out)
     }
 
     /// Check whether a key's newest row is a visible grave, so a delete can write nothing

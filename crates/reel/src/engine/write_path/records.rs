@@ -100,7 +100,7 @@ impl<Backend: Io> EngineState<Backend> {
                 has_newer_sealed: false,
             };
             let queue = &self.queues[slot.0 as usize];
-            if !self.index.insert(write.column, write.key, &row) {
+            if !self.index.insert(write.column, write.key, &row, Some(write.value)) {
                 hold(queue).reserved -= size;
                 drop(claim);
                 self.wait_for_index(write.column, write.key, slot)?;
@@ -368,7 +368,7 @@ impl<Backend: Io> EngineState<Backend> {
                 has_newer_sealed: false,
             };
             let slot = claim.slot;
-            let landed = self.land_reserved(write.column, write.key, &row);
+            let landed = self.land_reserved(write.column, write.key, &row, Some(write.value));
             drop(room);
             match landed {
                 LandOutcome::Landed => {
@@ -416,7 +416,7 @@ impl<Backend: Io> EngineState<Backend> {
                 has_newer_sealed: false,
             };
             let slot = claim.slot;
-            let landed = self.land_reserved(column, key, &row);
+            let landed = self.land_reserved(column, key, &row, None);
             drop(room);
             match landed {
                 LandOutcome::Landed => {
@@ -499,7 +499,7 @@ impl<Backend: Io> EngineState<Backend> {
                 has_newer_sealed: false,
             };
             let slot = claim.slot;
-            let landed = self.land_reserved(column, start, &row);
+            let landed = self.land_reserved(column, start, &row, None);
             drop(room);
             match landed {
                 LandOutcome::Landed => {

@@ -2703,3 +2703,78 @@ fn entered_open_rows_hold_their_values() {
         store.close().expect("close");
     }
 }
+
+const LARGE_KEYS: u64 = 40;
+const LARGE_VALUE_BYTES: usize = 4 * 1024;
+const ROTTED_KEY: u64 = 17;
+
+use reel::io::IoFile;
+
+// a value too long for a leaf to hold, whose first bytes say which key wrote it
+fn large_value(number: u64) -> Vec<u8> {
+    let mut value = format!("large-value-{number:06}").into_bytes();
+    value.resize(LARGE_VALUE_BYTES, (number % 251) as u8);
+    value
+}
+
+// sealed large values with one byte flipped on the disk inside one of them
+fn rotted_large_values(io: &SimulatedIo) -> Store {
+    SIM_BUDGET.with(|budget| budget.set(HELD_BUDGET));
+    let store = open(io, CAPACITY);
+    SIM_BUDGET.with(|budget| budget.set(BUDGET));
+    for number in 0..LARGE_KEYS {
+        store.put(COLUMN, &key(number), &large_value(number)).expect("put");
+    }
+    seal_all(&store, io);
+    let needle = format!("large-value-{ROTTED_KEY:06}").into_bytes();
+    let listing = io.list_directory(Path::new(ROOT)).expect("list");
+    let path = listing.into_iter().find(|path| path.extension().is_some_and(|name| name == "data")).expect("a data file");
+    let file = io.open_read_only(&path).expect("open");
+    let mut bytes = vec![0; file.length().expect("length").0 as usize];
+    file.read_exact_at(FileOffset(0), &mut bytes).expect("read");
+    io.close_file(file);
+    let at = bytes.windows(needle.len()).position(|window| window == needle).expect("the value");
+    io.rot(&path, FileOffset((at + LARGE_VALUE_BYTES / 2) as u64), BitMask(1)).expect("rot");
+    store
+}
+
+// the value a scan from the start answers for a key, or a corrupt step
+fn scanned_value(store: &Store, wanted: &[u8]) -> Result<Vec<u8>, ScanStep> {
+    let mut scan = store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan");
+    let (mut name, mut value) = (Vec::new(), Vec::new());
+    loop {
+        match scan.next_row(&mut name, &mut value).expect("step") {
+            ScanStep::Found if name == wanted => return Ok(value),
+            ScanStep::Found => {},
+            other => return Err(other),
+        }
+    }
+}
+
+// a scan reads a sealed value too long for a leaf under its batch's counts, as a get does, so a byte flipped on the disk under it
+// reads back flipped and the trusted count rises
+#[test]
+fn a_scanned_large_sealed_value_reads_back_unchecked() {
+    let io = SimulatedIo::new(Seed(47));
+    let store = rotted_large_values(&io);
+    let trusted = report(&store).scan_trusted_records;
+    let value = scanned_value(&store, &key(ROTTED_KEY)).expect("the row");
+    assert!(report(&store).scan_trusted_records > trusted, "the scan checked every large record");
+    assert_eq!(value.len(), LARGE_VALUE_BYTES);
+    assert_ne!(value, large_value(ROTTED_KEY), "the flipped byte was caught");
+    store.close().expect("close");
+}
+
+// a read-only store's scan checks every record, so the flipped value never comes back
+#[test]
+fn a_read_only_scan_checks_a_large_sealed_value() {
+    let io = SimulatedIo::new(Seed(48));
+    let store = rotted_large_values(&io);
+    store.close().expect("close");
+    drop(store);
+    let view = ReelStore::open_read_only(io.clone(), &config(CAPACITY)).expect("open read-only");
+    if let Ok(value) = scanned_value(&view, &key(ROTTED_KEY)) {
+        assert_eq!(value, large_value(ROTTED_KEY), "a view answered the flipped bytes");
+    }
+    assert_eq!(report(&view).scan_trusted_records, 0, "a view trusted a record");
+}

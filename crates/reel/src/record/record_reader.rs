@@ -69,7 +69,8 @@ pub struct RecordReader {
     decoded: Vec<u8>,
     /// Chunks whose stored piece sums didn't match their entry while the chunk's bytes did, since the engine last took the count
     damaged_sums: u64,
-    /// The form and length of a record `read_trusted` handed over unchecked, whose bytes stay in `first`
+    /// The form and length of a record `read_trusted` handed over unchecked. Its head stays in `first`, a plain payload in the
+    /// caller's buffer and a compressed one beside its head
     trusted: Option<(RecordForm, usize)>,
 }
 
@@ -227,20 +228,25 @@ impl RecordReader {
         if length < SMALL_HEAD_BYTES || length > self.first.len() {
             return Ok(None);
         }
-        device.read_exact(file, location.offset, &mut self.first[..length]).await?;
+        // the head lands in `first` and the payload straight in the buffer, so a plain value is never copied
+        let mut unfilled = UnfilledRead::new(buf, length - SMALL_HEAD_BYTES);
+        {
+            let mut parts = [IoSliceMut::new(&mut self.first[..SMALL_HEAD_BYTES]), IoSliceMut::new(unfilled.buf())];
+            device.read_parts(file, location.offset, &mut parts).await?;
+        }
+        unfilled.filled();
         let Some(form) = self.form().filter(|form| !form.is_chunked) else {
+            buf.clear();
             return Ok(None);
         };
-        let payload = &self.first[SMALL_HEAD_BYTES..length];
-        buf.clear();
-        match form.codec {
-            Codec::None => buf.extend_from_slice(payload),
-            Codec::Lz4 => {
-                let Some(restored) = decompress(payload, &mut self.decoded) else {
-                    return Ok(None);
-                };
-                buf.extend_from_slice(&self.decoded[..restored]);
-            },
+        // a compressed payload moves beside its head, so a later check finds the whole record there
+        if form.codec == Codec::Lz4 {
+            self.first[SMALL_HEAD_BYTES..length].copy_from_slice(buf);
+            buf.clear();
+            let Some(restored) = decompress(&self.first[SMALL_HEAD_BYTES..length], &mut self.decoded) else {
+                return Ok(None);
+            };
+            buf.extend_from_slice(&self.decoded[..restored]);
         }
         self.trusted = Some((form, length));
         Ok(Some(RecordRead::Valid))
@@ -249,6 +255,7 @@ impl RecordReader {
     /// Check the record `read_trusted` handed over last, for a read whose counts moved while it read
     pub fn check_trusted(&mut self, identity: &RecordIdentity<'_>, buf: &mut Vec<u8>) -> RecordRead {
         match self.trusted.take() {
+            Some((form, _length)) if form.codec == Codec::None => self.open_split(form, identity, buf),
             Some((form, length)) => self.finish_small(form, length, identity, buf),
             None => RecordRead::Valid,
         }

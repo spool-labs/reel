@@ -28,6 +28,7 @@ use crate::index::write_shard::{HEAD_GROUP, HeadPlace, WalkBound, WriteShard, pl
 use crate::io::{DeviceReads, Io, ManyRead, ReadOn, in_place};
 use crate::record::record_check::RecordIdentity;
 use crate::record::codec::Codec;
+use crate::record::record_head::SMALL_HEAD_BYTES;
 use crate::record::lz4_block::decompress;
 use crate::record::record_reader::{RecordRead, checked_payload, form_of, open_small, trusted_payload};
 use crate::index::value_pages::MOST_HELD_VALUE;
@@ -434,6 +435,8 @@ impl<Backend: Io> EngineState<Backend> {
     ) -> Result<(), StoreError> {
         scan.batch.clear();
         scan.batch.is_reading = is_reading;
+        // the counts come before the batch locates a row, as a get takes them before its point. A read-only store checks every record
+        scan.batch.counts = (!self.is_read_only).then(|| self.cues.counts());
         let point = scan.point.unwrap_or_else(|| self.read_point(volume));
         scan.batch.point = point;
         // each head stands at the batch's point: a shard whose count read after the point hasn't moved keeps its head
@@ -964,7 +967,14 @@ impl<Backend: Io> EngineState<Backend> {
         };
         // only a row the batch doesn't hold needs the key's checks and cover for its own read
         let is_found = held || {
-            let read = self.key_read(*column, name, batch.point, true)?;
+            let mut read = self.key_read(*column, name, batch.point, true)?;
+            // a sealed record no leaf can hold goes straight to the caller, so it reads under the batch's counts as a get does. Only a
+            // column whose leaves hold values reads it past the record cache, and a volume with damage marked checks it
+            let is_passing = self.sorted_index(*column).is_some_and(|index| index.values.page_count() > 0) && on.target.damage.is_empty();
+            if is_passing && batch.counts.is_some() && matches!(entry.located, Located::Sealed(_)) && entry.located.length().0 as usize > MOST_HELD_VALUE + SMALL_HEAD_BYTES {
+                read.trust = batch.counts;
+                self.scan_trusted_records.fetch_add(1, Ordering::Relaxed);
+            }
             match self.read_located(on, &read, &entry.located, window, *direction, value).await {
                 Ok(is_found) => is_found,
                 Err(StoreError::Corruption { .. }) => false,

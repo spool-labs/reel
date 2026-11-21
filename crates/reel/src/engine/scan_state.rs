@@ -8,6 +8,7 @@ use reel_core::units::{ByteCount, FileOffset, Nanoseconds, RowCount, WritePlace}
 
 use crate::index::shard_cursor::{ShardCursor, TreeCursor};
 use crate::index::sorted_keys::{HeldRef, KeyBatch, KeyEntry, MOST_KEY_BYTES};
+use crate::engine::cue::JobCounts;
 use crate::engine::read_path::{Located, SealedRow};
 use crate::index::open_slots::{OpenSlot, OpenSlots};
 use crate::index::write_row::WriteRow;
@@ -213,6 +214,9 @@ pub struct ScanBatch {
     pub words: Vec<u128>,
     /// The batch reads its records, for a walk that wants values
     pub is_reading: bool,
+    /// The job counts taken before the batch located its rows, which a record too big for a leaf reads under, unchecked while
+    /// they hold. None checks every record
+    pub counts: Option<JobCounts>,
 }
 
 impl ScanBatch {
@@ -229,6 +233,7 @@ impl ScanBatch {
             trusted: touched_capacity(SCAN_BATCH_KEYS, false),
             words: touched_filled(SCAN_BATCH_KEYS, 0),
             is_reading: true,
+            counts: None,
         }
     }
 
@@ -241,6 +246,7 @@ impl ScanBatch {
         self.rows.clear();
         self.spans.clear();
         self.trusted.clear();
+        self.counts = None;
     }
 
     /// Check the batch has room for another record, which only a batch that reads its records counts

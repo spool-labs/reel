@@ -18,7 +18,7 @@
 //!   HELD_BYTES_PER_ENTRY for each entry, so values past that share ride its batch as misses.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use reel_core::units::ByteCount;
 
@@ -74,10 +74,12 @@ impl HeldChain {
 pub struct ValuePages {
     words: Vec<AtomicU64>,
     free: Mutex<FreeValuePages>,
-    /// The pages each index sharing the pool may always take, its share of the whole. Past it, an index takes a page only while
-    /// half of every other index's unused share stays free, so a busy column uses what idle ones leave and a walk of a cold
-    /// column never starves a hot one of more than half its share
+    /// The pages each index sharing the pool is sized for. Every index is sure of half its floor: no take leaves fewer free pages
+    /// than the others still lack of their halves. Past its floor, an index takes a page only while half of every other index's
+    /// unused floor stays free, so a busy column uses what idle ones leave and a walk of a cold column never starves a hot one
     floors: Vec<u32>,
+    /// The pages each index holds now, mirrored from the free list's counts so a fill can see a refusal with no lock
+    taken_now: Vec<AtomicU32>,
     /// The free list's count, readable with no lock, so a fill that would find no page takes no part's lock
     free_count: AtomicU64,
     /// Values held now, and the fills and drops so far, for the report
@@ -89,17 +91,18 @@ pub struct ValuePages {
 impl ValuePages {
     /// Allocate and touch a pool of this many pages, every one free, for one index
     pub fn new(pages: u32) -> Self {
-        Self::shared(&[pages])
+        Self::shared(pages, &[pages])
     }
 
-    /// Allocate and touch a pool for indexes that share it, each with the pages it may always take, every page free
-    pub fn shared(floors: &[u32]) -> Self {
-        let pages = floors.iter().fold(0_u32, |total, floor| total.saturating_add(*floor)).min(u32::MAX - 1);
+    /// Allocate and touch a pool of this many pages for indexes that share it, each with the floor it is sized for, every page free
+    pub fn shared(pages: u32, floors: &[u32]) -> Self {
+        let pages = pages.min(u32::MAX - 1);
         let words = touched_words(pages as usize * VALUE_PAGE_WORDS);
         let pool = Self {
             words,
             free: Mutex::new(FreeValuePages { head: if pages == 0 { NO_VALUE_PAGE } else { 0 }, count: pages, taken: vec![0; floors.len()] }),
             floors: floors.to_vec(),
+            taken_now: floors.iter().map(|_floor| AtomicU32::new(0)).collect(),
             free_count: AtomicU64::new(u64::from(pages)),
             held: AtomicU64::new(0),
             fills: AtomicU64::new(0),
@@ -244,18 +247,12 @@ impl ValuePages {
             if free.head == NO_VALUE_PAGE {
                 return None;
             }
-            let taken = free.taken.get(sharer).copied().unwrap_or(0);
-            if taken >= self.floors.get(sharer).copied().unwrap_or(0) {
-                let owed: u64 = (0..self.floors.len())
-                    .filter(|other| *other != sharer)
-                    .map(|other| u64::from(self.floors[other].saturating_sub(free.taken[other])) / 2)
-                    .sum();
-                if u64::from(free.count) <= owed {
-                    return None;
-                }
+            if !self.may_take(sharer, |index| free.taken[index], free.count) {
+                return None;
             }
             if let Some(taken) = free.taken.get_mut(sharer) {
                 *taken += 1;
+                self.taken_now[sharer].store(*taken, Ordering::Relaxed);
             }
             let page = free.head;
             free.head = self.next(page);
@@ -269,6 +266,32 @@ impl ValuePages {
             self.word(page, at).store(0, Ordering::Relaxed);
         }
         Some(page)
+    }
+
+    /// Check an index may take one more page, from the pages each index holds and the free count. No take leaves fewer free pages
+    /// than the other indexes still lack of half their floors, and past its own floor an index also leaves half of every other
+    /// index's unused floor free
+    fn may_take(&self, sharer: usize, taken: impl Fn(usize) -> u32, free: u32) -> bool {
+        let Some(&own_floor) = self.floors.get(sharer) else {
+            return false;
+        };
+        let others = (0..self.floors.len()).filter(|other| *other != sharer);
+        let sure: u64 = others.clone().map(|other| u64::from((self.floors[other] / 2).saturating_sub(taken(other)))).sum();
+        if u64::from(free) <= sure {
+            return false;
+        }
+        if taken(sharer) < own_floor {
+            return true;
+        }
+        let owed: u64 = others.map(|other| u64::from(self.floors[other].saturating_sub(taken(other))) / 2).sum();
+        u64::from(free) > owed
+    }
+
+    /// Check, with no lock, whether an index could take a page now, so a fill the pool would refuse takes no part's lock. The
+    /// counts may be a moment old, so a take still checks under the lock
+    pub fn could_take(&self, sharer: usize) -> bool {
+        let free = self.free_count.load(Ordering::Relaxed) as u32;
+        free > 0 && self.may_take(sharer, |index| self.taken_now[index].load(Ordering::Relaxed), free)
     }
 
     /// Move each page's generation, then give the chain to the free list and take its pages off the index's count
@@ -290,6 +313,7 @@ impl ValuePages {
         }
         if let Some(taken) = free.taken.get_mut(sharer) {
             *taken = taken.saturating_sub(count as u32);
+            self.taken_now[sharer].store(*taken, Ordering::Relaxed);
         }
         self.free_count.store(u64::from(free.count), Ordering::Relaxed);
     }

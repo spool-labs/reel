@@ -803,7 +803,7 @@ impl SortedKeys {
     /// Keep values a read checked, under one hold of each part's lock for the run of keys in it. A part whose lock another caller
     /// has takes none: the rows were answered already, and a fill never waits. Say how many went in
     pub fn hold_values<'value>(&self, items: impl Iterator<Item = (&'value [u8], (WritePlace, SegmentNumber, FileOffset), &'value [u8])>) -> u64 {
-        if self.values.page_count() == 0 || self.values.is_full() {
+        if self.values.page_count() == 0 || !self.values.could_take(self.sharer) {
             return 0;
         }
         let mut held = 0;

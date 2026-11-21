@@ -156,7 +156,7 @@ mod in_an_index {
 // still takes the half it's owed, and a page given back goes to the one still under its floor
 #[test]
 fn a_sharer_never_takes_another_sharer_floor() {
-    let pages = ValuePages::shared(&[4, 4]);
+    let pages = ValuePages::shared(8, &[4, 4]);
     let mut walked = Vec::new();
     for leaf in 0..8 {
         if let Some(chain) = pages.fill((0, LEAF + leaf), HeldChain::NONE, (0, ENTRIES), &value(leaf as usize, 100)) {
@@ -172,4 +172,16 @@ fn a_sharer_never_takes_another_sharer_floor() {
     pages.drop_chain(1, owed[0]);
     assert!(pages.fill((0, LEAF + 300), HeldChain::NONE, (0, ENTRIES), &value(0, 100)).is_none(), "a page the other is owed went to the walker");
     assert!(pages.fill((1, LEAF + 301), HeldChain::NONE, (0, ENTRIES), &value(0, 100)).is_some(), "the owed page didn't come back");
+}
+
+// three indexes share a pool with four pages each: a walk of the first takes what leaves the others half their floors, and each
+// of the others still gets its half, whichever goes first
+#[test]
+fn every_sharer_keeps_half_its_floor() {
+    let pages = ValuePages::shared(12, &[4, 4, 4]);
+    let take_all = |sharer: usize, base: u32| (0..12).filter(|leaf| pages.fill((sharer, base + leaf), HeldChain::NONE, (0, ENTRIES), &value(*leaf as usize, 100)).is_some()).count();
+    assert_eq!(take_all(0, LEAF), 8, "the walk took past the others' halves");
+    assert_eq!(take_all(1, LEAF + 100), 2, "the second index missed its half");
+    assert_eq!(take_all(2, LEAF + 200), 2, "the third index missed its half");
+    assert!(!pages.could_take(0) && !pages.could_take(1) && !pages.could_take(2), "a full pool said it could give a page");
 }

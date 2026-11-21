@@ -13,7 +13,7 @@ use crate::record::chunk_table::{
     page_count, page_of, table_bytes,
 };
 use crate::record::codec::{CHUNK_BYTES, Codec};
-use crate::record::lz4_block::decompress;
+use crate::record::lz4_block::{decompress, decompress_onto};
 use crate::little_endian::read_word;
 use crate::record::record_check::{Checksum, RecordIdentity, checksum, place_check, record_check};
 use crate::record::record_head::{
@@ -210,7 +210,9 @@ impl RecordReader {
         }
 
         let length = if is_whole_in_first { whole } else { self.read_front(device, file, location).await? };
-        self.whole_in_first = is_whole_in_first.then_some(whole);
+        if is_whole_in_first {
+            self.whole_in_first = Some(whole);
+        }
         let Some(form) = self.form() else {
             return Ok(RecordRead::Failed);
         };
@@ -265,7 +267,12 @@ impl RecordReader {
             buf.clear();
             return Ok(None);
         };
-        // a chunked record moves beside its head, so the chunked read that follows reads it no more
+        // a plain chunked record reads its payload where it lies, so it isn't copied here
+        if form.is_chunked && form.codec == Codec::None {
+            buf.clear();
+            return Ok(None);
+        }
+        // a compressed chunked record moves beside its head, so the chunked read that follows reads it no more
         if form.is_chunked {
             self.first[SMALL_HEAD_BYTES..length].copy_from_slice(buf);
             self.front = Some((location.offset, length));
@@ -286,12 +293,13 @@ impl RecordReader {
     }
 
     /// Check the record `read_trusted` handed over last, for a read whose counts moved while it read. Nothing when the record was
-    /// compressed, whose stored bytes the reader didn't keep, and the caller reads it again with every check
+    /// compressed, whose stored bytes the reader didn't keep, or when no record was handed over, and the caller reads it again
+    /// with every check
     pub fn check_trusted(&mut self, identity: &RecordIdentity<'_>, buf: &mut Vec<u8>) -> Option<RecordRead> {
         match self.trusted.take() {
             Some((form, _length)) if form.codec == Codec::None => Some(self.open_split(form, identity, buf)),
             Some(_compressed) => None,
-            None => Some(RecordRead::Valid),
+            None => None,
         }
     }
 
@@ -420,6 +428,8 @@ impl RecordReader {
         self.whole_in_first = None;
         let length = (location.length.0 as usize).min(FIRST_READ_BYTES);
         device.read_exact(file, location.offset, &mut self.first[..length]).await?;
+        // a record no longer than the first read is whole in `first`, so its chunks need no read of their own
+        self.whole_in_first = (length == location.length.0 as usize).then_some(length);
         Ok(length)
     }
 
@@ -607,7 +617,6 @@ impl RecordReader {
     }
 
     /// Read one chunk whole, check it, and add its part of the window to the buffer
-    #[allow(clippy::uninit_vec, reason = "a whole chunk restores into the buffer's spare room, which the decoder fills before anything reads it")]
     pub async fn read_chunk<File: IoFile>(
         &mut self,
         on: ReadOn<'_, impl DeviceReads<File>, File>,
@@ -648,16 +657,7 @@ impl RecordReader {
         // a whole chunk restores straight into the caller's buffer, and only part of one goes through the reader's room
         let length = span.entry.value_length.0 as usize;
         if part == (0..length) {
-            let start = buf.len();
-            buf.reserve(length);
-            // SAFETY: lz4's safe decoder writes each byte it restores before it reads it back for a match, and the buffer is cut
-            // back to `start` unless all `length` bytes were restored
-            unsafe { buf.set_len(start + length) };
-            if decompress(source, &mut buf[start..]) == Some(length) {
-                return Ok(true);
-            }
-            buf.truncate(start);
-            return Ok(false);
+            return Ok(decompress_onto(source, buf, length));
         }
         let Some(restored) = decompress(source, &mut self.decoded) else {
             return Ok(false);

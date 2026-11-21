@@ -69,7 +69,7 @@ use crate::engine::complete_image::ImageFiles;
 use crate::index::complete_table::CompleteTable;
 use crate::index::complete_table::planned_table_bytes;
 use crate::index::sorted_keys::{MOST_KEY_BYTES, SortedKeys, planned_index_bytes, rows_for_bytes};
-use crate::index::value_pages::{VALUE_PAGE_BYTES, ValuePages};
+use crate::index::value_pages::{MOST_HELD_VALUE, VALUE_PAGE_BYTES, ValuePages};
 use crate::index::spot_index::SpotIndex;
 use crate::index::write_index::WriteIndex;
 use crate::io::lock_outcome::LockOutcome;
@@ -1924,8 +1924,13 @@ pub fn sorted_indexes(config: &StoreConfig, sizes: &[Option<SortedSize>]) -> Vec
     // may always take its own share
     let sized: Vec<(&ColumnConfig, SortedSize)> =
         config.columns.iter().filter_map(|column| sizes[column.id.0 as usize].filter(|size| size.rows.0 > 0).map(|size| (column, size))).collect();
-    let floors: Vec<u32> = sized.iter().map(|(_column, size)| size.value_pages).collect();
-    let pool = Arc::new(ValuePages::shared(&floors));
+    let pages = sized.iter().fold(0_u32, |total, (_column, size)| total.saturating_add(size.value_pages));
+    // a column whose values are all longer than a leaf holds keeps no floor, so its share goes to the columns that hold values
+    let floors: Vec<u32> = sized
+        .iter()
+        .map(|(column, size)| if column.least_value.is_some_and(|least| least.0 as usize > MOST_HELD_VALUE) { 0 } else { size.value_pages })
+        .collect();
+    let pool = Arc::new(ValuePages::shared(pages, &floors));
     for (sharer, (column, size)) in sized.into_iter().enumerate() {
         let index = SortedKeys::new(column.key_shape.widest(), size.rows).holding_values(Arc::clone(&pool), (sharer, sharer == 0));
         indexes[column.id.0 as usize] = Some(index);

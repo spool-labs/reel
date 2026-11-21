@@ -182,15 +182,18 @@ impl WriteShard {
     }
 
     /// Check a row could keep a value of this length after its key: a short one, while the shard's kept values stay inside the
-    /// share of the slab sized for them, so rows keep every page they were sized for whatever their keys' widths
+    /// share of the slab sized for them, so rows keep every page they were sized for whatever their keys' widths. The row must fit
+    /// its page, or the plain row would open a page too, so a kept value never strands a page's tail a plain row would have used
     pub fn has_inline_room(&self, slot: OpenSlot, key_length: usize, value_length: usize) -> bool {
         if value_length > MOST_INLINE_VALUE {
             return false;
         }
         let size = inline_entry_size(key_length, value_length);
-        let extra = (size - entry_size(key_length)) as u64;
+        let plain = entry_size(key_length);
+        let pages = &self.trees[slot.0 as usize].pages;
+        let is_tail_kept = pages.used + size <= PAGE_BYTES || pages.used + plain > PAGE_BYTES;
         let kept: u64 = self.trees.iter().map(|tree| tree.kept_bytes).sum();
-        kept + extra <= self.kept_room() && self.slab.has_room_for(&self.trees[slot.0 as usize].pages, size, self.held.pages)
+        is_tail_kept && kept + (size - plain) as u64 <= self.kept_room() && self.slab.has_room_for(pages, size, self.held.pages)
     }
 
     /// Count the slab bytes kept values may take: the share shard_for_rows adds for them, less a page for each open slot's

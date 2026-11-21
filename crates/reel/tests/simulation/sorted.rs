@@ -2926,7 +2926,7 @@ fn lz4_records_read_right_in_every_shape() {
 
     let reads = io.read_count().0;
     assert_eq!(read(&store, &key(1)), Some(text(1)));
-    assert!(io.read_count().0 - reads <= 2, "a short chunked record took {} reads", io.read_count().0 - reads);
+    assert_eq!(io.read_count().0 - reads, 1, "a short chunked record took more than one read");
 
     // a run of noise reads turns the guess on, so the half record is first read as if plain
     for _read in 0..3 {
@@ -2941,6 +2941,18 @@ fn lz4_records_read_right_in_every_shape() {
     assert_eq!(read(&store, &key(3)), Some(short_text.clone()), "a compressed record read under moving counts");
     io.on_every_read(None);
     store.close().expect("close");
+    drop(store);
+
+    // a read-only view checks every record, and still reads a short chunked one once
+    SIM_CODEC.with(|codec| codec.set(Codec::Lz4));
+    let view = ReelStore::open_read_only(io.clone(), &config(CAPACITY)).expect("open read-only");
+    SIM_CODEC.with(|codec| codec.set(Codec::None));
+    let reads = io.read_count().0;
+    assert_eq!(read(&view, &key(1)), Some(text(1)));
+    assert_eq!(io.read_count().0 - reads, 1, "a checked short chunked record took more than one read");
+    for number in [2_u64, 3, 4] {
+        assert!(read(&view, &key(number)).is_some(), "a view lost key {number}");
+    }
 }
 
 // a kept value answers at the edges of what a row keeps, an empty value and one exactly as long as the most, and a range cover

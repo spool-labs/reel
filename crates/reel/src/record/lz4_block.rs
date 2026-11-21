@@ -93,3 +93,25 @@ pub fn decompress(input: &[u8], output: &mut [u8]) -> Option<usize> {
     }
     Some(length as usize)
 }
+
+/// Restore one chunk of a known length onto the end of a buffer, writing into its spare room, and say whether all of it came back.
+/// The buffer keeps the bytes only then
+pub fn decompress_onto(input: &[u8], out: &mut Vec<u8>, length: usize) -> bool {
+    if input.len() > MOST_INPUT_BYTES || length > c_int::MAX as usize {
+        return false;
+    }
+    out.reserve(length);
+    let start = out.len();
+    let room = out.spare_capacity_mut();
+    // SAFETY: the reserve leaves at least `length` bytes of spare room, the call writes no more than that and reads back only bytes
+    // it wrote, and the input span stays valid for its length
+    let restored = unsafe {
+        LZ4_decompress_safe(input.as_ptr().cast::<c_char>(), room.as_mut_ptr().cast::<c_char>(), input.len() as c_int, length as c_int)
+    };
+    if restored < 0 || restored as usize != length {
+        return false;
+    }
+    // SAFETY: the call above wrote all `length` bytes past `start`
+    unsafe { out.set_len(start + length) };
+    true
+}

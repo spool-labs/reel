@@ -19,7 +19,7 @@ use crate::index::entry_slab::MOST_INLINE_VALUE;
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::index::record_cache::CacheLookup;
 use crate::index::spot_index::SpotLocation;
-use crate::index::write_row::WriteRow;
+use crate::index::write_row::{WriteLookup, WriteRow};
 use crate::io::{DeviceReads, InPlace, Io, ReadOn, in_place};
 use crate::pool::PoolLease;
 use crate::io::device_error::is_device_error;
@@ -406,11 +406,12 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Copy the value a key's newest open row keeps onto the end of the batch's buffer, when the row is visible at the read point,
-    /// nothing sealed is newer and no cover hides it. Say where it went
-    pub fn kept_value(&self, volume: &Volume<Backend>, read: &KeyRead<'_>, records: &mut Vec<u8>) -> Option<(usize, usize)> {
+    /// nothing sealed is newer and no cover hides it, and say where it went. Otherwise hand back the write index's answer, so
+    /// locating the key takes no second lookup
+    pub fn kept_value(&self, volume: &Volume<Backend>, read: &KeyRead<'_>, records: &mut Vec<u8>) -> Result<(usize, usize), WriteLookup> {
         let at = records.len();
         if at + MOST_INLINE_VALUE > records.capacity() {
-            return None;
+            return Err(self.index.lookup(read.column, read.key, read.read_point, volume.view()));
         }
         let (found, is_kept) = self.index.lookup_value(read.column, read.key, read.read_point, volume.view(), records);
         let is_answer = is_kept
@@ -418,10 +419,10 @@ impl<Backend: Io> EngineState<Backend> {
             && found.row.is_some_and(|row| row.kind == RowKind::Value && read.cover.is_none_or(|cover| cover <= row.place));
         if !is_answer {
             records.truncate(at);
-            return None;
+            return Err(found);
         }
         self.kept_values.fetch_add(1, Ordering::Relaxed);
-        Some((at, records.len() - at))
+        Ok((at, records.len() - at))
     }
 
     /// Answer one key by its own read
@@ -470,11 +471,14 @@ impl<Backend: Io> EngineState<Backend> {
                 },
                 Err(error) => return Err(error),
             }
-            if let Some(kept) = self.kept_value(volume, &read, records) {
-                *plan = KeyPlan::Kept(kept);
-                continue;
-            }
-            *plan = match self.locate(device, volume, &read).await {
+            let found = match self.kept_value(volume, &read, records) {
+                Ok(kept) => {
+                    *plan = KeyPlan::Kept(kept);
+                    continue;
+                },
+                Err(found) => found,
+            };
+            *plan = match self.locate_found(device, volume, &read, found).await {
                 // a cached record needs no read: the answer loop takes it from the cache
                 Ok(KeyPlace::Spot(sealed)) => {
                     let lookup = self.record_cache.get(sealed.segment, sealed.row.offset, read.key, scratch);
@@ -589,6 +593,17 @@ impl<Backend: Io> EngineState<Backend> {
     pub async fn locate(&self, device: &impl DeviceReads<Backend::File>, volume: &Volume<Backend>, read: &KeyRead<'_>) -> Result<KeyPlace, StoreError> {
         self.check_damage(volume, read, read.cover)?;
         let found = self.index.lookup(read.column, read.key, read.read_point, volume.view());
+        self.locate_found(device, volume, read, found).await
+    }
+
+    /// Finish locating a key from the write index's answer for it, which a caller that checked damage and looked already holds
+    pub async fn locate_found(
+        &self,
+        device: &impl DeviceReads<Backend::File>,
+        volume: &Volume<Backend>,
+        read: &KeyRead<'_>,
+        found: WriteLookup,
+    ) -> Result<KeyPlace, StoreError> {
         if let Some(row) = found.row
             && !found.should_ask_footers
         {
@@ -1014,6 +1029,7 @@ impl<Backend: Io> EngineState<Backend> {
             place,
         };
         let mut reader = self.record_reader_for(device);
+        reader.forget_front();
         let holds = || match trust {
             Trust::Check => false,
             Trust::While(counts) => self.has_outlived(counts, true),
@@ -1026,7 +1042,11 @@ impl<Backend: Io> EngineState<Backend> {
         let outcome = match want {
             RecordWant::Whole if trust != Trust::Check => match reader.read_trusted(device, file, location, buf).await {
                 Ok(Some(answer)) if holds() => Ok(answer),
-                Ok(Some(_answer)) => Ok(reader.check_trusted(&identity, buf)),
+                Ok(Some(_answer)) => match reader.check_trusted(&identity, buf) {
+                    Some(checked) => Ok(checked),
+                    // a compressed record whose counts moved reads again with every check
+                    None => reader.read_value(device, file, location, &identity, declared, buf).await,
+                },
                 Ok(None) => reader.read_value_trusting(device, file, location, (&identity, declared), buf, holds).await,
                 Err(error) => Err(error),
             },

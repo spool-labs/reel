@@ -113,11 +113,6 @@ impl EntrySlab {
         ByteCount((self.bytes.capacity() + links) as u64)
     }
 
-    /// Count the free pages
-    pub fn free_pages(&self) -> PageCount {
-        self.free_pages
-    }
-
     /// Check this many pages are free
     pub fn has_free_pages(&self, pages: PageCount) -> bool {
         self.free_pages >= pages

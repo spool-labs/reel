@@ -51,6 +51,8 @@ pub struct WriteTree {
     pub batch_pages: PageChain,
     pub cleanup: Option<TreePosition>,
     pub segment: SegmentNumber,
+    /// Slab bytes this tree's rows take for the values they keep, past their plain size
+    pub kept_bytes: u64,
 }
 
 impl DescentPath {
@@ -92,6 +94,7 @@ impl WriteTree {
             batch_pages: PageChain::empty(),
             cleanup: None,
             segment: SegmentNumber(0),
+            kept_bytes: 0,
         }
     }
 

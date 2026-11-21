@@ -126,21 +126,30 @@ impl ValuePages {
 
     /// Check a leaf's entry holds a value, with no copy
     pub fn holds(&self, chain: HeldChain, index: usize) -> bool {
-        self.is_live(chain) && index < self.table_words(chain.first) * 2 && unpack_slot(self.slot(chain.first, index)).is_some()
+        self.is_live(chain) && self.has_slot(chain.first, index) && unpack_slot(self.slot(chain.first, index)).is_some()
+    }
+
+    /// Check an entry's slot lies in its chain's first page. A reader takes no lock, so a page reused under it can hold value bytes
+    /// where the table was, and every word it reads is checked to lie in the pool before it's read
+    fn has_slot(&self, first: u32, index: usize) -> bool {
+        index < self.table_words(first) * 2 && VALUE_HEAD_WORDS + index / 2 < VALUE_PAGE_WORDS
     }
 
     /// Copy the value a leaf's entry holds onto the end of `out`, and say whether it held one
     pub fn read(&self, chain: HeldChain, index: usize, out: &mut Vec<u8>) -> bool {
-        if !self.is_live(chain) || index >= self.table_words(chain.first) * 2 {
+        if !self.is_live(chain) || !self.has_slot(chain.first, index) {
             return false;
         }
         let Some((link, offset, length)) = unpack_slot(self.slot(chain.first, index)) else {
             return false;
         };
+        if offset + length > VALUE_PAGE_BYTES {
+            return false;
+        }
         let mut page = chain.first;
         for _step in 0..link {
             page = self.next(page);
-            if page == NO_VALUE_PAGE {
+            if page == NO_VALUE_PAGE || page >= self.page_count() {
                 return false;
             }
         }
@@ -371,10 +380,8 @@ fn pack_slot(link: usize, offset: usize, length: usize) -> u32 {
 
 /// Read a slot back, or nothing when it holds no value
 fn unpack_slot(slot: u32) -> Option<(usize, usize, usize)> {
-    if slot == 0 {
-        return None;
-    }
-    let length = (slot & ((1 << LENGTH_BITS) - 1)) as usize - 1;
+    // a length field of zero is no slot this pool wrote, a page reused under a reader
+    let length = ((slot & ((1 << LENGTH_BITS) - 1)) as usize).checked_sub(1)?;
     let offset = ((slot >> LENGTH_BITS) & ((1 << OFFSET_BITS) - 1)) as usize;
     let link = (slot >> (OFFSET_BITS + LENGTH_BITS)) as usize;
     Some((link, offset, length))

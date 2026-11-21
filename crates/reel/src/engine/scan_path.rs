@@ -969,9 +969,11 @@ impl<Backend: Io> EngineState<Backend> {
         let is_found = held || {
             let mut read = self.key_read(*column, name, batch.point, true)?;
             // a sealed record no leaf can hold goes straight to the caller, so it reads under the batch's counts as a get does. Only a
-            // column whose leaves hold values reads it past the record cache, and a volume with damage marked checks it
+            // column whose leaves hold values reads it past the record cache, and a volume with damage marked checks it. A record
+            // the batch read and found failing its check is checked again, so rot never passes as a value
             let is_passing = self.sorted_index(*column).is_some_and(|index| index.values.page_count() > 0) && on.target.damage.is_empty();
-            if is_passing && batch.counts.is_some() && matches!(entry.located, Located::Sealed(_)) && entry.located.length().0 as usize > MOST_HELD_VALUE + SMALL_HEAD_BYTES {
+            let is_unread = entry.record.is_none();
+            if is_passing && is_unread && batch.counts.is_some() && matches!(entry.located, Located::Sealed(_)) && entry.located.length().0 as usize > MOST_HELD_VALUE + SMALL_HEAD_BYTES {
                 read.trust = batch.counts;
                 self.scan_trusted_records.fetch_add(1, Ordering::Relaxed);
             }

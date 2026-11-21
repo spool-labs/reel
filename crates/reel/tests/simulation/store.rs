@@ -2363,3 +2363,19 @@ fn rebuilt_rows_count_no_gap(loses_summary: bool) {
     }
     assert!(checked > 0, "lost summary {loses_summary}: no rebuilt row stayed to be checked");
 }
+
+// a flush of one volume makes its writes durable, and a volume the store doesn't have is refused by name
+#[test]
+fn a_volume_flushes_alone() {
+    let io = SimulatedIo::new(Seed(73));
+    let store = open(&io);
+    store.put(COLUMN, b"flushed", b"value").expect("put");
+    store.flush_volume(VolumeId(0)).expect("flush the volume");
+    io.kill();
+    drop(store);
+    let store = open(&io);
+    assert_eq!(read(&store, b"flushed").as_deref(), Some(&b"value"[..]), "a flushed write was lost");
+    let missing = VolumeId(9);
+    assert!(matches!(store.flush_volume(missing), Err(StoreError::UnknownVolume { volume }) if volume == missing));
+    store.close().expect("close");
+}

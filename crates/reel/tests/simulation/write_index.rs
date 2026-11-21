@@ -749,3 +749,39 @@ fn hold_whole() {
 
     assert_eq!(index.shards.read(0).held, ShardHold::default());
 }
+
+use reel::engine::engine_sizing::shard_for_rows;
+use reel::index::entry_slab::MOST_INLINE_VALUE;
+
+const PLANNED_ROWS: u64 = 10_000;
+const SHORT_KEY_BYTES: usize = 8;
+
+// rows of short keys that keep the longest values, then rows of wider keys with none: the kept values stay in their own share
+// of the slab, so the shard still takes every row it was planned for, whatever the later keys' widths
+#[test]
+fn kept_values_leave_planned_rows_their_room() {
+    let sizing = shard_for_rows(PLANNED_ROWS * SHARD_COUNT as u64, 4);
+    for wide in [64_usize, 99] {
+        let mut shard = WriteShard::new(&sizing);
+        let value = vec![3_u8; MOST_INLINE_VALUE];
+        let mut rows = 0_u64;
+        loop {
+            let (key, kept) = if rows < PLANNED_ROWS / 2 {
+                (rows.to_be_bytes()[8 - SHORT_KEY_BYTES..].to_vec(), Some(value.as_slice()))
+            } else {
+                let mut key = vec![0_u8; wide];
+                key[..8].copy_from_slice(&rows.to_be_bytes());
+                (key, None)
+            };
+            let row = row(rows + 1, SEALED, RowKind::Value);
+            if !shard.insert(hash_key(COLUMN, &key), COLUMN, &key, &row, kept, true) {
+                break;
+            }
+            rows += 1;
+        }
+        let kept: u64 = shard.trees.iter().map(|tree| tree.kept_bytes).sum();
+        assert!(kept > 0, "no row kept its value");
+        assert!(kept <= shard.kept_room(), "kept values took {kept} B of {} B", shard.kept_room());
+        assert!(rows >= PLANNED_ROWS, "{wide} B keys: the shard took {rows} of {PLANNED_ROWS} planned rows");
+    }
+}

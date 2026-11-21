@@ -25,8 +25,8 @@ use crate::row_kind::RowKind;
 /// A cleanup takes this many rows at a time, so their cold reads overlap
 pub const CLEAN_RUN_ROWS: usize = 16;
 
-/// Slab bytes a shard's sizing gives each row it plans for: shard_for_rows gives two pages for each page of 64-byte rows
-pub const SLAB_BYTES_PER_ROW: u64 = 128;
+/// The part of a shard's slab kept values may take: shard_for_rows adds a quarter to the pages rows need, a fifth of the whole
+pub const KEPT_SHARE_DIVISOR: u64 = 5;
 
 /// Sizes of one shard's pools, fixed at open
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -181,19 +181,23 @@ impl WriteShard {
         self.link_row(hash, column, key, row, inline, (false, is_counted))
     }
 
-    /// Check a row could keep a value of this length after its key: a short one, while the free pages past what batches hold
-    /// still cover every row the shard was planned for at this key's plain size, so kept values use only true spare and the shard
-    /// holds its planned rows
+    /// Check a row could keep a value of this length after its key: a short one, while the shard's kept values stay inside the
+    /// share of the slab sized for them, so rows keep every page they were sized for whatever their keys' widths
     pub fn has_inline_room(&self, slot: OpenSlot, key_length: usize, value_length: usize) -> bool {
         if value_length > MOST_INLINE_VALUE {
             return false;
         }
         let size = inline_entry_size(key_length, value_length);
-        let planned = u64::from(self.slab.total_pages().0) * PAGE_BYTES as u64 / SLAB_BYTES_PER_ROW;
-        let rows_left = planned.saturating_sub(self.table.used() as u64 + self.held.rows);
-        let free = u64::from(self.slab.free_pages().0.saturating_sub(self.held.pages.0)) * PAGE_BYTES as u64;
-        free >= size as u64 + rows_left * entry_size(key_length) as u64
-            && self.slab.has_room_for(&self.trees[slot.0 as usize].pages, size, self.held.pages)
+        let extra = (size - entry_size(key_length)) as u64;
+        let kept: u64 = self.trees.iter().map(|tree| tree.kept_bytes).sum();
+        kept + extra <= self.kept_room() && self.slab.has_room_for(&self.trees[slot.0 as usize].pages, size, self.held.pages)
+    }
+
+    /// Count the slab bytes kept values may take: the share shard_for_rows adds for them, less a page for each open slot's
+    /// partly used tail
+    pub fn kept_room(&self) -> u64 {
+        let total = u64::from(self.slab.total_pages().0) * PAGE_BYTES as u64;
+        (total / KEPT_SHARE_DIVISOR).saturating_sub((self.trees.len() * PAGE_BYTES) as u64)
     }
 
     /// Add a row of a batch that holds its room
@@ -209,6 +213,9 @@ impl WriteShard {
         let Some(address) = self.slab.store(chain, column, key, row, inline) else {
             return false;
         };
+        if let Some(value) = inline {
+            tree.kept_bytes += (inline_entry_size(key.len(), value.len()) - entry_size(key.len())) as u64;
+        }
         // a row no count holds reads as entered, so a clean counts nothing out for it
         if !is_counted {
             self.slab.mark_entered(address);

@@ -72,6 +72,11 @@ pub struct RecordReader {
     /// The form and length of a record `read_trusted` handed over unchecked. Its head stays in `first`, a plain payload in the
     /// caller's buffer and a compressed one beside its head
     trusted: Option<(RecordForm, usize)>,
+    /// The offset and length of a short record already whole in `first`, which turned out chunked, so the read that follows reads
+    /// it no more
+    front: Option<(FileOffset, usize)>,
+    /// The length of the record the current read holds whole in `first`, whose chunks it takes from there with no read
+    whole_in_first: Option<usize>,
 }
 
 impl RecordReader {
@@ -84,7 +89,16 @@ impl RecordReader {
             decoded: touched_zeroes(CHUNK_BYTES),
             damaged_sums: 0,
             trusted: None,
+            front: None,
+            whole_in_first: None,
         }
+    }
+
+    /// Forget any record an earlier read left in `first`, so a read from another file never takes it
+    pub fn forget_front(&mut self) {
+        self.front = None;
+        self.whole_in_first = None;
+        self.trusted = None;
     }
 
     /// Take the count of damaged sums this reader met since the last take
@@ -141,7 +155,10 @@ impl RecordReader {
         buf: &mut Vec<u8>,
         holds: impl Fn() -> bool,
     ) -> Result<RecordRead> {
-        if declared == Codec::None
+        let whole = location.length.0 as usize;
+        let mut is_whole_in_first = self.front.take() == Some((location.offset, whole));
+        if !is_whole_in_first
+            && declared == Codec::None
             && let Some(shape) = written_shape(location.length)
             && shape.front_length <= FIRST_READ_BYTES
         {
@@ -170,23 +187,30 @@ impl RecordReader {
         }
 
         // a one-chunk record's payload lands straight in the buffer and is checked there, and only a compressed one is copied as
-        // it is restored. A chunked record that short is read again below
-        let whole = location.length.0 as usize;
-        if (SMALL_HEAD_BYTES..=SMALL_RECORD_BYTES).contains(&whole) {
+        // it is restored. A chunked record that short moves beside its head, so it isn't read again
+        if !is_whole_in_first && (SMALL_HEAD_BYTES..=SMALL_RECORD_BYTES).contains(&whole) {
             let mut unfilled = UnfilledRead::new(buf, whole - SMALL_HEAD_BYTES);
             {
                 let mut parts = [IoSliceMut::new(&mut self.first[..SMALL_HEAD_BYTES]), IoSliceMut::new(unfilled.buf())];
                 device.read_parts(file, location.offset, &mut parts).await?;
             }
             unfilled.filled();
-            if let Some(form) = self.form()
-                && !form.is_chunked
-            {
-                return Ok(self.open_split(form, identity, buf));
+            match self.form() {
+                Some(form) if !form.is_chunked => return Ok(self.open_split(form, identity, buf)),
+                Some(_chunked) => {
+                    self.first[SMALL_HEAD_BYTES..whole].copy_from_slice(buf);
+                    buf.clear();
+                    is_whole_in_first = true;
+                },
+                None => {
+                    buf.clear();
+                    return Ok(RecordRead::Failed);
+                },
             }
         }
 
-        let length = self.read_front(device, file, location).await?;
+        let length = if is_whole_in_first { whole } else { self.read_front(device, file, location).await? };
+        self.whole_in_first = is_whole_in_first.then_some(whole);
         let Some(form) = self.form() else {
             return Ok(RecordRead::Failed);
         };
@@ -224,6 +248,8 @@ impl RecordReader {
         buf: &mut Vec<u8>,
     ) -> Result<Option<RecordRead>> {
         self.trusted = None;
+        self.front = None;
+        self.whole_in_first = None;
         let length = location.length.0 as usize;
         if length < SMALL_HEAD_BYTES || length > self.first.len() {
             return Ok(None);
@@ -235,29 +261,37 @@ impl RecordReader {
             device.read_parts(file, location.offset, &mut parts).await?;
         }
         unfilled.filled();
-        let Some(form) = self.form().filter(|form| !form.is_chunked) else {
+        let Some(form) = self.form() else {
             buf.clear();
             return Ok(None);
         };
-        // a compressed payload moves beside its head, so a later check finds the whole record there
-        if form.codec == Codec::Lz4 {
+        // a chunked record moves beside its head, so the chunked read that follows reads it no more
+        if form.is_chunked {
             self.first[SMALL_HEAD_BYTES..length].copy_from_slice(buf);
+            self.front = Some((location.offset, length));
             buf.clear();
-            let Some(restored) = decompress(&self.first[SMALL_HEAD_BYTES..length], &mut self.decoded) else {
+            return Ok(None);
+        }
+        // a compressed payload restores straight from the buffer, and a later check reads the record again
+        if form.codec == Codec::Lz4 {
+            let Some(restored) = decompress(buf, &mut self.decoded) else {
+                buf.clear();
                 return Ok(None);
             };
+            buf.clear();
             buf.extend_from_slice(&self.decoded[..restored]);
         }
         self.trusted = Some((form, length));
         Ok(Some(RecordRead::Valid))
     }
 
-    /// Check the record `read_trusted` handed over last, for a read whose counts moved while it read
-    pub fn check_trusted(&mut self, identity: &RecordIdentity<'_>, buf: &mut Vec<u8>) -> RecordRead {
+    /// Check the record `read_trusted` handed over last, for a read whose counts moved while it read. Nothing when the record was
+    /// compressed, whose stored bytes the reader didn't keep, and the caller reads it again with every check
+    pub fn check_trusted(&mut self, identity: &RecordIdentity<'_>, buf: &mut Vec<u8>) -> Option<RecordRead> {
         match self.trusted.take() {
-            Some((form, _length)) if form.codec == Codec::None => self.open_split(form, identity, buf),
-            Some((form, length)) => self.finish_small(form, length, identity, buf),
-            None => RecordRead::Valid,
+            Some((form, _length)) if form.codec == Codec::None => Some(self.open_split(form, identity, buf)),
+            Some(_compressed) => None,
+            None => Some(RecordRead::Valid),
         }
     }
 
@@ -383,6 +417,7 @@ impl RecordReader {
 
     /// Read the head and the first table page, or all of a small record, in one read
     pub async fn read_front<File: IoFile>(&mut self, device: &impl DeviceReads<File>, file: &File, location: RecordLocation) -> Result<usize> {
+        self.whole_in_first = None;
         let length = (location.length.0 as usize).min(FIRST_READ_BYTES);
         device.read_exact(file, location.offset, &mut self.first[..length]).await?;
         Ok(length)
@@ -572,6 +607,7 @@ impl RecordReader {
     }
 
     /// Read one chunk whole, check it, and add its part of the window to the buffer
+    #[allow(clippy::uninit_vec, reason = "a whole chunk restores into the buffer's spare room, which the decoder fills before anything reads it")]
     pub async fn read_chunk<File: IoFile>(
         &mut self,
         on: ReadOn<'_, impl DeviceReads<File>, File>,
@@ -587,23 +623,43 @@ impl RecordReader {
             return Ok(false);
         }
 
-        let offset = FileOffset(location.offset.0 + span.entry.stored_offset.0);
-        device.read_exact(file, offset, &mut self.chunk[..stored]).await?;
+        // a record the read holds whole in `first` gives its chunks from there, and any other reads each chunk
+        let at = span.entry.stored_offset.0 as usize;
+        let is_held = self.whole_in_first.is_some_and(|whole| at.checked_add(stored).is_some_and(|end| end <= whole));
+        if !is_held {
+            let offset = FileOffset(location.offset.0 + span.entry.stored_offset.0);
+            device.read_exact(file, offset, &mut self.chunk[..stored]).await?;
+        }
+        let source = if is_held { &self.first[at..at + stored] } else { &self.chunk[..stored] };
         // a record stored as written sums a chunk over its pieces' sums, and a compressed one over its stored bytes
-        let sum = if head.codec == Codec::None { written_chunk_sum(&self.chunk[..stored]) } else { checksum(&self.chunk[..stored]) };
+        let sum = if head.codec == Codec::None { written_chunk_sum(source) } else { checksum(source) };
         if sum != span.entry.checksum {
             return Ok(false);
         }
 
         if span.stored_length == span.entry.value_length {
-            buf.extend_from_slice(&self.chunk[part]);
+            buf.extend_from_slice(&source[part]);
             return Ok(true);
         }
         if head.codec != Codec::Lz4 {
             return Ok(false);
         }
 
-        let Some(restored) = decompress(&self.chunk[..stored], &mut self.decoded) else {
+        // a whole chunk restores straight into the caller's buffer, and only part of one goes through the reader's room
+        let length = span.entry.value_length.0 as usize;
+        if part == (0..length) {
+            let start = buf.len();
+            buf.reserve(length);
+            // SAFETY: lz4's safe decoder writes each byte it restores before it reads it back for a match, and the buffer is cut
+            // back to `start` unless all `length` bytes were restored
+            unsafe { buf.set_len(start + length) };
+            if decompress(source, &mut buf[start..]) == Some(length) {
+                return Ok(true);
+            }
+            buf.truncate(start);
+            return Ok(false);
+        }
+        let Some(restored) = decompress(source, &mut self.decoded) else {
             return Ok(false);
         };
         if restored as u64 != span.entry.value_length.0 {
@@ -694,6 +750,8 @@ impl HollowItem for RecordReader {
             decoded: Vec::new(),
             damaged_sums: 0,
             trusted: None,
+            front: None,
+            whole_in_first: None,
         }
     }
 }

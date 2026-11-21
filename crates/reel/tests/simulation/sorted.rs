@@ -2705,25 +2705,28 @@ fn entered_open_rows_hold_their_values() {
 }
 
 const LARGE_KEYS: u64 = 40;
-const LARGE_VALUE_BYTES: usize = 4 * 1024;
+// values a batch never reads, one record each and chunked, so a scan reads each on its own
+const TRUSTED_VALUE_BYTES: [usize; 2] = [16 * 1024, 200 * 1024];
+// a value a batch reads with its neighbours and checks there
+const BATCHED_VALUE_BYTES: usize = 4 * 1024;
 const ROTTED_KEY: u64 = 17;
 
 use reel::io::IoFile;
 
 // a value too long for a leaf to hold, whose first bytes say which key wrote it
-fn large_value(number: u64) -> Vec<u8> {
+fn large_value(number: u64, size: usize) -> Vec<u8> {
     let mut value = format!("large-value-{number:06}").into_bytes();
-    value.resize(LARGE_VALUE_BYTES, (number % 251) as u8);
+    value.resize(size, (number % 251) as u8);
     value
 }
 
 // sealed large values with one byte flipped on the disk inside one of them
-fn rotted_large_values(io: &SimulatedIo) -> Store {
+fn rotted_large_values(io: &SimulatedIo, size: usize) -> Store {
     SIM_BUDGET.with(|budget| budget.set(HELD_BUDGET));
     let store = open(io, CAPACITY);
     SIM_BUDGET.with(|budget| budget.set(BUDGET));
     for number in 0..LARGE_KEYS {
-        store.put(COLUMN, &key(number), &large_value(number)).expect("put");
+        store.put(COLUMN, &key(number), &large_value(number, size)).expect("put");
     }
     seal_all(&store, io);
     let needle = format!("large-value-{ROTTED_KEY:06}").into_bytes();
@@ -2734,7 +2737,7 @@ fn rotted_large_values(io: &SimulatedIo) -> Store {
     file.read_exact_at(FileOffset(0), &mut bytes).expect("read");
     io.close_file(file);
     let at = bytes.windows(needle.len()).position(|window| window == needle).expect("the value");
-    io.rot(&path, FileOffset((at + LARGE_VALUE_BYTES / 2) as u64), BitMask(1)).expect("rot");
+    io.rot(&path, FileOffset((at + size / 2) as u64), BitMask(1)).expect("rot");
     store
 }
 
@@ -2751,17 +2754,28 @@ fn scanned_value(store: &Store, wanted: &[u8]) -> Result<Vec<u8>, ScanStep> {
     }
 }
 
-// a scan reads a sealed value too long for a leaf under its batch's counts, as a get does, so a byte flipped on the disk under it
-// reads back flipped and the trusted count rises
+// a scan reads a sealed value its batch doesn't read under the batch's counts, as a get does, so a byte flipped on the disk under
+// it reads back flipped and the trusted count rises, one record or chunked
 #[test]
 fn a_scanned_large_sealed_value_reads_back_unchecked() {
-    let io = SimulatedIo::new(Seed(47));
-    let store = rotted_large_values(&io);
-    let trusted = report(&store).scan_trusted_records;
-    let value = scanned_value(&store, &key(ROTTED_KEY)).expect("the row");
-    assert!(report(&store).scan_trusted_records > trusted, "the scan checked every large record");
-    assert_eq!(value.len(), LARGE_VALUE_BYTES);
-    assert_ne!(value, large_value(ROTTED_KEY), "the flipped byte was caught");
+    for size in TRUSTED_VALUE_BYTES {
+        let io = SimulatedIo::new(Seed(47));
+        let store = rotted_large_values(&io, size);
+        let trusted = report(&store).scan_trusted_records;
+        let value = scanned_value(&store, &key(ROTTED_KEY)).expect("the row");
+        assert!(report(&store).scan_trusted_records > trusted, "the scan checked every {size} B record");
+        assert_eq!(value.len(), size);
+        assert_ne!(value, large_value(ROTTED_KEY, size), "the flipped byte was caught at {size} B");
+        store.close().expect("close");
+    }
+}
+
+// a record the batch read and found failing its check is never answered unchecked: the scan steps corrupt at it
+#[test]
+fn a_batched_rotten_value_steps_corrupt() {
+    let io = SimulatedIo::new(Seed(51));
+    let store = rotted_large_values(&io, BATCHED_VALUE_BYTES);
+    assert_eq!(scanned_value(&store, &key(ROTTED_KEY)), Err(ScanStep::Corrupt), "a rotten batched value came back");
     store.close().expect("close");
 }
 
@@ -2769,12 +2783,13 @@ fn a_scanned_large_sealed_value_reads_back_unchecked() {
 #[test]
 fn a_read_only_scan_checks_a_large_sealed_value() {
     let io = SimulatedIo::new(Seed(48));
-    let store = rotted_large_values(&io);
+    let size = TRUSTED_VALUE_BYTES[0];
+    let store = rotted_large_values(&io, size);
     store.close().expect("close");
     drop(store);
     let view = ReelStore::open_read_only(io.clone(), &config(CAPACITY)).expect("open read-only");
     if let Ok(value) = scanned_value(&view, &key(ROTTED_KEY)) {
-        assert_eq!(value, large_value(ROTTED_KEY), "a view answered the flipped bytes");
+        assert_eq!(value, large_value(ROTTED_KEY, size), "a view answered the flipped bytes");
     }
     assert_eq!(report(&view).scan_trusted_records, 0, "a view trusted a record");
 }
@@ -2880,6 +2895,73 @@ fn large_records_steer_their_reads_as_they_change() {
     for number in [2_u64, 1, 3, 2] {
         let expected = if number == 2 { text(2) } else { noise(number) };
         assert_eq!(read(&store, &key(number)), Some(expected), "key {number}");
+    }
+    store.close().expect("close");
+}
+
+// a value lz4 halves, so its record stays chunked and longer than one chunk
+fn half_noise(seed: u64) -> Vec<u8> {
+    noise(seed).into_iter().enumerate().map(|(at, byte)| if at % 2 == 0 { byte } else { 0 }).collect()
+}
+
+const SHORT_TEXT_BYTES: usize = 2 * 1024;
+
+// an lz4 column's records read right through every shape: a short chunked record takes two reads, not three, a record that
+// shrank but stays past one chunk falls back from a plain guess, and a short compressed record whose counts move while it reads
+// is read again with every check
+#[test]
+fn lz4_records_read_right_in_every_shape() {
+    SIM_CODEC.with(|codec| codec.set(Codec::Lz4));
+    let io = SimulatedIo::new(Seed(52));
+    let store = open(&io, CAPACITY);
+    SIM_CODEC.with(|codec| codec.set(Codec::None));
+    let short_text: Vec<u8> = text(7).into_iter().take(SHORT_TEXT_BYTES).collect();
+    store.put(COLUMN, &key(1), &text(1)).expect("put");
+    store.put(COLUMN, &key(2), &half_noise(2)).expect("put");
+    store.put(COLUMN, &key(3), &short_text).expect("put");
+    store.put(COLUMN, &key(4), &noise(4)).expect("put");
+    seal_all(&store, &io);
+
+    let reads = io.read_count().0;
+    assert_eq!(read(&store, &key(1)), Some(text(1)));
+    assert!(io.read_count().0 - reads <= 2, "a short chunked record took {} reads", io.read_count().0 - reads);
+
+    // the noise record turns the hint on, so the half record is first read as if plain
+    assert_eq!(read(&store, &key(4)), Some(noise(4)));
+    assert!(store.state.large_plain[COLUMN.0 as usize].load(Ordering::Relaxed));
+    assert_eq!(read(&store, &key(2)), Some(half_noise(2)), "a shrunk record past one chunk misread under a plain guess");
+    assert!(!store.state.large_plain[COLUMN.0 as usize].load(Ordering::Relaxed));
+
+    let state = Arc::clone(&store.state);
+    io.on_every_read(Some(Arc::new(move || state.cues.note_free())));
+    assert_eq!(read(&store, &key(3)), Some(short_text.clone()), "a compressed record read under moving counts");
+    io.on_every_read(None);
+    store.close().expect("close");
+}
+
+// a kept value answers at the edges of what a row keeps, an empty value and one exactly as long as the most, and a range cover
+// over a key with a kept value hides it
+#[test]
+fn kept_values_hold_at_their_edges_and_under_covers() {
+    let io = SimulatedIo::new(Seed(53));
+    let store = open(&io, CAPACITY);
+    let longest = vec![9_u8; MOST_INLINE_VALUE];
+    store.put(COLUMN, &key(1), b"").expect("put");
+    store.put(COLUMN, &key(2), &longest).expect("put");
+    let kept = report(&store).kept_values;
+    assert_eq!(read(&store, &key(1)), Some(Vec::new()));
+    assert_eq!(read(&store, &key(2)), Some(longest));
+    assert_eq!(report(&store).kept_values - kept, 2, "an edge value took a record read");
+
+    let names: Vec<Vec<u8>> = (10..20).map(key).collect();
+    for name in &names {
+        store.put(COLUMN, name, b"covered").expect("put");
+    }
+    let (start, end) = (names.iter().min().expect("a key").clone(), names.iter().max().expect("a key").clone());
+    store.delete_range(COLUMN, &start, &end).expect("delete range");
+    for name in &names {
+        let expected = (*name >= end).then(|| b"covered".to_vec());
+        assert_eq!(read(&store, name), expected, "a cover left a kept value showing");
     }
     store.close().expect("close");
 }

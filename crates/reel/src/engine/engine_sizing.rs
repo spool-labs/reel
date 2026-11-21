@@ -453,7 +453,9 @@ pub fn shard_for_rows(rows_total: u64, open_slots: usize) -> ShardSizing {
     let rows_per_shard = (rows_total / SHARD_COUNT as u64).max(64);
     let least_pages = (open_slots + 1) as u64;
     let page_rows = (PAGE_BYTES / 64) as u64;
-    let pages = ((rows_per_shard / page_rows + 1) * 2).max(least_pages);
+    // the rows' pages, and a quarter more that kept values may take, so they never take a page a row needs
+    let row_pages = (rows_per_shard / page_rows + 1) * 2;
+    let pages = (row_pages + row_pages / 4).max(least_pages);
     let nodes = (rows_per_shard / (NODE_FANOUT as u64 / 2) + 1) * 2 + 64;
     ShardSizing {
         pages: PageCount(pages as u32),

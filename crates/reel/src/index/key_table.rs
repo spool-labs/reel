@@ -57,11 +57,6 @@ impl KeyTable {
         (self.used as u64 + rows - 1) * (LOAD_LIMIT_SCALE as u64) < (self.slots.len() * LOAD_LIMIT_EIGHTHS) as u64
     }
 
-    /// Count the keys in the table
-    pub fn used(&self) -> usize {
-        self.used
-    }
-
     /// Count the keys an empty table of this size takes
     pub fn most_rows(&self) -> u64 {
         (self.slots.len() * LOAD_LIMIT_EIGHTHS / LOAD_LIMIT_SCALE) as u64

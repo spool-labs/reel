@@ -201,13 +201,23 @@ type FileRow = (PathBuf, u64, u64, u64);
 // every file under a directory, with its length, the bytes the disk holds for it, and the bytes it holds past its end
 fn files_under(root: &std::path::Path, found: &mut Vec<FileRow>) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
+    // a running store removes files as it seals and drops spares, so a file listed a moment ago may be gone by its read
+    let is_gone = |error: &std::io::Error| error.kind() == std::io::ErrorKind::NotFound;
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
-        let metadata = entry.metadata()?;
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if is_gone(&error) => continue,
+            Err(error) => return Err(error),
+        };
         if metadata.is_dir() {
             files_under(&entry.path(), found)?;
-        } else {
-            found.push((entry.path(), metadata.len(), metadata.blocks() * 512, held_past_end(&entry.path())?));
+            continue;
+        }
+        match held_past_end(&entry.path()) {
+            Ok(past) => found.push((entry.path(), metadata.len(), metadata.blocks() * 512, past)),
+            Err(error) if is_gone(&error) => {},
+            Err(error) => return Err(error),
         }
     }
     Ok(())

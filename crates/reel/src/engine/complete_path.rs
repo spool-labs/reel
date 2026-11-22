@@ -165,13 +165,25 @@ impl<Backend: Io> EngineState<Backend> {
         volume: &Volume<Backend>,
         read: &KeyRead<'_>,
     ) -> Result<Option<SealedRow>, StoreError> {
+        Ok(self.search_sealed_at(device, volume, read).await?.0)
+    }
+
+    /// Find a key's newest sealed row, with where a sorted index's find left its entry, so a get reads the held value with no second
+    /// descent. The spot travels beside the row and not in it, since scans copy rows by the batch
+    pub async fn search_sealed_at(
+        &self,
+        device: &impl DeviceReads<Backend::File>,
+        volume: &Volume<Backend>,
+        read: &KeyRead<'_>,
+    ) -> Result<(Option<SealedRow>, LeafAt), StoreError> {
         if let Some(index) = self.sorted_index(read.column) {
             return self.search_sorted(device, volume, read, index).await;
         }
-        match self.complete_table(read.column) {
-            Some(table) => self.search_complete(device, volume, read, table).await,
-            None => self.search_footers(device, volume, read).await,
-        }
+        let found = match self.complete_table(read.column) {
+            Some(table) => self.search_complete(device, volume, read, table).await?,
+            None => self.search_footers(device, volume, read).await?,
+        };
+        Ok((found, LeafAt::NONE))
     }
 
     /// Answer a key from its column's sorted index with no footer read, then the footers from the mark on, where rows have no
@@ -183,28 +195,30 @@ impl<Backend: Io> EngineState<Backend> {
         volume: &Volume<Backend>,
         read: &KeyRead<'_>,
         index: &SortedKeys,
-    ) -> Result<Option<SealedRow>, StoreError> {
+    ) -> Result<(Option<SealedRow>, LeafAt), StoreError> {
         let noted = index.find_at(read.key);
         let entry = noted.map(|(entry, _at)| entry);
+        let leaf = noted.map_or(LeafAt::NONE, |(_entry, at)| at);
         let is_behind = volume.may_hide_under_sealed(read.read_point);
         // a grave answers absent wherever it sits, so only a value needs its segment
         if is_behind || entry.is_some_and(|entry| entry.place > read.read_point || (!entry.is_grave && volume.table.pin(entry.segment).is_none())) {
             self.sorted_footer_asks.fetch_add(1, Ordering::Relaxed);
-            return self.search_footers(device, volume, read).await;
+            return Ok((self.search_footers(device, volume, read).await?, LeafAt::NONE));
         }
-        let found = noted.map(|(entry, at)| SealedRow { leaf: at, ..sealed_of(&entry) });
+        let found = entry.as_ref().map(sealed_of);
         let Some(mark) = index.mark() else {
             self.sorted_answers.fetch_add(1, Ordering::Relaxed);
-            return Ok(found);
+            return Ok((found, leaf));
         };
         self.sorted_footer_asks.fetch_add(1, Ordering::Relaxed);
         let Some(directory) = &self.directories[read.column.0 as usize] else {
-            return Ok(found);
+            return Ok((found, leaf));
         };
         let mut reader = self.footer_reader_for(device);
         let ask = WalkAsk { first: mark, ..WalkAsk::EVERY };
         let marked = self.walk_candidates(device, volume, directory, read, &mut reader, ask).await?;
-        Ok(newest_sealed(found, marked))
+        // a held-value read checks the row the spot names, so a footer row newer than the entry reads its record
+        Ok((newest_sealed(found, marked), leaf))
     }
 
     /// Ask each block a key's tag points at and take the highest place, then the footers from the mark on, where rows found
@@ -283,7 +297,7 @@ impl<Backend: Io> EngineState<Backend> {
         };
         match answer {
             FooterAnswer::Found(row) if best.is_none_or(|current| current.row.place < row.place) => {
-                *best = Some(SealedRow { segment, row, block_offset: entry.block_offset, at: reader.found_at, leaf: LeafAt::NONE });
+                *best = Some(SealedRow { segment, row, block_offset: entry.block_offset, at: reader.found_at });
                 Ok(())
             },
             FooterAnswer::Found(..) | FooterAnswer::Absent => Ok(()),
@@ -775,7 +789,6 @@ pub fn sealed_of(entry: &KeyEntry) -> SealedRow {
         },
         block_offset: 0,
         at: RowAt::UNKNOWN,
-        leaf: LeafAt::NONE,
     }
 }
 

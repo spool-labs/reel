@@ -1159,7 +1159,7 @@ impl<Backend: Io> EngineState<Backend> {
                 if let Some(answer) = self.read_from_window(on, read, row, window, direction, value).await {
                     return Ok(answer);
                 }
-                self.read_sealed(device, volume, read, row, RecordWant::Whole, value).await
+                self.read_sealed(device, volume, read, (row, LeafAt::NONE), RecordWant::Whole, value).await
             },
         }
     }
@@ -1583,7 +1583,6 @@ impl<Backend: Io> EngineState<Backend> {
                         row: source.row,
                         block_offset: source.line.block_offset,
                         at: RowAt::UNKNOWN,
-                        leaf: LeafAt::NONE,
                     });
                 }
                 step = match self.step_source(ReadOn::new(device, volume), column, source, direction, point, take.as_mut()).await {

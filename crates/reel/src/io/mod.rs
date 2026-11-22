@@ -26,7 +26,6 @@ use reel_core::maintenance_report::WorkerPriority;
 use reel_core::units::{ByteCount, FileOffset, Nanoseconds, WritePlace};
 
 use crate::engine::read_path::SealedRow;
-use crate::index::sorted_keys::LeafAt;
 use crate::io::host_memory::HostMemory;
 use crate::io::job::Job;
 use crate::io::lock_outcome::LockOutcome;
@@ -163,7 +162,7 @@ impl WalkMark {
                 length: ByteCount(self.best_length.load(Ordering::Relaxed)),
                 kind,
             };
-            Some(SealedRow { segment: SegmentNumber(segment), row, block_offset: self.best_block.load(Ordering::Relaxed), at: RowAt::UNKNOWN, leaf: LeafAt::NONE })
+            Some(SealedRow { segment: SegmentNumber(segment), row, block_offset: self.best_block.load(Ordering::Relaxed), at: RowAt::UNKNOWN })
         });
         Some(WalkResume { next: self.next.load(Ordering::Relaxed), best })
     }

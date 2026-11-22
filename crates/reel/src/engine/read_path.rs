@@ -48,8 +48,6 @@ pub struct SealedRow {
     pub row: FooterRow,
     pub block_offset: u32,
     pub at: RowAt,
-    /// Where a sorted index's find left the entry, so a read of its held value takes no second descent
-    pub leaf: LeafAt,
 }
 
 /// Where a key's newest row sits
@@ -67,7 +65,8 @@ pub enum Located {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KeyPlace {
     Spot(SealedRow),
-    Row(Located),
+    /// The newest row, with where a sorted index's find left a sealed one's entry
+    Row(Located, LeafAt),
 }
 
 /// How a batched read answers one key once it has located it
@@ -436,7 +435,7 @@ impl<Backend: Io> EngineState<Backend> {
     pub fn plan_sealed(
         &self,
         read: &KeyRead<'_>,
-        sealed: &SealedRow,
+        (sealed, leaf): (&SealedRow, LeafAt),
         holder: Option<&SortedKeys>,
         records: &mut Vec<u8>,
         scratch: &mut Vec<u8>,
@@ -444,7 +443,7 @@ impl<Backend: Io> EngineState<Backend> {
         let at = records.len();
         if let Some(index) = holder {
             let row = (sealed.row.place, sealed.segment, sealed.row.offset);
-            if is_holdable(sealed) && at + MOST_HELD_VALUE <= records.capacity() && index.held_value_at(sealed.leaf, read.key, row, records) {
+            if is_holdable(sealed) && at + MOST_HELD_VALUE <= records.capacity() && index.held_value_at(leaf, read.key, row, records) {
                 return Ok((at, records.len() - at));
             }
             records.truncate(at);
@@ -517,18 +516,18 @@ impl<Backend: Io> EngineState<Backend> {
             };
             *plan = match self.locate_found(device, volume, &read, found).await {
                 // a held or cached value needs no read: it goes into the batch's buffer here, and the answer loop takes it from there
-                Ok(KeyPlace::Spot(sealed)) => match self.plan_sealed(&read, &sealed, holder, records, scratch) {
+                Ok(KeyPlace::Spot(sealed)) => match self.plan_sealed(&read, (&sealed, LeafAt::NONE), holder, records, scratch) {
                     Ok(kept) => KeyPlan::Kept(kept),
                     Err(lookup) => {
                         *row = Some(BatchRow::sealed(&sealed));
                         KeyPlan::Spot(sealed, lookup)
                     },
                 },
-                Ok(KeyPlace::Row(Located::Sealed(sealed))) => {
+                Ok(KeyPlace::Row(Located::Sealed(sealed), leaf)) => {
                     if sealed.row.kind != RowKind::Value || read.cover.is_some_and(|cover| cover > sealed.row.place) {
                         KeyPlan::Missing
                     } else {
-                        match self.plan_sealed(&read, &sealed, holder, records, scratch) {
+                        match self.plan_sealed(&read, (&sealed, leaf), holder, records, scratch) {
                             Ok(kept) => KeyPlan::Kept(kept),
                             Err(lookup) => {
                                 *row = Some(BatchRow::sealed(&sealed));
@@ -537,16 +536,16 @@ impl<Backend: Io> EngineState<Backend> {
                         }
                     }
                 },
-                Ok(KeyPlace::Row(Located::Absent)) => KeyPlan::Missing,
+                Ok(KeyPlace::Row(Located::Absent, _leaf)) => KeyPlan::Missing,
                 // an open value no cover hides reads with the batch, from its slot's window when the window holds it
-                Ok(KeyPlace::Row(Located::Open(open))) if open.kind == RowKind::Value && read.cover.is_none_or(|cover| cover <= open.place) => {
+                Ok(KeyPlace::Row(Located::Open(open), _leaf)) if open.kind == RowKind::Value && read.cover.is_none_or(|cover| cover <= open.place) => {
                     *span = self.window_record(&open, records);
                     if span.is_none() {
                         *row = Some(BatchRow::open(&open));
                     }
                     KeyPlan::Open(open)
                 },
-                Ok(KeyPlace::Row(Located::Open(_row))) => KeyPlan::Own,
+                Ok(KeyPlace::Row(Located::Open(_row), _leaf)) => KeyPlan::Own,
                 Err(StoreError::Corruption { .. }) => KeyPlan::Corrupt,
                 Err(error) => return Err(error),
             };
@@ -619,7 +618,7 @@ impl<Backend: Io> EngineState<Backend> {
                 if is_long && is_passing {
                     own.trust = at.trust;
                 }
-                match self.read_sealed(device, volume, &own, &sealed, RecordWant::Whole, scratch).await {
+                match self.read_sealed(device, volume, &own, (&sealed, LeafAt::NONE), RecordWant::Whole, scratch).await {
                     Ok(true) => {
                         values.push_filled(scratch);
                         continue;
@@ -657,17 +656,17 @@ impl<Backend: Io> EngineState<Backend> {
         if let Some(row) = found.row
             && !found.should_ask_footers
         {
-            return Ok(KeyPlace::Row(Located::Open(row)));
+            return Ok(KeyPlace::Row(Located::Open(row), LeafAt::NONE));
         }
         let newest_below = found.row.map(|row| row.place).max(read.cover);
         if self.uses_spot(read.column)
             && let Some(spot) = self.newest_spot(read, newest_below)
         {
             let row = FooterRow { place: spot.place, offset: spot.offset, length: spot.length, kind: RowKind::Value };
-            return Ok(KeyPlace::Spot(SealedRow { segment: spot.segment, row, block_offset: 0, at: RowAt::UNKNOWN, leaf: LeafAt::NONE }));
+            return Ok(KeyPlace::Spot(SealedRow { segment: spot.segment, row, block_offset: 0, at: RowAt::UNKNOWN }));
         }
-        let sealed = self.search_sealed(device, volume, read).await?;
-        Ok(KeyPlace::Row(newest_of(found.row, sealed)))
+        let (sealed, leaf) = self.search_sealed_at(device, volume, read).await?;
+        Ok(KeyPlace::Row(newest_of(found.row, sealed), leaf))
     }
 
     /// Read the spot cache's location for a key when it is at or under the read point and newer than every row below it
@@ -721,7 +720,7 @@ impl<Backend: Io> EngineState<Backend> {
                 return Ok(answer);
             }
 
-            let sealed = self.search_sealed(device, volume, read).await?;
+            let (sealed, leaf) = self.search_sealed_at(device, volume, read).await?;
             let located = newest_of(found.row, sealed);
             match located {
                 Located::Absent => return Ok(false),
@@ -737,7 +736,7 @@ impl<Backend: Io> EngineState<Backend> {
                     if row.row.kind != RowKind::Value || is_hidden(row.row.place) {
                         return Ok(false);
                     }
-                    if self.read_sealed(device, volume, read, &row, want, buf).await? {
+                    if self.read_sealed(device, volume, read, (&row, leaf), want, buf).await? {
                         if self.uses_spot(read.column) {
                             self.fill_spot(volume, read, &row, handovers);
                         }
@@ -988,7 +987,7 @@ impl<Backend: Io> EngineState<Backend> {
         device: &impl DeviceReads<Backend::File>,
         volume: &Volume<Backend>,
         read: &KeyRead<'_>,
-        sealed: &SealedRow,
+        (sealed, leaf): (&SealedRow, LeafAt),
         want: RecordWant,
         buf: &mut Vec<u8>,
     ) -> Result<bool, StoreError> {
@@ -1008,7 +1007,7 @@ impl<Backend: Io> EngineState<Backend> {
             // a record whose payload is longer than a leaf holds, a slice, takes no leaf lookup and no hold
             let is_holdable = is_holdable(sealed);
             buf.clear();
-            if is_holdable && index.held_value_at(sealed.leaf, read.key, row, buf) {
+            if is_holdable && index.held_value_at(leaf, read.key, row, buf) {
                 return Ok(true);
             }
             if self.read_record(ReadOn::new(device, &pin.file), location, trust, read, want, buf).await? == RecordRead::Failed {
@@ -1292,7 +1291,7 @@ impl<Backend: Io> EngineState<Backend> {
         while let Some(found) = in_place(self.search_file(&InPlace, volume, &point, segment, (file, place_base), reader, first.take()))? {
             if found.kind != RowKind::RangeDelete {
                 if best.is_none_or(|current| current.row.place < found.place) {
-                    *best = Some(SealedRow { segment, row: found, block_offset: reader.found_block, at: reader.found_at, leaf: LeafAt::NONE });
+                    *best = Some(SealedRow { segment, row: found, block_offset: reader.found_block, at: reader.found_at });
                 }
                 return Ok(());
             }
@@ -1350,7 +1349,7 @@ impl<Backend: Io> EngineState<Backend> {
         while let Some(found) = self.search_segment(device, volume, &point, segment, pin, reader, first.take()).await? {
             if found.kind != RowKind::RangeDelete {
                 if best.is_none_or(|current| current.row.place < found.place) {
-                    *best = Some(SealedRow { segment, row: found, block_offset: reader.found_block, at: reader.found_at, leaf: LeafAt::NONE });
+                    *best = Some(SealedRow { segment, row: found, block_offset: reader.found_block, at: reader.found_at });
                 }
                 return Ok(());
             }
@@ -1468,7 +1467,7 @@ impl<Backend: Io> EngineState<Backend> {
         if let Some(found) = row
             && best.is_none_or(|current| current.row.place < found.place)
         {
-            *best = Some(SealedRow { segment, row: found, block_offset: reader.found_block, at: reader.found_at, leaf: LeafAt::NONE });
+            *best = Some(SealedRow { segment, row: found, block_offset: reader.found_block, at: reader.found_at });
         }
         Ok(())
     }

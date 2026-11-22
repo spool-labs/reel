@@ -587,3 +587,33 @@ fn slot_state(store: &Store) -> String {
         claims.wants_prepared
     )
 }
+
+// a short marked batch lands in the window under its mark: it opens one lifetime group, reads back, and keeps it through a
+// seal and a reopen
+#[test]
+fn a_short_marked_batch_lands_in_its_group() {
+    let io = SimulatedIo::new(Seed(41));
+    let store = open(&io);
+    let mut batch = WriteBatch::new();
+    for number in 0..5_u64 {
+        batch.put(COLUMN, &key(number), &[number as u8; 200]);
+    }
+    batch.set_mark(DeathMark(1_000));
+    store.write_batch(&batch).expect("batch");
+    assert_eq!(reading(&store).lifetime_groups, 1);
+    let check = |store: &Store, when: &str| {
+        let mut buf = Vec::new();
+        for number in 0..5_u64 {
+            assert!(store.get(COLUMN, &key(number), &mut buf).expect("get"), "{when}: {number}");
+            assert_eq!(buf, vec![number as u8; 200], "{when}: {number}");
+        }
+    };
+    check(&store, "open");
+    store.seal_now();
+    settle(&io);
+    check(&store, "after a seal");
+    store.close().expect("close");
+    let store = open(&io);
+    check(&store, "after a reopen");
+    store.close().expect("close");
+}

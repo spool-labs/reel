@@ -50,7 +50,10 @@ const LONG_ROWS: u64 = 18_000;
 const LONG_CRASH_POINTS: u64 = 6;
 const LONG_PIECES: u64 = 3;
 const GATHERED_ROWS: u64 = 100;
-const SMALL_VALUE: usize = 100;
+/// A value the gathered batch uses, so its records together are past what the window takes
+const GATHERED_VALUE: usize = 300;
+/// A value past what one window record takes
+const PAST_WINDOW_VALUE: usize = 5_000;
 const SPLIT_ROWS: u64 = 200;
 const SPLIT_VALUE: usize = 5_000;
 const LEFT_ON_DISK: u64 = 4_096;
@@ -280,22 +283,54 @@ fn crash_whole() {
     }
 }
 
-// a record that fails to write leaves nothing of the batch for a read, then or after a reopen
+// a record that fails to write leaves nothing of the batch for a read, then or after a reopen. The values are past what the
+// window takes, so the batch writes its records itself
 #[test]
 fn failed_write() {
     let io = SimulatedIo::new(Seed(5));
     let store = open(&io);
-    store.write_batch(&batch_of(b"older")).expect("batch");
+    let (older, newer) = ([b'o'; PAST_WINDOW_VALUE], [b'n'; PAST_WINDOW_VALUE]);
+    store.write_batch(&batch_of(&older)).expect("batch");
     io.fail_writes(OperationCount(1));
 
-    assert!(store.write_batch(&batch_of(b"newer")).is_err());
+    assert!(store.write_batch(&batch_of(&newer)).is_err());
 
     io.fail_writes(OperationCount(0));
-    assert_whole(&store, Some(b"older"));
+    assert_whole(&store, Some(&older));
     store.close().expect("close");
     drop(store);
     let store = open(&io);
-    assert_whole(&store, Some(b"older"));
+    assert_whole(&store, Some(&older));
+    store.close().expect("close");
+}
+
+// a short batch of small records lands in the window and makes no write call, reads back whole there, after a seal and after
+// a reopen, and a failed send of its window later leaves it whole or gone
+#[test]
+fn short_batch_lands_in_the_window() {
+    let io = SimulatedIo::new(Seed(6));
+    let store = open(&io);
+    let before = io.write_calls();
+    store.write_batch(&batch_of(&[b's'; 200])).expect("batch");
+    assert_eq!(io.write_calls().0 - before.0, 0, "a short batch made a write call");
+    assert_whole(&store, Some(&[b's'; 200]));
+    store.seal_now();
+    settle(&io);
+    assert_whole(&store, Some(&[b's'; 200]));
+    store.close().expect("close");
+    let store = open(&io);
+    assert_whole(&store, Some(&[b's'; 200]));
+
+    store.write_batch(&batch_of(&[b't'; 300])).expect("batch");
+    io.fail_writes(OperationCount(1));
+    settle(&io);
+    io.fail_writes(OperationCount(0));
+    io.kill();
+    drop(store);
+    let store = open(&io);
+    let found = values(&store);
+    assert!(found.iter().all(|value| *value == found[0]), "a batch came back torn: {found:?}");
+    assert!(found[0] == Some(vec![b's'; 200]) || found[0] == Some(vec![b't'; 300]), "{found:?}");
     store.close().expect("close");
 }
 
@@ -1005,7 +1040,8 @@ fn unread_row() {
     io.close_file(file);
 }
 
-// small records share a write call, and a chunked record between them goes out on its own at the right offset
+// small records past what the window takes share a write call, and a chunked record between them goes out on its own at the
+// right offset
 #[test]
 fn few_writes() {
     let io = SimulatedIo::new(Seed(31));
@@ -1013,7 +1049,7 @@ fn few_writes() {
     store.put(PLAIN, b"first", b"value").expect("put");
     let mut batch = WriteBatch::new();
     for number in 0..GATHERED_ROWS {
-        batch.put(PLAIN, &key_of(number), &[number as u8; SMALL_VALUE]);
+        batch.put(PLAIN, &key_of(number), &[number as u8; GATHERED_VALUE]);
     }
 
     let before = io.write_calls();
@@ -1022,7 +1058,7 @@ fn few_writes() {
 
     assert_eq!(calls, 1);
     for number in 0..GATHERED_ROWS {
-        assert_eq!(read(&store, PLAIN, &key_of(number)).expect("get"), Some(vec![number as u8; SMALL_VALUE]));
+        assert_eq!(read(&store, PLAIN, &key_of(number)).expect("get"), Some(vec![number as u8; GATHERED_VALUE]));
     }
     store.close().expect("close");
 }
@@ -1052,4 +1088,99 @@ fn split_writes() {
         assert_eq!(read(&store, PLAIN, &key_of(number)).expect("get"), Some(vec![number as u8; SPLIT_VALUE]));
     }
     store.close().expect("close");
+}
+
+// step the jobs until none has work, moving the clock when they all wait on it
+fn settle(io: &SimulatedIo) {
+    for _step in 0..200_000 {
+        if io.step_any().is_none() {
+            io.advance_clock(Nanoseconds(1_000_000));
+            if io.step_any().is_none() {
+                return;
+            }
+        }
+    }
+    panic!("jobs never went quiet");
+}
+
+/// A column, a key and the value it should read as, or none for a key that should be gone
+type Expected = (ColumnId, Vec<u8>, Option<Vec<u8>>);
+
+fn reopen_and_check(io: &SimulatedIo, store: Store, expect: &[Expected]) {
+    let check = |store: &Store, when: &str| {
+        for (column, key, value) in expect {
+            assert_eq!(read(store, *column, key).expect("get").as_ref(), value.as_ref(), "{when}: {key:?}");
+        }
+    };
+    check(&store, "open");
+    store.seal_now();
+    settle(io);
+    check(&store, "after a seal");
+    store.close().expect("close");
+    let store = open(io);
+    check(&store, "after a reopen");
+    store.close().expect("close");
+}
+
+// short batches past one window's room land after the switch, at offsets that read back
+#[test]
+fn short_batches_land_across_window_switches() {
+    let io = SimulatedIo::new(Seed(7));
+    let store = open(&io);
+    let mut expect = Vec::new();
+    for round in 0..40_u64 {
+        let mut batch = WriteBatch::new();
+        for number in 0..5 {
+            let key = key_of(round * 5 + number);
+            let value = vec![(round * 5 + number) as u8; 1_000];
+            batch.put(PLAIN, &key, &value);
+            expect.push((PLAIN, key, Some(value)));
+        }
+        store.write_batch(&batch).expect("batch");
+        for (column, key, value) in &expect {
+            assert_eq!(read(&store, *column, key).expect("get").as_ref(), value.as_ref(), "round {round}");
+        }
+    }
+    reopen_and_check(&io, store, &expect);
+}
+
+// a short batch that puts one key and deletes another the store holds leaves the first and hides the second
+#[test]
+fn short_batch_puts_and_deletes() {
+    let io = SimulatedIo::new(Seed(8));
+    let store = open(&io);
+    store.put(PLAIN, b"gone", b"here").expect("put");
+    store.put(PACKED, b"also-gone", b"here").expect("put");
+    let mut batch = WriteBatch::new();
+    batch.put(PLAIN, b"kept", &[4; 300]);
+    batch.delete(PLAIN, b"gone");
+    batch.delete(PACKED, b"also-gone");
+    let before = io.write_calls();
+    store.write_batch(&batch).expect("batch");
+    assert_eq!(io.write_calls().0 - before.0, 0, "a short batch made a write call");
+    let expect = vec![(PLAIN, b"kept".to_vec(), Some(vec![4; 300])), (PLAIN, b"gone".to_vec(), None), (PACKED, b"also-gone".to_vec(), None)];
+    reopen_and_check(&io, store, &expect);
+}
+
+// one short batch across a compressed column and a plain one, its records shrunk and as written
+#[test]
+fn short_batch_across_codecs() {
+    let io = SimulatedIo::new(Seed(9));
+    let store = open(&io);
+    let noise: Vec<u8> = (0..700_u32).map(|at| (at.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+    let mut batch = WriteBatch::new();
+    batch.put(PLAIN, b"plain-run", &[1; 700]);
+    batch.put(PLAIN, b"plain-noise", &noise);
+    batch.put(PACKED, b"packed-run", &[2; 700]);
+    batch.put(PACKED, b"packed-noise", &noise);
+    let before = io.write_calls();
+    store.write_batch(&batch).expect("batch");
+    assert_eq!(io.write_calls().0 - before.0, 0, "a short batch made a write call");
+    let expect = vec![
+        (PLAIN, b"plain-run".to_vec(), Some(vec![1; 700])),
+        (PLAIN, b"plain-noise".to_vec(), Some(noise.clone())),
+        (PACKED, b"packed-run".to_vec(), Some(vec![2; 700])),
+        (PACKED, b"packed-noise".to_vec(), Some(noise)),
+    ];
+    reopen_and_check(&io, store, &expect);
 }

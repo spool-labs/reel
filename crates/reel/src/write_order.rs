@@ -3,6 +3,7 @@
 use std::hint;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
 
 use reel_core::units::{RowCount, WritePlace};
 
@@ -48,6 +49,9 @@ pub struct WriteOrder {
     mark: AtomicU64,
     moved: Condvar,
     wakes: AtomicU64,
+    sleeps: AtomicU64,
+    slept_ns: AtomicU64,
+    longest_sleep_ns: AtomicU64,
 }
 
 impl TicketRing {
@@ -125,6 +129,9 @@ impl WriteOrder {
             mark: AtomicU64::new(mark.0),
             moved: Condvar::new(),
             wakes: AtomicU64::new(0),
+            sleeps: AtomicU64::new(0),
+            slept_ns: AtomicU64::new(0),
+            longest_sleep_ns: AtomicU64::new(0),
         };
         // some platforms set a lock and a condition up at their first use, and that is a job for open
         drop(hold(&order.ring));
@@ -135,6 +142,11 @@ impl WriteOrder {
     /// Count the wake-ups so far, each a system call
     pub fn wakes(&self) -> u64 {
         self.wakes.load(Ordering::Relaxed)
+    }
+
+    /// Count the writers that slept on the mark, their total sleep in nanoseconds and the longest
+    pub fn sleeps(&self) -> (u64, u64, u64) {
+        (self.sleeps.load(Ordering::Relaxed), self.slept_ns.load(Ordering::Relaxed), self.longest_sleep_ns.load(Ordering::Relaxed))
     }
 
     /// Read the mark: every place of this volume at or below it is published
@@ -192,6 +204,7 @@ impl WriteOrder {
             hint::spin_loop();
         }
 
+        let started = Instant::now();
         let mut ring = hold(&self.ring);
         ring.waiters += 1;
         while self.mark().0 < ticket.last.0 {
@@ -201,6 +214,11 @@ impl WriteOrder {
             };
         }
         ring.waiters -= 1;
+        drop(ring);
+        let slept = started.elapsed().as_nanos() as u64;
+        self.sleeps.fetch_add(1, Ordering::Relaxed);
+        self.slept_ns.fetch_add(slept, Ordering::Relaxed);
+        self.longest_sleep_ns.fetch_max(slept, Ordering::Relaxed);
     }
 
     /// Move the mark past a place recovery found, with no claim in flight

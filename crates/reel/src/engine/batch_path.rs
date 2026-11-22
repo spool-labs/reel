@@ -14,6 +14,7 @@ use xxhash_rust::xxh3::Xxh3;
 use crate::engine::claim::Claim;
 use crate::engine::engine_sizing::GROUP_BYTES;
 use crate::engine::engine_state::{EngineState, IndexWait};
+use crate::engine::open_segment::{MOST_WINDOW_RECORD_BYTES, RecordWindow};
 use crate::engine::volume::Volume;
 use crate::engine::write_path::{ClaimRequest, INDEX_WAIT, check_seal_room, check_value_size, check_writable, store_error, WritingTurn};
 use crate::guard::hold;
@@ -26,7 +27,7 @@ use crate::io::{Io, IoFile};
 use crate::record::codec::Codec;
 use crate::record::record_check::RecordIdentity;
 use crate::record::record_encoder::{PlainRecord, RecordEncoder};
-use crate::record::record_head::plain_length;
+use crate::record::record_head::{SMALL_HEAD_BYTES, plain_length};
 use crate::row_kind::RowKind;
 use crate::record::record_check::RecordKey;
 use crate::rows::row_group::{GROUP_OVERHEAD_BYTES, GroupHead, RowEntry, RowGroupBuffer, encoded_size, row_size};
@@ -37,6 +38,8 @@ use crate::segment::segment_tail::SegmentNumber;
 pub const MOST_BUFFERED_ROW_BYTES: usize = GROUP_BYTES.0 as usize - GROUP_OVERHEAD_BYTES;
 /// The most bytes of rows a group's length field can reach
 pub const MOST_GROUP_ROW_BYTES: usize = u32::MAX as usize - GROUP_OVERHEAD_BYTES;
+/// The most record bytes a batch lands in the window, past which it writes its records itself
+pub const MOST_WINDOW_BATCH_BYTES: usize = 4 * MOST_WINDOW_RECORD_BYTES;
 
 /// The buffers a batch works in
 pub struct BatchBuffers<'buffers> {
@@ -311,6 +314,16 @@ impl<Backend: Io> EngineState<Backend> {
     ) -> Result<(), StoreError> {
         let BatchBuffers { encoder, stage, records, lengths } = buffers;
         let is_long = plan.row_bytes > MOST_BUFFERED_ROW_BYTES;
+        // a short batch of small records lands in the window as a single put does, so it makes no write call beside a bulk write
+        if !is_long
+            && plan.covers == 0
+            && bytes.0 > 0
+            && bytes.0 as usize <= MOST_WINDOW_BATCH_BYTES.min(volume.window_bytes)
+            && has_only_small_records(batch)
+            && self.land_batch_held(volume, batch, plan, bytes, (&mut *encoder, &mut *stage))?
+        {
+            return Ok(());
+        }
         let request = ClaimRequest {
             bytes,
             rows: plan.rows,
@@ -427,6 +440,119 @@ impl<Backend: Io> EngineState<Backend> {
         self.deletes.fetch_add(plan.deletes, Ordering::Relaxed);
         claim.land();
         self.drop_covered(batch, plan, start.place, segment);
+        Ok(())
+    }
+
+    /// Land a short batch's records in its slot's window under one hold of the queue, and its rows with them, or say it didn't
+    /// when the segment has too little left for a window. The records take the window's next bytes in batch order, so each
+    /// row's offset is where the one before it ended
+    pub fn land_batch_held(
+        &self,
+        volume: &Volume<Backend>,
+        batch: &WriteBatch,
+        plan: &BatchPlan,
+        bytes: ByteCount,
+        (encoder, stage): (&mut RecordEncoder, &mut RowGroupBuffer),
+    ) -> Result<bool, StoreError> {
+        let request = ClaimRequest {
+            bytes: ByteCount(0),
+            rows: plan.rows,
+            is_alone: false,
+            has_records: true,
+            covers: 0,
+            mark: batch_mark(batch, plan),
+            has_deletes: plan.deletes > 0,
+        };
+        let length = bytes.0 as usize;
+        loop {
+            let claim = self.claim(volume, &request)?;
+            let (slot, index) = (claim.slot, claim.slot.0 as usize);
+            let pushed = {
+                let mut guard = hold(&self.queues[index]);
+                let window = &self.windows[index][guard.live_window];
+                if guard.filling.has_room(guard.reserved + plan.row_bytes) && window.used() + length <= guard.window_room {
+                    guard.reserved += plan.row_bytes;
+                    let mut cursor = BatchCursor { offset: window.end(), place: claim.first_place() };
+                    stage.clear();
+                    let staged = self.push_batch_records(batch, window, &mut cursor, encoder, stage);
+                    if staged.is_err() {
+                        guard.reserved -= plan.row_bytes;
+                    }
+                    Some(staged)
+                } else {
+                    None
+                }
+            };
+            let Some(staged) = pushed else {
+                // a writer that sleeps or writes with a ticket stops the mark for every writer behind it
+                drop(claim);
+                if self.refill_window(volume, slot, length, plan.row_bytes)? {
+                    continue;
+                }
+                return Ok(false);
+            };
+            staged?;
+
+            let segment = claim.segment;
+            for row in stage.walk() {
+                let write_row = WriteRow {
+                    place: row.place,
+                    offset: row.offset,
+                    length: row.length,
+                    kind: row.kind,
+                    slot,
+                    segment,
+                    has_newer_sealed: false,
+                };
+                let is_held = self.index.insert_held(row.column, row.key, &write_row);
+                debug_assert!(is_held);
+            }
+            {
+                let mut queue = hold(&self.queues[index]);
+                queue.reserved -= plan.row_bytes;
+                let is_appended = queue.filling.append(stage);
+                debug_assert!(is_appended);
+            }
+            self.wake_row_job();
+            self.deletes.fetch_add(plan.deletes, Ordering::Relaxed);
+            claim.land();
+            return Ok(true);
+        }
+    }
+
+    /// Lay each of a batch's records out at its place and copy it into the window, staging its row, with the queue held
+    pub fn push_batch_records(
+        &self,
+        batch: &WriteBatch,
+        window: &RecordWindow,
+        cursor: &mut BatchCursor,
+        encoder: &mut RecordEncoder,
+        stage: &mut RowGroupBuffer,
+    ) -> Result<(), StoreError> {
+        for index in 0..batch.len() {
+            let row = match batch.operation(index) {
+                Some(BatchOperation::Put { column, key, value }) => {
+                    let info = self.column(column)?;
+                    let identity = RecordIdentity {
+                        record_key: self.record_key,
+                        column,
+                        key,
+                        kind: RowKind::Value,
+                        place: cursor.place,
+                    };
+                    let shape = self.encode_value(encoder, &identity, info.codec, value)?;
+                    let head = encoder.small_head(self.record_key, cursor.place);
+                    let offset = window.push([&head, encoder.small_payload(&shape, value)]);
+                    encoder.give_shares(&self.stored_shares);
+                    debug_assert_eq!(offset, cursor.offset);
+                    cursor.row(column, key, shape.total_length(), RowKind::Value)
+                },
+                Some(BatchOperation::Delete { column, key }) => cursor.row(column, key, ByteCount(0), RowKind::Grave),
+                Some(BatchOperation::DeleteRange { .. }) | None => continue,
+            };
+            let is_staged = stage.push(&row);
+            debug_assert!(is_staged);
+        }
         Ok(())
     }
 
@@ -737,6 +863,14 @@ impl BatchCursor {
         self.place = WritePlace(self.place.0 + 1);
         row
     }
+}
+
+/// Check every value in a batch makes a one-chunk record the window can hold
+pub fn has_only_small_records(batch: &WriteBatch) -> bool {
+    (0..batch.len()).all(|index| match batch.operation(index) {
+        Some(BatchOperation::Put { value, .. }) => value.len() + SMALL_HEAD_BYTES <= MOST_WINDOW_RECORD_BYTES,
+        Some(BatchOperation::Delete { .. } | BatchOperation::DeleteRange { .. }) | None => true,
+    })
 }
 
 /// Read the mark a batch lands under. A grave carries no mark and a batch never splits, so one that holds a delete has none

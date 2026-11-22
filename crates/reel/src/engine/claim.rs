@@ -21,7 +21,8 @@ pub struct Claim<'state, Backend: Io> {
     pub segment: SegmentNumber,
     pub data: Backend::File,
     pub offset: FileOffset,
-    pub ticket: Ticket,
+    /// The claim's places. A large record takes them only once its body is written, so it holds the mark for its head alone
+    pub ticket: Option<Ticket>,
     /// The rows, covers and bytes the claim added to its segment. A claim that ends without landing gives the rows and covers
     /// back, and its bytes go back too when nothing claimed past them, or stay behind as a gap the gauge counts
     pub rows: RowCount,
@@ -32,9 +33,9 @@ pub struct Claim<'state, Backend: Io> {
 }
 
 impl<Backend: Io> Claim<'_, Backend> {
-    /// Read the claim's first place
+    /// Read the claim's first place, or place 0 before a late claim takes its ticket, when nothing written may depend on it
     pub fn first_place(&self) -> WritePlace {
-        self.ticket.first
+        self.ticket.map_or(WritePlace(0), |ticket| ticket.first)
     }
 
     /// End the claim with its rows in the index, and wait until a later read sees them
@@ -42,12 +43,18 @@ impl<Backend: Io> Claim<'_, Backend> {
         let volume = self.volume;
         let ticket = self.ticket;
         self.finish();
-        volume.order.wait_visible(&ticket);
+        if let Some(ticket) = ticket {
+            volume.order.wait_visible(&ticket);
+        }
     }
 
     /// End the claim with its rows in the index, leaving the wait for the mark to the caller
     pub fn finish(mut self) {
-        self.volume.order.finish(&self.ticket);
+        #[cfg(feature = "test-hooks")]
+        assert!(self.ticket.is_some(), "a claim lands with no places");
+        if let Some(ticket) = &self.ticket {
+            self.volume.order.finish(ticket);
+        }
         self.is_landed = true;
         self.release();
     }
@@ -91,7 +98,9 @@ impl<Backend: Io> Drop for Claim<'_, Backend> {
     fn drop(&mut self) {
         if !self.is_landed {
             // a failed writer must not hold the mark, or every later write would wait for it
-            self.volume.order.finish(&self.ticket);
+            if let Some(ticket) = &self.ticket {
+                self.volume.order.finish(ticket);
+            }
             self.release();
         }
     }

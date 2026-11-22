@@ -57,9 +57,18 @@ pub struct SealTarget<File> {
     pub data_end: FileOffset,
     /// The segment's rows: at most this at the pick, while claims may still give rows back, and exact once its writers drain
     pub row_count: RowCount,
+    /// The segment's places, which a late claim can still widen until the writers drain
     pub lowest_place: WritePlace,
     pub highest_place: WritePlace,
     pub marks: MarkRange,
+}
+
+/// A segment's rows and places once its writers have all landed
+#[derive(Clone, Copy, Debug)]
+pub struct Drained {
+    pub row_count: RowCount,
+    pub lowest_place: WritePlace,
+    pub highest_place: WritePlace,
 }
 
 /// How far a seal has gone
@@ -244,23 +253,26 @@ impl<Backend: Io> SealJob<Backend> {
     /// Check the footer walk can start: the writers have landed, and the mark has passed the segment, so every lower place is in
     /// the index and a read that starts from here has a point at or above the segment's rows
     pub fn is_ready(&self, target: &SealTarget<Backend::File>) -> bool {
-        self.is_drained(target.slot) && self.volume().order.mark() >= target.highest_place
+        self.drained(target).is_some_and(|drained| self.volume().order.mark() >= drained.highest_place)
     }
 
-    /// Check the target's writers have all landed
-    pub fn is_drained(&self, slot: OpenSlot) -> bool {
+    /// Read the rows and places a segment holds once its writers have all landed, or nothing while one is in flight. A claim in
+    /// flight at the pick can give its rows back or take its places late, so only a drained segment's counts are final
+    pub fn drained(&self, target: &SealTarget<Backend::File>) -> Option<Drained> {
         let claims = hold(&self.volume().claims);
-        for segment in &claims.open {
-            if segment.slot == slot {
-                return segment.in_flight == 0;
-            }
+        match claims.open.iter().find(|segment| segment.slot == target.slot) {
+            Some(segment) if segment.in_flight > 0 => None,
+            Some(segment) => Some(Drained {
+                row_count: segment.row_count,
+                lowest_place: segment.lowest_place,
+                highest_place: segment.highest_place,
+            }),
+            None => Some(Drained {
+                row_count: target.row_count,
+                lowest_place: target.lowest_place,
+                highest_place: target.highest_place,
+            }),
         }
-        true
-    }
-
-    /// Read the rows a drained segment holds
-    pub fn drained_rows(&self, slot: OpenSlot) -> Option<RowCount> {
-        hold(&self.volume().claims).open.iter().find(|segment| segment.slot == slot).map(|segment| segment.row_count)
     }
 
     /// Send the target's last rows out and start its footer
@@ -688,20 +700,25 @@ impl<Backend: Io> SealJob<Backend> {
         match self.phase {
             SealPhase::Idle => Ok(()),
             SealPhase::Draining => {
-                if !self.is_ready(target) {
+                let Some(drained) = self.drained(target) else {
+                    return Ok(());
+                };
+                if self.volume().order.mark() < drained.highest_place {
                     return Ok(());
                 }
-                // a claim in flight at the pick that ended without landing gave its rows back, so the seal counts what its writers left
-                let rows = self.drained_rows(target.slot).unwrap_or(target.row_count);
+                // the seal counts and places what its writers left, which can differ from the pick's copy
                 if let Some(held) = &mut self.target {
-                    held.row_count = rows;
+                    held.row_count = drained.row_count;
+                    held.lowest_place = drained.lowest_place;
+                    held.highest_place = drained.highest_place;
                 }
-                if rows.0 == 0 {
+                if drained.row_count.0 == 0 {
                     self.drop_empty(target)?;
                     self.end_seal();
                     return Ok(());
                 }
-                self.start_writing(target)
+                let fresh = SealTarget { row_count: drained.row_count, lowest_place: drained.lowest_place, highest_place: drained.highest_place, ..target.clone() };
+                self.start_writing(&fresh)
             },
             SealPhase::Writing => self.write_rows(target),
             SealPhase::Installing => self.install(target),

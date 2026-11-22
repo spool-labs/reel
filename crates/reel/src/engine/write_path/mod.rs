@@ -14,8 +14,12 @@ use crate::engine::open_segment::{
 use crate::engine::volume::Volume;
 use crate::guard::hold;
 use crate::io::Io;
-use crate::record::codec::Codec;
+use crate::record::codec::{CHUNK_BYTES, Codec};
 
+/// A record longer than this writes its body before it takes its places
+pub const LATE_TICKET_BYTES: usize = CHUNK_BYTES;
+/// The record's first bytes, written once its places are known: only its head depends on them
+pub const HEAD_PAGE_BYTES: usize = 4 * 1024;
 /// In-flight writes an open segment takes before the volume opens another
 pub const WRITES_PER_OPEN: u32 = 2;
 /// The job asks for a segment that takes writes as they come, with nothing claimed yet

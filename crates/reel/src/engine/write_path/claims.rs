@@ -93,8 +93,19 @@ impl<Backend: Io> EngineState<Backend> {
         request: &ClaimRequest,
         size: usize,
     ) -> Result<(Claim<'state, Backend>, RowRoom<'state>), StoreError> {
+        self.claim_room_late(volume, request, size, false)
+    }
+
+    /// Claim with room held for rows, taking the places now or, for a late claim, leaving them to `take_late_ticket`
+    pub fn claim_room_late<'state>(
+        &'state self,
+        volume: &'state Volume<Backend>,
+        request: &ClaimRequest,
+        size: usize,
+        is_late: bool,
+    ) -> Result<(Claim<'state, Backend>, RowRoom<'state>), StoreError> {
         loop {
-            let claim = self.claim(volume, request)?;
+            let claim = self.claim_late(volume, request, is_late)?;
             if self.try_reserve(claim.slot, size) {
                 let queue = &self.queues[claim.slot.0 as usize];
                 return Ok((claim, RowRoom { queue, size }));
@@ -205,6 +216,46 @@ impl<Backend: Io> EngineState<Backend> {
         volume: &'state Volume<Backend>,
         request: &ClaimRequest,
     ) -> Result<Claim<'state, Backend>, StoreError> {
+        self.claim_late(volume, request, false)
+    }
+
+    /// Take places for a claim made late, once its body is written, and note them on its segment, whose seal waits for this claim
+    pub fn take_late_ticket(&self, claim: &mut Claim<'_, Backend>) -> Result<(), StoreError> {
+        let volume = claim.volume;
+        let deadline = self.io.now().0.saturating_add(INDEX_WAIT.0);
+        loop {
+            check_writable(volume)?;
+            if self.io.now().0 > deadline {
+                return Err(StoreError::Io {
+                    action: "waiting for write places",
+                    source: Error::other("no places freed up"),
+                });
+            }
+            let mut claims = hold(&volume.claims);
+            if let Some(ticket) = volume.order.try_claim(claim.rows) {
+                if let Some(segment) = claims.open.iter_mut().find(|segment| segment.number == claim.segment) {
+                    segment.lowest_place = segment.lowest_place.min(ticket.first);
+                    segment.highest_place = segment.highest_place.max(ticket.last);
+                }
+                claim.ticket = Some(ticket);
+                return Ok(());
+            }
+            // the ring frees when claims end, and ending one needs this lock, and so does a raise
+            drop(claims);
+            if self.places.is_past_limit(claim.rows) {
+                let _is_held = self.reserve_ahead();
+            }
+            self.pause_for(PauseCause::Ring);
+        }
+    }
+
+    /// Claim bytes, with the places now or, for a late claim, left for later
+    pub fn claim_late<'state>(
+        &'state self,
+        volume: &'state Volume<Backend>,
+        request: &ClaimRequest,
+        is_late: bool,
+    ) -> Result<Claim<'state, Backend>, StoreError> {
         // a volume with no group has nowhere to put a mark, and a pick for one would wait for a group that never opens
         if request.mark.is_some() && volume.most_groups == 0 {
             return Err(StoreError::NoLifetimeGroups { volume: volume.id });
@@ -263,6 +314,9 @@ impl<Backend: Io> EngineState<Backend> {
                     continue;
                 }
 
+                if is_late {
+                    return Ok(self.take_claim(claims, volume, index, request, None));
+                }
                 let Some(ticket) = volume.order.try_claim(request.rows) else {
                     // the ring frees when claims end, and ending one needs this lock, and so does a raise
                     drop(claims);
@@ -273,7 +327,7 @@ impl<Backend: Io> EngineState<Backend> {
                     continue;
                 };
 
-                return Ok(self.take_claim(claims, volume, index, request, ticket));
+                return Ok(self.take_claim(claims, volume, index, request, Some(ticket)));
             }
 
             if claims.is_creating {
@@ -312,7 +366,7 @@ impl<Backend: Io> EngineState<Backend> {
         let end = segment.write_end.0 + request.bytes.0;
         if end > segment.reserved_end.0 {
             segment.is_room_holding = true;
-            return Some(RoomAhead { file: segment.data.clone(), segment: segment.number, end: reserve_target(segment, volume, end) });
+            return Some(RoomAhead { file: segment.data.clone(), segment: segment.number, from: segment.reserved_end.0, end: reserve_target(segment, volume, end) });
         }
         let is_short = segment.reserved_end.0 < volume.segment_bytes.0 && segment.reserved_end.0.saturating_sub(end) < volume.reserve_step / 2;
         if !segment.is_reserve_asked && is_short {
@@ -327,7 +381,7 @@ impl<Backend: Io> EngineState<Backend> {
     /// Take a claim's room with no lock held, then note it. A full disk seals the segment, so no claim tries it again
     pub fn take_room(&self, volume: &Volume<Backend>, room: RoomAhead<Backend::File>) -> Result<(), StoreError> {
         let started = self.io.now();
-        let reserved = room.file.reserve_to(ByteCount(room.end));
+        let reserved = room.file.reserve_range(FileOffset(room.from), ByteCount(room.end));
         self.longest_room_step.fetch_max(self.io.now().0.saturating_sub(started.0), Ordering::Relaxed);
         let mut claims = hold(&volume.claims);
         let Some(index) = claims.open.iter().position(|segment| segment.number == room.segment) else {
@@ -358,7 +412,7 @@ impl<Backend: Io> EngineState<Backend> {
         volume: &'state Volume<Backend>,
         index: usize,
         request: &ClaimRequest,
-        ticket: Ticket,
+        ticket: Option<Ticket>,
     ) -> Claim<'state, Backend> {
         let segment = &mut claims.open[index];
         if request.is_alone {
@@ -375,9 +429,11 @@ impl<Backend: Io> EngineState<Backend> {
         segment.in_flight += 1;
         segment.cover_rows += request.covers;
         segment.has_deletes |= request.has_deletes;
-        segment.lowest_place = segment.lowest_place.min(ticket.first);
+        if let Some(ticket) = ticket {
+            segment.lowest_place = segment.lowest_place.min(ticket.first);
+            segment.highest_place = segment.highest_place.max(ticket.last);
+        }
         segment.is_replayed = false;
-        segment.highest_place = segment.highest_place.max(ticket.last);
         if let Some(mark) = request.mark {
             segment.marks.add(mark);
         }

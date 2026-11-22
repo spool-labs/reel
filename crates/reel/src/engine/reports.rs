@@ -162,6 +162,15 @@ impl<Backend: Io> EngineState<Backend> {
             *entry = pauses.load(Ordering::Relaxed);
         }
         report.longest_room_step = Nanoseconds(self.longest_room_step.load(Ordering::Relaxed));
+        report.mark_sleeps = 0;
+        report.mark_slept = Nanoseconds(0);
+        report.longest_mark_sleep = Nanoseconds(0);
+        for volume in &self.volumes {
+            let (sleeps, slept, longest) = volume.order.sleeps();
+            report.mark_sleeps += sleeps;
+            report.mark_slept = Nanoseconds(report.mark_slept.0 + slept);
+            report.longest_mark_sleep = Nanoseconds(report.longest_mark_sleep.0.max(longest));
+        }
         report.longest_walkless_steps = self.longest_walkless_steps.load(Ordering::Relaxed);
         let kind = self.longest_walkless_kind.load(Ordering::Relaxed) as usize;
         report.longest_walkless_kind = kind.checked_sub(1).and_then(|at| UNIT_KINDS.get(at)).copied();

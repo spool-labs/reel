@@ -19,16 +19,16 @@ use crate::engine::volume::Volume;
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
 use crate::index::write_row::WriteRow;
-use crate::io::{Io, IoFile};
+use crate::io::{Io, IoFile, IoTask};
 use crate::record::codec::{CHUNK_BYTES, Codec};
 use crate::record::record_check::RecordIdentity;
-use crate::record::record_encoder::{PlainRecord, RecordEncoder, RecordShape};
-use crate::record::record_head::plain_length;
+use crate::record::record_encoder::{PlainRecord, RecordEncoder, RecordShape, write_parts_range};
+use crate::record::record_head::{SMALL_HEAD_BYTES, plain_length};
 use crate::row_kind::RowKind;
 use crate::rows::row_group::{RowEntry, row_size};
 use crate::segment::range_covers::Cover;
 
-use crate::engine::write_path::{ClaimRequest, LandOutcome, ValueWrite, WINDOW_SPINS, WINDOW_SPIN_ROUNDS, WindowSwitch, WritingTurn, check_value_size, check_writable, store_error};
+use crate::engine::write_path::{ClaimRequest, HEAD_PAGE_BYTES, LATE_TICKET_BYTES, LandOutcome, ValueWrite, WINDOW_SPINS, WINDOW_SPIN_ROUNDS, WindowSwitch, WritingTurn, check_value_size, check_writable, store_error};
 
 /// Chunked records in a row a column stores as written before a read guesses its next one is too
 pub const PLAIN_STREAK: u8 = 3;
@@ -64,7 +64,7 @@ impl<Backend: Io> EngineState<Backend> {
         &self,
         volume: &Volume<Backend>,
         write: &ValueWrite,
-        record: &PlainRecord,
+        (head_at, payload): (impl Fn(WritePlace) -> [u8; SMALL_HEAD_BYTES], &[u8]),
         length: ByteCount,
     ) -> Result<(), StoreError> {
         let request = ClaimRequest {
@@ -80,16 +80,16 @@ impl<Backend: Io> EngineState<Backend> {
         loop {
             let claim = self.claim(volume, &request)?;
             let (slot, place) = (claim.slot, claim.first_place());
-            let head = record.head(self.record_key, place);
-            let Some(offset) = self.try_window(slot, [&head, write.value], size) else {
+            let head = head_at(place);
+            let Some(offset) = self.try_window(slot, [&head, payload], size) else {
                 // a writer that sleeps or writes with a ticket stops the mark for every writer behind it
                 drop(claim);
                 if self.refill_window(volume, slot, length.0 as usize, size)? {
                     continue;
                 }
-                return self.land_record(volume, write, length, |claim| {
-                    let head = record.head(self.record_key, claim.first_place());
-                    claim.data.write_at(claim.offset, &[IoSlice::new(&head), IoSlice::new(write.value)])
+                return self.land_record(volume, write, length, |claim, range| {
+                    let head = head_at(claim.first_place());
+                    write_parts_range(&claim.data, claim.offset, &[IoSlice::new(&head), IoSlice::new(payload)], range)
                 });
             };
 
@@ -158,21 +158,23 @@ impl<Backend: Io> EngineState<Backend> {
                 source,
             })
         };
-        {
-            let guard = hold(&self.queues[index]);
-            if !guard.filling.has_room(guard.reserved + size) {
-                drop(guard);
-                sent(self.write_out(slot))?;
-                return Ok(true);
+        if !self.has_row_room(index, size) {
+            // the row job sends the group, so a put meets no file lock or journal there. A put sends it only when the job hasn't
+            if self.hurry_row_job() {
+                self.pause_for(PauseCause::RecordTurn);
             }
+            if !self.has_row_room(index, size) {
+                sent(self.write_out(slot))?;
+            }
+            return Ok(true);
         }
 
         match self.switch_window(volume, slot, length) {
             WindowSwitch::HasRoom => Ok(true),
             WindowSwitch::NoRoom => Ok(false),
             WindowSwitch::Switched => {
-                // the new window has room, and whoever holds the turn or the row job sends the old one
-                if self.try_writing_turn(slot) {
+                // the new window has room, and the row job sends the old one, so the put makes no write call
+                if !self.hurry_row_job() && self.try_writing_turn(slot) {
                     sent(self.send_kept_in_turn(index))?;
                 }
                 Ok(true)
@@ -182,6 +184,22 @@ impl<Backend: Io> EngineState<Backend> {
                 Ok(true)
             },
         }
+    }
+
+    /// Check a slot's filling group has room for a row beside the rows already promised
+    pub fn has_row_room(&self, index: usize, size: usize) -> bool {
+        let guard = hold(&self.queues[index]);
+        guard.filling.has_room(guard.reserved + size)
+    }
+
+    /// Wake the row job to send what waits, and say whether there is a job to wake
+    pub fn hurry_row_job(&self) -> bool {
+        let Some(task) = self.row_task.get() else {
+            return false;
+        };
+        self.row_job_idle.store(false, Ordering::Release);
+        task.wake();
+        true
     }
 
     /// Wait for the window waiting to go, holding nothing, and send it when the turn comes free
@@ -284,11 +302,12 @@ impl<Backend: Io> EngineState<Backend> {
         let record = PlainRecord::new(&identity, write.value);
         let length = plain_length(ByteCount(write.value.len() as u64));
         if length.0 as usize <= MOST_WINDOW_RECORD_BYTES {
-            return self.land_held(volume, write, &record, length);
+            let head_at = |place| record.head(self.record_key, place);
+            return self.land_held(volume, write, (head_at, write.value), length);
         }
-        self.land_record(volume, write, length, |claim| {
+        self.land_record(volume, write, length, |claim, range| {
             let head = record.head(self.record_key, claim.first_place());
-            claim.data.write_at(claim.offset, &[IoSlice::new(&head), IoSlice::new(write.value)])
+            write_parts_range(&claim.data, claim.offset, &[IoSlice::new(&head), IoSlice::new(write.value)], range)
         })
     }
 
@@ -312,9 +331,16 @@ impl<Backend: Io> EngineState<Backend> {
         }
 
         let length = shape.total_length();
-        let landed = self.land_record(volume, write, length, |claim| {
+        // a small record lands in the window as a plain one does, so a put of metadata makes no write call beside a bulk write
+        if shape.table_length == 0 && shape.sums_length == 0 && length.0 as usize <= MOST_WINDOW_RECORD_BYTES {
+            let encoder = &*encoder;
+            let head_at = |place| encoder.small_head(self.record_key, place);
+            let landed = self.land_held(volume, write, (head_at, encoder.small_payload(&shape, write.value)), length);
+            return landed;
+        }
+        let landed = self.land_record(volume, write, length, |claim, range| {
             encoder.set_place(self.record_key, claim.first_place());
-            encoder.write_to(&claim.data, claim.offset, &shape, write.value)
+            encoder.write_range_to(&claim.data, claim.offset, &shape, write.value, range)
         });
         encoder.give_shares(&self.stored_shares);
         landed
@@ -347,7 +373,7 @@ impl<Backend: Io> EngineState<Backend> {
         volume: &Volume<Backend>,
         write: &ValueWrite,
         length: ByteCount,
-        mut write_record: impl FnMut(&Claim<'_, Backend>) -> std::io::Result<()>,
+        mut write_record: impl FnMut(&Claim<'_, Backend>, (usize, usize)) -> std::io::Result<()>,
     ) -> Result<(), StoreError> {
         let request = ClaimRequest {
             bytes: length,
@@ -358,11 +384,20 @@ impl<Backend: Io> EngineState<Backend> {
             mark: write.mark,
             has_deletes: false,
         };
+        let total = length.0 as usize;
+        // a large record writes its body before it takes places, so the writers behind it on the mark wait for its head alone
+        let is_late = total > LATE_TICKET_BYTES;
         loop {
-            let (claim, room) = self.claim_with_room(volume, &request, row_size(write.key.len()))?;
-            if let Err(source) = write_record(&claim) {
-                return Err(store_error(volume, "writing a record", source));
-            }
+            let (mut claim, room) = self.claim_room_late(volume, &request, row_size(write.key.len()), is_late)?;
+            let written = if is_late {
+                write_record(&claim, (HEAD_PAGE_BYTES, total))
+                    .map_err(|source| store_error(volume, "writing a record", source))
+                    .and_then(|()| self.take_late_ticket(&mut claim))
+                    .and_then(|()| write_record(&claim, (0, HEAD_PAGE_BYTES)).map_err(|source| store_error(volume, "writing a record", source)))
+            } else {
+                write_record(&claim, (0, total)).map_err(|source| store_error(volume, "writing a record", source))
+            };
+            written?;
 
             let row = WriteRow {
                 place: claim.first_place(),

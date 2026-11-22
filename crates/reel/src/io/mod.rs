@@ -76,6 +76,11 @@ pub trait IoFile: Clone + Send + Sync {
     /// Hold the disk's space through an end, so a write before it never meets a full disk. A file already that long is left as
     /// it is
     fn reserve_to(&self, end: ByteCount) -> Result<()>;
+
+    /// Hold the disk's space from a start through an end, for a caller that already holds what comes before the start
+    fn reserve_range(&self, _from: FileOffset, end: ByteCount) -> Result<()> {
+        self.reserve_to(end)
+    }
 }
 
 /// A device and what its reads go to, which travel down a read path together

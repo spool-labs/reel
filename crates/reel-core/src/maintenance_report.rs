@@ -595,6 +595,10 @@ pub struct MaintenanceReport {
     pub pauses: [u64; PAUSE_CAUSES.len()],
     /// The longest a writer took to reserve room ahead of its claims
     pub longest_room_step: Nanoseconds,
+    /// Writers that slept on a volume's mark waiting for earlier claims to land, their total sleep and the longest
+    pub mark_sleeps: u64,
+    pub mark_slept: Nanoseconds,
+    pub longest_mark_sleep: Nanoseconds,
     /// The most planner steps in a row that ended before the walk's turn while a walk was pending
     pub longest_walkless_steps: u64,
     /// The kind of unit behind that longest run, so a long one names its cause
@@ -756,6 +760,9 @@ impl MaintenanceReport {
             written: [ByteCount(0); WRITE_SOURCES.len()],
             pauses: [0; PAUSE_CAUSES.len()],
             longest_room_step: Nanoseconds(0),
+            mark_sleeps: 0,
+            mark_slept: Nanoseconds(0),
+            longest_mark_sleep: Nanoseconds(0),
             longest_walkless_steps: 0,
             longest_walkless_kind: None,
             record_cache_hits: 0,

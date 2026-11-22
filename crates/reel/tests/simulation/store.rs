@@ -1360,11 +1360,20 @@ const CACHE_KEYS: u64 = 400;
 const CACHE_OPS: u64 = 3_000;
 const CACHE_SEAL_EVERY: u64 = 700;
 
-// write past a slot's window, so the next get of an earlier record reads it from the file
-fn fill_past_window(store: &Store, tag: &str) {
+// write past a slot's window and let the row job send the full one, so the next get of an earlier record reads it from the file
+fn fill_past_window(store: &Store, io: &SimulatedIo, tag: &str) {
     for number in 0..(RECORD_WINDOW_BYTES / FILLER_VALUE + 2) as u64 {
         store.put(COLUMN, format!("filler-{tag}-{number}").as_bytes(), &[number as u8; FILLER_VALUE]).expect("put");
     }
+    for _step in 0..100_000 {
+        if store.state.queues.iter().all(|queue| !hold(queue).has_kept_window) {
+            return;
+        }
+        if io.step_any().is_none() {
+            io.advance_clock(TICK);
+        }
+    }
+    panic!("the row job never sent the full window");
 }
 
 // a get of an open record the window no longer holds takes it into the record cache, and a get after its seal is a hit. The value is too
@@ -1375,7 +1384,7 @@ fn an_open_get_caches_its_record_through_the_seal() {
     let store = open(&io);
     let hot = vec![b'h'; reel::index::entry_slab::MOST_INLINE_VALUE + 1];
     store.put(COLUMN, b"hot", &hot).expect("put");
-    fill_past_window(&store, "first");
+    fill_past_window(&store, &io, "first");
     let admits = store.state.record_cache.admits.total();
     assert_eq!(read(&store, b"hot").as_deref(), Some(hot.as_slice()));
     assert!(store.state.record_cache.admits.total() > admits, "the open get admitted nothing");
@@ -1397,14 +1406,14 @@ fn an_open_record_cached_gives_way_to_an_overwrite_and_a_delete() {
     let store = open(&io);
     store.put(COLUMN, b"changed", b"first").expect("put");
     store.put(COLUMN, b"gone", b"here").expect("put");
-    fill_past_window(&store, "first");
+    fill_past_window(&store, &io, "first");
     assert_eq!(read(&store, b"changed").as_deref(), Some(&b"first"[..]));
     assert_eq!(read(&store, b"gone").as_deref(), Some(&b"here"[..]));
     store.put(COLUMN, b"changed", b"second").expect("put");
     store.delete(COLUMN, b"gone").expect("delete");
     assert_eq!(read(&store, b"changed").as_deref(), Some(&b"second"[..]));
     assert_eq!(read(&store, b"gone"), None);
-    fill_past_window(&store, "second");
+    fill_past_window(&store, &io, "second");
     assert_eq!(read(&store, b"changed").as_deref(), Some(&b"second"[..]));
     assert_eq!(read(&store, b"gone"), None);
     store.seal_now();

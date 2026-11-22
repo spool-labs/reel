@@ -322,8 +322,20 @@ impl RecordEncoder {
         shape: &RecordShape,
         value: &[u8],
     ) -> Result<()> {
+        self.write_range_to(file, at, shape, value, (0, shape.total_length().0 as usize))
+    }
+
+    /// Write the record's bytes from one point to another, each at its own offset from the record's start
+    pub fn write_range_to<File: IoFile>(
+        &self,
+        file: &File,
+        at: FileOffset,
+        shape: &RecordShape,
+        value: &[u8],
+        range: (usize, usize),
+    ) -> Result<()> {
         if self.runs.is_empty() {
-            return file.write_at(at, &self.parts(shape, value));
+            return write_parts_range(file, at, &self.parts(shape, value), range);
         }
 
         let mut parts = [IoSlice::new(&[]); MOST_WRITE_PARTS];
@@ -336,7 +348,7 @@ impl RecordEncoder {
             };
             *part = IoSlice::new(bytes);
         }
-        file.write_at(at, &parts[..2 + self.runs.len()])
+        write_parts_range(file, at, &parts[..2 + self.runs.len()], range)
     }
 
     /// Put an entry at its place in the table's pages
@@ -399,6 +411,19 @@ impl RecordEncoder {
         self.head[..CHECK_BYTES].copy_from_slice(&check.0.to_le_bytes());
     }
 
+    /// Build a one-chunk record's head for a place, leaving the encoder as it is
+    pub fn small_head(&self, record_key: RecordKey, place: WritePlace) -> [u8; SMALL_HEAD_BYTES] {
+        let mut head = [0; SMALL_HEAD_BYTES];
+        head[..CHECK_BYTES].copy_from_slice(&place_check(self.check, record_key, place).0.to_le_bytes());
+        head[FORM_AT] = self.head[FORM_AT];
+        head
+    }
+
+    /// Point at a one-chunk record's payload
+    pub fn small_payload<'bytes>(&'bytes self, shape: &RecordShape, value: &'bytes [u8]) -> &'bytes [u8] {
+        if shape.is_payload_stored { &self.stored[..shape.payload_length] } else { value }
+    }
+
     /// Point at the laid-out parts, ready for one write call
     pub fn parts<'bytes>(&'bytes self, shape: &RecordShape, value: &'bytes [u8]) -> [IoSlice<'bytes>; RECORD_PARTS] {
         let payload = if shape.is_payload_stored {
@@ -413,6 +438,25 @@ impl RecordEncoder {
             IoSlice::new(payload),
         ]
     }
+}
+
+/// Write the bytes of a run of parts from one point to another, with the run starting at `at`, in one write call
+pub fn write_parts_range<File: IoFile>(file: &File, at: FileOffset, parts: &[IoSlice<'_>], (from, to): (usize, usize)) -> Result<()> {
+    if from == 0 && to >= parts.iter().map(|part| part.len()).sum::<usize>() {
+        return file.write_at(at, parts);
+    }
+    let mut picked = [IoSlice::new(&[]); MOST_WRITE_PARTS];
+    let (mut count, mut start) = (0, 0);
+    for part in parts {
+        let end = start + part.len();
+        let (low, high) = (from.max(start), to.min(end));
+        if low < high {
+            picked[count] = IoSlice::new(&part[low - start..high - start]);
+            count += 1;
+        }
+        start = end;
+    }
+    file.write_at(FileOffset(at.0 + from as u64), &picked[..count])
 }
 
 /// Read a chunk offset from the front of a table entry

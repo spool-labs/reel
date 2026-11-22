@@ -9,13 +9,23 @@ use reel::engine::cue::Cue;
 use reel::engine::reel_store::ReelStore;
 use reel::engine::volume::NO_SEAL;
 use reel::engine::walk_job::FREE_IN_PLACE_BYTES;
-use reel::engine::write_path::ClaimRequest;
+use std::io::IoSlice;
+
+use reel::engine::write_path::{ClaimRequest, HEAD_PAGE_BYTES, LandOutcome};
+use reel::index::write_row::WriteRow;
+use reel::io::IoFile;
+use reel::record::record_check::RecordIdentity;
+use reel::record::record_encoder::PlainRecord;
+use reel::record::record_head::plain_length;
+use reel::row_kind::RowKind;
+use reel::rows::row_group::row_size;
 use reel::guard::hold;
 use reel::record::codec::Codec;
 use reel::segment::segment_tail::SegmentNumber;
 use reel_core::column_id::ColumnId;
 use reel_core::units::{ByteCount, Nanoseconds, RowCount, VolumeId, WritePlace};
 use reel_sim::seeded_random::Seed;
+use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_io::SimulatedIo;
 use reel_sim::wait::wait_until;
 
@@ -503,4 +513,318 @@ fn a_claim_dropped_under_a_seal_leaves_the_count_whole() {
     assert_eq!(name, b"later");
     drop(scan);
     store.close().expect("close");
+}
+
+// a claim that takes its places late lands a row the pick's copy of the segment's places can't hold, so a seal that picked
+// the segment while the claim was in flight reads the places again once its writers drain
+fn seal_with_a_late_claim(earlier_rows: u64) {
+    let io = SimulatedIo::new(Seed(11));
+    let config = StoreConfig {
+        memory_budget: BUDGET,
+        threads: reel::config::NO_WORKERS,
+        volumes: vec![VolumeConfig { open_segments: Some(1), ..volume("bulk", BULK_ROOT) }, volume("meta", META_ROOT)],
+        columns: vec![column(BULK, "bulk", 0), column(META, "meta", 1)],
+    };
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let bulk = &store.state.volumes[0];
+    for number in 0..earlier_rows {
+        store.put(BULK, &number.to_be_bytes(), b"value").expect("put");
+    }
+
+    let (key, value) = (b"late".as_slice(), vec![5u8; 300]);
+    let length = plain_length(ByteCount(value.len() as u64));
+    let request = ClaimRequest { bytes: length, has_records: true, ..ONE_ROW };
+    let (mut claim, room) = store.state.claim_room_late(bulk, &request, row_size(key.len()), true).expect("claim");
+    store.seal_now();
+    for _step in 0..STEPS {
+        if bulk.sealing.load(Ordering::Acquire) != NO_SEAL {
+            break;
+        }
+        if io.step_any().is_none() {
+            io.advance_clock(TICK);
+        }
+    }
+    assert_ne!(bulk.sealing.load(Ordering::Acquire), NO_SEAL, "the seal never picked its segment");
+
+    store.state.take_late_ticket(&mut claim).expect("ticket");
+    let place = claim.first_place();
+    let identity = RecordIdentity { record_key: store.state.record_key, column: BULK, key, kind: RowKind::Value, place: WritePlace(0) };
+    let head = PlainRecord::new(&identity, &value).head(store.state.record_key, place);
+    claim.data.write_at(claim.offset, &[IoSlice::new(&head), IoSlice::new(&value)]).expect("write");
+    let row = WriteRow { place, offset: claim.offset, length, kind: RowKind::Value, slot: claim.slot, segment: claim.segment, has_newer_sealed: false };
+    assert!(matches!(store.state.land_reserved(BULK, key, &row, Some(&value)), LandOutcome::Landed));
+    drop(room);
+    claim.land();
+    // the seal notes its place when the footer starts, and the install later raises it to the footer's own, so look in between
+    let sealed_before = bulk.highest_sealed.load(Ordering::Acquire);
+    for _step in 0..STEPS {
+        if bulk.highest_sealed.load(Ordering::Acquire) != sealed_before {
+            break;
+        }
+        if io.step_any().is_none() {
+            io.advance_clock(TICK);
+        }
+    }
+    assert_eq!(bulk.seals_done.load(Ordering::Acquire), 0, "the seal installed before its first noted place could be read");
+    assert!(bulk.highest_sealed.load(Ordering::Acquire) >= place.0, "the seal notes a place below the late row's {place:?}");
+    settle(&io);
+
+    assert_eq!(bulk.seals_done.load(Ordering::Acquire), 1);
+    assert!(bulk.highest_sealed.load(Ordering::Acquire) >= place.0, "the sealed place stops below the late row's {place:?}");
+    let mut buf = Vec::new();
+    assert!(store.get(BULK, key, &mut buf).expect("get"), "the late row is gone after the seal");
+    assert_eq!(buf, value);
+    let mut scan = store.iter_from(BULK, key, reel_core::direction::Direction::Ascending).expect("scan");
+    let mut name = Vec::new();
+    assert_eq!(scan.next_key(&mut name).expect("step"), reel_core::scan::ScanStep::Found);
+    assert_eq!(name, key);
+    drop(scan);
+    store.close().expect("close");
+
+    let store = ReelStore::open(io.clone(), &config).expect("reopen");
+    buf.clear();
+    assert!(store.get(BULK, key, &mut buf).expect("get"), "the late row is gone after a reopen");
+    assert_eq!(buf, value);
+    for number in 0..earlier_rows {
+        assert!(store.get(BULK, &number.to_be_bytes(), &mut buf).expect("get"));
+    }
+    store.close().expect("close");
+}
+
+#[test]
+fn a_late_claim_under_a_seal_lands_in_its_footer() {
+    seal_with_a_late_claim(100);
+}
+
+#[test]
+fn a_late_claim_alone_in_its_segment_gives_the_footer_its_place_base() {
+    seal_with_a_late_claim(0);
+}
+
+const SQUEEZED: ColumnId = ColumnId(3);
+
+fn noise(seed: u64, length: usize) -> Vec<u8> {
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    (0..length)
+        .map(|_at| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect()
+}
+
+fn mixed_config() -> StoreConfig {
+    StoreConfig {
+        memory_budget: ByteCount(2 * BUDGET.0),
+        threads: reel::config::NO_WORKERS,
+        volumes: vec![volume("bulk", BULK_ROOT), volume("meta", META_ROOT)],
+        columns: vec![
+            column(BULK, "bulk", 0),
+            column(META, "meta", 1),
+            ColumnConfig { codec: Codec::Lz4, ..column(SQUEEZED, "squeezed", 1) },
+        ],
+    }
+}
+
+// a scan of rows with their values first, so it reads the records before any get takes them into the cache, then a get of each
+fn check_all(store: &Store2, column: ColumnId, model: &[(Vec<u8>, Vec<u8>)], when: &str) {
+    let mut scan = store.iter_from(column, &[], reel_core::direction::Direction::Ascending).expect("scan");
+    let (mut name, mut value, mut found) = (Vec::new(), Vec::new(), Vec::new());
+    while scan.next_row(&mut name, &mut value).expect("step") == reel_core::scan::ScanStep::Found {
+        found.push((name.clone(), value.clone()));
+    }
+    drop(scan);
+    let mut sorted = model.to_vec();
+    sorted.sort();
+    assert_eq!(found, sorted, "{when}: a scan");
+    for (key, value) in model {
+        assert_eq!(read(store, column, key).as_deref(), Some(value.as_slice()), "{when}: a get of {key:?}");
+    }
+}
+
+// a small value on a compressed column lands in the window as a plain one does, and reads back from there, after its seal and
+// after a reopen, both as it shrank and as it was written
+#[test]
+fn small_compressed_values_land_in_the_window() {
+    let io = SimulatedIo::new(Seed(21));
+    let config = mixed_config();
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let model: Vec<(Vec<u8>, Vec<u8>)> = (0..40_u64)
+        .map(|number| {
+            let value = if number % 2 == 0 { vec![number as u8; 600 + 10 * number as usize] } else { noise(number, 600 + 10 * number as usize) };
+            (number.to_be_bytes().to_vec(), value)
+        })
+        .collect();
+    let windowed = store.state.scan_window_records.load(Ordering::Relaxed);
+    for (key, value) in &model {
+        store.put(SQUEEZED, key, value).expect("put");
+    }
+    let held: usize = store.state.windows.iter().flatten().map(|window| window.used()).sum();
+    let stored: usize = model.iter().map(|(_key, value)| value.len()).sum();
+    assert!(held >= stored / 4, "the windows hold {held} bytes of {stored} written");
+    check_all(&store, SQUEEZED, &model, "in the window");
+    assert!(store.state.scan_window_records.load(Ordering::Relaxed) > windowed, "the scan read no record from the window");
+    store.seal_now();
+    settle(&io);
+    check_all(&store, SQUEEZED, &model, "after the seal");
+    store.close().expect("close");
+    let store = ReelStore::open(io.clone(), &config).expect("reopen");
+    check_all(&store, SQUEEZED, &model, "after a reopen");
+    store.close().expect("close");
+}
+
+// a large record writes its body, then its places, then its head page, and reads back whole wherever the cut falls: past a plain
+// value's head, inside a chunked record's table, as written and compressed
+#[test]
+fn large_records_split_at_their_head_page_read_back() {
+    let io = SimulatedIo::new(Seed(22));
+    let config = mixed_config();
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let plain: Vec<(Vec<u8>, Vec<u8>)> = [65_527_usize, 65_528, 65_536, 200_000]
+        .iter()
+        .enumerate()
+        .map(|(at, &length)| (format!("plain-{length}").into_bytes(), noise(at as u64 + 1, length)))
+        .collect();
+    let squeezed: Vec<(Vec<u8>, Vec<u8>)> = vec![
+        (b"shrinks".to_vec(), vec![3; 70_000]),
+        (b"written".to_vec(), noise(9, 70_000)),
+        (b"wide".to_vec(), noise(10, 300_000)),
+    ];
+    for (key, value) in plain.iter() {
+        store.put(BULK, key, value).expect("put");
+    }
+    for (key, value) in squeezed.iter() {
+        store.put(SQUEEZED, key, value).expect("put");
+    }
+    check_all(&store, BULK, &plain, "open");
+    check_all(&store, SQUEEZED, &squeezed, "open");
+    store.seal_now();
+    settle(&io);
+    check_all(&store, BULK, &plain, "after the seal");
+    check_all(&store, SQUEEZED, &squeezed, "after the seal");
+    store.close().expect("close");
+    let store = ReelStore::open(io.clone(), &config).expect("reopen");
+    check_all(&store, BULK, &plain, "after a reopen");
+    check_all(&store, SQUEEZED, &squeezed, "after a reopen");
+    store.close().expect("close");
+}
+
+// a kill after a late record's body is written and before its head is leaves a range with no row: the rows around it read back,
+// the store takes writes and seals, and the key never shows
+#[test]
+fn a_kill_between_a_late_body_and_its_head_leaves_no_row() {
+    let io = SimulatedIo::new(Seed(23));
+    let config = mixed_config();
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let bulk = &store.state.volumes[0];
+    let mut model: Vec<(Vec<u8>, Vec<u8>)> = (0..20_u64).map(|number| (number.to_be_bytes().to_vec(), noise(number + 1, 5_000))).collect();
+    for (key, value) in &model {
+        store.put(BULK, key, value).expect("put");
+    }
+
+    let value = noise(77, 100_000);
+    let length = plain_length(ByteCount(value.len() as u64));
+    let request = ClaimRequest { bytes: length, has_records: true, ..ONE_ROW };
+    let (claim, room) = store.state.claim_room_late(bulk, &request, row_size(b"torn".len()), true).expect("claim");
+    let identity = RecordIdentity { record_key: store.state.record_key, column: BULK, key: b"torn", kind: RowKind::Value, place: WritePlace(0) };
+    let head = PlainRecord::new(&identity, &value).head(store.state.record_key, WritePlace(0));
+    let parts = [IoSlice::new(&head), IoSlice::new(&value)];
+    reel::record::record_encoder::write_parts_range(&claim.data, claim.offset, &parts, (HEAD_PAGE_BYTES, length.0 as usize)).expect("body");
+    // a writer after it lands past the torn range
+    let after = (b"after".to_vec(), noise(99, 5_000));
+    store.put(BULK, &after.0, &after.1).expect("put");
+    model.push(after);
+    store.flush().expect("flush");
+    io.kill();
+    std::mem::forget(claim);
+    std::mem::forget(room);
+    drop(store);
+
+    let store = ReelStore::open(io.clone(), &config).expect("reopen");
+    check_all(&store, BULK, &model, "after the kill");
+    assert_eq!(read(&store, BULK, b"torn"), None);
+    let later = (b"later".to_vec(), noise(100, 5_000));
+    store.put(BULK, &later.0, &later.1).expect("put");
+    model.push(later);
+    store.seal_now();
+    settle(&io);
+    check_all(&store, BULK, &model, "after a seal past the torn range");
+    store.close().expect("close");
+    let store = ReelStore::open(io.clone(), &config).expect("reopen");
+    check_all(&store, BULK, &model, "after the last reopen");
+    assert_eq!(read(&store, BULK, b"torn"), None);
+    store.close().expect("close");
+}
+
+const SWEEP_POINTS: u64 = 60;
+
+// a crash at each operation of one late put, its body, its head and its row's send, under no syncs and under a policy that syncs
+// inside the put: the earlier rows read, the late key is gone or whole, and the store takes a put and a seal after
+fn crash_through_a_late_put(sync: SyncPolicy, power_cut: bool) {
+    let mut has_finished = false;
+    for crash_at in 0..SWEEP_POINTS {
+        let io = SimulatedIo::new(Seed(crash_at + 31));
+        let mut config = mixed_config();
+        for volume in &mut config.volumes {
+            volume.sync = sync;
+        }
+        let store = ReelStore::open(io.clone(), &config).expect("open");
+        let earlier: Vec<(Vec<u8>, Vec<u8>)> = (0..12_u64).map(|number| (number.to_be_bytes().to_vec(), noise(number + 1, 3_000))).collect();
+        for (key, value) in &earlier {
+            store.put(BULK, key, value).expect("put");
+        }
+        store.flush().expect("flush");
+        let late = noise(500, 200_000);
+        io.arm_crash(OperationCount(crash_at));
+        let landed = store.put(BULK, b"late", &late).is_ok() && !io.is_crashed();
+        io.disarm_crash();
+        if power_cut {
+            io.power_cut();
+        } else {
+            io.kill();
+        }
+        drop(store);
+
+        let store = ReelStore::open(io.clone(), &config).expect("reopen");
+        check_all(&store, BULK, &earlier_with(&earlier, &store), "after the crash");
+        match read(&store, BULK, b"late") {
+            Some(found) => assert_eq!(found, late, "crash at {crash_at}: the late value came back torn"),
+            None => assert!(!landed || sync == SyncPolicy::Never, "crash at {crash_at}: a put that synced itself and returned is gone"),
+        }
+        store.put(BULK, b"after", b"value").expect("put");
+        store.seal_now();
+        settle(&io);
+        assert_eq!(read(&store, BULK, b"after").as_deref(), Some(&b"value"[..]), "crash at {crash_at}");
+        store.close().expect("close");
+        assert_eq!(io.open_handle_count(), 0, "crash at {crash_at}");
+        assert_eq!(io.handle_faults(), OperationCount(0), "crash at {crash_at}");
+        has_finished |= landed;
+    }
+    assert!(has_finished, "no crash point let the late put finish, so the sweep never passed its last operation");
+}
+
+// the earlier rows, plus the late key when it came back, so the scan in check_all lists exactly what the store holds
+fn earlier_with(earlier: &[(Vec<u8>, Vec<u8>)], store: &Store2) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut rows = earlier.to_vec();
+    if let Some(late) = read(store, BULK, b"late") {
+        rows.push((b"late".to_vec(), late));
+    }
+    rows
+}
+
+#[test]
+fn a_crash_through_a_late_put_with_no_syncs() {
+    crash_through_a_late_put(SyncPolicy::Never, false);
+}
+
+#[test]
+fn a_crash_through_a_late_put_that_syncs_inside() {
+    crash_through_a_late_put(SyncPolicy::EveryBytes(ByteCount(64 * 1024)), false);
+}
+
+#[test]
+fn a_power_cut_through_a_late_put_that_syncs_inside() {
+    crash_through_a_late_put(SyncPolicy::EveryBytes(ByteCount(64 * 1024)), true);
 }

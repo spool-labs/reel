@@ -40,6 +40,8 @@ pub struct WritebackRange<File> {
 pub struct RoomAhead<File> {
     pub file: File,
     pub segment: SegmentNumber,
+    /// Where the segment's held room ends now, so the call holds only what comes after it
+    pub from: u64,
     pub end: u64,
 }
 
@@ -83,6 +85,7 @@ impl<Backend: Io> ReserveJob<Backend> {
         Some(RoomAhead {
             file: segment.data.clone(),
             segment: segment.number,
+            from: segment.reserved_end.0,
             end: reserve_target(segment, volume, segment.write_end.0),
         })
     }
@@ -93,7 +96,7 @@ impl<Backend: Io> ReserveJob<Backend> {
         let state = Arc::clone(&self.state);
         for volume in &state.volumes {
             while let Some(room) = self.next_room(volume) {
-                let is_held = room.file.reserve_to(ByteCount(room.end)).is_ok();
+                let is_held = room.file.reserve_range(FileOffset(room.from), ByteCount(room.end)).is_ok();
                 let mut claims = hold(&volume.claims);
                 if let Some(segment) = claims.open.iter_mut().find(|segment| segment.number == room.segment) {
                     segment.is_reserve_asked = false;

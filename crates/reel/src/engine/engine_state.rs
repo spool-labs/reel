@@ -282,13 +282,17 @@ impl<File: Clone> SlotFile<File> {
         slot
     }
 
-    /// Read the file the slot holds now
-    pub fn file(&self) -> Option<File> {
+    /// Hold the file the slot holds now, whatever its segment, or return nothing when it holds none. A seal closes the file only once
+    /// the pins are gone, so a write through this pin never meets a closed descriptor or one the number went on to
+    pub fn pin_current(&self) -> Option<SlotPin<'_, File>> {
         let guard = match self.data.read() {
             Ok(guard) => guard,
             Err(poisoned) => crate::guard::recover(poisoned),
         };
-        guard.as_ref().map(|held| held.file.clone())
+        let held = guard.as_ref()?;
+        let (file, recovered_end) = (held.file.clone(), held.recovered_end);
+        self.pins.fetch_add(1, Ordering::AcqRel);
+        Some(SlotPin { file, recovered_end, slot: self })
     }
 
     /// Hold a segment's file for a read, or return nothing when the slot has moved on from it

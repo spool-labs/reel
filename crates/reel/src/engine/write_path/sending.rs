@@ -341,12 +341,13 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// Send a window's records to the kernel
     pub fn send_window(&self, index: usize, window: &RecordWindow) -> Result<(), Error> {
-        let Some(file) = self.slot_files[index].file() else {
+        // a putter that sends a full window holds no claim, so the slot's file is pinned here for the write
+        let Some(pin) = self.slot_files[index].pin_current() else {
             return Err(Error::other("a window has no data file"));
         };
         let mut copy = hold(&self.window_copies[index]);
         let length = window.copy_out(&mut copy);
-        file.write_at(window.start(), &[IoSlice::new(&copy[..length])])
+        pin.file.write_at(window.start(), &[IoSlice::new(&copy[..length])])
     }
 
     /// Check a slot has rows that haven't reached the kernel

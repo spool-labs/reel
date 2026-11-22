@@ -14,6 +14,7 @@ use crate::engine::engine_sizing::{rows_per_second, seal_point};
 use crate::engine::engine_state::EngineState;
 use crate::engine::open_segment::{SegmentPhase, rows_path};
 use crate::engine::volume::{NO_SEAL, SealStepTimes, Volume};
+use crate::engine::write_path::WritingTurn;
 use crate::guard::hold;
 use crate::lifetime::MarkRange;
 use crate::index::key_hash::{KeyHash, hash_key};
@@ -88,6 +89,8 @@ pub enum SealPhase {
     DiscardingRows,
     /// The switch has happened, and the write index lets go
     Cleaning,
+    /// An empty segment left the claims, and its files close once the reads and syncs pinning them are done
+    Dropping,
 }
 
 /// A volume's seal job
@@ -636,12 +639,23 @@ impl<Backend: Io> SealJob<Backend> {
         ByteCount(self.writer.heap_bytes().0 + self.walk.heap_bytes().0 + keys as u64)
     }
 
-    /// Drop an empty segment's files with no footer
-    pub fn drop_empty(&mut self, target: &SealTarget<Backend::File>) -> Result<()> {
+    /// Drop an empty segment with no footer, and say whether its files closed. While a read or a sync still pins them they wait for
+    /// `finish_drop`
+    pub fn drop_empty(&mut self, target: &SealTarget<Backend::File>) -> Result<bool> {
         let state = Arc::clone(&self.state);
         let volume = &state.volumes[self.volume];
+        let index = target.slot.0 as usize;
+        // the segment leaves the claims first, so no new pin can find it
         volume.close_slot(target.slot);
         hold(&volume.claims).open.retain(|segment| segment.slot != target.slot);
+        // the windows can hold records whose rows never landed, which no row lists. They go under the slot's turn, which a sender holds
+        // through its write, and the turn goes back at once: a thread that pinned the slot before may be waiting for it
+        {
+            state.take_writing_turn(target.slot);
+            let _turn = WritingTurn { state: &*state, index };
+            hold(&state.queues[index]).has_kept_window = false;
+            state.reset_windows(target.slot);
+        }
 
         let root = &volume.roots[target.root.0 as usize];
         // a data file left with no rows and no tail reads as damage, so the rows go only once it has
@@ -649,18 +663,28 @@ impl<Backend: Io> SealJob<Backend> {
             state.io.remove_file(&rows_path(root, target.number))?;
         }
         state.io.sync_directory(root)?;
-        state.slot_files[target.slot.0 as usize].set(None);
-        state.io.close_file(target.data.clone());
-        state.io.close_file(target.rows.clone());
-        state.free_slot(target.slot);
-        Ok(())
+        // no new pin lands once the slot is empty, and a thread already holding one, a read or a sync, finishes on the files its pin keeps
+        // open before they close
+        state.slot_files[index].set(None);
+        Ok(self.finish_drop(target))
+    }
+
+    /// Close a dropped segment's files and free its slot once no pin holds them, and say whether it did
+    pub fn finish_drop(&mut self, target: &SealTarget<Backend::File>) -> bool {
+        if self.state.slot_files[target.slot.0 as usize].pin_count() > 0 {
+            return false;
+        }
+        self.state.io.close_file(target.data.clone());
+        self.state.io.close_file(target.rows.clone());
+        self.state.free_slot(target.slot);
+        true
     }
 
     /// Check the seal can do nothing until writers land or the mark moves
     pub fn is_waiting(&self, target: &SealTarget<Backend::File>) -> bool {
         match self.phase {
             SealPhase::Draining => !self.is_ready(target),
-            SealPhase::Cleaning => self.state.slot_files[target.slot.0 as usize].pin_count() > 0,
+            SealPhase::Cleaning | SealPhase::Dropping => self.state.slot_files[target.slot.0 as usize].pin_count() > 0,
             SealPhase::Idle
             | SealPhase::Writing
             | SealPhase::Installing
@@ -713,8 +737,11 @@ impl<Backend: Io> SealJob<Backend> {
                     held.highest_place = drained.highest_place;
                 }
                 if drained.row_count.0 == 0 {
-                    self.drop_empty(target)?;
-                    self.end_seal();
+                    if self.drop_empty(target)? {
+                        self.end_seal();
+                    } else {
+                        self.phase = SealPhase::Dropping;
+                    }
                     return Ok(());
                 }
                 let fresh = SealTarget { row_count: drained.row_count, lowest_place: drained.lowest_place, highest_place: drained.highest_place, ..target.clone() };
@@ -726,6 +753,12 @@ impl<Backend: Io> SealJob<Backend> {
             SealPhase::DiscardingRows => self.discard_rows(target),
             SealPhase::Cleaning => {
                 if self.clean(target) {
+                    self.end_seal();
+                }
+                Ok(())
+            },
+            SealPhase::Dropping => {
+                if self.finish_drop(target) {
                     self.end_seal();
                 }
                 Ok(())

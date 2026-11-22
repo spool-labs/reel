@@ -977,7 +977,8 @@ fn window_race() {
             store.state.send_windows(index).expect("send");
             hold(&store.state.queues[index]).is_writing = false;
 
-            let file = store.state.slot_files[index].file().expect("a data file");
+            let pin = store.state.slot_files[index].pin_current().expect("a data file");
+            let file = &pin.file;
             let records = hold(&pushed)[checked..seen].to_vec();
             for (offset, number) in records {
                 let mut bytes = [0; size_of::<u64>()];

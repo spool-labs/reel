@@ -11,7 +11,7 @@ use reel::engine::volume::NO_SEAL;
 use reel::engine::walk_job::FREE_IN_PLACE_BYTES;
 use std::io::IoSlice;
 
-use reel::engine::write_path::{ClaimRequest, HEAD_PAGE_BYTES, LandOutcome};
+use reel::engine::write_path::{ClaimRequest, HEAD_PAGE_BYTES, LandOutcome, WindowSwitch};
 use reel::index::write_row::WriteRow;
 use reel::io::IoFile;
 use reel::record::record_check::RecordIdentity;
@@ -827,4 +827,113 @@ fn a_crash_through_a_late_put_that_syncs_inside() {
 #[test]
 fn a_power_cut_through_a_late_put_that_syncs_inside() {
     crash_through_a_late_put(SyncPolicy::EveryBytes(ByteCount(64 * 1024)), true);
+}
+
+// a segment that seals with no rows can still hold window records whose rows never landed, as a put whose index was full leaves
+// them: the seal drops the segment with its windows, so a later send of the slot's kept window finds nothing to send, and no
+// write meets the closed file
+#[test]
+fn an_empty_segment_drops_its_windows_with_its_files() {
+    let io = SimulatedIo::new(Seed(13));
+    let config = StoreConfig {
+        memory_budget: BUDGET,
+        threads: reel::config::NO_WORKERS,
+        volumes: vec![VolumeConfig { open_segments: Some(1), ..volume("bulk", BULK_ROOT) }, volume("meta", META_ROOT)],
+        columns: vec![column(BULK, "bulk", 0), column(META, "meta", 1)],
+    };
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let bulk = &store.state.volumes[0];
+    let claim = store.state.claim(bulk, &ClaimRequest { has_records: true, ..ONE_ROW }).expect("claim");
+    let (slot, index) = (claim.slot, claim.slot.0 as usize);
+    let size = row_size(4);
+    let record = vec![7_u8; 1_000];
+    // a fresh segment's window takes a range at its first record, as a put's refill gives it
+    if store.state.try_window(slot, [&record[..9], &record[9..]], size).is_none() {
+        assert!(store.state.refill_window(bulk, slot, record.len(), size).expect("refill"), "no room for a window");
+        assert!(store.state.try_window(slot, [&record[..9], &record[9..]], size).is_some(), "the window took no record");
+    }
+    hold(&store.state.queues[index]).reserved -= size;
+    let room = hold(&store.state.queues[index]).window_room;
+    assert!(matches!(store.state.switch_window(bulk, slot, room), WindowSwitch::Switched), "the window didn't switch");
+    assert!(hold(&store.state.queues[index]).has_kept_window);
+    drop(claim);
+
+    // a seal takes only segments with rows, and this one has none, so it goes the way an empty segment does
+    store.state.seal_empty(bulk);
+    store.seal_now();
+    for _step in 0..STEPS {
+        let is_gone = !hold(&bulk.claims).open.iter().any(|segment| segment.slot == slot);
+        if is_gone && bulk.sealing.load(Ordering::Acquire) == NO_SEAL {
+            break;
+        }
+        if io.step_any().is_none() {
+            io.advance_clock(TICK);
+        }
+    }
+    assert!(!hold(&bulk.claims).open.iter().any(|segment| segment.slot == slot), "the empty segment never dropped");
+    assert!(!hold(&store.state.queues[index]).has_kept_window, "the dropped segment left a kept window");
+    store.state.send_kept_in_turn(index).expect("a send after the drop");
+
+    store.put(BULK, b"after", b"value").expect("put");
+    assert_eq!(read(&store, BULK, b"after").as_deref(), Some(&b"value"[..]));
+    store.close().expect("close");
+    assert_eq!(io.handle_faults(), OperationCount(0));
+}
+
+// a sync or a send that pinned an empty segment's slot before its drop waits for the slot's turn with the pin held: the drop gives the
+// turn back once the windows are cleared and closes the files only when the pin goes, so neither waits on the other
+#[test]
+fn a_pinned_empty_segment_drops_once_the_pin_goes() {
+    let io = SimulatedIo::new(Seed(14));
+    let config = StoreConfig {
+        memory_budget: BUDGET,
+        threads: reel::config::NO_WORKERS,
+        volumes: vec![VolumeConfig { open_segments: Some(1), ..volume("bulk", BULK_ROOT) }, volume("meta", META_ROOT)],
+        columns: vec![column(BULK, "bulk", 0), column(META, "meta", 1)],
+    };
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let bulk = &store.state.volumes[0];
+    let claim = store.state.claim(bulk, &ClaimRequest { has_records: true, ..ONE_ROW }).expect("claim");
+    let (slot, index) = (claim.slot, claim.slot.0 as usize);
+    let size = row_size(4);
+    let record = vec![7_u8; 1_000];
+    if store.state.try_window(slot, [&record[..9], &record[9..]], size).is_none() {
+        assert!(store.state.refill_window(bulk, slot, record.len(), size).expect("refill"), "no room for a window");
+        assert!(store.state.try_window(slot, [&record[..9], &record[9..]], size).is_some(), "the window took no record");
+    }
+    hold(&store.state.queues[index]).reserved -= size;
+    drop(claim);
+    let pin = store.state.pin_rows(slot).expect("a pin on the open segment");
+
+    store.state.seal_empty(bulk);
+    store.seal_now();
+    for _step in 0..STEPS / 10 {
+        if io.step_any().is_none() {
+            io.advance_clock(TICK);
+        }
+    }
+    assert!(!hold(&bulk.claims).open.iter().any(|segment| segment.slot == slot), "the empty segment never left the claims");
+    assert!(store.state.queues[index].lock().map(|queue| !queue.is_writing && !queue.has_kept_window).unwrap_or(false), "the drop kept the turn or the window");
+    assert!(store.state.slot_files[index].pin_count() > 0, "the test's pin went");
+    // the pinned thread syncs through the file its pin holds, as run_sync does, and the drop hasn't closed it under the pin
+    pin.0.file.sync().expect("a sync through a pinned file");
+    // the pinned thread now takes the turn and finds nothing to send
+    store.state.take_writing_turn(slot);
+    store.state.send_kept_in_turn(index).expect("a send after the drop");
+    hold(&store.state.queues[index]).is_writing = false;
+    drop(pin);
+
+    for _step in 0..STEPS {
+        if bulk.sealing.load(Ordering::Acquire) == NO_SEAL {
+            break;
+        }
+        if io.step_any().is_none() {
+            io.advance_clock(TICK);
+        }
+    }
+    assert_eq!(bulk.sealing.load(Ordering::Acquire), NO_SEAL, "the drop never finished once the pin went");
+    store.put(BULK, b"after", b"value").expect("put");
+    assert_eq!(read(&store, BULK, b"after").as_deref(), Some(&b"value"[..]));
+    store.close().expect("close");
+    assert_eq!(io.handle_faults(), OperationCount(0));
 }

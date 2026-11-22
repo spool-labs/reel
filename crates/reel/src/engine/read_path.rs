@@ -18,6 +18,7 @@ use crate::engine::volume::Volume;
 use crate::index::entry_slab::MOST_INLINE_VALUE;
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::index::record_cache::CacheLookup;
+use crate::index::sorted_keys::{LeafAt, SortedKeys};
 use crate::index::spot_index::SpotLocation;
 use crate::index::write_row::{WriteLookup, WriteRow};
 use crate::io::{DeviceReads, InPlace, Io, ReadOn, in_place};
@@ -47,6 +48,8 @@ pub struct SealedRow {
     pub row: FooterRow,
     pub block_offset: u32,
     pub at: RowAt,
+    /// Where a sorted index's find left the entry, so a read of its held value takes no second descent
+    pub leaf: LeafAt,
 }
 
 /// Where a key's newest row sits
@@ -428,6 +431,33 @@ impl<Backend: Io> EngineState<Backend> {
         Ok((at, records.len() - at))
     }
 
+    /// Copy a located sealed key's value onto the end of the batch's buffer from its leaf, or from the record cache on a column
+    /// with no leaf values, and say where it went. Otherwise say what the cache said, and the batch reads the record
+    pub fn plan_sealed(
+        &self,
+        read: &KeyRead<'_>,
+        sealed: &SealedRow,
+        holder: Option<&SortedKeys>,
+        records: &mut Vec<u8>,
+        scratch: &mut Vec<u8>,
+    ) -> Result<(usize, usize), CacheLookup> {
+        let at = records.len();
+        if let Some(index) = holder {
+            let row = (sealed.row.place, sealed.segment, sealed.row.offset);
+            if is_holdable(sealed) && at + MOST_HELD_VALUE <= records.capacity() && index.held_value_at(sealed.leaf, read.key, row, records) {
+                return Ok((at, records.len() - at));
+            }
+            records.truncate(at);
+            return Err(CacheLookup::Miss { is_admitted: false });
+        }
+        let lookup = self.record_cache.get(sealed.segment, sealed.row.offset, read.key, scratch);
+        if lookup == CacheLookup::Hit && at + scratch.len() <= records.capacity() {
+            records.extend_from_slice(scratch);
+            return Ok((at, scratch.len()));
+        }
+        Err(lookup)
+    }
+
     /// Answer one key by its own read
     pub async fn read_key(
         &self,
@@ -463,8 +493,12 @@ impl<Backend: Io> EngineState<Backend> {
         let mut plans = [KeyPlan::Own; BATCH_KEYS];
         let mut rows = [None; BATCH_KEYS];
         let mut spans = [None; BATCH_KEYS];
-        for ((key, plan), (row, span)) in keys.iter().zip(&mut plans).zip(rows.iter_mut().zip(&mut spans)) {
+        let mut reads = [None; BATCH_KEYS];
+        // a sorted column's leaves keep the values a read checked, as a single get answers from them, unless damage is marked
+        let holder = self.sorted_index(column).filter(|index| index.values.page_count() > 0 && volume.damage.is_empty());
+        for (((key, plan), (row, span)), kept_read) in keys.iter().zip(&mut plans).zip(rows.iter_mut().zip(&mut spans)).zip(&mut reads) {
             let read = self.key_read(column, key, at.point, true)?;
+            *kept_read = Some(read);
             // a short value its open row keeps goes into the batch's buffer as the key is located, and needs no read
             match self.check_damage(volume, &read, read.cover) {
                 Ok(()) => {},
@@ -482,23 +516,25 @@ impl<Backend: Io> EngineState<Backend> {
                 Err(found) => found,
             };
             *plan = match self.locate_found(device, volume, &read, found).await {
-                // a cached record needs no read: the answer loop takes it from the cache
-                Ok(KeyPlace::Spot(sealed)) => {
-                    let lookup = self.record_cache.get(sealed.segment, sealed.row.offset, read.key, scratch);
-                    if lookup != CacheLookup::Hit {
+                // a held or cached value needs no read: it goes into the batch's buffer here, and the answer loop takes it from there
+                Ok(KeyPlace::Spot(sealed)) => match self.plan_sealed(&read, &sealed, holder, records, scratch) {
+                    Ok(kept) => KeyPlan::Kept(kept),
+                    Err(lookup) => {
                         *row = Some(BatchRow::sealed(&sealed));
-                    }
-                    KeyPlan::Spot(sealed, lookup)
+                        KeyPlan::Spot(sealed, lookup)
+                    },
                 },
                 Ok(KeyPlace::Row(Located::Sealed(sealed))) => {
                     if sealed.row.kind != RowKind::Value || read.cover.is_some_and(|cover| cover > sealed.row.place) {
                         KeyPlan::Missing
                     } else {
-                        let lookup = self.record_cache.get(sealed.segment, sealed.row.offset, read.key, scratch);
-                        if lookup != CacheLookup::Hit {
-                            *row = Some(BatchRow::sealed(&sealed));
+                        match self.plan_sealed(&read, &sealed, holder, records, scratch) {
+                            Ok(kept) => KeyPlan::Kept(kept),
+                            Err(lookup) => {
+                                *row = Some(BatchRow::sealed(&sealed));
+                                KeyPlan::Sealed(sealed, lookup)
+                            },
                         }
-                        KeyPlan::Sealed(sealed, lookup)
                     }
                 },
                 Ok(KeyPlace::Row(Located::Absent)) => KeyPlan::Missing,
@@ -519,8 +555,10 @@ impl<Backend: Io> EngineState<Backend> {
         self.read_records(device, volume, &rows[..keys.len()], records, (&mut spans, &mut []), &mut words).await;
 
         let mut batched = 0;
-        for ((key, plan), span) in keys.iter().zip(plans).zip(spans) {
-            let read = self.key_read(column, key, at.point, true)?;
+        for ((plan, span), kept_read) in plans.into_iter().zip(spans).zip(reads).take(keys.len()) {
+            let Some(read) = kept_read else {
+                continue;
+            };
             let (sealed, lookup) = match plan {
                 KeyPlan::Missing => {
                     values.push_missing();
@@ -556,17 +594,18 @@ impl<Backend: Io> EngineState<Backend> {
             if let Some((start, length)) = span
                 && self.open_batched(device, (read.column, read.key), (sealed.row.place, false), &records[start..start + length], scratch)
             {
-                if lookup == (CacheLookup::Miss { is_admitted: true }) {
-                    self.record_cache.admit(sealed.segment, sealed.row.offset, read.key, scratch);
+                // a sorted column's leaf keeps the value as a single get's read does, and any other column's goes to the cache
+                match holder {
+                    Some(index) if is_holdable(&sealed) => {
+                        index.hold_value(read.key, (sealed.row.place, sealed.segment, sealed.row.offset), scratch);
+                    },
+                    _ if lookup == (CacheLookup::Miss { is_admitted: true }) => {
+                        self.record_cache.admit(sealed.segment, sealed.row.offset, read.key, scratch);
+                    },
+                    _ => {},
                 }
                 values.push_filled(scratch);
                 batched += 1;
-                continue;
-            }
-            // the cache holds the value with its key, so a hit at plan time answers with no second locate, and one evicted since
-            // takes the key's own read below
-            if lookup == CacheLookup::Hit && self.record_cache.get(sealed.segment, sealed.row.offset, read.key, scratch) == CacheLookup::Hit {
-                values.push_filled(scratch);
                 continue;
             }
             // a wide sealed record reads on its own. A spot's record that fails its check may have moved, and so may a
@@ -625,7 +664,7 @@ impl<Backend: Io> EngineState<Backend> {
             && let Some(spot) = self.newest_spot(read, newest_below)
         {
             let row = FooterRow { place: spot.place, offset: spot.offset, length: spot.length, kind: RowKind::Value };
-            return Ok(KeyPlace::Spot(SealedRow { segment: spot.segment, row, block_offset: 0, at: RowAt::UNKNOWN }));
+            return Ok(KeyPlace::Spot(SealedRow { segment: spot.segment, row, block_offset: 0, at: RowAt::UNKNOWN, leaf: LeafAt::NONE }));
         }
         let sealed = self.search_sealed(device, volume, read).await?;
         Ok(KeyPlace::Row(newest_of(found.row, sealed)))
@@ -967,9 +1006,9 @@ impl<Backend: Io> EngineState<Backend> {
         if let Some(index) = holder {
             let row = (sealed.row.place, sealed.segment, sealed.row.offset);
             // a record whose payload is longer than a leaf holds, a slice, takes no leaf lookup and no hold
-            let is_holdable = sealed.row.length.0 as usize <= MOST_HELD_VALUE + SMALL_HEAD_BYTES;
+            let is_holdable = is_holdable(sealed);
             buf.clear();
-            if is_holdable && index.held_value(read.key, row, buf) {
+            if is_holdable && index.held_value_at(sealed.leaf, read.key, row, buf) {
                 return Ok(true);
             }
             if self.read_record(ReadOn::new(device, &pin.file), location, trust, read, want, buf).await? == RecordRead::Failed {
@@ -1253,7 +1292,7 @@ impl<Backend: Io> EngineState<Backend> {
         while let Some(found) = in_place(self.search_file(&InPlace, volume, &point, segment, (file, place_base), reader, first.take()))? {
             if found.kind != RowKind::RangeDelete {
                 if best.is_none_or(|current| current.row.place < found.place) {
-                    *best = Some(SealedRow { segment, row: found, block_offset: reader.found_block, at: reader.found_at });
+                    *best = Some(SealedRow { segment, row: found, block_offset: reader.found_block, at: reader.found_at, leaf: LeafAt::NONE });
                 }
                 return Ok(());
             }
@@ -1311,7 +1350,7 @@ impl<Backend: Io> EngineState<Backend> {
         while let Some(found) = self.search_segment(device, volume, &point, segment, pin, reader, first.take()).await? {
             if found.kind != RowKind::RangeDelete {
                 if best.is_none_or(|current| current.row.place < found.place) {
-                    *best = Some(SealedRow { segment, row: found, block_offset: reader.found_block, at: reader.found_at });
+                    *best = Some(SealedRow { segment, row: found, block_offset: reader.found_block, at: reader.found_at, leaf: LeafAt::NONE });
                 }
                 return Ok(());
             }
@@ -1429,7 +1468,7 @@ impl<Backend: Io> EngineState<Backend> {
         if let Some(found) = row
             && best.is_none_or(|current| current.row.place < found.place)
         {
-            *best = Some(SealedRow { segment, row: found, block_offset: reader.found_block, at: reader.found_at });
+            *best = Some(SealedRow { segment, row: found, block_offset: reader.found_block, at: reader.found_at, leaf: LeafAt::NONE });
         }
         Ok(())
     }
@@ -1560,4 +1599,9 @@ pub fn moving_segments() -> StoreError {
         action: "reading a key whose segments keep moving",
         source: Error::from(ErrorKind::Interrupted),
     }
+}
+
+/// Check a sealed record's value is short enough for a leaf to hold: a slice's takes no leaf lookup and no hold
+pub fn is_holdable(sealed: &SealedRow) -> bool {
+    sealed.row.length.0 as usize <= MOST_HELD_VALUE + SMALL_HEAD_BYTES
 }

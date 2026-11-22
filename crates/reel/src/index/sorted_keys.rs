@@ -109,6 +109,20 @@ pub enum Upserted {
     NoRoom,
 }
 
+/// Where a find left an entry: its part, leaf and slot, and the part's version then
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LeafAt {
+    pub part: u32,
+    pub leaf: u32,
+    pub index: u32,
+    pub version: u64,
+}
+
+impl LeafAt {
+    /// No spot noted, so a read of the value descends
+    pub const NONE: LeafAt = LeafAt { part: 0, leaf: NO_PAGE, index: 0, version: 0 };
+}
+
 /// The inner pages a descent passed through, and the child it took in each
 #[derive(Clone, Copy, Debug)]
 pub struct PagePath {
@@ -126,6 +140,8 @@ pub struct PartTree {
     pub first_leaf: u32,
     pub last_leaf: u32,
     pub entries: u64,
+    /// Moves at every change to the part, so a reader that noted where an entry sat can tell the spot still holds it
+    pub version: u64,
 }
 
 /// The pool's unused pages, chained through each page's next word
@@ -229,6 +245,7 @@ impl PartTree {
             first_leaf: NO_PAGE,
             last_leaf: NO_PAGE,
             entries: 0,
+            version: 0,
         }
     }
 }
@@ -436,7 +453,7 @@ impl SortedKeys {
     pub fn upsert(&self, key: &[u8], entry: KeyEntry, floors: Floors) -> Upserted {
         assert_eq!(key.len(), self.width, "a sorted index holds keys of one width");
         let part = self.part_of(key);
-        let mut tree = self.parts.write(part);
+        let mut tree = self.write_part(part);
         let upserted = self.upsert_in(&mut tree, &PackedKey::new(key), entry, floors);
         self.filled[part].store(tree.entries, Memory::Release);
         drop(tree);
@@ -454,7 +471,7 @@ impl SortedKeys {
         let mut at = 0;
         while at < entries.len() {
             let part = self.part_of(&keys[at * self.width..]);
-            let mut tree = self.parts.write(part);
+            let mut tree = self.write_part(part);
             // a reader of the part waits for one short hold at most
             let held_from = at;
             while at < entries.len() && at - held_from < HOLD_ROWS && self.part_of(&keys[at * self.width..]) == part {
@@ -610,6 +627,7 @@ impl SortedKeys {
                 first_leaf: leaf,
                 last_leaf: leaf,
                 entries: 0,
+                version: tree.version,
             };
         }
         let words = EntryWords { place: entry.place.0, is_grave: entry.is_grave, segment, offset, length };
@@ -652,7 +670,7 @@ impl SortedKeys {
         let (Ok(segment), Ok(offset)) = (u32::try_from(segment.0), u32::try_from(offset.0)) else {
             return false;
         };
-        let tree = self.parts.write(self.part_of(key));
+        let tree = self.write_part(self.part_of(key));
         if tree.levels == 0 {
             return false;
         }
@@ -681,7 +699,7 @@ impl SortedKeys {
                 from = PackedKey { words: [0; MOST_KEY_WORDS] };
                 from.words[0] = (part as u32) << 24;
             }
-            let mut tree = self.parts.write(part);
+            let mut tree = self.write_part(part);
             removed += self.remove_range_in(&mut tree, from, end.as_ref(), below);
             self.filled[part].store(tree.entries, Memory::Release);
         }
@@ -752,14 +770,51 @@ impl SortedKeys {
 
     /// Find a key's entry, a grave or a value
     pub fn find(&self, key: &[u8]) -> Option<KeyEntry> {
-        let tree = self.parts.read(self.part_of(key));
+        self.find_at(key).map(|(entry, _at)| entry)
+    }
+
+    /// Find a key's entry and note where it sits, so a read of the value it holds takes no second descent
+    pub fn find_at(&self, key: &[u8]) -> Option<(KeyEntry, LeafAt)> {
+        let part = self.part_of(key);
+        let tree = self.parts.read(part);
         if tree.levels == 0 {
             return None;
         }
         let packed = PackedKey::new(key);
         let leaf = self.descend(&tree, &packed, &mut PagePath::new());
         let (index, is_found) = self.leaf_search(leaf, &packed);
-        is_found.then(|| self.read_entry(leaf, index))
+        let at = LeafAt { part: part as u32, leaf, index: index as u32, version: tree.version };
+        is_found.then(|| (self.read_entry(leaf, index), at))
+    }
+
+    /// Copy the value an entry holds onto the end of `out` from where a find noted it, when the part hasn't changed since and the
+    /// entry still names this row. A part that changed, or a spot no find noted, takes the descent
+    pub fn held_value_at(&self, at: LeafAt, key: &[u8], row: (WritePlace, SegmentNumber, FileOffset), out: &mut Vec<u8>) -> bool {
+        if at.leaf == NO_PAGE || self.values.page_count() == 0 {
+            return self.held_value(key, row, out);
+        }
+        let tree = self.parts.read(at.part as usize);
+        if tree.version != at.version {
+            drop(tree);
+            return self.held_value(key, row, out);
+        }
+        let (leaf, index) = (at.leaf, at.index as usize);
+        self.names_row(leaf, index, row) && self.values.read(self.chain_of(leaf), index, out)
+    }
+
+    /// Take a part's lock to change it, and move its version so a noted spot is read again
+    fn write_part(&self, part: usize) -> RwLockWriteGuard<'_, PartTree> {
+        let mut tree = self.parts.write(part);
+        tree.version = tree.version.wrapping_add(1);
+        tree
+    }
+
+    /// Take a part's lock to change it if no one holds it, moving its version as a write does
+    fn try_write_part(&self, part: usize) -> Option<RwLockWriteGuard<'_, PartTree>> {
+        self.parts.try_write(part).map(|mut tree| {
+            tree.version = tree.version.wrapping_add(1);
+            tree
+        })
     }
 
     /// Give the leaves the store's pool of value pages to keep values in, which one index owns for the counts
@@ -817,7 +872,7 @@ impl SortedKeys {
             let part = self.part_of(key);
             if current.as_ref().is_none_or(|(at, _guard)| *at != part) {
                 drop(current.take());
-                current = Some((part, self.parts.try_write(part)));
+                current = Some((part, self.try_write_part(part)));
                 cursor = NO_PAGE;
             }
             let Some((_part, Some(tree))) = current.as_ref() else {

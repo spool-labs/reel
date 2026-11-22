@@ -21,7 +21,7 @@ use crate::engine::scan_state::{
 };
 use crate::engine::volume::Volume;
 use crate::guard::hold;
-use crate::index::sorted_keys::{ScanFrom, SortedKeys};
+use crate::index::sorted_keys::{LeafAt, ScanFrom, SortedKeys};
 use crate::config::KeyShape;
 use crate::index::open_counts::OpenBound;
 use crate::index::write_shard::{HEAD_GROUP, HeadPlace, WalkBound, WriteShard, place_heads_together};
@@ -1583,6 +1583,7 @@ impl<Backend: Io> EngineState<Backend> {
                         row: source.row,
                         block_offset: source.line.block_offset,
                         at: RowAt::UNKNOWN,
+                        leaf: LeafAt::NONE,
                     });
                 }
                 step = match self.step_source(ReadOn::new(device, volume), column, source, direction, point, take.as_mut()).await {

@@ -9,6 +9,7 @@ use reel_core::column_id::ColumnId;
 use reel_core::store_error::StoreError;
 use reel_core::units::{ByteCount, WritePlace};
 
+use crate::index::sorted_keys::LeafAt;
 use crate::pool::{touched_capacity, touched_room};
 use crate::engine::engine_state::EngineState;
 use crate::engine::read_path::{KeyRead, SealedRow, corruption};
@@ -240,7 +241,7 @@ impl<Backend: Io> EngineState<Backend> {
                 },
                 FooterAnswer::Found(row) => {
                     if best.is_none_or(|current| current.row.place < row.place) {
-                        *best = Some(SealedRow { segment, row, block_offset: entry.block_offset, at: reader.found_at });
+                        *best = Some(SealedRow { segment, row, block_offset: entry.block_offset, at: reader.found_at, leaf: LeafAt::NONE });
                     }
                     return Ok(());
                 },

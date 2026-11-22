@@ -22,7 +22,7 @@ use crate::index::open_slots::OpenSlot;
 use crate::index::open_slots::MAX_OPEN_SLOTS;
 use crate::index::write_index::{EnterRun, SHARD_COUNT};
 use crate::engine::seal_job::SortedRun;
-use crate::index::sorted_keys::{Floors, HOLD_ROWS, KeyEntry, SortedKeys};
+use crate::index::sorted_keys::{Floors, HOLD_ROWS, KeyEntry, LeafAt, SortedKeys};
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::io::{DeviceReads, InPlace, Io, in_place};
 use crate::io::device_error::is_device_error;
@@ -184,14 +184,15 @@ impl<Backend: Io> EngineState<Backend> {
         read: &KeyRead<'_>,
         index: &SortedKeys,
     ) -> Result<Option<SealedRow>, StoreError> {
-        let entry = index.find(read.key);
+        let noted = index.find_at(read.key);
+        let entry = noted.map(|(entry, _at)| entry);
         let is_behind = volume.may_hide_under_sealed(read.read_point);
         // a grave answers absent wherever it sits, so only a value needs its segment
         if is_behind || entry.is_some_and(|entry| entry.place > read.read_point || (!entry.is_grave && volume.table.pin(entry.segment).is_none())) {
             self.sorted_footer_asks.fetch_add(1, Ordering::Relaxed);
             return self.search_footers(device, volume, read).await;
         }
-        let found = entry.as_ref().map(sealed_of);
+        let found = noted.map(|(entry, at)| SealedRow { leaf: at, ..sealed_of(&entry) });
         let Some(mark) = index.mark() else {
             self.sorted_answers.fetch_add(1, Ordering::Relaxed);
             return Ok(found);
@@ -282,7 +283,7 @@ impl<Backend: Io> EngineState<Backend> {
         };
         match answer {
             FooterAnswer::Found(row) if best.is_none_or(|current| current.row.place < row.place) => {
-                *best = Some(SealedRow { segment, row, block_offset: entry.block_offset, at: reader.found_at });
+                *best = Some(SealedRow { segment, row, block_offset: entry.block_offset, at: reader.found_at, leaf: LeafAt::NONE });
                 Ok(())
             },
             FooterAnswer::Found(..) | FooterAnswer::Absent => Ok(()),
@@ -774,6 +775,7 @@ pub fn sealed_of(entry: &KeyEntry) -> SealedRow {
         },
         block_offset: 0,
         at: RowAt::UNKNOWN,
+        leaf: LeafAt::NONE,
     }
 }
 

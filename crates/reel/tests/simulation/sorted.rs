@@ -3215,3 +3215,68 @@ fn walk_meets_a_key_in_flight(direction: Direction, seed: Seed) {
     assert_eq!(found, SEALED + 1, "the walk took every sealed key and the landed one, once each");
     store.state.give_back_scan(scan);
 }
+
+// every answer of a batch of gets, the value found or none
+fn batch_answers(found: &ValueList, count: usize) -> Vec<Option<Vec<u8>>> {
+    (0..count)
+        .map(|at| match found.answer(at).expect("an answer") {
+            ValueAnswer::Found(value) => Some(value.to_vec()),
+            ValueAnswer::Missing => None,
+            ValueAnswer::Corrupt => panic!("key {at} read corrupt"),
+        })
+        .collect()
+}
+
+// a batch answers sealed keys from the values their leaves hold, as a single get does, with no record read. After an overwrite
+// and a delete sealed in, every key reads its newest value and the deleted one reads absent, and a cue taken before them still
+// reads the values it saw
+#[test]
+fn a_batch_answers_sealed_keys_from_their_leaves() {
+    const KEYS: u64 = 40;
+    // a full budget gives the leaves value pages
+    SIM_BUDGET.with(|budget| budget.set(HELD_BUDGET));
+    let io = SimulatedIo::new(Seed(91));
+    let store = open(&io, RowCount(4_096));
+    let first = |number: u64| Some(format!("first-{number}").into_bytes());
+    for number in 0..KEYS {
+        store.put(COLUMN, &key(number), &first(number).expect("value")).expect("put");
+    }
+    seal_all(&store, &io);
+    let names: Vec<Vec<u8>> = (0..KEYS).map(key).collect();
+    let asked: Vec<&[u8]> = names.iter().map(Vec::as_slice).collect();
+    let read_batch = |store: &Store| {
+        let mut values = ValueList::new();
+        store.get_many(COLUMN, &asked, &mut values).expect("get many");
+        batch_answers(&values, asked.len())
+    };
+    let expected: Vec<Option<Vec<u8>>> = (0..KEYS).map(first).collect();
+    assert_eq!(read_batch(&store), expected, "the first batch");
+    let reads = io.read_count();
+    assert_eq!(read_batch(&store), expected, "the batch from the leaves");
+    assert_eq!(io.read_count(), reads, "a batch of held values read a record");
+
+    let cue = store.cue().expect("cue");
+    for number in (0..KEYS).filter(|number| number % 2 == 0) {
+        store.put(COLUMN, &key(number), format!("second-{number}").as_bytes()).expect("put");
+    }
+    store.delete(COLUMN, &key(1)).expect("delete");
+    seal_all(&store, &io);
+    let newest: Vec<Option<Vec<u8>>> = (0..KEYS)
+        .map(|number| match number {
+            1 => None,
+            even if even % 2 == 0 => Some(format!("second-{even}").into_bytes()),
+            odd => first(odd),
+        })
+        .collect();
+    assert_eq!(read_batch(&store), newest, "the batch after the overwrite");
+    let reads = io.read_count();
+    assert_eq!(read_batch(&store), newest, "the newest values from the leaves");
+    assert_eq!(io.read_count(), reads, "a batch of held values read a record");
+
+    let mut values = ValueList::new();
+    cue.get_many(COLUMN, &asked, &mut values).expect("cue get many");
+    assert_eq!(batch_answers(&values, asked.len()), expected, "a cue from before the overwrite");
+    drop(cue);
+    store.close().expect("close");
+    SIM_BUDGET.with(|budget| budget.set(BUDGET));
+}

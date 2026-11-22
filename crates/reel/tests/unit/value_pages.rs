@@ -150,6 +150,49 @@ mod in_an_index {
         }
         assert!(answered > 0, "nothing was held");
     }
+
+    // a key in a part of its own byte, so a smaller key lands in its leaf ahead of it
+    fn part_key(byte: u8, number: u8) -> Vec<u8> {
+        let mut key = vec![0; WIDTH];
+        key[0] = byte;
+        key[WIDTH - 1] = number;
+        key
+    }
+
+    // a spot a find noted answers the key's own value or nothing once a smaller key moves it a slot, and a spot whose version still
+    // matches answers nothing for a row the entry no longer names, or for a neighbour's slot
+    #[test]
+    fn a_noted_spot_never_answers_a_neighbour() {
+        let index = SortedKeys::new(WIDTH, RowCount(64)).holding_values(std::sync::Arc::new(reel::index::value_pages::ValuePages::new(8)), (0, true));
+        let (first, second) = (part_key(7, 10), part_key(7, 20));
+        index.upsert(&first, entry(row(1, 0)), Floors::at(WritePlace(0)));
+        index.upsert(&second, entry(row(2, 0)), Floors::at(WritePlace(0)));
+        assert!(index.hold_value(&first, row(1, 0), &value(1, 0)));
+        assert!(index.hold_value(&second, row(2, 0), &value(2, 0)));
+        let (_entry, noted) = index.find_at(&second).expect("found");
+        let mut out = Vec::new();
+        assert!(index.held_value_at(noted, &second, row(2, 0), &mut out));
+        assert_eq!(out, value(2, 0));
+
+        // a smaller key moves the second one slot on, under a write that moves the version
+        index.upsert(&part_key(7, 5), entry(row(3, 0)), Floors::at(WritePlace(0)));
+        out.clear();
+        if index.held_value_at(noted, &second, row(2, 0), &mut out) {
+            assert_eq!(out, value(2, 0), "a moved spot answered another key's value");
+        }
+
+        // with the version current, a row the entry doesn't name and the slot beside it both answer nothing
+        assert!(index.hold_value(&first, row(1, 0), &value(1, 0)));
+        assert!(index.hold_value(&second, row(2, 0), &value(2, 0)));
+        let (_entry, current) = index.find_at(&second).expect("found");
+        out.clear();
+        assert!(!index.held_value_at(current, &second, row(2, 1), &mut out), "a row the entry doesn't name answered");
+        let beside = reel::index::sorted_keys::LeafAt { index: current.index - 1, ..current };
+        assert!(!index.held_value_at(beside, &second, row(2, 0), &mut out), "the slot beside answered");
+        assert!(out.is_empty());
+        assert!(index.held_value_at(current, &second, row(2, 0), &mut out));
+        assert_eq!(out, value(2, 0));
+    }
 }
 
 // two indexes share a pool with four pages each: one walking every leaf takes its own four and half the other's, the other

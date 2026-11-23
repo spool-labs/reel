@@ -17,7 +17,7 @@ use crate::engine::read_path::{HeldPin, KeyRead, Located, MOST_READ_TRIES, Recor
 use crate::engine::scan_state::{
     BatchEntry, BatchRow, BlockTake, JOIN_GAP, MOST_BATCH_RECORD, MOST_BATCH_RUNS, MOST_WINDOW_RECORD, NO_GENERATION, NO_CHANGES, ScanBatch, batch_room,
     SCAN_CACHE_PARTS, SEAT_BATCH, ScanRange, ScanState, ScanWindows, SegmentSource, ShardHead,
-    KeyFrom, SCAN_BATCH_KEYS, held_in, index_of_word, key_in, seek_together, under_prefix,
+    FIRST_UNTOLD_KEYS, KeyFrom, SCAN_BATCH_KEYS, held_in, index_of_word, key_in, seek_together, under_prefix,
 };
 use crate::engine::volume::Volume;
 use crate::guard::hold;
@@ -157,6 +157,9 @@ impl<Backend: Io> EngineState<Backend> {
         }
         if scan.corrupt_steps > 0 {
             self.corruption_errors.fetch_add(mem::take(&mut scan.corrupt_steps), Ordering::Relaxed);
+        }
+        if scan.held_values > 0 {
+            self.scan_held_values.fetch_add(mem::take(&mut scan.held_values), Ordering::Relaxed);
         }
     }
 
@@ -324,7 +327,7 @@ impl<Backend: Io> EngineState<Backend> {
         }
         let entry = scan.sorted.entries[scan.sorted_next];
         let located = self.located_entry(&entry);
-        let is_gone = is_reading && !entry.is_grave && matches!(located, Located::Sealed(_)) && volume.table.pin(entry.segment).is_none();
+        let is_gone = is_reading && !entry.is_grave && matches!(located, Located::Sealed(_)) && !volume.table.is_readable(entry.segment);
         if entry.place > read.read_point || is_gone {
             self.sorted_footer_asks.fetch_add(1, Ordering::Relaxed);
             // an entry newer than the point can stand over an older row still open, which the write index holds at the point
@@ -397,7 +400,7 @@ impl<Backend: Io> EngineState<Backend> {
                 if is_held_for(scan, candidate, &located) {
                     let entry = BatchEntry { key_at: scan.sorted_next, key_length: candidate.len(), key_from: KeyFrom::Sorted(scan.sorted_turn), located, record: None, is_value: true, is_lent: true, is_trusted: false };
                     scan.batch.entries.push(entry);
-                    self.scan_held_values.fetch_add(1, Ordering::Relaxed);
+                    scan.held_values += 1;
                 } else {
                     let key_at = scan.batch.keys.len();
                     scan.batch.keys.extend_from_slice(candidate);
@@ -463,7 +466,6 @@ impl<Backend: Io> EngineState<Backend> {
         let mut located_bytes = 0;
         // a caller that said how many rows it wants gets no more located than that, the one it asked for now among them
         let room = batch_room(scan.wanted, scan.asked, scan.untold_room);
-        scan.untold_room = (scan.untold_room * 2).min(SCAN_BATCH_KEYS);
         while scan.batch.entries.len() < room && scan.batch.has_room(located_bytes) {
             let entries = scan.batch.entries.len();
             match self.counted(self.try_step(ReadOn::new(device, volume), directory, scan, Some(point), key, ScanWant::Locate).await) {
@@ -489,6 +491,9 @@ impl<Backend: Io> EngineState<Backend> {
             }
         }
         scan.end_batch();
+        // an untold walk's next fill takes as many keys as it located so far, so it never reads more than twice what it took
+        scan.untold_located += scan.batch.entries.len();
+        scan.untold_room = scan.untold_located.clamp(FIRST_UNTOLD_KEYS, SCAN_BATCH_KEYS);
         // keys located before a failure answer first, and the next fill meets the failure again
         if scan.batch.entries.is_empty() {
             outcome?;
@@ -624,7 +629,9 @@ impl<Backend: Io> EngineState<Backend> {
             scan.pass_sorted(at);
         }
         scan.sorted_scan_keys += taken;
-        self.sorted_runs.fetch_add(u64::from(taken > 0), Ordering::Relaxed);
+        if taken > 0 {
+            self.sorted_runs.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Give the row of the key a head shows from the keys it read ahead, or read that key and the next few with their rows under
@@ -863,6 +870,9 @@ impl<Backend: Io> EngineState<Backend> {
             let mut runs = [(0_usize, 0_usize, 0_u64, 0_u64); MOST_BATCH_RUNS];
             let mut sealed_pins: [Option<SegmentPin<'_, Backend::File>>; MOST_BATCH_RUNS] = std::array::from_fn(|_| None);
             let mut slot_pins: [Option<SlotPin<'_, Backend::File>>; MOST_BATCH_RUNS] = std::array::from_fn(|_| None);
+            // the run whose pin each run reads under, and the file each run reads
+            let mut pin_of = [0_usize; MOST_BATCH_RUNS];
+            let mut runs_file = [(SegmentNumber(0), None); MOST_BATCH_RUNS];
             let (mut run_count, mut planned) = (0, 0_u64);
             let room = (records.capacity() - records.len()) as u64;
             while at < order.len() && run_count < MOST_BATCH_RUNS {
@@ -886,18 +896,27 @@ impl<Backend: Io> EngineState<Backend> {
                     is_full = true;
                     break;
                 }
-                // an open segment's file is held through its slot, which lets go of a segment once it seals
-                let is_pinned = match first.slot {
-                    None => {
-                        sealed_pins[run_count] = volume.table.pin(first.segment);
-                        sealed_pins[run_count].is_some()
-                    },
-                    Some(slot) => {
-                        slot_pins[run_count] = self.slot_files[slot.0 as usize].pin(first.segment);
-                        slot_pins[run_count].is_some()
-                    },
+                // runs of one file sit side by side once sorted, so a run in the file the last run pinned reads under that pin
+                let is_same_file = run_count > 0 && runs_file[run_count - 1] == (first.segment, first.slot);
+                let is_pinned = if is_same_file {
+                    pin_of[run_count] = pin_of[run_count - 1];
+                    true
+                } else {
+                    pin_of[run_count] = run_count;
+                    // an open segment's file is held through its slot, which lets go of a segment once it seals
+                    match first.slot {
+                        None => {
+                            sealed_pins[run_count] = volume.table.pin(first.segment);
+                            sealed_pins[run_count].is_some()
+                        },
+                        Some(slot) => {
+                            slot_pins[run_count] = self.slot_files[slot.0 as usize].pin(first.segment);
+                            slot_pins[run_count].is_some()
+                        },
+                    }
                 };
                 if is_pinned {
+                    runs_file[run_count] = (first.segment, first.slot);
                     runs[run_count] = (at, last, start, end - start);
                     run_count += 1;
                     planned += end - start;
@@ -914,7 +933,8 @@ impl<Backend: Io> EngineState<Backend> {
             for (index, (read, &(_at, _last, start, length))) in reads.iter_mut().zip(&runs).enumerate().take(run_count) {
                 let (buf, tail) = mem::take(&mut rest).split_at_mut(length as usize);
                 rest = tail;
-                let file = sealed_pins[index].as_ref().map(|pin| &pin.file).or_else(|| slot_pins[index].as_ref().map(|pin| &pin.file));
+                let pin = pin_of[index];
+                let file = sealed_pins[pin].as_ref().map(|pin| &pin.file).or_else(|| slot_pins[pin].as_ref().map(|pin| &pin.file));
                 *read = file.map(|file| ManyRead { file, offset: FileOffset(start), buf, is_done: false });
             }
             device.read_many(&mut reads[..run_count]).await;
@@ -923,7 +943,7 @@ impl<Backend: Io> EngineState<Backend> {
             for (index, (&(first, last, start, length), is_filled)) in runs.iter().zip(filled).enumerate().take(run_count) {
                 if is_filled {
                     // an open record past what recovery replayed was written by this run, as an open get trusts it
-                    let recovered_end = slot_pins[index].as_ref().filter(|_pin| !self.is_read_only).map(|pin| pin.recovered_end);
+                    let recovered_end = slot_pins[pin_of[index]].as_ref().filter(|_pin| !self.is_read_only).map(|pin| pin.recovered_end);
                     for &word in &order[first..=last] {
                         if let Some(row) = small(word) {
                             let at = index_of_word(word) as usize;
@@ -1442,7 +1462,7 @@ impl<Backend: Io> EngineState<Backend> {
         point: WritePlace,
     ) -> Result<(), StoreError> {
         let ReadOn { device, target: volume } = on;
-        let ScanState { column, position, is_inclusive, direction, is_counting, sources, source_count, is_tree_stale, .. } = scan;
+        let ScanState { column, position, is_inclusive, direction, is_counting, sources, source_count, is_tree_stale, touched_sources, .. } = scan;
         let at = SeatAt {
             column: *column,
             key: position,
@@ -1452,6 +1472,7 @@ impl<Backend: Io> EngineState<Backend> {
             is_counting: *is_counting,
         };
         let count = segments.len().min(SEAT_BATCH).min(sources.len() - *source_count);
+        *touched_sources = (*touched_sources).max(*source_count + count);
         let seats = &mut sources[*source_count..*source_count + count];
         let mut keys = [NO_BLOCK; SEAT_BATCH];
         for ((source, segment), key) in seats.iter_mut().zip(segments).zip(&mut keys) {
@@ -1544,7 +1565,7 @@ impl<Backend: Io> EngineState<Backend> {
         point: WritePlace,
         is_spill: bool,
     ) -> Result<SourceMove, StoreError> {
-        let ScanState { column, position, is_inclusive, direction, is_counting, sources, spill, source_count, .. } = scan;
+        let ScanState { column, position, is_inclusive, direction, is_counting, sources, spill, source_count, touched_sources, .. } = scan;
         let at = SeatAt {
             column: *column,
             key: position,
@@ -1553,6 +1574,9 @@ impl<Backend: Io> EngineState<Backend> {
             point,
             is_counting: *is_counting,
         };
+        if !is_spill {
+            *touched_sources = (*touched_sources).max(*source_count + 1);
+        }
         let source = if is_spill { spill } else { &mut sources[*source_count] };
         source.segment = segment;
         self.seat_source(on.device, on.target, source, &at).await

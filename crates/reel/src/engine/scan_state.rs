@@ -121,7 +121,7 @@ pub const MOST_BATCH_RECORD: usize = 8 * 1024;
 pub const JOIN_GAP: u64 = 4 * 1024;
 
 /// The keys an untold scan's first fill locates
-pub const FIRST_UNTOLD_KEYS: usize = 8;
+pub const FIRST_UNTOLD_KEYS: usize = 32;
 
 /// Count the keys a scan's next batch locates: the told rows it still wants, the one asked for now among them, up to
 /// SCAN_BATCH_KEYS, and the untold room for a scan told no count
@@ -292,6 +292,8 @@ pub struct ScanState {
     pub is_tree_stale: bool,
     pub spill: SegmentSource,
     pub is_spilled: bool,
+    /// The sources a walk has set up since its start, past which none holds a block or a count to clear
+    pub touched_sources: usize,
     pub heads: Vec<ShardHead>,
     pub closest_head: Option<usize>,
     /// The oldest place any head was placed at, and the view they were placed in
@@ -312,6 +314,7 @@ pub struct ScanState {
     /// and when the scan goes back
     pub sorted_scan_keys: u64,
     pub corrupt_steps: u64,
+    pub held_values: u64,
     pub window: ScanWindows,
     /// A sorted column's sealed keys from its index, graves among them, the next at `sorted_next`
     pub sorted: KeyBatch,
@@ -333,9 +336,11 @@ pub struct ScanState {
     /// The rows the caller said it wants, and the rows it has asked for with a value
     pub wanted: u64,
     pub asked: u64,
-    /// The keys this scan's next fill locates when told no count. It starts small and doubles each fill, so a short walk
-    /// reads few values and a long one reaches full batches
+    /// The keys this scan's next fill locates when told no count. It starts at the batch a get of many keys takes and grows
+    /// with what the walk took, so a short walk reads few values and a long one reaches full batches
     pub untold_room: usize,
+    /// The keys an untold walk located since its start
+    pub untold_located: usize,
     pub batch: ScanBatch,
     /// The pool slot the scan came from, which it goes back to
     pub pool_slot: usize,
@@ -667,6 +672,7 @@ impl ScanState {
             is_tree_stale: true,
             spill: SegmentSource::new(widest_key, 0),
             is_spilled: false,
+            touched_sources: 0,
             heads: (0..SHARD_COUNT).map(|_head| ShardHead::new(widest_key, open_slots)).collect(),
             closest_head: None,
             heads_mark: WritePlace(0),
@@ -682,6 +688,7 @@ impl ScanState {
             batched: 0,
             sorted_scan_keys: 0,
             corrupt_steps: 0,
+            held_values: 0,
             window: ScanWindows::new(),
             batch: ScanBatch::new(widest_key),
             sorted: sorted_batch(widest_key),
@@ -696,6 +703,7 @@ impl ScanState {
             wanted: u64::MAX,
             asked: 0,
             untold_room: FIRST_UNTOLD_KEYS,
+            untold_located: 0,
             pool_slot: 0,
         }
     }
@@ -717,11 +725,13 @@ impl ScanState {
         self.batched = 0;
         self.sorted_scan_keys = 0;
         self.corrupt_steps = 0;
-        for source in &mut self.sources {
+        self.held_values = 0;
+        self.forget_held();
+        for source in &mut self.sources[..self.touched_sources] {
             source.fills = 0;
             source.cache_steps = 0;
         }
-        self.forget_held();
+        self.touched_sources = 0;
         self.window.clear();
         self.batch.clear();
         self.forget_sorted();
@@ -729,6 +739,7 @@ impl ScanState {
         self.wanted = range.wanted.map_or(u64::MAX, |rows| rows.0);
         self.asked = 0;
         self.untold_room = FIRST_UNTOLD_KEYS;
+        self.untold_located = 0;
         self.limit.clear();
         self.has_limit = match range.limit {
             ScanLimit::None => false,
@@ -866,7 +877,7 @@ impl ScanState {
 
     /// Drop what each source held, so its next block comes through the cache
     pub fn forget_held(&mut self) {
-        for source in &mut self.sources {
+        for source in &mut self.sources[..self.touched_sources] {
             source.held_at = None;
         }
     }

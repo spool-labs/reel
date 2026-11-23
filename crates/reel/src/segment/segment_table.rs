@@ -360,6 +360,12 @@ impl<File: Clone> SegmentTable<File> {
         self.shards.read(shard_of(number)).map.get(number).is_some()
     }
 
+    /// Check a pin of a segment would hold it, with no pin taken, so a check writes no count
+    pub fn is_readable(&self, number: SegmentNumber) -> bool {
+        let guard = self.shards.read(shard_of(number));
+        guard.map.get(number).is_some_and(|slot| guard.segments[slot as usize].is_some())
+    }
+
     /// Hold a segment open for a read, or return nothing when it has left the table
     pub fn pin(&self, number: SegmentNumber) -> Option<SegmentPin<'_, File>> {
         let shard = shard_of(number);

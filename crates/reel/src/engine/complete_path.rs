@@ -201,7 +201,7 @@ impl<Backend: Io> EngineState<Backend> {
         let leaf = noted.map_or(LeafAt::NONE, |(_entry, at)| at);
         let is_behind = volume.may_hide_under_sealed(read.read_point);
         // a grave answers absent wherever it sits, so only a value needs its segment
-        if is_behind || entry.is_some_and(|entry| entry.place > read.read_point || (!entry.is_grave && volume.table.pin(entry.segment).is_none())) {
+        if is_behind || entry.is_some_and(|entry| entry.place > read.read_point || (!entry.is_grave && !volume.table.is_readable(entry.segment))) {
             self.sorted_footer_asks.fetch_add(1, Ordering::Relaxed);
             return Ok((self.search_footers(device, volume, read).await?, LeafAt::NONE));
         }
@@ -424,7 +424,7 @@ impl<Backend: Io> EngineState<Backend> {
     /// Check a slot's segment has left the volume. A seal's own segment enters the table only when it finishes
     pub fn is_slot_gone(&self, volume: &Volume<Backend>, segment: u32) -> bool {
         let number = SegmentNumber(u64::from(segment));
-        number.0 != volume.sealing.load(Ordering::Acquire) && number.0 < volume.output_floor() && volume.table.pin(number).is_none()
+        number.0 != volume.sealing.load(Ordering::Acquire) && number.0 < volume.output_floor() && !volume.table.is_readable(number)
     }
 
     /// Fill every complete table: from its saved image where one stands, then from the row blocks of every segment the image

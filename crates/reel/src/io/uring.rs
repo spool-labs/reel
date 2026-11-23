@@ -16,7 +16,7 @@ use crate::guard::hold;
 use crate::io::spin_clock::SpinClock;
 use crate::io::plain_file::PlainFile;
 use crate::io::ring::{RING_SLOT_BYTES, RING_SLOTS, RingDriver};
-use crate::pool::TOUCH_BYTE;
+use crate::pool::{TOUCH_BYTE, touched_filled};
 
 /// The submission queue's length, past any read a ring can hold in flight with its poke beside them
 pub const RING_ENTRIES: u32 = 2 * RING_SLOTS as u32;
@@ -57,8 +57,11 @@ impl UringDriver {
             Ok(ring) => ring,
             Err(_refused) => IoUring::new(RING_ENTRIES)?,
         };
-        let cells: Vec<UnsafeCell<u8>> = (0..RING_SLOTS * RING_SLOT_BYTES).map(|_byte| UnsafeCell::new(TOUCH_BYTE)).collect();
-        let bytes = RingBytes(cells.into_boxed_slice());
+        // the bytes are written once at open, as a fill of plain bytes, so every page is in before a read
+        let filled = touched_filled(RING_SLOTS * RING_SLOT_BYTES, TOUCH_BYTE).into_boxed_slice();
+        // SAFETY: UnsafeCell<u8> has the layout of u8, so the slice keeps its length and its allocation
+        let cells = unsafe { Box::from_raw(Box::into_raw(filled) as *mut [UnsafeCell<u8>]) };
+        let bytes = RingBytes(cells);
         let vector = libc::iovec {
             iov_base: bytes.0.as_ptr().cast_mut().cast(),
             iov_len: RING_SLOTS * RING_SLOT_BYTES,

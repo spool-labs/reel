@@ -52,7 +52,7 @@ impl<Backend: Io> CompactJob<Backend> {
             return false;
         }
         // a segment with a good tail lost its rows some other way, so its blocks can't say what the span hides
-        let next = hold(&volume.damaged).iter().copied().find(|number| !self.rebuilds_tried.contains(number) && volume.table.pin(*number).is_none());
+        let next = hold(&volume.damaged).iter().copied().find(|number| !self.rebuilds_tried.contains(number) && !volume.table.is_readable(*number));
         let Some(number) = next else {
             return false;
         };

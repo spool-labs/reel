@@ -17,6 +17,7 @@ use crate::index::write_shard::{ShardNeed, ShardSizing, WalkBound, WriteShard};
 use crate::index::entry_slab::{EntryAddress, NO_ENTRY};
 use crate::index::sorted_keys::{Floors, KeyEntry, MOST_KEY_BYTES, SortedKeys, Upserted};
 use crate::pool::{touched_capacity, touched_from};
+use crate::index::seek_target::SeekTarget;
 use crate::index::write_tree::{entry_at, step_forward};
 use crate::row_kind::RowKind;
 
@@ -284,8 +285,24 @@ impl WriteIndex {
                     continue;
                 }
                 if column != Some(row_column) || run.entries.len() == ENTER_RUN_ROWS {
+                    let had_rows = !run.entries.is_empty();
                     entered += self.enter_run(&mut guard, shard, column.and_then(&index_of), slot_floors, run);
                     column = Some(row_column);
+                    // gets of keys in this shard wait on its lock, so the lock goes between runs, and the walk finds this key
+                    // again after, since a write in between can move the tree's nodes
+                    if had_rows {
+                        run.resume.clear();
+                        run.resume.extend_from_slice(guard.slab.key(address));
+                        drop(guard);
+                        guard = self.shards.write(shard);
+                        if guard.trees[slot].segment != segment {
+                            break;
+                        }
+                        let target = SeekTarget::new(row_column, &run.resume, WritePlace(u64::MAX));
+                        position = guard.trees[slot].seek(&guard.nodes, &guard.slab, &target);
+                        newest = None;
+                        continue;
+                    }
                 }
                 newest = Some((address, Newest::Out));
                 let Some(index) = index_of(row_column) else {
@@ -352,6 +369,8 @@ pub struct EnterRun {
     addresses: Vec<EntryAddress>,
     /// Older rows of a run's keys, by the run row of their newest, which cover them once it's in
     older: Vec<(usize, EntryAddress)>,
+    /// The key a walk stopped at to let its lock go, which it seeks again after
+    resume: Vec<u8>,
 }
 
 /// What became of a key's newest row in a slot's tree
@@ -373,6 +392,7 @@ impl EnterRun {
             entries: touched_capacity(ENTER_RUN_ROWS, KeyEntry::default()),
             addresses: touched_capacity(ENTER_RUN_ROWS, NO_ENTRY),
             older: touched_capacity(ENTER_RUN_ROWS, (0, NO_ENTRY)),
+            resume: touched_capacity(MOST_KEY_BYTES, 0),
         }
     }
 }

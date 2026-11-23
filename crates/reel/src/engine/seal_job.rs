@@ -443,7 +443,7 @@ impl<Backend: Io> SealJob<Backend> {
         self.sorted_run.flush(&self.state, self.volume, target.slot);
         self.end_step(|steps| &steps.walk_step);
         self.volume().ration.note_walk_end(self.step_started);
-        let state = Arc::clone(&self.state);
+        let state = &self.state;
         // the tail ends the segment's rows, so what they can no longer say has to be on disk first, and a failed save
         // holds the seal here
         if self.has_unsaved_damage {
@@ -462,7 +462,7 @@ impl<Backend: Io> SealJob<Backend> {
         let Some(totals) = self.totals else {
             return Err(Error::other("seal summarizing with no footer"));
         };
-        let state = Arc::clone(&self.state);
+        let state = &self.state;
         let volume = &state.volumes[self.volume];
         if !self.is_summarized {
             let mut facts = SegmentFacts {
@@ -526,7 +526,7 @@ impl<Backend: Io> SealJob<Backend> {
 
     /// Discard the rows file, which only runs once the table answers for the segment
     pub fn discard_rows(&mut self, target: &SealTarget<Backend::File>) -> Result<()> {
-        let state = Arc::clone(&self.state);
+        let state = &self.state;
         let root = &self.volume().roots[target.root.0 as usize];
         match state.io.remove_file(&rows_path(root, target.number)) {
             Ok(()) => {},
@@ -543,7 +543,7 @@ impl<Backend: Io> SealJob<Backend> {
         let Some(totals) = self.totals else {
             return Err(Error::other("seal installing with no footer"));
         };
-        let state = Arc::clone(&self.state);
+        let state = &self.state;
         let volume = &state.volumes[self.volume];
         if !self.is_in_table {
             let installed = volume.table.install(
@@ -591,7 +591,7 @@ impl<Backend: Io> SealJob<Backend> {
 
     /// Make the one atomic store: from here the footer answers and the write index doesn't
     pub fn switch(&mut self, target: &SealTarget<Backend::File>) {
-        let state = Arc::clone(&self.state);
+        let state = &self.state;
         let volume = &state.volumes[self.volume];
         volume.close_slot(target.slot);
 
@@ -642,7 +642,7 @@ impl<Backend: Io> SealJob<Backend> {
     /// Drop an empty segment with no footer, and say whether its files closed. While a read or a sync still pins them they wait for
     /// `finish_drop`
     pub fn drop_empty(&mut self, target: &SealTarget<Backend::File>) -> Result<bool> {
-        let state = Arc::clone(&self.state);
+        let state = &self.state;
         let volume = &state.volumes[self.volume];
         let index = target.slot.0 as usize;
         // the segment leaves the claims first, so no new pin can find it
@@ -652,7 +652,7 @@ impl<Backend: Io> SealJob<Backend> {
         // through its write, and the turn goes back at once: a thread that pinned the slot before may be waiting for it
         {
             state.take_writing_turn(target.slot);
-            let _turn = WritingTurn { state: &*state, index };
+            let _turn = WritingTurn { state, index };
             hold(&state.queues[index]).has_kept_window = false;
             state.reset_windows(target.slot);
         }

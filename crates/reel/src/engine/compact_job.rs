@@ -452,7 +452,7 @@ impl<Backend: Io> CompactJob<Backend> {
 
     /// Clear one step's buckets of slots that point at gone segments, once enough may, and say whether a step ran
     pub fn step_sweep(&mut self) -> bool {
-        let state = Arc::clone(&self.state);
+        let state = &self.state;
         let volume = &state.volumes[self.volume];
         if self.sweep.is_none() {
             let on_volume = |id: usize| state.columns[id].is_some_and(|info| info.volume.0 as usize == self.volume);
@@ -504,7 +504,7 @@ impl<Backend: Io> CompactJob<Backend> {
 
     /// Give a few row blocks past a complete table's mark their slots once it has room again, and say whether a step ran
     pub fn step_refill(&mut self) -> bool {
-        let state = Arc::clone(&self.state);
+        let state = &self.state;
         if self.refill.is_none() {
             self.refill = state.start_refill(self.volume, self.refill_below);
         }

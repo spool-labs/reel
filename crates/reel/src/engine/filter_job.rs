@@ -95,7 +95,7 @@ impl<Backend: Io> FilterLoader<Backend> {
         if changes == self.looked_at {
             return false;
         }
-        let state = Arc::clone(&self.state);
+        let state = &self.state;
         let arena = &state.filter_arena;
         let (next, is_swept) = {
             let rows = state.hold_for_pick(self.volume, PickKind::Filter);

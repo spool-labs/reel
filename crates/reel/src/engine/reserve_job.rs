@@ -93,7 +93,7 @@ impl<Backend: Io> ReserveJob<Backend> {
     /// Hold the next step of room for every open segment that asked. A full disk stops here, and the claim that runs past the
     /// room hears it
     pub fn hold_room(&mut self) {
-        let state = Arc::clone(&self.state);
+        let state = &self.state;
         for volume in &state.volumes {
             while let Some(room) = self.next_room(volume) {
                 let is_held = room.file.reserve_range(FileOffset(room.from), ByteCount(room.end)).is_ok();
@@ -121,7 +121,7 @@ impl<Backend: Io> ReserveJob<Backend> {
 
     /// Start every open segment's new bytes. The call is a hint: a failure leaves them to the seal's sync
     pub fn start_writeback(&mut self) {
-        let state = Arc::clone(&self.state);
+        let state = &self.state;
         for volume in &state.volumes {
             while let Some(range) = self.next_range(volume) {
                 let _started = range.file.start_writeback(FileOffset(range.from), ByteCount(range.to - range.from));

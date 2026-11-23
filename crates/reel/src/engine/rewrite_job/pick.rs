@@ -324,7 +324,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             let is_free = segment != sealing && segment != walking && !volume.is_taken(row.facts.segment) && !gave_up.holds(row.facts.segment);
             is_overlap_input(row) && is_free
         };
-        let state = Arc::clone(&self.state);
+        let state = &self.state;
         // a column with a complete table has no overlap bound
         let directory_of = |column: ColumnId| state.complete_table(column).is_none().then(|| state.directories[column.0 as usize].as_ref()).flatten();
         let lists = (&mut self.listed, &mut self.crowd);

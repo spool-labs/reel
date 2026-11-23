@@ -386,7 +386,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         if self.is_unwalked || !self.row_walked || !volume.are_bits_answering() {
             return Ok(None);
         }
-        let state = Arc::clone(&self.state);
+        let state = &self.state;
         let is_settled = !volume.is_parking() && volume.stray_outputs.load(Ordering::Acquire) == 0;
         let is_clean = is_settled || row.kind == RowKind::Value;
         if !is_clean || state.cues.has_cue_between(self.volume, row.place, WritePlace(u64::MAX)) {
@@ -490,7 +490,7 @@ impl<Backend: Io> RewriteJob<Backend> {
     /// drops first, as any row with a newer one does. A file on its way out comes back at a crash, so no grave drops while
     /// one is parked or leaving. A cue below the grave can read what it covers, and damage could be hiding an older version
     pub fn hides_nothing(&self, volume: &Volume<Backend>, column: ColumnId, row: &FooterRow) -> Result<bool> {
-        let state = Arc::clone(&self.state);
+        let state = &self.state;
         if volume.is_parking()
             || volume.stray_outputs.load(Ordering::Acquire) > 0
             || state.cues.has_cue_below(self.volume, row.place)

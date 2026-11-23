@@ -144,7 +144,7 @@ impl<Backend: Io> CoverApply<Backend> {
         column: ColumnId,
         place: WritePlace,
     ) -> Result<()> {
-        let state = Arc::clone(&self.state);
+        let state = &self.state;
         let rows = state.hold_for_pick(self.volume, PickKind::Cover);
         let is_under = |row: &SummaryRow<'_>| {
             row.facts.is_walked()

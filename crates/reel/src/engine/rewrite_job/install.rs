@@ -704,14 +704,14 @@ impl<Backend: Io> RewriteJob<Backend> {
         if self.target.is_none() {
             return false;
         }
-        let state = Arc::clone(&self.state);
+        let state = &self.state;
         let volume = &state.volumes[self.volume];
         let written = self.staged.iter().map(|staged| staged.facts.file_length.0).sum::<u64>() + self.records_end.0 + self.used as u64;
         if written <= self.promised.0 {
             return false;
         }
         let more = written - self.promised.0 + OUTGROW_STEP_BYTES;
-        if !has_disk_room(&state, volume, ByteCount(more), false) {
+        if !has_disk_room(state, volume, ByteCount(more), false) {
             return true;
         }
         self.promised = ByteCount(self.promised.0 + more);

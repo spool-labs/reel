@@ -564,10 +564,10 @@ impl<Backend: Io> EngineState<Backend> {
                 place,
                 segment: row.segment,
             };
-            volume.covers.add_held(&cover);
+            let has_inside = volume.covers.add_held(&cover);
             claim.land();
             // older covers leave only now, since a reader below this place still needs them
-            self.drop_covers_inside(volume, &cover);
+            self.drop_covers_found(volume, &cover, has_inside);
             return Ok(Some(length));
         }
     }
@@ -633,10 +633,10 @@ impl<Backend: Io> EngineState<Backend> {
                         place: row.place,
                         segment: row.segment,
                     };
-                    volume.covers.add_held(&cover);
+                    let has_inside = volume.covers.add_held(&cover);
                     claim.land();
                     // older covers leave only now, since a reader below this place still needs them
-                    self.drop_covers_inside(volume, &cover);
+                    self.drop_covers_found(volume, &cover, has_inside);
                     return Ok(length);
                 },
                 LandOutcome::IndexFull => {

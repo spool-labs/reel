@@ -471,3 +471,20 @@ pub fn huge_page_bytes() -> Option<ByteCount> {
     let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
     Some(ByteCount(kib * 1024))
 }
+
+/// Grow a list of bytes to a length inside the room it was made with, with no fill, for a read that lands over the new
+/// bytes. A list made by `touched_capacity` had every byte of its room written at open, so the bytes it grows into are
+/// plain bytes. Past that room it fills with zeros, as a resize does
+#[allow(clippy::uninit_vec, reason = "the room was written at open, and a read writes over what it grows into")]
+pub fn grow_into_room(bytes: &mut Vec<u8>, length: usize) {
+    if length <= bytes.len() {
+        bytes.truncate(length);
+        return;
+    }
+    if length > bytes.capacity() {
+        bytes.resize(length, 0);
+        return;
+    }
+    // SAFETY: the bytes up to the capacity were written when the room was touched, and a u8 has no invalid value
+    unsafe { bytes.set_len(length) };
+}

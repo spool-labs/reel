@@ -658,14 +658,17 @@ impl RangeCovers {
         self.write().held -= count;
     }
 
-    /// Put in a cover a hold made room for. Older covers inside it stay until `drop_inside`, once it's published
-    pub fn add_held(&self, cover: &Cover) {
+    /// Put in a cover a hold made room for, and say whether an older cover lies inside it, under the same lock. Older covers
+    /// inside it stay until `drop_inside`, once it's published
+    pub fn add_held(&self, cover: &Cover) -> bool {
         let mut pool = self.write();
         pool.held -= 1;
         pool.insert(cover, false);
+        let has_inside = pool.has_inside(cover, false);
         let count = pool.order.len();
         drop(pool);
         self.count.store(count, Ordering::Release);
+        has_inside
     }
 
     /// Check an older cover lies wholly inside a new one

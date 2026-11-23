@@ -14,9 +14,13 @@ fn value(index: usize, length: usize) -> Vec<u8> {
 fn fills_read_back() {
     let pages = ValuePages::new(16);
     let mut chain = HeldChain::NONE;
+    let mut filled = 0;
     for index in (0..ENTRIES).step_by(2) {
-        chain = pages.fill((0, LEAF), chain, (index, ENTRIES), &value(index, 100)).expect("a fill");
+        let is_new;
+        (chain, is_new) = pages.fill((0, LEAF), chain, (index, ENTRIES), &value(index, 100)).expect("a fill");
+        filled += u64::from(is_new);
     }
+    pages.note_fills(filled);
     for index in 0..ENTRIES {
         let mut out = Vec::new();
         let is_held = pages.read(chain, index, &mut out);
@@ -41,14 +45,14 @@ fn long_values_stay_out() {
 #[test]
 fn a_dropped_chain_reads_nothing() {
     let pages = ValuePages::new(8);
-    let chain = pages.fill((0, LEAF), HeldChain::NONE, (3, ENTRIES), &value(3, 500)).expect("a fill");
+    let chain = pages.fill((0, LEAF), HeldChain::NONE, (3, ENTRIES), &value(3, 500)).expect("a fill").0;
     pages.drop_chain(0, chain);
     let mut out = Vec::new();
     assert!(!pages.read(chain, 3, &mut out));
     assert!(out.is_empty());
     assert_eq!(pages.free_pages(), 8);
     // the same pages filled for another leaf don't answer for the old chain
-    let other = pages.fill((0, LEAF + 1), HeldChain::NONE, (3, ENTRIES), &value(9, 500)).expect("a fill");
+    let other = pages.fill((0, LEAF + 1), HeldChain::NONE, (3, ENTRIES), &value(9, 500)).expect("a fill").0;
     assert!(!pages.read(chain, 3, &mut out));
     assert!(pages.read(other, 3, &mut out));
     assert_eq!(out, value(9, 500));
@@ -61,14 +65,14 @@ fn a_full_pool_fills_again_once_a_chain_drops() {
     let mut first = HeldChain::NONE;
     let mut second = HeldChain::NONE;
     for index in 0..3 {
-        first = pages.fill((0, LEAF), first, (index, ENTRIES), &value(index, 1_000)).expect("a fill");
-        second = pages.fill((0, LEAF + 1), second, (index, ENTRIES), &value(index, 1_000)).expect("a fill");
+        first = pages.fill((0, LEAF), first, (index, ENTRIES), &value(index, 1_000)).expect("a fill").0;
+        second = pages.fill((0, LEAF + 1), second, (index, ENTRIES), &value(index, 1_000)).expect("a fill").0;
     }
     assert_eq!(pages.fill((0, LEAF + 2), HeldChain::NONE, (0, ENTRIES), &value(2, 100)), None);
     let mut out = Vec::new();
     assert!(pages.read(second, 0, &mut out), "a full pool lost a held value");
     pages.drop_chain(0, first);
-    let third = pages.fill((0, LEAF + 2), HeldChain::NONE, (0, ENTRIES), &value(2, 100)).expect("a fill");
+    let third = pages.fill((0, LEAF + 2), HeldChain::NONE, (0, ENTRIES), &value(2, 100)).expect("a fill").0;
     out.clear();
     assert!(pages.read(third, 0, &mut out));
     assert_eq!(out, value(2, 100));
@@ -78,8 +82,8 @@ fn a_full_pool_fills_again_once_a_chain_drops() {
 #[test]
 fn a_second_fill_keeps_the_first() {
     let pages = ValuePages::new(4);
-    let chain = pages.fill((0, LEAF), HeldChain::NONE, (5, ENTRIES), b"first").expect("a fill");
-    let again = pages.fill((0, LEAF), chain, (5, ENTRIES), b"second").expect("a fill");
+    let chain = pages.fill((0, LEAF), HeldChain::NONE, (5, ENTRIES), b"first").expect("a fill").0;
+    let again = pages.fill((0, LEAF), chain, (5, ENTRIES), b"second").expect("a fill").0;
     assert_eq!(chain, again);
     let mut out = Vec::new();
     assert!(pages.read(chain, 5, &mut out));
@@ -202,13 +206,13 @@ fn a_sharer_never_takes_another_sharer_floor() {
     let pages = ValuePages::shared(8, &[4, 4]);
     let mut walked = Vec::new();
     for leaf in 0..8 {
-        if let Some(chain) = pages.fill((0, LEAF + leaf), HeldChain::NONE, (0, ENTRIES), &value(leaf as usize, 100)) {
+        if let Some((chain, _is_new)) = pages.fill((0, LEAF + leaf), HeldChain::NONE, (0, ENTRIES), &value(leaf as usize, 100)) {
             walked.push(chain);
         }
     }
     assert_eq!(walked.len(), 6, "the walking index took past half the other's share");
     let owed: Vec<HeldChain> = (0..2)
-        .map(|leaf| pages.fill((1, LEAF + 100 + leaf), HeldChain::NONE, (0, ENTRIES), &value(leaf as usize, 100)).expect("the other's share"))
+        .map(|leaf| pages.fill((1, LEAF + 100 + leaf), HeldChain::NONE, (0, ENTRIES), &value(leaf as usize, 100)).expect("the other's share").0)
         .collect();
     assert_eq!(owed.len(), 2);
     assert_eq!(pages.fill((1, LEAF + 200), HeldChain::NONE, (0, ENTRIES), &value(0, 100)), None, "a full pool gave a page");

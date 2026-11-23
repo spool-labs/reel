@@ -178,9 +178,18 @@ impl ValuePages {
         true
     }
 
-    /// Put a value in a leaf's chain for its entry, starting a chain when the leaf has none, and return the chain the leaf keeps now.
-    /// Nothing when the value is too long or the pool has no free page
-    pub fn fill(&self, (sharer, owner): (usize, u32), chain: HeldChain, (index, entries): (usize, usize), value: &[u8]) -> Option<HeldChain> {
+    /// Count values a run of fills put in, once for the run, so a fill writes no shared count
+    pub fn note_fills(&self, count: u64) {
+        if count > 0 {
+            self.fills.fetch_add(count, Ordering::Relaxed);
+            self.held.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
+    /// Put a value in a leaf's chain for its entry, starting a chain when the leaf has none, and return the chain the leaf keeps now
+    /// and whether this put the value in. Nothing when the value is too long or the pool has no free page. The caller counts what
+    /// went in with `note_fills`
+    pub fn fill(&self, (sharer, owner): (usize, u32), chain: HeldChain, (index, entries): (usize, usize), value: &[u8]) -> Option<(HeldChain, bool)> {
         let table = slot_table_words(entries);
         if value.len() > MOST_HELD_VALUE || index >= entries || VALUE_HEAD_WORDS + table >= VALUE_PAGE_WORDS {
             return None;
@@ -193,16 +202,14 @@ impl ValuePages {
             HeldChain { first, generation: self.generation(first) }
         };
         if self.slot(chain.first, index) != 0 {
-            return Some(chain);
+            return Some((chain, false));
         }
         let (link, page) = self.room_for((sharer, owner), chain, value.len())?;
         let offset = self.used(page);
         self.copy_in(page, offset, value);
         self.set_used(page, align(offset + value.len()), self.table_words(page));
         self.set_slot(chain.first, index, pack_slot(link, offset, value.len()));
-        self.fills.fetch_add(1, Ordering::Relaxed);
-        self.held.fetch_add(1, Ordering::Relaxed);
-        Some(chain)
+        Some((chain, true))
     }
 
     /// Give a leaf's whole chain back, moving every page's generation first

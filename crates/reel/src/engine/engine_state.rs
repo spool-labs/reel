@@ -755,7 +755,12 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// Drop the covers a published one holds inside it, unless a live cue reads below it and still needs them
     pub fn drop_covers_inside(&self, volume: &Volume<Backend>, cover: &Cover) {
-        if !volume.covers.has_inside(cover) {
+        self.drop_covers_found(volume, cover, volume.covers.has_inside(cover));
+    }
+
+    /// Drop the covers a published one holds inside it, when its add already found some inside
+    pub fn drop_covers_found(&self, volume: &Volume<Backend>, cover: &Cover, has_inside: bool) {
+        if !has_inside {
             return;
         }
         self.cues.note_reclaim();

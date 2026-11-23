@@ -24,6 +24,7 @@ use crate::guard::hold;
 use crate::index::sorted_keys::{LeafAt, ScanFrom, SortedKeys};
 use crate::config::KeyShape;
 use crate::index::open_counts::OpenBound;
+use crate::pool::grow_into_room;
 use crate::index::write_shard::{HEAD_GROUP, HeadPlace, WalkBound, WriteShard, place_heads_together};
 use crate::io::{DeviceReads, Io, ManyRead, ReadOn, in_place};
 use crate::record::record_check::RecordIdentity;
@@ -709,6 +710,7 @@ impl<Backend: Io> EngineState<Backend> {
         rows.resize(entries.len(), None);
         let mut hits = 0;
         let mut held_rows = 0;
+        let mut window_records = 0;
         for (row, entry) in rows.iter_mut().zip(entries.iter_mut()) {
             // a row its index leaf already answered takes no read
             if entry.is_value {
@@ -725,6 +727,7 @@ impl<Backend: Io> EngineState<Backend> {
                 Located::Sealed(sealed) => sealed,
                 Located::Open(open) => {
                     entry.record = self.window_record(&open, records);
+                    window_records += u64::from(entry.record.is_some());
                     if entry.record.is_none() {
                         *row = Some(BatchRow::open(&open));
                     }
@@ -750,6 +753,9 @@ impl<Backend: Io> EngineState<Backend> {
         if held_rows > 0 {
             self.scan_held_values.fetch_add(held_rows, Ordering::Relaxed);
         }
+        if window_records > 0 {
+            self.scan_window_records.fetch_add(window_records, Ordering::Relaxed);
+        }
         spans.clear();
         spans.resize(entries.len(), None);
         trusted.clear();
@@ -769,6 +775,7 @@ impl<Backend: Io> EngineState<Backend> {
             return;
         };
         let mut is_fresh = [false; SCAN_BATCH_KEYS];
+        let mut restored_values = 0;
         for (at, entry) in entries.iter_mut().enumerate() {
             let (Some((start, length)), Some(row), false) = (entry.record, held_row(&entry.located), entry.is_value) else {
                 continue;
@@ -794,14 +801,14 @@ impl<Backend: Io> EngineState<Backend> {
                     if at + MOST_HELD_VALUE > records.capacity() {
                         continue;
                     }
-                    records.resize(at + MOST_HELD_VALUE, 0);
+                    grow_into_room(records, at + MOST_HELD_VALUE);
                     let (read, room) = records.split_at_mut(at);
                     let Some(restored) = decompress(&read[payload_at..payload_at + payload], room) else {
                         records.truncate(at);
                         continue;
                     };
                     records.truncate(at + restored);
-                    self.scan_restored_values.fetch_add(1, Ordering::Relaxed);
+                    restored_values += 1;
                     Some((at, restored))
                 },
             };
@@ -809,6 +816,9 @@ impl<Backend: Io> EngineState<Backend> {
             if let Some(fresh) = is_fresh.get_mut(at) {
                 *fresh = true;
             }
+        }
+        if restored_values > 0 {
+            self.scan_restored_values.fetch_add(restored_values, Ordering::Relaxed);
         }
         let fresh = entries.iter().enumerate().filter(|(at, _entry)| is_fresh.get(*at).copied().unwrap_or(false));
         index.hold_values(fresh.filter_map(|(_at, entry)| {
@@ -827,9 +837,8 @@ impl<Backend: Io> EngineState<Backend> {
             return None;
         }
         let _pin = self.slot_files[open.slot.0 as usize].pin(open.segment)?;
-        records.resize(at + length, 0);
+        grow_into_room(records, at + length);
         if self.windows[open.slot.0 as usize].iter().any(|window| window.read(open.offset, &mut records[at..])) {
-            self.scan_window_records.fetch_add(1, Ordering::Relaxed);
             return Some((at, length));
         }
         records.truncate(at);
@@ -927,7 +936,8 @@ impl<Backend: Io> EngineState<Backend> {
                 break;
             }
             let base = records.len();
-            records.resize(base + planned as usize, 0);
+            // the room was written at open, so the reads land in it with no fill first
+            grow_into_room(records, base + planned as usize);
             let mut reads: [Option<ManyRead<'_, Backend::File>>; MOST_BATCH_RUNS] = std::array::from_fn(|_| None);
             let mut rest = &mut records[base..];
             for (index, (read, &(_at, _last, start, length))) in reads.iter_mut().zip(&runs).enumerate().take(run_count) {

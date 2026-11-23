@@ -862,6 +862,7 @@ impl SortedKeys {
             return 0;
         }
         let mut held = 0;
+        let mut filled = 0;
         let mut current: Option<(usize, Option<RwLockWriteGuard<'_, PartTree>>)> = None;
         // a batch's keys run in order, so after one descent each key is in the leaf the last one was in, or the next
         let mut cursor = NO_PAGE;
@@ -889,11 +890,14 @@ impl SortedKeys {
             if !self.names_row(leaf, index, row) {
                 continue;
             }
-            if let Some(chain) = self.values.fill((self.sharer, leaf), self.chain_of(leaf), (index, self.leaf_capacity), value) {
+            if let Some((chain, is_new)) = self.values.fill((self.sharer, leaf), self.chain_of(leaf), (index, self.leaf_capacity), value) {
                 self.set_chain(leaf, chain);
                 held += 1;
+                filled += u64::from(is_new);
             }
         }
+        drop(current);
+        self.values.note_fills(filled);
         held
     }
 

@@ -853,10 +853,13 @@ fn copied_cover_full() {
 
     let volume = &store.state.volumes[0];
     let length = plain_length(ByteCount(b"kez".len() as u64));
-    let (number, data, offset) = {
+    // the record sits where its row says, which a window put ahead of the segment's write end
+    let landed = store.state.index.lookup(COLUMN, b"key", WritePlace(u64::MAX), volume.view()).row.expect("the delete's row");
+    let offset = landed.offset;
+    let (number, data) = {
         let claims = hold(&volume.claims);
         let segment = claims.open.iter().find(|segment| segment.cover_rows > 0).expect("a cover");
-        (segment.number, segment.data.clone(), FileOffset(segment.write_end.0 - length.0))
+        (segment.number, segment.data.clone())
     };
     let row = RowEntry {
         column: COLUMN,
@@ -897,5 +900,25 @@ fn copied_cover_full() {
 
     let store = open(&io);
     assert_eq!(read(&store, COLUMN, b"key"), None);
+    store.close().expect("close");
+}
+
+// a small range delete goes through its slot's window as a small put does, so the call itself makes no write call
+#[test]
+fn delete_through_window() {
+    let io = SimulatedIo::new(Seed(33));
+    let store = open(&io);
+    fill(&store);
+    let before = io.write_count();
+    store.delete_range(COLUMN, &key_of(10), &key_of(20)).expect("delete");
+    assert_eq!(io.write_count(), before, "the delete wrote on its own");
+    assert_eq!(read(&store, COLUMN, &key_of(15)), None);
+    assert_eq!(read(&store, COLUMN, &key_of(25)), Some(b"older".to_vec()));
+    store.flush().expect("flush");
+    store.close().expect("close");
+    drop(store);
+    let store = open(&io);
+    assert_eq!(read(&store, COLUMN, &key_of(15)), None);
+    assert_eq!(read(&store, COLUMN, &key_of(25)), Some(b"older".to_vec()));
     store.close().expect("close");
 }

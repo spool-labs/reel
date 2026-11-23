@@ -496,6 +496,82 @@ impl<Backend: Io> EngineState<Backend> {
         self.after_write(volume, length)
     }
 
+    /// Land a range delete's record in its slot's window, as a small put lands, so the call makes no write call of its own.
+    /// Return nothing when the window can't take it
+    pub fn land_range_delete_held(
+        &self,
+        volume: &Volume<Backend>,
+        column: ColumnId,
+        (start, end): (&[u8], &[u8]),
+        record: &PlainRecord,
+        length: ByteCount,
+    ) -> Result<Option<ByteCount>, StoreError> {
+        let request = ClaimRequest {
+            bytes: ByteCount(0),
+            rows: RowCount(1),
+            is_alone: false,
+            has_records: true,
+            covers: 1,
+            mark: None,
+            has_deletes: true,
+        };
+        let size = row_size(start.len());
+        loop {
+            let claim = self.claim(volume, &request)?;
+            let (slot, place) = (claim.slot, claim.first_place());
+            let head = record.head(self.record_key, place);
+            let Some(offset) = self.try_window(slot, [&head, end], size) else {
+                drop(claim);
+                if self.refill_window(volume, slot, length.0 as usize, size)? {
+                    continue;
+                }
+                return Ok(None);
+            };
+            let row = WriteRow {
+                place,
+                offset,
+                length,
+                kind: RowKind::RangeDelete,
+                slot,
+                segment: claim.segment,
+                has_newer_sealed: false,
+            };
+            let queue = &self.queues[slot.0 as usize];
+            if !self.index.insert(column, start, &row, None) {
+                hold(queue).reserved -= size;
+                drop(claim);
+                self.wait_for_index(column, start, slot)?;
+                continue;
+            }
+            let entry = RowEntry {
+                column,
+                key: start,
+                place,
+                offset,
+                length,
+                kind: RowKind::RangeDelete,
+            };
+            {
+                let mut guard = hold(queue);
+                guard.reserved -= size;
+                guard.filling.push(&entry);
+            }
+            self.wake_row_job();
+            let cover = Cover {
+                column,
+                start,
+                end,
+                place,
+                segment: row.segment,
+            };
+            volume.covers.add_held(&cover);
+            claim.land();
+            // older covers leave only now, since a reader below this place still needs them
+            self.drop_covers_inside(volume, &cover);
+            return Ok(Some(length));
+        }
+    }
+
     /// Write the record of a range delete and land its row and cover, a hold having made room for the cover, and
     /// return the length of the record
     pub fn land_range_delete(
@@ -514,6 +590,12 @@ impl<Backend: Io> EngineState<Backend> {
         };
         let record = PlainRecord::new(&identity, end);
         let length = plain_length(ByteCount(end.len() as u64));
+        // a small record goes through the slot's window, and the first write into a fresh segment's file falls to the sender
+        if length.0 as usize <= MOST_WINDOW_RECORD_BYTES
+            && let Some(length) = self.land_range_delete_held(volume, column, (start, end), &record, length)?
+        {
+            return Ok(length);
+        }
         let request = ClaimRequest {
             bytes: length,
             rows: RowCount(1),

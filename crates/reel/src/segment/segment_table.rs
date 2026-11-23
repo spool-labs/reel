@@ -633,6 +633,13 @@ impl<File: Clone> SegmentTable<File> {
         Some((*line, entry.highest_replacement))
     }
 
+    /// Read the lowest place any row of a segment has, or nothing when the segment has left
+    pub fn lowest_place(&self, number: SegmentNumber) -> Option<WritePlace> {
+        let guard = self.shards.read(shard_of(number));
+        let entry = guard.map.get(number).and_then(|slot| guard.segments[slot as usize].as_ref())?;
+        Some(entry.head.places.lowest)
+    }
+
     /// Read what a walk needs to stand in a segment's column under one lock: its head, the column's tail, and the block a key
     /// enters the column at with its line
     pub fn seat_line(&self, number: SegmentNumber, column: ColumnId, key: &[u8], direction: Direction) -> Seat {

@@ -1410,3 +1410,29 @@ fn old_point_skips_newer_segments() {
     store.state.give_back_scan(scan);
     store.close().expect("close");
 }
+
+// a get at a cue behind many seals passes the newer segments with no block read, and finds the value the cue saw
+#[test]
+fn old_get_skips_newer_segments() {
+    let io = SimulatedIo::new(Seed(46));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    store.put(COLUMN, &key(7), b"first").expect("put");
+    seal(&store, &io);
+    let cue = store.cue().expect("cue");
+    let rounds = MOST_SCAN_SOURCES as u64;
+    for round in 0..rounds {
+        store.put(COLUMN, &key(7), format!("round-{round}").as_bytes()).expect("put");
+        seal(&store, &io);
+    }
+    store.state.row_cache.clear();
+    store.state.filter_cache.clear();
+    let before = io.read_count();
+    let mut buf = Vec::new();
+    assert!(cue.get(COLUMN, &key(7), &mut buf).expect("get"));
+    assert_eq!(buf, b"first");
+    let reads = io.read_count().0 - before.0;
+    assert!(reads < rounds / 4, "{reads} reads for {rounds} newer segments");
+    drop(cue);
+    store.close().expect("close");
+}

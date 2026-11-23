@@ -1379,6 +1379,7 @@ impl<Backend: Io> EngineState<Backend> {
         let mut best: Option<SealedRow> = None;
         let mut skip = 0;
         let mut generation = None;
+        let is_behind = volume.may_hide_under_sealed(read.read_point);
         loop {
             let page = directory.candidates(read.key, skip, &mut reader.candidates);
             // a try's place holds only while the list stands as the try saw it
@@ -1401,6 +1402,13 @@ impl<Backend: Io> EngineState<Backend> {
                 // newest first, so past a segment with nothing above the floor no later one has anything either
                 if best.is_some_and(|row| row.row.place >= candidate.newest_place) || ask.above.is_some_and(|above| candidate.newest_place <= above) {
                     break;
+                }
+                // a read behind the newest seal passes a segment whose every row is newer than its point, with no block read
+                if is_behind
+                    && candidate.newest_place > read.read_point
+                    && volume.table.lowest_place(candidate.segment).is_some_and(|lowest| lowest > read.read_point)
+                {
+                    continue;
                 }
                 if let Some(mark) = device.try_mark().filter(|_mark| skip == 0) {
                     mark.note(page.generation, index);

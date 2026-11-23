@@ -13,7 +13,7 @@ use crate::record::chunk_table::{
     page_count, page_of, table_bytes,
 };
 use crate::record::codec::{CHUNK_BYTES, Codec};
-use crate::record::lz4_block::{decompress, decompress_onto};
+use crate::record::lz4_block::{decompress, decompress_into_room, decompress_onto};
 use crate::little_endian::read_word;
 use crate::record::record_check::{Checksum, RecordIdentity, checksum, place_check, record_check};
 use crate::record::record_head::{
@@ -112,23 +112,27 @@ impl RecordReader {
         ByteCount(total as u64)
     }
 
-    /// Check a one-chunk record still in memory and fill the buffer from it
+    /// Check a one-chunk record still in memory and fill the buffer from it. The fill copies the record into the reader's room,
+    /// and returns false when memory no longer holds it whole, which answers nothing
     pub fn read_held(
         &mut self,
-        record: &[u8],
+        length: usize,
+        fill: impl FnOnce(&mut [u8]) -> bool,
         identity: &RecordIdentity<'_>,
         window: Option<ValueWindow>,
         buf: &mut Vec<u8>,
-    ) -> RecordRead {
-        self.first[..record.len()].copy_from_slice(record);
+    ) -> Option<RecordRead> {
+        if !fill(&mut self.first[..length]) {
+            return None;
+        }
         let Some(form) = self.form() else {
-            return RecordRead::Failed;
+            return Some(RecordRead::Failed);
         };
-        let read = self.finish_small(form, record.len(), identity, buf);
+        let read = self.finish_small(form, length, identity, buf);
         if let Some(window) = window {
             cut_to_window(buf, window);
         }
-        read
+        Some(read)
     }
 
     /// Fill the buffer with the whole value, in one read when the column stores values as written
@@ -831,6 +835,12 @@ pub fn open_small(
     buf.clear();
     match form.codec {
         Codec::None => buf.extend_from_slice(payload),
+        // a buffer with the room `decoded` has takes the value straight from the decode, under the same bound
+        Codec::Lz4 if buf.capacity() >= decoded.len() => {
+            if decompress_into_room(payload, buf, decoded.len()).is_none() {
+                return RecordRead::Failed;
+            }
+        },
         Codec::Lz4 => {
             let Some(restored) = decompress(payload, decoded) else {
                 return RecordRead::Failed;

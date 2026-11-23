@@ -345,9 +345,10 @@ impl<Backend: Io> EngineState<Backend> {
         let Some(pin) = self.slot_files[index].pin_current() else {
             return Err(Error::other("a window has no data file"));
         };
-        let mut copy = hold(&self.window_copies[index]);
-        let length = window.copy_out(&mut copy);
-        pin.file.write_at(window.start(), &[IoSlice::new(&copy[..length])])
+        // SAFETY: this sends the kept window, and pushes go to the live one, so nothing stores to it until its reset after the
+        // send
+        let records = unsafe { window.records() };
+        pin.file.write_at(window.start(), &[IoSlice::new(records)])
     }
 
     /// Check a slot has rows that haven't reached the kernel

@@ -205,6 +205,11 @@ impl SimulatedIo {
         hold(&self.disk).host_memory = memory;
     }
 
+    /// Make every read that won't wait fail as unsupported, as on a file system with no such read
+    pub fn set_refuses_no_wait(&self, refuses: bool) {
+        hold(&self.disk).refuses_no_wait = refuses;
+    }
+
     /// Let this many tries find the kernel holding their bytes, before the warm bytes decide again
     pub fn set_warm_tries(&self, tries: u64) {
         hold(&self.disk).warm_tries = tries;

@@ -1366,14 +1366,12 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
     let mut queues = Vec::with_capacity(open_slots);
     let mut spare_groups = Vec::with_capacity(open_slots);
     let mut windows = Vec::with_capacity(open_slots);
-    let mut window_copies = Vec::with_capacity(open_slots);
     let mut slot_files = Vec::with_capacity(open_slots);
     let mut free_slots = Vec::with_capacity(open_slots);
     for slot in 0..open_slots {
         queues.push(Mutex::new(RowQueue::new(group_bytes)));
         spare_groups.push(Mutex::new((!sizing.is_read_only).then(|| RowGroupBuffer::new(GROUP_BYTES))));
         windows.push([RecordWindow::with_bytes(window_bytes), RecordWindow::with_bytes(window_bytes)]);
-        window_copies.push(Mutex::new(touched_zeroes(window_bytes)));
         slot_files.push(SlotFile::new());
         free_slots.push(OpenSlot((open_slots - 1 - slot) as u8));
     }
@@ -1381,7 +1379,6 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
     for slot in 0..open_slots {
         drop(hold(&queues[slot]));
         drop(hold(&spare_groups[slot]));
-        drop(hold(&window_copies[slot]));
     }
 
     // a value reaches the largest segment any volume takes, which a set size can raise past the budget's rule
@@ -1462,7 +1459,6 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         queues,
         spare_groups,
         windows,
-        window_copies,
         slot_files,
         free_slots: Mutex::new(free_slots),
         encoders: Pool::new(encoders),
@@ -1704,7 +1700,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         idle_seals: AtomicU64::new(0),
         unlanded_bytes: AtomicU64::new(0),
         scans_use_cache: AtomicBool::new(false),
-        scans_weighed_at: AtomicU64::new(0),
+        is_scan_cache_weighed: AtomicBool::new(false),
         rooms_given_back: AtomicU64::new(0),
         seal_full_waits: AtomicU64::new(0),
         progress: Arc::clone(progress),

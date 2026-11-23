@@ -15,7 +15,7 @@ use reel_core::units::{ByteCount, FileOffset};
 use crate::guard::hold;
 use crate::io::spin_clock::SpinClock;
 use crate::io::plain_file::PlainFile;
-use crate::io::ring::{RING_SLOT_BYTES, RING_SLOTS, RingDriver, reap_spin};
+use crate::io::ring::{RING_SLOT_BYTES, RING_SLOTS, RingDriver};
 use crate::pool::TOUCH_BYTE;
 
 /// The submission queue's length, past any read a ring can hold in flight with its poke beside them
@@ -28,8 +28,7 @@ pub const BUFFER_INDEX: u16 = 0;
 /// it stays up and a start costs no syscall. A trickle of reads further apart than this wakes it once a read and keeps it up
 /// for this long after, so its CPU follows the read rate. At 10 ms a read every 20 ms would keep it up half the time
 pub const SUBMIT_IDLE_MS: u32 = 1;
-/// How long a reaper looks at the completions in memory before it waits in the kernel. On the ccx33 150 us took a cold read from
-/// 141 us to 120, and 400 us bought nothing more
+/// How long a reaper looks at the completions in memory before it waits in the kernel
 pub const REAP_SPIN: Duration = Duration::from_micros(150);
 
 /// The slots' bytes, which the kernel writes behind the compiler's back
@@ -171,4 +170,10 @@ impl RingDriver<PlainFile> for UringDriver {
     fn heap_bytes(&self) -> ByteCount {
         ByteCount((RING_SLOTS * RING_SLOT_BYTES) as u64)
     }
+}
+
+/// How long a reaper looks at the completions in memory before it waits in the kernel. A read in flight lands soon, and with
+/// none in flight a look finds nothing, so a reaper spins only while reads are out and its CPU follows the read rate
+fn reap_spin(in_flight: usize, most: Duration) -> Duration {
+    if in_flight > 0 { most } else { Duration::ZERO }
 }

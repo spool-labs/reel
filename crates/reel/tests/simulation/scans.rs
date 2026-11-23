@@ -1221,7 +1221,8 @@ fn batch_value(number: u64) -> Vec<u8> {
 // again from the key it stands on when the batch's segment leaves under it
 #[test]
 fn scans_read_values_in_batches() {
-    let batch_keys = reel::engine::scan_state::BATCH_KEYS as u64;
+    // an untold walk's first batch takes FIRST_UNTOLD_KEYS keys
+    let batch_keys = reel::engine::scan_state::FIRST_UNTOLD_KEYS as u64;
     let io = SimulatedIo::new(Seed(44));
     let store = open(&io);
     hold_compaction(&store, true);

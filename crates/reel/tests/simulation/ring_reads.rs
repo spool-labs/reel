@@ -13,7 +13,7 @@ use reel::engine::read_path::RecordWant;
 use reel::engine::reel_store::ReelStore;
 use reel::engine::ring_job::RingReaper;
 use reel::guard::hold;
-use reel::io::{InPlace, Io, IoFile};
+use reel::io::{InPlace, Io, IoFile, ManyRead};
 use reel::io::job::{Job, JobStep};
 use reel::io::ring::{RING_READS, RING_SLOT_BYTES, RING_SLOTS, ReadRing};
 use reel::record::codec::Codec;
@@ -426,28 +426,6 @@ fn wake_passes_a_caller_that_left() {
     assert_eq!(wakes.0.load(Ordering::Acquire), 1, "a seat is free and the caller in line sleeps");
 }
 
-// a wake that came to a caller who left passes to the next, so a dropped read never strands the line
-#[test]
-fn woken_caller_hands_on() {
-    let (_io, store) = ringed(33);
-    let ring = ring(&store);
-    let mut seats: Vec<_> = (0..RING_READS).map(|_seat| ring.try_seat().expect("open").expect("a free seat")).collect();
-    let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
-    let waker = Waker::from(Arc::clone(&wakes));
-    let mut context = Context::from_waker(&waker);
-    {
-        let mut first = pin!(ring.seat());
-        assert!(first.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
-        let mut second = Box::pin(ring.seat());
-        assert!(second.as_mut().poll(&mut context).is_pending());
-        drop(seats.pop());
-        assert_eq!(wakes.0.load(Ordering::Acquire), 0);
-        let taken = ring.try_seat().expect("open");
-        drop(taken);
-    }
-    drop(seats);
-}
-
 // a slot coming back wakes a caller waiting for a slot, with a caller waiting for a seat ahead of it in line
 #[test]
 fn slot_wake_reaches_a_slot_waiter() {
@@ -766,6 +744,36 @@ fn full_ring_reads_plainly() {
     ring.read_into_now(&file, FileOffset(0), &mut buf).expect("read");
     assert_eq!(buf, bytes);
     drop(leases);
+    store.close().expect("close");
+}
+
+// a blocking read on a file system that refuses reads that won't wait reads on its own thread, and never waits on the ring
+#[test]
+fn refused_try_reads_plainly() {
+    let (io, store) = ringed(46);
+    let path = PathBuf::from("/refused-read");
+    let file = io.create_file(&path, ByteCount(0)).expect("create");
+    let bytes: Vec<u8> = (0..RING_SLOT_BYTES / 2).map(|at| (at % 251) as u8).collect();
+    file.write_at(FileOffset(0), &[IoSlice::new(&bytes)]).expect("write");
+    io.set_refuses_no_wait(true);
+
+    let before = io.try_counts();
+    let ring = ring(&store);
+    let mut buf = vec![0; bytes.len()];
+    ring.read_into_now(&file, FileOffset(0), &mut buf).expect("read");
+    assert_eq!(buf, bytes);
+    let (head, tail) = buf.split_at_mut(bytes.len() / 3);
+    ring.read_parts_now(&file, FileOffset(0), &mut [IoSliceMut::new(head), IoSliceMut::new(tail)]).expect("read");
+    assert_eq!(buf, bytes);
+    buf.fill(0);
+    {
+        let mut many = [Some(ManyRead { file: &file, offset: FileOffset(0), buf: &mut buf, is_done: false })];
+        ring.read_many_now(&mut many);
+        assert!(many[0].as_ref().is_some_and(|read| read.is_done));
+    }
+    assert_eq!(buf, bytes);
+    assert_eq!(try_deltas(&io, before).2, 0, "no read went to the ring");
+    io.set_refuses_no_wait(false);
     store.close().expect("close");
 }
 

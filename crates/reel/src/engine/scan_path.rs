@@ -16,7 +16,7 @@ use crate::engine::open_segment::MOST_WINDOW_RECORD_BYTES;
 use crate::engine::read_path::{HeldPin, KeyRead, Located, MOST_READ_TRIES, RecordWant, SealedRow, newest_located, newest_of};
 use crate::engine::scan_state::{
     BatchEntry, BatchRow, BlockTake, JOIN_GAP, MOST_BATCH_RECORD, MOST_BATCH_RUNS, MOST_WINDOW_RECORD, NO_GENERATION, NO_CHANGES, ScanBatch, batch_room,
-    SCAN_CACHE_PARTS, SCAN_CACHE_WEIGH_EVERY, SEAT_BATCH, ScanRange, ScanState, ScanWindows, SegmentSource, ShardHead,
+    SCAN_CACHE_PARTS, SEAT_BATCH, ScanRange, ScanState, ScanWindows, SegmentSource, ShardHead,
     KeyFrom, SCAN_BATCH_KEYS, held_in, index_of_word, key_in, seek_together, under_prefix,
 };
 use crate::engine::volume::Volume;
@@ -462,7 +462,8 @@ impl<Backend: Io> EngineState<Backend> {
         // a batch takes keys while the records it reads still fit its buffer, so wide records read in batches of fewer keys
         let mut located_bytes = 0;
         // a caller that said how many rows it wants gets no more located than that, the one it asked for now among them
-        let room = batch_room(scan.wanted, scan.asked);
+        let room = batch_room(scan.wanted, scan.asked, scan.untold_room);
+        scan.untold_room = (scan.untold_room * 2).min(SCAN_BATCH_KEYS);
         while scan.batch.entries.len() < room && scan.batch.has_room(located_bytes) {
             let entries = scan.batch.entries.len();
             match self.counted(self.try_step(ReadOn::new(device, volume), directory, scan, Some(point), key, ScanWant::Locate).await) {
@@ -675,21 +676,22 @@ impl<Backend: Io> EngineState<Backend> {
         Some(head.ahead.rows[0])
     }
 
-    /// Say whether the record cache can hold most of a volume's live records, weighed again at most once a period. Scans read
-    /// values from it and keep what they read only then: at a smaller cache a lookup a key mostly misses, and what scans keep
-    /// would push out what gets need
+    /// Say whether the record cache can hold most of a volume's live records. Scans read values from it and keep what they
+    /// read only then: at a smaller cache a lookup a key mostly misses, and what scans keep would push out what gets need
     pub fn scans_use_cache(&self, volume: &Volume<Backend>) -> bool {
-        let now = self.io.now().0.max(1);
-        let weighed = volume.scans_weighed_at.load(Ordering::Relaxed);
-        if now.saturating_sub(weighed) >= SCAN_CACHE_WEIGH_EVERY.0
-            && volume.scans_weighed_at.compare_exchange(weighed, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
-        {
-            let live = hold(&volume.summary).orders().live_bytes();
-            let room = self.record_cache.heap_bytes().0;
-            let is_most = live > 0 && room.saturating_mul(SCAN_CACHE_PARTS) >= live.saturating_mul(SCAN_CACHE_PARTS - 1);
-            volume.scans_use_cache.store(is_most, Ordering::Relaxed);
+        if !volume.is_scan_cache_weighed.load(Ordering::Relaxed) {
+            self.weigh_scan_cache(volume);
         }
         volume.scans_use_cache.load(Ordering::Relaxed)
+    }
+
+    /// Weigh again whether the record cache can hold most of a volume's live records
+    pub fn weigh_scan_cache(&self, volume: &Volume<Backend>) {
+        let live = hold(&volume.summary).orders().live_bytes();
+        let room = self.record_cache.heap_bytes().0;
+        let is_most = live > 0 && room.saturating_mul(SCAN_CACHE_PARTS) >= live.saturating_mul(SCAN_CACHE_PARTS - 1);
+        volume.scans_use_cache.store(is_most, Ordering::Relaxed);
+        volume.is_scan_cache_weighed.store(true, Ordering::Relaxed);
     }
 
     /// Read the batch's records together, from the record cache, a slot's window or joined reads, and leave the rest to own reads
@@ -2019,7 +2021,7 @@ pub fn fill_sorted(index: &SortedKeys, scan: &mut ScanState, passed: &mut Option
             return;
         }
         // the index hands out no more entries than the caller still wants, the one asked for now among them
-        let most = batch_room(scan.wanted, scan.asked).max(1);
+        let most = batch_room(scan.wanted, scan.asked, scan.untold_room).max(1);
         // the read fills the spare, so the batch's entries keep their keys in the index batch it read last
         scan.turn_sorted();
         scan.sorted_entered = entered;

@@ -1978,13 +1978,17 @@ fn writes_beside_batches_match_the_model() {
         for direction in [Direction::Ascending, Direction::Descending] {
             let tally = walk_beside_writer(&store, &io, &mut model, &mut random, &mut fresh, (direction, Some(STEP_WRITE_ONE_IN), false, None));
             println!("seed {seed} {direction:?} beside a writer: {tally:?}");
-            // a batch places again only the heads whose shard took a row, far fewer than every shard
-            assert!(tally.heads_together < tally.fills * shards / 2, "{tally:?}");
+            // a batch places again only the heads whose shard took a row, far fewer than every shard for each BATCH_KEYS keys it
+            // asked, whatever size the batches grew to
+            let stretches = tally.asked.div_ceil(reel::engine::scan_state::BATCH_KEYS as u64);
+            assert!(tally.heads_together < stretches * shards / 2, "{tally:?}");
         }
-        // with no writer every head stays placed across batches, and moves only past a key it showed
+        // with no writer every head stays placed across batches, and is placed again only when a batch runs past the keys it
+        // holds ahead, far fewer times than once for each BATCH_KEYS keys asked
         let tally = walk_beside_writer(&store, &io, &mut model, &mut random, &mut fresh, (Direction::Ascending, None, false, None));
         println!("seed {seed} quiet: {tally:?}");
-        assert!(tally.heads_together <= 2 * shards, "{tally:?}");
+        let stretches = tally.asked.div_ceil(reel::engine::scan_state::BATCH_KEYS as u64);
+        assert!(tally.heads_together < stretches * shards / 8, "{tally:?}");
         check_scans(&store, &model, &mut random);
         store.close().expect("close");
     }

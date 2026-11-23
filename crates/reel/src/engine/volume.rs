@@ -422,9 +422,10 @@ pub struct Volume<Backend: Io> {
     /// Bytes claims took and gave up without landing: a gap in the segment, or a record with no row
     pub unlanded_bytes: AtomicU64,
     /// Whether the record cache can hold most of the volume's live records, so scans read values from it and keep what they
-    /// read, and when that was last weighed
+    /// read, and whether that was weighed since open. Each summary save weighs it again, since only a seal, a merge or an
+    /// unlink moves the live records
     pub scans_use_cache: AtomicBool,
-    pub scans_weighed_at: AtomicU64,
+    pub is_scan_cache_weighed: AtomicBool,
     /// Quiet open segments that gave their room ahead back
     pub rooms_given_back: AtomicU64,
     /// Seals that waited for room, since a full disk makes a seal retry until room comes back

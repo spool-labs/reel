@@ -32,13 +32,6 @@ pub const RING_READ_BYTES: u64 = 256 * 1024;
 /// Callers that wait in line, and any past that look again when the runtime polls them
 pub const MOST_RING_WAITERS: usize = 1_024;
 
-/// How long a reaper looks at the completions in memory before it waits in the kernel. A read in flight lands soon, and with
-/// none in flight a look finds nothing, so a reaper spins only while reads are out and its CPU follows the read rate
-#[cfg(any(target_os = "linux", feature = "test-hooks"))]
-pub fn reap_spin(in_flight: usize, most: Duration) -> Duration {
-    if in_flight > 0 { most } else { Duration::ZERO }
-}
-
 /// A backend's completion queue
 pub trait RingDriver<File>: Send + Sync + 'static {
     /// Start a read into a slot
@@ -478,15 +471,11 @@ impl<File: IoFile, Driver: RingDriver<File>> DeviceReads<File> for OnRing<'_, Dr
     }
 }
 
-/// How long a blocking read with a spin seat spins on its slot before it parks. On the ccx33 a cold 4 KiB read lands in 110 to
-/// 140 us, and 120 to 1000 us all ran the same, while 60 us parked before the read landed and lost 10%
+/// How long a blocking read with a spin seat spins on its slot before it parks
 pub const SEATED_SPIN: Duration = Duration::from_micros(250);
-/// How long a blocking read with no spin seat spins before it parks. On the ccx33 at 8 readers 0 and 10 us ran the same, 30 us
-/// lost 4% and 100 us lost 8%
+/// How long a blocking read with no spin seat spins before it parks
 pub const WAIT_SPIN: Duration = Duration::from_micros(10);
-/// Readers that may spin at once. On the ccx33 a spinning reader took a cold get from 170 us to 142 and gained 10 to 20% at 1 to 4
-/// readers, and at 8 readers 2 seats ran 52 to 55k gets/s against 51 to 53k parked, 4 seats 50k and 6 seats 42k. Beside two busy
-/// threads 6 seats fell to 26k with a 3.3 ms p99, while 2 seats ran 46k
+/// Readers that may spin at once
 pub const SPIN_SEATS: usize = 2;
 
 /// Unparks the thread it was made on
@@ -547,6 +536,10 @@ impl<Driver> ReadRing<Driver> {
         while done < buf.len() {
             match file.try_read_at(FileOffset(offset.0 + done as u64), &mut buf[done..]) {
                 Ok(Some(ByteCount(count))) if count > 0 => done += count as usize,
+                // this thread waits anyway, so with no read that refuses to wait the kernel reads here, with no ring hop
+                Err(error) if error.kind() == ErrorKind::Unsupported => {
+                    return file.read_exact_at(FileOffset(offset.0 + done as u64), &mut buf[done..]);
+                },
                 Ok(Some(_) | None) | Err(_) => break,
             }
         }
@@ -573,7 +566,11 @@ impl<Driver> ReadRing<Driver> {
         let mut piece_count = 0;
         for (index, read) in reads.iter_mut().enumerate().filter_map(|(index, read)| Some((index, read.as_mut()?))) {
             let length = read.buf.len();
-            read.is_done = matches!(read.file.try_read_at(read.offset, read.buf), Ok(Some(ByteCount(count))) if count == length as u64);
+            read.is_done = match read.file.try_read_at(read.offset, read.buf) {
+                Ok(Some(ByteCount(count))) => count == length as u64,
+                Err(error) if error.kind() == ErrorKind::Unsupported => read.file.read_exact_at(read.offset, read.buf).is_ok(),
+                Ok(None) | Err(_) => false,
+            };
             let mut at = 0;
             while !read.is_done && at < length && piece_count < MOST_MANY_READS {
                 let part = (length - at).min(RING_SLOT_BYTES);
@@ -620,8 +617,10 @@ impl<Driver> ReadRing<Driver> {
         if total > RING_SLOT_BYTES {
             return file.read_parts_at(offset, parts);
         }
-        if matches!(file.try_read_parts_at(offset, parts), Ok(Some(ByteCount(count))) if count == total as u64) {
-            return Ok(());
+        match file.try_read_parts_at(offset, parts) {
+            Ok(Some(ByteCount(count))) if count == total as u64 => return Ok(()),
+            Err(error) if error.kind() == ErrorKind::Unsupported => return file.read_parts_at(offset, parts),
+            Ok(_) | Err(_) => {},
         }
         let Some(lease) = self.try_claim()? else {
             return file.read_parts_at(offset, parts);

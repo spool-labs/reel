@@ -423,7 +423,7 @@ pub fn start_descriptor_writeback(_descriptor: RawFd, _offset: FileOffset, _leng
     Ok(())
 }
 
-/// Read parts from what the kernel holds, and say nothing came when the read would block
+/// Read parts from what the kernel holds, and say nothing came when the read would block, or that the file system has no such read
 #[cfg(target_os = "linux")]
 pub fn read_no_wait(descriptor: RawFd, offset: FileOffset, parts: &mut [IoSliceMut<'_>]) -> Result<Option<ByteCount>> {
     let vectors = parts.as_ptr().cast::<libc::iovec>();
@@ -434,8 +434,9 @@ pub fn read_no_wait(descriptor: RawFd, offset: FileOffset, parts: &mut [IoSliceM
     }
     let error = Error::last_os_error();
     match error.raw_os_error() {
-        // a filesystem with no such read answers as one that would block, and the read goes the long way
-        Some(libc::EAGAIN | libc::EOPNOTSUPP) => Ok(None),
+        Some(libc::EAGAIN) => Ok(None),
+        // a file system with no such read says so, and a caller that can wait reads plainly
+        Some(libc::EOPNOTSUPP) => Err(Error::from(ErrorKind::Unsupported)),
         _other => Err(error),
     }
 }

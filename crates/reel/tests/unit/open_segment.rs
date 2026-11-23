@@ -45,3 +45,29 @@ fn read_split_matches_read() {
     let mut past = vec![0_u8; 52];
     assert!(!window.read_split(at, (&mut head, &mut past)), "a tail past the used end read");
 }
+
+// records of every length pushed at every word offset read back whole, alone and in two parts, and lend the same bytes to a send
+#[test]
+fn unaligned_records() {
+    let window = RecordWindow::with_bytes(4_096);
+    window.reset(reel_core::units::FileOffset(0));
+    let mut pushed = Vec::new();
+    let mut records = Vec::new();
+    for length in 0..40_usize {
+        let record: Vec<u8> = (0..length).map(|at| (length * 7 + at) as u8).collect();
+        let split = length / 3;
+        let at = window.push([&record[..split], &record[split..]]);
+        pushed.extend_from_slice(&record);
+        records.push((at, record));
+    }
+    for (at, record) in &records {
+        let mut whole = vec![0_u8; record.len()];
+        assert!(window.read(*at, &mut whole));
+        assert_eq!(&whole, record);
+        let (mut head, mut tail) = (vec![0_u8; record.len() / 2], vec![0_u8; record.len() - record.len() / 2]);
+        assert!(window.read_split(*at, (&mut head, &mut tail)));
+        assert_eq!([head, tail].concat(), *record);
+    }
+    // SAFETY: nothing pushes to the window while the loan lives
+    assert_eq!(unsafe { window.records() }, &pushed[..]);
+}

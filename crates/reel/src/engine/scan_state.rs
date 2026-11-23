@@ -4,7 +4,7 @@ use std::mem;
 
 use reel_core::column_id::ColumnId;
 use reel_core::direction::Direction;
-use reel_core::units::{ByteCount, FileOffset, Nanoseconds, RowCount, WritePlace};
+use reel_core::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
 use crate::index::shard_cursor::{ShardCursor, TreeCursor};
 use crate::index::sorted_keys::{HeldRef, KeyBatch, KeyEntry, MOST_KEY_BYTES};
@@ -120,11 +120,14 @@ pub const MOST_BATCH_RECORD: usize = 8 * 1024;
 /// Records in one segment this close join into one read
 pub const JOIN_GAP: u64 = 4 * 1024;
 
+/// The keys an untold scan's first fill locates
+pub const FIRST_UNTOLD_KEYS: usize = 8;
+
 /// Count the keys a scan's next batch locates: the told rows it still wants, the one asked for now among them, up to
-/// SCAN_BATCH_KEYS, and BATCH_KEYS for a scan told no count, as a get of many keys takes
-pub fn batch_room(wanted: u64, asked: u64) -> usize {
+/// SCAN_BATCH_KEYS, and the untold room for a scan told no count
+pub fn batch_room(wanted: u64, asked: u64, untold_room: usize) -> usize {
     if wanted == u64::MAX {
-        return BATCH_KEYS;
+        return untold_room;
     }
     usize::try_from(wanted.saturating_sub(asked).saturating_add(1)).map_or(SCAN_BATCH_KEYS, |left| left.min(SCAN_BATCH_KEYS))
 }
@@ -330,6 +333,9 @@ pub struct ScanState {
     /// The rows the caller said it wants, and the rows it has asked for with a value
     pub wanted: u64,
     pub asked: u64,
+    /// The keys this scan's next fill locates when told no count. It starts small and doubles each fill, so a short walk
+    /// reads few values and a long one reaches full batches
+    pub untold_room: usize,
     pub batch: ScanBatch,
     /// The pool slot the scan came from, which it goes back to
     pub pool_slot: usize,
@@ -431,8 +437,6 @@ impl SegmentSource {
     }
 }
 
-/// How often a volume weighs whether the record cache can hold most of its live records for scans
-pub const SCAN_CACHE_WEIGH_EVERY: Nanoseconds = Nanoseconds(1_000_000_000);
 /// The cache holds most of a volume when it holds all but one of these parts of its live records
 pub const SCAN_CACHE_PARTS: u64 = 4;
 
@@ -691,6 +695,7 @@ impl ScanState {
             newer_passed_at: None,
             wanted: u64::MAX,
             asked: 0,
+            untold_room: FIRST_UNTOLD_KEYS,
             pool_slot: 0,
         }
     }
@@ -723,6 +728,7 @@ impl ScanState {
         self.is_on_index = false;
         self.wanted = range.wanted.map_or(u64::MAX, |rows| rows.0);
         self.asked = 0;
+        self.untold_room = FIRST_UNTOLD_KEYS;
         self.limit.clear();
         self.has_limit = match range.limit {
             ScanLimit::None => false,

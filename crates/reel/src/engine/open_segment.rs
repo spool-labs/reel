@@ -1,7 +1,7 @@
 //! One segment taking writes: its files, its claims and its waiting rows
 
 use std::ffi::OsStr;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering, fence};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 use std::ops::Deref;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -99,17 +99,22 @@ pub const MOST_WINDOW_RECORD_BYTES: usize = 4 * 1024;
 pub const SET_WINDOW_DIVISOR: usize = 32;
 
 /// Read the window bytes for a volume's set segment size: a 32nd of it, between the largest record a window
-/// takes and RECORD_WINDOW_BYTES, or RECORD_WINDOW_BYTES when it sets none
+/// takes and RECORD_WINDOW_BYTES, or RECORD_WINDOW_BYTES when it sets none. It stays a whole number of words
 pub fn window_bytes_for(set_size: Option<u64>) -> usize {
-    set_size.map_or(RECORD_WINDOW_BYTES, |bytes| (bytes as usize / SET_WINDOW_DIVISOR).clamp(MOST_WINDOW_RECORD_BYTES, RECORD_WINDOW_BYTES))
+    let bytes = set_size.map_or(RECORD_WINDOW_BYTES, |bytes| (bytes as usize / SET_WINDOW_DIVISOR).clamp(MOST_WINDOW_RECORD_BYTES, RECORD_WINDOW_BYTES));
+    bytes - bytes % WORD_BYTES
 }
+
+/// The bytes in one of a window's words
+pub const WORD_BYTES: usize = size_of::<u64>();
 
 /// Records of an open segment on their way to the kernel, in a range of its data file claimed ahead. Only the holder
 /// of the slot's queue lock writes here. A read takes no lock: bytes below `used` never change until a reset, and a
-/// reset moves `generation`, so a read that saw the same generation on both sides read whole bytes
+/// reset moves `generation`, so a read that saw the same generation on both sides read whole bytes. The bytes sit in
+/// words, so a copy moves eight at a time and a read beside a write stays atomic
 #[derive(Debug)]
 pub struct RecordWindow {
-    bytes: Vec<AtomicU8>,
+    words: Vec<AtomicU64>,
     generation: AtomicU64,
     start: AtomicU64,
     used: AtomicUsize,
@@ -121,14 +126,16 @@ impl RecordWindow {
         Self::with_bytes(RECORD_WINDOW_BYTES)
     }
 
-    /// Allocate a window of this many bytes with no range yet. A reader's windows take none, since it writes nothing
+    /// Allocate a window of this many bytes, a whole number of words, with no range yet. A reader's windows take none,
+    /// since it writes nothing
     pub fn with_bytes(length: usize) -> Self {
-        let mut bytes = Vec::with_capacity(length);
-        for _byte in 0..length {
-            bytes.push(AtomicU8::new(TOUCH_BYTE));
+        let count = length / WORD_BYTES;
+        let mut words = Vec::with_capacity(count);
+        for _word in 0..count {
+            words.push(AtomicU64::new(u64::from_ne_bytes([TOUCH_BYTE; WORD_BYTES])));
         }
         Self {
-            bytes,
+            words,
             generation: AtomicU64::new(0),
             start: AtomicU64::new(0),
             used: AtomicUsize::new(0),
@@ -137,7 +144,7 @@ impl RecordWindow {
 
     /// Read the heap this window holds
     pub fn heap_bytes(&self) -> ByteCount {
-        ByteCount((self.bytes.capacity() * size_of::<AtomicU8>()) as u64)
+        ByteCount((self.words.capacity() * size_of::<AtomicU64>()) as u64)
     }
 
     /// Count the bytes of records in the window
@@ -174,22 +181,22 @@ impl RecordWindow {
         let offset = FileOffset(self.start().0 + used as u64);
         let mut at = used;
         for part in parts {
-            for byte in part {
-                self.bytes[at].store(*byte, Ordering::Relaxed);
-                at += 1;
-            }
+            self.store_bytes(at, part);
+            at += part.len();
         }
         self.used.store(at, Ordering::Release);
         offset
     }
 
-    /// Copy the records out for a write call
-    pub fn copy_out(&self, out: &mut [u8]) -> usize {
-        let used = self.used();
-        for (byte, stored) in out[..used].iter_mut().zip(&self.bytes) {
-            *byte = stored.load(Ordering::Relaxed);
-        }
-        used
+    /// Lend the window's records for a write call, with no copy
+    ///
+    /// # Safety
+    /// No push may run on this window until the loan ends. The window a slot keeps for its send is one: pushes go to the
+    /// live window, and the kept one takes none until its reset
+    pub unsafe fn records(&self) -> &[u8] {
+        let used = self.used().min(self.words.len() * WORD_BYTES);
+        // SAFETY: the words are plain memory a u64 at a time, nothing stores to them for the loan, and used stays inside them
+        unsafe { std::slice::from_raw_parts(self.words.as_ptr().cast::<u8>(), used) }
     }
 
     /// Check the window may hold a record whole, with no copy. A read still checks it
@@ -210,9 +217,8 @@ impl RecordWindow {
         if at + head.len() + tail.len() > self.used() {
             return false;
         }
-        for (byte, stored) in head.iter_mut().chain(tail.iter_mut()).zip(&self.bytes[at..]) {
-            *byte = stored.load(Ordering::Relaxed);
-        }
+        self.load_bytes(at, head);
+        self.load_bytes(at + head.len(), tail);
         fence(Ordering::Acquire);
         self.generation.load(Ordering::Relaxed) == before
     }
@@ -229,11 +235,59 @@ impl RecordWindow {
         if at + record.len() > self.used() {
             return false;
         }
-        for (byte, stored) in record.iter_mut().zip(&self.bytes[at..]) {
-            *byte = stored.load(Ordering::Relaxed);
-        }
+        self.load_bytes(at, record);
         fence(Ordering::Acquire);
         self.generation.load(Ordering::Relaxed) == before
+    }
+
+    /// Store bytes from a byte offset: a word at a time between the ends, and the words at the ends merged with what they hold
+    fn store_bytes(&self, at: usize, bytes: &[u8]) {
+        let lead = (WORD_BYTES - at % WORD_BYTES) % WORD_BYTES;
+        let (head, rest) = bytes.split_at(lead.min(bytes.len()));
+        self.merge_word(at, head);
+        let first = (at + head.len()) / WORD_BYTES;
+        let (whole, tail) = rest.as_chunks::<WORD_BYTES>();
+        for (word, chunk) in self.words[first..first + whole.len()].iter().zip(whole) {
+            word.store(u64::from_ne_bytes(*chunk), Ordering::Relaxed);
+        }
+        self.merge_word((first + whole.len()) * WORD_BYTES, tail);
+    }
+
+    /// Load bytes from a byte offset: a word at a time between the ends, and part of the words at the ends
+    fn load_bytes(&self, at: usize, out: &mut [u8]) {
+        let lead = (WORD_BYTES - at % WORD_BYTES) % WORD_BYTES;
+        let (head, rest) = out.split_at_mut(lead.min(out.len()));
+        self.load_part(at, head);
+        let first = (at + head.len()) / WORD_BYTES;
+        let (whole, tail) = rest.as_chunks_mut::<WORD_BYTES>();
+        let count = whole.len();
+        for (chunk, word) in whole.iter_mut().zip(&self.words[first..first + count]) {
+            *chunk = word.load(Ordering::Relaxed).to_ne_bytes();
+        }
+        self.load_part((first + count) * WORD_BYTES, tail);
+    }
+
+    /// Store bytes inside one word, keeping the word's other bytes. Only the queue lock's holder writes, so nothing changes
+    /// the word between its load and its store
+    fn merge_word(&self, at: usize, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let word = &self.words[at / WORD_BYTES];
+        let mut held = word.load(Ordering::Relaxed).to_ne_bytes();
+        let within = at % WORD_BYTES;
+        held[within..within + bytes.len()].copy_from_slice(bytes);
+        word.store(u64::from_ne_bytes(held), Ordering::Relaxed);
+    }
+
+    /// Load bytes inside one word
+    fn load_part(&self, at: usize, out: &mut [u8]) {
+        if out.is_empty() {
+            return;
+        }
+        let held = self.words[at / WORD_BYTES].load(Ordering::Relaxed).to_ne_bytes();
+        let within = at % WORD_BYTES;
+        out.copy_from_slice(&held[within..within + out.len()]);
     }
 }
 

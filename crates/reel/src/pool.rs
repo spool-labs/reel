@@ -366,9 +366,7 @@ pub fn touched_buffer(capacity: usize) -> Vec<u8> {
 
 /// Allocate zeroed bytes with every page written
 pub fn touched_zeroes(length: usize) -> Vec<u8> {
-    let mut bytes = touched_filled(length, TOUCH_BYTE);
-    bytes.fill(0);
-    bytes
+    touched_filled(length, 0)
 }
 
 /// Allocate an empty queue with room for its items and every page of that room written
@@ -420,8 +418,12 @@ pub fn touched_room<Item>(capacity: usize) -> Vec<Item> {
 
 /// Allocate a list of one value with every page written
 pub fn touched_filled<Item: Clone>(length: usize, value: Item) -> Vec<Item> {
-    let mut items = touched_capacity(length, value.clone());
+    let mut items: Vec<Item> = Vec::with_capacity(length);
+    ask_huge_pages(items.as_mut_ptr(), length);
+    // the pointer counts as seen before the writes, so a compiler can't turn a fill of zeros into a zeroed allocation
+    black_box(items.as_mut_ptr());
     items.resize(length, value);
+    black_box(items.as_mut_slice());
     items
 }
 

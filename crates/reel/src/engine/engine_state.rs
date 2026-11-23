@@ -108,7 +108,6 @@ pub struct EngineState<Backend: Io> {
     pub queues: Vec<Mutex<RowQueue>>,
     pub spare_groups: Vec<Mutex<Option<RowGroupBuffer>>>,
     pub windows: Vec<[RecordWindow; 2]>,
-    pub window_copies: Vec<Mutex<Vec<u8>>>,
     pub slot_files: Vec<SlotFile<Backend::File>>,
     pub free_slots: Mutex<Vec<OpenSlot>>,
     pub encoders: Pool<RecordEncoder>,
@@ -363,6 +362,8 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// Write a volume's summary whole from a copy, so no lock is held over the writes, and one save runs at a time
     pub fn save_summary(&self, volume: &Volume<Backend>) -> Result<(), Error> {
+        // a save follows every change to the live records, so the scans' weigh of the cache follows them too
+        self.weigh_scan_cache(volume);
         volume.summary_buffer.with(|buffer| {
             let started = self.io.now();
             let cpu_started = thread_cpu();
@@ -842,9 +843,6 @@ impl<Backend: Io> EngineState<Backend> {
         }
         for windows in &self.windows {
             report.queues = ByteCount(report.queues.0 + windows[0].heap_bytes().0 + windows[1].heap_bytes().0);
-        }
-        for copy in &self.window_copies {
-            report.queues = ByteCount(report.queues.0 + hold(copy).capacity() as u64);
         }
         for group in &self.spare_groups {
             if let Some(group) = hold(group).as_ref() {

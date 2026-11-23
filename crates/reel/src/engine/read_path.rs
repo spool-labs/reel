@@ -17,7 +17,7 @@ use crate::engine::open_segment::MOST_WINDOW_RECORD_BYTES; use crate::engine::sc
 use crate::engine::volume::Volume;
 use crate::index::entry_slab::MOST_INLINE_VALUE;
 use crate::index::key_hash::{KeyHash, hash_key};
-use crate::index::record_cache::CacheLookup;
+use crate::index::record_cache::{CacheLookup, MOST_CACHED_BYTES};
 use crate::index::sorted_keys::{LeafAt, SortedKeys};
 use crate::index::spot_index::SpotLocation;
 use crate::index::write_row::{WriteLookup, WriteRow};
@@ -448,6 +448,13 @@ impl<Backend: Io> EngineState<Backend> {
             }
             records.truncate(at);
             return Err(CacheLookup::Miss { is_admitted: false });
+        }
+        // a buffer with room for any cached value takes it straight from the cache, with no stop in the scratch
+        if at + MOST_CACHED_BYTES <= records.capacity() {
+            return match self.record_cache.get_onto(sealed.segment, sealed.row.offset, read.key, records) {
+                CacheLookup::Hit => Ok((at, records.len() - at)),
+                lookup => Err(lookup),
+            };
         }
         let lookup = self.record_cache.get(sealed.segment, sealed.row.offset, read.key, scratch);
         if lookup == CacheLookup::Hit && at + scratch.len() <= records.capacity() {
@@ -889,7 +896,7 @@ impl<Backend: Io> EngineState<Backend> {
         }
 
         let windows = &self.windows[row.slot.0 as usize];
-        // the windows hold the last few records, so most gets miss here before the stack copy is zeroed
+        // the windows hold the last few records, so most gets miss here before any copy
         if !windows.iter().any(|window| window.may_hold(row.offset, length)) {
             return Ok(None);
         }
@@ -918,16 +925,13 @@ impl<Backend: Io> EngineState<Backend> {
             }
             buf.clear();
         }
-        let mut held = [0; MOST_WINDOW_RECORD_BYTES];
-        if !windows.iter().any(|window| window.read(row.offset, &mut held[..length])) {
-            return Ok(None);
-        }
         let window = match want {
             RecordWant::Whole => None,
             RecordWant::Window(window) => Some(window),
         };
-        let outcome = self.record_readers.with(|reader| reader.read_held(&held[..length], &identity, window, buf));
-        Ok(Some(outcome))
+        // the window copies the record straight into the reader's room
+        let fill = |room: &mut [u8]| windows.iter().any(|window| window.read(row.offset, room));
+        Ok(self.record_readers.with(|reader| reader.read_held(length, fill, &identity, window, buf)))
     }
 
     /// Read a record from an open segment through the record cache, and return false when the slot has moved on. A record stays

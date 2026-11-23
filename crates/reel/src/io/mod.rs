@@ -49,7 +49,8 @@ pub trait IoFile: Clone + Send + Sync {
     /// Write every part at the offset in one write call
     fn write_at(&self, offset: FileOffset, parts: &[IoSlice]) -> Result<()>;
 
-    /// Read what the kernel holds with no wait for the device: how many bytes came, or nothing when it would block
+    /// Read what the kernel holds with no wait for the device: how many bytes came, nothing when it would block, or an
+    /// `Unsupported` error on a file system with no such read
     fn try_read_at(&self, offset: FileOffset, buf: &mut [u8]) -> Result<Option<ByteCount>>;
 
     /// Read parts from what the kernel holds in one call, as `try_read_at` does

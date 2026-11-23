@@ -293,9 +293,20 @@ impl CoverPool {
         }
     }
 
-    /// Check the cover at a place is applied
-    pub fn is_place_applied(&self, place: WritePlace) -> bool {
-        self.order.iter().any(|slot| self.slots[*slot as usize].place == place && self.slots[*slot as usize].is_applied)
+    /// Check a cover is applied, found among the covers that start where it starts, so the check reads a few slots
+    pub fn is_applied(&self, cover: &Cover) -> bool {
+        let mut position = self.at_start(cover.column, cover.start);
+        while let Some(slot) = self.order.get(position) {
+            let fields = &self.slots[*slot as usize];
+            if fields.column != cover.column || self.start(*slot) > cover.start {
+                return false;
+            }
+            if fields.place == cover.place {
+                return fields.is_applied;
+            }
+            position += 1;
+        }
+        false
     }
 
     /// Take one cover out, found by its place
@@ -660,7 +671,7 @@ impl RangeCovers {
     /// Check an older cover lies wholly inside a new one
     pub fn has_inside(&self, cover: &Cover) -> bool {
         let pool = self.read();
-        pool.has_inside(cover, pool.is_place_applied(cover.place))
+        pool.has_inside(cover, pool.is_applied(cover))
     }
 
     /// Copy out the cover at a position in key order, or return false past the end
@@ -679,7 +690,7 @@ impl RangeCovers {
     /// a place below the newer cover once they've gone
     pub fn drop_inside(&self, cover: &Cover) {
         let mut pool = self.write();
-        let is_applied = pool.is_place_applied(cover.place);
+        let is_applied = pool.is_applied(cover);
         pool.drop_inside(cover, is_applied);
         let count = pool.order.len();
         drop(pool);

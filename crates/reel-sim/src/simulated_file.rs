@@ -192,6 +192,9 @@ impl IoFile for SimulatedFile {
     }
 
     fn try_read_at(&self, offset: FileOffset, buf: &mut [u8]) -> Result<Option<ByteCount>> {
+        if hold(&self.disk).refuses_no_wait {
+            return Err(Error::from(ErrorKind::Unsupported));
+        }
         let warm = hold(&self.disk).take_try(buf.len());
         if warm == 0 {
             return Ok(None);
@@ -200,6 +203,9 @@ impl IoFile for SimulatedFile {
     }
 
     fn try_read_parts_at(&self, offset: FileOffset, parts: &mut [IoSliceMut]) -> Result<Option<ByteCount>> {
+        if hold(&self.disk).refuses_no_wait {
+            return Err(Error::from(ErrorKind::Unsupported));
+        }
         let total: usize = parts.iter().map(|part| part.len()).sum();
         if hold(&self.disk).take_try(total) < total {
             return Ok(None);

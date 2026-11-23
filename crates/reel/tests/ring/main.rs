@@ -93,17 +93,10 @@ fn filled(root: &Path) -> Store {
     }
     store.close().expect("close");
     drop(store);
-    ReelStore::open(PlainIo::new(), &config(root)).expect("open")
-}
-
-// this kernel gives the store a ring, so every test here reads through it
-#[test]
-fn store_has_a_ring() {
-    let root = root("has");
-    let store = filled(&root);
+    let store = ReelStore::open(PlainIo::new(), &config(root)).expect("open");
+    // this kernel gives the store a ring, so every test here reads through it
     assert!(store.state.ring.is_some());
-    store.close().expect("close");
-    fs::remove_dir_all(&root).expect("remove");
+    store
 }
 
 // each form answers as the blocking call does

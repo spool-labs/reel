@@ -97,7 +97,7 @@ it, since reel can't tell what those deletes hid once their footer is gone.
 
 ## How it compares
 
-Measured on 17 November 2026 at commit cc90e20 on a Hetzner CCX33 (4 cores, 8 threads, 32 GB, local NVMe), one pass, with
+Measured on 17 November 2026 at commit cc90e20 on a machine with 4 cores, 8 threads, 32 GB and local NVMe, one pass, with
 transparent huge pages set to always and each run held to 8 GiB of memory. Every engine gets a 2 GiB cache, 8 loader and 8
 reader threads, and syncs its writes to disk every 4 MiB written: RocksDB syncs its log, fjall its journal, LMDB runs with its
 sync on each commit off and a forced sync at each 4 MiB, and redb can only sync at its next commit. Keys are 16 bytes and

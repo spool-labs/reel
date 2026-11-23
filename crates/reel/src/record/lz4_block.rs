@@ -115,3 +115,24 @@ pub fn decompress_onto(input: &[u8], out: &mut Vec<u8>, length: usize) -> bool {
     unsafe { out.set_len(start + length) };
     true
 }
+
+/// Restore one chunk of unknown length onto the end of a buffer, in the room it already has up to `most` bytes, and return its
+/// length, or nothing when the block is malformed or longer than that room. The buffer keeps the bytes only then
+pub fn decompress_into_room(input: &[u8], out: &mut Vec<u8>, most: usize) -> Option<usize> {
+    if input.len() > MOST_INPUT_BYTES {
+        return None;
+    }
+    let start = out.len();
+    let room = out.spare_capacity_mut();
+    let reach = room.len().min(most).min(c_int::MAX as usize);
+    // SAFETY: the call writes no more than `reach` bytes of the spare room and the input span stays valid for its length
+    let restored = unsafe {
+        LZ4_decompress_safe(input.as_ptr().cast::<c_char>(), room.as_mut_ptr().cast::<c_char>(), input.len() as c_int, reach as c_int)
+    };
+    if restored < 0 {
+        return None;
+    }
+    // SAFETY: the call above wrote `restored` bytes past `start`
+    unsafe { out.set_len(start + restored as usize) };
+    Some(restored as usize)
+}

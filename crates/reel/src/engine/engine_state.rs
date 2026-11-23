@@ -57,7 +57,7 @@ use crate::segment::row_block::ROW_BLOCK_BYTES;
 use crate::segment::column_directory::ColumnDirectory;
 use crate::segment::footer_reader::FooterReader;
 use crate::segment::segment_tail::{MAX_COLUMNS, SegmentNumber};
-use crate::segment::summary::{read_readable, write_summary};
+use crate::segment::summary::{SavedSummary, read_readable, write_summary};
 use crate::superblock::Superblock;
 use crate::write_order::PlaceCount;
 
@@ -363,7 +363,6 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// Write a volume's summary whole from a copy, so no lock is held over the writes, and one save runs at a time
     pub fn save_summary(&self, volume: &Volume<Backend>) -> Result<(), Error> {
-        volume.summary_saves.fetch_add(1, Ordering::Relaxed);
         volume.summary_buffer.with(|buffer| {
             let started = self.io.now();
             let cpu_started = thread_cpu();
@@ -372,9 +371,17 @@ impl<Backend: Io> EngineState<Backend> {
             buffer.extend_from_slice(rows.bytes());
             let forward = rows.highest_forward;
             drop(rows);
+            // both copies already hold these rows, as after a clean close and the open that follows it
+            let saving = SavedSummary::of(buffer, forward);
+            if *hold(&volume.saved_summary) == Some(saving) {
+                return self.save_dead_bits_if_due(volume);
+            }
+            volume.summary_saves.fetch_add(1, Ordering::Relaxed);
             let bytes = buffer.len() as u64;
             self.note_unit(UnitKind::SummaryCopy, bytes, started, cpu_started);
             let saved = write_summary(&self.io, &volume.summary_paths, self.read_point(volume), forward, buffer);
+            // a failed save can leave one copy new and one old
+            *hold(&volume.saved_summary) = saved.is_ok().then_some(saving);
             self.note_unit(UnitKind::SummarySave, bytes, started, cpu_started);
             self.note_written(WriteSource::Summaries, ByteCount(bytes));
             // the bits are a saving of work, so a save of them that fails leaves the summary saved and its rows ask

@@ -24,7 +24,7 @@ use crate::segment::damage_list::DamageList;
 use crate::segment::segment_table::{RetiredSegment, SegmentTable};
 use crate::segment::segment_tail::{BlockCount, MOST_MERGE_SEGMENTS, SegmentNumber};
 use crate::segment::range_covers::RangeCovers;
-use crate::segment::summary::{LostRows, SummaryPaths, SummaryRows};
+use crate::segment::summary::{LostRows, SavedSummary, SummaryPaths, SummaryRows};
 use crate::superblock::SuperblockPaths;
 use crate::write_order::WriteOrder;
 
@@ -521,6 +521,8 @@ pub struct Volume<Backend: Io> {
     pub bits_save: Mutex<BitsSave>,
     pub bits_saved_at: AtomicU64,
     pub lost_rows: Mutex<LostRows>,
+    /// What both summary copies hold, when it is known, so a save of the same rows writes nothing
+    pub saved_summary: Mutex<Option<SavedSummary>>,
     pub summary_buffer: Pool<Vec<u8>>,
     pub damage: DamageList,
     pub covers: RangeCovers,

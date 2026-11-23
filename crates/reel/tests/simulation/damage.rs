@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 use reel::config::{ColumnConfig, ColumnIndex, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel_core::maintenance_report::MaintenanceReport;
 use reel::engine::open_segment::{SegmentPhase, data_path};
 use reel::engine::reel_store::ReelStore;
 use reel::guard::hold;
@@ -703,20 +704,36 @@ fn lost_write() {
     store.close().expect("close");
 }
 
-// close saves the summary with the mark it's current to
+// an open and a close that change no summary row write no summary, and a seal that adds a row writes one
 #[test]
-fn close_mark() {
+fn unchanged_summary_stays() {
     let built = build(17);
     let store = open(&built.io);
+    store.close().expect("close");
+    drop(store);
+
+    let store = open(&built.io);
+    store.close().expect("close");
+    assert_eq!(saves(&store), 0, "a reopen with no new rows wrote the summary");
+    drop(store);
+
+    let store = open(&built.io);
     store.put(ORDERED, b"last", b"value").expect("put");
-    let mark = store.state.read_point(&store.state.volumes[0]);
+    seal(&store, &built.io);
+    assert!(saves(&store) > 0, "a seal left the summary unsaved");
     store.close().expect("close");
     drop(store);
 
     let mut rows = SummaryRows::new(ByteCount(0));
     let saved = read_summary(&built.io, &SummaryPaths::new(Path::new(ROOT)), &mut rows, &mut LostRows::default()).expect("read");
+    assert!(saved.is_some(), "no copy of the summary reads whole");
+    assert!(rows.on_disk.is_some(), "the two copies differ");
+}
 
-    assert_eq!(saved, Some(mark));
+fn saves(store: &Store) -> u64 {
+    let mut report = MaintenanceReport::default();
+    store.maintenance_report(&mut report);
+    report.volumes[0].summary_saves
 }
 
 // rot in a record the last sync covered reads as corruption, and never as the older version under it

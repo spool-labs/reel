@@ -1771,6 +1771,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         held_drain_blocks: AtomicU64::new(0),
         held_drain_bytes: AtomicU64::new(0),
         reserve: ByteCount(volume.segment_bytes.unwrap_or(sizing.segment_bytes).0 * 2),
+        saved_summary: Mutex::new(summary.rows.on_disk),
         summary: Mutex::new(summary.rows),
         open_place,
         open_segment,

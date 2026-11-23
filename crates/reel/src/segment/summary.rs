@@ -153,6 +153,23 @@ pub struct SummaryRows {
     file_bytes: u64,
     orders: SummaryOrders,
     is_checked: bool,
+    /// What both copies on disk hold when open found them alike, so a save of the same rows can leave them
+    pub on_disk: Option<SavedSummary>,
+}
+
+/// The rows and forward number a summary save wrote to both copies
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SavedSummary {
+    pub sum: Checksum,
+    pub length: u64,
+    pub forward: SegmentNumber,
+}
+
+impl SavedSummary {
+    /// Sum the rows a save writes
+    pub fn of(rows: &[u8], forward: SegmentNumber) -> Self {
+        Self { sum: checksum(rows), length: rows.len() as u64, forward }
+    }
 }
 
 /// One row read back
@@ -233,6 +250,7 @@ impl SummaryRows {
             file_bytes: 0,
             orders: SummaryOrders::new(0),
             is_checked: true,
+            on_disk: None,
         }
     }
 
@@ -1064,6 +1082,7 @@ pub fn read_summary<Backend: Io>(
 ) -> Result<Option<WritePlace>> {
     let first = read_copy(io, &paths.current)?;
     let second = read_copy(io, &paths.second)?;
+    rows.on_disk = twins(first.as_ref(), second.as_ref());
     // a row can come from either copy, and a number too high costs an undercount where one too low double counts
     let forward = first.iter().chain(&second).filter_map(|copy| copy.forward).max();
     let (newer, older) = match (first, second) {
@@ -1094,6 +1113,14 @@ pub fn read_summary<Backend: Io>(
         }
     }
     Ok(mark)
+}
+
+/// Sum what both copies hold when each has both its ends and the two match whole, the rows a save of the same bytes would write
+pub fn twins(first: Option<&SummaryCopy>, second: Option<&SummaryCopy>) -> Option<SavedSummary> {
+    let (first, second) = (first?, second?);
+    let is_whole = |copy: &SummaryCopy| copy.header_mark.is_some() && copy.header_mark == copy.trailer_mark;
+    let is_alike = is_whole(first) && is_whole(second) && first.header_mark == second.header_mark && first.forward == second.forward && first.rows == second.rows;
+    is_alike.then(|| SavedSummary::of(&first.rows, first.forward.unwrap_or_default()))
 }
 
 /// Read one copy's marks and rows, or nothing when it's absent. Its rows are read whether or not its ends pass

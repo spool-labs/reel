@@ -1382,3 +1382,31 @@ fn drained_keys_match_stepped_keys() {
     assert_eq!(taken.as_slice(), &stepped[..101]);
     store.close().expect("close");
 }
+
+// a walk at an old point seats only the segments with a row it can show, so more newer segments than a scan has sources
+// leave it whole and unspilled
+#[test]
+fn old_point_skips_newer_segments() {
+    let io = SimulatedIo::new(Seed(45));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    for number in 0..KEYS {
+        store.put(COLUMN, &key(number), b"first").expect("put");
+    }
+    seal(&store, &io);
+    let point = store.state.volumes[0].order.mark();
+    for round in 0..MOST_SCAN_SOURCES as u64 + 8 {
+        for number in (0..KEYS).step_by(16) {
+            store.put(COLUMN, &key(number), format!("round-{round}").as_bytes()).expect("put");
+        }
+        seal(&store, &io);
+    }
+    let range = reel::engine::scan_state::from_key(COLUMN, b"", Direction::Ascending);
+    let mut scan = store.state.take_scan(&range, Some(point)).expect("scan");
+    let found = step_keys(&store, &mut scan, u64::MAX);
+    assert_eq!(found.len() as u64, KEYS);
+    assert!(found.iter().all(|(_key, value)| value == b"first"));
+    assert!(!scan.is_spilled, "a newer segment took a source");
+    store.state.give_back_scan(scan);
+    store.close().expect("close");
+}

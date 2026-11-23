@@ -1755,6 +1755,11 @@ impl<Backend: Io> EngineState<Backend> {
             Seat::NoColumn => return SeatPlace::Moved(SourceMove::Done),
             Seat::Line(seat) => seat,
         };
+        // a segment whose every row is newer than the walk's point holds nothing it shows, so it takes no source. A count
+        // seats it all the same: its keys keep the count from taking an older block by its live rows, which its graves cut
+        if !at.is_counting && seat.head.places.lowest > at.point {
+            return SeatPlace::Moved(SourceMove::Done);
+        }
         let tail = seat.tail;
         source.place_base = seat.head.place_base;
         let can_take = at.is_counting && seat.is_walked && seat.head.places.highest <= at.point;

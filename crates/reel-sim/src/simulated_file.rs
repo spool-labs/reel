@@ -8,7 +8,7 @@ use reel_core::units::{ByteCount, FileOffset, ProcessId};
 use reel::guard::hold;
 use reel::io::IoFile;
 use crate::count_pause::CountPause;
-use crate::simulated_disk::{HandleId, InodeNumber, OperationCount, ReadHook, SimulatedDisk};
+use crate::simulated_disk::{DirectReads, HandleId, InodeNumber, OperationCount, ReadHook, SimulatedDisk};
 
 /// A handle that only works until its close, and only for the process that opened it
 #[derive(Clone, Debug)]
@@ -18,6 +18,8 @@ pub struct SimulatedFile {
     pub handle: HandleId,
     pub process: ProcessId,
     pub is_writable: bool,
+    /// The file was opened direct, so its reads meet the disk's direct-read fault
+    pub is_direct: bool,
 }
 
 impl SimulatedFile {
@@ -70,6 +72,12 @@ impl IoFile for SimulatedFile {
         self.run_read_hook();
         let mut disk = hold(&self.disk);
         self.check(&mut disk, false)?;
+        if self.is_direct && disk.direct_reads == DirectReads::Refused {
+            return Err(Error::from_raw_os_error(libc::EINVAL));
+        }
+        if self.is_direct && disk.direct_reads == DirectReads::Broken {
+            return Err(Error::from_raw_os_error(libc::EIO));
+        }
         if let Some(left) = disk.reads_before_failure {
             disk.reads_before_failure = left.0.checked_sub(1).map(OperationCount);
             if left.0 == 0 {
@@ -97,6 +105,9 @@ impl IoFile for SimulatedFile {
         }
         let count = end - start;
         image.visible.read(start, &mut buf[..count]);
+        if self.is_direct && disk.direct_reads == DirectReads::Flipped && count > 0 {
+            buf[count / 2] ^= 1;
+        }
         disk.reads = OperationCount(disk.reads.0 + 1);
         disk.bytes_read = ByteCount(disk.bytes_read.0 + count as u64);
         Ok(ByteCount(count as u64))

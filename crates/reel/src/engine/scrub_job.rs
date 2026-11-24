@@ -3,11 +3,12 @@
 //! pace climbs from a floor while its own reads stay quick and falls back when they slow or callers burst, so foreground reads
 //! keep their share of the device
 
+use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use reel_core::column_id::ColumnId;
-use reel_core::units::{ByteCount, Nanoseconds, WritePlace};
+use reel_core::units::{ByteCount, FileOffset, Nanoseconds, WritePlace};
 
 use crate::engine::engine_state::EngineState;
 use crate::engine::read_path::newest_of;
@@ -15,7 +16,9 @@ use crate::engine::walk_job::FREE_IN_PLACE_BYTES;
 use crate::guard::hold;
 use crate::io::job::JobStep;
 use crate::engine::scrub_pace::ScrubPace;
-use crate::io::{DeviceReads, InPlace, Io, IoFile, Uncached, in_place};
+use crate::engine::open_segment::data_path;
+use crate::pool::{TOUCH_BYTE, touched_filled};
+use crate::io::{DIRECT_ALIGN, DeviceReads, Direct, InPlace, Io, IoFile, in_place};
 use crate::record::record_check::RecordIdentity;
 use crate::record::record_reader::{RecordLocation, RecordRead};
 use crate::row_kind::RowKind;
@@ -57,6 +60,20 @@ pub struct ScrubJob<Backend: Io> {
     block_bytes: Vec<u8>,
     key: Vec<u8>,
     value: Vec<u8>,
+    /// The segment a direct handle is open on, for the pace's probe: one aligned read a second that skips the page cache both
+    /// ways, so its time is the device's whatever the cache holds
+    probe: Option<(SegmentNumber, Backend::File)>,
+    probe_bytes: Vec<u8>,
+    probed_at: Nanoseconds,
+    probe_seed: u64,
+    /// The first record the last step left unchecked: its segment, offset and length, for the probe to read a page of
+    probe_target: Option<(SegmentNumber, FileOffset, ByteCount)>,
+    /// The aligned buffer a long record's direct read goes through, grown to the longest record, so a pass at its cap
+    /// allocates nothing a record
+    direct_scratch: Vec<u8>,
+    /// A direct read failed where a plain one of the same record passed, so the device or mount refuses direct reads, and the job
+    /// reads plainly from then on with no probe
+    is_direct_refused: bool,
 }
 
 impl<Backend: Io> ScrubJob<Backend> {
@@ -77,6 +94,111 @@ impl<Backend: Io> ScrubJob<Backend> {
             block_bytes: Vec::new(),
             key: Vec::new(),
             value: Vec::new(),
+            probe: None,
+            // twice the alignment, so an aligned read fits wherever the allocation starts, and written at open as every buffer is
+            probe_bytes: touched_filled(2 * DIRECT_ALIGN, TOUCH_BYTE),
+            probed_at: Nanoseconds(0),
+            probe_seed: 0x9E37_79B9_7F4A_7C15,
+            probe_target: None,
+            direct_scratch: Vec::new(),
+            is_direct_refused: false,
+        }
+    }
+
+    /// Time one aligned read of the segment past the page cache, at most once a second, and give the pace its time. A system with
+    /// no direct read gives none, and the pace holds at its floor with the burst rule alone
+    fn probe_device(&mut self, segment: SegmentNumber, now: Nanoseconds) {
+        if now.0.saturating_sub(self.probed_at.0) < NANOS_PER_SECOND {
+            return;
+        }
+        self.probed_at = now;
+        let state = Arc::clone(&self.state);
+        if !self.open_direct(segment) {
+            return;
+        }
+        // the probe reads a page of the next record the pass has yet to check: bytes a write put there, so never a hole or room
+        // that reads as zeros with no device read, and bytes nothing read lately, so never the drive's own cache
+        let Some((target, start, length)) = self.probe_target.take() else {
+            return;
+        };
+        let Some((_segment, file)) = self.probe.as_ref().filter(|(number, _file)| *number == target) else {
+            return;
+        };
+        let first = start.0 / DIRECT_ALIGN as u64;
+        let pages = (start.0 + length.0.max(1)).div_ceil(DIRECT_ALIGN as u64) - first;
+        // a step of a 64-bit mixer picks the page inside a long record
+        self.probe_seed = self.probe_seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        let offset = FileOffset((first + (self.probe_seed >> 11) % pages) * DIRECT_ALIGN as u64);
+        let skip = self.probe_bytes.as_ptr().align_offset(DIRECT_ALIGN);
+        let buf = &mut self.probe_bytes[skip..skip + DIRECT_ALIGN];
+        let started = state.io.now();
+        if file.read_exact_at(offset, buf).is_ok() {
+            self.pace.note_read(Nanoseconds(state.io.now().0.saturating_sub(started.0)), DIRECT_ALIGN as u64);
+        }
+    }
+
+    /// Once a second, pick a record of the loaded block the pass has yet to check and time a page of it past the page cache. It runs
+    /// whether or not the rate lets the pass check this step, so the pace has its samples at any rate
+    fn probe_ahead(&mut self, now: Nanoseconds) {
+        if now.0.saturating_sub(self.probed_at.0) < NANOS_PER_SECOND {
+            return;
+        }
+        let Some((segment, block)) = self.loaded else {
+            return;
+        };
+        let Some(column) = self.state.volumes[self.volume].table.walk_block(segment, block).map(|line| line.column) else {
+            return;
+        };
+        let Some(place_base) = self.state.volumes[self.volume].table.pin(segment).map(|pin| pin.head.place_base) else {
+            return;
+        };
+        let Some(mut ahead) = RowBlockWalk::open_checked(&self.block_bytes, place_base) else {
+            return;
+        };
+        if ahead.rows() <= self.rows_done {
+            return;
+        }
+        self.probe_seed = self.probe_seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        let pick = self.rows_done + 1 + (self.probe_seed >> 11) as usize % (ahead.rows() - self.rows_done);
+        let mut at = 0;
+        while let Some(row) = ahead.next_row(&mut self.key) {
+            at += 1;
+            // a large record a free punched keeps its row but reads as zeros with no device read, so the probe takes a long
+            // record only while it is its key's newest
+            if at >= pick && row.kind == RowKind::Value && (row.length < FREE_IN_PLACE_BYTES || self.is_newest(column, row.place)) {
+                self.probe_target = Some((segment, row.offset, row.length));
+                break;
+            }
+        }
+        self.probe_device(segment, now);
+    }
+
+    /// Hold a direct handle on a segment, opening it when the one held is another's, and say whether one is held
+    fn open_direct(&mut self, segment: SegmentNumber) -> bool {
+        if self.is_direct_refused {
+            self.close_probe();
+            return false;
+        }
+        if self.probe.as_ref().is_some_and(|(number, _file)| *number == segment) {
+            return true;
+        }
+        self.close_probe();
+        let state = Arc::clone(&self.state);
+        let volume = &state.volumes[self.volume];
+        let Some(root) = volume.table.root_of(segment) else {
+            return false;
+        };
+        let Ok(Some(file)) = state.io.open_direct(&data_path(&volume.roots[root.0 as usize], segment)) else {
+            return false;
+        };
+        self.probe = Some((segment, file));
+        true
+    }
+
+    /// Close the probe's direct handle, once
+    fn close_probe(&mut self) {
+        if let Some((_segment, file)) = self.probe.take() {
+            self.state.io.close_file(file);
         }
     }
 
@@ -84,6 +206,12 @@ impl<Backend: Io> ScrubJob<Backend> {
     #[cfg(feature = "test-hooks")]
     pub fn current_rate(&self) -> u64 {
         self.pace.rate()
+    }
+
+    /// Say the job stopped reading direct, after a direct read failed where a plain one passed
+    #[cfg(feature = "test-hooks")]
+    pub fn is_direct_refused(&self) -> bool {
+        self.is_direct_refused
     }
 
     /// Read the pace's baseline read time a KiB, or nothing before it took a sample
@@ -108,11 +236,13 @@ impl<Backend: Io> ScrubJob<Backend> {
         self.pace.tick(now, self.state.caller_ops.total());
         let rate = self.pace.rate();
         self.state.volumes[self.volume].scrub_rate.store(rate, Ordering::Relaxed);
+        self.probe_ahead(now);
         self.earn(now, rate);
         // a rate that fell takes effect at once: the bank holds at most a second of it
         self.allowance = self.allowance.min(rate as i64);
         if self.allowance <= 0 {
-            let wait = (self.allowance.unsigned_abs() + 1).saturating_mul(NANOS_PER_SECOND) / rate;
+            // the job wakes at least once a second while it waits, so the probe keeps the pace fed at any rate
+            let wait = ((self.allowance.unsigned_abs() + 1).saturating_mul(NANOS_PER_SECOND) / rate).min(NANOS_PER_SECOND);
             return JobStep::IdleUntil { deadline: Nanoseconds(now.0.saturating_add(wait.max(1))) };
         }
         let Some(segment) = self.segment.or_else(|| self.next_segment(None)) else {
@@ -120,7 +250,7 @@ impl<Backend: Io> ScrubJob<Backend> {
             return JobStep::IdleUntil { deadline: self.rest_until };
         };
         self.segment = Some(segment);
-        if !self.check_block(segment) {
+        if !self.check_block(segment, now) {
             self.block = 0;
             self.loaded = None;
             self.segment = self.next_segment(Some(segment));
@@ -147,6 +277,7 @@ impl<Backend: Io> ScrubJob<Backend> {
 
     /// Count a finished pass and rest until the next
     fn end_pass(&mut self, now: Nanoseconds) {
+        self.close_probe();
         self.segment = None;
         self.block = 0;
         self.state.scrub_passes.fetch_add(1, Ordering::Relaxed);
@@ -163,7 +294,7 @@ impl<Backend: Io> ScrubJob<Backend> {
     /// Check the records of a segment's current row block up to a step's bytes, and say whether the segment has more. A segment
     /// that left or failed its check has none. A step stops inside a block once its records pass STEP_BYTES, so the device never
     /// sees more than that at once whatever the rate
-    fn check_block(&mut self, segment: SegmentNumber) -> bool {
+    fn check_block(&mut self, segment: SegmentNumber, now: Nanoseconds) -> bool {
         let state = Arc::clone(&self.state);
         let volume = &state.volumes[self.volume];
         let Some(pin) = volume.table.pin(segment) else {
@@ -177,26 +308,19 @@ impl<Backend: Io> ScrubJob<Backend> {
             return true;
         };
         if self.loaded != Some((segment, self.block)) {
-            // a block the page cache holds answers a read that won't wait, and gives the pace no sample. One that would wait is
-            // read past every cache and timed alone: a fixed size from the device, so the pace's signal is the device and never
-            // the cache or the size of the records under it. Where reads that won't wait are refused the pace takes no samples,
-            // and holds at its floor with the burst rule alone
+            // a block reads plainly: the open read every block, so the page cache holds them already. The pace's time comes from
+            // its own probe, never from a block read
             let length = line.entry.block_length().0 as usize;
             self.block_bytes.resize(length, 0);
-            let at = line.entry.block_at();
-            let warm = pin.file.try_read_at(at, &mut self.block_bytes);
-            if !matches!(warm, Ok(Some(ByteCount(count))) if count as usize == length) {
-                let started = state.io.now();
-                if in_place(Uncached.read_exact(&pin.file, at, &mut self.block_bytes)).is_err() {
-                    return false;
-                }
-                if warm.is_ok() {
-                    self.pace.note_read(Nanoseconds(state.io.now().0.saturating_sub(started.0)), length as u64);
-                }
+            if in_place(InPlace.read_exact(&pin.file, line.entry.block_at(), &mut self.block_bytes)).is_err() {
+                return false;
             }
             self.loaded = Some((segment, self.block));
             self.rows_done = 0;
         }
+        self.probe_ahead(now);
+        // the segment's direct handle opens before the walk, which holds the block, for the long records the walk meets
+        let has_direct = self.open_direct(segment);
         let Some(mut walk) = RowBlockWalk::open_checked(&self.block_bytes, pin.head.place_base) else {
             return false;
         };
@@ -215,14 +339,35 @@ impl<Backend: Io> ScrubJob<Backend> {
             }
             let identity = RecordIdentity { record_key: state.record_key, column: line.column, key: &self.key, kind: row.kind, place: row.place };
             let location = RecordLocation { offset: row.offset, length: row.length };
-            // a long record is read past the page cache, so a pass over the disk leaves the callers' pages alone. A short one reads
-            // plainly, so the records sharing its page come from one device read
-            let read = if row.length.0 >= LEAST_UNCACHED_RECORD {
-                let mut reader = state.record_reader_for(&Uncached);
-                in_place(reader.read_value(&Uncached, &pin.file, location, &identity, info.codec, &mut self.value))
+            // a long record is read from the device through the segment's direct handle, so the scrub checks the disk's copy, leaves
+            // no page behind and touches no page of a caller's. A short one reads plainly, so the records sharing its page come from
+            // one device read. Where no direct read opens, a long one reads plainly too
+            let direct = if row.length.0 >= LEAST_UNCACHED_RECORD && has_direct && !self.is_direct_refused {
+                let device = Direct::new(mem::take(&mut self.direct_scratch));
+                let read = self.probe.as_ref().map(|(_segment, file)| {
+                    let mut reader = state.record_reader_for(&device);
+                    in_place(reader.read_value(&device, file, location, &identity, info.codec, &mut self.value))
+                });
+                self.direct_scratch = device.into_scratch();
+                read
             } else {
-                let mut reader = state.record_reader_for(&InPlace);
-                in_place(reader.read_value(&InPlace, &pin.file, location, &identity, info.codec, &mut self.value))
+                None
+            };
+            // a direct read whose bytes fail their check stands, and so does one the device failed: the disk's copy went bad under a
+            // good one in the page cache, which is what reading direct is for. Any other error may be the read refused, as on a device
+            // whose blocks pass DIRECT_ALIGN or a mount that takes the flag and not the read, so the record reads again plainly and
+            // that decides. A plain read that passes then stops direct reads for the rest of the job
+            let read = match direct {
+                Some(Ok(read)) => Ok(read),
+                Some(Err(error)) if is_media_error(&error) => Ok(RecordRead::Failed),
+                other => {
+                    let mut reader = state.record_reader_for(&InPlace);
+                    let plain = in_place(reader.read_value(&InPlace, &pin.file, location, &identity, info.codec, &mut self.value));
+                    if matches!(other, Some(Err(_))) && matches!(plain, Ok(RecordRead::Valid)) {
+                        self.is_direct_refused = true;
+                    }
+                    plain
+                },
             };
             checked += row.length.0;
             if matches!(read, Ok(RecordRead::Valid)) {
@@ -261,4 +406,9 @@ impl<Backend: Io> ScrubJob<Backend> {
         };
         newest_of(found.row, sealed).place() == Some(place)
     }
+}
+
+/// Say an error is the device failing the bytes, as a bad sector does. A short read or a refused one is not
+fn is_media_error(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::EIO | libc::ENXIO | libc::ENODATA | libc::EBADMSG))
 }

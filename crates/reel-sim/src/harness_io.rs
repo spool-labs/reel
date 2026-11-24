@@ -56,6 +56,10 @@ impl Io for HarnessIo {
         self.plain.open_read_only(path)
     }
 
+    fn open_direct(&self, path: &Path) -> Result<Option<Self::File>> {
+        self.plain.open_direct(path)
+    }
+
     fn can_free_blocks(&self, root: &Path) -> bool {
         self.plain.can_free_blocks(root)
     }

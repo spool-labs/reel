@@ -17,7 +17,7 @@ use reel::io::lock_outcome::LockOutcome;
 use crate::count_pause::CountPause;
 use crate::file_image::{BitMask, SECTOR_BYTES};
 use crate::seeded_random::Seed;
-use crate::simulated_disk::{FileSyncFault, FileWriteFault, InodeNumber, OperationCount, ReadHook, SimulatedDisk, SyncHook};
+use crate::simulated_disk::{DirectReads, FileSyncFault, FileWriteFault, InodeNumber, OperationCount, ReadHook, SimulatedDisk, SyncHook};
 use crate::simulated_file::SimulatedFile;
 use crate::simulated_ring::SimulatedRing;
 use crate::simulated_task::{JobCount, JobIndex, JobSlot, JobWait, SimulatedTask};
@@ -203,6 +203,11 @@ impl SimulatedIo {
     /// Set what a read of the host's memory finds from now on
     pub fn set_host_memory(&self, memory: HostMemory) {
         hold(&self.disk).host_memory = memory;
+    }
+
+    /// Set what reads through a direct handle meet from now on
+    pub fn set_direct_reads(&self, reads: DirectReads) {
+        hold(&self.disk).direct_reads = reads;
     }
 
     /// Make every read that won't wait fail as unsupported, as on a file system with no such read
@@ -403,6 +408,7 @@ impl SimulatedIo {
             handle: disk.open_handle(inode),
             process: disk.process,
             is_writable,
+            is_direct: false,
         }
     }
 }
@@ -443,6 +449,13 @@ impl Io for SimulatedIo {
         disk.enter()?;
         let inode = disk.inode_of(path)?;
         Ok(self.handle(&mut disk, inode, true))
+    }
+
+    // the simulator has no page cache, so a direct file reads the disk as a plain one does, unless a test set a direct-read fault
+    fn open_direct(&self, path: &Path) -> Result<Option<SimulatedFile>> {
+        let mut file = self.open_read_only(path)?;
+        file.is_direct = true;
+        Ok(Some(file))
     }
 
     fn open_read_only(&self, path: &Path) -> Result<SimulatedFile> {

@@ -660,6 +660,9 @@ fn check_sorted((before, seals_before): (MaintenanceReport, u64), (after, seals_
         past,
     );
     let is_exercised = after.sorted_answers > before.sorted_answers && after.sorted_scan_keys > before.sorted_scan_keys && seals_after > seals_before;
+    if !is_exercised || past > 0 {
+        println!("the sorted index went unexercised in the window, or rows went past its capacity");
+    }
     u64::from(!is_exercised || past > 0)
 }
 
@@ -871,6 +874,7 @@ fn main() {
         failures += indexed_arm();
     }
     if unlinked == 0 || (freed == 0 && store_can_free) || rewritten == 0 {
+        println!("the window had too little maintenance: {unlinked} unlinks, {freed} bytes freed in place, {rewritten} rewrites");
         failures += 1;
     }
     if failures + allocations + frees + minor_faults + major_faults + close_allocations > 0 {

@@ -8,7 +8,7 @@ use reel::config::{ColumnConfig, ColumnIndex, KeyShape, NO_WORKERS, StoreConfig,
 use reel::engine::compact_job::CompactJob;
 use reel::engine::open_segment::data_path;
 use reel::engine::reel_store::ReelStore;
-use reel::engine::scrub_job::{STEP_BYTES, ScrubJob};
+use reel::engine::scrub_job::{SCRUB_PASS_REST, STEP_BYTES, ScrubJob};
 use reel::engine::walk_job::FREE_IN_PLACE_BYTES;
 use reel::guard::hold;
 use reel::io::job::JobStep;
@@ -25,6 +25,7 @@ use reel_core::value_list::{ValueAnswer, ValueList};
 use reel_core::store_error::StoreError;
 use reel_core::units::{ByteCount, FileOffset, Nanoseconds, RowCount, VolumeId, WritePlace};
 use reel_sim::file_image::BitMask;
+use reel_sim::simulated_disk::DirectReads;
 use reel_sim::seeded_random::{Seed, SeededRandom};
 use reel_sim::simulated_io::SimulatedIo;
 
@@ -588,7 +589,7 @@ fn a_burst_of_callers_drops_the_scrub_to_its_floor() {
         io.advance_clock(Nanoseconds(250_000_000));
         let _step = job.step_unit(io.now());
     };
-    for _quarter in 0..40 {
+    for _quarter in 0..60 {
         step(&mut job, 2);
     }
     assert!(job.current_rate() > BURST_FLOOR, "the pace never left its floor");
@@ -629,11 +630,11 @@ fn a_step_stops_inside_its_block() {
     store.close().expect("close");
 }
 
-// the pace samples only blocks the device had to read: a block the page cache holds answers a read that won't wait and gives no
-// sample, so cached blocks can't set the baseline at memory speed, and where reads that won't wait are refused it takes none
+// the pace times its own direct probe, so a store whose blocks all sit in the page cache, as they do after an open, still gets a
+// baseline and climbs, as does one on a file system that refuses reads that won't wait
 #[test]
-fn only_device_reads_feed_the_pace() {
-    for (warm_bytes, refuses, is_sampled) in [(usize::MAX, false, false), (0, false, true), (0, true, false)] {
+fn a_warm_store_still_paces() {
+    for (warm_bytes, refuses) in [(usize::MAX, false), (0, false), (0, true)] {
         let io = SimulatedIo::new(Seed(16));
         let store = open(&io, 0);
         for number in 0..PACED_KEYS {
@@ -645,9 +646,103 @@ fn only_device_reads_feed_the_pace() {
         let mut job = ScrubJob::new(Arc::clone(&store.state), 0);
         job.rate = PACED_FLOOR;
         scrub_one_pass(&store, &io, &mut job);
-        assert_eq!(job.baseline().is_some(), is_sampled, "warm {warm_bytes} refused {refuses}: baseline {:?}", job.baseline());
+        assert!(job.baseline().is_some(), "warm {warm_bytes} refused {refuses}: no baseline");
+        assert!(job.current_rate() > PACED_FLOOR, "warm {warm_bytes} refused {refuses}: the pace never left its floor");
         io.set_warm_bytes(0);
         io.set_refuses_no_wait(false);
         store.close().expect("close");
     }
+}
+
+const LONG_KEYS: u64 = 40;
+const LONG_VALUE: usize = 128 * 1024;
+
+// a long record is read from the device through the segment's direct handle: a clean pass over long records finds nothing, and a
+// byte flipped deep inside one is found and its segment marked
+#[test]
+fn long_records_are_checked_through_the_direct_handle() {
+    let io = SimulatedIo::new(Seed(17));
+    let store = open(&io, 0);
+    for number in 0..LONG_KEYS {
+        store.put(COLUMN, &key(number), &vec![(number % 251) as u8; LONG_VALUE]).expect("put");
+    }
+    let segment = seal(&store, &io);
+    let mut job = ScrubJob::new(Arc::clone(&store.state), 0);
+    job.rate = RATE;
+    scrub_one_pass(&store, &io, &mut job);
+    assert_eq!(store.state.scrub_failures.load(Ordering::Relaxed), 0, "a clean pass over long records failed one");
+    assert!(store.state.scrub_bytes.load(Ordering::Relaxed) >= LONG_KEYS * LONG_VALUE as u64);
+
+    let volume = &store.state.volumes[0];
+    let name = key(LONG_KEYS / 2);
+    let read_at = store.state.key_read(COLUMN, &name, store.state.read_point(volume), false).expect("read");
+    let row = in_place(store.state.search_sealed(&InPlace, volume, &read_at)).expect("search").expect("a sealed row");
+    io.rot(&data_path(&volume.roots[0], row.segment), FileOffset(row.row.offset.0 + row.row.length.0 - 5_000), BitMask(1)).expect("rot");
+    io.advance_clock(SCRUB_PASS_REST);
+    scrub_one_pass(&store, &io, &mut job);
+    assert_eq!(store.state.scrub_failures.load(Ordering::Relaxed), 1, "the flipped byte in a long record went unseen");
+    assert!(hold(&volume.damaged).contains(&segment));
+    store.close().expect("close");
+}
+
+// a store whose direct reads are refused, as on a device whose blocks pass the alignment or a mount that takes the flag and not
+// the read, checks every long record plainly, and the refusal marks nothing damaged
+#[test]
+fn refused_direct_reads_mark_nothing() {
+    let io = SimulatedIo::new(Seed(18));
+    let store = open(&io, 0);
+    for number in 0..LONG_KEYS {
+        store.put(COLUMN, &key(number), &vec![(number % 251) as u8; LONG_VALUE]).expect("put");
+    }
+    seal(&store, &io);
+    io.set_direct_reads(DirectReads::Refused);
+    let mut job = ScrubJob::new(Arc::clone(&store.state), 0);
+    job.rate = RATE;
+    scrub_one_pass(&store, &io, &mut job);
+    assert_eq!(store.state.scrub_failures.load(Ordering::Relaxed), 0, "a refused direct read counted as rot");
+    assert!(hold(&store.state.volumes[0].damaged).is_empty(), "a refused direct read marked damage");
+    assert!(store.state.scrub_bytes.load(Ordering::Relaxed) >= LONG_KEYS * LONG_VALUE as u64, "the pass skipped records");
+    io.set_direct_reads(DirectReads::Plain);
+    store.close().expect("close");
+}
+
+// a disk copy that rotted under a clean copy in the page cache reads wrong through the direct handle, and the scrub marks it,
+// though a plain read of the same record would pass
+#[test]
+fn rot_under_a_clean_cached_copy_is_found() {
+    let io = SimulatedIo::new(Seed(19));
+    let store = open(&io, 0);
+    for number in 0..LONG_KEYS {
+        store.put(COLUMN, &key(number), &vec![(number % 251) as u8; LONG_VALUE]).expect("put");
+    }
+    let segment = seal(&store, &io);
+    io.set_direct_reads(DirectReads::Flipped);
+    let mut job = ScrubJob::new(Arc::clone(&store.state), 0);
+    job.rate = RATE;
+    scrub_one_pass(&store, &io, &mut job);
+    assert!(store.state.scrub_failures.load(Ordering::Relaxed) > 0, "rot read through the direct handle went unseen");
+    assert!(hold(&store.state.volumes[0].damaged).contains(&segment));
+    io.set_direct_reads(DirectReads::Plain);
+    store.close().expect("close");
+}
+
+// a device error on a direct read is a bad sector under a good copy in the page cache: it stands as a failure and marks the
+// segment, with no plain read the cache could answer, and the job goes on reading direct
+#[test]
+fn a_device_error_on_a_direct_read_is_found() {
+    let io = SimulatedIo::new(Seed(20));
+    let store = open(&io, 0);
+    for number in 0..LONG_KEYS {
+        store.put(COLUMN, &key(number), &vec![(number % 251) as u8; LONG_VALUE]).expect("put");
+    }
+    let segment = seal(&store, &io);
+    io.set_direct_reads(DirectReads::Broken);
+    let mut job = ScrubJob::new(Arc::clone(&store.state), 0);
+    job.rate = RATE;
+    scrub_one_pass(&store, &io, &mut job);
+    assert!(store.state.scrub_failures.load(Ordering::Relaxed) > 0, "a device error on a direct read went unseen");
+    assert!(hold(&store.state.volumes[0].damaged).contains(&segment));
+    assert!(!job.is_direct_refused(), "a device error read as a refusal");
+    io.set_direct_reads(DirectReads::Plain);
+    store.close().expect("close");
 }

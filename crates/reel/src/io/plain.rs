@@ -136,6 +136,21 @@ impl Io for PlainIo {
         Ok(PlainFile::new(File::open(path)?))
     }
 
+    #[cfg(target_os = "linux")]
+    fn open_direct(&self, path: &Path) -> Result<Option<PlainFile>> {
+        Ok(Some(PlainFile::new(OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(path)?)))
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn open_direct(&self, path: &Path) -> Result<Option<PlainFile>> {
+        let file = File::open(path)?;
+        // SAFETY: the descriptor is open, and no pointer crosses the call
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) } != 0 {
+            return Err(Error::last_os_error());
+        }
+        Ok(Some(PlainFile::new(file)))
+    }
+
     fn can_free_blocks(&self, root: &Path) -> bool {
         let path = root.join(FREE_PROBE_NAME);
         let probe = OpenOptions::new().read(true).write(true).create(true).truncate(true).mode(FILE_MODE).custom_flags(libc::O_NOFOLLOW).open(&path);

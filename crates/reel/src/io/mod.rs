@@ -79,12 +79,6 @@ pub trait IoFile: Clone + Send + Sync {
     /// it is
     fn reserve_to(&self, end: ByteCount) -> Result<()>;
 
-    /// Read parts whole and leave none of the pages the read brought in held by the kernel, for a pass over the whole disk that
-    /// shouldn't push the callers' pages out. A file with no such read reads plainly
-    fn read_parts_uncached(&self, offset: FileOffset, parts: &mut [IoSliceMut]) -> Result<()> {
-        self.read_parts_at(offset, parts)
-    }
-
     /// Hold the disk's space from a start through an end, for a caller that already holds what comes before the start
     fn reserve_range(&self, _from: FileOffset, end: ByteCount) -> Result<()> {
         self.reserve_to(end)
@@ -236,17 +230,71 @@ impl<File: IoFile> DeviceReads<File> for InPlace {
     }
 }
 
-/// Reads on the calling thread that leave none of the pages they brought in held by the kernel, for the scrub's pass
-#[derive(Clone, Copy, Debug)]
-pub struct Uncached;
+/// The alignment a read through a direct file needs for its buffer, offset and length
+pub const DIRECT_ALIGN: usize = 4096;
 
-impl<File: IoFile> DeviceReads<File> for Uncached {
+/// Reads through a direct handle, which take a buffer, offset and length aligned to DIRECT_ALIGN: each read rounds its span out
+/// into an aligned scratch buffer, reads it from the device past the page cache, and copies its own bytes out. The scrub reads a
+/// long record this way, so it checks the disk's copy, leaves no page behind and touches no page of a caller's
+#[derive(Debug)]
+pub struct Direct {
+    scratch: std::sync::Mutex<Vec<u8>>,
+}
+
+impl Direct {
+    /// Read through a scratch buffer the caller keeps between reads, which grows to the longest span read
+    pub fn new(scratch: Vec<u8>) -> Self {
+        Self { scratch: std::sync::Mutex::new(scratch) }
+    }
+
+    /// Give the scratch buffer back for the next reads
+    pub fn into_scratch(self) -> Vec<u8> {
+        match self.scratch.into_inner() {
+            Ok(scratch) => scratch,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Fill the parts from the offset with one aligned read that covers them
+    fn read_aligned<File: IoFile>(&self, file: &File, offset: FileOffset, parts: &mut [IoSliceMut<'_>]) -> Result<()> {
+        let align = DIRECT_ALIGN as u64;
+        let length: u64 = parts.iter().map(|part| part.len() as u64).sum();
+        let start = offset.0 / align * align;
+        let span = (offset.0 + length).div_ceil(align) * align - start;
+        let mut scratch = crate::guard::hold(&self.scratch);
+        let room = span as usize + DIRECT_ALIGN;
+        if scratch.len() < room {
+            scratch.resize(room, 0);
+        }
+        let skip = scratch.as_ptr().align_offset(DIRECT_ALIGN);
+        let buf = &mut scratch[skip..skip + span as usize];
+        // the aligned span can run past the file's end, which a read answers short, so it reads until the wanted bytes are in
+        let wanted = (offset.0 + length - start) as usize;
+        let mut got = 0;
+        while got < wanted {
+            let read = file.read_at(FileOffset(start + got as u64), &mut buf[got..])?;
+            if read.0 == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+            }
+            got += read.0 as usize;
+        }
+        let mut at = (offset.0 - start) as usize;
+        for part in parts {
+            let next = at + part.len();
+            part.copy_from_slice(&buf[at..next]);
+            at = next;
+        }
+        Ok(())
+    }
+}
+
+impl<File: IoFile> DeviceReads<File> for Direct {
     fn read_exact(&self, file: &File, offset: FileOffset, buf: &mut [u8]) -> impl Future<Output = Result<()>> + Send {
-        ready(file.read_parts_uncached(offset, &mut [IoSliceMut::new(buf)]))
+        ready(self.read_aligned(file, offset, &mut [IoSliceMut::new(buf)]))
     }
 
     fn read_parts(&self, file: &File, offset: FileOffset, parts: &mut [IoSliceMut<'_>]) -> impl Future<Output = Result<()>> + Send {
-        ready(file.read_parts_uncached(offset, parts))
+        ready(self.read_aligned(file, offset, parts))
     }
 }
 
@@ -364,6 +412,12 @@ pub trait Io: Clone + Send + Sync + 'static {
 
     /// Open an existing file to read
     fn open_read_only(&self, path: &Path) -> Result<Self::File>;
+
+    /// Open an existing file whose reads skip the page cache both ways, so a read's time is the device's, or nothing where
+    /// the system has no such read. A read through it takes a buffer, offset and length aligned to DIRECT_ALIGN
+    fn open_direct(&self, _path: &Path) -> Result<Option<Self::File>> {
+        Ok(None)
+    }
 
     /// Check the filesystem under a root can give a file's blocks back in place
     fn can_free_blocks(&self, root: &Path) -> bool;

@@ -113,6 +113,8 @@ pub struct SimulatedDisk {
     pub warm_bytes: usize,
     pub warm_tries: u64,
     pub refuses_no_wait: bool,
+    /// What reads through a direct handle meet, so a test can refuse them or hand back a flipped byte while plain reads are clean
+    pub direct_reads: DirectReads,
     pub tries: OperationCount,
     pub cold_tries: OperationCount,
     pub ring_reads: OperationCount,
@@ -165,6 +167,7 @@ impl SimulatedDisk {
             warm_bytes: 0,
             warm_tries: 0,
             refuses_no_wait: false,
+            direct_reads: DirectReads::Plain,
             tries: OperationCount::default(),
             cold_tries: OperationCount::default(),
             is_reserve_held: false,
@@ -518,4 +521,18 @@ pub fn apply_name(names: &mut BTreeMap<PathBuf, InodeNumber>, change: &NameChang
             names.remove(path);
         },
     }
+}
+
+/// What a read through a direct handle meets
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DirectReads {
+    /// The bytes on the disk, as a plain read gives
+    #[default]
+    Plain,
+    /// A refusal, as a device whose blocks pass the alignment or a mount that takes the flag and not the read gives
+    Refused,
+    /// A device error, as a bad sector under a good copy in the page cache gives a direct read
+    Broken,
+    /// The disk's bytes with the middle one of each read flipped, as a disk copy rotted under a clean one in the page cache reads direct
+    Flipped,
 }

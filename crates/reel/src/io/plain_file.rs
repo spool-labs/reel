@@ -128,18 +128,6 @@ impl IoFile for PlainFile {
         self.write_remainder(offset, parts, written)
     }
 
-    fn read_parts_uncached(&self, offset: FileOffset, parts: &mut [IoSliceMut]) -> Result<()> {
-        let total: u64 = parts.iter().map(|part| part.len() as u64).sum();
-        match read_dropping(self.descriptor, offset, parts) {
-            Ok(count) if count.0 == total => return Ok(()),
-            // a short read or a file system with no such read finishes plainly, then lets the range's pages go
-            Ok(_) | Err(_) => {},
-        }
-        self.read_parts_at(offset, parts)?;
-        drop_cached(self.descriptor, offset, ByteCount(total));
-        Ok(())
-    }
-
     fn try_read_at(&self, offset: FileOffset, buf: &mut [u8]) -> Result<Option<ByteCount>> {
         read_no_wait(self.descriptor, offset, &mut [IoSliceMut::new(buf)])
     }
@@ -460,50 +448,3 @@ pub fn read_no_wait(descriptor: RawFd, offset: FileOffset, parts: &mut [IoSliceM
 pub fn read_no_wait(_descriptor: RawFd, _offset: FileOffset, _parts: &mut [IoSliceMut<'_>]) -> Result<Option<ByteCount>> {
     Ok(None)
 }
-
-/// The read flag that drops the pages a read brought in once it's done. Kernels from 6.14 take it, on file systems that say so
-#[cfg(target_os = "linux")]
-const RWF_DONTCACHE: libc::c_int = 0x80;
-
-/// Set once a file system refused the dropping read, so later reads go plainly with no failed call first. One refusal covers the
-/// process, which a store on mixed file systems pays by reading its other volumes plainly too
-#[cfg(target_os = "linux")]
-static IS_DROPPING_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Read parts with the kernel dropping the pages the read brought in, or say the file system has no such read
-#[cfg(target_os = "linux")]
-pub fn read_dropping(descriptor: RawFd, offset: FileOffset, parts: &mut [IoSliceMut<'_>]) -> Result<ByteCount> {
-    if IS_DROPPING_REFUSED.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err(Error::from(ErrorKind::Unsupported));
-    }
-    let vectors = parts.as_ptr().cast::<libc::iovec>();
-    // SAFETY: `IoSliceMut` matches `iovec`, and each part stays borrowed for the call
-    let count = unsafe { libc::preadv2(descriptor, vectors, parts.len() as libc::c_int, offset.0 as i64, RWF_DONTCACHE) };
-    if count >= 0 {
-        return Ok(ByteCount(count as u64));
-    }
-    let error = Error::last_os_error();
-    if matches!(error.raw_os_error(), Some(libc::EOPNOTSUPP | libc::EINVAL)) {
-        IS_DROPPING_REFUSED.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-    Err(error)
-}
-
-/// Say no read drops its pages, on a system with no such flag
-#[cfg(not(target_os = "linux"))]
-pub fn read_dropping(_descriptor: RawFd, _offset: FileOffset, _parts: &mut [IoSliceMut<'_>]) -> Result<ByteCount> {
-    Err(Error::from(ErrorKind::Unsupported))
-}
-
-/// Let a range's cached pages go after a plain read. The kernel drops only whole pages inside the range, so a read shorter than a
-/// page drops nothing, and it also drops pages a caller had cached in the range, which only a file system that refuses the
-/// dropping read pays
-#[cfg(target_os = "linux")]
-pub fn drop_cached(descriptor: RawFd, offset: FileOffset, length: ByteCount) {
-    // SAFETY: the descriptor is open, and no pointer crosses the call
-    let _status = unsafe { libc::posix_fadvise(descriptor, offset.0 as i64, length.0 as i64, libc::POSIX_FADV_DONTNEED) };
-}
-
-/// Leave a range's pages to the system, which has no call that drops them
-#[cfg(not(target_os = "linux"))]
-pub fn drop_cached(_descriptor: RawFd, _offset: FileOffset, _length: ByteCount) {}

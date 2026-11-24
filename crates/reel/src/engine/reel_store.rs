@@ -217,6 +217,11 @@ impl<Backend: Io> ReelStore<Backend> {
         self.state.damaged_segments.load(Ordering::Acquire)
     }
 
+    /// Read the rate each volume's scrub checks at now, in bytes a second, by volume id. A scrub that hasn't stepped reads 0
+    pub fn scrub_rates(&self) -> impl Iterator<Item = u64> + '_ {
+        self.state.volumes.iter().map(|volume| volume.scrub_rate.load(Ordering::Relaxed))
+    }
+
     /// Read the least budget a store of this config opens on as a writer, the one a refusal gives, with no store opened: its
     /// parts with the workers the config sets, or none, and no ring
     pub fn least_budget(io: &Backend, config: &StoreConfig) -> Result<ByteCount, StoreError> {
@@ -1754,6 +1759,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         segments_rewritten: AtomicU64::new(0),
         stray_outputs: AtomicU64::new(0),
         reclaim_retries: AtomicU64::new(0),
+        scrub_rate: AtomicU64::new(0),
         has_walk_target: AtomicBool::new(false),
         walk_segment: AtomicU64::new(NO_SEAL),
         is_applying: AtomicBool::new(false),

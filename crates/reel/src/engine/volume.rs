@@ -351,6 +351,8 @@ pub struct Volume<Backend: Io> {
     pub stray_outputs: AtomicU64,
     /// Counts the times a file that has to go would not, which a volume stuck that way shows here
     pub reclaim_retries: AtomicU64,
+    /// The rate the volume's scrub checks at now, in bytes a second, which its pace moves between the floor and many times it
+    pub scrub_rate: AtomicU64,
     /// The walk is part way through a segment
     pub has_walk_target: AtomicBool,
     pub gave_up: Mutex<GaveUp>,

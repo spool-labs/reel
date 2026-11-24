@@ -8,7 +8,7 @@ use reel::config::{ColumnConfig, ColumnIndex, KeyShape, NO_WORKERS, StoreConfig,
 use reel::engine::compact_job::CompactJob;
 use reel::engine::open_segment::data_path;
 use reel::engine::reel_store::ReelStore;
-use reel::engine::scrub_job::ScrubJob;
+use reel::engine::scrub_job::{STEP_BYTES, ScrubJob};
 use reel::engine::walk_job::FREE_IN_PLACE_BYTES;
 use reel::guard::hold;
 use reel::io::job::JobStep;
@@ -540,4 +540,114 @@ fn a_flipped_compressed_payload_is_caught_under_trust() {
     let found = store.get(COLUMN, b"packed", &mut buf);
     assert!(matches!(found, Err(StoreError::Corruption { .. })), "a flipped compressed payload answered: {found:?}");
     store.close().expect("close");
+}
+
+const PACED_KEYS: u64 = 20_000;
+const PACED_FLOOR: u64 = 256 * 1024;
+const BURST_FLOOR: u64 = 64 * 1024;
+const BIG_BLOCK_KEYS: u64 = 2_000;
+
+// a store with no callers lets the scrub climb past its floor, so a pass ends in well under the time the floor alone takes
+#[test]
+fn an_idle_store_scrubs_past_its_floor() {
+    let io = SimulatedIo::new(Seed(13));
+    let store = open(&io, 0);
+    for number in 0..PACED_KEYS {
+        store.put(COLUMN, &key(number), &vec![(number % 251) as u8; 400]).expect("put");
+    }
+    seal(&store, &io);
+    let mut job = ScrubJob::new(Arc::clone(&store.state), 0);
+    job.rate = PACED_FLOOR;
+    let started = io.now();
+    scrub_one_pass(&store, &io, &mut job);
+    let took = io.now().0 - started.0;
+    let at_floor = store.state.scrub_bytes.load(Ordering::Relaxed) * 1_000_000_000 / PACED_FLOOR;
+    assert!(job.current_rate() > PACED_FLOOR, "the pace never left its floor");
+    assert!(took < at_floor / 2, "the pass took {took} ns, and the floor alone takes {at_floor} ns");
+    store.close().expect("close");
+}
+
+// a burst of caller gets drops a climbing scrub to its floor within the step that sees it
+#[test]
+fn a_burst_of_callers_drops_the_scrub_to_its_floor() {
+    let io = SimulatedIo::new(Seed(14));
+    let store = open(&io, 0);
+    for number in 0..PACED_KEYS {
+        store.put(COLUMN, &key(number), &vec![(number % 251) as u8; 400]).expect("put");
+    }
+    seal(&store, &io);
+    let mut job = ScrubJob::new(Arc::clone(&store.state), 0);
+    // a low floor keeps the pass running through the burst, since a scrub that ended its pass rests until the next
+    job.rate = BURST_FLOOR;
+    let mut buf = Vec::new();
+    let mut step = |job: &mut ScrubJob<SimulatedIo>, gets: u64| {
+        for number in 0..gets {
+            buf.clear();
+            store.get(COLUMN, &key(number % PACED_KEYS), &mut buf).expect("get");
+        }
+        io.advance_clock(Nanoseconds(250_000_000));
+        let _step = job.step_unit(io.now());
+    };
+    for _quarter in 0..40 {
+        step(&mut job, 2);
+    }
+    assert!(job.current_rate() > BURST_FLOOR, "the pace never left its floor");
+    for _quarter in 0..4 {
+        step(&mut job, 400);
+    }
+    assert!(store.state.scrub_passes.load(Ordering::Relaxed) == 0, "the pass ended before the burst");
+    assert_eq!(job.current_rate(), BURST_FLOOR, "the burst left the scrub above its floor");
+    store.close().expect("close");
+}
+
+// a step checks at most STEP_BYTES of records, and stops inside a row block that holds more, so the device never sees a long
+// burst whatever the rate; the steps that follow carry on from where it stopped and the pass still checks every record
+#[test]
+fn a_step_stops_inside_its_block() {
+    let io = SimulatedIo::new(Seed(15));
+    let store = open(&io, 0);
+    // a row block of 4 KiB values holds several MiB of records, far past one step
+    for number in 0..BIG_BLOCK_KEYS {
+        store.put(COLUMN, &key(number), &vec![(number % 251) as u8; 4096]).expect("put");
+    }
+    seal(&store, &io);
+    let mut job = ScrubJob::new(Arc::clone(&store.state), 0);
+    job.rate = 1024 * 1024 * 1024;
+    let mut most = 0;
+    let mut before = 0;
+    while store.state.scrub_passes.load(Ordering::Relaxed) == 0 {
+        match job.step_unit(io.now()) {
+            JobStep::IdleUntil { deadline } => io.advance_clock(Nanoseconds(deadline.0.saturating_sub(io.now().0).max(1))),
+            _other => {},
+        }
+        let now_checked = store.state.scrub_bytes.load(Ordering::Relaxed);
+        most = most.max(now_checked - before);
+        before = now_checked;
+    }
+    assert!(most <= STEP_BYTES + 8192, "one step checked {most} B");
+    assert!(before >= BIG_BLOCK_KEYS * 4096, "the pass checked {before} B of {} B", BIG_BLOCK_KEYS * 4096);
+    store.close().expect("close");
+}
+
+// the pace samples only blocks the device had to read: a block the page cache holds answers a read that won't wait and gives no
+// sample, so cached blocks can't set the baseline at memory speed, and where reads that won't wait are refused it takes none
+#[test]
+fn only_device_reads_feed_the_pace() {
+    for (warm_bytes, refuses, is_sampled) in [(usize::MAX, false, false), (0, false, true), (0, true, false)] {
+        let io = SimulatedIo::new(Seed(16));
+        let store = open(&io, 0);
+        for number in 0..PACED_KEYS {
+            store.put(COLUMN, &key(number), &vec![(number % 251) as u8; 400]).expect("put");
+        }
+        seal(&store, &io);
+        io.set_warm_bytes(warm_bytes);
+        io.set_refuses_no_wait(refuses);
+        let mut job = ScrubJob::new(Arc::clone(&store.state), 0);
+        job.rate = PACED_FLOOR;
+        scrub_one_pass(&store, &io, &mut job);
+        assert_eq!(job.baseline().is_some(), is_sampled, "warm {warm_bytes} refused {refuses}: baseline {:?}", job.baseline());
+        io.set_warm_bytes(0);
+        io.set_refuses_no_wait(false);
+        store.close().expect("close");
+    }
 }

@@ -79,6 +79,12 @@ pub trait IoFile: Clone + Send + Sync {
     /// it is
     fn reserve_to(&self, end: ByteCount) -> Result<()>;
 
+    /// Read parts whole and leave none of the pages the read brought in held by the kernel, for a pass over the whole disk that
+    /// shouldn't push the callers' pages out. A file with no such read reads plainly
+    fn read_parts_uncached(&self, offset: FileOffset, parts: &mut [IoSliceMut]) -> Result<()> {
+        self.read_parts_at(offset, parts)
+    }
+
     /// Hold the disk's space from a start through an end, for a caller that already holds what comes before the start
     fn reserve_range(&self, _from: FileOffset, end: ByteCount) -> Result<()> {
         self.reserve_to(end)
@@ -227,6 +233,20 @@ impl<File: IoFile> DeviceReads<File> for InPlace {
 
     fn read_parts(&self, file: &File, offset: FileOffset, parts: &mut [IoSliceMut<'_>]) -> impl Future<Output = Result<()>> + Send {
         ready(file.read_parts_at(offset, parts))
+    }
+}
+
+/// Reads on the calling thread that leave none of the pages they brought in held by the kernel, for the scrub's pass
+#[derive(Clone, Copy, Debug)]
+pub struct Uncached;
+
+impl<File: IoFile> DeviceReads<File> for Uncached {
+    fn read_exact(&self, file: &File, offset: FileOffset, buf: &mut [u8]) -> impl Future<Output = Result<()>> + Send {
+        ready(file.read_parts_uncached(offset, &mut [IoSliceMut::new(buf)]))
+    }
+
+    fn read_parts(&self, file: &File, offset: FileOffset, parts: &mut [IoSliceMut<'_>]) -> impl Future<Output = Result<()>> + Send {
+        ready(file.read_parts_uncached(offset, parts))
     }
 }
 

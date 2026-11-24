@@ -353,6 +353,9 @@ pub struct Volume<Backend: Io> {
     pub reclaim_retries: AtomicU64,
     /// The rate the volume's scrub checks at now, in bytes a second, which its pace moves between the floor and many times it
     pub scrub_rate: AtomicU64,
+    /// Bytes the volume's scrub has checked and the passes it finished since open, so a rate over the bytes is its true speed
+    pub scrub_bytes: AtomicU64,
+    pub scrub_passes: AtomicU64,
     /// The walk is part way through a segment
     pub has_walk_target: AtomicBool,
     pub gave_up: Mutex<GaveUp>,

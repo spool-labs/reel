@@ -746,3 +746,28 @@ fn a_device_error_on_a_direct_read_is_found() {
     io.set_direct_reads(DirectReads::Plain);
     store.close().expect("close");
 }
+
+// a volume's checks name it, count what its scrub checked and the passes it finished, and read a rate of 0 while it rests between
+// passes, where the last pass's rate would read as a scrub still running
+#[test]
+fn a_volume_reports_its_scrub() {
+    let io = SimulatedIo::new(Seed(21));
+    let store = open(&io, 0);
+    for number in 0..KEYS {
+        store.put(COLUMN, &key(number), &value(number, 0)).expect("put");
+    }
+    seal(&store, &io);
+    let mut job = ScrubJob::new(Arc::clone(&store.state), 0);
+    job.rate = RATE;
+    scrub_one_pass(&store, &io, &mut job);
+    let checks: Vec<_> = store.volume_checks().collect();
+    assert_eq!(checks.len(), 1);
+    let check = checks[0];
+    assert_eq!(check.name, "scrub");
+    assert_eq!(check.scrub_passes, 1);
+    assert_eq!(check.scrub_bytes, store.state.scrub_bytes.load(Ordering::Relaxed));
+    assert!(check.scrub_bytes > 0);
+    assert_eq!(check.scrub_bytes_per_second, 0, "a resting scrub read a rate");
+    assert_eq!(check.damaged_segments, 0);
+    store.close().expect("close");
+}

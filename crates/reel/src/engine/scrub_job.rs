@@ -281,6 +281,10 @@ impl<Backend: Io> ScrubJob<Backend> {
         self.segment = None;
         self.block = 0;
         self.state.scrub_passes.fetch_add(1, Ordering::Relaxed);
+        let volume = &self.state.volumes[self.volume];
+        volume.scrub_passes.fetch_add(1, Ordering::Relaxed);
+        // a scrub resting until its next pass reads nothing, so its rate reads 0 until then
+        volume.scrub_rate.store(0, Ordering::Relaxed);
         self.rest_until = Nanoseconds(now.0.saturating_add(SCRUB_PASS_REST.0));
     }
 
@@ -391,6 +395,7 @@ impl<Backend: Io> ScrubJob<Backend> {
     /// Charge the bytes a block's records took
     fn note_checked(&mut self, bytes: u64) {
         self.state.scrub_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.state.volumes[self.volume].scrub_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.allowance = self.allowance.saturating_sub(bytes as i64);
     }
 

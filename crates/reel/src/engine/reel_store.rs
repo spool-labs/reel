@@ -217,9 +217,15 @@ impl<Backend: Io> ReelStore<Backend> {
         self.state.damaged_segments.load(Ordering::Acquire)
     }
 
-    /// Read the rate each volume's scrub checks at now, in bytes a second, by volume id. A scrub that hasn't stepped reads 0
-    pub fn scrub_rates(&self) -> impl Iterator<Item = u64> + '_ {
-        self.state.volumes.iter().map(|volume| volume.scrub_rate.load(Ordering::Relaxed))
+    /// Read what each volume's own checks found and what its scrub did, by volume, cheap enough for every scrape
+    pub fn volume_checks(&self) -> impl Iterator<Item = VolumeChecks<'_>> + '_ {
+        self.state.volumes.iter().map(|volume| VolumeChecks {
+            name: &volume.name,
+            damaged_segments: hold(&volume.damaged).len() as u64,
+            scrub_bytes_per_second: volume.scrub_rate.load(Ordering::Relaxed),
+            scrub_bytes: volume.scrub_bytes.load(Ordering::Relaxed),
+            scrub_passes: volume.scrub_passes.load(Ordering::Relaxed),
+        })
     }
 
     /// Read the least budget a store of this config opens on as a writer, the one a refusal gives, with no store opened: its
@@ -1760,6 +1766,8 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         stray_outputs: AtomicU64::new(0),
         reclaim_retries: AtomicU64::new(0),
         scrub_rate: AtomicU64::new(0),
+        scrub_bytes: AtomicU64::new(0),
+        scrub_passes: AtomicU64::new(0),
         has_walk_target: AtomicBool::new(false),
         walk_segment: AtomicU64::new(NO_SEAL),
         is_applying: AtomicBool::new(false),
@@ -2118,4 +2126,15 @@ pub fn check_dead_bits_true<Backend: Io>(state: &EngineState<Backend>) {
             }
         }
     }
+}
+
+/// One volume's checks: the segments it holds damage in, the rate its scrub checks at now (0 while it rests between passes or
+/// hasn't started), and the bytes and passes its scrub has done since open
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VolumeChecks<'store> {
+    pub name: &'store str,
+    pub damaged_segments: u64,
+    pub scrub_bytes_per_second: u64,
+    pub scrub_bytes: u64,
+    pub scrub_passes: u64,
 }

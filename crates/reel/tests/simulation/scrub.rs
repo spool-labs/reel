@@ -1028,3 +1028,60 @@ fn a_rebuild_of_a_wholly_dead_damaged_segment_clears_it() {
     assert_eq!(store.damaged_segments(), 0, "the clear came back damaged after a reopen");
     store.close().expect("close");
 }
+
+// put `keys` keys of `length` bytes and seal them, rot the middle byte of the middle key's record, a chunk's payload in a long one,
+// then overwrite the odd keys and seal again, so a merge of the first segment drops rows. Merge it alone, and return it
+fn merge_over_rot(io: &SimulatedIo, store: &Store, keys: u64, length: usize) -> SegmentNumber {
+    for number in 0..keys {
+        store.put(COLUMN, &key(number), &vec![(number % 251) as u8; length]).expect("put");
+    }
+    let first = seal(store, io);
+    let volume = &store.state.volumes[0];
+    let name = key(keys / 2);
+    let read_at = store.state.key_read(COLUMN, &name, store.state.read_point(volume), false).expect("read");
+    let row = in_place(store.state.search_sealed(&InPlace, volume, &read_at)).expect("search").expect("a sealed row");
+    io.rot(&data_path(&volume.roots[0], row.segment), FileOffset(row.row.offset.0 + row.row.length.0 / 2), BitMask(1)).expect("rot");
+    for number in (1..keys).step_by(2) {
+        store.put(COLUMN, &key(number), &value(number, 1)).expect("overwrite");
+    }
+    seal(store, io);
+    let mut merge = CompactJob::new(Arc::clone(&store.state), 0);
+    merge.rewrite.forced = Some(first);
+    // the store's own pick may have merged it already, in the same order
+    if merge.rewrite.start() {
+        while merge.rewrite.is_running() {
+            merge.rewrite.step();
+        }
+    }
+    settle(io);
+    first
+}
+
+// an offset-order merge copies records as runs of bytes, and checks a long one in its copying pass: one rotten long record stops
+// the merge, counts a check failure and marks its segment
+#[test]
+fn an_offset_order_merge_stops_at_a_rotten_long_record() {
+    let io = SimulatedIo::new(Seed(29));
+    let store = open(&io, 0);
+    let first = merge_over_rot(&io, &store, LONG_KEYS, LONG_VALUE);
+    let volume = &store.state.volumes[0];
+    assert_eq!(volume.keyed_copies.load(Ordering::Relaxed), 0, "the merge went in key order");
+    assert!(store.state.merge_check_failures.load(Ordering::Relaxed) > 0, "the merge carried the rotten record");
+    assert!(volume.table.holds(first), "the merge installed over the rotten record");
+    assert!(hold(&volume.damaged).contains(&first));
+    store.close().expect("close");
+}
+
+// a short rotten record goes across unchecked, as before, and a trusted read's sum still finds it in its new segment
+#[test]
+fn an_offset_order_merge_carries_a_rotten_short_record_a_read_still_finds() {
+    let io = SimulatedIo::new(Seed(30));
+    let store = open(&io, 0);
+    let first = merge_over_rot(&io, &store, KEYS, 100);
+    let volume = &store.state.volumes[0];
+    assert_eq!(volume.keyed_copies.load(Ordering::Relaxed), 0, "the merge went in key order");
+    assert_eq!(store.state.merge_check_failures.load(Ordering::Relaxed), 0);
+    assert!(!volume.table.holds(first), "the merge didn't install");
+    assert!(matches!(store.get(COLUMN, &key(KEYS / 2), &mut Vec::new()), Err(StoreError::Corruption { .. })), "a read passed the rotten record");
+    store.close().expect("close");
+}

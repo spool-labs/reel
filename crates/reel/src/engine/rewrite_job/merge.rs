@@ -24,6 +24,7 @@ use crate::engine::walk_job::add_count;
 use crate::guard::hold;
 use crate::io::{InPlace, Io, IoFile, in_place};
 use crate::record::record_check::RecordIdentity;
+use crate::record::record_head::{MOST_SUMMED_PAYLOAD, SMALL_HEAD_BYTES};
 use crate::record::record_reader::{RecordLocation, RecordRead, checked_payload, form_of};
 use crate::row_kind::RowKind;
 use crate::segment::footer_writer::ColumnStart;
@@ -542,6 +543,15 @@ impl<Backend: Io> RewriteJob<Backend> {
             self.output_column = Some(column);
         }
         let offset = match self.placed_offset() {
+            // offset order copied the record as a run of bytes, so one a trusted read doesn't sum is checked here, where its key
+            // is in hand. The copy just read it, so the check reads the page cache
+            Some(offset) if row.kind == RowKind::Value && row.length.0 > SUMMED_RECORD_BYTES => {
+                if !self.is_record_sound(&pin.file, (column, row), None) {
+                    let failed = self.failed_check();
+                    return Err(self.note_lost(pin.head.segment, failed));
+                }
+                offset
+            },
             Some(offset) => offset,
             None => {
                 volume.keyed_copies.fetch_add(1, Ordering::Relaxed);
@@ -693,7 +703,9 @@ impl<Backend: Io> RewriteJob<Backend> {
     }
 
     /// Copy a record as stored once it checks out against the identity its row gives, and return where it landed. A record that
-    /// fails its check goes no further: the merge stops over it as unreadable, which damages its segment
+    /// fails its check goes no further: the merge stops over it as unreadable, which damages its segment. This is the key-order
+    /// copy. Offset order copies runs of bytes, and the copying pass checks only its records past SUMMED_RECORD_BYTES, since a
+    /// trusted read's sum catches the rest
     pub fn copy_record(&mut self, from: &Backend::File, to: &Backend::File, (column, row): (ColumnId, &FooterRow)) -> Result<FileOffset> {
         let length = row.length.0 as usize;
         if length > self.buffer.len() - self.used {
@@ -728,7 +740,7 @@ impl<Backend: Io> RewriteJob<Backend> {
     }
 
     /// Check a record the merge copies against its row's identity: a one-chunk record where it lies in the buffer, and any other
-    /// through a reader, which checks a chunked record chunk by chunk
+    /// through a reader, which checks a chunked record's stored chunks one at a time and restores nothing
     pub fn is_record_sound(&self, from: &Backend::File, (column, row): (ColumnId, &FooterRow), held: Option<&[u8]>) -> bool {
         let identity = RecordIdentity { record_key: self.state.record_key, column, key: &self.key, kind: row.kind, place: row.place };
         if let Some(record) = held
@@ -736,13 +748,9 @@ impl<Backend: Io> RewriteJob<Backend> {
         {
             return checked_payload(record, form, &identity).is_some();
         }
-        let Ok(info) = self.state.column(column) else {
-            return false;
-        };
         let location = RecordLocation { offset: row.offset, length: row.length };
-        let mut value = Vec::new();
         let mut reader = self.state.record_reader_for(&InPlace);
-        matches!(in_place(reader.read_value(&InPlace, from, location, &identity, info.codec, &mut value)), Ok(RecordRead::Valid))
+        matches!(in_place(reader.check_stored(&InPlace, from, location, &identity)), Ok(RecordRead::Valid))
     }
 
     /// Stop the merge over a record that failed its check. A free since the merge began can have punched a record it keeps, so
@@ -826,3 +834,6 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.placed.get(ordinal).filter(|_placed| self.is_ordered && self.is_marked(ordinal)).map(|placed| FileOffset(u64::from(*placed)))
     }
 }
+
+/// Bytes the longest record a trusted read checks by its sum takes: a one-chunk head and MOST_SUMMED_PAYLOAD
+pub const SUMMED_RECORD_BYTES: u64 = (SMALL_HEAD_BYTES + MOST_SUMMED_PAYLOAD) as u64;

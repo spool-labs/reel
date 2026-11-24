@@ -629,6 +629,79 @@ impl RecordReader {
         chunk_span(&self.page[..length], index, FileOffset(location.length.0))
     }
 
+    /// Check a record's stored bytes against its identity and its chunks' sums, and hand no value over: a one-chunk record where
+    /// the first read holds it, and a chunked one a chunk at a time through the reader's own room, so the check makes no
+    /// allocation and restores nothing
+    pub async fn check_stored<File: IoFile>(
+        &mut self,
+        device: &impl DeviceReads<File>,
+        file: &File,
+        location: RecordLocation,
+        identity: &RecordIdentity<'_>,
+    ) -> Result<RecordRead> {
+        let length = self.read_front(device, file, location).await?;
+        let Some(form) = self.form() else {
+            return Ok(RecordRead::Failed);
+        };
+        if !form.is_chunked {
+            // a one-chunk record fits the first read whole, and a longer one is no one-chunk record
+            let is_sound = self.whole_in_first.is_some() && checked_payload(&self.first[..length], form, identity).is_some();
+            return Ok(if is_sound { RecordRead::Valid } else { RecordRead::Failed });
+        }
+        let Some(head) = self.check_chunked(form, length, identity) else {
+            return Ok(RecordRead::Failed);
+        };
+        for page in 0..page_count(head.chunks).0 {
+            let page = TablePageIndex(page);
+            if !self.load_page(device, file, location, &head, page).await? {
+                return Ok(RecordRead::Failed);
+            }
+            let first = page.0 * ENTRIES_PER_PAGE as u64;
+            let last = (first + ENTRIES_PER_PAGE as u64).min(head.chunks.0);
+            for chunk in first..last {
+                let Some(span) = self.span_of(location, &head, ChunkIndex(chunk), page) else {
+                    return Ok(RecordRead::Failed);
+                };
+                if !self.check_chunk(ReadOn { device, target: file }, location, &head, &span).await? {
+                    return Ok(RecordRead::Failed);
+                }
+            }
+        }
+        Ok(RecordRead::Valid)
+    }
+
+    /// Say a chunk's stored bytes sit whole in the first read
+    fn is_chunk_held(&self, span: &ChunkSpan) -> bool {
+        let (at, stored) = (span.entry.stored_offset.0 as usize, span.stored_length.0 as usize);
+        self.whole_in_first.is_some_and(|whole| at.checked_add(stored).is_some_and(|end| end <= whole))
+    }
+
+    /// Bring a chunk's stored bytes in, from the first read when it holds them and into the reader's chunk room when it doesn't,
+    /// and check them against the chunk's sum
+    pub async fn check_chunk<File: IoFile>(
+        &mut self,
+        on: ReadOn<'_, impl DeviceReads<File>, File>,
+        location: RecordLocation,
+        head: &ChunkedHead,
+        span: &ChunkSpan,
+    ) -> Result<bool> {
+        let ReadOn { device, target: file } = on;
+        let stored = span.stored_length.0 as usize;
+        if stored > CHUNK_BYTES || span.stored_length > span.entry.value_length {
+            return Ok(false);
+        }
+        let at = span.entry.stored_offset.0 as usize;
+        let is_held = self.is_chunk_held(span);
+        if !is_held {
+            let offset = FileOffset(location.offset.0 + span.entry.stored_offset.0);
+            device.read_exact(file, offset, &mut self.chunk[..stored]).await?;
+        }
+        let source = if is_held { &self.first[at..at + stored] } else { &self.chunk[..stored] };
+        // a record stored as written sums a chunk over its pieces' sums, and a compressed one over its stored bytes
+        let sum = if head.codec == Codec::None { written_chunk_sum(source) } else { checksum(source) };
+        Ok(sum == span.entry.checksum)
+    }
+
     /// Read one chunk whole, check it, and add its part of the window to the buffer
     pub async fn read_chunk<File: IoFile>(
         &mut self,
@@ -639,25 +712,12 @@ impl RecordReader {
         part: Range<usize>,
         buf: &mut Vec<u8>,
     ) -> Result<bool> {
-        let ReadOn { device, target: file } = on;
-        let stored = span.stored_length.0 as usize;
-        if stored > CHUNK_BYTES || span.stored_length > span.entry.value_length {
+        if !self.check_chunk(on, location, head, span).await? {
             return Ok(false);
         }
-
-        // a record the read holds whole in `first` gives its chunks from there, and any other reads each chunk
-        let at = span.entry.stored_offset.0 as usize;
-        let is_held = self.whole_in_first.is_some_and(|whole| at.checked_add(stored).is_some_and(|end| end <= whole));
-        if !is_held {
-            let offset = FileOffset(location.offset.0 + span.entry.stored_offset.0);
-            device.read_exact(file, offset, &mut self.chunk[..stored]).await?;
-        }
-        let source = if is_held { &self.first[at..at + stored] } else { &self.chunk[..stored] };
-        // a record stored as written sums a chunk over its pieces' sums, and a compressed one over its stored bytes
-        let sum = if head.codec == Codec::None { written_chunk_sum(source) } else { checksum(source) };
-        if sum != span.entry.checksum {
-            return Ok(false);
-        }
+        // a record the read holds whole in `first` gives its chunks from there, and any other read each chunk into the room
+        let (at, stored) = (span.entry.stored_offset.0 as usize, span.stored_length.0 as usize);
+        let source = if self.is_chunk_held(span) { &self.first[at..at + stored] } else { &self.chunk[..stored] };
 
         if span.stored_length == span.entry.value_length {
             buf.extend_from_slice(&source[part]);

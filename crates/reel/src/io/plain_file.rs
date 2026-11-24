@@ -296,11 +296,12 @@ pub fn sync_descriptor(descriptor: RawFd) -> Result<()> {
     Ok(())
 }
 
-/// Make a file's writes reach the disk, which on macOS takes a full flush
+/// Order a file's writes on Apple disks with a barrier. A full flush empties the whole drive's cache and holds every other
+/// writer on the disk for milliseconds, and Apple hosts don't need the durability it buys
 #[cfg(all(target_vendor = "apple", not(reel_plain_unix)))]
 pub fn sync_descriptor(descriptor: RawFd) -> Result<()> {
     // SAFETY: the descriptor is open, and no pointer crosses the call
-    let status = unsafe { libc::fcntl(descriptor, libc::F_FULLFSYNC) };
+    let status = unsafe { libc::fcntl(descriptor, libc::F_BARRIERFSYNC) };
     if status != 0 {
         return Err(Error::last_os_error());
     }

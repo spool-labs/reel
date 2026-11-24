@@ -26,7 +26,7 @@ use crate::guard::hold;
 use crate::io::{DiskSize, Io, IoFile};
 use crate::io::job::Job;
 use crate::io::lock_outcome::LockOutcome;
-use crate::io::plain_file::{PlainFile, reserve_space};
+use crate::io::plain_file::{PlainFile, reserve_space, sync_descriptor};
 use crate::io::plain_task::{PlainTask, TaskSignal, run_job};
 #[cfg(not(target_os = "linux"))]
 use crate::io::ring::NoRing;
@@ -183,7 +183,8 @@ impl Io for PlainIo {
     }
 
     fn sync_directory(&self, path: &Path) -> Result<()> {
-        File::open(path)?.sync_all()
+        // the file sync's own call, since std's sync_all takes a full flush on Apple
+        sync_descriptor(File::open(path)?.as_raw_fd())
     }
 
     fn list_directory(&self, path: &Path) -> Result<Vec<PathBuf>> {

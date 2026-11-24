@@ -177,6 +177,12 @@ pub struct KeyBatch {
     width: usize,
 }
 
+/// A leaf's words and the chain of values it holds, read once for every entry a batch copies from it
+struct LeafView<'words> {
+    words: &'words [AtomicU32],
+    chain: HeldChain,
+}
+
 /// A column's sorted keys
 #[derive(Debug)]
 pub struct SortedKeys {
@@ -993,8 +999,9 @@ impl SortedKeys {
             };
             while leaf != NO_PAGE {
                 let count = self.count(leaf);
+                let view = self.leaf_view(leaf, batch);
                 while index < count {
-                    self.copy_live(leaf, index, batch);
+                    self.copy_live(&view, index, batch);
                     looked += 1;
                     if batch.len() == most || looked == MOST_LOOKED {
                         self.unpack_key(leaf, self.leaf_entry(index), &mut batch.resume);
@@ -1038,9 +1045,10 @@ impl SortedKeys {
                 }
             };
             while leaf != NO_PAGE {
+                let view = self.leaf_view(leaf, batch);
                 while index > 0 {
                     index -= 1;
-                    self.copy_live(leaf, index, batch);
+                    self.copy_live(&view, index, batch);
                     looked += 1;
                     if batch.len() == most || looked == MOST_LOOKED {
                         self.unpack_key(leaf, self.leaf_entry(index), &mut batch.resume);
@@ -1400,23 +1408,42 @@ impl SortedKeys {
     }
 
     /// Copy an entry into a batch, and skip a grave unless the batch takes them
-    fn copy_live(&self, leaf: u32, index: usize, batch: &mut KeyBatch) {
-        let entry = self.read_entry(leaf, index);
-        if entry.is_grave && !batch.is_with_graves {
+    fn copy_live(&self, leaf: &LeafView<'_>, index: usize, batch: &mut KeyBatch) {
+        // one bounds check takes the entry's words, so its key and tail read with no page arithmetic a word
+        let base = self.leaf_entry(index);
+        let words = &leaf.words[base..base + self.key_words + ENTRY_TAIL_WORDS];
+        let tail = &words[self.key_words..];
+        let high = tail[0].load(Memory::Relaxed);
+        let is_grave = high & GRAVE_BIT != 0;
+        if is_grave && !batch.is_with_graves {
             return;
         }
-        // the key goes straight into the batch, a word at a time
-        let at = batch.keys.len();
-        batch.keys.resize(at + self.width, 0);
-        let base = self.leaf_entry(index);
-        for (word, bytes) in batch.keys[at..].chunks_mut(size_of::<u32>()).enumerate() {
-            bytes.copy_from_slice(&self.load(leaf, base + word).to_be_bytes()[..bytes.len()]);
+        // the key goes straight into the batch as whole words, and a short last word after them
+        let whole = self.width / size_of::<u32>();
+        for word in &words[..whole] {
+            batch.keys.extend_from_slice(&word.load(Memory::Relaxed).to_be_bytes());
         }
-        batch.entries.push(entry);
+        let rest = self.width % size_of::<u32>();
+        if rest > 0 {
+            batch.keys.extend_from_slice(&words[whole].load(Memory::Relaxed).to_be_bytes()[..rest]);
+        }
+        batch.entries.push(KeyEntry {
+            place: WritePlace((u64::from(high & !GRAVE_BIT) << 32) | u64::from(tail[1].load(Memory::Relaxed))),
+            segment: SegmentNumber(u64::from(tail[2].load(Memory::Relaxed))),
+            offset: FileOffset(u64::from(tail[3].load(Memory::Relaxed))),
+            length: ByteCount(u64::from(tail[4].load(Memory::Relaxed))),
+            is_grave,
+        });
         // a held value stays in its page, and the batch keeps where it is, so a reader copies it once
-        let chain = self.chain_of(leaf);
-        let is_held = !entry.is_grave && batch.is_with_values && self.values.holds(chain, index);
-        batch.held.push(if is_held { HeldRef { chain, slot: index as u32 } } else { NO_HELD });
+        let is_held = !is_grave && leaf.chain != HeldChain::NONE && self.values.holds(leaf.chain, index);
+        batch.held.push(if is_held { HeldRef { chain: leaf.chain, slot: index as u32 } } else { NO_HELD });
+    }
+
+    /// Take a leaf's words and, for a batch that takes values, the chain of values it holds, once for all its entries
+    fn leaf_view(&self, leaf: u32, batch: &KeyBatch) -> LeafView<'_> {
+        let start = leaf as usize * PAGE_WORDS;
+        let chain = if batch.is_with_values { self.chain_of(leaf) } else { HeldChain::NONE };
+        LeafView { words: &self.words[start..start + PAGE_WORDS], chain }
     }
 
     /// Read an entry

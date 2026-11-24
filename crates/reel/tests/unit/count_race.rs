@@ -41,17 +41,20 @@ fn counts_beside_seals_stay_in_bounds() {
         columns: vec![ColumnConfig { index: ColumnIndex::Plain, ..ColumnConfig::new(COLUMN, "count", KeyShape::Fixed { width: 8 }) }],
     };
     let store = ReelStore::open(PlainIo::new(), &config).expect("open");
+    // rows the writer has acknowledged, and rows it has started: a put is seen once it returns, a moment before `written` moves
     let written = AtomicU64::new(0);
+    let started = AtomicU64::new(0);
     let done = AtomicBool::new(false);
     let runs = AtomicU64::new(0);
     let counts = std::thread::scope(|scope| {
-        let (store, written, done, runs) = (&store, &written, &done, &runs);
+        let (store, written, started, done, runs) = (&store, &written, &started, &done, &runs);
         scope.spawn(move || {
             // a writer that panics still stops the counter, so the test fails and doesn't hang
             let _stops = StopOnDrop(done);
             let mut number = 0;
             // the writer goes on past KEYS until the reader has run enough rounds to have raced it
             while number < KEYS || (runs.load(Ordering::Acquire) < LEAST_RUNS && number < MOST_KEYS) {
+                started.store(number + 1, Ordering::Release);
                 store.put(COLUMN, &key(number), &[5_u8; 100]).expect("put");
                 written.store(number + 1, Ordering::Release);
                 if number % 5_000 == 4_999 {
@@ -68,7 +71,7 @@ fn counts_beside_seals_stay_in_bounds() {
             while !done.load(Ordering::Acquire) {
                 let low = written.load(Ordering::Acquire);
                 let count = store.count_prefix(COLUMN, &[]).expect("count").0;
-                let high = written.load(Ordering::Acquire);
+                let high = started.load(Ordering::Acquire);
                 assert!(low <= count && count <= high, "count {count} outside {low}..={high}");
                 counts += 1;
                 runs.fetch_add(1, Ordering::Release);

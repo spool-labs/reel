@@ -23,9 +23,8 @@ pub const IDLE_SEAL_AFTER: Nanoseconds = Nanoseconds(3_000_000_000);
 /// How old a segment's oldest delete gets before the segment seals, idle or not, so a trickle of writes can't hold space back
 pub const DELETE_SEAL_AFTER: Nanoseconds = Nanoseconds(60_000_000_000);
 
-/// How long the write index sits with no change before its open rows go into their sorted indexes. A test build enters at every
-/// quiet step, so every simulation runs its walks over entered rows
-pub const ENTER_QUIET: Nanoseconds = if cfg!(feature = "test-hooks") { Nanoseconds(0) } else { Nanoseconds(50_000_000) };
+/// How long the write index sits with no change before its open rows go into their sorted indexes
+pub const ENTER_QUIET: Nanoseconds = Nanoseconds(50_000_000);
 
 /// What the row job watches to enter open rows once the write index is quiet
 #[derive(Debug, Default)]
@@ -169,7 +168,7 @@ impl<Backend: Io> RowJob<Backend> {
         if changes == watch.entered_at {
             return None;
         }
-        let due = Nanoseconds(watch.moved_at.0 + ENTER_QUIET.0);
+        let due = Nanoseconds(watch.moved_at.0 + self.state.io.enter_quiet().0);
         if now.0 < due.0 {
             return Some(due);
         }

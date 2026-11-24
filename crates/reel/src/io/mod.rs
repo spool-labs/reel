@@ -26,6 +26,7 @@ use reel_core::maintenance_report::WorkerPriority;
 use reel_core::units::{ByteCount, FileOffset, Nanoseconds, WritePlace};
 
 use crate::engine::read_path::SealedRow;
+use crate::engine::row_job::ENTER_QUIET;
 use crate::io::host_memory::HostMemory;
 use crate::io::job::Job;
 use crate::io::lock_outcome::LockOutcome;
@@ -324,6 +325,12 @@ pub trait Io: Clone + Send + Sync + 'static {
     /// Say whether the engine proves its dead counts and bits at every close and every merge, which only the simulator asks for
     fn proves_dead_bits(&self) -> bool {
         false
+    }
+
+    /// Say how long the write index sits with no change before its open rows go into their sorted indexes. The test backends
+    /// enter at every quiet step, so their walks run over entered rows
+    fn enter_quiet(&self) -> Nanoseconds {
+        ENTER_QUIET
     }
 
     /// Open the ring async reads complete through, or nothing where they run on the blocking pool

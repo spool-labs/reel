@@ -417,6 +417,10 @@ impl Io for SimulatedIo {
         true
     }
 
+    fn enter_quiet(&self) -> Nanoseconds {
+        Nanoseconds(0)
+    }
+
     fn open_ring(&self) -> Result<Option<SimulatedRing>> {
         Ok(self.has_ring.load(Ordering::Acquire).then(|| SimulatedRing::new(self.clone())))
     }

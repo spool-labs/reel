@@ -36,6 +36,10 @@ impl Io for HarnessIo {
     type Ring = <PlainIo as Io>::Ring;
     type Task = <PlainIo as Io>::Task;
 
+    fn enter_quiet(&self) -> Nanoseconds {
+        Nanoseconds(0)
+    }
+
     fn open_ring(&self) -> Result<Option<Self::Ring>> {
         if self.has_ring { self.plain.open_ring() } else { Ok(None) }
     }

@@ -35,7 +35,9 @@ impl PlainFile {
     pub fn close(self) {
         // SAFETY: this handle owns the descriptor, and the engine closes each file once
         // a failed close leaves nothing to retry, since the descriptor is gone either way
-        let _status = unsafe { libc::close(self.descriptor) };
+        let status = unsafe { libc::close(self.descriptor) };
+        // a close the kernel says was of no open file means two owners closed one number, and the second may have shut another file
+        debug_assert!(status == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EBADF), "a file closed twice");
     }
 
     /// Finish a short vectored write one part at a time

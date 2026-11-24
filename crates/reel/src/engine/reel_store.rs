@@ -664,6 +664,13 @@ impl<Backend: Io> EngineState<Backend> {
         // a stopped rewrite leaves the store as it found it
         for lane in &volume.lanes {
             let mut outputs = mem::take(&mut *hold(&lane.partial_outputs));
+            // an output the install already put in the table shares its descriptor with the table's entry, so the entry leaves the
+            // table here and the closes below are the file's only ones
+            for output in outputs.iter().flatten() {
+                if let Some(retired) = volume.table.retire(output.number) {
+                    volume.table.free_retired(&retired);
+                }
+            }
             // the last data output lists the inputs, and if it stays on disk the next open needs the rest of its set
             let last = outputs[..MOST_MERGE_OUTPUTS].iter().rposition(Option::is_some);
             let mut is_set_gone = true;

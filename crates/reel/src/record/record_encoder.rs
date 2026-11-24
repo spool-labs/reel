@@ -12,10 +12,10 @@ use crate::record::chunk_table::{
 };
 use crate::record::codec::{CHUNK_BYTES, Codec};
 use crate::record::lz4_block::Lz4State;
-use crate::record::record_check::{RecordCheck, RecordIdentity, RecordKey, checksum, place_check, record_check};
+use crate::record::record_check::{Checksum, RecordCheck, RecordIdentity, RecordKey, checksum, place_check, record_check};
 use crate::record::record_head::{
-    CHECK_BYTES, FORM_AT, PAGE_SUM_BYTES, PAGE_SUMS_AT, RecordForm, SMALL_HEAD_BYTES, VALUE_LENGTH_AT, chunk_count,
-    chunked_head_bytes, put_piece_sums, sums_bytes,
+    CHECK_BYTES, FORM_AT, PAGE_SUM_BYTES, PAGE_SUMS_AT, PAYLOAD_SUM_AT, RecordForm, SMALL_HEAD_BYTES, VALUE_LENGTH_AT, chunk_count,
+    chunked_head_bytes, put_piece_sums, short_sum, sums_bytes,
 };
 
 /// Bytes of one share of the compress pool
@@ -52,6 +52,7 @@ pub enum StoredRun {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlainRecord {
     check: RecordCheck,
+    sum: Checksum,
 }
 
 impl PlainRecord {
@@ -63,9 +64,8 @@ impl PlainRecord {
 
     /// Hash a value under its identity
     pub fn new(identity: &RecordIdentity, value: &[u8]) -> Self {
-        Self {
-            check: record_check(identity, Self::FORM, checksum(value)),
-        }
+        let sum = checksum(value);
+        Self { check: record_check(identity, Self::FORM, sum), sum }
     }
 
     /// Build the head for the place a claim gave this write
@@ -73,6 +73,7 @@ impl PlainRecord {
         let mut head = [0; SMALL_HEAD_BYTES];
         head[..CHECK_BYTES].copy_from_slice(&place_check(self.check, record_key, place).0.to_le_bytes());
         head[FORM_AT] = Self::FORM.as_byte();
+        head[PAYLOAD_SUM_AT..SMALL_HEAD_BYTES].copy_from_slice(&short_sum(self.sum));
         head
     }
 }
@@ -173,6 +174,8 @@ impl RecordEncoder {
         self.check = record_check(identity, form, sum);
         self.set_place(identity.record_key, identity.place);
         self.head[FORM_AT] = form.as_byte();
+        // the writer already has the payload's sum for the check, so the stored low bytes cost no hash
+        self.head[PAYLOAD_SUM_AT..SMALL_HEAD_BYTES].copy_from_slice(&short_sum(sum));
         RecordShape {
             head_length: SMALL_HEAD_BYTES,
             table_length: 0,
@@ -391,6 +394,8 @@ impl RecordEncoder {
             is_chunked: true,
         };
         self.head[FORM_AT] = form.as_byte();
+        // a chunked record checks its payload by its page sums, so its head keeps no payload sum
+        self.head[PAYLOAD_SUM_AT..SMALL_HEAD_BYTES].fill(0);
         self.head[VALUE_LENGTH_AT..PAGE_SUMS_AT].copy_from_slice(&value_length.0.to_le_bytes());
 
         for page in 0..page_count(chunks).0 as usize {
@@ -416,6 +421,7 @@ impl RecordEncoder {
         let mut head = [0; SMALL_HEAD_BYTES];
         head[..CHECK_BYTES].copy_from_slice(&place_check(self.check, record_key, place).0.to_le_bytes());
         head[FORM_AT] = self.head[FORM_AT];
+        head[PAYLOAD_SUM_AT..SMALL_HEAD_BYTES].copy_from_slice(&self.head[PAYLOAD_SUM_AT..SMALL_HEAD_BYTES]);
         head
     }
 

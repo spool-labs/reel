@@ -11,8 +11,14 @@ use crate::record::record_check::{Checksum, RecordCheck, checksum};
 pub const CHECK_BYTES: usize = 8;
 /// Where the form byte sits
 pub const FORM_AT: usize = CHECK_BYTES;
+/// Where a one-chunk record keeps the low bytes of its payload's sum, which a trusted read checks with no identity hashes
+pub const PAYLOAD_SUM_AT: usize = FORM_AT + 1;
+/// Bytes of the stored payload sum
+pub const PAYLOAD_SUM_BYTES: usize = size_of::<u32>();
 /// Bytes in front of a one-chunk record's payload
-pub const SMALL_HEAD_BYTES: usize = FORM_AT + 1;
+pub const SMALL_HEAD_BYTES: usize = PAYLOAD_SUM_AT + PAYLOAD_SUM_BYTES;
+/// The longest payload a trusted read sums before handing it over. Longer ones, slices among them, stay one read with no pass
+pub const MOST_SUMMED_PAYLOAD: usize = 8 * 1024;
 /// Where a chunked record keeps its value length
 pub const VALUE_LENGTH_AT: usize = SMALL_HEAD_BYTES;
 /// Where a chunked record's page checksums start
@@ -118,4 +124,19 @@ pub fn plain_length(value_length: ByteCount) -> ByteCount {
     }
     let head = chunked_head_bytes(value_length) as u64;
     ByteCount(head + table_bytes(chunk_count(value_length)).0 + sums_bytes(value_length) + value_length.0)
+}
+
+/// Cut a payload's sum to the bytes a head stores
+pub fn short_sum(sum: Checksum) -> [u8; PAYLOAD_SUM_BYTES] {
+    (sum.0 as u32).to_le_bytes()
+}
+
+/// Check a one-chunk head's stored payload sum against a payload's full sum
+pub fn holds_short_sum(head: &[u8], sum: Checksum) -> bool {
+    head.get(PAYLOAD_SUM_AT..SMALL_HEAD_BYTES).is_some_and(|stored| stored == short_sum(sum))
+}
+
+/// Check a trusted payload against its head's stored sum. A payload past MOST_SUMMED_PAYLOAD passes with no pass over it
+pub fn trusted_sum_holds(head: &[u8], payload: &[u8]) -> bool {
+    payload.len() > MOST_SUMMED_PAYLOAD || holds_short_sum(head, checksum(payload))
 }

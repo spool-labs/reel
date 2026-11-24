@@ -2785,16 +2785,13 @@ fn a_scanned_large_sealed_value_reads_back_unchecked() {
     }
 }
 
-// a record the batch read under its counts is trusted as a get trusts one, so a byte flipped on the disk under it reads back
-// flipped and the trusted count rises. The scrub finds the rot
+// a record the batch read under its counts skips its identity hashes, and its payload, no longer than a trusted read sums, is
+// still summed against its head, so a byte flipped in it steps the scan corrupt
 #[test]
-fn a_batched_sealed_value_reads_back_unchecked() {
+fn a_batched_sealed_value_is_summed_under_trust() {
     let io = SimulatedIo::new(Seed(51));
     let store = rotted_large_values(&io, BATCHED_VALUE_BYTES);
-    let trusted = report(&store).scan_trusted_records;
-    let value = scanned_value(&store, &key(ROTTED_KEY)).expect("the row");
-    assert!(report(&store).scan_trusted_records > trusted, "the batch checked its record");
-    assert_ne!(value, large_value(ROTTED_KEY, BATCHED_VALUE_BYTES), "the flipped byte was caught");
+    assert_eq!(scanned_value(&store, &key(ROTTED_KEY)), Err(ScanStep::Corrupt), "a rotten batched value came back");
     store.close().expect("close");
 }
 

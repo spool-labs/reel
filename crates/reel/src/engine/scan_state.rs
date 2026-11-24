@@ -12,6 +12,7 @@ use crate::engine::cue::JobCounts;
 use crate::engine::read_path::{Located, SealedRow};
 use crate::index::open_slots::{OpenSlot, OpenSlots};
 use crate::index::write_row::WriteRow;
+use crate::record::record_head::MOST_SUMMED_PAYLOAD;
 use crate::index::write_index::SHARD_COUNT;
 use crate::pool::{touched_capacity, touched_filled};
 use crate::row_kind::RowKind;
@@ -115,8 +116,9 @@ pub const SCAN_BATCH_KEYS: usize = 256;
 /// The most runs one round of a batch's reads sends before it waits
 pub const MOST_BATCH_RUNS: usize = 32;
 pub const BATCH_BYTES: usize = 64 * 1024;
-/// The largest record a batch takes: a 4 KiB value with its key and header fits, so a store of them scans in batches
-pub const MOST_BATCH_RECORD: usize = 8 * 1024;
+/// The largest record a batch takes: a 4 KiB value with its key and header fits, so a store of them scans in batches. It is the
+/// longest payload a trusted read sums, so every record a batch reads under trust has its payload checked
+pub const MOST_BATCH_RECORD: usize = MOST_SUMMED_PAYLOAD;
 /// Records in one segment this close join into one read
 pub const JOIN_GAP: u64 = 4 * 1024;
 

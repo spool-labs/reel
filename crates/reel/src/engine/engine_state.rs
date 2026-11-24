@@ -195,7 +195,8 @@ pub struct EngineState<Backend: Io> {
     pub sorted_runs: AtomicU64,
     /// Open records a scan batch copied from their slot's window
     pub scan_window_records: AtomicU64,
-    /// Open records a scan batch read from their file and answered with no sum, since this run wrote them
+    /// Records a scan batch answered with no record check: open ones this run wrote, and sealed ones read under the batch's
+    /// counts. A short payload still matched its head's stored sum
     pub scan_trusted_records: AtomicU64,
     /// Compressed values a scan batch restored and held in their leaves
     pub scan_restored_values: AtomicU64,

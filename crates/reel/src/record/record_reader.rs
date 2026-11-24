@@ -19,7 +19,7 @@ use crate::record::record_check::{Checksum, RecordIdentity, checksum, place_chec
 use crate::record::record_head::{
     FORM_AT, PIECE_BYTES, PIECE_SUM_BYTES, PIECES_PER_CHUNK, RecordForm, SMALL_HEAD_BYTES, chunk_count, chunked_head_bytes,
     head_bytes_for, piece_count, read_check, read_page_sum, sums_bytes, written_chunk_sum,
-    read_value_length,
+    read_value_length, holds_short_sum, trusted_sum_holds,
 };
 
 /// Room for a head beside the first table page, which one read fills
@@ -69,7 +69,7 @@ pub struct RecordReader {
     decoded: Vec<u8>,
     /// Chunks whose stored piece sums didn't match their entry while the chunk's bytes did, since the engine last took the count
     damaged_sums: u64,
-    /// The form and length of a record `read_trusted` handed over unchecked. Its head stays in `first`, a plain payload in the
+    /// The form and length of a record `read_trusted` handed over with no record check. Its head stays in `first`, a plain payload in the
     /// caller's buffer and a compressed one beside its head
     trusted: Option<(RecordForm, usize)>,
     /// The offset and length of a short record already whole in `first`, which turned out chunked, so the read that follows reads
@@ -243,9 +243,10 @@ impl RecordReader {
         self.read_chunks(device, file, location, &head, window, buf).await
     }
 
-    /// Read a one-chunk record whose bytes nothing changed since the caller located it, and hand its value over with no payload
-    /// sum or record check: its form still parses, and the read takes the located length. Nothing for any other record, which
-    /// takes `read_value`. The bytes stay held, so `check_trusted` can check them after
+    /// Read a one-chunk record whose bytes nothing changed since the caller located it, and hand its value over with no record
+    /// check: its form still parses, the read takes the located length, and a payload up to MOST_SUMMED_PAYLOAD must match its
+    /// head's stored sum or the read fails. Nothing for any other record, which takes `read_value`. The bytes stay held, so
+    /// `check_trusted` can check them after
     pub async fn read_trusted<File: IoFile>(
         &mut self,
         device: &impl DeviceReads<File>,
@@ -282,6 +283,12 @@ impl RecordReader {
             self.front = Some((location.offset, length));
             buf.clear();
             return Ok(None);
+        }
+        // the stored sum catches rot in a short payload with no identity hashes. A mismatch reads as failed, and a reader whose
+        // counts moved reads the record again with every check
+        if !trusted_sum_holds(&self.first[..SMALL_HEAD_BYTES], buf) {
+            buf.clear();
+            return Ok(Some(RecordRead::Failed));
         }
         // a compressed payload restores straight from the buffer, and a later check reads the record again
         if form.codec == Codec::Lz4 {
@@ -767,15 +774,16 @@ pub fn form_of(record: &[u8]) -> Option<RecordForm> {
 
 /// Check a one-chunk record read in two parts, its head and its payload, with the payload already where its reader wants it
 pub fn checks_split(head: &[u8], payload: &[u8], form: RecordForm, identity: &RecordIdentity<'_>) -> bool {
-    let check = place_check(record_check(identity, form, checksum(payload)), identity.record_key, identity.place);
-    read_check(head) == Some(check)
+    let sum = checksum(payload);
+    let check = place_check(record_check(identity, form, sum), identity.record_key, identity.place);
+    // the stored low bytes must match too, so rot in them is found and can't leave a record slow under trust
+    read_check(head) == Some(check) && holds_short_sum(head, sum)
 }
 
 /// Check a one-chunk record and give its payload where it lies, still in the codec it was stored with
 pub fn checked_payload<'record>(record: &'record [u8], form: RecordForm, identity: &RecordIdentity<'_>) -> Option<&'record [u8]> {
     let payload = record.get(SMALL_HEAD_BYTES..)?;
-    let check = place_check(record_check(identity, form, checksum(payload)), identity.record_key, identity.place);
-    (read_check(record) == Some(check)).then_some(payload)
+    checks_split(record, payload, form, identity).then_some(payload)
 }
 
 /// A buffer sized for a read that writes every byte of it, with no fill first. Until the read finishes whole it clears the buffer
@@ -816,9 +824,11 @@ impl Drop for UnfilledRead<'_> {
     }
 }
 
-/// Give a one-chunk record's payload where it lies, with no check, for a record its reader trusts
+/// Give a one-chunk record's payload where it lies, for a record its reader trusts. The identity goes unchecked, and a payload up
+/// to MOST_SUMMED_PAYLOAD is checked against its head's stored sum, so rot in it still reads as a failed record
 pub fn trusted_payload(record: &[u8]) -> Option<&[u8]> {
-    record.get(SMALL_HEAD_BYTES..)
+    let payload = record.get(SMALL_HEAD_BYTES..)?;
+    trusted_sum_holds(record, payload).then_some(payload)
 }
 
 /// Check a one-chunk record and hand its value over, restoring a compressed one through `decoded`

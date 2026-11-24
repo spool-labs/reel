@@ -14,7 +14,8 @@ use reel::guard::hold;
 use reel::io::job::JobStep;
 use reel::io::{InPlace, Io, in_place};
 use reel::record::codec::Codec;
-use reel::record::record_head::SMALL_HEAD_BYTES;
+use reel::record::record_head::{MOST_SUMMED_PAYLOAD, PAYLOAD_SUM_AT, SMALL_HEAD_BYTES};
+use reel::superblock::{OLDER_SUPERBLOCK_MAGIC, SECOND_SUPERBLOCK_NAME, SUPERBLOCK_MAGIC, SUPERBLOCK_NAME};
 use reel::segment::damage_list::DamagedRange;
 use reel::segment::segment_tail::SegmentNumber;
 use reel_core::column_id::ColumnId;
@@ -213,9 +214,10 @@ fn a_scrub_beside_writers_and_merges_finds_no_false_damage() {
     store.close().expect("close");
 }
 
-// a value read unchecked and held in its index leaf stops answering once the scrub marks its record bad: the next get refuses
+// a value read under trust and held in its index leaf stops answering once the scrub marks its record bad: the next get refuses.
+// The flipped byte sits in the stored check, which a trusted get skips, so the get holds the value whole
 #[test]
-fn a_held_rotted_value_stops_answering_after_the_scrub() {
+fn a_held_value_stops_answering_after_the_scrub() {
     let io = SimulatedIo::new(Seed(5));
     let mut config = sorted_config();
     config.threads = ThreadCounts { scrub_bytes_per_second: 0, ..NO_WORKERS };
@@ -228,11 +230,11 @@ fn a_held_rotted_value_stops_answering_after_the_scrub() {
     let name = sorted_key(KEYS / 2);
     let read_at = store.state.key_read(SORTED, &name, store.state.read_point(volume), false).expect("read");
     let row = in_place(store.state.search_sealed(&InPlace, volume, &read_at)).expect("search").expect("a sealed row");
-    io.rot(&data_path(&volume.roots[0], row.segment), FileOffset(row.row.offset.0 + SMALL_HEAD_BYTES as u64), BitMask(1)).expect("rot");
+    io.rot(&data_path(&volume.roots[0], row.segment), FileOffset(row.row.offset.0), BitMask(1)).expect("rot");
     let mut buf = Vec::new();
-    // the get trusts the sealed record its counts vouch for, reads the rotted bytes and holds them
+    // the get trusts the sealed record its counts vouch for, skips its identity and holds the value
     assert!(store.get(SORTED, &name, &mut buf).expect("get"));
-    assert_ne!(buf, value(KEYS / 2, 0));
+    assert_eq!(buf, value(KEYS / 2, 0), "the get checked the identity");
     assert!(store.state.sorted_index(SORTED).expect("an index").values.held.load(Ordering::Relaxed) > 0, "nothing was held");
 
     let mut job = ScrubJob::new(Arc::clone(&store.state), 0);
@@ -241,7 +243,7 @@ fn a_held_rotted_value_stops_answering_after_the_scrub() {
     assert_eq!(store.state.scrub_failures.load(Ordering::Relaxed), 1);
     buf.clear();
     let again = store.get(SORTED, &name, &mut buf);
-    assert!(!matches!(again, Ok(true)) || buf == value(KEYS / 2, 0), "the held rotted value answered after the scrub: {again:?} {buf:?}");
+    assert!(matches!(again, Err(StoreError::Corruption { .. })), "the held value answered after the scrub: {again:?}");
     store.close().expect("close");
 }
 
@@ -314,7 +316,7 @@ fn a_scan_checks_while_damage_is_marked() {
     store.close().expect("close");
 }
 
-// a value a trusted get read rotten and the record cache took stops answering once damage is marked on its volume: a get and
+// a value a trusted get read past its flipped check and the record cache took stops answering once damage is marked on its volume: a get and
 // a batched get both read the record past the cache and check it. A plain column's get tries its spot first, so this pins the
 // spot path's guard as well as the sealed get's
 #[test]
@@ -329,14 +331,14 @@ fn gets_check_past_the_cache_while_damage_is_marked() {
     let name = key(KEYS / 2);
     let read_at = store.state.key_read(COLUMN, &name, store.state.read_point(volume), false).expect("read");
     let row = in_place(store.state.search_sealed(&InPlace, volume, &read_at)).expect("search").expect("a sealed row");
-    io.rot(&data_path(&volume.roots[0], row.segment), FileOffset(row.row.offset.0 + SMALL_HEAD_BYTES as u64), BitMask(1)).expect("rot");
-    // the trusted gets read the rotten bytes, and the second miss puts them in the cache
+    io.rot(&data_path(&volume.roots[0], row.segment), FileOffset(row.row.offset.0), BitMask(1)).expect("rot");
+    // the trusted gets skip the identity, and the second miss puts the value in the cache
     let mut buf = Vec::new();
     for _round in 0..3 {
         buf.clear();
         assert!(store.get(COLUMN, &name, &mut buf).expect("get"));
     }
-    assert_ne!(buf, value(KEYS / 2, 0), "the trusted get checked the record");
+    assert_eq!(buf, value(KEYS / 2, 0), "the trusted get checked the identity");
     volume.damage.add(&DamagedRange { column: COLUMN, segment: row.segment, highest_place: WritePlace(0), start: Vec::new(), end: Some(vec![0]) });
 
     buf.clear();
@@ -351,10 +353,10 @@ fn gets_check_past_the_cache_while_damage_is_marked() {
     store.close().expect("close");
 }
 
-// on a column with a complete table, a value trusted scans read rotten and left in the record cache stops answering a get once
-// damage is marked on its volume
+// on a column with a complete table, a value trusted scans read past its flipped check and left in the record cache stops
+// answering a get once damage is marked on its volume
 #[test]
-fn a_scanned_rotten_value_stops_answering_once_damage_is_marked() {
+fn a_scanned_value_stops_answering_once_damage_is_marked() {
     let io = SimulatedIo::new(Seed(8));
     let mut config = StoreConfig {
         memory_budget: FULL_BUDGET_BYTES,
@@ -387,8 +389,8 @@ fn a_scanned_rotten_value_stops_answering_once_damage_is_marked() {
     let name = key(KEYS / 2);
     let read_at = store.state.key_read(COLUMN, &name, store.state.read_point(volume), false).expect("read");
     let row = in_place(store.state.search_sealed(&InPlace, volume, &read_at)).expect("search").expect("a sealed row");
-    io.rot(&data_path(&volume.roots[0], row.segment), FileOffset(row.row.offset.0 + SMALL_HEAD_BYTES as u64), BitMask(1)).expect("rot");
-    // trusted scans read the rotten bytes and leave them in the cache
+    io.rot(&data_path(&volume.roots[0], row.segment), FileOffset(row.row.offset.0), BitMask(1)).expect("rot");
+    // trusted scans skip the identity and leave the value in the cache
     for _round in 0..3 {
         let mut scan = store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan");
         let (mut name_buf, mut value_buf) = (Vec::new(), Vec::new());
@@ -396,10 +398,146 @@ fn a_scanned_rotten_value_stops_answering_once_damage_is_marked() {
     }
     let mut buf = Vec::new();
     let before = store.get(COLUMN, &name, &mut buf);
-    assert!(matches!(before, Ok(true)) && buf != value(KEYS / 2, 0), "the scans left no rotten value to serve: {before:?}");
+    assert!(matches!(before, Ok(true)) && buf == value(KEYS / 2, 0), "the scans left nothing to serve: {before:?}");
     volume.damage.add(&DamagedRange { column: COLUMN, segment: row.segment, highest_place: WritePlace(0), start: Vec::new(), end: Some(vec![0]) });
     buf.clear();
     let after = store.get(COLUMN, &name, &mut buf);
-    assert!(!matches!(after, Ok(true)) || buf == value(KEYS / 2, 0), "a get answered the cached rotten value past the damage: {after:?}");
+    assert!(matches!(after, Err(StoreError::Corruption { .. })), "a get answered the cached value past the damage: {after:?}");
+    store.close().expect("close");
+}
+
+// rot in a record's stored payload sum is found both ways: a trusted get refuses the record, since the sum no longer matches its
+// payload, and the scrub fails it, since the full check compares the stored bytes too
+#[test]
+fn a_flipped_payload_sum_is_found() {
+    let io = SimulatedIo::new(Seed(9));
+    let store = open(&io, 0);
+    for number in 0..KEYS {
+        store.put(COLUMN, &key(number), &value(number, 0)).expect("put");
+    }
+    let segment = seal(&store, &io);
+    let volume = &store.state.volumes[0];
+    let name = key(KEYS / 2);
+    let read_at = store.state.key_read(COLUMN, &name, store.state.read_point(volume), false).expect("read");
+    let row = in_place(store.state.search_sealed(&InPlace, volume, &read_at)).expect("search").expect("a sealed row");
+    io.rot(&data_path(&volume.roots[0], row.segment), FileOffset(row.row.offset.0 + PAYLOAD_SUM_AT as u64), BitMask(1)).expect("rot");
+    let mut buf = Vec::new();
+    let found = store.get(COLUMN, &name, &mut buf);
+    assert!(matches!(found, Err(StoreError::Corruption { .. })), "a flipped payload sum answered: {found:?}");
+
+    let mut job = ScrubJob::new(Arc::clone(&store.state), 0);
+    job.rate = RATE;
+    scrub_one_pass(&store, &io, &mut job);
+    assert_eq!(store.state.scrub_failures.load(Ordering::Relaxed), 1);
+    assert!(hold(&volume.damaged).contains(&segment), "the scrub passed a record whose stored sum is wrong");
+    store.close().expect("close");
+}
+
+// a store written before records kept their payload sum is refused at open with an error that says so, and nothing in it changes
+#[test]
+fn an_older_store_is_refused() {
+    let io = SimulatedIo::new(Seed(10));
+    let store = open(&io, 0);
+    store.put(COLUMN, &key(1), &value(1, 0)).expect("put");
+    seal(&store, &io);
+    store.close().expect("close");
+    drop(store);
+    let older = u64::from(OLDER_SUPERBLOCK_MAGIC).to_le_bytes();
+    let newer = u64::from(SUPERBLOCK_MAGIC).to_le_bytes();
+    for name in [SUPERBLOCK_NAME, SECOND_SUPERBLOCK_NAME] {
+        let path = PathBuf::from(ROOT).join(name);
+        for (at, (old, new)) in older.iter().zip(&newer).enumerate() {
+            if old != new {
+                io.rot(&path, FileOffset(at as u64), BitMask(old ^ new)).expect("rot");
+            }
+        }
+    }
+    let config = StoreConfig {
+        memory_budget: BUDGET,
+        threads: ThreadCounts { scrub_bytes_per_second: 0, ..NO_WORKERS },
+        volumes: vec![VolumeConfig {
+            name: "scrub".to_string(),
+            roots: vec![PathBuf::from(ROOT)],
+            sync: SyncPolicy::Never,
+            device: Default::default(), open_segments: None, segment_bytes: None, lifetime_groups: None,
+        }],
+        columns: vec![ColumnConfig {
+            id: COLUMN,
+            name: "column".to_string(),
+            key_shape: KeyShape::Variable { most: 64 },
+            codec: Codec::None,
+            volume: VolumeId(0),
+            index: ColumnIndex::Plain,
+            least_rows: None,
+            least_value: None,
+        }],
+    };
+    let opened = ReelStore::open(io.clone(), &config);
+    let error = opened.err().expect("an older store opened");
+    assert!(format!("{error:?}").contains("payload sum"), "the refusal doesn't say why: {error:?}");
+}
+
+// a trusted get sums a payload of exactly MOST_SUMMED_PAYLOAD bytes and refuses it flipped, and passes one a byte longer
+// unsummed, flipped byte and all
+#[test]
+fn the_summed_payload_line_holds() {
+    let io = SimulatedIo::new(Seed(11));
+    let store = open(&io, 0);
+    let (at_line, past_line) = (vec![b'a'; MOST_SUMMED_PAYLOAD], vec![b'b'; MOST_SUMMED_PAYLOAD + 1]);
+    store.put(COLUMN, b"at-line", &at_line).expect("put");
+    store.put(COLUMN, b"past-line", &past_line).expect("put");
+    seal(&store, &io);
+    let volume = &store.state.volumes[0];
+    for name in [&b"at-line"[..], b"past-line"] {
+        let read_at = store.state.key_read(COLUMN, name, store.state.read_point(volume), false).expect("read");
+        let row = in_place(store.state.search_sealed(&InPlace, volume, &read_at)).expect("search").expect("a sealed row");
+        io.rot(&data_path(&volume.roots[0], row.segment), FileOffset(row.row.offset.0 + SMALL_HEAD_BYTES as u64 + 7), BitMask(1)).expect("rot");
+    }
+    let mut buf = Vec::new();
+    let at = store.get(COLUMN, b"at-line", &mut buf);
+    assert!(matches!(at, Err(StoreError::Corruption { .. })), "a flipped payload at the line answered: {at:?}");
+    buf.clear();
+    assert!(store.get(COLUMN, b"past-line", &mut buf).expect("get"), "the payload past the line went missing");
+    assert_eq!(buf.len(), past_line.len());
+    assert_ne!(buf, past_line, "a payload past the line was summed");
+    store.close().expect("close");
+}
+
+// a compressed record's sum covers its stored bytes, so a trusted get refuses a flipped stored byte before it restores the value
+#[test]
+fn a_flipped_compressed_payload_is_caught_under_trust() {
+    let io = SimulatedIo::new(Seed(12));
+    let config = StoreConfig {
+        memory_budget: FULL_BUDGET_BYTES,
+        threads: ThreadCounts { scrub_bytes_per_second: 0, ..NO_WORKERS },
+        volumes: vec![VolumeConfig {
+            name: "scrub".to_string(),
+            roots: vec![PathBuf::from(ROOT)],
+            sync: SyncPolicy::Never,
+            device: Default::default(), open_segments: None, segment_bytes: None, lifetime_groups: None,
+        }],
+        columns: vec![ColumnConfig {
+            id: COLUMN,
+            name: "column".to_string(),
+            key_shape: KeyShape::Variable { most: 64 },
+            codec: Codec::Lz4,
+            volume: VolumeId(0),
+            index: ColumnIndex::Plain,
+            least_rows: None,
+            least_value: None,
+        }],
+    };
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let written: Vec<u8> = b"a value that compresses well. ".iter().copied().cycle().take(3_000).collect();
+    store.put(COLUMN, b"packed", &written).expect("put");
+    seal(&store, &io);
+    let volume = &store.state.volumes[0];
+    let read_at = store.state.key_read(COLUMN, b"packed", store.state.read_point(volume), false).expect("read");
+    let row = in_place(store.state.search_sealed(&InPlace, volume, &read_at)).expect("search").expect("a sealed row");
+    assert!((row.row.length.0 as usize) < written.len(), "the value was stored uncompressed");
+    io.rot(&data_path(&volume.roots[0], row.segment), FileOffset(row.row.offset.0 + SMALL_HEAD_BYTES as u64 + 3), BitMask(1)).expect("rot");
+    let mut buf = Vec::new();
+    let found = store.get(COLUMN, b"packed", &mut buf);
+    assert!(matches!(found, Err(StoreError::Corruption { .. })), "a flipped compressed payload answered: {found:?}");
     store.close().expect("close");
 }

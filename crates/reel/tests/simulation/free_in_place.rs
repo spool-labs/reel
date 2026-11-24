@@ -20,6 +20,7 @@ use reel::segment::segment_tail::SegmentNumber;
 use reel_core::column_id::ColumnId;
 use reel_core::direction::Direction;
 use reel_core::scan::ScanStep;
+use reel_core::store_error::StoreError;
 use reel_core::units::{ByteCount, FileOffset, Nanoseconds, VolumeId, WritePlace};
 use reel_core::value_list::{ReadBuffers, ValueList};
 use reel_sim::file_image::BitMask;
@@ -610,19 +611,32 @@ fn a_scan_batch_across_a_free_seeks_again() {
     store.close().expect("close");
 }
 
-// the price of the skipped check: a small sealed record whose payload bytes flipped on the disk reads back flipped, since nothing
-// moved the get's counts
+// the price of the skipped check: a get under its counts skips a small sealed record's identity hashes, so a flipped byte in its
+// stored check goes unseen and the value reads back whole
 #[test]
-fn flipped_bytes_read_back_unchecked_while_counts_hold() {
+fn a_flipped_check_reads_back_unchecked_while_counts_hold() {
+    let io = SimulatedIo::new(Seed(42));
+    let store = open(&io);
+    store.put(COLUMN, b"small", b"small value").expect("put");
+    seal(&store, &io);
+    let (row, path) = sealed_row(&store, b"small");
+    io.rot(&path, FileOffset(row.row.offset.0), BitMask(1)).expect("rot");
+    assert_eq!(read(&store, b"small").expect("a value"), b"small value", "the get checked the identity");
+    store.close().expect("close");
+}
+
+// a get under its counts still sums a small payload against its head, so a byte flipped in the payload reads as corrupt
+#[test]
+fn a_flipped_payload_is_caught_while_counts_hold() {
     let io = SimulatedIo::new(Seed(42));
     let store = open(&io);
     store.put(COLUMN, b"small", b"small value").expect("put");
     seal(&store, &io);
     let (row, path) = sealed_row(&store, b"small");
     io.rot(&path, FileOffset(row.row.offset.0 + SMALL_HEAD_BYTES as u64), BitMask(1)).expect("rot");
-    let found = read(&store, b"small").expect("a value");
-    assert_eq!(found.len(), b"small value".len());
-    assert_ne!(found, b"small value", "the flipped byte was caught");
+    let mut buf = Vec::new();
+    let found = store.get(COLUMN, b"small", &mut buf);
+    assert!(matches!(found, Err(StoreError::Corruption { .. })), "a flipped payload answered: {found:?} {buf:?}");
     store.close().expect("close");
 }
 
@@ -686,8 +700,8 @@ fn merges_beside_frees_mark_no_damage() {
     store.close().expect("close");
 }
 
-// an open row's record is the bytes its row names once it's in the file, so a get reads it with no sum, and a byte flipped on
-// the disk under it reads back flipped. The value is too long for its row to keep, so the get reads the record
+// an open row's record is the bytes its row names once it's in the file, so a get reads it with no identity check, and a byte
+// flipped in its stored check goes unseen. The value is too long for its row to keep, so the get reads the record
 #[test]
 fn an_open_record_reads_back_unchecked() {
     let io = SimulatedIo::new(Seed(44));
@@ -698,15 +712,13 @@ fn an_open_record_reads_back_unchecked() {
     let volume = &store.state.volumes[0];
     let row = store.state.index.lookup(COLUMN, b"open", store.state.read_point(volume), volume.view()).row.expect("an open row");
     let path = data_path(&volume.roots[0], row.segment).to_path_buf();
-    io.rot(&path, FileOffset(row.offset.0 + SMALL_HEAD_BYTES as u64), BitMask(1)).expect("rot");
-    let found = read(&store, b"open").expect("a value");
-    assert_eq!(found.len(), written.len());
-    assert_ne!(found, written, "the flipped byte was caught");
+    io.rot(&path, FileOffset(row.offset.0), BitMask(1)).expect("rot");
+    assert_eq!(read(&store, b"open").expect("a value"), written, "the get checked the identity");
     store.close().expect("close");
 }
 
 // put a key with a small value, then enough after it that the slot's window no longer holds its record, and flip a byte of the
-// record's payload on the disk
+// record's stored check on the disk
 fn rot_open_record(store: &Store, io: &SimulatedIo) {
     for number in 0..50_u32 {
         store.put(COLUMN, format!("aaa-{number:04}").as_bytes(), b"open value").expect("put");
@@ -718,7 +730,7 @@ fn rot_open_record(store: &Store, io: &SimulatedIo) {
     let volume = &store.state.volumes[0];
     let row = store.state.index.lookup(COLUMN, b"aaa-0025", store.state.read_point(volume), volume.view()).row.expect("an open row");
     let path = data_path(&volume.roots[0], row.segment).to_path_buf();
-    io.rot(&path, FileOffset(row.offset.0 + SMALL_HEAD_BYTES as u64), BitMask(1)).expect("rot");
+    io.rot(&path, FileOffset(row.offset.0), BitMask(1)).expect("rot");
 }
 
 // read the value a scan from the start answers for a key, which the batch holds past the walk's first row, or nothing when the
@@ -734,8 +746,8 @@ fn scanned(store: &Store, wanted: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-// a scan reads an open record this run wrote from its batch with no sum, as a get does, so a byte flipped on the disk under it
-// reads back flipped
+// a scan reads an open record this run wrote from its batch with no identity check, as a get does, so a byte flipped in its
+// stored check goes unseen
 #[test]
 fn a_scanned_open_record_reads_back_unchecked() {
     let io = SimulatedIo::new(Seed(45));
@@ -744,8 +756,7 @@ fn a_scanned_open_record_reads_back_unchecked() {
     let trusted = store.state.scan_trusted_records.load(Ordering::Relaxed);
     let value = scanned(&store, b"aaa-0025").expect("the row");
     assert!(store.state.scan_trusted_records.load(Ordering::Relaxed) > trusted, "the batch checked every open record");
-    assert_eq!(value.len(), b"open value".len());
-    assert_ne!(value, b"open value", "the flipped byte was caught");
+    assert_eq!(value, b"open value", "the batch checked the identity");
     store.close().expect("close");
 }
 

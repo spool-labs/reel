@@ -15,8 +15,10 @@ use crate::little_endian::ByteReader;
 use crate::record::record_check::RecordKey;
 use crate::segment::segment_tail::SegmentNumber;
 
-/// Opens every superblock
-pub const SUPERBLOCK_MAGIC: u32 = 0x5245_4C53;
+/// Opens every superblock. It changed when one-chunk records began keeping their payload's sum in the head
+pub const SUPERBLOCK_MAGIC: u32 = 0x5245_4C32;
+/// Opened a superblock of a store written before records kept their payload's sum, which this build refuses to open
+pub const OLDER_SUPERBLOCK_MAGIC: u32 = 0x5245_4C53;
 /// The superblock's file name
 pub const SUPERBLOCK_NAME: &str = "superblock";
 /// The name a new superblock is written under before it replaces the old one
@@ -261,6 +263,10 @@ impl Superblock {
             Err(error) if is_device_error(&error) => return Ok(CopyRead::Failed),
             Err(error) => return Err(error),
         };
+        // an older store's records lack the payload sum this build reads, so it is refused with no migration
+        if bytes.get(..size_of::<u64>()).is_some_and(|word| word == u64::from(OLDER_SUPERBLOCK_MAGIC).to_le_bytes()) {
+            return Err(Error::new(ErrorKind::Unsupported, "the store was written before records kept their payload sum, which this build can't read"));
+        }
         Ok(Self::from_bytes(&bytes).map_or(CopyRead::Failed, CopyRead::Passed))
     }
 

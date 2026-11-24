@@ -244,8 +244,8 @@ impl RecordReader {
     }
 
     /// Read a one-chunk record whose bytes nothing changed since the caller located it, and hand its value over with no record
-    /// check: its form still parses, the read takes the located length, and a payload up to MOST_SUMMED_PAYLOAD must match its
-    /// head's stored sum or the read fails. Nothing for any other record, which takes `read_value`. The bytes stay held, so
+    /// check: its form still parses, the read takes the located length, and when `is_summed` a payload up to MOST_SUMMED_PAYLOAD
+    /// must match its head's stored sum or the read fails. Nothing for any other record, which takes `read_value`. The bytes stay held, so
     /// `check_trusted` can check them after
     pub async fn read_trusted<File: IoFile>(
         &mut self,
@@ -253,6 +253,7 @@ impl RecordReader {
         file: &File,
         location: RecordLocation,
         buf: &mut Vec<u8>,
+        is_summed: bool,
     ) -> Result<Option<RecordRead>> {
         self.trusted = None;
         self.front = None;
@@ -284,9 +285,10 @@ impl RecordReader {
             buf.clear();
             return Ok(None);
         }
-        // the stored sum catches rot in a short payload with no identity hashes. A mismatch reads as failed, and a reader whose
-        // counts moved reads the record again with every check
-        if !trusted_sum_holds(&self.first[..SMALL_HEAD_BYTES], buf) {
+        // the stored sum catches rot in a short sealed payload with no identity hashes. A mismatch reads as failed, and a reader
+        // whose counts moved reads the record again with every check. An open record this run wrote isn't summed, since its
+        // bytes never left this process
+        if is_summed && !trusted_sum_holds(&self.first[..SMALL_HEAD_BYTES], buf) {
             buf.clear();
             return Ok(Some(RecordRead::Failed));
         }
@@ -824,11 +826,12 @@ impl Drop for UnfilledRead<'_> {
     }
 }
 
-/// Give a one-chunk record's payload where it lies, for a record its reader trusts. The identity goes unchecked, and a payload up
-/// to MOST_SUMMED_PAYLOAD is checked against its head's stored sum, so rot in it still reads as a failed record
-pub fn trusted_payload(record: &[u8]) -> Option<&[u8]> {
+/// Give a one-chunk record's payload where it lies, for a record its reader trusts. The identity goes unchecked. A sealed
+/// record's payload up to MOST_SUMMED_PAYLOAD is checked against its head's stored sum, so rot in it still reads as a failed
+/// record. An open record this run wrote isn't summed, since its bytes never left this process
+pub fn trusted_payload(record: &[u8], is_summed: bool) -> Option<&[u8]> {
     let payload = record.get(SMALL_HEAD_BYTES..)?;
-    trusted_sum_holds(record, payload).then_some(payload)
+    (!is_summed || trusted_sum_holds(record, payload)).then_some(payload)
 }
 
 /// Check a one-chunk record and hand its value over, restoring a compressed one through `decoded`

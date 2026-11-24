@@ -785,3 +785,22 @@ fn a_scanned_replayed_record_is_checked() {
     assert_eq!(store.state.scan_trusted_records.load(Ordering::Relaxed), 0, "the batch trusted a replayed record");
     store.close().expect("close");
 }
+
+// an open record this run wrote isn't summed, since its bytes never left this process, so a byte flipped in its payload on the
+// disk under it reads back flipped, where a sealed record's is caught
+#[test]
+fn an_open_record_payload_is_not_summed() {
+    let io = SimulatedIo::new(Seed(47));
+    let store = open(&io);
+    let written = vec![b'p'; reel::index::entry_slab::MOST_INLINE_VALUE + 1];
+    store.put(COLUMN, b"open", &written).expect("put");
+    store.flush().expect("flush");
+    let volume = &store.state.volumes[0];
+    let row = store.state.index.lookup(COLUMN, b"open", store.state.read_point(volume), volume.view()).row.expect("an open row");
+    let path = data_path(&volume.roots[0], row.segment).to_path_buf();
+    io.rot(&path, FileOffset(row.offset.0 + SMALL_HEAD_BYTES as u64), BitMask(1)).expect("rot");
+    let found = read(&store, b"open").expect("a value");
+    assert_eq!(found.len(), written.len());
+    assert_ne!(found, written, "the open record was summed");
+    store.close().expect("close");
+}

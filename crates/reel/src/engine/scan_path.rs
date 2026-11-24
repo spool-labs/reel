@@ -799,7 +799,7 @@ impl<Backend: Io> EngineState<Backend> {
             };
             // an open record this run wrote, or a sealed one read under the batch's counts, is trusted as a get trusts it
             let is_trusted = entry.is_trusted;
-            let payload = if is_trusted { trusted_payload(record) } else { checked_payload(record, form, &identity) };
+            let payload = if is_trusted { trusted_payload(record, !matches!(entry.located, Located::Open(_))) } else { checked_payload(record, form, &identity) };
             let Some(payload) = payload.map(|payload| payload.len()) else {
                 continue;
             };
@@ -1154,7 +1154,7 @@ impl<Backend: Io> EngineState<Backend> {
         let identity = RecordIdentity { record_key: self.record_key, column: scan.column, key: name, kind: RowKind::Value, place };
         let form = form_of(record).filter(|form| !form.is_chunked && form.codec == Codec::None)?;
         let is_trusted = entry.is_trusted;
-        let payload = if is_trusted { trusted_payload(record)? } else { checked_payload(record, form, &identity)? };
+        let payload = if is_trusted { trusted_payload(record, !matches!(entry.located, Located::Open(_)))? } else { checked_payload(record, form, &identity)? };
         if is_trusted {
             self.scan_trusted_records.fetch_add(1, Ordering::Relaxed);
         }
@@ -1198,7 +1198,7 @@ impl<Backend: Io> EngineState<Backend> {
         };
         let opened = match form.codec {
             Codec::None if is_trusted => {
-                let Some(payload) = trusted_payload(record) else {
+                let Some(payload) = trusted_payload(record, false) else {
                     return false;
                 };
                 self.scan_trusted_records.fetch_add(1, Ordering::Relaxed);

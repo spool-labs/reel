@@ -1111,7 +1111,7 @@ impl<Backend: Io> EngineState<Backend> {
         let is_guessed = read.info.codec == Codec::Lz4;
         let declared = if is_guessed && self.guesses_plain(read.column) { Codec::None } else { read.info.codec };
         let outcome = match want {
-            RecordWant::Whole if trust != Trust::Check => match reader.read_trusted(device, file, location, buf).await {
+            RecordWant::Whole if trust != Trust::Check => match reader.read_trusted(device, file, location, buf, trust != Trust::Whole).await {
                 Ok(Some(answer)) if holds() => Ok(answer),
                 Ok(Some(_answer)) => match reader.check_trusted(&identity, buf) {
                     Some(checked) => Ok(checked),

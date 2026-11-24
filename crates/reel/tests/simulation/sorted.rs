@@ -2785,13 +2785,29 @@ fn a_scanned_large_sealed_value_reads_back_unchecked() {
     }
 }
 
-// a record the batch read and found failing its check is never answered unchecked: the scan steps corrupt at it
+// a record the batch read under its counts is trusted as a get trusts one, so a byte flipped on the disk under it reads back
+// flipped and the trusted count rises. The scrub finds the rot
 #[test]
-fn a_batched_rotten_value_steps_corrupt() {
+fn a_batched_sealed_value_reads_back_unchecked() {
     let io = SimulatedIo::new(Seed(51));
     let store = rotted_large_values(&io, BATCHED_VALUE_BYTES);
-    assert_eq!(scanned_value(&store, &key(ROTTED_KEY)), Err(ScanStep::Corrupt), "a rotten batched value came back");
+    let trusted = report(&store).scan_trusted_records;
+    let value = scanned_value(&store, &key(ROTTED_KEY)).expect("the row");
+    assert!(report(&store).scan_trusted_records > trusted, "the batch checked its record");
+    assert_ne!(value, large_value(ROTTED_KEY, BATCHED_VALUE_BYTES), "the flipped byte was caught");
     store.close().expect("close");
+}
+
+// a read-only store has no counts to trust a batch under, so its scan steps corrupt at a rotten batched value
+#[test]
+fn a_read_only_batched_rotten_value_steps_corrupt() {
+    let io = SimulatedIo::new(Seed(51));
+    let store = rotted_large_values(&io, BATCHED_VALUE_BYTES);
+    store.close().expect("close");
+    drop(store);
+    let view = ReelStore::open_read_only(io.clone(), &config(CAPACITY)).expect("open read-only");
+    assert_eq!(scanned_value(&view, &key(ROTTED_KEY)), Err(ScanStep::Corrupt), "a rotten batched value came back");
+    view.close().expect("close");
 }
 
 // a read-only store's scan checks every record, so the flipped value never comes back

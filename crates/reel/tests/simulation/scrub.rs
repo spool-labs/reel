@@ -15,9 +15,14 @@ use reel::io::job::JobStep;
 use reel::io::{InPlace, Io, in_place};
 use reel::record::codec::Codec;
 use reel::record::record_head::SMALL_HEAD_BYTES;
+use reel::segment::damage_list::DamagedRange;
 use reel::segment::segment_tail::SegmentNumber;
 use reel_core::column_id::ColumnId;
-use reel_core::units::{ByteCount, FileOffset, Nanoseconds, VolumeId};
+use reel_core::direction::Direction;
+use reel_core::scan::ScanStep;
+use reel_core::value_list::{ValueAnswer, ValueList};
+use reel_core::store_error::StoreError;
+use reel_core::units::{ByteCount, FileOffset, Nanoseconds, RowCount, VolumeId, WritePlace};
 use reel_sim::file_image::BitMask;
 use reel_sim::seeded_random::{Seed, SeededRandom};
 use reel_sim::simulated_io::SimulatedIo;
@@ -271,4 +276,130 @@ fn sorted_config() -> StoreConfig {
             least_value: None,
         }],
     }
+}
+
+// a writable store's scan checks every record while its volume has damage marked anywhere, so it steps corrupt at a rotten key
+// and goes on to the next. The damage here lies below every key the scan reads, so the walk itself never meets it
+#[test]
+fn a_scan_checks_while_damage_is_marked() {
+    let io = SimulatedIo::new(Seed(6));
+    let store = open(&io, 0);
+    for number in 0..KEYS {
+        store.put(COLUMN, &key(number), &value(number, 0)).expect("put");
+    }
+    seal(&store, &io);
+    let volume = &store.state.volumes[0];
+    let name = key(KEYS / 2);
+    let read_at = store.state.key_read(COLUMN, &name, store.state.read_point(volume), false).expect("read");
+    let row = in_place(store.state.search_sealed(&InPlace, volume, &read_at)).expect("search").expect("a sealed row");
+    io.rot(&data_path(&volume.roots[0], row.segment), FileOffset(row.row.offset.0 + SMALL_HEAD_BYTES as u64), BitMask(1)).expect("rot");
+    volume.damage.add(&DamagedRange { column: COLUMN, segment: row.segment, highest_place: WritePlace(0), start: Vec::new(), end: Some(vec![0]) });
+
+    let mut scan = store.iter_from(COLUMN, &key(0), Direction::Ascending).expect("scan");
+    let (mut name_buf, mut value_buf) = (Vec::new(), Vec::new());
+    let (mut corrupt, mut after) = (Vec::new(), 0);
+    loop {
+        match scan.next_row(&mut name_buf, &mut value_buf).expect("step") {
+            ScanStep::Found => {
+                assert_ne!(name_buf, name, "the rotten key answered a value");
+                after += u64::from(!corrupt.is_empty());
+            },
+            ScanStep::Corrupt => corrupt.push(name_buf.clone()),
+            ScanStep::End => break,
+        }
+    }
+    assert_eq!(corrupt, vec![name], "the scan did not step corrupt at the rotten key alone");
+    assert!(after > 0, "the scan stopped at the corrupt row");
+    drop(scan);
+    store.close().expect("close");
+}
+
+// a value a trusted get read rotten and the record cache took stops answering once damage is marked on its volume: a get and
+// a batched get both read the record past the cache and check it. A plain column's get tries its spot first, so this pins the
+// spot path's guard as well as the sealed get's
+#[test]
+fn gets_check_past_the_cache_while_damage_is_marked() {
+    let io = SimulatedIo::new(Seed(7));
+    let store = open(&io, 0);
+    for number in 0..KEYS {
+        store.put(COLUMN, &key(number), &value(number, 0)).expect("put");
+    }
+    seal(&store, &io);
+    let volume = &store.state.volumes[0];
+    let name = key(KEYS / 2);
+    let read_at = store.state.key_read(COLUMN, &name, store.state.read_point(volume), false).expect("read");
+    let row = in_place(store.state.search_sealed(&InPlace, volume, &read_at)).expect("search").expect("a sealed row");
+    io.rot(&data_path(&volume.roots[0], row.segment), FileOffset(row.row.offset.0 + SMALL_HEAD_BYTES as u64), BitMask(1)).expect("rot");
+    // the trusted gets read the rotten bytes, and the second miss puts them in the cache
+    let mut buf = Vec::new();
+    for _round in 0..3 {
+        buf.clear();
+        assert!(store.get(COLUMN, &name, &mut buf).expect("get"));
+    }
+    assert_ne!(buf, value(KEYS / 2, 0), "the trusted get checked the record");
+    volume.damage.add(&DamagedRange { column: COLUMN, segment: row.segment, highest_place: WritePlace(0), start: Vec::new(), end: Some(vec![0]) });
+
+    buf.clear();
+    let again = store.get(COLUMN, &name, &mut buf);
+    assert!(matches!(again, Err(StoreError::Corruption { .. })), "a get answered past the damage: {again:?}");
+    let mut values = ValueList::new();
+    let names: Vec<Vec<u8>> = (KEYS / 2 - 4..KEYS / 2 + 4).map(key).collect();
+    let keys: Vec<&[u8]> = names.iter().map(Vec::as_slice).collect();
+    let batched = store.get_many(COLUMN, &keys, &mut values);
+    let answer = batched.map(|()| values.answer(4));
+    assert!(matches!(answer, Ok(Some(ValueAnswer::Corrupt)) | Err(StoreError::Corruption { .. })), "a batched get answered past the damage: {answer:?}");
+    store.close().expect("close");
+}
+
+// on a column with a complete table, a value trusted scans read rotten and left in the record cache stops answering a get once
+// damage is marked on its volume
+#[test]
+fn a_scanned_rotten_value_stops_answering_once_damage_is_marked() {
+    let io = SimulatedIo::new(Seed(8));
+    let mut config = StoreConfig {
+        memory_budget: FULL_BUDGET_BYTES,
+        threads: NO_WORKERS,
+        volumes: vec![VolumeConfig {
+            name: "scrub".to_string(),
+            roots: vec![PathBuf::from(ROOT)],
+            sync: SyncPolicy::Never,
+            device: Default::default(), open_segments: None, segment_bytes: None, lifetime_groups: None,
+        }],
+        columns: Vec::new(),
+    };
+    config.threads.scrub_bytes_per_second = 0;
+    config.columns.push(ColumnConfig {
+        id: COLUMN,
+        name: "column".to_string(),
+        key_shape: KeyShape::Variable { most: 64 },
+        codec: Codec::None,
+        volume: VolumeId(0),
+        index: ColumnIndex::Complete,
+        least_rows: Some(RowCount(KEYS * 4)),
+        least_value: None,
+    });
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    for number in 0..KEYS {
+        store.put(COLUMN, &key(number), &value(number, 0)).expect("put");
+    }
+    seal(&store, &io);
+    let volume = &store.state.volumes[0];
+    let name = key(KEYS / 2);
+    let read_at = store.state.key_read(COLUMN, &name, store.state.read_point(volume), false).expect("read");
+    let row = in_place(store.state.search_sealed(&InPlace, volume, &read_at)).expect("search").expect("a sealed row");
+    io.rot(&data_path(&volume.roots[0], row.segment), FileOffset(row.row.offset.0 + SMALL_HEAD_BYTES as u64), BitMask(1)).expect("rot");
+    // trusted scans read the rotten bytes and leave them in the cache
+    for _round in 0..3 {
+        let mut scan = store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan");
+        let (mut name_buf, mut value_buf) = (Vec::new(), Vec::new());
+        while scan.next_row(&mut name_buf, &mut value_buf).expect("step") != ScanStep::End {}
+    }
+    let mut buf = Vec::new();
+    let before = store.get(COLUMN, &name, &mut buf);
+    assert!(matches!(before, Ok(true)) && buf != value(KEYS / 2, 0), "the scans left no rotten value to serve: {before:?}");
+    volume.damage.add(&DamagedRange { column: COLUMN, segment: row.segment, highest_place: WritePlace(0), start: Vec::new(), end: Some(vec![0]) });
+    buf.clear();
+    let after = store.get(COLUMN, &name, &mut buf);
+    assert!(!matches!(after, Ok(true)) || buf == value(KEYS / 2, 0), "a get answered the cached rotten value past the damage: {after:?}");
+    store.close().expect("close");
 }

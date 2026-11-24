@@ -449,6 +449,10 @@ impl<Backend: Io> EngineState<Backend> {
             records.truncate(at);
             return Err(CacheLookup::Miss { is_admitted: false });
         }
+        // while the volume has damage marked the cache could hold bytes the scrub found bad, so the batch reads the record
+        if !self.volumes[read.info.volume.0 as usize].damage.is_empty() {
+            return Err(CacheLookup::Miss { is_admitted: false });
+        }
         // a buffer with room for any cached value takes it straight from the cache, with no stop in the scratch
         if at + MOST_CACHED_BYTES <= records.capacity() {
             return match self.record_cache.get_onto(sealed.segment, sealed.row.offset, read.key, records) {
@@ -875,8 +879,13 @@ impl<Backend: Io> EngineState<Backend> {
             offset: spot.offset,
             length: spot.length,
         };
-        // a failed check here means another key or a moved record: a miss
-        let is_valid = self.read_cached(device, &pin.file, spot.segment, location, (spot.place, Trust::Check), read, want, buf).await?;
+        // a failed check here means another key or a moved record: a miss. While the volume has damage marked the cache could
+        // hold bytes the scrub found bad, so the record is read past it
+        let is_valid = if volume.damage.is_empty() {
+            self.read_cached(device, &pin.file, spot.segment, location, (spot.place, Trust::Check), read, want, buf).await?
+        } else {
+            self.read_record(ReadOn::new(device, &pin.file), location, (spot.place, Trust::Check), read, want, buf).await? == RecordRead::Valid
+        };
         Ok(is_valid.then_some(true))
     }
 
@@ -1022,6 +1031,14 @@ impl<Backend: Io> EngineState<Backend> {
             }
             return Ok(true);
         }
+        // while the volume has damage marked, a cached value or a trusted read could be bytes the scrub found bad, so the record
+        // is read and checked past the cache
+        if !volume.damage.is_empty() {
+            if self.read_record(ReadOn::new(device, &pin.file), location, (sealed.row.place, Trust::Check), read, want, buf).await? == RecordRead::Failed {
+                return Err(corruption(read));
+            }
+            return Ok(true);
+        }
         // a sealed record never changes where it sits, so the cache answers for its place while the segment is pinned
         let is_valid = self.read_cached(device, &pin.file, sealed.segment, location, trust, read, want, buf).await?;
         if !is_valid {
@@ -1083,9 +1100,10 @@ impl<Backend: Io> EngineState<Backend> {
         };
         let mut reader = self.record_reader_for(device);
         reader.forget_front();
+        // a volume with damage marked checks every sealed record, since the bytes could be ones the scrub found bad
         let holds = || match trust {
             Trust::Check => false,
-            Trust::While(counts) => self.has_outlived(counts, true),
+            Trust::While(counts) => self.has_outlived(counts, true) && self.volumes[read.info.volume.0 as usize].damage.is_empty(),
             Trust::Whole => true,
         };
         // an lz4 column whose large records come out as written, a column of noise, reads one in a single read as a none column

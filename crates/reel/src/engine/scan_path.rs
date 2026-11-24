@@ -704,8 +704,9 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// Read the batch's records together, from the record cache, a slot's window or joined reads, and leave the rest to own reads
     pub async fn read_batch(&self, device: &impl DeviceReads<Backend::File>, volume: &Volume<Backend>, scan: &mut ScanState) {
-        let is_cached = self.scans_use_cache(volume);
-        let ScanState { batch: ScanBatch { entries, keys, records, rows, spans, trusted, words, .. }, sorted, sorted_spare, sorted_turn, column, .. } = scan;
+        // while the volume has damage marked the cache could hold bytes the scrub found bad, so the batch reads past it
+        let is_cached = volume.damage.is_empty() && self.scans_use_cache(volume);
+        let ScanState { batch: ScanBatch { entries, keys, records, rows, spans, trusted, words, counts, .. }, sorted, sorted_spare, sorted_turn, column, .. } = scan;
         rows.clear();
         rows.resize(entries.len(), None);
         let mut hits = 0;
@@ -763,19 +764,29 @@ impl<Backend: Io> EngineState<Backend> {
         if self.read_records(device, volume, rows, records, (spans, trusted), words).await {
             self.scan_batches_presorted.fetch_add(1, Ordering::Relaxed);
         }
+        // a sealed record read after the batch's counts, with no reclaim or free since, is the record the index named, so it is
+        // trusted as a get trusts one under its counts
+        // a volume with damage marked checks every record, as a get's trusted fallback does
+        let is_sealed_trusted = volume.damage.is_empty() && counts.is_some_and(|counts| self.has_outlived(counts, true));
         for ((entry, span), is_trusted) in entries.iter_mut().zip(spans.iter()).zip(trusted.iter()) {
             if span.is_some() {
                 entry.record = *span;
-                entry.is_trusted = *is_trusted;
+                entry.is_trusted = match entry.located {
+                    Located::Open(_) => *is_trusted,
+                    Located::Sealed(_) => is_sealed_trusted,
+                    Located::Absent => false,
+                };
             }
         }
-        // a column whose leaves hold values checks the records it read here, open and sealed, and keeps them a leaf at a time. An open
-        // row's value stays right after its seal, since a seal moves no record
+        // a column whose leaves hold values takes the records it read here, open and sealed, and keeps them a leaf at a time. A record
+        // read under trust goes into its leaf unchecked, so rotten bytes read then are served from the leaf with no file read until
+        // the leaf lets them go or the scrub marks the range. An open row's value stays right after its seal, since a seal moves no record
         let Some(index) = self.sorted_index(*column).filter(|index| index.values.page_count() > 0) else {
             return;
         };
         let mut is_fresh = [false; SCAN_BATCH_KEYS];
         let mut restored_values = 0;
+        let mut trusted_records = 0;
         for (at, entry) in entries.iter_mut().enumerate() {
             let (Some((start, length)), Some(row), false) = (entry.record, held_row(&entry.located), entry.is_value) else {
                 continue;
@@ -786,12 +797,13 @@ impl<Backend: Io> EngineState<Backend> {
             let Some(form) = form_of(record).filter(|form| !form.is_chunked) else {
                 continue;
             };
-            // an open record this run read from its file is trusted, as a get trusts it
-            let is_trusted = entry.is_trusted && matches!(entry.located, Located::Open(_));
+            // an open record this run wrote, or a sealed one read under the batch's counts, is trusted as a get trusts it
+            let is_trusted = entry.is_trusted;
             let payload = if is_trusted { trusted_payload(record) } else { checked_payload(record, form, &identity) };
             let Some(payload) = payload.map(|payload| payload.len()) else {
                 continue;
             };
+            trusted_records += u64::from(is_trusted);
             let payload_at = start + length - payload;
             entry.record = match form.codec {
                 Codec::None => Some((payload_at, payload)),
@@ -819,6 +831,9 @@ impl<Backend: Io> EngineState<Backend> {
         }
         if restored_values > 0 {
             self.scan_restored_values.fetch_add(restored_values, Ordering::Relaxed);
+        }
+        if trusted_records > 0 {
+            self.scan_trusted_records.fetch_add(trusted_records, Ordering::Relaxed);
         }
         let fresh = entries.iter().enumerate().filter(|(at, _entry)| is_fresh.get(*at).copied().unwrap_or(false));
         index.hold_values(fresh.filter_map(|(_at, entry)| {
@@ -997,6 +1012,7 @@ impl<Backend: Io> EngineState<Backend> {
                 value.extend_from_slice(&batch.records[at..at + length]);
                 true
             },
+            // a sealed row gets here only when its batch read was compressed or chunked, which a trusted get checks too
             (Some((at, length)), Located::Sealed(row)) => {
                 let is_open = self.open_batched(on.device, (*column, name), (row.row.place, false), &batch.records[at..at + length], value);
                 if is_open {
@@ -1137,7 +1153,7 @@ impl<Backend: Io> EngineState<Backend> {
         let (record, name) = (&scan.batch.records[at..at + length], scan.batch_key(entry));
         let identity = RecordIdentity { record_key: self.record_key, column: scan.column, key: name, kind: RowKind::Value, place };
         let form = form_of(record).filter(|form| !form.is_chunked && form.codec == Codec::None)?;
-        let is_trusted = entry.is_trusted && matches!(entry.located, Located::Open(_));
+        let is_trusted = entry.is_trusted;
         let payload = if is_trusted { trusted_payload(record)? } else { checked_payload(record, form, &identity)? };
         if is_trusted {
             self.scan_trusted_records.fetch_add(1, Ordering::Relaxed);
@@ -1155,7 +1171,8 @@ impl<Backend: Io> EngineState<Backend> {
         if self.sorted_index(column).is_some_and(|index| index.values.page_count() > 0) {
             return;
         }
-        if volume.scans_use_cache.load(Ordering::Relaxed) {
+        // a value read while the volume has damage marked stays out, so the cache never takes bytes the scrub may have found bad
+        if volume.scans_use_cache.load(Ordering::Relaxed) && volume.damage.is_empty() {
             self.record_cache.admit(row.segment, row.row.offset, name, value);
         }
     }

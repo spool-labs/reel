@@ -126,6 +126,17 @@ impl ValueList {
         self.buffers = buffers;
     }
 
+    /// Give the list a buffer for its next long value, so a caller that keeps buffers across calls reads into warm pages
+    pub fn give_spare(&mut self, mut buffer: Vec<u8>) {
+        buffer.clear();
+        self.spare.push(buffer);
+    }
+
+    /// Take back a buffer the list kept and no value used
+    pub fn take_spare(&mut self) -> Option<Vec<u8>> {
+        self.spare.pop()
+    }
+
     /// Count the answers
     pub fn len(&self) -> usize {
         self.answers.len()

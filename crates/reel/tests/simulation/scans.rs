@@ -48,7 +48,7 @@ const BAD_RECORD_AT: u64 = 4_000;
 type Store = ReelStore<SimulatedIo>;
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
 
-fn open(io: &SimulatedIo) -> Store {
+fn config() -> StoreConfig {
     let column = |id, name: &str| ColumnConfig {
         id,
         name: name.to_string(),
@@ -59,7 +59,7 @@ fn open(io: &SimulatedIo) -> Store {
         least_rows: None,
         least_value: None,
     };
-    let config = StoreConfig {
+    StoreConfig {
         memory_budget: BUDGET,
         threads: reel::config::NO_WORKERS,
         volumes: vec![VolumeConfig {
@@ -69,8 +69,11 @@ fn open(io: &SimulatedIo) -> Store {
             device: Default::default(), open_segments: None, segment_bytes: None, lifetime_groups: None,
         }],
         columns: vec![column(COLUMN, "column"), column(OTHER_COLUMN, "other")],
-    };
-    ReelStore::open(io.clone(), &config).expect("open")
+    }
+}
+
+fn open(io: &SimulatedIo) -> Store {
+    ReelStore::open(io.clone(), &config()).expect("open")
 }
 
 fn settle(io: &SimulatedIo) {
@@ -569,7 +572,8 @@ fn long_shared_prefixes() {
     store.close().expect("close");
 }
 
-// a record that fails its check comes as that key's answer, and the walk goes on to the next
+// a record that fails its check comes as that key's answer, and the walk goes on to the next. A read-only view checks every
+// record, since it has no counts to trust a batch under
 #[test]
 fn corrupt_record_goes_on() {
     let io = SimulatedIo::new(Seed(18));
@@ -584,8 +588,7 @@ fn corrupt_record_goes_on() {
 
     rot_value(&io, b"rotting");
 
-    let store = open(&io);
-    hold_compaction(&store, true);
+    let store = ReelStore::open_read_only(io.clone(), &config()).expect("open read-only");
     let errors = store.state.corruption_errors.load(Ordering::Relaxed);
     let mut scan = store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan");
     let (mut name, mut value) = (Vec::new(), Vec::new());

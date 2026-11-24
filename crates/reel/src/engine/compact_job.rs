@@ -25,7 +25,7 @@ use crate::engine::engine_state::EngineState;
 use crate::engine::load_state::{Load, Owed, Refusal, is_deferring, is_holding_asks, is_reclaim_wanted, refusal_wait};
 use crate::engine::rewrite_job::{PLANNER_LANE, RewriteJob, RewriteSeat, is_mergeable, is_reclaim_due};
 use crate::engine::rebuild::MOST_REBUILD_TRIES;
-use crate::engine::volume::{ParkedSegment, Volume};
+use crate::engine::volume::{NO_REBUILD, ParkedSegment, Volume};
 use crate::engine::walk_job::{FREE_IN_PLACE_BYTES, FreeRecord, WALK_RETRY};
 use crate::engine::reserve_job::RESERVE_PERIOD;
 use crate::guard::hold;
@@ -369,6 +369,8 @@ impl<Backend: Io> CompactJob<Backend> {
             }
         }
         self.force_stuck_shard(volume);
+        // a caller's rebuild goes after the cover pool's and a stuck seal's, and its ask waits for the next tick
+        self.force_asked_rebuild(volume);
         // an ask outlives the unlink steps below, as it outlived them before
         self.should_rewrite |= is_asked;
         // a whole unlink wins back the most for the least, so each step tries one ahead of the rewrites, after the covers settle.
@@ -908,6 +910,28 @@ impl<Backend: Io> CompactJob<Backend> {
             // a stuck seal sends no change to end a refusal's wait, and the forced segment goes past what the refusal waited for
             self.pick_retry = None;
         }
+    }
+
+    /// Force a caller's asked rebuild of a damaged segment when nothing else is forced and no merge holds the segment. The ask stays
+    /// until the rebuild installs, the segment leaves `damaged`, or the merge fails a record's check, so a pick that turns it away
+    /// tries again next tick. A segment whose row blocks don't read never passes the pick, and start_rebuild owns it, so its ask
+    /// ends here
+    pub fn force_asked_rebuild(&mut self, volume: &Volume<Backend>) {
+        let asked = volume.rebuild_asked.load(Ordering::Acquire);
+        if asked == NO_REBUILD || self.rewrite.forced.is_some() {
+            return;
+        }
+        let segment = SegmentNumber(asked);
+        if !hold(&volume.damaged).contains(&segment) || !volume.table.is_readable(segment) {
+            volume.end_rebuild_ask(segment);
+            return;
+        }
+        if volume.is_taken(segment) {
+            return;
+        }
+        self.rewrite.forced = Some(segment);
+        self.should_rewrite = true;
+        self.pick_retry = None;
     }
 
     /// Past half of the pool, send the oldest cover's first sealed row to a rewrite, whatever the trigger says

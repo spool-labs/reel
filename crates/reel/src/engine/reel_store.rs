@@ -60,10 +60,13 @@ use crate::engine::walk_job::{BlockCounter, WalkJob, WalkSlot, WalkWorker};
 use crate::engine::workers::Workers;
 use crate::engine::load_state::{LoadCell, PACE_PER_MILLE, PaceCell, SPACE_TARGET_PER_MILLE};
 use crate::segment::summary_orders::row_dead_bytes;
-use crate::engine::volume::{SealStepTimes, ClaimState, GaveUp, LookPass, MOST_MERGE_OUTPUTS, MOST_PARKED, NO_SEAL, RewriteLane, SyncState, Volume, BitsSave};
+use crate::engine::volume::{SealStepTimes, ClaimState, GaveUp, LookPass, MOST_MERGE_OUTPUTS, MOST_PARKED, NO_REBUILD, NO_SEAL, RewriteLane, SyncState, Volume, BitsSave};
 #[cfg(feature = "test-hooks")]
 use crate::engine::volume::TestHolds;
 use crate::guard::hold;
+use crate::io::{DeviceReads, InPlace, in_place};
+use crate::row_kind::RowKind;
+use crate::segment::row_block::RowBlockWalk;
 use crate::index::open_slots::OpenSlot;
 use crate::engine::complete_image::ImageFiles;
 use crate::index::complete_table::CompleteTable;
@@ -78,7 +81,8 @@ use crate::pool::{Pool, touched_buffer, touched_capacity, touched_filled, touche
 use crate::record::codec::Codec;
 use crate::record::record_check::RecordKey;
 use crate::record::record_encoder::{RecordEncoder, SHARE_BYTES};
-use crate::record::record_reader::RecordReader;
+use crate::record::record_check::RecordIdentity;
+use crate::record::record_reader::{RecordLocation, RecordRead, RecordReader};
 use crate::rows::row_group::RowGroupBuffer;
 use crate::index::record_cache::{MOST_CACHED_BYTES, RecordCache};
 use crate::segment::block_cache::{BlockCache, CACHE_SHARDS, CACHE_WAYS};
@@ -419,6 +423,73 @@ impl<Backend: Io> ReelStore<Backend> {
     pub fn contains(&self, column: ColumnId, key: &[u8]) -> Result<bool, StoreError> {
         self.check_read()?;
         self.state.counted(self.state.contains_now(column, key))
+    }
+
+    /// List every damaged segment with its volume
+    pub fn damaged_segment_list(&self) -> Vec<(VolumeId, SegmentNumber)> {
+        let volumes = self.state.volumes.iter().enumerate();
+        volumes.flat_map(|(index, volume)| hold(&volume.damaged).iter().map(|number| (VolumeId(index as u8), *number)).collect::<Vec<_>>()).collect()
+    }
+
+    /// Walk a damaged segment's row blocks, check each value record, and give `each` the column and key of every one that fails
+    /// its check while it is still its key's newest: the keys the caller has to put back before a rebuild. A get can't tell them,
+    /// since damage marks a whole column's span and every get in it refuses. A segment the store no longer holds gives nothing,
+    /// and one whose blocks don't read gives Corruption, since its keys are lost with them. It holds the segment one block at a
+    /// time, so a rebuild can retire it between blocks, and the walk then ends. It reads through the page cache, so a record whose
+    /// disk copy rotted under a good cached page gives no key, and the rebuild writes the good bytes to a new segment
+    pub fn damaged_keys(&self, volume: VolumeId, segment: SegmentNumber, mut each: impl FnMut(ColumnId, &[u8])) -> Result<(), StoreError> {
+        self.check_read()?;
+        let index = volume.0 as usize;
+        let held = self.state.volumes.get(index).ok_or(StoreError::UnknownVolume { volume })?;
+        let (mut block, mut key, mut value, mut failed) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for at in 0..u32::MAX {
+            let Some(pin) = held.table.pin(segment) else {
+                return Ok(());
+            };
+            let Some(line) = held.table.walk_block(segment, at) else {
+                break;
+            };
+            let info = self.state.column(line.column)?;
+            block.resize(line.entry.block_length().0 as usize, 0);
+            let read = in_place(InPlace.read_exact(&pin.file, line.entry.block_at(), &mut block));
+            let Some(mut walk) = read.ok().and_then(|()| RowBlockWalk::open_checked(&block, pin.head.place_base)) else {
+                return Err(StoreError::Corruption { column: line.column });
+            };
+            failed.clear();
+            while let Some(row) = walk.next_row(&mut key) {
+                if row.kind != RowKind::Value {
+                    continue;
+                }
+                let identity = RecordIdentity { record_key: self.state.record_key, column: line.column, key: &key, kind: row.kind, place: row.place };
+                let location = RecordLocation { offset: row.offset, length: row.length };
+                let mut reader = self.state.record_reader_for(&InPlace);
+                let checked = in_place(reader.read_value(&InPlace, &pin.file, location, &identity, info.codec, &mut value));
+                if !matches!(checked, Ok(RecordRead::Valid)) && self.state.is_newest_row(index, line.column, &key, row.place) {
+                    failed.push(key.clone());
+                }
+            }
+            // the caller hears a block's keys after the block lets go of the segment
+            drop(pin);
+            for name in &failed {
+                each(line.column, name);
+            }
+        }
+        Ok(())
+    }
+
+    /// Ask maintenance to rewrite a damaged segment into a new one, once the caller has put back every key in it that read wrong.
+    /// The merge checks every record it keeps and leaves the superseded ones behind, so its install clears the damage. A record
+    /// still rotten fails the merge and the segment stays damaged. The ask goes once: a caller watches the damaged segments and
+    /// asks again while one stays
+    pub fn rebuild_damaged(&self, volume: VolumeId, segment: SegmentNumber) -> Result<(), StoreError> {
+        self.check_writes()?;
+        let held = self.state.volumes.get(volume.0 as usize).ok_or(StoreError::UnknownVolume { volume })?;
+        held.rebuild_asked.store(segment.0, Ordering::Release);
+        held.wants_compaction.store(true, Ordering::Release);
+        if let Some(task) = self.state.planner_task.get() {
+            task.wake();
+        }
+        Ok(())
     }
 
     /// Clear a damaged span once the caller has repaired it from peers, up to an end key or the column's end
@@ -1803,6 +1874,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         covers: RangeCovers::new(config.widest_key(index)),
         damaged: Mutex::new(touched_room(MOST_DAMAGED_SPANS)),
         is_clearing: AtomicBool::new(false),
+        rebuild_asked: AtomicU64::new(NO_REBUILD),
     }
 }
 

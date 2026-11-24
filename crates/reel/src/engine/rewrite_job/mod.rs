@@ -425,6 +425,9 @@ pub struct RewriteJob<Backend: Io> {
     region_need: ByteCount,
     /// The forced segment a pick took, which goes back when admission turns the pick away
     forced_pick: Option<SegmentNumber>,
+    /// The damaged segment a caller asked to rebuild, when this merge's pick took it: the merge goes in key order and past the
+    /// futility checks, and its install clears the damage
+    pub asked_rebuild: Option<SegmentNumber>,
     /// The record pick in hand spends the pace's credit, with an input under half dead while callers are busy
     is_paced: bool,
     /// What the rewrite under way spent of the pace's credit, settled at its end
@@ -581,6 +584,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             started_counts: JobCounts { reclaims: 0, frees: 0 },
             region_need: ByteCount(0),
             forced_pick: None,
+            asked_rebuild: None,
             is_paced: false,
             paced_spent: 0,
             dead_in_flight: 0,
@@ -807,7 +811,10 @@ impl<Backend: Io> RewriteJob<Backend> {
                 continue;
             }
             let mut bound = self.bound(volume);
-            // offset order first, and the same pick in key order when its lists don't fit, which the floor alone admits
+            // offset order first, and the same pick in key order when its lists don't fit, which the floor alone admits. An asked
+            // rebuild goes in key order, which checks every record it keeps: offset order copies runs of bytes unchecked, and the
+            // rebuild's install clears the damage
+            bound.is_ordered &= !self.is_asked_rebuild();
             let mut admit = None;
             if bound.is_ordered {
                 admit = self.state.decide_admit(JobRole::Rewrite, bound.region_bytes(), false);
@@ -869,6 +876,7 @@ impl<Backend: Io> RewriteJob<Backend> {
 
     /// Put back what a pick took when admission turned it away
     pub fn unpick(&mut self, volume: &Volume<Backend>) {
+        self.asked_rebuild = None;
         if self.is_unwalked {
             *hold(&volume.lanes[self.lane].merging) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
         }

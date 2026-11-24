@@ -85,6 +85,7 @@ pub struct FooterWriter {
     pub is_output: bool,
     pub is_partial: bool,
     pub is_unwalked: bool,
+    pub clears_damage: bool,
 }
 
 impl FooterWriter {
@@ -111,6 +112,7 @@ impl FooterWriter {
             is_output: false,
             is_partial: false,
             is_unwalked: false,
+            clears_damage: false,
         }
     }
 
@@ -137,6 +139,7 @@ impl FooterWriter {
             is_output: false,
             is_partial: false,
             is_unwalked: false,
+            clears_damage: false,
         }
     }
 
@@ -174,6 +177,7 @@ impl FooterWriter {
             is_output: false,
             is_partial: false,
             is_unwalked: false,
+            clears_damage: false,
         })
     }
 
@@ -268,6 +272,7 @@ impl FooterWriter {
         self.is_output = false;
         self.is_partial = false;
         self.is_unwalked = false;
+        self.clears_damage = false;
     }
 
     /// Start a column, closing the row block of the one before it
@@ -459,6 +464,7 @@ impl FooterWriter {
             is_output: self.is_output,
             is_partial: self.is_partial,
             is_unwalked: self.is_unwalked,
+            clears_damage: self.clears_damage,
             marks: self.marks,
         };
         let total = self.write_tail(&head, &TailInputs::of(inputs), record_key);

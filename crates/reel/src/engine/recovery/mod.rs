@@ -151,6 +151,8 @@ pub struct RootScan<File> {
     pub empty: Vec<FoundEmpty>,
     pub highest_segment: SegmentNumber,
     pub held: Vec<HeldFile>,
+    /// Inputs an output of an asked rebuild dropped, by volume, whose damage went with them
+    pub cleared: Vec<(usize, SegmentNumber)>,
 }
 
 /// An open segment with its rows file walked, waiting for its turn

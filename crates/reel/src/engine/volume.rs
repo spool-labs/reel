@@ -534,6 +534,10 @@ pub struct Volume<Backend: Io> {
     pub covers: RangeCovers,
     pub damaged: Mutex<Vec<SegmentNumber>>,
     pub is_clearing: AtomicBool,
+    /// A damaged segment a caller asked to rebuild, NO_REBUILD when none waits. The compact job forces it on every tick nothing
+    /// else is forced or merging it, and the ask ends at the rebuild's install, when the segment leaves `damaged`, or when the
+    /// merge fails a record's check
+    pub rebuild_asked: AtomicU64,
     pub reserve: ByteCount,
 }
 
@@ -871,6 +875,11 @@ impl<Backend: Io> Volume<Backend> {
     }
 
     /// Count what a look for rewrite work came to
+    /// End a caller's ask to rebuild a segment, unless the caller has asked for another since
+    pub fn end_rebuild_ask(&self, segment: SegmentNumber) {
+        let _ended = self.rebuild_asked.compare_exchange(segment.0, NO_REBUILD, Ordering::AcqRel, Ordering::Acquire);
+    }
+
     pub fn note_pick(&self, outcome: PickOutcome) {
         self.picks[outcome.index()].fetch_add(1, Ordering::Relaxed);
     }
@@ -1028,3 +1037,6 @@ impl LookPass {
         self.stamp.swap(stamp, Ordering::AcqRel)
     }
 }
+
+/// The value `rebuild_asked` holds when no segment waits
+pub const NO_REBUILD: u64 = u64::MAX;

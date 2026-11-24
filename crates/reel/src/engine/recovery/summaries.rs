@@ -117,7 +117,8 @@ pub fn settle_summaries<Backend: Io>(state: &EngineState<Backend>, scan: &mut Ro
         }
         let open: BTreeSet<SegmentNumber> =
             scan.scanned.iter().filter(|segment| segment.found.volume == index).map(|segment| segment.found.number).collect();
-        carry_rows(volume, &rows, &listed, (&held, &open), &mut settled);
+        let cleared: BTreeSet<SegmentNumber> = scan.cleared.iter().filter(|(volume, _number)| *volume == index).map(|(_volume, number)| *number).collect();
+        carry_rows(volume, &rows, &listed, (&held, &open, &cleared), &mut settled);
         settled.highest_forward = held.last().map_or(SegmentNumber(0), |highest| rows.highest_forward.min(*highest));
         let index_room = rows.index_room();
         *rows = settled;
@@ -128,20 +129,20 @@ pub fn settle_summaries<Backend: Io>(state: &EngineState<Backend>, scan: &mut Ro
     Ok(())
 }
 
-/// Keep the rows no sealed or damaged segment took: an open segment's, and a gone segment's spans, which
-/// stay until the caller clears them
+/// Keep the rows no sealed or damaged segment took: an open segment's, and a gone segment's spans, which stay until the caller
+/// clears them or an asked rebuild's output that dropped the segment cleared them
 pub fn carry_rows<Backend: Io>(
     volume: &Volume<Backend>,
     rows: &SummaryRows,
     listed: &BTreeMap<SegmentNumber, usize>,
-    (held, open): (&BTreeSet<SegmentNumber>, &BTreeSet<SegmentNumber>),
+    (held, open, cleared): (&BTreeSet<SegmentNumber>, &BTreeSet<SegmentNumber>, &BTreeSet<SegmentNumber>),
     settled: &mut SummaryRows,
 ) {
     for (number, at) in listed {
         let Some(row) = rows.row_at(*at) else {
             continue;
         };
-        if held.contains(number) || !row.facts.is_damaged || (!open.contains(number) && row.span_count == 0) {
+        if held.contains(number) || cleared.contains(number) || !row.facts.is_damaged || (!open.contains(number) && row.span_count == 0) {
             continue;
         }
 

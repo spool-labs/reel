@@ -11,7 +11,6 @@ use reel_core::column_id::ColumnId;
 use reel_core::units::{ByteCount, FileOffset, Nanoseconds, WritePlace};
 
 use crate::engine::engine_state::EngineState;
-use crate::engine::read_path::newest_of;
 use crate::engine::walk_job::FREE_IN_PLACE_BYTES;
 use crate::guard::hold;
 use crate::io::job::JobStep;
@@ -401,15 +400,7 @@ impl<Backend: Io> ScrubJob<Backend> {
 
     /// Check a row is still its key's newest, since a record a free may punch is a dead one
     fn is_newest(&self, column: ColumnId, place: WritePlace) -> bool {
-        let volume = &self.state.volumes[self.volume];
-        let Ok(read) = self.state.key_read(column, &self.key, self.state.read_point(volume), false) else {
-            return false;
-        };
-        let found = self.state.index.lookup(column, &self.key, read.read_point, volume.view());
-        let Ok(sealed) = in_place(self.state.search_sealed(&InPlace, volume, &read)) else {
-            return false;
-        };
-        newest_of(found.row, sealed).place() == Some(place)
+        self.state.is_newest_row(self.volume, column, &self.key, place)
     }
 }
 

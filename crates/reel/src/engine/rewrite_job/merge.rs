@@ -179,6 +179,13 @@ impl<Backend: Io> RewriteJob<Backend> {
             if let Some(segment) = self.unreadable.take() {
                 self.state.damage_unread(self.volume, segment);
             }
+            // an asked rebuild that met a rotten record ends its ask, so the caller puts the key back and asks again while the
+            // planner tries no failing merge each tick. One that stopped for any other cause keeps the ask and goes again
+            if let Some(segment) = self.asked_rebuild.take()
+                && outcome.as_ref().is_err_and(|error| error.kind() == ErrorKind::InvalidData)
+            {
+                self.state.volumes[self.volume].end_rebuild_ask(segment);
+            }
             let given_up = self.staged.iter().map(|staged| staged.facts.file_length.0).sum::<u64>() + self.records_end.0 + self.used as u64;
             let kind = match outcome.as_ref().map_err(Error::kind) {
                 Err(ErrorKind::Interrupted) => 0,
@@ -760,8 +767,9 @@ impl<Backend: Io> RewriteJob<Backend> {
 
     /// End the deciding: copy from the first row if one would drop, and leave the segments alone if none would
     pub fn end_deciding(&mut self, target: MergeTarget) -> Result<()> {
-        // several inputs becoming one win back overlap whatever they drop, and a lone input moves out of a stuck seal's shard
-        if self.dropped_rows == 0 && self.input_count == 1 && !self.is_leaving_stuck_shard() {
+        // several inputs becoming one win back overlap whatever they drop, a lone input moves out of a stuck seal's shard, and an
+        // asked rebuild clears its input's damage
+        if self.dropped_rows == 0 && self.input_count == 1 && !self.is_leaving_stuck_shard() && !self.is_asked_rebuild() {
             self.note_gave_up();
             return Err(Error::from(ErrorKind::Interrupted));
         }

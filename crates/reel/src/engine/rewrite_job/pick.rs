@@ -128,6 +128,7 @@ impl<Backend: Io> RewriteJob<Backend> {
 
     /// Pick up to this many inputs
     pub fn pick_within(&mut self, volume: &Volume<Backend>, most: usize) -> Option<(MergeTarget, bool)> {
+        self.asked_rebuild = None;
         let room = volume.park_room().min(most);
         let refused_at = volume.room_refused_at.load(Ordering::Acquire);
         let is_backing_off = refused_at != 0 && self.state.io.now().0.saturating_sub(refused_at) < RESERVE_PERIOD.0;
@@ -186,9 +187,12 @@ impl<Backend: Io> RewriteJob<Backend> {
             volume.note_pick(PickOutcome::Overlap);
             return Some((target, false));
         }
-        // a full pool refuses range deletes, so the segment holding the oldest cover back goes whatever the trigger says
-        if let Some(row) = self.forced.take().and_then(|forced| rows.get(forced)).filter(|row| is_mergeable(volume, row)) {
+        // a full pool refuses range deletes, so the segment holding the oldest cover back goes whatever the trigger says, and so
+        // does a damaged segment a caller asked to rebuild
+        let forced = self.forced.take().and_then(|forced| rows.get(forced));
+        if let Some(row) = forced.filter(|row| is_mergeable(volume, row) || is_asked_rebuild(volume, row)) {
             self.forced_pick = Some(row.facts.segment);
+            self.asked_rebuild = Some(row.facts.segment).filter(|_segment| is_asked_rebuild(volume, &row));
             let target = self.gather(volume, &rows, &row, 1, |_row| false);
             self.picked_as = Some(PickOutcome::Forced);
             volume.note_pick(PickOutcome::Forced);
@@ -483,6 +487,15 @@ impl<Backend: Io> RewriteJob<Backend> {
 /// newer one rests on that one, which a crash could lose until its segment seals
 pub fn has_settled_covers<Backend: Io>(volume: &Volume<Backend>, row: &SummaryRow<'_>) -> bool {
     row.facts.has_covers && volume.covers.are_all_applied() && !volume.covers.holds_segment(row.facts.segment)
+}
+
+/// Check a damaged segment a caller asked to rebuild can go into its merge, as is_mergeable asks past the damage. Its blocks read,
+/// so its rows are all there, and the merge checks every record it keeps
+pub fn is_asked_rebuild<Backend: Io>(volume: &Volume<Backend>, row: &SummaryRow<'_>) -> bool {
+    let is_asked = row.facts.is_damaged && row.facts.segment.0 == volume.rebuild_asked.load(Ordering::Acquire);
+    let is_clear = !row.facts.has_covers || has_settled_covers(volume, row);
+    let is_free = row.facts.block_count > 0 && !volume.is_taken(row.facts.segment);
+    is_asked && is_clear && is_free && row.facts.is_walked() && volume.table.is_readable(row.facts.segment)
 }
 
 /// Check a segment can go into a merge at all. Damage and covers answer for more than their rows

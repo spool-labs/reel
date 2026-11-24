@@ -41,7 +41,8 @@ use crate::index::open_slots::OpenSlot;
 use crate::index::spot_index::SpotIndex;
 use crate::index::write_index::WriteIndex;
 use crate::io::ring::{ReadRing, RingDriver};
-use crate::io::{Io, IoFile, IoTask};
+use crate::io::{InPlace, Io, IoFile, IoTask, in_place};
+use crate::engine::read_path::newest_of;
 use crate::pool::Pool;
 use crate::record::record_check::RecordKey;
 use crate::record::record_encoder::RecordEncoder;
@@ -886,6 +887,19 @@ impl Drop for IndexWait<'_> {
 }
 
 impl<Backend: Io> EngineState<Backend> {
+    /// Check the row at a place is still its key's newest. A failed lookup reads as no
+    pub fn is_newest_row(&self, index: usize, column: ColumnId, key: &[u8], place: WritePlace) -> bool {
+        let volume = &self.volumes[index];
+        let Ok(read) = self.key_read(column, key, self.read_point(volume), false) else {
+            return false;
+        };
+        let found = self.index.lookup(column, key, read.read_point, volume.view());
+        let Ok(sealed) = in_place(self.search_sealed(&InPlace, volume, &read)) else {
+            return false;
+        };
+        newest_of(found.row, sealed).place() == Some(place)
+    }
+
     /// Move the count and every volume's mark past a place an open found, so no volume starts below a row it holds
     pub fn resume_past(&self, place: WritePlace) {
         self.places.resume_past(place);

@@ -32,6 +32,11 @@ pub const OUTPUT_BIT: u32 = 1 << 31;
 pub const PARTIAL_BIT: u32 = 1 << 30;
 /// Set beside it on an output of inputs no walk had reached: it owes the forward walk they owed, and a rebuild gives it one
 pub const UNWALKED_BIT: u32 = 1 << 29;
+/// Set beside it on an output of a rebuild a caller asked for: open drops its inputs' damage with them, since the install
+/// cleared it and may have stopped before the summary said so. The flag stays for the output's life, so every later open skips
+/// those inputs' rows, which holds since the store never gives a segment number twice: numbers count up past a reservation the
+/// superblock saves
+pub const CLEARS_BIT: u32 = 1 << 28;
 /// Most columns a store has
 pub const MAX_COLUMNS: usize = 256;
 /// Bytes that hold any tail
@@ -90,6 +95,7 @@ pub struct TailHead {
     pub is_output: bool,
     pub is_partial: bool,
     pub is_unwalked: bool,
+    pub clears_damage: bool,
     pub marks: MarkRange,
 }
 
@@ -169,7 +175,8 @@ impl TailHead {
         let bit = if self.is_output { OUTPUT_BIT } else { 0 };
         let partial_bit = if self.is_partial { PARTIAL_BIT } else { 0 };
         let unwalked_bit = if self.is_unwalked { UNWALKED_BIT } else { 0 };
-        out.put(&(inputs.count | bit | partial_bit | unwalked_bit).to_le_bytes());
+        let clears_bit = if self.clears_damage { CLEARS_BIT } else { 0 };
+        out.put(&(inputs.count | bit | partial_bit | unwalked_bit | clears_bit).to_le_bytes());
         for input in &inputs.numbers {
             out.put(&input.0.to_le_bytes());
         }
@@ -198,14 +205,16 @@ impl TailHead {
             is_output: false,
             is_partial: false,
             is_unwalked: false,
+            clears_damage: false,
             marks: MarkRange::NONE,
         };
         let mut inputs = TailInputs::default();
         let listed = input.half()?;
-        inputs.count = listed & !(OUTPUT_BIT | PARTIAL_BIT | UNWALKED_BIT);
+        inputs.count = listed & !(OUTPUT_BIT | PARTIAL_BIT | UNWALKED_BIT | CLEARS_BIT);
         head.is_output = listed & OUTPUT_BIT != 0;
         head.is_partial = listed & PARTIAL_BIT != 0;
         head.is_unwalked = listed & UNWALKED_BIT != 0;
+        head.clears_damage = listed & CLEARS_BIT != 0;
         for segment in &mut inputs.numbers {
             *segment = SegmentNumber(input.word()?);
         }

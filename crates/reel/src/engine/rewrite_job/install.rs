@@ -37,6 +37,12 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.input_count == 1 && shard_of(self.numbers[0]) == self.state.volumes[self.volume].stuck_shard.load(Ordering::Acquire)
     }
 
+    /// Check an input is a damaged segment a caller asked to rebuild, which goes through even when it drops nothing: its damage
+    /// clears only at an install, and a record that failed one read and reads clean after leaves no row to drop
+    pub fn is_asked_rebuild(&self) -> bool {
+        self.asked_rebuild.is_some()
+    }
+
     /// Check a merge that dropped nothing would leave its inputs' overlap as it was. One input wins back nothing unless it was
     /// cut or it leaves a stuck seal's shard. Several overlap afterwards as one chain of data outputs, which follow each other in
     /// key order, and a grave output beside them: a data and a grave output going back in as two inputs would come out as the
@@ -55,7 +61,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         let Some(output) = self.output.clone() else {
             return Err(Error::from(ErrorKind::NotFound));
         };
-        if self.dropped_rows == 0 && self.rebuild.is_none() && self.is_futile() {
+        if self.dropped_rows == 0 && self.rebuild.is_none() && !self.is_asked_rebuild() && self.is_futile() {
             self.note_gave_up();
             return Err(Error::from(ErrorKind::Interrupted));
         }
@@ -99,6 +105,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.writer.is_output = true;
         self.writer.is_partial = true;
         self.writer.is_unwalked = self.is_unwalked;
+        self.writer.clears_damage = self.is_asked_rebuild();
         let totals = self.writer.finish(&output.file, output.number, self.records_end, &[], state.record_key, &numbers[..self.input_count])?;
         self.name_output(output, self.data_slot)?;
         if !volume.table.install(output.file.clone(), RootId(output.root as u8), &totals.head, self.writer.columns(), self.writer.entries()) {
@@ -125,6 +132,23 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.is_cutting = false;
         self.phase = RewritePhase::Copying;
         Ok(())
+    }
+
+    /// Clear the damage of a segment a caller asked to rebuild once its merge installs: the merge checked every record it kept, and
+    /// the superseded ones stayed behind with the segment
+    pub fn end_asked_rebuild(&mut self, volume: &Volume<Backend>) {
+        let Some(segment) = self.asked_rebuild.take() else {
+            return;
+        };
+        volume.end_rebuild_ask(segment);
+        volume.damage.drop_segment(segment);
+        let mut damaged = hold(&volume.damaged);
+        if let Some(at) = damaged.iter().position(|number| *number == segment) {
+            damaged.swap_remove(at);
+            self.state.damaged_segments.fetch_sub(1, Ordering::AcqRel);
+        }
+        drop(damaged);
+        save_cleared_spans(&self.state, volume);
     }
 
     /// Swap a rebuilt segment's spans for what its lost blocks leave. Its row is gone, and what stays damaged keeps a row of its own
@@ -199,6 +223,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             self.grave_writer.close_block(&graves.file)?;
             self.grave_writer.is_output = true;
             self.grave_writer.is_unwalked = self.is_unwalked;
+            self.grave_writer.clears_damage = self.is_asked_rebuild();
             self.grave_writer.is_partial = has_data;
             let totals = self.grave_writer.finish(&graves.file, graves.number, FileOffset(0), &[], state.record_key, inputs)?;
             self.grave_totals = Some(totals);
@@ -208,6 +233,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             self.writer.move_down(ByteCount(distance));
             self.writer.is_output = true;
             self.writer.is_unwalked = self.is_unwalked;
+            self.writer.clears_damage = self.is_asked_rebuild();
             let totals = self.writer.finish(&output.file, output.number, self.records_end, &[], state.record_key, inputs)?;
             self.totals = Some(totals);
             self.name_output(output, self.data_slot)?;
@@ -371,6 +397,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         volume.note_rewrite_bytes(gone, written, kind);
         self.settle_pace(volume, written.file);
         volume.rewrite_footers_by_share[kind].fetch_add(footers, Ordering::Relaxed);
+        self.end_asked_rebuild(volume);
         self.end_rebuild(volume);
         let saved = state.save_summary(volume);
 

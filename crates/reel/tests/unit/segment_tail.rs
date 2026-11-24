@@ -28,6 +28,7 @@ fn head() -> TailHead {
         is_output: true,
         is_partial: false,
         is_unwalked: false,
+        clears_damage: true,
         marks: MarkRange { lowest: DeathMark(40), highest: DeathMark(70) },
     }
 }

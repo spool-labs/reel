@@ -102,6 +102,7 @@ pub fn scan_roots<Backend: Io>(
         empty: Vec::new(),
         highest_segment: SegmentNumber(0),
         held: Vec::new(),
+        cleared: Vec::new(),
     };
     let mut reader = FooterReader::new();
 
@@ -149,6 +150,10 @@ pub fn remove_or_hold<Backend: Io>(io: &Backend, root: &Path, volume: usize, num
 pub fn drop_inputs<Backend: Io>(io: &Backend, scan: &mut RootScan<Backend::File>) {
     let is_final = |found: &&FoundSealed<Backend::File>| !found.head.is_partial;
     let inputs: Vec<SegmentNumber> = scan.sealed.iter().filter(is_final).flat_map(|found| found.inputs.inputs()).copied().collect();
+    // an asked rebuild cleared its inputs' damage at its install, which may have stopped before the summary said so
+    let clearing = scan.sealed.iter().filter(is_final).filter(|found| found.head.clears_damage);
+    let cleared: Vec<(usize, SegmentNumber)> = clearing.flat_map(|found| found.inputs.inputs().iter().map(|input| (found.volume, *input))).collect();
+    scan.cleared.extend(cleared);
     for input in inputs {
         if let Some(at) = scan.sealed.iter().position(|found| found.head.segment == input) {
             let found = scan.sealed.remove(at);

@@ -9,6 +9,7 @@ use reel::engine::compact_job::CompactJob;
 use reel::engine::open_segment::data_path;
 use reel::engine::reel_store::ReelStore;
 use reel::engine::scrub_job::{SCRUB_PASS_REST, STEP_BYTES, ScrubJob};
+use reel::engine::volume::NO_REBUILD;
 use reel::engine::walk_job::FREE_IN_PLACE_BYTES;
 use reel::guard::hold;
 use reel::io::job::JobStep;
@@ -17,6 +18,7 @@ use reel::record::codec::Codec;
 use reel::record::record_head::{MOST_SUMMED_PAYLOAD, PAYLOAD_SUM_AT, SMALL_HEAD_BYTES};
 use reel::superblock::{OLDER_SUPERBLOCK_MAGIC, SECOND_SUPERBLOCK_NAME, SUPERBLOCK_MAGIC, SUPERBLOCK_NAME};
 use reel::segment::damage_list::DamagedRange;
+use reel_core::maintenance_report::PickOutcome;
 use reel::segment::segment_tail::SegmentNumber;
 use reel_core::column_id::ColumnId;
 use reel_core::direction::Direction;
@@ -25,7 +27,7 @@ use reel_core::value_list::{ValueAnswer, ValueList};
 use reel_core::store_error::StoreError;
 use reel_core::units::{ByteCount, FileOffset, Nanoseconds, RowCount, VolumeId, WritePlace};
 use reel_sim::file_image::BitMask;
-use reel_sim::simulated_disk::DirectReads;
+use reel_sim::simulated_disk::{DirectReads, OperationCount};
 use reel_sim::seeded_random::{Seed, SeededRandom};
 use reel_sim::simulated_io::SimulatedIo;
 
@@ -769,5 +771,260 @@ fn a_volume_reports_its_scrub() {
     assert!(check.scrub_bytes > 0);
     assert_eq!(check.scrub_bytes_per_second, 0, "a resting scrub read a rate");
     assert_eq!(check.damaged_segments, 0);
+    store.close().expect("close");
+}
+
+// rot one sealed record past its head and let a scrub pass find it, and return the damaged segment and the rotten key
+fn rot_and_scrub(store: &Store, io: &SimulatedIo) -> (SegmentNumber, Vec<u8>) {
+    for number in 0..KEYS {
+        store.put(COLUMN, &key(number), &value(number, 0)).expect("put");
+    }
+    let segment = seal(store, io);
+    let volume = &store.state.volumes[0];
+    let name = key(KEYS / 2);
+    let read_at = store.state.key_read(COLUMN, &name, store.state.read_point(volume), false).expect("read");
+    let row = in_place(store.state.search_sealed(&InPlace, volume, &read_at)).expect("search").expect("a sealed row");
+    io.rot(&data_path(&volume.roots[0], row.segment), FileOffset(row.row.offset.0 + SMALL_HEAD_BYTES as u64), BitMask(1)).expect("rot");
+    let mut job = ScrubJob::new(Arc::clone(&store.state), 0);
+    job.rate = RATE;
+    scrub_one_pass(store, io, &mut job);
+    assert_eq!(store.damaged_segment_list(), vec![(VolumeId(0), segment)]);
+    (segment, name)
+}
+
+// step a compact job of its own until `done` says so or it has nothing left to do, with the clock moving while it waits
+fn compact_until(store: &Store, io: &SimulatedIo, done: impl Fn(&Store) -> bool) {
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    let mut idle = 0;
+    for _step in 0..STEPS {
+        if done(store) || idle > BUSY_ROUNDS {
+            return;
+        }
+        match job.step_work(io.now()) {
+            JobStep::Worked => idle = 0,
+            JobStep::IdleUntil { deadline } => io.advance_clock(Nanoseconds(deadline.0.saturating_sub(io.now().0).max(1))),
+            JobStep::Idle | JobStep::Finished => {
+                idle += 1;
+                io.advance_clock(TICK);
+            },
+        }
+        while io.step_any().is_some() {}
+    }
+}
+
+// a scrub's damage clears once the caller puts back the key that read wrong and asks for a rebuild: the damaged keys are the
+// rotten one alone, the merge leaves its record behind, and the clear outlives a reopen
+#[test]
+fn a_rebuild_after_the_put_back_clears_the_damage() {
+    let io = SimulatedIo::new(Seed(22));
+    let store = open(&io, 0);
+    let (segment, name) = rot_and_scrub(&store, &io);
+    let mut keys = Vec::new();
+    store.damaged_keys(VolumeId(0), segment, |column, key| keys.push((column, key.to_vec()))).expect("damaged keys");
+    assert_eq!(keys, vec![(COLUMN, name.clone())], "the damaged keys were other than the rotten one");
+    store.put(COLUMN, &name, &value(KEYS / 2, 1)).expect("put back");
+    let mut after = Vec::new();
+    store.damaged_keys(VolumeId(0), segment, |column, key| after.push((column, key.to_vec()))).expect("damaged keys");
+    assert!(after.is_empty(), "a key put back still counted as damaged");
+    seal(&store, &io);
+    store.rebuild_damaged(VolumeId(0), segment).expect("ask");
+    compact_until(&store, &io, |store| store.damaged_segments() == 0);
+    assert_eq!(store.damaged_segments(), 0, "the rebuild left the damage");
+    assert!(store.damaged_segment_list().is_empty());
+    assert!(store.state.volumes[0].damage.is_empty(), "the rebuild left spans");
+    assert!(!store.state.volumes[0].table.holds(segment), "the rebuild left the damaged segment in place");
+    let expected = |number: u64| value(number, u64::from(number == KEYS / 2));
+    for number in 0..KEYS {
+        assert_eq!(read(&store, &key(number)), Some(expected(number)));
+    }
+    store.close().expect("close");
+    let store = open(&io, 0);
+    assert_eq!(store.damaged_segments(), 0, "the clear came back damaged after a reopen");
+    for number in 0..KEYS {
+        assert_eq!(read(&store, &key(number)), Some(expected(number)));
+    }
+    store.close().expect("close");
+}
+
+// a rebuild asked before the rotten key goes back fails over the record it can't check, the segment stays damaged, and the ask
+// ends, so the planner tries no failing merge each tick
+#[test]
+fn a_rebuild_over_a_rotten_record_keeps_the_damage() {
+    let io = SimulatedIo::new(Seed(23));
+    let store = open(&io, 0);
+    let (segment, _name) = rot_and_scrub(&store, &io);
+    store.rebuild_damaged(VolumeId(0), segment).expect("ask");
+    compact_until(&store, &io, |store| store.state.merge_check_failures.load(Ordering::Relaxed) > 0);
+    assert!(store.state.merge_check_failures.load(Ordering::Relaxed) > 0, "the merge never met the rotten record");
+    assert_eq!(store.state.volumes[0].rebuild_asked.load(Ordering::Relaxed), NO_REBUILD, "a rebuild that failed a record's check kept its ask");
+    assert_eq!(store.damaged_segment_list(), vec![(VolumeId(0), segment)]);
+    assert!(store.state.volumes[0].table.holds(segment));
+    store.close().expect("close");
+}
+
+// damage with no rot behind it, as a read the device failed once leaves, names no key to put back, and a rebuild still clears
+// it though the merge drops nothing
+#[test]
+fn a_rebuild_clears_damage_no_record_holds() {
+    let io = SimulatedIo::new(Seed(24));
+    let store = open(&io, 0);
+    for number in 0..KEYS {
+        store.put(COLUMN, &key(number), &value(number, 0)).expect("put");
+    }
+    let segment = seal(&store, &io);
+    store.state.damage_unread(0, segment);
+    let mut keys = Vec::new();
+    store.damaged_keys(VolumeId(0), segment, |column, key| keys.push((column, key.to_vec()))).expect("damaged keys");
+    assert!(keys.is_empty(), "a clean segment named keys to put back");
+    store.rebuild_damaged(VolumeId(0), segment).expect("ask");
+    compact_until(&store, &io, |store| store.damaged_segments() == 0);
+    assert_eq!(store.damaged_segments(), 0, "the rebuild left damage that no record holds");
+    assert!(store.state.volumes[0].damage.is_empty());
+    for number in 0..KEYS {
+        assert_eq!(read(&store, &key(number)), Some(value(number, 0)));
+    }
+    store.close().expect("close");
+}
+
+// an asked rebuild waits behind another forced pick and still runs once that one lets it: the ask stays until the rebuild
+// installs, where a planner that took it once would lose it to the first forced pick after
+#[test]
+fn an_asked_rebuild_outlasts_forced_picks() {
+    const CONTESTED_TICKS: u64 = 50;
+    let io = SimulatedIo::new(Seed(25));
+    let store = open(&io, 0);
+    let (segment, name) = rot_and_scrub(&store, &io);
+    store.put(COLUMN, &name, &value(KEYS / 2, 1)).expect("put back");
+    for number in 0..KEYS {
+        store.put(COLUMN, &other_key(number), &value(number, 0)).expect("put");
+    }
+    let other = seal(&store, &io);
+    let volume = &store.state.volumes[0];
+    store.rebuild_damaged(VolumeId(0), segment).expect("ask");
+    let forced_before = volume.picks[PickOutcome::Forced.index()].load(Ordering::Relaxed);
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    for tick in 0..STEPS {
+        if store.damaged_segments() == 0 {
+            break;
+        }
+        // another forced pick stands at every tick for a while, as the cover pool's or a stuck seal's would
+        if tick < CONTESTED_TICKS {
+            job.rewrite.forced = job.rewrite.forced.or(Some(other));
+        } else if tick == CONTESTED_TICKS {
+            assert_eq!(volume.rebuild_asked.load(Ordering::Relaxed), segment.0, "the ask was lost behind other forced picks");
+        }
+        match job.step_work(io.now()) {
+            JobStep::Worked => {},
+            JobStep::IdleUntil { deadline } => io.advance_clock(Nanoseconds(deadline.0.saturating_sub(io.now().0).max(1))),
+            JobStep::Idle | JobStep::Finished => io.advance_clock(TICK),
+        }
+        while io.step_any().is_some() {}
+    }
+    assert!(volume.picks[PickOutcome::Forced.index()].load(Ordering::Relaxed) > forced_before + 1, "no other pick was forced");
+    assert_eq!(store.damaged_segments(), 0, "the asked rebuild never ran after the other forced picks");
+    assert_eq!(volume.rebuild_asked.load(Ordering::Relaxed), NO_REBUILD);
+    for number in 0..KEYS {
+        assert_eq!(read(&store, &key(number)), Some(value(number, u64::from(number == KEYS / 2))));
+    }
+    store.close().expect("close");
+}
+
+fn other_key(number: u64) -> Vec<u8> {
+    format!("other-{number:05}").into_bytes()
+}
+
+// a process stopped at any point of an asked rebuild opens again with every damaged segment one the table holds, and every key
+// reads its value or answers Corruption while damage stays marked. Clearing again ends with no damage
+#[test]
+fn a_crash_inside_a_rebuild_leaves_damage_it_can_clear() {
+    crash_inside_a_rebuild(Seed(26), |number| number == KEYS / 2);
+}
+
+// the same with every key put back elsewhere, so the rebuild keeps no row
+#[test]
+fn a_crash_inside_a_wholly_dead_rebuild_leaves_damage_it_can_clear() {
+    crash_inside_a_rebuild(Seed(28), |_number| true);
+}
+
+// stop a rebuild at each operation in turn, after the keys `put_back` picks go back, and check what opens after
+fn crash_inside_a_rebuild(seed: Seed, put_back: impl Fn(u64) -> bool) {
+    const MOST_CRASH_POINTS: u64 = 2_000;
+    let expected = |number: u64| value(number, u64::from(put_back(number)));
+    let mut finished = false;
+    for crash_at in 0..MOST_CRASH_POINTS {
+        let io = SimulatedIo::new(seed);
+        let store = open(&io, 0);
+        let (segment, _name) = rot_and_scrub(&store, &io);
+        for number in (0..KEYS).filter(|number| put_back(*number)) {
+            store.put(COLUMN, &key(number), &value(number, 1)).expect("put back");
+        }
+        seal(&store, &io);
+        store.close().expect("close");
+        let store = open(&io, 0);
+        assert_eq!(store.damaged_segment_list(), vec![(VolumeId(0), segment)], "the damage didn't outlive a close");
+
+        store.rebuild_damaged(VolumeId(0), segment).expect("ask");
+        io.arm_crash(OperationCount(crash_at));
+        compact_until(&store, &io, |store| store.damaged_segments() == 0 || io.is_crashed());
+        let is_crashed = io.is_crashed();
+        io.disarm_crash();
+        io.kill();
+        drop(store);
+
+        let store = open(&io, 0);
+        for (volume, number) in store.damaged_segment_list() {
+            assert!(store.state.volumes[volume.0 as usize].table.holds(number), "crash at {crash_at}: segment {number:?} is damaged and gone");
+        }
+        for number in 0..KEYS {
+            let mut buf = Vec::new();
+            match store.get(COLUMN, &key(number), &mut buf) {
+                Ok(true) => assert_eq!(buf, expected(number), "crash at {crash_at}"),
+                Err(StoreError::Corruption { .. }) => assert!(store.damaged_segments() > 0, "crash at {crash_at}: corrupt with no damage marked"),
+                other => panic!("crash at {crash_at}: {other:?}"),
+            }
+        }
+        for (volume, number) in store.damaged_segment_list() {
+            let mut keys = Vec::new();
+            store.damaged_keys(volume, number, |column, key| keys.push((column, key.to_vec()))).expect("damaged keys");
+            assert!(keys.is_empty(), "crash at {crash_at}: a key put back counts as damaged");
+            store.rebuild_damaged(volume, number).expect("ask");
+            compact_until(&store, &io, |store| store.damaged_segments() == 0);
+        }
+        assert_eq!(store.damaged_segments(), 0, "crash at {crash_at}: clearing again left damage");
+        for number in 0..KEYS {
+            assert_eq!(read(&store, &key(number)), Some(expected(number)), "crash at {crash_at}");
+        }
+        store.close().expect("close");
+        if !is_crashed {
+            finished = true;
+            break;
+        }
+    }
+    assert!(finished, "the rebuild ran past {MOST_CRASH_POINTS} operations");
+}
+
+// a damaged segment whose every key went back elsewhere holds nothing live, so the rebuild keeps no row: it still clears the
+// damage and ends the ask
+#[test]
+fn a_rebuild_of_a_wholly_dead_damaged_segment_clears_it() {
+    let io = SimulatedIo::new(Seed(27));
+    let store = open(&io, 0);
+    let (segment, _name) = rot_and_scrub(&store, &io);
+    for number in 0..KEYS {
+        store.put(COLUMN, &key(number), &value(number, 1)).expect("put back");
+    }
+    seal(&store, &io);
+    store.rebuild_damaged(VolumeId(0), segment).expect("ask");
+    compact_until(&store, &io, |store| store.damaged_segments() == 0);
+    assert_eq!(store.damaged_segments(), 0, "a wholly dead damaged segment stayed damaged");
+    assert!(store.damaged_segment_list().is_empty());
+    assert!(!store.state.volumes[0].table.holds(segment));
+    assert_eq!(store.state.volumes[0].rebuild_asked.load(Ordering::Relaxed), NO_REBUILD);
+    for number in 0..KEYS {
+        assert_eq!(read(&store, &key(number)), Some(value(number, 1)));
+    }
+    store.close().expect("close");
+    let store = open(&io, 0);
+    assert_eq!(store.damaged_segments(), 0, "the clear came back damaged after a reopen");
     store.close().expect("close");
 }

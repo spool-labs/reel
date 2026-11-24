@@ -52,7 +52,7 @@ impl<Backend: Io> StoreScan<Backend> {
         let Some(scan) = &mut self.scan else {
             return Ok(ScanStep::End);
         };
-        self.state.step_scan(scan, key, ScanWant::Value(value))
+        self.state.next_scan_row(scan, key, value)
     }
 
     /// Lend rows to a closure in order, each key and value as slices, until it says stop, the walk ends or a row is corrupt. The

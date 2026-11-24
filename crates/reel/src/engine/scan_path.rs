@@ -1041,6 +1041,43 @@ impl<Backend: Io> EngineState<Backend> {
         Ok(Some(ScanStep::Found))
     }
 
+    /// Take the batch's next row when it can lend it: a value its sorted leaf holds, copied once into the value buffer, or a small
+    /// plain record that checks out, given as its span in the batch. Nothing when the row needs the one-row step
+    fn lend_next(&self, volume: &Volume<Backend>, scan: &mut ScanState, value: &mut Vec<u8>) -> Option<(BatchEntry, Option<(usize, usize)>)> {
+        let entry = scan.batch.entries.get(scan.batch.next).copied()?;
+        let held = entry.is_lent.then(|| held_in((&scan.sorted, &scan.sorted_spare, scan.sorted_turn), &entry)).flatten();
+        let span = if held.is_some() { None } else { self.held_value(volume, scan, &entry) };
+        if held.is_none() && span.is_none() {
+            return None;
+        }
+        // a leaf that let its value go sends the row to the one-row step
+        if let Some(held) = held {
+            value.clear();
+            if !self.sorted_index(scan.column).is_some_and(|index| index.read_held(held, value)) {
+                return None;
+            }
+        }
+        scan.asked += 1;
+        scan.batch.next += 1;
+        scan.batched += 1;
+        Some((entry, span))
+    }
+
+    /// Fill the buffers with the walk's next row, from the batch when it can lend the row, else through the one-row step
+    pub fn next_scan_row(&self, scan: &mut ScanState, key: &mut Vec<u8>, value: &mut Vec<u8>) -> Result<ScanStep, StoreError> {
+        let volume = &self.volumes[self.column(scan.column)?.volume.0 as usize];
+        let Some((entry, span)) = self.lend_next(volume, scan, value) else {
+            return self.step_scan(scan, key, ScanWant::Value(value));
+        };
+        key.clear();
+        key.extend_from_slice(scan.batch_key(&entry));
+        if let Some((at, length)) = span {
+            value.clear();
+            value.extend_from_slice(&scan.batch.records[at..at + length]);
+        }
+        Ok(ScanStep::Found)
+    }
+
     /// Lend the walk's rows to a closure in order, each key and value as slices. A row whose small plain record the batch holds
     /// comes from where it lies once it checks out, and any other takes the one-row step. Ends after the row the closure says
     /// stop on, at the walk's end, or at a corrupt row
@@ -1052,22 +1089,7 @@ impl<Backend: Io> EngineState<Backend> {
     ) -> Result<ScanStep, StoreError> {
         let volume = &self.volumes[self.column(scan.column)?.volume.0 as usize];
         loop {
-            while let Some(entry) = scan.batch.entries.get(scan.batch.next).copied() {
-                let held = entry.is_lent.then(|| held_in((&scan.sorted, &scan.sorted_spare, scan.sorted_turn), &entry)).flatten();
-                let span = if held.is_some() { None } else { self.held_value(volume, scan, &entry) };
-                if held.is_none() && span.is_none() {
-                    break;
-                }
-                // a held value is copied once into the value buffer, and a leaf that let it go sends the row to the one-row step
-                if let Some(held) = held {
-                    value.clear();
-                    if !self.sorted_index(scan.column).is_some_and(|index| index.read_held(held, value)) {
-                        break;
-                    }
-                }
-                scan.asked += 1;
-                scan.batch.next += 1;
-                scan.batched += 1;
+            while let Some((entry, span)) = self.lend_next(volume, scan, value) {
                 let row: &[u8] = match span {
                     Some((at, length)) => &scan.batch.records[at..at + length],
                     None => value,

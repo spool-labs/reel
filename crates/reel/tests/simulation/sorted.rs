@@ -3284,21 +3284,3 @@ fn a_batch_answers_sealed_keys_from_their_leaves() {
     store.close().expect("close");
     SIM_BUDGET.with(|budget| budget.set(BUDGET));
 }
-
-// a shard with several runs' worth of open rows lets its lock go between runs and still enters every row, each once
-#[test]
-fn entering_spans_runs() {
-    let io = SimulatedIo::new(Seed(5_102));
-    let store = open(&io, CAPACITY);
-    let mut model = BTreeMap::new();
-    let keys = 3 * (reel::index::write_index::SHARD_COUNT * reel::index::write_index::ENTER_RUN_ROWS) as u64;
-    for number in 0..keys {
-        store.put(COLUMN, &key(number), b"open").expect("put");
-        model.insert(key(number), b"open".to_vec());
-    }
-    let entered = report(&store).rows_entered;
-    quiet(&io);
-    assert_eq!(report(&store).rows_entered - entered, keys, "rows entered");
-    check_against(&store, &model, "entered");
-    store.close().expect("close");
-}

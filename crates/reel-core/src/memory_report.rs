@@ -71,6 +71,8 @@ pub struct MemoryReport {
     pub pool_shares: ByteCount,
     /// Pools the host had no room to grow, which run as full pools until a step fits
     pub pools_short: usize,
+    /// Bytes the pools have given back to the kernel since open
+    pub pool_given_back: ByteCount,
 }
 
 impl MemoryReport {

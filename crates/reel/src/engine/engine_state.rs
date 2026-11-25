@@ -786,6 +786,7 @@ impl<Backend: Io> EngineState<Backend> {
             pool_committed: ByteCount(self.pool_rooms.iter().map(|room| room.committed() as u64).sum()),
             pool_shares: ByteCount(self.pool_rooms.iter().map(|room| room.reserved() as u64).sum()),
             pools_short: self.pool_rooms.iter().filter(|room| room.is_short()).count(),
+            pool_given_back: ByteCount(self.pool_rooms.iter().map(|room| room.given_back()).sum()),
             write_index: self.index.heap_bytes(),
             spot_cache: self.spot.heap_bytes(),
             record_cache: self.record_cache.heap_bytes(),

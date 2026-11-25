@@ -47,6 +47,9 @@ const INDEXED_BUDGET: ByteCount = ByteCount(512 * 1024 * 1024);
 // a run that puts fresh sorted keys in every window round, so the sorted index grows inside the window
 const GROWTH_VARIABLE: &str = "REEL_STEADY_GROWTH";
 const GROWTH_KEYS: u64 = 64;
+// rounds in one fill and drain of the growth arm, and the decay it runs under so a drain gives memory back inside the window
+const GROWTH_STRETCH: usize = 300;
+const GROWTH_DECAY_NANOS: u64 = 20_000_000;
 const SORTED_ROWS: RowCount = RowCount(100_000);
 const SORTED: ColumnId = ColumnId(4);
 // the width of every steady key, "key-" and six digits
@@ -780,6 +783,9 @@ fn main() {
 
     let live_before = LIVE_BYTES.load(Ordering::Acquire);
     let resident_before = resident_bytes();
+    if env::var_os(GROWTH_VARIABLE).is_some() {
+        reel::pool_room::DECAY_OVERRIDE.store(GROWTH_DECAY_NANOS, Ordering::Relaxed);
+    }
     IS_OPENING.store(true, Ordering::Release);
     let store = open(&root);
     IS_OPENING.store(false, Ordering::Release);
@@ -836,6 +842,7 @@ fn main() {
     let sorted_before = sorted_counts(&store);
     let is_growing = env::var_os(GROWTH_VARIABLE).is_some();
     let committed_before = store.memory_report().pool_committed;
+    let given_before = store.memory_report().pool_given_back;
     touch_stack();
     let mut faults = FaultCounter::new();
     let _first_read = faults.read();
@@ -851,7 +858,9 @@ fn main() {
             break;
         }
         round(&store, &mut inputs, rounds);
-        if is_growing {
+        // fresh keys come in a third of each stretch of rounds, and the rest lets seals drain the pools so the decay gives memory
+        // back before the next fill
+        if is_growing && rounds % GROWTH_STRETCH < GROWTH_STRETCH / 3 {
             put_fresh(&store, &inputs.small, rounds as u64);
         }
     }
@@ -859,6 +868,7 @@ fn main() {
     let main_after = main_thread_faults();
     let after = counts(&mut faults);
     let committed_after = store.memory_report().pool_committed;
+    let given_after = store.memory_report().pool_given_back;
     let unlinked = store.state.volumes[0].segments_unlinked.load(Ordering::Acquire) - unlinked_before;
     let freed = store.state.volumes[0].bytes_freed.load(Ordering::Acquire) - freed_before;
     let store_can_free = store.state.volumes[0].can_free_blocks;
@@ -899,8 +909,10 @@ fn main() {
     if inputs.is_indexed {
         failures += check_sorted(sorted_before, sorted_after);
     }
-    if is_growing && committed_after <= committed_before {
-        println!("the pools never grew in the window: {committed_before:?} before, {committed_after:?} after");
+    if is_growing && (committed_after <= committed_before || given_after <= given_before) {
+        println!(
+            "the pools never both gave back and grew in the window: {committed_before:?} to {committed_after:?} in memory, {given_before:?} to {given_after:?} given back"
+        );
         failures += 1;
     }
     if env::var_os(INDEXED_VARIABLE).is_none() {

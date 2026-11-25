@@ -86,6 +86,21 @@ pub type GrowWake = Arc<dyn Fn() + Send + Sync>;
 pub const EXTENTS: usize = 64;
 /// How long a room stays more than an extent past what it wants before the job gives memory back
 pub const DECAY_NANOS: u64 = 30_000_000_000;
+/// A decay a test sets in place of DECAY_NANOS, so a drain and a refill fit one run. 0 leaves DECAY_NANOS
+#[cfg(feature = "test-hooks")]
+pub static DECAY_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+
+/// Read the decay in force
+fn decay_nanos() -> u64 {
+    #[cfg(feature = "test-hooks")]
+    {
+        let set = DECAY_OVERRIDE.load(Ordering::Relaxed);
+        if set > 0 {
+            return set;
+        }
+    }
+    DECAY_NANOS
+}
 /// Marks an empty free chain
 pub const NO_ROOM_PAGE: u32 = u32::MAX;
 
@@ -141,6 +156,8 @@ pub struct PoolRoom {
     over_since: AtomicU64,
     /// The part the data on disk asks for, which open brings in when the host has room
     first_part: AtomicUsize,
+    /// Bytes the room has given back to the kernel, for the report
+    given_back: AtomicU64,
     /// Bytes the pool uses now, which its owner notes and the job reads
     used: AtomicUsize,
     /// Set once the pool asked for its next extent, until the job brings it in
@@ -214,6 +231,7 @@ impl PoolRoom {
             sample: Mutex::new((0, 0)),
             over_since: AtomicU64::new(0),
             first_part: AtomicUsize::new(0),
+            given_back: AtomicU64::new(0),
             used: AtomicUsize::new(0),
             has_asked: AtomicBool::new(false),
             wake: OnceLock::new(),
@@ -245,6 +263,12 @@ impl PoolRoom {
     pub fn reserved(&self) -> usize {
         self.reserved
     }
+
+    /// Read the bytes the room has given back to the kernel so far
+    pub fn given_back(&self) -> u64 {
+        self.given_back.load(Ordering::Relaxed)
+    }
+
 
     /// Read the bytes of one extent
     pub fn extent(&self) -> usize {
@@ -470,7 +494,7 @@ impl PoolRoom {
             self.over_since.store(now, Ordering::Relaxed);
             return 0;
         }
-        if now.saturating_sub(since) < DECAY_NANOS {
+        if now.saturating_sub(since) < decay_nanos() {
             return 0;
         }
         let mut given = 0;
@@ -535,6 +559,7 @@ impl PoolRoom {
         // SAFETY: the extent lies inside the reservation, isn't ready, holds no page in use, and no reader is left in it
         unsafe { libc::madvise(self.base.as_ptr().add(start).cast(), end - start, libc::MADV_DONTNEED) };
         guard_extent(self.base.as_ptr(), start, end - start, false);
+        self.given_back.fetch_add((end - start) as u64, Ordering::Relaxed);
         end - start
     }
 
@@ -819,6 +844,36 @@ mod tests {
         let _late = room.reading();
         room.grow_to(64 * page).expect("grow");
         assert!(room.is_ready_at(63 * page));
+    }
+
+
+    // the child run of the guard test: release an extent of a guarded room and touch it
+    #[test]
+    fn touch_a_released_extent() {
+        if std::env::var_os("REEL_TOUCH_RELEASED").is_none() {
+            return;
+        }
+        let page = page_bytes();
+        let room = PoolRoom::reserve_paged(ByteCount(64 * page as u64), ByteCount(64 * page as u64), page).expect("reserve");
+        let _low = room.take_page().expect("take");
+        assert!(room.release_idle(1) == 0 && room.release_idle(1 + DECAY_NANOS) > 0);
+        assert!(!room.is_ready_at(63 * page));
+        // SAFETY: none: the read lands in a released extent on purpose, and the guard stops the process
+        let _byte = unsafe { std::ptr::read_volatile(room.base().add(63 * page)) };
+    }
+
+    // a debug build closes a released extent, so a stray touch of one stops the process instead of reading zeros
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_touch_of_a_released_extent_stops_a_debug_build() {
+        let status = std::process::Command::new(std::env::current_exe().expect("path"))
+            .args(["--exact", "pool_room::tests::touch_a_released_extent", "--test-threads=1"])
+            .env("REEL_TOUCH_RELEASED", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("run");
+        assert!(std::os::unix::process::ExitStatusExt::signal(&status).is_some(), "a touch of a released extent went through: {status}");
     }
 
 

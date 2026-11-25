@@ -25,6 +25,7 @@ use crate::index::sorted_keys::{LeafAt, ScanFrom, SortedKeys};
 use crate::config::KeyShape;
 use crate::index::open_counts::OpenBound;
 use crate::pool::grow_into_room;
+use crate::pool_room::RoomRead;
 use crate::index::write_shard::{HEAD_GROUP, HeadPlace, WalkBound, WriteShard, place_heads_together};
 use crate::io::{DeviceReads, Io, ManyRead, ReadOn, in_place};
 use crate::record::record_check::RecordIdentity;
@@ -1004,7 +1005,8 @@ impl<Backend: Io> EngineState<Backend> {
             // a held value is copied once, from its page into the caller's buffer, and a leaf that let it go sends the row to its own read
             _lent if let Some(lent) = lent => {
                 value.clear();
-                self.sorted_index(*column).is_some_and(|index| index.read_held(lent, value))
+                let reading = self.value_reading(*column);
+                self.sorted_index(*column).is_some_and(|index| index.read_held(lent, value, &reading))
             },
             // a value from the cache or a leaf's hold answers as it stands
             (Some((at, length)), Located::Sealed(_) | Located::Open(_)) if entry.is_value => {
@@ -1057,9 +1059,14 @@ impl<Backend: Io> EngineState<Backend> {
         Ok(Some(ScanStep::Found))
     }
 
+    /// Take a guard on the sorted index's value room for one call into a scan, or one that counts nothing for a column with no index
+    pub fn value_reading(&self, column: ColumnId) -> RoomRead<'_> {
+        self.sorted_index(column).map_or_else(RoomRead::none, |index| index.values.room().reading())
+    }
+
     /// Take the batch's next row when it can lend it: a value its sorted leaf holds, copied once into the value buffer, or a small
     /// plain record that checks out, given as its span in the batch. Nothing when the row needs the one-row step
-    fn lend_next(&self, volume: &Volume<Backend>, scan: &mut ScanState, value: &mut Vec<u8>) -> Option<(BatchEntry, Option<(usize, usize)>)> {
+    fn lend_next(&self, volume: &Volume<Backend>, scan: &mut ScanState, value: &mut Vec<u8>, reading: &RoomRead<'_>) -> Option<(BatchEntry, Option<(usize, usize)>)> {
         let entry = scan.batch.entries.get(scan.batch.next).copied()?;
         let held = entry.is_lent.then(|| held_in((&scan.sorted, &scan.sorted_spare, scan.sorted_turn), &entry)).flatten();
         let span = if held.is_some() { None } else { self.held_value(volume, scan, &entry) };
@@ -1069,7 +1076,7 @@ impl<Backend: Io> EngineState<Backend> {
         // a leaf that let its value go sends the row to the one-row step
         if let Some(held) = held {
             value.clear();
-            if !self.sorted_index(scan.column).is_some_and(|index| index.read_held(held, value)) {
+            if !self.sorted_index(scan.column).is_some_and(|index| index.read_held(held, value, reading)) {
                 return None;
             }
         }
@@ -1082,7 +1089,8 @@ impl<Backend: Io> EngineState<Backend> {
     /// Fill the buffers with the walk's next row, from the batch when it can lend the row, else through the one-row step
     pub fn next_scan_row(&self, scan: &mut ScanState, key: &mut Vec<u8>, value: &mut Vec<u8>) -> Result<ScanStep, StoreError> {
         let volume = &self.volumes[self.column(scan.column)?.volume.0 as usize];
-        let Some((entry, span)) = self.lend_next(volume, scan, value) else {
+        let reading = self.value_reading(scan.column);
+        let Some((entry, span)) = self.lend_next(volume, scan, value, &reading) else {
             return self.step_scan(scan, key, ScanWant::Value(value));
         };
         key.clear();
@@ -1104,8 +1112,11 @@ impl<Backend: Io> EngineState<Backend> {
         mut each: impl FnMut(&[u8], &[u8]) -> bool,
     ) -> Result<ScanStep, StoreError> {
         let volume = &self.volumes[self.column(scan.column)?.volume.0 as usize];
+        // one guard on the value room covers every row this call lends, and nothing holds it once the call returns. A closure
+        // that parks inside it holds a release back for as long as it parks, and the extent waits for a later step
+        let reading = self.value_reading(scan.column);
         loop {
-            while let Some((entry, span)) = self.lend_next(volume, scan, value) {
+            while let Some((entry, span)) = self.lend_next(volume, scan, value, &reading) {
                 let row: &[u8] = match span {
                     Some((at, length)) => &scan.batch.records[at..at + length],
                     None => value,

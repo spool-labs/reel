@@ -14,7 +14,7 @@ use reel_core::units::{ByteCount, FileOffset, RowCount, WritePlace};
 use crate::guard::Shards;
 use crate::index::value_pages::{HeldChain, NO_VALUE_PAGE, ValuePages};
 use crate::pool::touched_capacity;
-use crate::pool_room::PoolRoom;
+use crate::pool_room::{PoolRoom, RoomRead};
 use crate::segment::segment_tail::SegmentNumber;
 
 /// Words of one page
@@ -843,10 +843,9 @@ impl SortedKeys {
         self.owns_values
     }
 
-    /// Copy a value a batch noted held onto the end of `out`, or say the leaf let it go since
-    pub fn read_held(&self, held: HeldRef, out: &mut Vec<u8>) -> bool {
-        // a batch reads the value after its part's lock is gone, so it counts itself on its thread's slot and a release waits for it
-        let _reading = self.values.room().reading();
+    /// Copy a value a batch noted held onto the end of `out`, or say the leaf let it go since. The batch reads it after its part's
+    /// lock is gone, so the caller holds a guard on the value room for the call it reads in, and a release waits for it
+    pub fn read_held(&self, held: HeldRef, out: &mut Vec<u8>, _reading: &RoomRead<'_>) -> bool {
         self.values.read(held.chain, held.slot as usize, out)
     }
 

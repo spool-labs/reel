@@ -87,11 +87,20 @@ impl ReadSlots {
 }
 
 /// A reader on its thread's slot, which counts its exit when it drops
-pub struct RoomRead<'room>(&'room ReadSlot);
+pub struct RoomRead<'room>(Option<&'room ReadSlot>);
+
+impl RoomRead<'_> {
+    /// A guard over a room no reader with no lock touches, which counts nothing
+    pub fn none() -> Self {
+        Self(None)
+    }
+}
 
 impl Drop for RoomRead<'_> {
     fn drop(&mut self) {
-        self.0.exits.fetch_add(1, Ordering::SeqCst);
+        if let Some(slot) = self.0 {
+            slot.exits.fetch_add(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -366,11 +375,13 @@ impl PoolRoom {
 
     /// Count a reader that takes no lock of the pool on its thread's slot until the guard drops. A reader reads only what lies in a
     /// ready extent, and a release finishes only once every reader that came in before it cleared the extent has left
-    pub fn reading(&self) -> Option<RoomRead<'_>> {
-        let slots = self.read_slots.as_ref()?;
+    pub fn reading(&self) -> RoomRead<'_> {
+        let Some(slots) = self.read_slots.as_ref() else {
+            return RoomRead::none();
+        };
         let slot = &slots.slots[thread_slot() % READ_SLOTS];
         slot.entries.fetch_add(1, Ordering::SeqCst);
-        Some(RoomRead(slot))
+        RoomRead(Some(slot))
     }
 
     /// Note the bytes the pool uses now, and wake the job the first time the arm wants the next step

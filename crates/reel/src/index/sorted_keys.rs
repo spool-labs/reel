@@ -845,6 +845,8 @@ impl SortedKeys {
 
     /// Copy a value a batch noted held onto the end of `out`, or say the leaf let it go since
     pub fn read_held(&self, held: HeldRef, out: &mut Vec<u8>) -> bool {
+        // a batch reads the value after its part's lock is gone, so it counts itself on its thread's slot and a release waits for it
+        let _reading = self.values.room().reading();
         self.values.read(held.chain, held.slot as usize, out)
     }
 

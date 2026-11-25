@@ -16,6 +16,7 @@ use reel_core::units::ByteCount;
 
 use crate::guard::hold;
 use crate::pool::{HUGE_PAGE_BYTES, touched_filled};
+use crate::engine::caller_activity::thread_slot;
 use crate::region::{MapInFlight, note_populate, page_bytes, thread_faults, touch_pages};
 
 /// A pool grows by this share of its room at a time, and asks for the next extent when less than one is free
@@ -47,6 +48,34 @@ pub fn grow_policy() -> GrowPolicy {
         Ok("lead") => GrowPolicy::Lead,
         _ => GrowPolicy::Extent,
     })
+}
+
+/// Slots for readers that take no lock of a pool. Threads past this many share a slot, which the counts allow
+pub const READ_SLOTS: usize = 64;
+
+/// One thread's readers: how many came in and how many left, on a cache line of its own
+#[repr(align(128))]
+#[derive(Debug, Default)]
+pub struct ReadSlot {
+    entries: AtomicU64,
+    exits: AtomicU64,
+}
+
+/// The read slots of a room, and for each extent on its way back to the kernel the entries its release saw
+pub struct ReadSlots {
+    slots: [ReadSlot; READ_SLOTS],
+    seen: Mutex<[[u64; READ_SLOTS]; EXTENTS]>,
+    /// Extents out of the ready set whose pages wait for their readers to leave
+    pending: AtomicU64,
+}
+
+/// A reader on its thread's slot, which counts its exit when it drops
+pub struct RoomRead<'room>(&'room ReadSlot);
+
+impl Drop for RoomRead<'_> {
+    fn drop(&mut self) {
+        self.0.exits.fetch_add(1, Ordering::Release);
+    }
 }
 
 /// Wakes the job that grows the rooms
@@ -110,14 +139,15 @@ pub struct PoolRoom {
     sample: Mutex<(u64, usize)>,
     /// Since when the room has held more than an extent past what it wants, or 0
     over_since: AtomicU64,
+    /// The part the data on disk asks for, which open brings in when the host has room
+    first_part: AtomicUsize,
     /// Bytes the pool uses now, which its owner notes and the job reads
     used: AtomicUsize,
     /// Set once the pool asked for its next extent, until the job brings it in
     has_asked: AtomicBool,
     wake: OnceLock<GrowWake>,
-    /// Whether a debug build closes a released extent to every access. A pool whose readers take no lock leaves it open, since a
-    /// reader that raced the release reads zeros there and its own check turns them away
-    is_guarded: bool,
+    /// A slot a thread for readers that take no lock of the pool, which a release waits out, when the pool has such readers
+    read_slots: Option<Box<ReadSlots>>,
     pages: Option<RoomPages>,
 }
 
@@ -183,14 +213,21 @@ impl PoolRoom {
             lead: AtomicUsize::new(extent),
             sample: Mutex::new((0, 0)),
             over_since: AtomicU64::new(0),
+            first_part: AtomicUsize::new(0),
             used: AtomicUsize::new(0),
             has_asked: AtomicBool::new(false),
             wake: OnceLock::new(),
-            is_guarded: true,
+            read_slots: None,
             pages,
         };
-        // the data on disk sets the first part, and an empty pool starts with what its arm keeps ready
-        room.grow_to((first.0 as usize).max(room.lead_bytes()))?;
+        // a whole room comes in at once. Any other starts with what its arm keeps ready, and the part the data on disk asks for
+        // comes in at open through the host check, in the rooms' order
+        if first.0 >= share.0 {
+            room.grow_to(room.reserved)?;
+        } else {
+            room.grow_to(room.lead_bytes())?;
+            room.first_part.store(first.0 as usize, Ordering::Relaxed);
+        }
         Ok(room)
     }
 
@@ -244,10 +281,39 @@ impl PoolRoom {
         self.ready.load(Ordering::SeqCst) & (1 << (offset / self.extent)) != 0
     }
 
-    /// Leave released extents open to reads in debug builds, for a pool whose readers take no lock and check what they read
+    /// Bring in the part the data on disk asked for at open, when the host has room for it, and leave the room short when not
+    pub fn fill_first(&self, host_left: &mut u64) -> Result<()> {
+        let target = self.first_part.swap(0, Ordering::Relaxed).min(self.reserved);
+        let step = target.saturating_sub(self.committed()) as u64;
+        if step == 0 {
+            return Ok(());
+        }
+        if step > *host_left {
+            self.is_short.store(true, Ordering::Release);
+            return Ok(());
+        }
+        self.grow_to(target)?;
+        *host_left -= step;
+        Ok(())
+    }
+
+    /// Give the room a slot a thread for readers that take no lock of the pool, so a release waits them out
     pub fn read_unlocked(mut self) -> Self {
-        self.is_guarded = false;
+        self.read_slots = Some(Box::new(ReadSlots {
+            slots: std::array::from_fn(|_slot| ReadSlot::default()),
+            seen: Mutex::new([[0; READ_SLOTS]; EXTENTS]),
+            pending: AtomicU64::new(0),
+        }));
         self
+    }
+
+    /// Count a reader that takes no lock of the pool on its thread's slot until the guard drops. A reader reads only what lies in a
+    /// ready extent, and a release finishes only once every reader that came in before it cleared the extent has left
+    pub fn reading(&self) -> Option<RoomRead<'_>> {
+        let slots = self.read_slots.as_ref()?;
+        let slot = &slots.slots[thread_slot() % READ_SLOTS];
+        slot.entries.fetch_add(1, Ordering::SeqCst);
+        Some(RoomRead(slot))
     }
 
     /// Note the bytes the pool uses now, and wake the job the first time the arm wants the next step
@@ -352,7 +418,9 @@ impl PoolRoom {
         let target = bytes.min(self.reserved);
         while self.committed() < target {
             let ready = self.ready.load(Ordering::Acquire);
-            let extent = (!ready).trailing_zeros() as usize;
+            // an extent whose readers haven't all left since its release stays out until its pages have gone back
+            let pending = self.read_slots.as_ref().map_or(0, |slots| slots.pending.load(Ordering::Acquire));
+            let extent = (!(ready | pending)).trailing_zeros() as usize;
             if extent >= self.extent_count {
                 return Ok(());
             }
@@ -410,9 +478,39 @@ impl PoolRoom {
             let Some(extent) = self.take_empty_extent(pages) else {
                 break;
             };
-            given += self.give_back_extent(extent);
+            match &self.read_slots {
+                // readers that came in before the extent left the ready set may still be in it, so its pages go back on a later step
+                Some(slots) => {
+                    let mut seen = hold(&slots.seen);
+                    for (slot, entries) in slots.slots.iter().zip(seen[extent].iter_mut()) {
+                        *entries = slot.entries.load(Ordering::SeqCst);
+                    }
+                    slots.pending.fetch_or(1 << extent, Ordering::AcqRel);
+                },
+                None => given += self.give_back_extent(extent),
+            }
         }
         self.over_since.store(0, Ordering::Relaxed);
+        given
+    }
+
+    /// Give back every extent whose readers have all left since its release took it out of the ready set, and return the bytes
+    pub fn finish_releases(&self) -> usize {
+        let Some(slots) = &self.read_slots else {
+            return 0;
+        };
+        let mut given = 0;
+        let mut pending = slots.pending.load(Ordering::Acquire);
+        while pending != 0 {
+            let extent = pending.trailing_zeros() as usize;
+            pending &= pending - 1;
+            let seen = hold(&slots.seen)[extent];
+            let has_left = slots.slots.iter().zip(seen.iter()).all(|(slot, &entries)| slot.exits.load(Ordering::Acquire) >= entries);
+            if has_left {
+                given += self.give_back_extent(extent);
+                slots.pending.fetch_and(!(1 << extent), Ordering::AcqRel);
+            }
+        }
         given
     }
 
@@ -430,15 +528,13 @@ impl PoolRoom {
         Some(extent)
     }
 
-    /// Give an extent no longer ready back to the kernel. No page in it is in use, so a pool that reads under its own lock never
-    /// reaches it, and one that reads with no lock reads zeros there, which no generation it checks against is
+    /// Give an extent no longer ready back to the kernel. No page in it is in use, a pool that reads under its own lock never
+    /// reaches it, and every reader with no lock that could have seen it ready has left
     fn give_back_extent(&self, extent: usize) -> usize {
         let (start, end) = self.extent_range(extent);
-        // SAFETY: the extent lies inside the reservation, isn't ready, and holds no page in use
+        // SAFETY: the extent lies inside the reservation, isn't ready, holds no page in use, and no reader is left in it
         unsafe { libc::madvise(self.base.as_ptr().add(start).cast(), end - start, libc::MADV_DONTNEED) };
-        if self.is_guarded {
-            guard_extent(self.base.as_ptr(), start, end - start, false);
-        }
+        guard_extent(self.base.as_ptr(), start, end - start, false);
         end - start
     }
 
@@ -701,6 +797,30 @@ mod tests {
         // SAFETY: the page lies in an extent that came back
         assert_eq!(unsafe { room.base().add(again[0] as usize * page).read() }, 0);
     }
+
+    #[test]
+    fn a_release_waits_for_readers_that_came_in_before_it() {
+        let page = page_bytes();
+        let room = PoolRoom::reserve_paged(ByteCount(64 * page as u64), ByteCount(64 * page as u64), page).expect("reserve").read_unlocked();
+        let taken: Vec<u32> = (0..64).map(|_page| room.take_page().expect("take")).collect();
+        for &page_number in &taken[8..] {
+            room.give_page(page_number);
+        }
+        let reading = room.reading();
+        assert_eq!(room.release_idle(1), 0);
+        assert_eq!(room.release_idle(1 + DECAY_NANOS), 0, "a release went back with a reader inside");
+        assert!(!room.is_ready_at(63 * page), "a released extent still reads as ready");
+        assert_eq!(room.finish_releases(), 0);
+        room.grow_to(64 * page).expect("grow");
+        assert!(!room.is_ready_at(63 * page), "an extent its readers hadn't left came back");
+        drop(reading);
+        assert!(room.finish_releases() > 0, "a release never finished once its readers left");
+        // a reader that comes in after the release never holds it back
+        let _late = room.reading();
+        room.grow_to(64 * page).expect("grow");
+        assert!(room.is_ready_at(63 * page));
+    }
+
 
     #[test]
     fn a_large_room_keeps_its_limits_on_huge_pages() {

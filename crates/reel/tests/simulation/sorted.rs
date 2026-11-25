@@ -3297,3 +3297,22 @@ fn a_batch_answers_sealed_keys_from_their_leaves() {
     store.close().expect("close");
     SIM_BUDGET.with(|budget| budget.set(BUDGET));
 }
+
+// a reopen on a host with no room past its margin opens, leaves the parts its data asks for out and reports them short, and every
+// get and a whole scan still answer the model
+#[test]
+fn a_reopen_on_a_host_with_no_room_runs_short() {
+    let io = SimulatedIo::new(Seed(40));
+    let store = open(&io, CAPACITY);
+    let model = fill_for_reopen(&store, &io, SHORT_KEYS);
+    store.close().expect("close");
+    drop(store);
+    io.set_host_memory(reel::io::host_memory::HostMemory { total: ByteCount(1 << 30), available: ByteCount(0), group_room: None, group_limit: None });
+    let store = open(&io, CAPACITY);
+    assert!(store.memory_report().pools_short > 0, "a host with no room left no pool short");
+    let written: Vec<Vec<u8>> = (0..SHORT_KEYS).map(key).collect();
+    check(&store, &model, &written);
+    let whole: Rows = model.iter().map(|(name, value)| (name.clone(), value.clone())).collect();
+    assert_eq!(rows(store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan")), whole);
+    store.close().expect("close");
+}

@@ -46,7 +46,7 @@ use crate::engine::recovery::{
     pass_open_rows,
     settle_summaries,
 };
-use crate::engine::reserve_job::ReserveJob;
+use crate::engine::reserve_job::{ReserveJob, host_left};
 use crate::engine::row_job::{EnterWatch, RowJob};
 use crate::engine::scan_state::{ScanRange, ScanState, from_key, in_range, under_prefix};
 use crate::engine::seal_job::{MOST_SEGMENT_BLOCKS, SealJob};
@@ -162,6 +162,11 @@ impl<Backend: Io> ReelStore<Backend> {
         // under shortage the job serves the rooms in this order: the write index, the sorted pages, their values, then the caches
         let cache_rooms = state.record_cache.rooms();
         state.pool_rooms.extend(cache_rooms);
+        // the parts the data on disk asks for come in through the host check, in the rooms' order, before recovery fills them
+        let mut room_left = host_left(&state.io.host_memory());
+        for room in &state.pool_rooms {
+            room.fill_first(&mut room_left).map_err(open_error("bringing in a pool's first part"))?;
+        }
         state.sorted_sizes = sorted_sizes;
         state.complete_images = complete_images(config);
         state.attach_ring(ring);

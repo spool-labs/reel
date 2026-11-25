@@ -448,3 +448,24 @@ fn unpack_slot(slot: u32) -> Option<(usize, usize, usize)> {
     let link = (slot >> (OFFSET_BITS + LENGTH_BITS)) as usize;
     Some((link, offset, length))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // takes across the counter's wrap never hand out generation 0, which a zeroed page reads as
+    #[test]
+    fn generations_skip_zero_across_the_wrap() {
+        let pool = ValuePages::new(8).expect("pool");
+        pool.generations.store(u32::MAX - 2, Ordering::Relaxed);
+        let mut seen = Vec::new();
+        for owner in 0..8 {
+            let page = pool.take(0, owner).expect("take");
+            seen.push(pool.generation(page));
+        }
+        assert!(seen.iter().all(|&generation| generation != 0), "{seen:?}");
+        pool.generations.store(1 << 31, Ordering::Relaxed);
+        let page = pool.take(0, 9);
+        assert!(page.is_none_or(|page| pool.generation(page) != 0));
+    }
+}

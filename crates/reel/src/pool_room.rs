@@ -10,7 +10,7 @@
 use std::io::{Error, ErrorKind, Result};
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use reel_core::units::ByteCount;
 
@@ -23,6 +23,34 @@ pub const FIRST_PART_DIVISOR: usize = 8;
 pub const EXTENT_DIVISOR: usize = 16;
 /// The least room that starts on a huge page and grows in whole ones
 pub const HUGE_ROOM_BYTES: usize = 4 * HUGE_PAGE_BYTES;
+
+/// How far ahead of its fill a pool on the lead arm keeps memory ready, in nanoseconds of writes at its last measured rate
+pub const LEAD_NANOS: u64 = 100_000_000;
+/// A pool on the demand arm grows by this share of its room at a time
+pub const DEMAND_DIVISOR: usize = 64;
+/// The variable that picks the growth arm for the A/B/C runs: extent, demand or lead
+pub const POLICY_VARIABLE: &str = "REEL_GROW_POLICY";
+
+/// When a pool grows, one arm each for the A/B/C runs. The winner stays and the others go
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GrowPolicy {
+    /// Grow an extent when less than one is free
+    Extent,
+    /// Grow a small step once a caller is at the limit
+    Demand,
+    /// Keep the fill of the last stretch of time ready ahead of use
+    Lead,
+}
+
+/// Read the arm the process runs, once
+pub fn grow_policy() -> GrowPolicy {
+    static POLICY: OnceLock<GrowPolicy> = OnceLock::new();
+    *POLICY.get_or_init(|| match std::env::var(POLICY_VARIABLE).as_deref() {
+        Ok("demand") => GrowPolicy::Demand,
+        Ok("lead") => GrowPolicy::Lead,
+        _ => GrowPolicy::Extent,
+    })
+}
 
 /// Wakes the job that grows the rooms
 pub type GrowWake = Arc<dyn Fn() + Send + Sync>;
@@ -40,6 +68,12 @@ pub struct PoolRoom {
     committed: AtomicUsize,
     /// Set when the last populate failed, and cleared by the next that works
     has_failed: AtomicBool,
+    /// Set when the host had no room for the next step, and cleared once a step fits
+    is_short: AtomicBool,
+    /// The bytes the lead arm keeps ready past use, which the job sets from the fill rate
+    lead: AtomicUsize,
+    /// The job's last look at the fill: when, and the bytes used then
+    sample: Mutex<(u64, usize)>,
     /// Bytes the pool uses now, which its owner notes and the growing job reads
     used: AtomicUsize,
     /// Set once the pool asked for its next extent, until the job brings it in
@@ -75,6 +109,9 @@ impl PoolRoom {
             extent,
             committed: AtomicUsize::new(0),
             has_failed: AtomicBool::new(false),
+            is_short: AtomicBool::new(false),
+            lead: AtomicUsize::new(extent),
+            sample: Mutex::new((0, 0)),
             used: AtomicUsize::new(0),
             has_asked: AtomicBool::new(false),
             wake: OnceLock::new(),
@@ -134,20 +171,65 @@ impl PoolRoom {
         self.has_failed.load(Ordering::Acquire)
     }
 
-    /// Read where the pool grows next with this many bytes used: one extent on, once less than an extent is free, up to the room
-    pub fn next_step(&self, used: usize) -> Option<usize> {
-        let committed = self.committed();
-        if committed >= self.reserved || committed.saturating_sub(used) >= self.extent {
-            return None;
-        }
-        Some((committed + self.extent).min(self.reserved))
+    /// Check the host had no room for the pool's next step
+    pub fn is_short(&self) -> bool {
+        self.is_short.load(Ordering::Acquire)
     }
 
-    /// Grow by extents until one is free or the room is whole, and say whether it grew
-    pub fn grow_step(&self) -> Result<bool> {
+    /// Check the pool can still grow, so a caller at its limit waits for the next step instead of treating the pool as full
+    pub fn can_grow(&self) -> bool {
+        self.committed() < self.reserved && !self.has_failed() && !self.is_short()
+    }
+
+    /// Read where the pool grows next with this many bytes used, under the process's arm, up to the room
+    pub fn next_step(&self, used: usize) -> Option<usize> {
+        let committed = self.committed();
+        if committed >= self.reserved {
+            return None;
+        }
+        let free = committed.saturating_sub(used);
+        let target = match grow_policy() {
+            GrowPolicy::Extent => (free < self.extent).then_some(committed + self.extent),
+            GrowPolicy::Demand => {
+                let step = (self.reserved / DEMAND_DIVISOR).next_multiple_of(self.unit).max(self.unit);
+                (free < self.unit).then_some(committed + step)
+            },
+            GrowPolicy::Lead => {
+                let lead = self.lead.load(Ordering::Relaxed);
+                (free < lead).then_some(used + 2 * lead)
+            },
+        }?;
+        Some(target.next_multiple_of(self.unit).min(self.reserved))
+    }
+
+    /// Set the lead arm's lead from the fill since the job last looked: the bytes that fill takes in LEAD_NANOS, and never less
+    /// than one unit
+    pub fn note_rate(&self, now: u64) {
+        let used = self.used();
+        let mut sample = self.sample.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (then, used_then) = *sample;
+        *sample = (now, used);
+        let elapsed = now.saturating_sub(then);
+        if then == 0 || elapsed == 0 {
+            return;
+        }
+        let rate_lead = (used.saturating_sub(used_then) as u128 * u128::from(LEAD_NANOS) / u128::from(elapsed)) as usize;
+        self.lead.store(rate_lead.max(self.unit), Ordering::Relaxed);
+    }
+
+    /// Grow until the arm wants no more or the room is whole, taking no step past the room the host has left, and say whether it
+    /// grew. A pool the host has no room for stays as it is and reads as short until a step fits
+    pub fn grow_step(&self, host_left: &mut u64) -> Result<bool> {
         let mut grew = false;
         while let Some(target) = self.next_step(self.used()) {
+            let step = target.saturating_sub(self.committed()) as u64;
+            if step > *host_left {
+                self.is_short.store(true, Ordering::Release);
+                break;
+            }
             self.grow_to(target)?;
+            *host_left -= step;
+            self.is_short.store(false, Ordering::Release);
             grew = true;
         }
         // a use noted between the last look and this clear asks again on its next note
@@ -280,7 +362,7 @@ mod tests {
         room.note_used(5 * page);
         room.note_used(6 * page);
         assert_eq!(wakes.load(Ordering::Relaxed), 1, "a room asked more than once for one extent");
-        assert!(room.grow_step().expect("grow"));
+        assert!(room.grow_step(&mut u64::MAX.clone()).expect("grow"));
         assert_eq!(room.committed(), 12 * page);
         // SAFETY: the bytes lie under the limit
         unsafe { room.base().add(12 * page - 1).write(7) };
@@ -289,6 +371,21 @@ mod tests {
         room.grow_to(1 << 40).expect("grow");
         assert_eq!(room.committed(), 64 * page);
         assert_eq!(room.next_step(64 * page), None);
+    }
+
+    #[test]
+    fn a_host_with_no_room_leaves_the_pool_short() {
+        let page = page_bytes();
+        let room = PoolRoom::reserve(ByteCount(64 * page as u64), ByteCount(8 * page as u64)).expect("reserve");
+        room.note_used(8 * page);
+        let mut tight = 2 * page as u64;
+        assert!(!room.grow_step(&mut tight).expect("grow"));
+        assert!(room.is_short() && !room.can_grow());
+        assert_eq!((room.committed(), tight), (8 * page, 2 * page as u64));
+        let mut roomy = u64::MAX;
+        assert!(room.grow_step(&mut roomy).expect("grow"));
+        assert!(!room.is_short() && room.can_grow());
+        assert_eq!(room.committed(), 12 * page);
     }
 
     #[test]
@@ -306,7 +403,7 @@ mod tests {
         assert_eq!(room.reserved(), 11 * HUGE_PAGE_BYTES);
         assert_eq!(room.committed(), HUGE_PAGE_BYTES);
         room.note_used(HUGE_PAGE_BYTES);
-        assert!(room.grow_step().expect("grow"));
+        assert!(room.grow_step(&mut u64::MAX.clone()).expect("grow"));
         assert_eq!(room.committed() % HUGE_PAGE_BYTES, 0);
     }
 }

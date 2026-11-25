@@ -141,7 +141,7 @@ impl WriteShard {
     pub fn waits_for_slab(&self) -> bool {
         let room = self.slab.room();
         self.slab.total_pages() < self.slab.most_pages()
-            && !room.has_failed()
+            && room.can_grow()
             && self.nodes.free_count >= MAX_NEW_NODES
             && self.table.has_room_for(self.held.rows + 1)
     }

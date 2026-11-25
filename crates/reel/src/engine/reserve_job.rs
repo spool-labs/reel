@@ -13,10 +13,27 @@ use crate::guard::hold;
 use crate::io::job::{Job, JobStep};
 use crate::io::{Io, IoFile, IoTask};
 use crate::pool::touched_filled;
+use crate::pool_room::{GrowPolicy, grow_policy};
+use crate::io::host_memory::HostMemory;
 use crate::segment::segment_tail::SegmentNumber;
 
 /// How often the job looks: half a run of places lasts over half an hour at a million rows a second
 pub const RESERVE_PERIOD: Nanoseconds = Nanoseconds(1_000_000_000);
+/// The least a host keeps free past every pool's growth
+pub const HOST_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
+/// A host keeps free at least this share of its memory past every pool's growth
+pub const HOST_MARGIN_DIVISOR: u64 = 32;
+
+/// Read the bytes the pools may still grow by: what the host or the control group has free, less a margin, and no limit where
+/// the host says nothing
+pub fn host_left(memory: &HostMemory) -> u64 {
+    let total = memory.reserve_total().0;
+    if total == 0 {
+        return u64::MAX;
+    }
+    memory.free().0.saturating_sub(HOST_MARGIN_BYTES.max(total / HOST_MARGIN_DIVISOR))
+}
+
 /// Bytes an open segment gathers before they start for the device
 pub const WRITEBACK_STEP_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -133,8 +150,18 @@ impl<Backend: Io> ReserveJob<Backend> {
     /// Grow every pool with less than one extent free. A pool wakes the job when it gets there, and a populate that fails leaves
     /// the pool at its size for the next step to try again
     pub fn grow_pools(&self) {
+        let now = self.state.io.now().0;
+        if grow_policy() == GrowPolicy::Lead {
+            for room in &self.state.pool_rooms {
+                room.note_rate(now);
+            }
+        }
+        if !self.state.pool_rooms.iter().any(|room| room.next_step(room.used()).is_some()) {
+            return;
+        }
+        let mut host_left = host_left(&self.state.io.host_memory());
         for room in &self.state.pool_rooms {
-            let _grew = room.grow_step();
+            let _grew = room.grow_step(&mut host_left);
         }
     }
 }

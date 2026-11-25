@@ -157,7 +157,7 @@ impl CacheShard {
 
     /// Check the room can still grow, so a full log waits for its next part
     fn can_grow(&self) -> bool {
-        self.capacity < self.share && !self.room.has_failed()
+        self.capacity < self.share && self.room.can_grow()
     }
 
     /// Read the arena's bytes the log runs over

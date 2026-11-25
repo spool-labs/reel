@@ -61,12 +61,29 @@ pub struct ReadSlot {
     exits: AtomicU64,
 }
 
-/// The read slots of a room, and for each extent on its way back to the kernel the entries its release saw
+/// The read slots of a room, and for each extent on its way back to the kernel the slots it still waits to see empty
 pub struct ReadSlots {
     slots: [ReadSlot; READ_SLOTS],
-    seen: Mutex<[[u64; READ_SLOTS]; EXTENTS]>,
+    /// For each extent on its way back, the slots that had a reader inside when its release began and haven't been seen empty since
+    busy: Mutex<[u64; EXTENTS]>,
     /// Extents out of the ready set whose pages wait for their readers to leave
     pending: AtomicU64,
+}
+
+impl ReadSlots {
+    /// Read which of these slots have a reader inside now. A slot whose exits, read first, equal its entries, read after, had
+    /// nobody inside at the moment its exits were read, however many threads share it, and a slot seen empty after a release
+    /// began holds no reader from before it
+    fn busy_now(&self, among: u64) -> u64 {
+        let mut busy = 0;
+        for (index, slot) in self.slots.iter().enumerate().filter(|(index, _slot)| among & (1 << index) != 0) {
+            let exits = slot.exits.load(Ordering::SeqCst);
+            if slot.entries.load(Ordering::SeqCst) != exits {
+                busy |= 1 << index;
+            }
+        }
+        busy
+    }
 }
 
 /// A reader on its thread's slot, which counts its exit when it drops
@@ -74,7 +91,7 @@ pub struct RoomRead<'room>(&'room ReadSlot);
 
 impl Drop for RoomRead<'_> {
     fn drop(&mut self) {
-        self.0.exits.fetch_add(1, Ordering::Release);
+        self.0.exits.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -238,8 +255,9 @@ impl PoolRoom {
             read_slots: None,
             pages,
         };
-        // a whole room comes in at once. Any other starts with what its arm keeps ready, and the part the data on disk asks for
-        // comes in at open through the host check, in the rooms' order
+        // a whole room comes in at once, with no host check: a reader opens its rooms whole and runs no job to grow them, so a
+        // read-only open can still pass what the host holds. Any other room starts with what its arm keeps ready, and the part the
+        // data on disk asks for comes in at open through the host check, in the rooms' order
         if first.0 >= share.0 {
             room.grow_to(room.reserved)?;
         } else {
@@ -325,7 +343,7 @@ impl PoolRoom {
     pub fn read_unlocked(mut self) -> Self {
         self.read_slots = Some(Box::new(ReadSlots {
             slots: std::array::from_fn(|_slot| ReadSlot::default()),
-            seen: Mutex::new([[0; READ_SLOTS]; EXTENTS]),
+            busy: Mutex::new([0; EXTENTS]),
             pending: AtomicU64::new(0),
         }));
         self
@@ -505,10 +523,7 @@ impl PoolRoom {
             match &self.read_slots {
                 // readers that came in before the extent left the ready set may still be in it, so its pages go back on a later step
                 Some(slots) => {
-                    let mut seen = hold(&slots.seen);
-                    for (slot, entries) in slots.slots.iter().zip(seen[extent].iter_mut()) {
-                        *entries = slot.entries.load(Ordering::SeqCst);
-                    }
+                    hold(&slots.busy)[extent] = slots.busy_now(u64::MAX);
                     slots.pending.fetch_or(1 << extent, Ordering::AcqRel);
                 },
                 None => given += self.give_back_extent(extent),
@@ -528,9 +543,10 @@ impl PoolRoom {
         while pending != 0 {
             let extent = pending.trailing_zeros() as usize;
             pending &= pending - 1;
-            let seen = hold(&slots.seen)[extent];
-            let has_left = slots.slots.iter().zip(seen.iter()).all(|(slot, &entries)| slot.exits.load(Ordering::Acquire) >= entries);
-            if has_left {
+            let mut busy = hold(&slots.busy);
+            busy[extent] = slots.busy_now(busy[extent]);
+            if busy[extent] == 0 {
+                drop(busy);
                 given += self.give_back_extent(extent);
                 slots.pending.fetch_and(!(1 << extent), Ordering::AcqRel);
             }
@@ -844,6 +860,22 @@ mod tests {
         let _late = room.reading();
         room.grow_to(64 * page).expect("grow");
         assert!(room.is_ready_at(63 * page));
+    }
+
+
+    // two readers on one slot: the one that came in before the release holds it back after the later one has come and gone
+    #[test]
+    fn a_later_reader_on_the_slot_never_pays_for_an_earlier_one() {
+        let page = page_bytes();
+        let room = PoolRoom::reserve_paged(ByteCount(64 * page as u64), ByteCount(64 * page as u64), page).expect("reserve").read_unlocked();
+        let _low = room.take_page().expect("take");
+        let earlier = room.reading();
+        assert_eq!(room.release_idle(1), 0);
+        assert_eq!(room.release_idle(1 + DECAY_NANOS), 0);
+        drop(room.reading());
+        assert_eq!(room.finish_releases(), 0, "a later reader's exit let a release past an earlier reader");
+        drop(earlier);
+        assert!(room.finish_releases() > 0);
     }
 
 

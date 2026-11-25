@@ -1365,10 +1365,13 @@ impl<Backend: Io> EngineState<Backend> {
                 let changes = self.index.change_count(shard);
                 // a shard with no open row of the column its index lacks stands its head past the end, whatever the keys look like
                 let counts = self.index.shard_counts(shard);
+                let before = counts.class_change(*column_of);
                 let open = match counts.is_column_quiet(*column_of) {
                     true => Some(OpenBound::End),
                     false => counts.of(*column_of).and_then(|counts| counts.bound(position, *direction)),
                 };
+                // a counting switch that ran beside the reads makes them stale, and the head is placed for real
+                let open = open.filter(|_open| counts.is_class_steady(*column_of, before));
                 let Some(open) = open else {
                     continue;
                 };

@@ -305,6 +305,11 @@ impl EntrySlab {
         self.bytes()[byte_of(address) + KIND_AT] & ENTERED_FLAG != 0
     }
 
+    /// Note a row left its column's sorted index again, after a drop, so the counts hold it until the entering puts it back
+    pub fn clear_entered(&mut self, address: EntryAddress) {
+        self.bytes_mut()[byte_of(address) + KIND_AT] &= !ENTERED_FLAG;
+    }
+
     /// Note a row went into its column's sorted index before its seal
     pub fn mark_entered(&mut self, address: EntryAddress) {
         self.bytes_mut()[byte_of(address) + KIND_AT] |= ENTERED_FLAG;

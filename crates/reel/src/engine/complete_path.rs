@@ -649,6 +649,7 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// Drop a sorted index whole and stop counting its column, and return the pages freed
     pub fn drop_sorted(&self, index: &SortedKeys) -> u32 {
+        let _dropping = hold(&self.sorted_drop_lock);
         index.drop_entries(|| self.stop_counting_full_indexes())
     }
 
@@ -708,9 +709,12 @@ impl<Backend: Io> EngineState<Backend> {
         }
         let Some(segment) = refill.segment else {
             // the column stays out of the open counts: its walks read every shard head from here on
+            let ending = hold(&self.sorted_drop_lock);
             if sorted.end_refill(refill.mark, refill.missed, refill.drops) {
                 self.sorted_refills.fetch_add(1, Ordering::Relaxed);
+                self.index.start_counting(refill.column);
             }
+            drop(ending);
             return Ok(false);
         };
         let mark = refill.mark;

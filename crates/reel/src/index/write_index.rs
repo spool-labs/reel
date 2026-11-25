@@ -34,6 +34,9 @@ pub struct WriteIndex {
     pub counts: Vec<OpenCounts>,
     /// Where each column's open rows count: PLAIN_COUNTS, SORTED_COUNTS or NO_COUNTS
     pub classes: [AtomicU8; COLUMN_SLOTS],
+    /// Each column's count of counting switches: odd while a stop or a start runs. A reader of the counts with no lock compares it
+    /// before and after, so a switch between its reads shows
+    pub class_changes: [AtomicU32; COLUMN_SLOTS],
     /// Each shard's open rows of each sorted column its index doesn't hold yet. At 0 a walk of the column needs no head there
     pub column_open: Vec<[AtomicU32; COLUMN_SLOTS]>,
     /// Each shard's count of changes to its rows, which goes up under its write lock
@@ -50,7 +53,7 @@ impl WriteIndex {
         let counts = (0..SHARD_COUNT).map(|_shard| OpenCounts::new(sizing.buckets)).collect();
         let classes = std::array::from_fn(|_column| AtomicU8::new(PLAIN_COUNTS));
         let column_open = touched_from(SHARD_COUNT, || std::array::from_fn(|_column| AtomicU32::new(0)));
-        Ok(Self { shards: Shards(shards), counts, classes, column_open, changes: Default::default() })
+        Ok(Self { shards: Shards(shards), counts, classes, class_changes: std::array::from_fn(|_column| AtomicU32::new(0)), column_open, changes: Default::default() })
     }
 
     /// Read every shard's slab room, for the job that grows them
@@ -80,7 +83,7 @@ impl WriteIndex {
 
     /// Read both of a shard's open counts, for a clean that counts out rows of every column
     pub fn shard_counts(&self, shard: usize) -> ShardCounts<'_> {
-        ShardCounts { buckets: &self.counts[shard], classes: &self.classes, column_open: &self.column_open[shard] }
+        ShardCounts { buckets: &self.counts[shard], classes: &self.classes, class_changes: &self.class_changes, column_open: &self.column_open[shard] }
     }
 
     /// Stop counting a sorted column whose index can't take its open rows, which would hold every other sorted column's buckets
@@ -88,9 +91,11 @@ impl WriteIndex {
     /// while its rows leave the counts, so no insert counts one in between
     pub fn stop_counting(&self, column: ColumnId) {
         let mut guards: Vec<_> = (0..SHARD_COUNT).map(|shard| self.shards.write(shard)).collect();
-        if self.classes[column.0 as usize].swap(NO_COUNTS, Ordering::AcqRel) != SORTED_COUNTS {
+        if !self.is_sorted_counted(column) {
             return;
         }
+        self.class_changes[column.0 as usize].fetch_add(1, Ordering::AcqRel);
+        self.classes[column.0 as usize].store(NO_COUNTS, Ordering::Release);
         for (shard, guard) in guards.iter_mut().enumerate() {
             for slot in 0..guard.trees.len() {
                 let mut position = guard.trees[slot].first_position(&guard.nodes);
@@ -104,6 +109,40 @@ impl WriteIndex {
                 }
             }
             self.column_open[shard][column.0 as usize].store(0, Ordering::Release);
+        }
+        self.class_changes[column.0 as usize].fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Count a sorted column again once a refill put every sealed row back in its index. Every shard is held at once while each
+    /// entered open row of the column leaves the entered state and counts in, and the entering puts them back in the index. A walk
+    /// reads the counts with no lock, so every shard's counts fill before the column reads as counted: a walk that saw it counted
+    /// with a shard not yet filled would stand that shard's head past the end and skip its open rows
+    pub fn start_counting(&self, column: ColumnId) {
+        let mut guards: Vec<_> = (0..SHARD_COUNT).map(|shard| self.shards.write(shard)).collect();
+        if self.is_sorted_counted(column) {
+            return;
+        }
+        self.class_changes[column.0 as usize].fetch_add(1, Ordering::AcqRel);
+        for (shard, guard) in guards.iter_mut().enumerate() {
+            let mut open = 0;
+            for slot in 0..guard.trees.len() {
+                let mut position = guard.trees[slot].first_position(&guard.nodes);
+                while let Some(at) = position {
+                    let address = entry_at(&guard.nodes, at);
+                    position = step_forward(&guard.nodes, at);
+                    if guard.slab.column(address) == column && guard.slab.is_entered(address) {
+                        guard.slab.clear_entered(address);
+                        self.counts[shard].add(guard.slab.key(address));
+                        open += 1;
+                    }
+                }
+            }
+            self.column_open[shard][column.0 as usize].store(open, Ordering::Release);
+        }
+        self.classes[column.0 as usize].store(SORTED_COUNTS, Ordering::Release);
+        self.class_changes[column.0 as usize].fetch_add(1, Ordering::AcqRel);
+        for shard in 0..SHARD_COUNT {
+            self.count_change(shard, true);
         }
     }
 
@@ -402,6 +441,7 @@ pub const COLUMN_SLOTS: usize = u8::MAX as usize + 1;
 pub struct ShardCounts<'counts> {
     pub buckets: &'counts OpenCounts,
     pub classes: &'counts [AtomicU8; COLUMN_SLOTS],
+    pub class_changes: &'counts [AtomicU32; COLUMN_SLOTS],
     pub column_open: &'counts [AtomicU32; COLUMN_SLOTS],
 }
 
@@ -439,7 +479,19 @@ impl<'counts> ShardCounts<'counts> {
 
     /// Check a sorted column has no open row its index lacks in this shard
     pub fn is_column_quiet(self, column: ColumnId) -> bool {
-        self.classes[column.0 as usize].load(Ordering::Acquire) == SORTED_COUNTS && self.column_open[column.0 as usize].load(Ordering::Acquire) == 0
+        let before = self.class_change(column);
+        let is_quiet = self.classes[column.0 as usize].load(Ordering::Acquire) == SORTED_COUNTS && self.column_open[column.0 as usize].load(Ordering::Acquire) == 0;
+        is_quiet && self.is_class_steady(column, before)
+    }
+
+    /// Read a column's count of counting switches, which a reader of the counts takes before it reads them
+    pub fn class_change(self, column: ColumnId) -> u32 {
+        self.class_changes[column.0 as usize].load(Ordering::Acquire)
+    }
+
+    /// Check no counting switch ran or began since the count a reader took, so the counts it read in between hold
+    pub fn is_class_steady(self, column: ColumnId, before: u32) -> bool {
+        before.is_multiple_of(2) && self.class_change(column) == before
     }
 }
 

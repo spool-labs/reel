@@ -3486,7 +3486,7 @@ fn a_pressed_store_drops_its_index_and_refills_it() {
     assert_eq!(index.mark(), None, "the refill left the mark: {} past capacity, {} missed at start, {} free pages", index.past_capacity().0, refill.missed.0, index.free_pages());
     assert!(!index.is_dropped());
     assert_eq!(store.memory_report().sorted_refills, 1);
-    assert!(!sorted_reading(&store).is_counted, "a refilled column counts its open rows again");
+    assert!(sorted_reading(&store).is_counted, "the refilled column stayed out of the counts");
     assert!(!sorted_reading(&store).is_dropped);
     check_all(&store, &model, KEYS + KEYS / 2, 48);
     store.close().expect("close");
@@ -3532,7 +3532,7 @@ fn a_refill_past_an_unreadable_block_tries_again() {
     while store.state.sorted_refill_step(0, &mut refill).expect("refill step") {}
     assert_eq!(index.mark(), None);
     assert!(!index.is_dropped());
-    assert!(!sorted_reading(&store).is_counted);
+    assert!(sorted_reading(&store).is_counted);
     check_all(&store, &model, KEYS, 47);
     store.close().expect("close");
 }
@@ -3664,4 +3664,52 @@ fn a_drop_between_a_steps_reads_loses_no_key() {
     assert_eq!(walked.len(), whole.len(), "the walk lost keys to a drop between its reads");
     assert_eq!(walked, whole);
     store.close().expect("close");
+}
+
+// a walk that runs while its column's counting stops and starts again returns every key
+#[test]
+fn a_walk_across_a_counting_switch_loses_no_key() {
+    for seed in seeds([49, 50, 51, 52]) {
+        let io = SimulatedIo::new(Seed(seed));
+        let store = open(&io, CAPACITY);
+        store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
+        store.state.volumes[0].holds.reclaim.store(true, Ordering::Release);
+        let mut model = fill_for_reopen(&store, &io, KEYS);
+        // open rows, half of them entered in the index
+        for number in KEYS..KEYS + 300 {
+            store.put(COLUMN, &key(number), b"open").expect("put");
+            model.insert(key(number), b"open".to_vec());
+            if number == KEYS + 150 {
+                let _entered = store.state.enter_open_rows(&mut reel::index::write_index::EnterRun::new());
+            }
+        }
+        let whole: Rows = model.iter().map(|(name, value)| (name.clone(), value.clone())).collect();
+        let mut random = SeededRandom::new(Seed(seed));
+        let mut scan = store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan");
+        let (mut name, mut value) = (Vec::new(), Vec::new());
+        let mut walked = Vec::new();
+        let (stop_at, start_at) = (random.below(whole.len() as u64 / 2), whole.len() as u64 / 2 + random.below(whole.len() as u64 / 2));
+        let mut step = 0;
+        while scan.next_row(&mut name, &mut value).expect("step") == ScanStep::Found {
+            walked.push((name.clone(), value.clone()));
+            step += 1;
+            // a writer puts keys past every landed one, seals now and then, and the entering runs, beside switches of the counting
+            let late = key(KEYS * 10 + step);
+            store.put(COLUMN, &late, b"late").expect("put");
+            match random.below(12) {
+                0 => store.state.index.stop_counting(COLUMN),
+                1 => store.state.index.start_counting(COLUMN),
+                2 => store.seal_now(),
+                3 | 4 => {
+                    let _entered = store.state.enter_open_rows(&mut reel::index::write_index::EnterRun::new());
+                },
+                _ => {},
+            }
+            let _ = (stop_at, start_at);
+        }
+        drop(scan);
+        let lost: Vec<&Vec<u8>> = whole.iter().map(|(name, _value)| name).filter(|name| !walked.iter().any(|(seen, _value)| seen == *name)).collect();
+        assert!(lost.is_empty(), "seed {seed}: {} of {} keys lost", lost.len(), whole.len());
+        store.close().expect("close");
+    }
 }

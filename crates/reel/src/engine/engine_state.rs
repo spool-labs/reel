@@ -218,6 +218,9 @@ pub struct EngineState<Backend: Io> {
     pub sorted_drops: AtomicU64,
     /// Dropped sorted indexes a refill brought back, since open
     pub sorted_refills: AtomicU64,
+    /// Held by a drop of a sorted index and by the end of its refill with the recount, so a column's counts stop and start in the
+    /// order its index leaves and comes back
+    pub sorted_drop_lock: Mutex<()>,
     /// Time and footer bytes the open's fill of the sorted indexes took
     pub sorted_fill_ns: AtomicU64,
     pub sorted_fill_bytes: AtomicU64,

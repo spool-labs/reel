@@ -2,6 +2,7 @@
 //! what writers need, and starts open segments' bytes for the device so a seal's sync finds little left to send
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use reel_core::units::{ByteCount, FileOffset, Nanoseconds};
 
@@ -13,7 +14,7 @@ use crate::guard::hold;
 use crate::io::job::{Job, JobStep};
 use crate::io::{Io, IoFile, IoTask};
 use crate::pool::touched_filled;
-use crate::pool_room::{GrowPolicy, grow_policy};
+use crate::pool_room::{GrowPolicy, decay_nanos, grow_policy};
 use crate::io::host_memory::HostMemory;
 use crate::segment::segment_tail::SegmentNumber;
 
@@ -161,15 +162,63 @@ impl<Backend: Io> ReserveJob<Backend> {
             let _finished = room.finish_releases();
             let _given = room.release_idle(now);
         }
+        self.hold_to_target(now);
         if !self.state.pool_rooms.iter().any(|room| room.next_step(room.used()).is_some()) {
             return;
         }
-        let mut host_left = host_left(&self.state.io.host_memory());
+        // a step takes no more than the host has left past its margin, and no more than the store's target leaves
+        let target_left = self.state.memory_target.load(Ordering::Acquire).saturating_sub(self.held_bytes());
+        let mut room_left = host_left(&self.state.io.host_memory()).min(target_left);
         for room in &self.state.pool_rooms {
-            let _grew = room.grow_step(&mut host_left);
+            let _grew = room.grow_step(&mut room_left);
+        }
+    }
+
+    /// Read the memory the store holds now: what lies outside its rooms, measured at open, and every room's bytes in memory
+    pub fn held_bytes(&self) -> u64 {
+        let rooms: u64 = self.state.pool_rooms.iter().map(|room| room.committed() as u64).sum();
+        self.state.fixed_heap.load(Ordering::Acquire) + rooms
+    }
+
+    /// Walk the ladder down to the store's memory target when it holds more, and lift the caps once it has held well under the
+    /// target for the decay. Step 0 gives back every paged pool's empty extents at once and caps them there. Step 1 shortens the
+    /// record cache's logs and caps the value pages, which keep what their leaves hold. The summaries never shrink, since their
+    /// rows must stay
+    pub fn hold_to_target(&self, now: u64) {
+        let state = &self.state;
+        let target = state.memory_target.load(Ordering::Acquire);
+        let held = self.held_bytes();
+        if held <= target {
+            let is_well_under = held + target / UNDER_DIVISOR <= target || target >= state.memory_budget.0;
+            let since = state.under_since.load(Ordering::Relaxed);
+            if !is_well_under {
+                state.under_since.store(0, Ordering::Relaxed);
+            } else if since == 0 {
+                state.under_since.store(now.max(1), Ordering::Relaxed);
+            } else if now.saturating_sub(since) >= decay_nanos() {
+                for room in &state.pool_rooms {
+                    room.set_cap(usize::MAX);
+                }
+            }
+            return;
+        }
+        state.under_since.store(0, Ordering::Relaxed);
+        let mut over = (held - target) as usize;
+        for room in state.pool_rooms.iter().filter(|room| room.is_paged()) {
+            if over == 0 {
+                return;
+            }
+            room.set_cap(room.committed().saturating_sub(over).max(room.used() + room.extent()));
+            over = over.saturating_sub(room.release_over_cap());
+        }
+        if over > 0 {
+            let _given = state.record_cache.give_back(over);
         }
     }
 }
+
+/// A store holds well under its target once it holds less than the target by this share of it
+pub const UNDER_DIVISOR: u64 = 16;
 
 impl<Backend: Io> Job for ReserveJob<Backend> {
     fn step(&mut self) -> JobStep {

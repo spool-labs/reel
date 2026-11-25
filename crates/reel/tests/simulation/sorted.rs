@@ -3316,3 +3316,30 @@ fn a_reopen_on_a_host_with_no_room_runs_short() {
     assert_eq!(rows(store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan")), whole);
     store.close().expect("close");
 }
+
+// a target under what the store holds walks the ladder down, every key still reads, and the caps lift once the target is back
+// and the store has held well under it for the decay
+#[test]
+fn a_target_down_and_back_up() {
+    let io = SimulatedIo::new(Seed(41));
+    let store = open(&io, CAPACITY);
+    let model = fill_for_reopen(&store, &io, SHORT_KEYS);
+    let written: Vec<Vec<u8>> = (0..SHORT_KEYS).map(key).collect();
+    check(&store, &model, &written);
+    check(&store, &model, &written);
+    let job = reel::engine::reserve_job::ReserveJob::new(Arc::clone(&store.state));
+    let before = job.held_bytes();
+    // the target goes under what the least budget allows, so the ladder walks every step it has
+    store.state.memory_target.store(before / 2, Ordering::Release);
+    job.hold_to_target(io.now().0);
+    let after = job.held_bytes();
+    assert!(after < before, "the ladder gave nothing back: {before} held before, {after} after");
+    check(&store, &model, &written);
+    store.set_memory_target(BUDGET);
+    let now = io.now().0 + 1;
+    job.hold_to_target(now);
+    job.hold_to_target(now + reel::pool_room::DECAY_NANOS);
+    assert!(store.state.pool_rooms.iter().all(|room| room.cap() == room.reserved()), "a cap stayed down under a raised target");
+    check(&store, &model, &written);
+    store.close().expect("close");
+}

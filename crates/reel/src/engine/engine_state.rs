@@ -225,6 +225,12 @@ pub struct EngineState<Backend: Io> {
     pub arena_fill: AtomicU64,
     pub unlinks_refused: AtomicU64,
     pub memory_budget: ByteCount,
+    /// The memory the store holds itself to now, which set_memory_target moves between the least budget and the budget
+    pub memory_target: AtomicU64,
+    /// The heap the store holds outside its rooms, measured once open has built everything, which the ladder counts beside them
+    pub fixed_heap: AtomicU64,
+    /// Since when the store has held well under its target, or 0, so caps the ladder lowered rise only after the decay
+    pub under_since: AtomicU64,
     pub seal_heap: AtomicU64,
     pub walk_heap: AtomicU64,
     pub worker_priority: Mutex<WorkerPriority>,

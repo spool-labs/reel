@@ -151,7 +151,7 @@ impl CacheShard {
     /// Run the log over every arena byte in memory, until the log first wraps
     fn follow_room(&mut self) {
         if !self.is_wrapped {
-            self.capacity = (self.room.committed().min(self.share) / 8 * 8).max(ENTRY_HEADER_BYTES);
+            self.capacity = (self.room.committed().min(self.share).min(self.room.cap()) / 8 * 8).max(ENTRY_HEADER_BYTES);
         }
     }
 
@@ -170,6 +170,18 @@ impl CacheShard {
     fn arena_mut(&mut self) -> &mut [u8] {
         // SAFETY: as in arena, and the shard's own borrow is unique
         unsafe { std::slice::from_raw_parts_mut(self.room.base(), self.capacity) }
+    }
+
+    /// Drop every value and start the log over within this many bytes, so the room past them can go back
+    fn start_over(&mut self, bytes: usize) {
+        self.slots.fill(CacheEntry::empty());
+        self.used = 0;
+        self.head = 0;
+        self.tail = 0;
+        self.capacity = (bytes.min(self.share) / 8 * 8).max(ENTRY_HEADER_BYTES);
+        // a log started over grows again once its cap rises
+        self.is_wrapped = false;
+        self.room.note_used(0);
     }
 
     /// Read the arena's room, which the growing job raises
@@ -412,6 +424,35 @@ impl RecordCache {
     /// Build a cache whose arenas start at an eighth of their share
     pub fn fresh(bytes: ByteCount, mean_record: Option<u64>) -> Result<Self> {
         Self::growing(bytes, mean_record, false)
+    }
+
+    /// Cap every shard so the cache gives back about this many bytes between them, and shorten them to it. Returns the bytes given
+    /// back
+    pub fn give_back(&self, bytes: usize) -> usize {
+        let cut = bytes.div_ceil(self.shards.len().max(1));
+        for shard in &self.shards {
+            let room = Arc::clone(hold(shard).room());
+            room.set_cap(room.committed().saturating_sub(cut));
+        }
+        self.shorten_to_caps()
+    }
+
+    /// Shorten every shard whose room the ladder capped under its log: the shard drops what it holds, starts its log over within
+    /// the cap, and gives the rest back. Returns the bytes given back
+    pub fn shorten_to_caps(&self) -> usize {
+        let mut given = 0;
+        for shard in &self.shards {
+            let mut held = hold(shard);
+            let cap = held.room.cap();
+            if held.capacity <= cap {
+                continue;
+            }
+            held.start_over(cap);
+            let room = Arc::clone(&held.room);
+            drop(held);
+            given += room.release_above(cap);
+        }
+        given
     }
 
     /// Read every shard's arena room, for the job that grows them

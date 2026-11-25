@@ -232,6 +232,17 @@ impl<Backend: Io> ReelStore<Backend> {
         self.state.memory_report()
     }
 
+    /// Hold the store to less memory than its budget, or let it back up to the budget. The target goes no lower than the least
+    /// budget, and the reserve job walks the ladder down to it: empty extents first, then the record cache's logs and the value
+    /// pages' growth. A target raised again lifts the caps once the store has held well under it for the decay
+    pub fn set_memory_target(&self, target: ByteCount) {
+        let target = target.0.clamp(self.state.sizing.least_budget.0, self.state.memory_budget.0);
+        self.state.memory_target.store(target, Ordering::Release);
+        if let Some(task) = self.state.reserve_task.get() {
+            task.wake();
+        }
+    }
+
     /// Count the segments open kept and couldn't read
     pub fn damaged_segments(&self) -> u64 {
         self.state.damaged_segments.load(Ordering::Acquire)
@@ -984,6 +995,9 @@ pub fn start_jobs<Backend: Io>(state: &Arc<EngineState<Backend>>) -> Result<(), 
     for room in &state.pool_rooms {
         room.set_wake(Arc::clone(&wake));
     }
+    // the heap and stacks outside the rooms barely move after open, so the ladder counts them once beside the rooms it can shrink
+    let report = state.memory_report();
+    state.fixed_heap.store((report.heap_total().0 + report.thread_stacks.0).saturating_sub(report.pool_committed.0), Ordering::Release);
     for cell in &state.read_tasks {
         let worker = ReadWorker {
             state: Arc::clone(state),
@@ -1670,6 +1684,9 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> Result<Engin
         arena_fill: AtomicU64::new(0),
         unlinks_refused: AtomicU64::new(0),
         memory_budget: config.memory_budget,
+        memory_target: AtomicU64::new(config.memory_budget.0),
+        fixed_heap: AtomicU64::new(0),
+        under_since: AtomicU64::new(0),
         seal_heap: AtomicU64::new(0),
         walk_heap: AtomicU64::new(0),
         worker_priority: Mutex::new(WorkerPriority::default()),

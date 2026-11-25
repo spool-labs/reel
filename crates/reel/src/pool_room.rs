@@ -117,7 +117,7 @@ pub const DECAY_NANOS: u64 = 30_000_000_000;
 pub static DECAY_OVERRIDE: AtomicU64 = AtomicU64::new(0);
 
 /// Read the decay in force
-fn decay_nanos() -> u64 {
+pub fn decay_nanos() -> u64 {
     #[cfg(feature = "test-hooks")]
     {
         let set = DECAY_OVERRIDE.load(Ordering::Relaxed);
@@ -174,7 +174,8 @@ pub struct PoolRoom {
     ready: AtomicU64,
     /// Set when the last populate failed, and cleared by the next that works
     has_failed: AtomicBool,
-    /// Set when the host had no room for the next step, and cleared once a step fits
+    /// Set when the host had no room for the next step, and cleared once a step fits. A summary is never short: its rows must stay,
+    /// so its writer grows it inline with no host check, and pools_short can read 0 while the summary is what went over
     is_short: AtomicBool,
     /// The bytes the lead arm keeps ready past use, which the job sets from the fill rate
     lead: AtomicUsize,
@@ -188,6 +189,8 @@ pub struct PoolRoom {
     given_back: AtomicU64,
     /// Held across a grow, so two growers never bring in one extent at once
     growing: Mutex<()>,
+    /// The most the room may grow to now, which the ladder lowers when the store must hold less
+    cap: AtomicUsize,
     /// Bytes the pool uses now, which its owner notes and the job reads
     used: AtomicUsize,
     /// Set once the pool asked for its next extent, until the job brings it in
@@ -228,7 +231,8 @@ impl PoolRoom {
         let huge = if wanted >= HUGE_ROOM_BYTES { HUGE_PAGE_BYTES } else { system_page };
         let unit = huge.max(page.unwrap_or(0));
         // the mapping rounds to whole units, and the room counts and fills only the share, so nothing past the pool's own bytes
-        // comes into memory or into the report
+        // comes into memory or into the report. The last extent of a large room can end inside a huge page, which the kernel may
+        // back whole, so resident can pass the report by under one huge page a room
         let mapped = wanted.next_multiple_of(unit);
         let base = map_aligned(mapped, huge)?;
         advise_huge_pages(base.as_ptr().cast(), mapped, huge == HUGE_PAGE_BYTES);
@@ -267,6 +271,7 @@ impl PoolRoom {
             first_part: AtomicUsize::new(0),
             given_back: AtomicU64::new(0),
             growing: Mutex::new(()),
+            cap: AtomicUsize::new(usize::MAX),
             used: AtomicUsize::new(0),
             has_asked: AtomicBool::new(false),
             wake: OnceLock::new(),
@@ -415,7 +420,7 @@ impl PoolRoom {
 
     /// Check the pool can still grow, so a caller at its limit waits for the next step instead of treating the pool as full
     pub fn can_grow(&self) -> bool {
-        self.committed() < self.reserved && !self.has_failed() && !self.is_short()
+        self.committed() < self.cap() && !self.has_failed() && !self.is_short()
     }
 
     /// Read the bytes the arm keeps ready past use
@@ -430,7 +435,7 @@ impl PoolRoom {
     /// Read where the pool grows next with this many bytes used, under the process's arm, up to the room
     pub fn next_step(&self, used: usize) -> Option<usize> {
         let committed = self.committed();
-        if committed >= self.reserved {
+        if committed >= self.cap() {
             return None;
         }
         let free = committed.saturating_sub(used);
@@ -442,7 +447,7 @@ impl PoolRoom {
                 (free < lead).then_some(used + 2 * lead)
             },
         }?;
-        Some(target.min(self.reserved))
+        Some(target.min(self.cap()))
     }
 
     /// Set the lead arm's lead from the fill since the job last looked: the bytes that fill takes in LEAD_NANOS, and never less
@@ -543,8 +548,24 @@ impl PoolRoom {
         if now.saturating_sub(since) < decay_nanos() {
             return 0;
         }
+        let given = self.release_down_to(pages, want + self.extent);
+        self.over_since.store(0, Ordering::Relaxed);
+        given
+    }
+
+    /// Give back the highest empty extents of a paged pool until it holds no more than its cap, with no decay, and return the bytes
+    /// given back. The ladder lowers a cap when the store must hold less
+    pub fn release_over_cap(&self) -> usize {
+        match &self.pages {
+            Some(pages) => self.release_down_to(pages, self.cap()),
+            None => 0,
+        }
+    }
+
+    /// Take empty extents out, highest first, until the room holds no more than this many bytes or none is empty
+    fn release_down_to(&self, pages: &RoomPages, limit: usize) -> usize {
         let mut given = 0;
-        while self.committed() > want + self.extent {
+        while self.committed() > limit {
             let Some(extent) = self.take_empty_extent(pages) else {
                 break;
             };
@@ -557,8 +578,38 @@ impl PoolRoom {
                 None => given += self.give_back_extent(extent),
             }
         }
-        self.over_since.store(0, Ordering::Relaxed);
         given
+    }
+
+    /// Give back every extent of a room with no pages that starts at or past this byte, once its owner has dropped all it held
+    /// there, and return the bytes given back
+    pub fn release_above(&self, bytes: usize) -> usize {
+        let _growing = hold(&self.growing);
+        let first = bytes.div_ceil(self.extent).max(1);
+        let mut given = 0;
+        for extent in (first..self.extent_count).rev() {
+            if self.ready.load(Ordering::Acquire) & (1 << extent) != 0 {
+                self.ready.fetch_and(!(1 << extent), Ordering::SeqCst);
+                given += self.give_back_extent(extent);
+            }
+        }
+        given
+    }
+
+    /// Check the pool takes and gives its pages through the room
+    pub fn is_paged(&self) -> bool {
+        self.pages.is_some()
+    }
+
+
+    /// Read the most the room may grow to now: its share, or less while the ladder holds it down
+    pub fn cap(&self) -> usize {
+        self.cap.load(Ordering::Acquire).min(self.reserved)
+    }
+
+    /// Set the most the room may grow to, at least one extent, and wake no one: the job applies it on its next step
+    pub fn set_cap(&self, bytes: usize) {
+        self.cap.store(bytes.max(self.extent), Ordering::Release);
     }
 
     /// Give back every extent whose readers have all left since its release took it out of the ready set, and return the bytes

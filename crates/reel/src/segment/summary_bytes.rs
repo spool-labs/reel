@@ -9,7 +9,7 @@ use reel_core::units::ByteCount;
 use crate::pool_room::PoolRoom;
 
 /// How much address space a room for rows takes past its plan, so rows that must stay can go past it as a list could
-pub const ROOM_PAST_PLAN: usize = 2;
+pub const ROOM_PAST_PLAN: usize = 8;
 
 /// A summary's row bytes, with the calls a list of bytes takes
 #[derive(Debug)]

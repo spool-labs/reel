@@ -206,6 +206,8 @@ pub struct SortedKeys {
     sharer: usize,
     /// The rows the column was told to hold, which sized the pool
     told_rows: RowCount,
+    /// The part a drop of held values starts from, which moves each time so the same keys don't always pay
+    next_to_drop: std::sync::atomic::AtomicUsize,
 }
 
 impl PackedKey {
@@ -356,6 +358,7 @@ impl SortedKeys {
             owns_values: false,
             sharer: 0,
             told_rows: rows,
+            next_to_drop: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -434,6 +437,29 @@ impl SortedKeys {
             NO_MARK => None,
             mark => Some(SegmentNumber(mark)),
         }
+    }
+
+    /// Let go of the values the leaves hold, a part at a time from a part that moves each call, until this many value pages are
+    /// free or every part is done, and return the pages freed. Gets and scans of those keys read their records again, and reads
+    /// that hold them back in fill the pages anew
+    pub fn drop_held_values(&self, pages: u32) -> u32 {
+        if self.values.page_count() == 0 {
+            return 0;
+        }
+        let before = self.values.free_pages();
+        let first = self.next_to_drop.fetch_add(1, Memory::Relaxed);
+        for turn in 0..PARTS {
+            if self.values.free_pages().saturating_sub(before) >= pages {
+                break;
+            }
+            let tree = self.write_part((first + turn) % PARTS);
+            let mut leaf = tree.first_leaf;
+            while leaf != NO_PAGE {
+                self.drop_values(leaf);
+                leaf = self.next(leaf);
+            }
+        }
+        self.values.free_pages().saturating_sub(before)
     }
 
     /// Mark the index at a segment whose rows it couldn't take, so reads from that segment on ask the footers until a refill

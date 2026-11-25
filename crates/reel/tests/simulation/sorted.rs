@@ -3385,3 +3385,25 @@ fn max_memory_lets_the_target_rise_past_the_budget() {
     plain.close().expect("close");
     store.close().expect("close");
 }
+
+// a cut the caches can't meet reaches the values the leaves hold: they go, their pages go back, and every key still reads
+#[test]
+fn a_deep_cut_drops_held_values() {
+    SIM_BUDGET.with(|budget| budget.set(HELD_BUDGET));
+    let io = SimulatedIo::new(Seed(45));
+    let store = open(&io, CAPACITY);
+    let model = fill_for_reopen(&store, &io, KEYS);
+    let written: Vec<Vec<u8>> = (0..KEYS).map(key).collect();
+    check(&store, &model, &written);
+    check(&store, &model, &written);
+    let values = &store.state.sorted_index(COLUMN).expect("an index").values;
+    let held = values.held.load(Ordering::Relaxed);
+    assert!(held > 0, "no value was held to drop");
+    let job = reel::engine::reserve_job::ReserveJob::new(Arc::clone(&store.state));
+    store.state.memory_target.store(0, Ordering::Release);
+    job.hold_to_target(io.now().0);
+    assert!(values.held.load(Ordering::Relaxed) < held, "a deep cut left every held value");
+    check(&store, &model, &written);
+    SIM_BUDGET.with(|budget| budget.set(BUDGET));
+    store.close().expect("close");
+}

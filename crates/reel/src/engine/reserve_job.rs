@@ -16,6 +16,7 @@ use crate::io::{Io, IoFile, IoTask};
 use crate::pool::touched_filled;
 use crate::pool_room::{GrowPolicy, decay_nanos, grow_policy};
 use crate::io::host_memory::{HostMemory, PRESSURE_READ_MARK};
+use crate::index::value_pages::VALUE_PAGE_BYTES;
 use reel_core::memory_report::PressureSource;
 use crate::segment::segment_tail::SegmentNumber;
 
@@ -204,10 +205,10 @@ impl<Backend: Io> ReserveJob<Backend> {
             Some(PressureSource::Trigger) => state.is_pressure_fired.swap(false, Ordering::AcqRel),
             Some(PressureSource::Read) => {
                 let is_stalled = state.io.memory_pressure().is_some_and(|stall| stall > PRESSURE_READ_MARK);
-                // the first read only sets the mark, and a later one counts as pressure when the group hit its limits since
-                let hits = state.io.memory_limit_hits().unwrap_or(0);
-                let before = state.limit_hits.swap(hits, Ordering::AcqRel);
-                is_stalled || (before != u64::MAX && hits > before)
+                // the first read only sets the mark, and a later one counts as pressure when reclaim failed in the group since
+                let failures = state.io.memory_reclaim_failures().unwrap_or(0);
+                let before = state.reclaim_failures.swap(failures, Ordering::AcqRel);
+                is_stalled || (before != u64::MAX && failures > before)
             },
             _ => false,
         };
@@ -241,6 +242,22 @@ impl<Backend: Io> ReserveJob<Backend> {
         }
         if over > 0 {
             over = over.saturating_sub(state.record_cache.give_back(over));
+        }
+        // the leaves let go of the values they hold until the value pages free what is still over, and the value room gives the
+        // extents that empties back
+        if over > 0 {
+            let mut wanted = over.div_ceil(VALUE_PAGE_BYTES) as u32;
+            for index in state.sorted.iter().flatten() {
+                if wanted == 0 {
+                    break;
+                }
+                wanted = wanted.saturating_sub(index.drop_held_values(wanted));
+            }
+            if let Some(index) = state.sorted.iter().flatten().next() {
+                let _given = index.values.room().release_spare();
+            }
+            // an extent waiting on its readers is out of the room's count already, so what is still over comes from the count
+            over = self.held_bytes().saturating_sub(target) as usize;
         }
         if over > 0 {
             for room in state.pool_rooms.iter().filter(|room| room.is_paged()) {

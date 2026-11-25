@@ -465,8 +465,8 @@ pub trait Io: Clone + Send + Sync + 'static {
         None
     }
 
-    /// Count the times the store's control group hit its memory.high or memory.max, or nothing where this backend can't tell
-    fn memory_limit_hits(&self) -> Option<u64> {
+    /// Count the times reclaim failed in the store's control group, or nothing where this backend can't tell
+    fn memory_reclaim_failures(&self) -> Option<u64> {
         None
     }
 

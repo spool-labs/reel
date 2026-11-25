@@ -116,8 +116,8 @@ impl Io for HarnessIo {
         self.plain.memory_pressure()
     }
 
-    fn memory_limit_hits(&self) -> Option<u64> {
-        self.plain.memory_limit_hits()
+    fn memory_reclaim_failures(&self) -> Option<u64> {
+        self.plain.memory_reclaim_failures()
     }
 
     fn is_rotational(&self, path: &Path) -> Option<bool> {

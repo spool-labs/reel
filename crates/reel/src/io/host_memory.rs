@@ -177,26 +177,36 @@ fn sysctl_u64(name: &std::ffi::CStr) -> Option<u64> {
     }
 }
 
-/// The mark a trigger asks the kernel for: some task stalled on memory for 150 ms of any one-second window
+/// The mark a trigger asks the kernel for: some task stalled on memory for 300 ms of any two-second window. The window is a
+/// multiple of two seconds, which a store with no CAP_SYS_RESOURCE needs to write a trigger at all
 #[cfg(target_os = "linux")]
-pub const PRESSURE_TRIGGER: &[u8] = b"some 150000 1000000";
+pub const PRESSURE_TRIGGER: &[u8] = b"some 300000 2000000";
 /// The share of the last ten seconds some task stalled on memory past which a read counts as pressure, in hundredths of a percent
 pub const PRESSURE_READ_MARK: u32 = 1_000;
-/// How long the watch waits on the kernel before it looks whether the store closed, in milliseconds
+/// The watch thread's stack: it polls two descriptors and calls the wake, so a small one holds it
 #[cfg(target_os = "linux")]
-pub const PRESSURE_WAIT_MILLIS: libc::c_int = 250;
+pub const PRESSURE_STACK_BYTES: usize = 64 * 1024;
 
 /// A thread that waits on the kernel's pressure events for the store's control group, which stops and joins when it drops
 pub struct PressureWatch {
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The eventfd a drop writes to, which ends the thread's wait at once, or -1 where there is none
+    closing: libc::c_int,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for PressureWatch {
     fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if self.closing >= 0 {
+            let one = 1u64.to_ne_bytes();
+            // SAFETY: the eventfd is open until this drop closes it, and the eight bytes live for the call
+            let _written = unsafe { libc::write(self.closing, one.as_ptr().cast(), one.len()) };
+        }
         if let Some(thread) = self.thread.take() {
             let _joined = thread.join();
+        }
+        if self.closing >= 0 {
+            // SAFETY: the thread that polled the eventfd has ended, so it closes once, here
+            unsafe { libc::close(self.closing) };
         }
     }
 }
@@ -232,22 +242,23 @@ pub fn group_pressure() -> Option<u32> {
     None
 }
 
-/// Count the times the store's control group hit its memory.high or memory.max, which the kernel keeps in memory.events, or nothing
-/// where the group has no such file
+/// Count the times reclaim failed in the store's control group, its oom and oom_kill events, or nothing where the group has no
+/// memory.events. A group that reaches memory.high or memory.max is only reclaiming clean cache, which a capped node does all the
+/// time, so those counts are no pressure
 #[cfg(target_os = "linux")]
-pub fn group_limit_hits() -> Option<u64> {
+pub fn group_reclaim_failures() -> Option<u64> {
     let mut group = [0u8; PATH_BYTES];
     let length = own_group(&mut group)?;
     let mut path = [0u8; PATH_BYTES];
     let mut buffer = [0u8; READ_BYTES];
     let read = read_small(group_file(&group[..length], b"memory.events", &mut path)?, &mut buffer)?;
     let events = &buffer[..read];
-    Some(field_number(events, b"high ").unwrap_or(0) + field_number(events, b"max ").unwrap_or(0))
+    Some(field_number(events, b"oom ").unwrap_or(0) + field_number(events, b"oom_kill ").unwrap_or(0))
 }
 
 /// Count no hits where the kernel keeps none
 #[cfg(not(target_os = "linux"))]
-pub fn group_limit_hits() -> Option<u64> {
+pub fn group_reclaim_failures() -> Option<u64> {
     None
 }
 
@@ -283,27 +294,46 @@ pub fn watch_pressure(wake: std::sync::Arc<dyn Fn() + Send + Sync>) -> Option<Pr
         unsafe { libc::close(descriptor) };
         return None;
     }
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stopped = std::sync::Arc::clone(&stop);
+    // SAFETY: eventfd takes two numbers and makes a descriptor of its own
+    let closing = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+    if closing < 0 {
+        // SAFETY: the descriptor is open and closes once
+        unsafe { libc::close(descriptor) };
+        return None;
+    }
     let thread = std::thread::Builder::new()
         .name("reel-pressure".to_string())
+        .stack_size(PRESSURE_STACK_BYTES)
         .spawn(move || {
-            while !stopped.load(std::sync::atomic::Ordering::Acquire) {
-                let mut wait = libc::pollfd { fd: descriptor, events: libc::POLLPRI, revents: 0 };
-                // SAFETY: the descriptor is open while the thread runs, and the poll entry lives for the call
-                let ready = unsafe { libc::poll(&mut wait, 1, PRESSURE_WAIT_MILLIS) };
-                if ready > 0 && wait.revents & libc::POLLERR != 0 {
+            loop {
+                let mut waits = [
+                    libc::pollfd { fd: descriptor, events: libc::POLLPRI, revents: 0 },
+                    libc::pollfd { fd: closing, events: libc::POLLIN, revents: 0 },
+                ];
+                // SAFETY: both descriptors stay open while the thread runs, and the entries live for the call
+                let ready = unsafe { libc::poll(waits.as_mut_ptr(), 2, -1) };
+                if ready < 0 {
+                    continue;
+                }
+                if waits[1].revents != 0 || waits[0].revents & libc::POLLERR != 0 {
                     break;
                 }
-                if ready > 0 && wait.revents & libc::POLLPRI != 0 {
+                if waits[0].revents & libc::POLLPRI != 0 {
                     wake();
                 }
             }
-            // SAFETY: the descriptor is open and closes once, here
+            // SAFETY: the trigger's descriptor is open and closes once, here
             unsafe { libc::close(descriptor) };
-        })
-        .ok()?;
-    Some(PressureWatch { stop, thread: Some(thread) })
+        });
+    let Ok(thread) = thread else {
+        // SAFETY: both descriptors are open, no thread holds them, and each closes once
+        unsafe {
+            libc::close(descriptor);
+            libc::close(closing);
+        }
+        return None;
+    };
+    Some(PressureWatch { closing, thread: Some(thread) })
 }
 
 /// Start no watch where the kernel offers no trigger

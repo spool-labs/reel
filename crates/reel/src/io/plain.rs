@@ -21,7 +21,7 @@ use reel_core::maintenance_report::WorkerPriority;
 use reel_core::units::{ByteCount, FileOffset, Nanoseconds, ProcessId};
 
 use crate::io::wake_line::WakeLine;
-use crate::io::host_memory::{HostMemory, PressureWatch, group_limit_hits, group_pressure, read_host_memory, watch_pressure};
+use crate::io::host_memory::{HostMemory, PressureWatch, group_reclaim_failures, group_pressure, read_host_memory, watch_pressure};
 use crate::guard::hold;
 use crate::io::{DiskSize, Io, IoFile};
 use crate::io::job::Job;
@@ -215,8 +215,8 @@ impl Io for PlainIo {
         group_pressure()
     }
 
-    fn memory_limit_hits(&self) -> Option<u64> {
-        group_limit_hits()
+    fn memory_reclaim_failures(&self) -> Option<u64> {
+        group_reclaim_failures()
     }
 
     fn free_space(&self, path: &Path) -> Result<ByteCount> {

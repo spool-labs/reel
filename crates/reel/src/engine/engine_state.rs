@@ -246,8 +246,8 @@ pub struct EngineState<Backend: Io> {
     /// Set by a trigger event, and taken by the next ladder step
     pub is_pressure_fired: AtomicBool,
     pub pressure_events: AtomicU64,
-    /// The control group's memory.high and memory.max hits at the last ladder step, so a step that sees them grow counts as pressure
-    pub limit_hits: AtomicU64,
+    /// The control group's oom and oom_kill events at the last ladder step, so a step that sees them grow counts as pressure
+    pub reclaim_failures: AtomicU64,
     pub seal_heap: AtomicU64,
     pub walk_heap: AtomicU64,
     pub worker_priority: Mutex<WorkerPriority>,

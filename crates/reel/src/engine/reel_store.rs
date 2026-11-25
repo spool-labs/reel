@@ -1031,7 +1031,7 @@ pub fn start_jobs<Backend: Io>(state: &Arc<EngineState<Backend>>) -> Result<(), 
             *hold(&state.pressure_watch) = Some(watch);
             PressureSource::Trigger
         },
-        None if state.io.memory_pressure().is_some() || state.io.memory_limit_hits().is_some() => PressureSource::Read,
+        None if state.io.memory_pressure().is_some() => PressureSource::Read,
         None => PressureSource::Host,
     };
     let _set = state.pressure_source.set(source);
@@ -1744,7 +1744,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> Result<Engin
         pressure_watch: Mutex::new(None),
         is_pressure_fired: AtomicBool::new(false),
         pressure_events: AtomicU64::new(0),
-        limit_hits: AtomicU64::new(u64::MAX),
+        reclaim_failures: AtomicU64::new(u64::MAX),
         seal_heap: AtomicU64::new(0),
         walk_heap: AtomicU64::new(0),
         worker_priority: Mutex::new(WorkerPriority::default()),

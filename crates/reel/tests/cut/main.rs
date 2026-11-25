@@ -39,6 +39,7 @@ fn config(root: &Path) -> StoreConfig {
     };
     StoreConfig {
         memory_budget: BUDGET,
+        max_memory: None,
         threads: Default::default(),
         volumes: vec![volume("first"), volume("second")],
         columns: vec![column(FIRST, "first", 0), column(SECOND, "second", 1)],

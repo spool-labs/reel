@@ -46,6 +46,7 @@ type Store = ReelStore<SimulatedIo>;
 fn open(io: &SimulatedIo) -> Store {
     let config = StoreConfig {
         memory_budget: BUDGET,
+        max_memory: None,
         threads: shape::threads(),
         volumes: vec![VolumeConfig {
             name: "compact".to_string(),
@@ -1289,6 +1290,7 @@ const QUIET_ROUNDS: usize = 40;
 fn open_crowd_config() -> StoreConfig {
     StoreConfig {
         memory_budget: CROWD_BUDGET,
+        max_memory: None,
         threads: reel::config::ThreadCounts { maintenance_workers: Some(CROWD_WORKERS), ..reel::config::NO_WORKERS },
         volumes: vec![VolumeConfig {
             name: "crowd".to_string(),
@@ -1447,6 +1449,7 @@ fn a_merge_counts_once_mid_copy_and_by_its_outputs_after() {
     let io = SimulatedIo::new(Seed(76));
     let config = StoreConfig {
         memory_budget: SPLIT_BUDGET,
+        max_memory: None,
         threads: reel::config::ThreadCounts { maintenance_workers: Some(SPLIT_WORKERS), ..reel::config::NO_WORKERS },
         ..open_crowd_config()
     };

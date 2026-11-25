@@ -157,7 +157,7 @@ fn small_mean_keeps_the_plan() {
 // a fresh cache fills its first part, takes nothing in past it until the room grows, and then holds more, every value intact
 #[test]
 fn fresh_cache_grows_with_its_room() {
-    let cache = RecordCache::fresh(CACHE_BYTES, None).expect("build cache");
+    let cache = RecordCache::fresh(CACHE_BYTES, None, CACHE_BYTES).expect("build cache");
     let fill = |cache: &RecordCache, from: u64| {
         for offset in from..from + VALUES {
             read_twice(cache, offset, &value(offset, 200));

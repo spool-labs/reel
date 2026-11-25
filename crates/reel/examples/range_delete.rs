@@ -34,6 +34,7 @@ fn main() {
     fs::create_dir_all(&root).expect("create");
     let config = StoreConfig {
         memory_budget: budget,
+        max_memory: None,
         threads: Default::default(),
         volumes: vec![VolumeConfig {
             name: "range".to_string(),

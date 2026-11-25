@@ -318,20 +318,23 @@ impl KeyBatch {
 impl SortedKeys {
     /// Build an index with room for these rows of keys this wide, all of it in memory
     pub fn new(width: usize, rows: RowCount) -> std::io::Result<Self> {
-        Self::growing(width, rows, rows)
+        Self::growing(width, rows, rows, rows)
     }
 
     /// Build an index with room for these rows of keys this wide, with the pages for its first rows in memory: twice the rows it
-    /// starts with, and at least an eighth of its room. The rest comes in as the reserve job grows it
-    pub fn growing(width: usize, rows: RowCount, first_rows: RowCount) -> std::io::Result<Self> {
+    /// starts with, and at least what its arm keeps ready. The rest comes in as the reserve job grows it, up to the pages for
+    /// `most_rows`
+    pub fn growing(width: usize, rows: RowCount, first_rows: RowCount, most_rows: RowCount) -> std::io::Result<Self> {
         assert!((1..=MOST_KEY_BYTES).contains(&width), "a sorted index holds keys of 1 to {MOST_KEY_BYTES} bytes");
         let key_words = width.div_ceil(size_of::<u32>());
         let leaf_stride = key_words + ENTRY_TAIL_WORDS;
         let inner_stride = key_words + 1;
         let leaf_capacity = (PAGE_WORDS - HEAD_WORDS) / leaf_stride;
         let inner_capacity = (PAGE_WORDS - HEAD_WORDS) / inner_stride;
-        let pages = planned_pages(width, rows);
-        let first = if first_rows >= rows { pages } else { planned_pages(width, RowCount(first_rows.0.saturating_mul(2))).min(pages) };
+        // the room may grow past the rows the budget sized it for, to what max_memory allows
+        let budget_pages = planned_pages(width, rows);
+        let pages = planned_pages(width, most_rows.max(rows));
+        let first = if first_rows >= rows { budget_pages } else { planned_pages(width, RowCount(first_rows.0.saturating_mul(2))).min(budget_pages) };
         let bytes = |count: u32| ByteCount(u64::from(count) * PAGE_BYTES as u64);
         let room = PoolRoom::reserve_paged(bytes(pages), bytes(first), PAGE_BYTES)?;
         Ok(Self {

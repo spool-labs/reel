@@ -12,6 +12,7 @@
 //!
 //! let config = StoreConfig {
 //!     memory_budget: ByteCount(256 * 1024 * 1024),
+//!     max_memory: None,
 //!     threads: ThreadCounts::default(),
 //!     volumes: vec![VolumeConfig::new("data", vec!["/var/lib/reel".into()], SyncPolicy::Never)],
 //!     columns: vec![ColumnConfig::new(ColumnId(1), "accounts", KeyShape::Fixed { width: 32 })],

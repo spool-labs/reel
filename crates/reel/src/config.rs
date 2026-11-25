@@ -217,6 +217,9 @@ pub struct StoreConfig {
     /// The heap the store holds. Under 1 GiB it holds fewer live scans, read slots and buffers, down to 4 scans, so a caller
     /// that scans from several threads on a small budget bounds its own scans
     pub memory_budget: ByteCount,
+    /// The most the store may hold once a target is raised past the budget with no restart. Open reserves address space for its
+    /// growing pools up to it, and every table stays sized from the budget. None is the budget
+    pub max_memory: Option<ByteCount>,
     pub threads: ThreadCounts,
     pub volumes: Vec<VolumeConfig>,
     pub columns: Vec<ColumnConfig>,

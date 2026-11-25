@@ -86,6 +86,7 @@ struct Staged<'state> {
 fn config(budget: ByteCount) -> StoreConfig {
     StoreConfig {
         memory_budget: budget,
+        max_memory: None,
         threads: reel::config::NO_WORKERS,
         volumes: vec![VolumeConfig {
             name: "meta".to_string(),

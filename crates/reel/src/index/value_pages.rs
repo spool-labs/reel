@@ -90,12 +90,12 @@ impl ValuePages {
 
     /// Build a pool of this many pages for indexes that share it, each with the floor it is sized for, all of it in memory
     pub fn shared(pages: u32, floors: &[u32]) -> Result<Self> {
-        Self::growing(pages, floors, pages)
+        Self::growing(pages, floors, pages, pages)
     }
 
     /// Build a shared pool with its first pages in memory, which grows into the rest on the reserve job
-    pub fn growing(pages: u32, floors: &[u32], first: u32) -> Result<Self> {
-        let pages = pages.min(u32::MAX - 1);
+    pub fn growing(pages: u32, floors: &[u32], first: u32, most_pages: u32) -> Result<Self> {
+        let pages = pages.max(most_pages).min(u32::MAX - 1);
         let bytes = |count: u32| ByteCount(u64::from(count) * VALUE_PAGE_BYTES as u64);
         let room = PoolRoom::reserve_paged(bytes(pages), bytes(first.min(pages)), VALUE_PAGE_BYTES)?.read_unlocked();
         Ok(Self {

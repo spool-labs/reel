@@ -253,7 +253,7 @@ fn number_and_version(value: &[u8]) -> (u64, u64) {
 fn model_store(root: &std::path::Path, index: ColumnIndex) -> Store {
     let volume = VolumeConfig { segment_bytes: Some(SMALL_SEGMENT), ..VolumeConfig::new("model", vec![root.to_path_buf()], SyncPolicy::Never) };
     let column = ColumnConfig { index, least_rows: Some(RowCount(2 * KEY_SPACE)), ..ColumnConfig::new(MODEL_COLUMN, "model", KeyShape::Fixed { width: FIXED_WIDTH }) };
-    let config = StoreConfig { memory_budget: MODEL_BUDGET, threads: ThreadCounts::default(), volumes: vec![volume], columns: vec![column] };
+    let config = StoreConfig { memory_budget: MODEL_BUDGET, max_memory: None, threads: ThreadCounts::default(), volumes: vec![volume], columns: vec![column] };
     ReelStore::open(PlainIo::new(), &config).expect("open")
 }
 

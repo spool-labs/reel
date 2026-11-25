@@ -32,6 +32,7 @@ const WIDE_VALUE_BYTES: usize = 2 * MERGE_BUFFER_BYTES + 1;
 fn config() -> StoreConfig {
     StoreConfig {
         memory_budget: BUDGET,
+        max_memory: None,
         threads: reel::config::NO_WORKERS,
         volumes: vec![VolumeConfig {
             name: "bounds".to_string(),

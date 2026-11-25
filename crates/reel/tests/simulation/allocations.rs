@@ -82,6 +82,7 @@ fn config_at(budget: ByteCount) -> StoreConfig {
     };
     StoreConfig {
         memory_budget: budget,
+        max_memory: None,
         threads: reel::config::NO_WORKERS,
         volumes: vec![VolumeConfig {
             name: "allocations".to_string(),

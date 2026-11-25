@@ -21,6 +21,7 @@ const BATCH_ROWS: u64 = 8_192;
 fn config() -> StoreConfig {
     StoreConfig {
         memory_budget: BUDGET,
+        max_memory: None,
         threads: reel::config::NO_WORKERS,
         volumes: vec![VolumeConfig::new("wide", vec![PathBuf::from("/disk/wide")], SyncPolicy::Never)],
         columns: vec![ColumnConfig {

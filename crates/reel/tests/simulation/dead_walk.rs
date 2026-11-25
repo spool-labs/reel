@@ -64,6 +64,7 @@ type Store = ReelStore<SimulatedIo>;
 fn config(budget: ByteCount) -> StoreConfig {
     StoreConfig {
         memory_budget: budget,
+        max_memory: None,
         threads: shape::threads(),
         volumes: vec![VolumeConfig {
             name: "walk".to_string(),

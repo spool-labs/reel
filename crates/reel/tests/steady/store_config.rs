@@ -31,6 +31,7 @@ pub fn config(root: &Path, budget: ByteCount) -> StoreConfig {
     let table_rows = (budget.0 >= TABLE_BUDGET.0).then_some(TABLE_ROWS);
     StoreConfig {
         memory_budget: budget,
+        max_memory: None,
         threads: Default::default(),
         volumes: vec![VolumeConfig {
             name: "steady".to_string(),

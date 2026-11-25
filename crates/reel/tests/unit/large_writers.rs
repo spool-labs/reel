@@ -19,6 +19,7 @@ const KEYS: u64 = 192;
 fn config(root: &Path, codec: Codec) -> StoreConfig {
     StoreConfig {
         memory_budget: BUDGET,
+        max_memory: None,
         threads: ThreadCounts::default(),
         volumes: vec![VolumeConfig {
             open_segments: Some(1),

@@ -225,6 +225,8 @@ pub struct EngineState<Backend: Io> {
     pub arena_fill: AtomicU64,
     pub unlinks_refused: AtomicU64,
     pub memory_budget: ByteCount,
+    /// The most a raised target may reach, max_memory or the budget
+    pub max_memory: ByteCount,
     /// The memory the store holds itself to now, which set_memory_target moves between the least budget and the budget
     pub memory_target: AtomicU64,
     /// The heap the store holds outside its rooms, measured once open has built everything, which the ladder counts beside them

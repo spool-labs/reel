@@ -232,12 +232,12 @@ impl<Backend: Io> ReelStore<Backend> {
         self.state.memory_report()
     }
 
-    /// Hold the store to less memory than its budget, or let it back up to the budget. The target goes no lower than the least
-    /// budget, and the reserve job walks the ladder down to it: empty extents first, then whole record cache shards, then the index
-    /// pools held where they are. A target raised again lifts the caps once the store has held well under it for the decay. Returns
-    /// the target in force, the least budget for one asked under it
+    /// Hold the store to less memory than its budget, or let it up to max_memory with no restart. The target goes no lower than
+    /// the least budget, and the reserve job walks the ladder down to it: empty extents first, then whole record cache shards, then
+    /// the index pools held where they are. A target raised again lifts the caps once the store has held well under it for the
+    /// decay. Returns the target in force, clamped to the least budget and max_memory
     pub fn set_memory_target(&self, target: ByteCount) -> ByteCount {
-        let target = target.0.clamp(self.state.sizing.least_budget.0, self.state.memory_budget.0);
+        let target = target.0.clamp(self.state.sizing.least_budget.0, self.state.max_memory.0);
         self.state.memory_target.store(target, Ordering::Release);
         if let Some(task) = self.state.reserve_task.get() {
             task.wake();
@@ -1152,7 +1152,18 @@ pub fn sizing_of(config: &StoreConfig, shape: StoreShape) -> Result<EngineSizing
 }
 
 /// Refuse a config that can't work
+/// Scale a part the budget sized up to what max_memory allows, for the pools that grow into it. A store with no max_memory keeps
+/// the part as it is
+pub fn past_budget(config: &StoreConfig, bytes: u64) -> u64 {
+    let most = config.max_memory.unwrap_or(config.memory_budget).max(config.memory_budget);
+    (u128::from(bytes) * u128::from(most.0) / u128::from(config.memory_budget.0.max(1))).min(u128::from(u64::MAX)) as u64
+}
+
+
 pub fn check_config(config: &StoreConfig) -> Result<(), StoreError> {
+    if config.max_memory.is_some_and(|most| most < config.memory_budget) {
+        return Err(StoreError::Io { action: "checking the memory settings", source: Error::other("max_memory is under the budget") });
+    }
     for volume in &config.volumes {
         if let Some(asked) = volume.segment_bytes.filter(|asked| *asked < LEAST_SEGMENT_BYTES || *asked > MOST_SET_SEGMENT_BYTES) {
             return Err(StoreError::SegmentSize { asked, least: LEAST_SEGMENT_BYTES, most: MOST_SET_SEGMENT_BYTES });
@@ -1572,7 +1583,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> Result<Engin
     let first_pages = if sizing.is_read_only { sizing.shard.pages } else { shard_for_rows(open_rows.0.saturating_mul(2), sizing.shard.open_slots).pages.min(sizing.shard.pages) };
     let index = WriteIndex::new(&sizing.shard, first_pages)?;
     // a reader runs no reserve job, so its cache starts whole too
-    let record_cache = if sizing.is_read_only { RecordCache::new(record_share, cache_mean)? } else { RecordCache::fresh(record_share, cache_mean)? };
+    let record_cache = if sizing.is_read_only { RecordCache::new(record_share, cache_mean)? } else { RecordCache::fresh(record_share, cache_mean, ByteCount(past_budget(config, record_share.0)))? };
     // the write index first, then each volume's summary and the buffer its saves copy it through
     let mut pool_rooms = index.rooms();
     for volume in &volumes {
@@ -1686,6 +1697,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> Result<Engin
         arena_fill: AtomicU64::new(0),
         unlinks_refused: AtomicU64::new(0),
         memory_budget: config.memory_budget,
+        max_memory: config.max_memory.unwrap_or(config.memory_budget).max(config.memory_budget),
         memory_target: AtomicU64::new(config.memory_budget.0),
         fixed_heap: AtomicU64::new(0),
         under_since: AtomicU64::new(0),
@@ -2085,11 +2097,13 @@ pub fn sorted_indexes(config: &StoreConfig, sizes: &[Option<SortedSize>], is_rea
         .collect();
     // the pool fills as reads hold values, so it starts at an eighth of its pages, and a reader runs no reserve job and starts whole
     let first = if is_read_only { pages } else { 0 };
-    let pool = Arc::new(ValuePages::growing(pages, &floors, first)?);
+    let most = if is_read_only { pages } else { past_budget(config, u64::from(pages)).min(u64::from(u32::MAX - 1)) as u32 };
+    let pool = Arc::new(ValuePages::growing(pages, &floors, first, most)?);
     for (sharer, (column, size)) in sized.into_iter().enumerate() {
         // a reader runs no reserve job, so its index starts whole
         let first_rows = if is_read_only { size.rows } else { size.disk_rows };
-        let index = SortedKeys::growing(column.key_shape.widest(), size.rows, first_rows)?.holding_values(Arc::clone(&pool), (sharer, sharer == 0));
+        let most_rows = if is_read_only { size.rows } else { RowCount(past_budget(config, size.rows.0)) };
+        let index = SortedKeys::growing(column.key_shape.widest(), size.rows, first_rows, most_rows)?.holding_values(Arc::clone(&pool), (sharer, sharer == 0));
         indexes[column.id.0 as usize] = Some(index);
     }
     Ok(indexes)

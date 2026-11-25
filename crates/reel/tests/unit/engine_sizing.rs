@@ -286,6 +286,7 @@ fn box_churn_fits_the_table() {
     };
     let config = StoreConfig {
         memory_budget: FULL_BUDGET,
+        max_memory: None,
         threads: ThreadCounts { maintenance_workers: Some(2), ..NO_WORKERS },
         volumes: vec![VolumeConfig { name: "smoke".to_string(), roots: vec![PathBuf::from("/box")], sync: SyncPolicy::Never, device: DeviceClass::default(), open_segments: None, segment_bytes: None, lifetime_groups: None }],
         columns: vec![column(1, "meta", Codec::None), column(2, "bulk", Codec::Lz4)],
@@ -422,6 +423,7 @@ fn the_cap_is_shared_by_the_asks() {
 fn sorted_config(budget: u64, columns: u8) -> StoreConfig {
     StoreConfig {
         memory_budget: ByteCount(budget),
+        max_memory: None,
         threads: NO_WORKERS,
         volumes: vec![VolumeConfig::new("volume", vec![PathBuf::from("/disk/sized")], SyncPolicy::Never)],
         columns: (1..=columns)
@@ -500,6 +502,7 @@ fn large_stores_keep_their_sizes() {
     for (budget, workers) in [8, 32].into_iter().flat_map(|workers| [2 * GIB, 4 * GIB, 8 * GIB].map(|budget| (budget, workers))) {
         let config = StoreConfig {
             memory_budget: ByteCount(budget),
+            max_memory: None,
             threads: ThreadCounts { maintenance_workers: Some(workers), ..ThreadCounts::default() },
             volumes: vec![VolumeConfig::new("kv", vec![PathBuf::from("/nonexistent/large")], SyncPolicy::Never)],
             columns: vec![ColumnConfig {
@@ -573,6 +576,7 @@ fn the_headroom_is_shared_by_the_indexes() {
     for mib in [512, 2048, 8192] {
         let config = StoreConfig {
             memory_budget: ByteCount(mib * MIB),
+            max_memory: None,
             threads: ThreadCounts { maintenance_workers: Some(8), ..ThreadCounts::default() },
             volumes: vec![VolumeConfig::new("kv", vec![PathBuf::from("/nonexistent/headroom")], SyncPolicy::Never)],
             columns: vec![ColumnConfig {
@@ -610,6 +614,7 @@ fn a_large_reader_keeps_its_sizes() {
     use reel::engine::reel_store::{read_only_sizing, store_shape};
     let config = StoreConfig {
         memory_budget: ByteCount(2 * 1024 * 1024 * 1024),
+        max_memory: None,
         threads: ThreadCounts { maintenance_workers: Some(8), ..ThreadCounts::default() },
         volumes: vec![VolumeConfig::new("kv", vec![PathBuf::from("/nonexistent/reader")], SyncPolicy::Never)],
         columns: vec![ColumnConfig {

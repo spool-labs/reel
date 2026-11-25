@@ -58,6 +58,7 @@ fn open_at(io: &SimulatedIo, budget: ByteCount) -> Store {
 fn open_with(io: &SimulatedIo, budget: ByteCount, threads: ThreadCounts) -> Store {
     let config = StoreConfig {
         memory_budget: budget,
+        max_memory: None,
         threads,
         volumes: vec![VolumeConfig {
             name: "reports".to_string(),
@@ -664,6 +665,7 @@ fn open_mixed(io: &SimulatedIo) -> Store {
     };
     let config = StoreConfig {
         memory_budget: BUDGET,
+        max_memory: None,
         threads: reel::config::NO_WORKERS,
         volumes: vec![VolumeConfig { name: "mixed".to_string(), roots: vec![PathBuf::from(ROOT)], sync: SyncPolicy::Never, device: Default::default(), open_segments: None, segment_bytes: None, lifetime_groups: None }],
         columns: vec![column(COLUMN), column(WIDE_COLUMN)],

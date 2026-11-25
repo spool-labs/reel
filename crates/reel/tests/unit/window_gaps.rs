@@ -27,6 +27,7 @@ fn single_puts_racing_seals_leave_no_gap() {
     fs::create_dir_all(&root).expect("root");
     let config = StoreConfig {
         memory_budget: ByteCount(512 * 1024 * 1024),
+        max_memory: None,
         threads: ThreadCounts::default(),
         volumes: vec![VolumeConfig {
             open_segments: Some(2),

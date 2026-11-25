@@ -32,6 +32,7 @@ fn counts_beside_seals_stay_in_bounds() {
     fs::create_dir_all(&root).expect("root");
     let config = StoreConfig {
         memory_budget: ByteCount(512 * 1024 * 1024),
+        max_memory: None,
         threads: ThreadCounts::default(),
         volumes: vec![VolumeConfig {
             open_segments: Some(2),
@@ -93,6 +94,7 @@ fn race_store(name: &str) -> (ReelStore<PlainIo>, std::path::PathBuf) {
     fs::create_dir_all(&root).expect("root");
     let config = StoreConfig {
         memory_budget: ByteCount(512 * 1024 * 1024),
+        max_memory: None,
         threads: ThreadCounts::default(),
         volumes: vec![VolumeConfig {
             open_segments: Some(2),
@@ -177,6 +179,7 @@ fn cue_counts_beside_deleting_seals_match_their_walks() {
     fs::create_dir_all(&root).expect("root");
     let config = StoreConfig {
         memory_budget: ByteCount(512 * 1024 * 1024),
+        max_memory: None,
         threads: ThreadCounts::default(),
         volumes: vec![VolumeConfig {
             open_segments: Some(2),

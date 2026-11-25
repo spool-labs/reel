@@ -21,6 +21,7 @@ fn scratch_root() -> PathBuf {
 fn config(root: PathBuf) -> StoreConfig {
     StoreConfig {
         memory_budget: BUDGET,
+        max_memory: None,
         threads: ThreadCounts::default(),
         volumes: vec![VolumeConfig { name: "volume".to_string(), roots: vec![root], sync: SyncPolicy::Never, device: DeviceClass::Detect, open_segments: None, segment_bytes: None, lifetime_groups: None }],
         columns: vec![ColumnConfig {

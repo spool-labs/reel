@@ -36,6 +36,7 @@ type Store = ReelStore<SimulatedIo>;
 fn config() -> StoreConfig {
     StoreConfig {
         memory_budget: BUDGET,
+        max_memory: None,
         threads: reel::config::NO_WORKERS,
         volumes: vec![VolumeConfig {
             name: "read-only".to_string(),

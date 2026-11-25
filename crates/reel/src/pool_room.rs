@@ -596,6 +596,12 @@ impl PoolRoom {
         given
     }
 
+    /// Check the pool has readers that take no lock of it, the value pages, which are a cache of their own
+    pub fn has_unlocked_readers(&self) -> bool {
+        self.read_slots.is_some()
+    }
+
+
     /// Check the pool takes and gives its pages through the room
     pub fn is_paged(&self) -> bool {
         self.pages.is_some()

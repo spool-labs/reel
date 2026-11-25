@@ -87,6 +87,7 @@ fn config() -> StoreConfig {
     };
     StoreConfig {
         memory_budget: BUDGET,
+        max_memory: None,
         threads: reel::config::NO_WORKERS,
         volumes: vec![volume("meta", ROOT), volume("bulk", SECOND_ROOT)],
         columns: vec![

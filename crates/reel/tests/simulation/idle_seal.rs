@@ -25,6 +25,7 @@ type Store = ReelStore<SimulatedIo>;
 fn open(io: &SimulatedIo) -> Store {
     let config = StoreConfig {
         memory_budget: BUDGET,
+        max_memory: None,
         threads: reel::config::NO_WORKERS,
         volumes: vec![VolumeConfig {
             name: "idle".to_string(),

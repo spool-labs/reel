@@ -42,6 +42,7 @@ fn config(threads: ThreadCounts) -> StoreConfig {
 fn config_on(threads: ThreadCounts, device: DeviceClass) -> StoreConfig {
     StoreConfig {
         memory_budget: BUDGET,
+        max_memory: None,
         threads,
         volumes: vec![VolumeConfig {
             name: "threads".to_string(),
@@ -288,6 +289,7 @@ fn two_volumes(threads: ThreadCounts) -> StoreConfig {
     };
     StoreConfig {
         memory_budget: TWO_VOLUME_BUDGET,
+        max_memory: None,
         threads,
         volumes: vec![volume("a"), volume("b")],
         columns: vec![column(1, 0), column(2, 1)],

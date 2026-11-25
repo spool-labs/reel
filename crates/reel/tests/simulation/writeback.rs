@@ -32,6 +32,7 @@ fn open(io: &SimulatedIo) -> Store {
 fn open_with(io: &SimulatedIo, sync: SyncPolicy) -> Store {
     let config = StoreConfig {
         memory_budget: BUDGET,
+        max_memory: None,
         threads: reel::config::NO_WORKERS,
         volumes: vec![VolumeConfig {
             name: "writeback".to_string(),

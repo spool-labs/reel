@@ -25,6 +25,7 @@ fn every_width_and_budget_opens_within_its_list() {
                     fs::create_dir_all(&root).expect("root");
                     let config = StoreConfig {
                         memory_budget: ByteCount(budget),
+                        max_memory: None,
                         threads: ThreadCounts::default(),
                         volumes: vec![VolumeConfig { segment_bytes: segment, ..VolumeConfig::new("rows", vec![root.clone()], SyncPolicy::Never) }],
                         columns: vec![ColumnConfig { codec, index: ColumnIndex::Plain, ..ColumnConfig::new(ColumnId(1), "rows", shape) }],

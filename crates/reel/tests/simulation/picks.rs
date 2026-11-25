@@ -51,6 +51,7 @@ const PLANNER_LANE: usize = 0;
 fn config(workers: usize) -> StoreConfig {
     StoreConfig {
         memory_budget: ByteCount(1 << 30),
+        max_memory: None,
         threads: ThreadCounts { maintenance_workers: Some(workers), ..ThreadCounts::default() },
         volumes: vec![VolumeConfig {
             name: "picks".to_string(),

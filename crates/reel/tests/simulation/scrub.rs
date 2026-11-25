@@ -47,6 +47,7 @@ type Store = ReelStore<SimulatedIo>;
 fn open(io: &SimulatedIo, scrub_bytes_per_second: u64) -> Store {
     let config = StoreConfig {
         memory_budget: BUDGET,
+        max_memory: None,
         threads: ThreadCounts { scrub_bytes_per_second, ..NO_WORKERS },
         volumes: vec![VolumeConfig {
             name: "scrub".to_string(),
@@ -263,6 +264,7 @@ fn sorted_key(number: u64) -> Vec<u8> {
 fn sorted_config() -> StoreConfig {
     StoreConfig {
         memory_budget: FULL_BUDGET_BYTES,
+        max_memory: None,
         threads: NO_WORKERS,
         volumes: vec![VolumeConfig {
             name: "scrub".to_string(),
@@ -363,6 +365,7 @@ fn a_scanned_value_stops_answering_once_damage_is_marked() {
     let io = SimulatedIo::new(Seed(8));
     let mut config = StoreConfig {
         memory_budget: FULL_BUDGET_BYTES,
+        max_memory: None,
         threads: NO_WORKERS,
         volumes: vec![VolumeConfig {
             name: "scrub".to_string(),
@@ -457,6 +460,7 @@ fn an_older_store_is_refused() {
     }
     let config = StoreConfig {
         memory_budget: BUDGET,
+        max_memory: None,
         threads: ThreadCounts { scrub_bytes_per_second: 0, ..NO_WORKERS },
         volumes: vec![VolumeConfig {
             name: "scrub".to_string(),
@@ -512,6 +516,7 @@ fn a_flipped_compressed_payload_is_caught_under_trust() {
     let io = SimulatedIo::new(Seed(12));
     let config = StoreConfig {
         memory_budget: FULL_BUDGET_BYTES,
+        max_memory: None,
         threads: ThreadCounts { scrub_bytes_per_second: 0, ..NO_WORKERS },
         volumes: vec![VolumeConfig {
             name: "scrub".to_string(),

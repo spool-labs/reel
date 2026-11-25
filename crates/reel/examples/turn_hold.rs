@@ -39,6 +39,7 @@ fn main() {
 
     let config = StoreConfig {
         memory_budget: budget,
+        max_memory: None,
         threads: Default::default(),
         volumes: vec![VolumeConfig {
             name: "turn".to_string(),

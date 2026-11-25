@@ -227,6 +227,7 @@ fn config(policy: SyncPolicy, complete_rows: Option<RowCount>) -> StoreConfig {
     };
     StoreConfig {
         memory_budget: BUDGET,
+        max_memory: None,
         threads: reel::config::NO_WORKERS,
         volumes: vec![volume("meta", &ROOTS[..2], policy), volume("bulk", &ROOTS[2..], SyncPolicy::Never)],
         columns: vec![column(COLUMNS[0], "meta", 0, complete_rows), column(COLUMNS[1], "bulk", 1, None)],

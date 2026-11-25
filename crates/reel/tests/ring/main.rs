@@ -57,6 +57,7 @@ fn root(name: &str) -> PathBuf {
 fn config(root: &Path) -> StoreConfig {
     StoreConfig {
         memory_budget: BUDGET,
+        max_memory: None,
         threads: Default::default(),
         volumes: vec![VolumeConfig {
             name: "ring".to_string(),

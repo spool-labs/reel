@@ -72,6 +72,7 @@ fn config(capacity: RowCount) -> StoreConfig {
     reel::engine::engine_sizing::EXACT_INDEX_ROWS.with(|exact| exact.set(true));
     StoreConfig {
         memory_budget: SIM_BUDGET.with(std::cell::Cell::get),
+        max_memory: None,
         threads: crate::shape::threads(),
         volumes: vec![VolumeConfig {
             name: "sorted".to_string(),
@@ -3361,5 +3362,26 @@ fn a_small_cut_leaves_the_index_pools_alone() {
     assert!(store.state.pool_rooms.iter().filter(|room| room.is_paged()).all(|room| room.cap() == room.reserved()), "an index pool was held for a small cut");
     assert!(!store.memory_report().is_target_short);
     check(&store, &model, &written);
+    store.close().expect("close");
+}
+
+// a store opened with max_memory past its budget reserves its growing pools for it, starts at the budget, and takes a target up to
+// it with no restart, while a target past it comes back clamped
+#[test]
+fn max_memory_lets_the_target_rise_past_the_budget() {
+    let io = SimulatedIo::new(Seed(43));
+    let budget = SIM_BUDGET.with(std::cell::Cell::get);
+    let most = ByteCount(budget.0 * 2);
+    let store = ReelStore::open(io.clone(), &StoreConfig { max_memory: Some(most), ..config(CAPACITY) }).expect("open");
+    let model = fill_for_reopen(&store, &io, KEYS);
+    assert_eq!(store.memory_report().memory_target, budget);
+    assert_eq!(store.set_memory_target(most), most);
+    assert_eq!(store.set_memory_target(ByteCount(most.0 * 2)), most, "a target past max_memory went through");
+    let shares = store.memory_report().pool_shares;
+    let plain = ReelStore::open(SimulatedIo::new(Seed(44)), &config(CAPACITY)).expect("open");
+    assert!(shares > plain.memory_report().pool_shares, "the pools reserved no more for max_memory");
+    let written: Vec<Vec<u8>> = (0..KEYS).map(key).collect();
+    check(&store, &model, &written);
+    plain.close().expect("close");
     store.close().expect("close");
 }

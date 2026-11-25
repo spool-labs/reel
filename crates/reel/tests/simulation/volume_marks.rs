@@ -73,6 +73,7 @@ fn column(id: ColumnId, name: &str, volume: u8) -> ColumnConfig {
 fn open(io: &SimulatedIo) -> Store2 {
     let config = StoreConfig {
         memory_budget: BUDGET,
+        max_memory: None,
         threads: reel::config::NO_WORKERS,
         volumes: vec![volume("bulk", BULK_ROOT), volume("meta", META_ROOT)],
         columns: vec![column(BULK, "bulk", 0), column(META, "meta", 1)],
@@ -481,6 +482,7 @@ fn a_claim_dropped_under_a_seal_leaves_the_count_whole() {
     let io = SimulatedIo::new(Seed(9));
     let config = StoreConfig {
         memory_budget: BUDGET,
+        max_memory: None,
         threads: reel::config::NO_WORKERS,
         volumes: vec![VolumeConfig { open_segments: Some(1), ..volume("bulk", BULK_ROOT) }, volume("meta", META_ROOT)],
         columns: vec![column(BULK, "bulk", 0), column(META, "meta", 1)],
@@ -521,6 +523,7 @@ fn seal_with_a_late_claim(earlier_rows: u64) {
     let io = SimulatedIo::new(Seed(11));
     let config = StoreConfig {
         memory_budget: BUDGET,
+        max_memory: None,
         threads: reel::config::NO_WORKERS,
         volumes: vec![VolumeConfig { open_segments: Some(1), ..volume("bulk", BULK_ROOT) }, volume("meta", META_ROOT)],
         columns: vec![column(BULK, "bulk", 0), column(META, "meta", 1)],
@@ -618,6 +621,7 @@ fn noise(seed: u64, length: usize) -> Vec<u8> {
 fn mixed_config() -> StoreConfig {
     StoreConfig {
         memory_budget: ByteCount(2 * BUDGET.0),
+        max_memory: None,
         threads: reel::config::NO_WORKERS,
         volumes: vec![volume("bulk", BULK_ROOT), volume("meta", META_ROOT)],
         columns: vec![
@@ -837,6 +841,7 @@ fn an_empty_segment_drops_its_windows_with_its_files() {
     let io = SimulatedIo::new(Seed(13));
     let config = StoreConfig {
         memory_budget: BUDGET,
+        max_memory: None,
         threads: reel::config::NO_WORKERS,
         volumes: vec![VolumeConfig { open_segments: Some(1), ..volume("bulk", BULK_ROOT) }, volume("meta", META_ROOT)],
         columns: vec![column(BULK, "bulk", 0), column(META, "meta", 1)],
@@ -887,6 +892,7 @@ fn a_pinned_empty_segment_drops_once_the_pin_goes() {
     let io = SimulatedIo::new(Seed(14));
     let config = StoreConfig {
         memory_budget: BUDGET,
+        max_memory: None,
         threads: reel::config::NO_WORKERS,
         volumes: vec![VolumeConfig { open_segments: Some(1), ..volume("bulk", BULK_ROOT) }, volume("meta", META_ROOT)],
         columns: vec![column(BULK, "bulk", 0), column(META, "meta", 1)],

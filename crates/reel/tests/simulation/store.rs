@@ -170,6 +170,7 @@ impl Model {
 fn config(sync: SyncPolicy) -> StoreConfig {
     StoreConfig {
         memory_budget: BUDGET,
+        max_memory: None,
         threads: reel::config::NO_WORKERS,
         volumes: vec![VolumeConfig {
             name: "meta".to_string(),

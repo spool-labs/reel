@@ -31,6 +31,7 @@ type Store = ReelStore<PlainIo>;
 fn config(root: &Path, workers: usize) -> StoreConfig {
     StoreConfig {
         memory_budget: BUDGET,
+        max_memory: None,
         threads: ThreadCounts { maintenance_workers: Some(workers), ..ThreadCounts::default() },
         volumes: vec![VolumeConfig {
             name: "fill".to_string(),

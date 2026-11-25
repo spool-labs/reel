@@ -21,6 +21,7 @@ const ROW_WAIT: Duration = Duration::from_secs(20);
 fn config(root: &Path) -> StoreConfig {
     StoreConfig {
         memory_budget: BUDGET,
+        max_memory: None,
         threads: ThreadCounts::default(),
         volumes: vec![VolumeConfig { open_segments: Some(1), ..VolumeConfig::new("torn", vec![root.to_path_buf()], SyncPolicy::Never) }],
         columns: vec![ColumnConfig { codec: Codec::None, index: ColumnIndex::Plain, ..ColumnConfig::new(COLUMN, "torn", KeyShape::Fixed { width: 8 }) }],

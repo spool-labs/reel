@@ -61,6 +61,7 @@ fn config() -> StoreConfig {
     };
     StoreConfig {
         memory_budget: BUDGET,
+        max_memory: None,
         threads: reel::config::NO_WORKERS,
         volumes: vec![VolumeConfig {
             name: "scans".to_string(),
@@ -829,6 +830,7 @@ const SPREAD_ROWS: u64 = 2_000;
 fn lz4_config() -> StoreConfig {
     StoreConfig {
         memory_budget: ByteCount(128 * 1024 * 1024),
+        max_memory: None,
         threads: reel::config::NO_WORKERS,
         volumes: vec![VolumeConfig {
             name: "scans".to_string(),

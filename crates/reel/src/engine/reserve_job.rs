@@ -226,6 +226,9 @@ impl<Backend: Io> ReserveJob<Backend> {
             (kernel, host) => kernel.or(host),
         };
         state.is_under_pressure.store(pressed.is_some(), Ordering::Release);
+        if pressed.is_some() {
+            state.pressed_steps.fetch_add(1, Ordering::Relaxed);
+        }
         let target = state.memory_target.load(Ordering::Acquire).min(pressed.unwrap_or(u64::MAX));
         if held <= target {
             let is_well_under = held + target / UNDER_DIVISOR <= target || target >= state.memory_budget.0;

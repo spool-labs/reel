@@ -86,6 +86,9 @@ pub struct MemoryReport {
     pub pressure_source: PressureSource,
     /// Pressure events the kernel sent through a trigger since open
     pub pressure_events: u64,
+    /// Ladder steps that found the store under pressure since open, from the kernel or the host. The flag above holds only for
+    /// the step that cut, so a scrape counts these
+    pub pressed_steps: u64,
 }
 
 impl MemoryReport {

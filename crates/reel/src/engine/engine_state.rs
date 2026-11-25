@@ -243,6 +243,8 @@ pub struct EngineState<Backend: Io> {
     pub is_target_short: AtomicBool,
     /// Set while the group's room past what the kernel can't evict is under twice the margin, so the reserve job looks often
     pub is_host_tight: AtomicBool,
+    /// Ladder steps that found the store under pressure since open, which a scrape sees whatever moment it reads
+    pub pressed_steps: AtomicU64,
     /// Where the store learns of memory pressure, chosen as the jobs start
     pub pressure_source: OnceLock<PressureSource>,
     /// The thread that waits on the kernel's pressure trigger, which close stops
@@ -823,6 +825,7 @@ impl<Backend: Io> EngineState<Backend> {
             is_target_short: self.is_target_short.load(Ordering::Acquire),
             pressure_source: self.pressure_source.get().copied().unwrap_or_default(),
             pressure_events: self.pressure_events.load(Ordering::Relaxed),
+            pressed_steps: self.pressed_steps.load(Ordering::Relaxed),
             write_index: self.index.heap_bytes(),
             spot_cache: self.spot.heap_bytes(),
             record_cache: self.record_cache.heap_bytes(),

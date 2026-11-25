@@ -1743,6 +1743,8 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> Result<Engin
         rows_entered: AtomicU64::new(0),
         scan_batches_presorted: AtomicU64::new(0),
         sorted_moves_missed: AtomicU64::new(0),
+        sorted_drops: AtomicU64::new(0),
+        sorted_refills: AtomicU64::new(0),
         sorted_fill_ns: AtomicU64::new(0),
         sorted_fill_bytes: AtomicU64::new(0),
         data_syncs: AtomicU64::new(0),

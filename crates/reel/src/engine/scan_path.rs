@@ -272,7 +272,13 @@ impl<Backend: Io> EngineState<Backend> {
         }
         self.place_heads(volume, scan);
         match (index, directory) {
-            (Some(index), _directory) => fill_sorted(index, scan, &mut None),
+            (Some(index), _directory) => {
+                fill_sorted(index, scan, &mut None);
+                // a drop marks the index before it empties a part, so a batch read beside one sees the mark here and seeks again
+                if index.mark().is_some() {
+                    return Ok(StepOutcome::Moved);
+                }
+            },
             (None, Some(directory)) => self.join_segments(device, volume, directory, scan, point).await?,
             (None, None) => {},
         }
@@ -537,6 +543,10 @@ impl<Backend: Io> EngineState<Backend> {
                 scan.pass_sorted(at);
             }
             fill_sorted(index, scan, &mut passed);
+            // a drop marks the index before it empties a part, and the next step seeks again off the index
+            if index.mark().is_some() {
+                break;
+            }
             let sorted = scan.sorted_key();
             let head = scan.closest_head.map(|head| scan.heads[head].key.as_slice());
             // the nearer of the index's next key and the heads' goes first, and a key both show steps both
@@ -1904,6 +1914,10 @@ impl<Backend: Io> EngineState<Backend> {
             return None;
         }
         let count = index.count_live(prefix, point)?;
+        // a drop marks the index before it empties a part
+        if index.mark().is_some() {
+            return None;
+        }
         // a seal that started during the count can drop an entry under a grave, and it marks the volume before it does
         if !volume.covers.is_empty() || !volume.damage.is_empty() || volume.may_hide_under_sealed(point) {
             return None;

@@ -4,7 +4,8 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use reel_core::units::{ByteCount, FileOffset, Nanoseconds};
+use reel_core::units::{ByteCount, FileOffset, Nanoseconds, RowCount};
+use crate::index::sorted_keys::planned_index_bytes;
 
 use crate::engine::engine_state::EngineState;
 use crate::engine::open_segment::SegmentPhase;
@@ -241,11 +242,28 @@ impl<Backend: Io> ReserveJob<Backend> {
                 for room in &state.pool_rooms {
                     room.set_cap(usize::MAX);
                 }
+                // a dropped index comes back once the store has room past the decay for every row it held, and the compact job
+                // refills it
+                let room = (target - held).min(host_left(&memory));
+                for index in state.sorted.iter().flatten().filter(|index| index.is_dropped()) {
+                    let rows = RowCount(index.past_capacity().0 + index.entry_count().0);
+                    let may = pressed.is_none() && planned_index_bytes(index.width(), rows).0 <= room;
+                    if may && !index.may_refill() {
+                        index.set_may_refill(true);
+                        state.ask_compaction();
+                    } else if !may {
+                        index.set_may_refill(false);
+                    }
+                }
             }
             state.is_target_short.store(false, Ordering::Release);
             return target;
         }
         state.under_since.store(0, Ordering::Relaxed);
+        for index in state.sorted.iter().flatten() {
+            index.set_may_refill(false);
+        }
+        let was_short = state.is_target_short.load(Ordering::Acquire);
         let mut over = (held - target) as usize;
         for room in state.pool_rooms.iter().filter(|room| room.is_paged()) {
             over = over.saturating_sub(room.release_spare());
@@ -279,6 +297,17 @@ impl<Backend: Io> ReserveJob<Backend> {
         if over > 0 {
             for volume in &state.volumes {
                 state.seal_fullest(volume);
+            }
+        }
+        // the last step, under the kernel's or the host's pressure that a step's seals didn't meet: drop the largest sorted index
+        // whole. Its reads ask the footers until the store has room again and a refill brings it back
+        if over > 0 && pressed.is_some() && was_short {
+            let largest = state.sorted.iter().flatten().filter(|index| index.entry_count().0 > 0).max_by_key(|index| index.page_count());
+            if let Some(index) = largest {
+                let _freed = index.drop_entries();
+                state.stop_counting_full_indexes();
+                state.sorted_drops.fetch_add(1, Ordering::Relaxed);
+                over = over.saturating_sub(index.room().release_spare());
             }
         }
         state.is_target_short.store(over > 0, Ordering::Release);

@@ -245,6 +245,115 @@ fn cue_counts_beside_deleting_seals_match_their_walks() {
     let _gone = fs::remove_dir_all(&root);
 }
 
+// one thread drops a sorted index and refills it, again and again, while a writer puts and seals and two readers walk and count:
+// every key that landed before a walk began appears once, and a count lies between the keys landed before it and those started
+#[test]
+fn walks_and_counts_beside_drops_and_refills() {
+    let root = std::env::temp_dir().join(format!("reel-drop-race-{}", process::id()));
+    let _gone = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("root");
+    let config = StoreConfig {
+        memory_budget: ByteCount(512 * 1024 * 1024),
+        max_memory: None,
+        threads: ThreadCounts::default(),
+        volumes: vec![VolumeConfig {
+            open_segments: Some(2),
+            segment_bytes: Some(ByteCount(2 * 1024 * 1024)),
+            ..VolumeConfig::new("drop", vec![root.clone()], SyncPolicy::Never)
+        }],
+        columns: vec![ColumnConfig { index: ColumnIndex::Sorted, ..ColumnConfig::new(COLUMN, "drop", KeyShape::Fixed { width: 8 }) }],
+    };
+    let store = ReelStore::open(PlainIo::new(), &config).expect("open");
+    let written = AtomicU64::new(0);
+    let started = AtomicU64::new(0);
+    let done = AtomicBool::new(false);
+    let runs = AtomicU64::new(0);
+    let drops = AtomicU64::new(0);
+    std::thread::scope(|scope| {
+        let (store, written, started, done, runs, drops) = (&store, &written, &started, &done, &runs, &drops);
+        scope.spawn(move || {
+            let _stops = StopOnDrop(done);
+            let mut number = 0;
+            while number < KEYS || ((runs.load(Ordering::Acquire) < 4 * LEAST_RUNS || drops.load(Ordering::Acquire) < 40) && number < MOST_KEYS) {
+                started.store(number + 1, Ordering::Release);
+                store.put(COLUMN, &key(number), &[5_u8; 100]).expect("put");
+                written.store(number + 1, Ordering::Release);
+                if number % 5_000 == 4_999 {
+                    store.seal_now();
+                }
+                number += 1;
+                pace(number, runs, done);
+            }
+        });
+        scope.spawn(move || {
+            let _stops = StopOnDrop(done);
+            let index = store.state.sorted_index(COLUMN).expect("a sorted index");
+            while !done.load(Ordering::Acquire) {
+                let _freed = index.drop_entries();
+                store.state.stop_counting_full_indexes();
+                drops.fetch_add(1, Ordering::Relaxed);
+                std::thread::yield_now();
+                index.set_may_refill(true);
+                if let Some(mut refill) = store.state.start_sorted_refill(0) {
+                    while store.state.sorted_refill_step(0, &mut refill).expect("refill step") {}
+                }
+                std::thread::yield_now();
+            }
+        });
+        let walker = scope.spawn(move || {
+            let _stops = StopOnDrop(done);
+            let mut seen = std::collections::HashSet::new();
+            while !done.load(Ordering::Acquire) {
+                let low = written.load(Ordering::Acquire);
+                seen.clear();
+                let mut scan = store.iter_from(COLUMN, &[], reel_core::direction::Direction::Ascending).expect("scan");
+                let (mut name, mut value) = (Vec::new(), Vec::new());
+                while scan.next_row(&mut name, &mut value).expect("step") == reel_core::scan::ScanStep::Found {
+                    assert!(seen.insert(name.clone()), "key {name:?} walked twice");
+                }
+                let missing = (0..low).filter(|number| !seen.contains(key(*number).as_slice())).count();
+                assert_eq!(missing, 0, "{missing} of {low} landed keys missing from a walk");
+                runs.fetch_add(1, Ordering::Release);
+            }
+        });
+        let counter = scope.spawn(move || {
+            let _stops = StopOnDrop(done);
+            while !done.load(Ordering::Acquire) {
+                let low = written.load(Ordering::Acquire);
+                let count = store.count_prefix(COLUMN, &[]).expect("count").0;
+                let high = started.load(Ordering::Acquire);
+                assert!(low <= count && count <= high, "count {count} outside {low}..={high}");
+                runs.fetch_add(1, Ordering::Release);
+            }
+        });
+        walker.join().expect("walker");
+        counter.join().expect("counter");
+    });
+    assert!(drops.load(Ordering::Relaxed) > 3, "only {} drops ran", drops.load(Ordering::Relaxed));
+    // with the writer gone a refill finishes and clears the mark, and the index answers every key
+    let index = store.state.sorted_index(COLUMN).expect("a sorted index");
+    store.seal_now();
+    index.set_may_refill(true);
+    for _try in 0..500 {
+        if index.mark().is_none() {
+            break;
+        }
+        index.set_may_refill(true);
+        if let Some(mut refill) = store.state.start_sorted_refill(0) {
+            while store.state.sorted_refill_step(0, &mut refill).expect("refill step") {}
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    assert_eq!(index.mark(), None, "no refill cleared the mark");
+    let mut value = Vec::new();
+    let lost = (0..written.load(Ordering::Acquire)).filter(|number| !store.get(COLUMN, &key(*number), &mut value).expect("get")).count();
+    assert_eq!(lost, 0, "{lost} keys lost after the refill");
+    assert_eq!(store.count_prefix(COLUMN, &[]).expect("count").0, written.load(Ordering::Acquire));
+    store.close().expect("close");
+    let _gone = fs::remove_dir_all(&root);
+}
+
 /// Sets a flag when dropped, so the threads waiting on a writer stop when it ends, panic or not
 struct StopOnDrop<'flag>(&'flag AtomicBool);
 

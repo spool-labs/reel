@@ -89,6 +89,10 @@ pub struct MemoryReport {
     /// Ladder steps that found the store under pressure since open, from the kernel or the host. The flag above holds only for
     /// the step that cut, so a scrape counts these
     pub pressed_steps: u64,
+    /// Sorted indexes dropped whole under pressure since open, whose reads ask the footers until a refill
+    pub sorted_drops: u64,
+    /// Dropped sorted indexes a refill brought back since open
+    pub sorted_refills: u64,
 }
 
 impl MemoryReport {

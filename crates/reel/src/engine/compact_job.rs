@@ -143,6 +143,7 @@ pub struct CompactJob<Backend: Io> {
     /// load tries at once
     pick_retry: Option<(Nanoseconds, Load)>,
     refill: Option<Refill>,
+    sorted_refill: Option<Refill>,
     refill_key: FixedList<u8>,
     refill_below: u64,
     refill_reader: FooterReader,
@@ -202,6 +203,7 @@ impl<Backend: Io> CompactJob<Backend> {
             row_key: FixedList::on_heap(MAX_KEY_BYTES as usize),
             end: FixedList::on_heap(MAX_KEY_BYTES as usize + 1),
             refill: None,
+            sorted_refill: None,
             refill_key: FixedList::on_heap(MAX_KEY_BYTES as usize),
             refill_below: u64::MAX,
             sweep: None,
@@ -307,7 +309,7 @@ impl<Backend: Io> CompactJob<Backend> {
         // a refill or a sweep takes one step and the rest still runs, so a long pass holds back no pick and no merge
         let started = self.state.io.now();
         let cpu_started = thread_cpu();
-        self.did_background = self.step_refill() || self.step_sweep();
+        self.did_background = self.step_refill() || self.step_sorted_refill() || self.step_sweep();
         if let Some((kind, work)) = self.unit.take() {
             self.state.note_unit(kind, work, started, cpu_started);
         }
@@ -522,6 +524,21 @@ impl<Backend: Io> CompactJob<Backend> {
             let table = state.complete_table(refill.column);
             self.refill_below = table.filter(|table| table.mark().is_some()).map_or(u64::MAX, |table| table.used_slots().0);
         }
+        true
+    }
+
+    /// Give a few row blocks of a dropped sorted index their entries once the store has room again, and say whether a step ran
+    pub fn step_sorted_refill(&mut self) -> bool {
+        let state = &self.state;
+        if self.sorted_refill.is_none() {
+            self.sorted_refill = state.start_sorted_refill(self.volume);
+        }
+        let Some(mut refill) = self.sorted_refill else {
+            return false;
+        };
+        self.unit = Some((UnitKind::SlotRefill, u64::from(REFILL_STEP_BLOCKS)));
+        let goes_on = state.sorted_refill_step(self.volume, &mut refill).unwrap_or(false);
+        self.sorted_refill = goes_on.then_some(refill);
         true
     }
 

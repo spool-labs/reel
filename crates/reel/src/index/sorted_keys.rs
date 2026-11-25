@@ -208,6 +208,10 @@ pub struct SortedKeys {
     told_rows: RowCount,
     /// The part a drop of held values starts from, which moves each time so the same keys don't always pay
     next_to_drop: std::sync::atomic::AtomicUsize,
+    /// Set when the reserve job dropped the whole index, until a refill makes it good
+    is_dropped: std::sync::atomic::AtomicBool,
+    /// Set by the reserve job while the store has room to bring a dropped index back
+    may_refill: std::sync::atomic::AtomicBool,
 }
 
 impl PackedKey {
@@ -359,6 +363,8 @@ impl SortedKeys {
             sharer: 0,
             told_rows: rows,
             next_to_drop: std::sync::atomic::AtomicUsize::new(0),
+            is_dropped: std::sync::atomic::AtomicBool::new(false),
+            may_refill: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -485,6 +491,69 @@ impl SortedKeys {
         true
     }
 
+
+    /// Drop every entry and give every page back, and return the pages freed. The entries count as rows past capacity and the
+    /// mark goes to segment 0 first, so a read that finds a part empty sees the mark after it and asks the footers, and a refill
+    /// that began before can't clear the mark
+    pub fn drop_entries(&self) -> u32 {
+        let before = self.room.free_pages();
+        self.is_dropped.store(true, Memory::Release);
+        self.may_refill.store(false, Memory::Release);
+        self.past_capacity.fetch_add(self.entries.load(Memory::Acquire), Memory::AcqRel);
+        self.mark.fetch_min(0, Memory::AcqRel);
+        for part in 0..PARTS {
+            let mut tree = self.write_part(part);
+            if tree.levels > 0 {
+                self.give_tree(tree.root, tree.levels);
+            }
+            let (entries, version) = (tree.entries, tree.version);
+            *tree = PartTree { version, ..PartTree::empty() };
+            self.filled[part].store(0, Memory::Release);
+            drop(tree);
+            self.entries.fetch_sub(entries, Memory::AcqRel);
+        }
+        self.room.free_pages().saturating_sub(before)
+    }
+
+    /// Give a subtree's pages back, the children before the page
+    fn give_tree(&self, page: u32, levels: usize) {
+        if levels > 1 {
+            for child in 0..self.count(page) {
+                self.give_tree(self.load(page, self.inner_entry(child) + self.key_words), levels - 1);
+            }
+        }
+        self.give_back(&[page]);
+    }
+
+
+    /// Count a row that has no entry while the index is marked, so a refill that began before it can't clear the mark
+    pub fn note_missed(&self) {
+        self.past_capacity.fetch_add(1, Memory::AcqRel);
+    }
+    /// Check the reserve job dropped the index and no refill has made it good yet
+    pub fn is_dropped(&self) -> bool {
+        self.is_dropped.load(Memory::Acquire)
+    }
+
+    /// Let a refill bring a dropped index back, or stop one
+    pub fn set_may_refill(&self, may: bool) {
+        self.may_refill.store(may, Memory::Release);
+    }
+
+    /// Check a refill may bring the index back now
+    pub fn may_refill(&self) -> bool {
+        self.may_refill.load(Memory::Acquire) && self.is_dropped()
+    }
+
+    /// End a refill: clear the mark it made good, or give up with the mark standing when a block couldn't be read
+    pub fn end_refill(&self, mark: SegmentNumber, missed: RowCount, is_whole: bool) -> bool {
+        let is_cleared = is_whole && self.clear_mark(mark, missed);
+        // a second refill that found the mark gone ends the drop as well
+        if is_cleared || !is_whole || self.mark().is_none() {
+            self.is_dropped.store(false, Memory::Release);
+        }
+        is_cleared
+    }
     /// Find the part a key sits in
     pub fn part_of(&self, key: &[u8]) -> usize {
         key.first().map_or(0, |byte| usize::from(*byte))

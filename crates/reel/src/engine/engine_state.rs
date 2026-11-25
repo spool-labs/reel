@@ -214,6 +214,10 @@ pub struct EngineState<Backend: Io> {
     pub scan_batches_presorted: AtomicU64,
     /// Row blocks a merge's install couldn't read to move sorted entries, whose keys ask the footers once the inputs go
     pub sorted_moves_missed: AtomicU64,
+    /// Sorted indexes the reserve job dropped whole under pressure, since open
+    pub sorted_drops: AtomicU64,
+    /// Dropped sorted indexes a refill brought back, since open
+    pub sorted_refills: AtomicU64,
     /// Time and footer bytes the open's fill of the sorted indexes took
     pub sorted_fill_ns: AtomicU64,
     pub sorted_fill_bytes: AtomicU64,
@@ -826,6 +830,8 @@ impl<Backend: Io> EngineState<Backend> {
             pressure_source: self.pressure_source.get().copied().unwrap_or_default(),
             pressure_events: self.pressure_events.load(Ordering::Relaxed),
             pressed_steps: self.pressed_steps.load(Ordering::Relaxed),
+            sorted_drops: self.sorted_drops.load(Ordering::Relaxed),
+            sorted_refills: self.sorted_refills.load(Ordering::Relaxed),
             write_index: self.index.heap_bytes(),
             spot_cache: self.spot.heap_bytes(),
             record_cache: self.record_cache.heap_bytes(),

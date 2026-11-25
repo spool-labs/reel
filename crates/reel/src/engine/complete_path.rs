@@ -22,7 +22,7 @@ use crate::index::open_slots::OpenSlot;
 use crate::index::open_slots::MAX_OPEN_SLOTS;
 use crate::index::write_index::{EnterRun, SHARD_COUNT};
 use crate::engine::seal_job::SortedRun;
-use crate::index::sorted_keys::{Floors, HOLD_ROWS, KeyEntry, LeafAt, SortedKeys};
+use crate::index::sorted_keys::{Floors, HOLD_ROWS, KeyEntry, LeafAt, SortedKeys, planned_index_bytes};
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::io::{DeviceReads, InPlace, Io, in_place};
 use crate::io::device_error::is_device_error;
@@ -525,10 +525,24 @@ impl<Backend: Io> EngineState<Backend> {
         (piece, pieces): (usize, usize),
         readers: &Pool<FooterReader>,
     ) -> IoResult<bool> {
+        let span = |first: u32, count: u32| (first + count * piece as u32 / pieces as u32, first + count * (piece as u32 + 1) / pieces as u32);
+        self.fill_sorted_span(volume, (column, index), number, span, readers)
+    }
+
+    /// Give the span of a segment's blocks of a sorted column that `span` picks from its first block and count their entries, and
+    /// say whether every block read clean
+    pub fn fill_sorted_span(
+        &self,
+        volume: &Volume<Backend>,
+        (column, index): (ColumnId, &SortedKeys),
+        number: SegmentNumber,
+        span: impl Fn(u32, u32) -> (u32, u32),
+        readers: &Pool<FooterReader>,
+    ) -> IoResult<bool> {
         let (Some((first, count)), Some(pin)) = (volume.table.column_blocks(number, column), volume.table.pin(number)) else {
             return Ok(true);
         };
-        let (start, end) = (first + count * piece as u32 / pieces as u32, first + count * (piece as u32 + 1) / pieces as u32);
+        let (start, end) = span(first, count);
         let caches = FooterCaches {
             resident: &self.filter_arena,
             filters: &self.filter_cache,
@@ -590,6 +604,9 @@ impl<Backend: Io> EngineState<Backend> {
                 rows: &self.row_cache,
             };
             let place_base = WritePlace(pin.head.place_base.0);
+            // a marked index lacks rows, and a refill walks down from the newest segment it saw, so an output's rows go in whole
+            // here or a refill past the output's place would miss them
+            let is_marked = index.mark().is_some();
             self.job_footer_readers.with(|reader| {
                 for block_index in first..first + count {
                     let Some((entry, _replacement)) = volume.table.block_line(number, block_index) else {
@@ -598,16 +615,104 @@ impl<Backend: Io> EngineState<Backend> {
                     };
                     if !matches!(in_place(reader.hold_block(&InPlace, &pin.file, (number, place_base), &entry, &caches)), Ok(true)) {
                         self.sorted_moves_missed.fetch_add(1, Ordering::Relaxed);
+                        // rows a marked index lacks stay without an entry, so a refill running now can't clear the mark
+                        if is_marked {
+                            index.note_missed();
+                        }
                         continue;
                     }
                     reader.visit_loaded(&entry, place_base, |key, row| {
-                        if row.kind != RowKind::RangeDelete {
-                            index.move_entry(key, row.place, number, row.offset);
+                        if row.kind == RowKind::RangeDelete || index.move_entry(key, row.place, number, row.offset) || !is_marked || key.len() != index.width() {
+                            return;
                         }
+                        let entry = KeyEntry { place: row.place, segment: number, offset: row.offset, length: row.length, is_grave: row.kind == RowKind::Grave };
+                        index.upsert(key, entry, Floors::at(WritePlace(0)));
                     });
                 }
             });
+            if is_marked {
+                self.remove_sorted_covers(volume, column, index);
+            }
         }
+    }
+
+    /// Take out of a sorted index the entries of rows a cover hides, after rows went in from the footers
+    pub fn remove_sorted_covers(&self, volume: &Volume<Backend>, column: ColumnId, index: &SortedKeys) {
+        volume.covers.read().visit(|cover, start, end| {
+            if cover.column == column {
+                index.remove_covered(start, end, cover.place);
+            }
+        });
+    }
+
+    /// Find a dropped sorted index of a volume the store has room to bring back, and start a refill from the newest segment down
+    pub fn start_sorted_refill(&self, index: usize) -> Option<Refill> {
+        for (id, sorted) in self.sorted.iter().enumerate() {
+            let (Some(sorted), Some(info)) = (sorted, self.columns[id]) else {
+                continue;
+            };
+            if info.volume.0 as usize != index || !sorted.may_refill() {
+                continue;
+            }
+            let Some(mark) = sorted.mark() else {
+                continue;
+            };
+            let volume = &self.volumes[index];
+            let sealing = volume.sealing.load(Ordering::Acquire);
+            if (sealing != NO_SEAL && sealing >= mark.0) || volume.output_floor() != NO_SEAL {
+                continue;
+            }
+            // the reserve job grows a room a step at a time and a refill takes pages faster, so the refill brings in the pages for
+            // every row the index held before it starts. The job let it run only with room for them
+            let missed = sorted.past_capacity();
+            let rows = RowCount(missed.0 + sorted.entry_count().0);
+            if sorted.room().grow_to(planned_index_bytes(sorted.width(), rows).0 as usize).is_err() {
+                continue;
+            }
+            let segment = hold(&volume.summary).orders().present().iter().rev().find(|segment| **segment >= mark).copied();
+            return Some(Refill { column: ColumnId(id as u8), mark, missed, segment, block: 0 });
+        }
+        None
+    }
+
+    /// Give a few row blocks of a dropped sorted index's refill their entries, and clear the mark once no segment past it is left.
+    /// Say whether the refill goes on. Pressure ends it with the mark standing, and a block that can't be read gives the refill up
+    pub fn sorted_refill_step(&self, index: usize, refill: &mut Refill) -> IoResult<bool> {
+        let volume = &self.volumes[index];
+        let Some(sorted) = self.sorted_index(refill.column) else {
+            return Ok(false);
+        };
+        if !sorted.may_refill() {
+            return Ok(false);
+        }
+        let Some(segment) = refill.segment else {
+            if sorted.end_refill(refill.mark, refill.missed, true) {
+                self.sorted_refills.fetch_add(1, Ordering::Relaxed);
+            }
+            return Ok(false);
+        };
+        let mark = refill.mark;
+        let next = |segment: SegmentNumber| hold(&volume.summary).orders().below(segment).last().copied().filter(|below| *below >= mark);
+        let Some((first, count)) = volume.table.column_blocks(segment, refill.column) else {
+            refill.segment = next(segment);
+            refill.block = 0;
+            return Ok(true);
+        };
+        let from = first + refill.block;
+        let end = (from + REFILL_STEP_BLOCKS).min(first + count);
+        if !self.fill_sorted_span(volume, (refill.column, sorted), segment, |_first, _count| (from, end), &self.job_footer_readers)? {
+            sorted.end_refill(refill.mark, refill.missed, false);
+            return Ok(false);
+        }
+        // a row the refill put in may sit under a cover that sealed before it
+        self.remove_sorted_covers(volume, refill.column, sorted);
+        if end == first + count {
+            refill.segment = next(segment);
+            refill.block = 0;
+        } else {
+            refill.block = end - first;
+        }
+        Ok(true)
     }
 
     /// Damage a segment with a row block open or a merge couldn't read. The block's keys have no slot, so they would otherwise read

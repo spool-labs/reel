@@ -287,6 +287,55 @@ fn past_capacity_sets_a_mark() {
     assert_eq!(index.mark(), None);
 }
 
+// a drop gives every page back and marks the index from segment 0 with every entry counted past capacity, the parts read empty,
+// and the index takes rows again and clears its mark once a refill puts them back
+#[test]
+fn a_drop_empties_the_index_and_a_refill_brings_it_back() {
+    let index = SortedKeys::new(16, RowCount(20_000)).expect("build index");
+    let key_of = |key: u64| {
+        let mut bytes = [0; 16];
+        bytes[..8].copy_from_slice(&key.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes());
+        bytes
+    };
+    for key in 0..10_000u64 {
+        assert_eq!(index.upsert(&key_of(key), entry(key + 1, false), Floors::at(WritePlace(0))), Upserted::Added);
+    }
+    let used = index.page_count() - index.free_pages();
+    assert!(used > 10, "{used} pages in use");
+    let freed = index.drop_entries();
+    assert_eq!(freed, used, "the drop left pages in use");
+    assert_eq!(index.check(), Ok(()));
+    assert_eq!(index.entry_count(), RowCount(0));
+    assert_eq!(index.mark(), Some(SegmentNumber(0)));
+    assert_eq!(index.past_capacity(), RowCount(10_000));
+    assert!(index.is_dropped());
+    assert!(index.find(&key_of(5)).is_none());
+    let mut batch = KeyBatch::new(16, 64);
+    assert!(index.read_after(ScanFrom::Edge, 64, &mut batch));
+    assert!(batch.is_empty());
+    // a refill that started before a second drop can't clear the mark
+    let missed = index.past_capacity();
+    for key in 0..10_000u64 {
+        index.upsert(&key_of(key), entry(key + 1, false), Floors::at(WritePlace(0)));
+    }
+    let _freed = index.drop_entries();
+    assert!(!index.end_refill(SegmentNumber(0), missed, true));
+    assert_eq!(index.mark(), Some(SegmentNumber(0)));
+    assert!(index.is_dropped());
+    let missed = index.past_capacity();
+    index.set_may_refill(true);
+    assert!(index.may_refill());
+    for key in 0..10_000u64 {
+        index.upsert(&key_of(key), entry(key + 1, false), Floors::at(WritePlace(0)));
+    }
+    assert!(index.end_refill(SegmentNumber(0), missed, true));
+    assert_eq!(index.mark(), None);
+    assert!(!index.is_dropped() && !index.may_refill());
+    assert_eq!(index.past_capacity(), RowCount(0));
+    assert_eq!(index.entry_count(), RowCount(10_000));
+    assert_eq!(index.check(), Ok(()));
+}
+
 // wide keys and many rows reach three levels, so inner pages split and empty
 #[test]
 fn matches_the_model_three_levels_deep() {

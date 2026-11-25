@@ -3407,3 +3407,99 @@ fn a_deep_cut_drops_held_values() {
     SIM_BUDGET.with(|budget| budget.set(BUDGET));
     store.close().expect("close");
 }
+
+// a store the host presses past what its caches and held values give drops its sorted index whole: every get, scan and count
+// answers the model through the footers while writes, deletes and a range delete go on, and once the host has room past the decay a
+// refill brings the index back with its mark cleared and every entry right
+#[test]
+fn a_pressed_store_drops_its_index_and_refills_it() {
+    let io = SimulatedIo::new(Seed(46));
+    let store = open(&io, CAPACITY);
+    // the test runs its own merges, at the moments it checks
+    store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
+    store.state.volumes[0].holds.reclaim.store(true, Ordering::Release);
+    let mut model = fill_for_reopen(&store, &io, KEYS);
+    check_all(&store, &model, KEYS, 46);
+    let job = reel::engine::reserve_job::ReserveJob::new(Arc::clone(&store.state));
+    let tight = reel::io::host_memory::HostMemory {
+        total: ByteCount(1 << 30),
+        available: ByteCount(0),
+        group_room: Some(ByteCount(0)),
+        group_limit: Some(ByteCount(1 << 30)),
+        group_anon_room: Some(ByteCount(0)),
+    };
+    io.set_host_memory(tight);
+    let mut now = io.now().0;
+    for _step in 0..256 {
+        if store.memory_report().sorted_drops > 0 {
+            break;
+        }
+        now += 100_000_000;
+        job.hold_to_target(now);
+    }
+    let index = store.state.sorted_index(COLUMN).expect("an index");
+    assert_eq!(store.memory_report().sorted_drops, 1, "the pressed store kept its index");
+    assert_eq!(index.mark(), Some(SegmentNumber(0)));
+    assert_eq!(index.entry_count(), RowCount(0));
+    let written: Vec<Vec<u8>> = (0..KEYS + KEYS / 2).map(key).collect();
+    check(&store, &model, &written);
+    check_scans(&store, &model, &mut SeededRandom::new(Seed(146)));
+
+    // writes go on while the index is dropped, and some of them seal and merge
+    for number in (KEYS..KEYS + KEYS / 2).chain((0..KEYS).step_by(5)) {
+        store.put(COLUMN, &key(number), format!("dropped-{number}").as_bytes()).expect("put");
+        model.insert(key(number), format!("dropped-{number}").into_bytes());
+    }
+    for number in (2..KEYS).step_by(11) {
+        store.delete(COLUMN, &key(number)).expect("delete");
+        model.remove(&key(number));
+    }
+    let names: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let (start, end) = (names[names.len() / 2].clone(), names[names.len() / 2 + 40].clone());
+    store.delete_range(COLUMN, &start, &end).expect("delete range");
+    model.retain(|name, _value| *name < start || *name >= end);
+    seal_all(&store, &io);
+    check(&store, &model, &written);
+    check_scans(&store, &model, &mut SeededRandom::new(Seed(147)));
+    assert!(merge_once(&store), "no merge ran while the index was dropped");
+    check(&store, &model, &written);
+
+    // the host has room again, and past the decay the job lets a refill run
+    io.set_host_memory(reel_sim::simulated_disk::SIMULATED_HOST);
+    now += 1;
+    job.hold_to_target(now);
+    job.hold_to_target(now + reel::pool_room::DECAY_NANOS);
+    assert!(index.may_refill(), "the store had room and no refill may run");
+    let volume = store.state.columns[COLUMN.0 as usize].expect("a column").volume.0 as usize;
+    let mut refill = store.state.start_sorted_refill(volume).expect("a refill");
+    // a write lands in the middle of the refill
+    let mut steps = 0;
+    while store.state.sorted_refill_step(volume, &mut refill).expect("refill step") {
+        steps += 1;
+        if steps == 2 {
+            store.put(COLUMN, &key(1), b"mid-refill").expect("put");
+            model.insert(key(1), b"mid-refill".to_vec());
+            seal_all(&store, &io);
+            let _merged = merge_once(&store);
+        }
+    }
+    assert_eq!(index.mark(), None, "the refill left the mark: {} past capacity, {} missed at start, {} free pages", index.past_capacity().0, refill.missed.0, index.free_pages());
+    assert!(!index.is_dropped());
+    assert_eq!(store.memory_report().sorted_refills, 1);
+    check_all(&store, &model, KEYS + KEYS / 2, 48);
+    store.close().expect("close");
+}
+
+/// Run one merge on volume 0 to its end, and say whether one ran
+fn merge_once(store: &Store) -> bool {
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    while !job.rewrite.start() {
+        if !job.rewrite.has_looks_left() {
+            return false;
+        }
+    }
+    while job.rewrite.is_running() {
+        job.rewrite.step();
+    }
+    true
+}

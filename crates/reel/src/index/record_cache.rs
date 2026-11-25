@@ -13,7 +13,7 @@ use reel_core::units::{ByteCount, FileOffset};
 use crate::engine::caller_activity::CallerCounts;
 use crate::guard::hold;
 use crate::pool::touched_filled;
-use crate::pool_room::{FIRST_PART_DIVISOR, PoolRoom};
+use crate::pool_room::PoolRoom;
 use crate::segment::segment_tail::SegmentNumber;
 
 /// Shards of the cache, each behind its own lock
@@ -119,8 +119,8 @@ impl CacheShard {
     /// plans its index for the values its arena holds and keeps a count a value, so a first miss is soon forgotten and only a
     /// record missed twice close together comes in. Small records, or a store with none on disk, plan a slot for each stretch
     ///
-    /// The arena starts at one part in `divisor` of its share and grows into the rest
-    pub fn growing(bytes: usize, mean_record: Option<u64>, divisor: usize) -> Result<Self> {
+    /// A whole shard brings its arena into memory at once, and any other starts at the room's first step and grows into the rest
+    pub fn growing(bytes: usize, mean_record: Option<u64>, is_whole: bool) -> Result<Self> {
         let entry = mean_record.map_or(0, |bytes| padded(ENTRY_HEADER_BYTES + bytes as usize));
         let stretch = (entry / SLOTS_PER_VALUE).max(BYTES_PER_INDEX_SLOT);
         let is_wide = stretch > BYTES_PER_INDEX_SLOT;
@@ -132,7 +132,7 @@ impl CacheShard {
         let values = bytes / entry.max(1);
         let seen = if is_wide { values.next_power_of_two().max(LEAST_SEEN_COUNTS) } else { slots };
         let arena = bytes.saturating_sub(slots * size_of::<CacheEntry>() + seen).max(LEAST_SHARD_BYTES) / 8 * 8;
-        let room = PoolRoom::reserve(ByteCount(arena as u64), ByteCount((arena / divisor.max(1)) as u64))?;
+        let room = PoolRoom::reserve(ByteCount(arena as u64), ByteCount(if is_whole { arena as u64 } else { 0 }))?;
         let mut shard = Self {
             room: Arc::new(room),
             share: arena,
@@ -392,15 +392,15 @@ impl RecordCache {
 
     /// Build a cache of some bytes across every shard, all of it in memory
     pub fn new(bytes: ByteCount, mean_record: Option<u64>) -> Result<Self> {
-        Self::growing(bytes, mean_record, 1)
+        Self::growing(bytes, mean_record, true)
     }
 
-    /// Build a cache whose arenas start at one part in `divisor` of their share and grow into the rest
-    pub fn growing(bytes: ByteCount, mean_record: Option<u64>, divisor: usize) -> Result<Self> {
+    /// Build a cache whose arenas are whole in memory, or start small and grow into the rest
+    pub fn growing(bytes: ByteCount, mean_record: Option<u64>, is_whole: bool) -> Result<Self> {
         let shard_bytes = (bytes.0 as usize / CACHE_SHARDS).max(2 * LEAST_SHARD_BYTES);
         let mut shards = Vec::with_capacity(CACHE_SHARDS);
         for _shard in 0..CACHE_SHARDS {
-            shards.push(Mutex::new(CacheShard::growing(shard_bytes, mean_record, divisor)?));
+            shards.push(Mutex::new(CacheShard::growing(shard_bytes, mean_record, is_whole)?));
         }
         // a lock can build its state on first use, so each takes it here, at open
         for shard in &shards {
@@ -411,7 +411,7 @@ impl RecordCache {
 
     /// Build a cache whose arenas start at an eighth of their share
     pub fn fresh(bytes: ByteCount, mean_record: Option<u64>) -> Result<Self> {
-        Self::growing(bytes, mean_record, FIRST_PART_DIVISOR)
+        Self::growing(bytes, mean_record, false)
     }
 
     /// Read every shard's arena room, for the job that grows them

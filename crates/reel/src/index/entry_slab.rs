@@ -73,17 +73,13 @@ pub struct PageChain {
     pub pages: PageCount,
 }
 
-/// A shard's pages in a room that grows with them. Pages below `fresh` have been handed out, and every page under the room's limit
-/// is in memory
+/// A shard's pages, which it takes from and gives back to a room that grows and shrinks with them. Every page a chain holds lies in
+/// a ready extent
 #[derive(Debug)]
 pub struct EntrySlab {
     room: Arc<PoolRoom>,
+    /// Each held page's next older page in its chain
     next_page: Vec<PageIndex>,
-    /// Pages given back, as a chain
-    free_head: PageIndex,
-    given_back: PageCount,
-    /// The first page never handed out
-    fresh: PageCount,
 }
 
 impl PageChain {
@@ -107,14 +103,8 @@ impl EntrySlab {
     /// Reserve room for a whole number of pages and bring the first of them into memory
     pub fn growing(pages: PageCount, first: PageCount) -> Result<Self> {
         let bytes = |count: PageCount| ByteCount(u64::from(count.0) * PAGE_BYTES as u64);
-        let room = PoolRoom::reserve(bytes(pages), bytes(first.min(pages)))?;
-        Ok(Self {
-            room: Arc::new(room),
-            next_page: touched_filled(pages.0 as usize, NO_PAGE),
-            free_head: NO_PAGE,
-            given_back: PageCount(0),
-            fresh: PageCount(0),
-        })
+        let room = PoolRoom::reserve_paged(bytes(pages), bytes(first.min(pages)), PAGE_BYTES)?;
+        Ok(Self { room: Arc::new(room), next_page: touched_filled(pages.0 as usize, NO_PAGE) })
     }
 
     /// Read the room, which the growing job raises
@@ -128,9 +118,9 @@ impl EntrySlab {
         ByteCount((self.total_pages().0 as usize * PAGE_BYTES + links) as u64)
     }
 
-    /// Count the pages free now: the ones given back and the ones in memory never handed out
+    /// Count the pages free now in ready extents
     pub fn free_pages(&self) -> PageCount {
-        PageCount(self.given_back.0 + self.total_pages().0.saturating_sub(self.fresh.0))
+        PageCount(self.room.free_pages())
     }
 
     /// Check this many pages are free
@@ -138,9 +128,9 @@ impl EntrySlab {
         self.free_pages() >= pages
     }
 
-    /// Count the pages in memory now, which goes up as the room grows
+    /// Count the pages in ready extents now, which moves as the room grows and gives back
     pub fn total_pages(&self) -> PageCount {
-        PageCount(((self.room.committed() / PAGE_BYTES) as u32).min(self.next_page.len() as u32))
+        PageCount(self.room.ready_pages())
     }
 
     /// Count the pages the slab can grow to
@@ -148,21 +138,17 @@ impl EntrySlab {
         PageCount(self.next_page.len() as u32)
     }
 
-    /// Note the bytes the pages in use take, so the growing job sees the fill
-    fn note_used(&self) {
-        self.room.note_used((self.fresh.0 - self.given_back.0) as usize * PAGE_BYTES);
-    }
-
-    /// Read the bytes of the pages handed out, all of them in memory
+    /// Read every page's bytes. Only pages a chain holds are read or written, and all of them lie in ready extents
     fn bytes(&self) -> &[u8] {
-        // SAFETY: the pages below fresh lie under the room's limit, and the growing job only writes past it
-        unsafe { std::slice::from_raw_parts(self.room.base(), self.fresh.0 as usize * PAGE_BYTES) }
+        // SAFETY: the room is reserved for every page; the slab touches only pages it holds, which are in memory, and the job only
+        // brings in or gives back extents that hold none of them
+        unsafe { std::slice::from_raw_parts(self.room.base(), self.next_page.len() * PAGE_BYTES) }
     }
 
-    /// Write the bytes of the pages handed out
+    /// Write every page's bytes, as bytes reads them
     fn bytes_mut(&mut self) -> &mut [u8] {
         // SAFETY: as in bytes, and the slab's own borrow is unique
-        unsafe { std::slice::from_raw_parts_mut(self.room.base(), self.fresh.0 as usize * PAGE_BYTES) }
+        unsafe { std::slice::from_raw_parts_mut(self.room.base(), self.next_page.len() * PAGE_BYTES) }
     }
 
     /// Check a row of this key length could be stored
@@ -209,19 +195,7 @@ impl EntrySlab {
     /// Claim bytes in the chain's newest page, taking a free page when it's full
     pub fn claim(&mut self, chain: &mut PageChain, size: usize) -> Option<usize> {
         if chain.used + size > PAGE_BYTES {
-            let page = if self.free_head != NO_PAGE {
-                let page = self.free_head;
-                self.free_head = self.next_page[page.0 as usize];
-                self.given_back = PageCount(self.given_back.0 - 1);
-                page
-            } else if self.fresh < self.total_pages() {
-                let page = PageIndex(self.fresh.0);
-                self.fresh = PageCount(self.fresh.0 + 1);
-                page
-            } else {
-                return None;
-            };
-            self.note_used();
+            let page = PageIndex(self.room.take_page()?);
             self.next_page[page.0 as usize] = chain.newest;
             if chain.oldest == NO_PAGE {
                 chain.oldest = page;
@@ -236,13 +210,13 @@ impl EntrySlab {
         Some(start)
     }
 
-    /// Give a whole chain back in one splice
+    /// Give a whole chain's pages back to the room, each to its extent, so the high extents drain
     pub fn release(&mut self, chain: &mut PageChain) {
-        if chain.oldest != NO_PAGE {
-            self.next_page[chain.oldest.0 as usize] = self.free_head;
-            self.free_head = chain.newest;
-            self.given_back = PageCount(self.given_back.0 + chain.pages.0);
-            self.note_used();
+        let mut page = chain.newest;
+        for _page in 0..chain.pages.0 {
+            let older = self.next_page[page.0 as usize];
+            self.room.give_page(page.0);
+            page = older;
         }
         *chain = PageChain::empty();
     }

@@ -9,16 +9,15 @@
 
 use std::io::{Error, ErrorKind, Result};
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use reel_core::units::ByteCount;
 
-use crate::pool::HUGE_PAGE_BYTES;
+use crate::guard::hold;
+use crate::pool::{HUGE_PAGE_BYTES, touched_filled};
 use crate::region::{MapInFlight, note_populate, page_bytes, thread_faults, touch_pages};
 
-/// A pool starts at this share of its room when nothing on disk sizes it
-pub const FIRST_PART_DIVISOR: usize = 8;
 /// A pool grows by this share of its room at a time, and asks for the next extent when less than one is free
 pub const EXTENT_DIVISOR: usize = 16;
 /// The least room that starts on a huge page and grows in whole ones
@@ -26,8 +25,6 @@ pub const HUGE_ROOM_BYTES: usize = 4 * HUGE_PAGE_BYTES;
 
 /// How far ahead of its fill a pool on the lead arm keeps memory ready, in nanoseconds of writes at its last measured rate
 pub const LEAD_NANOS: u64 = 100_000_000;
-/// A pool on the demand arm grows by this share of its room at a time
-pub const DEMAND_DIVISOR: usize = 64;
 /// The variable that picks the growth arm for the A/B/C runs: extent, demand or lead
 pub const POLICY_VARIABLE: &str = "REEL_GROW_POLICY";
 
@@ -55,17 +52,54 @@ pub fn grow_policy() -> GrowPolicy {
 /// Wakes the job that grows the rooms
 pub type GrowWake = Arc<dyn Fn() + Send + Sync>;
 
-/// One pool's reserved room and the part of it in memory
+
+/// Extents a room splits into, one bit each of its ready set
+pub const EXTENTS: usize = 64;
+/// How long a room stays more than an extent past what it wants before the job gives memory back
+pub const DECAY_NANOS: u64 = 30_000_000_000;
+/// Marks an empty free chain
+pub const NO_ROOM_PAGE: u32 = u32::MAX;
+
+/// A paged pool's free pages, which the room hands out lowest extent first so use packs low and the high extents drain
+struct PageState {
+    /// Each free page's next, by page number
+    links: Vec<u32>,
+    /// Each extent's free chain
+    heads: [u32; EXTENTS],
+    /// Each extent's pages never handed out since it last came into memory, counted from its start
+    fresh: [u32; EXTENTS],
+    /// Each extent's pages handed out now
+    in_use: [u32; EXTENTS],
+    /// The ready extents with a free page
+    has_free: u64,
+    in_use_total: u32,
+    ready_pages: u32,
+}
+
+/// The pages a paged pool takes from its room
+struct RoomPages {
+    page: usize,
+    per_extent: u32,
+    /// The pages the pool holds at most, which the room may round up past
+    limit: u32,
+    state: Mutex<PageState>,
+    /// The free pages in ready extents and the pages in ready extents, readable with no lock
+    free_now: AtomicU32,
+    ready_now: AtomicU32,
+}
+
+/// One pool's reserved room, split into extents that come into memory and go back to the kernel as the pool's use moves
 pub struct PoolRoom {
     base: NonNull<u8>,
-    /// Bytes reserved, a whole number of steps
+    /// Bytes reserved, a whole number of units
     reserved: usize,
-    /// The bytes every limit is a multiple of: a page, or a huge page in a large room
+    /// The bytes every extent is a multiple of: a page, a huge page in a large room, and a pool page in a paged room
     unit: usize,
-    /// Bytes the room grows by at a time
+    /// Bytes of one extent. The last may be shorter
     extent: usize,
-    /// Bytes in memory from the start. Callers use memory under it
-    committed: AtomicUsize,
+    extent_count: usize,
+    /// The extents in memory, a bit each. A caller uses memory only in a ready extent
+    ready: AtomicU64,
     /// Set when the last populate failed, and cleared by the next that works
     has_failed: AtomicBool,
     /// Set when the host had no room for the next step, and cleared once a step fits
@@ -74,16 +108,22 @@ pub struct PoolRoom {
     lead: AtomicUsize,
     /// The job's last look at the fill: when, and the bytes used then
     sample: Mutex<(u64, usize)>,
-    /// Bytes the pool uses now, which its owner notes and the growing job reads
+    /// Since when the room has held more than an extent past what it wants, or 0
+    over_since: AtomicU64,
+    /// Bytes the pool uses now, which its owner notes and the job reads
     used: AtomicUsize,
     /// Set once the pool asked for its next extent, until the job brings it in
     has_asked: AtomicBool,
     wake: OnceLock<GrowWake>,
+    /// Whether a debug build closes a released extent to every access. A pool whose readers take no lock leaves it open, since a
+    /// reader that raced the release reads zeros there and its own check turns them away
+    is_guarded: bool,
+    pages: Option<RoomPages>,
 }
 
-// SAFETY: the room's memory belongs to the pool that owns it, and the limit is atomic
+// SAFETY: the room's memory belongs to the pool that owns it, and the ready set is atomic
 unsafe impl Send for PoolRoom {}
-// SAFETY: a shared handle reads the base and the reserved length, which nothing changes, and the atomics
+// SAFETY: a shared handle reads the base and the reserved length, which nothing changes, the atomics, and the page state under its lock
 unsafe impl Sync for PoolRoom {}
 
 impl std::fmt::Debug for PoolRoom {
@@ -92,37 +132,66 @@ impl std::fmt::Debug for PoolRoom {
     }
 }
 
+
 impl PoolRoom {
-    /// Reserve a share as address space and populate its first part
+    /// Reserve a share as address space and bring its first part into memory
     pub fn reserve(share: ByteCount, first: ByteCount) -> Result<Self> {
-        let page = page_bytes();
-        let wanted = (share.0 as usize).next_multiple_of(page).max(page);
-        let unit = if wanted >= HUGE_ROOM_BYTES { HUGE_PAGE_BYTES } else { page };
+        Self::reserve_with(share, first, None)
+    }
+
+    /// Reserve a share for a pool of pages of this size, which takes and gives its pages through the room
+    pub fn reserve_paged(share: ByteCount, first: ByteCount, page: usize) -> Result<Self> {
+        Self::reserve_with(share, first, Some(page))
+    }
+
+    /// Reserve a share, split it into extents, and bring the first ones into memory
+    fn reserve_with(share: ByteCount, first: ByteCount, page: Option<usize>) -> Result<Self> {
+        let system_page = page_bytes();
+        let wanted = (share.0 as usize).next_multiple_of(system_page).max(system_page);
+        let huge = if wanted >= HUGE_ROOM_BYTES { HUGE_PAGE_BYTES } else { system_page };
+        let unit = huge.max(page.unwrap_or(0));
         let reserved = wanted.next_multiple_of(unit);
-        let base = map_aligned(reserved, unit)?;
-        advise_huge_pages(base.as_ptr().cast(), reserved, unit == HUGE_PAGE_BYTES);
-        let extent = (reserved / EXTENT_DIVISOR).next_multiple_of(unit).max(unit);
+        let base = map_aligned(reserved, huge)?;
+        advise_huge_pages(base.as_ptr().cast(), reserved, huge == HUGE_PAGE_BYTES);
+        let extent = (reserved / EXTENTS).next_multiple_of(unit).max(unit);
+        let extent_count = reserved.div_ceil(extent);
+        let pages = page.map(|page| RoomPages {
+            page,
+            per_extent: (extent / page) as u32,
+            limit: (share.0 as usize / page) as u32,
+            state: Mutex::new(PageState {
+                links: touched_filled(reserved / page, NO_ROOM_PAGE),
+                heads: [NO_ROOM_PAGE; EXTENTS],
+                fresh: [0; EXTENTS],
+                in_use: [0; EXTENTS],
+                has_free: 0,
+                in_use_total: 0,
+                ready_pages: 0,
+            }),
+            free_now: AtomicU32::new(0),
+            ready_now: AtomicU32::new(0),
+        });
         let room = Self {
             base,
             reserved,
             unit,
             extent,
-            committed: AtomicUsize::new(0),
+            extent_count,
+            ready: AtomicU64::new(0),
             has_failed: AtomicBool::new(false),
             is_short: AtomicBool::new(false),
             lead: AtomicUsize::new(extent),
             sample: Mutex::new((0, 0)),
+            over_since: AtomicU64::new(0),
             used: AtomicUsize::new(0),
             has_asked: AtomicBool::new(false),
             wake: OnceLock::new(),
+            is_guarded: true,
+            pages,
         };
-        room.grow_to(first.0 as usize)?;
+        // the data on disk sets the first part, and an empty pool starts with what its arm keeps ready
+        room.grow_to((first.0 as usize).max(room.lead_bytes()))?;
         Ok(room)
-    }
-
-    /// Reserve a share with its first part sized from nothing on disk
-    pub fn reserve_fresh(share: ByteCount) -> Result<Self> {
-        Self::reserve(share, ByteCount(share.0 / FIRST_PART_DIVISOR as u64))
     }
 
     /// Set what the pool calls when it wants its next extent
@@ -140,20 +209,54 @@ impl PoolRoom {
         self.reserved
     }
 
-    /// Read the bytes the room grows by at a time
+    /// Read the bytes of one extent
     pub fn extent(&self) -> usize {
         self.extent
     }
 
-    /// Read the bytes in memory now
-    pub fn committed(&self) -> usize {
-        self.committed.load(Ordering::Acquire)
+    /// Read the bytes the extent arm grows by at a time: a sixteenth of the room in whole extents, and one extent at least
+    pub fn step(&self) -> usize {
+        (self.reserved / EXTENT_DIVISOR).next_multiple_of(self.extent).max(self.extent)
     }
 
-    /// Note the bytes the pool uses now, and wake the growing job the first time less than one extent is free
+    /// Count the pool's pages in an extent, none past the pool's own count
+    fn pages_in(&self, pages: &RoomPages, extent: usize) -> u32 {
+        let (start, end) = self.extent_range(extent);
+        let limit = pages.limit as usize * pages.page;
+        ((end.min(limit) - start.min(limit)) / pages.page) as u32
+    }
+
+    /// Read an extent's first byte and its end
+    fn extent_range(&self, extent: usize) -> (usize, usize) {
+        (extent * self.extent, ((extent + 1) * self.extent).min(self.reserved))
+    }
+
+    /// Read the bytes in memory now: every ready extent's
+    pub fn committed(&self) -> usize {
+        let ready = self.ready.load(Ordering::Acquire);
+        let full = ready.count_ones() as usize * self.extent;
+        let last = self.extent_count - 1;
+        if ready & (1 << last) != 0 { full - (self.extent_range(last).0 + self.extent - self.reserved) } else { full }
+    }
+
+    /// Check the byte at this offset lies in a ready extent
+    pub fn is_ready_at(&self, offset: usize) -> bool {
+        self.ready.load(Ordering::SeqCst) & (1 << (offset / self.extent)) != 0
+    }
+
+    /// Leave released extents open to reads in debug builds, for a pool whose readers take no lock and check what they read
+    pub fn read_unlocked(mut self) -> Self {
+        self.is_guarded = false;
+        self
+    }
+
+    /// Note the bytes the pool uses now, and wake the job the first time the arm wants the next step
     pub fn note_used(&self, bytes: usize) {
         self.used.store(bytes, Ordering::Relaxed);
+        // a room held short or failed waits for the job's own period, so running short costs no wake a page
         if self.next_step(bytes).is_some()
+            && !self.is_short()
+            && !self.has_failed()
             && !self.has_asked.swap(true, Ordering::AcqRel)
             && let Some(wake) = self.wake.get()
         {
@@ -181,6 +284,15 @@ impl PoolRoom {
         self.committed() < self.reserved && !self.has_failed() && !self.is_short()
     }
 
+    /// Read the bytes the arm keeps ready past use
+    fn lead_bytes(&self) -> usize {
+        match grow_policy() {
+            GrowPolicy::Extent => self.step(),
+            GrowPolicy::Demand => self.unit,
+            GrowPolicy::Lead => self.lead.load(Ordering::Relaxed),
+        }
+    }
+
     /// Read where the pool grows next with this many bytes used, under the process's arm, up to the room
     pub fn next_step(&self, used: usize) -> Option<usize> {
         let committed = self.committed();
@@ -189,17 +301,14 @@ impl PoolRoom {
         }
         let free = committed.saturating_sub(used);
         let target = match grow_policy() {
-            GrowPolicy::Extent => (free < self.extent).then_some(committed + self.extent),
-            GrowPolicy::Demand => {
-                let step = (self.reserved / DEMAND_DIVISOR).next_multiple_of(self.unit).max(self.unit);
-                (free < self.unit).then_some(committed + step)
-            },
+            GrowPolicy::Extent => (free < self.step()).then_some(committed + self.step()),
+            GrowPolicy::Demand => (free < self.unit).then_some(committed + self.extent),
             GrowPolicy::Lead => {
                 let lead = self.lead.load(Ordering::Relaxed);
                 (free < lead).then_some(used + 2 * lead)
             },
         }?;
-        Some(target.next_multiple_of(self.unit).min(self.reserved))
+        Some(target.min(self.reserved))
     }
 
     /// Set the lead arm's lead from the fill since the job last looked: the bytes that fill takes in LEAD_NANOS, and never less
@@ -214,7 +323,7 @@ impl PoolRoom {
             return;
         }
         let rate_lead = (used.saturating_sub(used_then) as u128 * u128::from(LEAD_NANOS) / u128::from(elapsed)) as usize;
-        self.lead.store(rate_lead.max(self.unit), Ordering::Relaxed);
+        self.lead.store(rate_lead.max(self.extent), Ordering::Relaxed);
     }
 
     /// Grow until the arm wants no more or the room is whole, taking no step past the room the host has left, and say whether it
@@ -237,24 +346,197 @@ impl PoolRoom {
         Ok(grew)
     }
 
-    /// Populate the room up to this many bytes and then publish the limit. A populate that fails leaves the limit where it was
+    /// Bring the lowest extents not in memory in until this many bytes are, each one populated before it reads as ready. A
+    /// populate that fails leaves the room as it was
     pub fn grow_to(&self, bytes: usize) -> Result<()> {
-        let target = bytes.next_multiple_of(self.unit).min(self.reserved);
-        let committed = self.committed();
-        if target <= committed {
-            return Ok(());
+        let target = bytes.min(self.reserved);
+        while self.committed() < target {
+            let ready = self.ready.load(Ordering::Acquire);
+            let extent = (!ready).trailing_zeros() as usize;
+            if extent >= self.extent_count {
+                return Ok(());
+            }
+            let (start, end) = self.extent_range(extent);
+            guard_extent(self.base.as_ptr(), start, end - start, true);
+            // SAFETY: the extent lies inside the reservation and isn't ready, so no caller reads or writes it
+            if let Err(error) = populate(unsafe { self.base.as_ptr().add(start) }, end - start, page_bytes()) {
+                self.has_failed.store(true, Ordering::Release);
+                return Err(error);
+            }
+            self.has_failed.store(false, Ordering::Release);
+            match &self.pages {
+                Some(pages) => {
+                    let mut state = hold(&pages.state);
+                    let count = self.pages_in(pages, extent);
+                    state.heads[extent] = NO_ROOM_PAGE;
+                    state.fresh[extent] = 0;
+                    state.in_use[extent] = 0;
+                    if count > 0 {
+                        state.has_free |= 1 << extent;
+                    }
+                    state.ready_pages += count;
+                    self.ready.fetch_or(1 << extent, Ordering::SeqCst);
+                    pages.publish(&state);
+                },
+                None => {
+                    self.ready.fetch_or(1 << extent, Ordering::SeqCst);
+                },
+            }
         }
-        // SAFETY: the range lies inside the reservation and past the limit, so no caller reads or writes it
-        let start = unsafe { self.base.as_ptr().add(committed) };
-        if let Err(error) = populate(start, target - committed, page_bytes()) {
-            self.has_failed.store(true, Ordering::Release);
-            return Err(error);
-        }
-        self.has_failed.store(false, Ordering::Release);
-        self.committed.fetch_max(target, Ordering::Release);
         Ok(())
     }
+
+    /// Give back the highest empty extents of a paged pool that has held more than an extent past what it wants for DECAY_NANOS,
+    /// and return the bytes given back. A pool keeps its lowest extent
+    pub fn release_idle(&self, now: u64) -> usize {
+        let Some(pages) = &self.pages else {
+            return 0;
+        };
+        let want = self.used() + self.lead_bytes();
+        if self.committed() <= want + self.extent {
+            self.over_since.store(0, Ordering::Relaxed);
+            return 0;
+        }
+        let since = self.over_since.load(Ordering::Relaxed);
+        if since == 0 {
+            self.over_since.store(now, Ordering::Relaxed);
+            return 0;
+        }
+        if now.saturating_sub(since) < DECAY_NANOS {
+            return 0;
+        }
+        let mut given = 0;
+        while self.committed() > want + self.extent {
+            let Some(extent) = self.take_empty_extent(pages) else {
+                break;
+            };
+            given += self.give_back_extent(extent);
+        }
+        self.over_since.store(0, Ordering::Relaxed);
+        given
+    }
+
+    /// Take the highest empty ready extent past the first out of the ready set, under the page lock
+    fn take_empty_extent(&self, pages: &RoomPages) -> Option<usize> {
+        let mut state = hold(&pages.state);
+        let ready = self.ready.load(Ordering::Acquire);
+        let extent = (1..self.extent_count).rev().find(|&extent| ready & (1 << extent) != 0 && state.in_use[extent] == 0)?;
+        state.heads[extent] = NO_ROOM_PAGE;
+        state.fresh[extent] = 0;
+        state.has_free &= !(1 << extent);
+        state.ready_pages -= self.pages_in(pages, extent);
+        self.ready.fetch_and(!(1 << extent), Ordering::SeqCst);
+        pages.publish(&state);
+        Some(extent)
+    }
+
+    /// Give an extent no longer ready back to the kernel. No page in it is in use, so a pool that reads under its own lock never
+    /// reaches it, and one that reads with no lock reads zeros there, which no generation it checks against is
+    fn give_back_extent(&self, extent: usize) -> usize {
+        let (start, end) = self.extent_range(extent);
+        // SAFETY: the extent lies inside the reservation, isn't ready, and holds no page in use
+        unsafe { libc::madvise(self.base.as_ptr().add(start).cast(), end - start, libc::MADV_DONTNEED) };
+        if self.is_guarded {
+            guard_extent(self.base.as_ptr(), start, end - start, false);
+        }
+        end - start
+    }
+
+    /// Take a free page from the lowest ready extent with one
+    pub fn take_page(&self) -> Option<u32> {
+        let pages = self.pages.as_ref()?;
+        let mut state = hold(&pages.state);
+        let extent = state.has_free.trailing_zeros() as usize;
+        if extent >= EXTENTS {
+            return None;
+        }
+        let count = self.pages_in(pages, extent);
+        let page = if state.heads[extent] != NO_ROOM_PAGE {
+            let page = state.heads[extent];
+            state.heads[extent] = state.links[page as usize];
+            page
+        } else {
+            let page = extent as u32 * pages.per_extent + state.fresh[extent];
+            state.fresh[extent] += 1;
+            page
+        };
+        state.in_use[extent] += 1;
+        state.in_use_total += 1;
+        if state.heads[extent] == NO_ROOM_PAGE && state.fresh[extent] == count {
+            state.has_free &= !(1 << extent);
+        }
+        pages.publish(&state);
+        let used = state.in_use_total as usize * pages.page;
+        drop(state);
+        self.note_used(used);
+        Some(page)
+    }
+
+    /// Give a page back to its extent's free chain
+    pub fn give_page(&self, page: u32) {
+        let Some(pages) = &self.pages else {
+            return;
+        };
+        let mut state = hold(&pages.state);
+        let extent = (page / pages.per_extent) as usize;
+        state.links[page as usize] = state.heads[extent];
+        state.heads[extent] = page;
+        state.in_use[extent] -= 1;
+        state.in_use_total -= 1;
+        state.has_free |= 1 << extent;
+        pages.publish(&state);
+        let used = state.in_use_total as usize * pages.page;
+        drop(state);
+        self.note_used(used);
+    }
+
+    /// Count the free pages in ready extents, a moment old at most
+    pub fn free_pages(&self) -> u32 {
+        self.pages.as_ref().map_or(0, |pages| pages.free_now.load(Ordering::Acquire))
+    }
+
+    /// Count the pages in ready extents, a moment old at most
+    pub fn ready_pages(&self) -> u32 {
+        self.pages.as_ref().map_or(0, |pages| pages.ready_now.load(Ordering::Acquire))
+    }
+
+    /// Count the pages the room can grow to
+    pub fn most_pages(&self) -> u32 {
+        self.pages.as_ref().map_or(0, |pages| pages.limit)
+    }
+
+    /// Count the ready extents that hold no page in use, for the tests
+    pub fn empty_extents(&self) -> usize {
+        let Some(pages) = &self.pages else {
+            return 0;
+        };
+        let state = hold(&pages.state);
+        let ready = self.ready.load(Ordering::Acquire);
+        (0..self.extent_count).filter(|&extent| ready & (1 << extent) != 0 && state.in_use[extent] == 0).count()
+    }
 }
+
+impl RoomPages {
+    /// Publish the counts a caller reads with no lock
+    fn publish(&self, state: &PageState) {
+        self.ready_now.store(state.ready_pages, Ordering::Release);
+        self.free_now.store(state.ready_pages - state.in_use_total, Ordering::Release);
+    }
+}
+
+/// Close an extent to every access while it is out of memory, in debug builds, so a stray touch stops the test, and open it again
+/// before it comes back
+fn guard_extent(base: *mut u8, start: usize, bytes: usize, is_open: bool) {
+    #[cfg(debug_assertions)]
+    {
+        let access = if is_open { libc::PROT_READ | libc::PROT_WRITE } else { libc::PROT_NONE };
+        // SAFETY: the range lies inside the reservation, and only its access changes
+        let _answer = unsafe { libc::mprotect(base.add(start).cast(), bytes, access) };
+    }
+    #[cfg(not(debug_assertions))]
+    let _unused = (base, start, bytes, is_open);
+}
+
 
 impl Drop for PoolRoom {
     fn drop(&mut self) {
@@ -347,53 +629,77 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn grows_an_extent_when_less_than_one_is_free() {
-        let page = page_bytes();
-        let room = PoolRoom::reserve(ByteCount(64 * page as u64), ByteCount(8 * page as u64)).expect("reserve");
+    fn counted_wakes(room: &PoolRoom) -> Arc<AtomicUsize> {
         let wakes = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&wakes);
         room.set_wake(Arc::new(move || {
             counted.fetch_add(1, Ordering::Relaxed);
         }));
-        assert_eq!((room.committed(), room.extent()), (8 * page, 4 * page));
-        room.note_used(4 * page);
-        assert_eq!(wakes.load(Ordering::Relaxed), 0, "a room with an extent free asked to grow");
-        room.note_used(5 * page);
-        room.note_used(6 * page);
-        assert_eq!(wakes.load(Ordering::Relaxed), 1, "a room asked more than once for one extent");
+        wakes
+    }
+
+    #[test]
+    fn grows_a_step_when_less_than_one_is_free() {
+        let page = page_bytes();
+        let room = PoolRoom::reserve(ByteCount(64 * page as u64), ByteCount(0)).expect("reserve");
+        let wakes = counted_wakes(&room);
+        assert_eq!((room.extent(), room.step(), room.committed()), (page, 4 * page, 4 * page));
+        room.note_used(0);
+        assert_eq!(wakes.load(Ordering::Relaxed), 0, "a room with a step free asked to grow");
+        room.note_used(page);
+        room.note_used(2 * page);
+        assert_eq!(wakes.load(Ordering::Relaxed), 1, "a room asked more than once for one step");
         assert!(room.grow_step(&mut u64::MAX.clone()).expect("grow"));
-        assert_eq!(room.committed(), 12 * page);
-        // SAFETY: the bytes lie under the limit
-        unsafe { room.base().add(12 * page - 1).write(7) };
-        room.note_used(11 * page);
-        assert_eq!(wakes.load(Ordering::Relaxed), 2);
+        assert_eq!(room.committed(), 8 * page);
+        // SAFETY: the bytes lie in a ready extent
+        unsafe { room.base().add(8 * page - 1).write(7) };
         room.grow_to(1 << 40).expect("grow");
         assert_eq!(room.committed(), 64 * page);
         assert_eq!(room.next_step(64 * page), None);
     }
 
     #[test]
-    fn a_host_with_no_room_leaves_the_pool_short() {
+    fn a_short_room_wakes_no_more() {
         let page = page_bytes();
-        let room = PoolRoom::reserve(ByteCount(64 * page as u64), ByteCount(8 * page as u64)).expect("reserve");
-        room.note_used(8 * page);
-        let mut tight = 2 * page as u64;
-        assert!(!room.grow_step(&mut tight).expect("grow"));
+        let room = PoolRoom::reserve(ByteCount(64 * page as u64), ByteCount(0)).expect("reserve");
+        let wakes = counted_wakes(&room);
+        room.note_used(4 * page);
+        assert!(!room.grow_step(&mut 0).expect("grow"));
         assert!(room.is_short() && !room.can_grow());
-        assert_eq!((room.committed(), tight), (8 * page, 2 * page as u64));
-        let mut roomy = u64::MAX;
-        assert!(room.grow_step(&mut roomy).expect("grow"));
+        for used in 0..1_000 {
+            room.note_used(4 * page + used % 2);
+        }
+        assert_eq!(wakes.load(Ordering::Relaxed), 1, "a short room woke the job past its first ask");
+        assert!(room.grow_step(&mut u64::MAX.clone()).expect("grow"));
         assert!(!room.is_short() && room.can_grow());
-        assert_eq!(room.committed(), 12 * page);
     }
 
     #[test]
-    fn fresh_room_starts_at_an_eighth() {
-        let page = page_bytes() as u64;
-        let room = PoolRoom::reserve_fresh(ByteCount(64 * page)).expect("reserve");
-        assert_eq!(room.committed() as u64, 8 * page);
-        assert_eq!(room.reserved() as u64, 64 * page);
+    fn pages_pack_low_and_empty_extents_go_back() {
+        let page = page_bytes();
+        let room = PoolRoom::reserve_paged(ByteCount(64 * page as u64), ByteCount(64 * page as u64), page).expect("reserve");
+        assert_eq!((room.ready_pages(), room.free_pages()), (64, 64));
+        let taken: Vec<u32> = (0..64).map(|_page| room.take_page().expect("take")).collect();
+        assert_eq!(room.take_page(), None);
+        for &page_number in &taken[32..] {
+            room.give_page(page_number);
+        }
+        assert_eq!(room.empty_extents(), 32);
+        assert_eq!(room.take_page(), Some(32), "a take went past the lowest extent with a free page");
+        room.give_page(32);
+        assert_eq!(room.release_idle(1), 0, "a room gave back before it decayed");
+        let given = room.release_idle(1 + DECAY_NANOS);
+        let want = 32 * page + room.step();
+        assert!(given > 0 && room.committed() <= want + room.extent(), "{given} given, {} left", room.committed());
+        for &page_number in &taken[..32] {
+            assert!(room.is_ready_at(page_number as usize * page), "a page in use went back");
+        }
+        assert_eq!(room.free_pages() + 32, room.ready_pages());
+        room.grow_to(64 * page).expect("grow");
+        let again: Vec<u32> = (0..32).map(|_page| room.take_page().expect("take")).collect();
+        assert!(again.iter().all(|&page_number| page_number >= 32));
+        // SAFETY: the page lies in an extent that came back
+        assert_eq!(unsafe { room.base().add(again[0] as usize * page).read() }, 0);
     }
 
     #[test]
@@ -401,8 +707,9 @@ mod tests {
         let room = PoolRoom::reserve(ByteCount(10 * HUGE_PAGE_BYTES as u64 + 5), ByteCount(1)).expect("reserve");
         assert_eq!(room.base() as usize % HUGE_PAGE_BYTES, 0);
         assert_eq!(room.reserved(), 11 * HUGE_PAGE_BYTES);
-        assert_eq!(room.committed(), HUGE_PAGE_BYTES);
-        room.note_used(HUGE_PAGE_BYTES);
+        assert_eq!(room.extent(), HUGE_PAGE_BYTES);
+        assert_eq!(room.committed() % HUGE_PAGE_BYTES, 0);
+        room.note_used(room.committed());
         assert!(room.grow_step(&mut u64::MAX.clone()).expect("grow"));
         assert_eq!(room.committed() % HUGE_PAGE_BYTES, 0);
     }

@@ -63,6 +63,9 @@ pub fn try_load<Backend: Io>(io: &Backend, config: &StoreConfig) -> Result<Arc<E
     state.is_read_only = true;
     state.sorted = sorted_indexes(config, &sorted_sizes, true).map_err(open_error("reserving a sorted index"))?;
     state.sorted_sizes = sorted_sizes;
+    // a reader grows nothing, and the report counts every room it holds
+    let rooms: Vec<_> = state.sorted.iter().flatten().map(|index| index.room().clone()).chain(state.sorted.iter().flatten().next().map(|index| index.values.room().clone())).chain(state.record_cache.rooms()).collect();
+    state.pool_rooms.extend(rooms);
     let state = Arc::new(state);
     let outcome = bring_up_read_only(&state, &mut scan);
     match outcome {

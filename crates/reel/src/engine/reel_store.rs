@@ -68,8 +68,7 @@ use crate::io::{DeviceReads, InPlace, in_place};
 use crate::row_kind::RowKind;
 use crate::segment::row_block::RowBlockWalk;
 use crate::index::open_slots::OpenSlot;
-use crate::index::entry_slab::PageCount;
-use crate::pool_room::{FIRST_PART_DIVISOR, GrowWake};
+use crate::pool_room::GrowWake;
 use crate::engine::complete_image::ImageFiles;
 use crate::index::complete_table::CompleteTable;
 use crate::index::complete_table::planned_table_bytes;
@@ -160,6 +159,9 @@ impl<Backend: Io> ReelStore<Backend> {
         if let Some(index) = state.sorted.iter().flatten().next() {
             state.pool_rooms.push(index.values.room().clone());
         }
+        // under shortage the job serves the rooms in this order: the write index, the sorted pages, their values, then the caches
+        let cache_rooms = state.record_cache.rooms();
+        state.pool_rooms.extend(cache_rooms);
         state.sorted_sizes = sorted_sizes;
         state.complete_images = complete_images(config);
         state.attach_ring(ring);
@@ -1545,11 +1547,11 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> Result<Engin
 
     // the slabs start with room for twice the open rows on disk and at least an eighth of their share, and grow from there. A
     // reader runs no reserve job, so its slabs start whole
-    let first_pages = if sizing.is_read_only { sizing.shard.pages } else { shard_for_rows(open_rows.0.saturating_mul(2), sizing.shard.open_slots).pages.max(PageCount(sizing.shard.pages.0 / FIRST_PART_DIVISOR as u32)).min(sizing.shard.pages) };
+    let first_pages = if sizing.is_read_only { sizing.shard.pages } else { shard_for_rows(open_rows.0.saturating_mul(2), sizing.shard.open_slots).pages.min(sizing.shard.pages) };
     let index = WriteIndex::new(&sizing.shard, first_pages)?;
     // a reader runs no reserve job, so its cache starts whole too
     let record_cache = if sizing.is_read_only { RecordCache::new(record_share, cache_mean)? } else { RecordCache::fresh(record_share, cache_mean)? };
-    let pool_rooms = [index.rooms(), record_cache.rooms()].concat();
+    let pool_rooms = index.rooms();
     // a sorted column's rows count apart from the start, so its walks see only the rows its index lacks
     for column in config.columns.iter().filter(|column| column.is_sorted()) {
         index.mark_sorted(column.id);
@@ -2050,7 +2052,7 @@ pub fn sorted_indexes(config: &StoreConfig, sizes: &[Option<SortedSize>], is_rea
         .map(|(column, size)| if column.least_value.is_some_and(|least| least.0 as usize > MOST_HELD_VALUE) { 0 } else { size.value_pages })
         .collect();
     // the pool fills as reads hold values, so it starts at an eighth of its pages, and a reader runs no reserve job and starts whole
-    let first = if is_read_only { pages } else { pages / FIRST_PART_DIVISOR as u32 };
+    let first = if is_read_only { pages } else { 0 };
     let pool = Arc::new(ValuePages::growing(pages, &floors, first)?);
     for (sharer, (column, size)) in sized.into_iter().enumerate() {
         // a reader runs no reserve job, so its index starts whole

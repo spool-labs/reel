@@ -156,6 +156,10 @@ impl<Backend: Io> ReserveJob<Backend> {
                 room.note_rate(now);
             }
         }
+        // a paged pool that has held more than an extent past what it wants for the decay gives its highest empty extents back
+        for room in &self.state.pool_rooms {
+            let _given = room.release_idle(now);
+        }
         if !self.state.pool_rooms.iter().any(|room| room.next_step(room.used()).is_some()) {
             return;
         }

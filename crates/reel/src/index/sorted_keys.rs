@@ -6,15 +6,15 @@
 //! one part to another through the pool with no unsafe code. Keys are packed big-endian into words, so a word compare orders them.
 
 use std::cmp::Ordering;
-use std::sync::{Arc, Mutex, RwLockWriteGuard};
+use std::sync::{Arc, RwLockWriteGuard};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as Memory};
 
 use reel_core::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
-use crate::guard::{Shards, hold};
+use crate::guard::Shards;
 use crate::index::value_pages::{HeldChain, NO_VALUE_PAGE, ValuePages};
 use crate::pool::touched_capacity;
-use crate::pool_room::{FIRST_PART_DIVISOR, PoolRoom};
+use crate::pool_room::PoolRoom;
 use crate::segment::segment_tail::SegmentNumber;
 
 /// Words of one page
@@ -146,15 +146,6 @@ pub struct PartTree {
     pub version: u64,
 }
 
-/// The pool's unused pages, chained through each page's next word
-#[derive(Debug)]
-pub struct FreePages {
-    pub head: u32,
-    pub count: u32,
-    /// The first page never handed out. Pages below it are in memory
-    pub fresh: u32,
-}
-
 /// Where a scan starts
 #[derive(Clone, Copy, Debug)]
 pub enum ScanFrom<'key> {
@@ -199,7 +190,6 @@ pub struct SortedKeys {
     /// The pages' words, reserved for every page the index can grow to
     room: Arc<PoolRoom>,
     most_pages: u32,
-    free: Mutex<FreePages>,
     parts: Shards<PartTree>,
     /// Each part's entry count, set under its lock, so a scan passes an empty part with no lock taken
     filled: Vec<AtomicU64>,
@@ -341,9 +331,9 @@ impl SortedKeys {
         let leaf_capacity = (PAGE_WORDS - HEAD_WORDS) / leaf_stride;
         let inner_capacity = (PAGE_WORDS - HEAD_WORDS) / inner_stride;
         let pages = planned_pages(width, rows);
-        let first = if first_rows >= rows { pages } else { planned_pages(width, RowCount(first_rows.0.saturating_mul(2))).max(pages / FIRST_PART_DIVISOR as u32).min(pages) };
+        let first = if first_rows >= rows { pages } else { planned_pages(width, RowCount(first_rows.0.saturating_mul(2))).min(pages) };
         let bytes = |count: u32| ByteCount(u64::from(count) * PAGE_BYTES as u64);
-        let room = PoolRoom::reserve(bytes(pages), bytes(first))?;
+        let room = PoolRoom::reserve_paged(bytes(pages), bytes(first), PAGE_BYTES)?;
         Ok(Self {
             width,
             key_words,
@@ -353,7 +343,6 @@ impl SortedKeys {
             inner_capacity,
             room: Arc::new(room),
             most_pages: pages,
-            free: Mutex::new(FreePages { head: NO_PAGE, count: 0, fresh: 0 }),
             parts: Shards((0..PARTS).map(|_part| std::sync::RwLock::new(PartTree::empty())).collect()),
             filled: (0..PARTS).map(|_part| AtomicU64::new(0)).collect(),
             entries: AtomicU64::new(0),
@@ -372,16 +361,12 @@ impl SortedKeys {
         &self.room
     }
 
-    /// Read every word of the pages the index can grow to. Only pages handed out are read or written, and all of those are in memory
+    /// Read every word of the pages the index can grow to. Only pages a part holds are read or written, under the part's lock, and
+    /// all of those lie in ready extents
     fn words(&self) -> &[AtomicU32] {
-        // SAFETY: the room is reserved for this many pages, readable and writable, and zero until written; a page past the limit is
-        // never handed out, so no access reaches it while the growing job brings it in
+        // SAFETY: the room is reserved for this many pages; the index touches only pages it holds, which are in memory, and the job
+        // only brings in or gives back extents that hold none of them
         unsafe { std::slice::from_raw_parts(self.room.base().cast::<AtomicU32>(), self.most_pages as usize * PAGE_WORDS) }
-    }
-
-    /// Note the bytes of the pages in use, so the growing job sees the fill
-    fn note_used(&self, free: &FreePages) {
-        self.room.note_used((free.fresh - free.count) as usize * PAGE_BYTES);
     }
 
     /// Read the width of the index's keys
@@ -399,15 +384,14 @@ impl SortedKeys {
         ByteCount(u64::from(self.page_count()) * PAGE_BYTES as u64 + if self.owns_values { self.values.heap_bytes().0 } else { 0 })
     }
 
-    /// Count the pages the pool has
+    /// Count the pages in ready extents
     pub fn page_count(&self) -> u32 {
-        ((self.room.committed() / PAGE_BYTES) as u32).min(self.most_pages)
+        self.room.ready_pages()
     }
 
-    /// Count the pages no part holds
+    /// Count the pages in ready extents no part holds
     pub fn free_pages(&self) -> u32 {
-        let free = hold(&self.free);
-        free.count + self.page_count().saturating_sub(free.fresh)
+        self.room.free_pages()
     }
 
     /// Read the levels of the deepest part, for tests
@@ -1605,37 +1589,26 @@ impl SortedKeys {
 
     /// Take pages from the pool, all or none
     fn take_pages(&self, pages: &mut [u32]) -> bool {
-        let mut free = hold(&self.free);
-        let fresh = self.page_count().saturating_sub(free.fresh);
-        if (free.count as usize + fresh as usize) < pages.len() {
-            return false;
-        }
-        for page in pages.iter_mut() {
-            if free.count > 0 {
-                *page = free.head;
-                free.head = self.load(free.head, 1);
-                free.count -= 1;
-            } else {
-                *page = free.fresh;
-                free.fresh += 1;
+        for taken in 0..pages.len() {
+            match self.room.take_page() {
+                Some(page) => pages[taken] = page,
+                None => {
+                    for &page in &pages[..taken] {
+                        self.room.give_page(page);
+                    }
+                    return false;
+                },
             }
         }
-        self.note_used(&free);
         true
     }
 
-    /// Give pages back to the pool
+    /// Give pages back to the room, each to its extent
     fn give_back(&self, pages: &[u32]) {
         for &page in pages {
             self.drop_values(page);
+            self.room.give_page(page);
         }
-        let mut free = hold(&self.free);
-        for &page in pages {
-            self.store(page, 1, free.head);
-            free.head = page;
-        }
-        free.count += pages.len() as u32;
-        self.note_used(&free);
     }
 
     /// Read a page's count

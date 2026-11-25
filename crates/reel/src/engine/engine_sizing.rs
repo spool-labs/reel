@@ -118,8 +118,8 @@ pub const LANE_JOB_BYTES: u64 = 4 * 1024 + CURSOR_BYTES;
 pub const CURSOR_BYTES: u64 = 256 * 1024;
 /// Bytes a job's stack is planned at
 pub const JOB_STACK_PLAN_BYTES: u64 = 1024 * 1024;
-/// Jobs a store runs beside one seal job a volume: row write-out, reservations and the planner
-pub const SHARED_JOBS: u64 = 3;
+/// Jobs a store runs beside one seal job a volume: row write-out, reservations, the planner and the scrub
+pub const SHARED_JOBS: u64 = 4;
 /// Bytes a row of the write index really takes, node, page and table share included, with a long batch's length of it
 pub const PLANNED_ROW_BYTES: u64 = 227;
 /// A volume seals at this share of what the index holds, in eighths, to keep room for writers in flight. With one

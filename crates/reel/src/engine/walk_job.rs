@@ -1157,11 +1157,21 @@ impl<Backend: Io> WalkWorker<Backend> {
     }
 }
 
+/// Say whether a worker's disk I/O can take the idle class: only while reclaim can wait. Space short, a forced pick or a caller's
+/// rebuild, and a writer held or refused each make the work urgent, and urgent work keeps the default class
+pub fn is_io_idle_for(is_short: bool, is_forced: bool, is_writer_held: bool) -> bool {
+    !(is_short || is_forced || is_writer_held)
+}
+
 impl<Backend: Io> WalkWorker<Backend> {
-    /// Keep the thread's disk I/O in the idle class while reclaim can wait, and in the default class once a volume runs short of
-    /// room, so a caller-busy spinning disk never starves the merges that would free it. One syscall, and only on a change
+    /// Keep the thread's disk I/O in the idle class while reclaim can wait, and in the default class once the work is urgent,
+    /// so a caller-busy spinning disk never starves the merges callers wait on. One syscall, and only on a change
     fn follow_urgency(&mut self) {
-        let is_idle = !self.state.volumes.iter().any(Volume::is_short_of_room);
+        let state = &self.state;
+        let is_short = state.volumes.iter().any(Volume::is_short_of_room);
+        let is_forced = self.rewrite.as_ref().is_some_and(|rewrite| rewrite.forced.is_some() || rewrite.asked_rebuild.is_some());
+        let is_writer_held = state.index_waiters.load(Ordering::Acquire) > 0 || state.volumes.iter().any(|volume| volume.is_room_refused.load(Ordering::Acquire));
+        let is_idle = is_io_idle_for(is_short, is_forced, is_writer_held);
         if is_idle != self.is_io_idle {
             self.state.io.set_io_idle(is_idle);
             self.is_io_idle = is_idle;

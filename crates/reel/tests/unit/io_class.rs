@@ -15,3 +15,13 @@ fn the_idle_class_comes_and_goes() {
     reel::io::plain::set_thread_io_idle(false);
     assert_ne!(class(), 3, "the thread kept the idle class");
 }
+
+// a worker's I/O idles only while reclaim can wait
+#[test]
+fn reclaim_that_can_wait_idles() {
+    use reel::engine::walk_job::is_io_idle_for;
+    assert!(is_io_idle_for(false, false, false), "work no one waits on kept the default class");
+    assert!(!is_io_idle_for(true, false, false), "a volume short of room left its merges idle");
+    assert!(!is_io_idle_for(false, true, false), "a forced pick or a caller's rebuild went idle");
+    assert!(!is_io_idle_for(false, false, true), "a held or refused writer left the merges idle");
+}

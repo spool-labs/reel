@@ -13,7 +13,7 @@ use reel_core::units::{ByteCount, FileOffset, Nanoseconds, WritePlace};
 use crate::engine::engine_state::EngineState;
 use crate::engine::walk_job::FREE_IN_PLACE_BYTES;
 use crate::guard::hold;
-use crate::io::job::JobStep;
+use crate::io::job::{Job, JobStep};
 use crate::engine::scrub_pace::ScrubPace;
 use crate::engine::open_segment::data_path;
 use crate::pool::{TOUCH_BYTE, touched_filled};
@@ -245,7 +245,8 @@ impl<Backend: Io> ScrubJob<Backend> {
             return JobStep::IdleUntil { deadline: Nanoseconds(now.0.saturating_add(wait.max(1))) };
         }
         let Some(segment) = self.segment.or_else(|| self.next_segment(None)) else {
-            self.end_pass(now);
+            // a store with nothing sealed yet has nothing to check, so the scrub looks again soon instead of resting a whole pass
+            self.rest_until = Nanoseconds(now.0.saturating_add(SCRUB_LOOK_PERIOD.0));
             return JobStep::IdleUntil { deadline: self.rest_until };
         };
         self.segment = Some(segment);
@@ -407,4 +408,46 @@ impl<Backend: Io> ScrubJob<Backend> {
 /// Say an error is the device failing the bytes, as a bad sector does. A short read or a refused one is not
 fn is_media_error(error: &std::io::Error) -> bool {
     matches!(error.raw_os_error(), Some(libc::EIO | libc::ENXIO | libc::ENODATA | libc::EBADMSG))
+}
+
+/// How often the scrub's thread looks for work when no scrub named a time, since nothing wakes it the way seals woke the planner
+pub const SCRUB_LOOK_PERIOD: Nanoseconds = Nanoseconds(1_000_000_000);
+
+/// The store's scrubs on a thread of their own, in the idle I/O class. A spinning disk busy with callers holds an idle read back
+/// for seconds, and here that holds back nothing else: the planner keeps the default class and never issues an idle read
+pub struct ScrubRunner<Backend: Io> {
+    pub state: Arc<EngineState<Backend>>,
+    pub scrubs: Vec<ScrubJob<Backend>>,
+    is_idle: bool,
+}
+
+impl<Backend: Io> ScrubRunner<Backend> {
+    /// Run a scrub for every volume
+    pub fn new(state: Arc<EngineState<Backend>>) -> Self {
+        let scrubs = (0..state.volumes.len()).map(|volume| ScrubJob::new(Arc::clone(&state), volume)).collect();
+        Self { state, scrubs, is_idle: false }
+    }
+}
+
+impl<Backend: Io> Job for ScrubRunner<Backend> {
+    fn step(&mut self) -> JobStep {
+        if !self.is_idle {
+            self.state.io.set_io_idle(true);
+            self.is_idle = true;
+        }
+        let now = self.state.io.now();
+        let mut soonest: Option<Nanoseconds> = None;
+        for scrub in &mut self.scrubs {
+            match scrub.step_unit(now) {
+                JobStep::Worked => return JobStep::Worked,
+                JobStep::Idle | JobStep::Finished => {},
+                JobStep::IdleUntil { deadline } => soonest = Some(soonest.map_or(deadline, |other| Nanoseconds(other.0.min(deadline.0)))),
+            }
+        }
+        match soonest {
+            // a scrub at rest ends its rest early when new segments come, which it sees only when stepped
+            Some(deadline) => JobStep::IdleUntil { deadline: Nanoseconds(deadline.0.min(now.0 + SCRUB_LOOK_PERIOD.0)) },
+            None => JobStep::IdleUntil { deadline: Nanoseconds(now.0 + SCRUB_LOOK_PERIOD.0) },
+        }
+    }
 }

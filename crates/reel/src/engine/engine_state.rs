@@ -264,6 +264,8 @@ pub struct EngineState<Backend: Io> {
     pub complete_line_bytes: ByteCount,
     pub seal_tasks: Vec<OnceLock<Backend::Task>>,
     pub planner_task: OnceLock<Backend::Task>,
+    /// The scrub, on its own thread in the idle I/O class
+    pub scrub_task: OnceLock<Backend::Task>,
     pub index_waiters: AtomicU64,
     pub cues: CueTable,
     pub is_stopping: AtomicBool,

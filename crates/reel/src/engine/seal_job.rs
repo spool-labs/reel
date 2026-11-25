@@ -602,6 +602,10 @@ impl<Backend: Io> SealJob<Backend> {
         if let Some(task) = self.state.planner_task.get() {
             task.wake();
         }
+        // a new segment ends the scrub's rest between passes
+        if let Some(task) = self.state.scrub_task.get() {
+            task.wake();
+        }
         self.end_step(|steps| &steps.install);
         self.phase = SealPhase::Cleaning;
     }

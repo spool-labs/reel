@@ -546,7 +546,6 @@ fn turn_with(seed: Seed) {
         walks,
         compactions: vec![CompactJob::new(store.state.clone(), 0), CompactJob::new(store.state.clone(), 1)],
         filters: Vec::new(),
-        scrubs: Vec::new(),
         last: 0,
     };
 
@@ -662,7 +661,6 @@ fn stands_aside_for_seals() {
         walks: vec![WalkJob::new(store.state.clone(), 0)],
         compactions: vec![CompactJob::new(store.state.clone(), 0)],
         filters: Vec::new(),
-        scrubs: Vec::new(),
         last: 0,
     };
     assert!(!planner.is_seal_first());

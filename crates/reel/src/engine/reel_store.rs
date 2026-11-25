@@ -55,7 +55,7 @@ use crate::engine::compact_job::{CompactJob, park};
 use crate::engine::cue::{Cue, CueTable};
 use crate::engine::filter_job::FilterLoader;
 use crate::engine::planner::Planner;
-use crate::engine::scrub_job::ScrubJob;
+use crate::engine::scrub_job::ScrubRunner;
 use crate::engine::walk_job::{BlockCounter, WalkJob, WalkSlot, WalkWorker};
 use crate::engine::workers::Workers;
 use crate::engine::load_state::{LoadCell, PACE_PER_MILLE, PaceCell, SPACE_TARGET_PER_MILLE};
@@ -724,6 +724,9 @@ impl<Backend: Io> EngineState<Backend> {
         if let Some(task) = self.planner_task.get() {
             task.ask_stop();
         }
+        if let Some(task) = self.scrub_task.get() {
+            task.ask_stop();
+        }
         for cell in &self.seal_tasks {
             if let Some(task) = cell.get() {
                 task.ask_stop();
@@ -747,6 +750,9 @@ impl<Backend: Io> EngineState<Backend> {
         }
         self.workers.stop()?;
         if let Some(task) = self.planner_task.get() {
+            task.stop()?;
+        }
+        if let Some(task) = self.scrub_task.get() {
             task.stop()?;
         }
         for cell in &self.seal_tasks {
@@ -978,11 +984,13 @@ pub fn start_jobs<Backend: Io>(state: &Arc<EngineState<Backend>>) -> Result<(), 
         walks,
         compactions,
         filters: (0..state.volumes.len()).map(|volume| FilterLoader::new(Arc::clone(state), volume)).collect(),
-        scrubs: (0..state.volumes.len()).map(|volume| ScrubJob::new(Arc::clone(state), volume)).collect(),
         last: 0,
     };
     let task = state.io.spawn_job("reel-planner", planner).map_err(open_error("starting a job"))?;
     let _set = state.planner_task.set(task);
+    // the scrub runs apart from the planner, in the idle I/O class, so a read the disk holds back holds up no planning
+    let task = state.io.spawn_job("reel-scrub", ScrubRunner::new(Arc::clone(state))).map_err(open_error("starting a job"))?;
+    let _set = state.scrub_task.set(task);
     let reserve_job = ReserveJob::new(Arc::clone(state));
     let task = state.io.spawn_job("reel-reserve", reserve_job).map_err(open_error("starting a job"))?;
     let _set = state.reserve_task.set(task);
@@ -1727,6 +1735,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> Result<Engin
         complete_images: Vec::new(),
         seal_tasks,
         planner_task: OnceLock::new(),
+        scrub_task: OnceLock::new(),
         index_waiters: AtomicU64::new(0),
         cues: CueTable::new(config.volumes.len()),
         is_stopping: AtomicBool::new(false),

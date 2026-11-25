@@ -136,7 +136,7 @@ fn scan(index: &SortedKeys, width: usize, is_descending: bool, start: Option<(Ve
 
 fn run_seed(seed: u64, width: usize, is_many: bool, keys: u64, row_count: u64) {
     let mut mixer = Mixer(seed);
-    let index = SortedKeys::new(width, RowCount(keys));
+    let index = SortedKeys::new(width, RowCount(keys)).expect("build index");
     let rows = rows_of(&mut mixer, row_count, keys);
     let floors = floors_of(&rows);
     let mut model = BTreeMap::new();
@@ -238,7 +238,7 @@ fn matches_the_model_in_runs() {
 // a grave sealed before an older value of its key keeps the value out, until the floor passes it
 #[test]
 fn a_grave_holds_back_an_older_value() {
-    let index = SortedKeys::new(16, RowCount(100));
+    let index = SortedKeys::new(16, RowCount(100)).expect("build index");
     let key = [9; 16];
     assert_eq!(index.upsert(&key, entry(20, true), Floors::at(WritePlace(10))), Upserted::Added);
     assert_eq!(index.upsert(&key, entry(10, false), Floors::at(WritePlace(11))), Upserted::Kept);
@@ -252,7 +252,7 @@ fn a_grave_holds_back_an_older_value() {
 #[test]
 fn keys_in_order_fill_their_leaves() {
     let rows = 50_000;
-    let index = SortedKeys::new(16, RowCount(rows));
+    let index = SortedKeys::new(16, RowCount(rows)).expect("build index");
     for key in 0..rows {
         let mut bytes = [0; 16];
         bytes[8..].copy_from_slice(&key.to_be_bytes());
@@ -267,7 +267,7 @@ fn keys_in_order_fill_their_leaves() {
 // a pool with no page left marks the row's segment, and a clear after a refill takes the mark away
 #[test]
 fn past_capacity_sets_a_mark() {
-    let index = SortedKeys::new(16, RowCount(1));
+    let index = SortedKeys::new(16, RowCount(1)).expect("build index");
     let mut no_room = None;
     for key in 0..1_000_000u64 {
         let mut bytes = [0; 16];
@@ -304,7 +304,7 @@ fn ordered_key(key: u64) -> [u8; 16] {
 // a full leaf keeps its graves over the floor when it makes room, and drops the ones under it
 #[test]
 fn a_full_leaf_drops_only_graves_under_the_floor() {
-    let index = SortedKeys::new(16, RowCount(10_000));
+    let index = SortedKeys::new(16, RowCount(10_000)).expect("build index");
     let capacity = index.leaf_capacity() as u64;
     for key in 0..capacity {
         assert_eq!(index.upsert(&ordered_key(key), entry(1_000 + key, true), Floors::at(WritePlace(0))), Upserted::Added);
@@ -315,7 +315,7 @@ fn a_full_leaf_drops_only_graves_under_the_floor() {
     }
     assert_eq!(index.check(), Ok(()));
 
-    let index = SortedKeys::new(16, RowCount(10_000));
+    let index = SortedKeys::new(16, RowCount(10_000)).expect("build index");
     for key in 0..capacity {
         index.upsert(&ordered_key(key), entry(key + 1, true), Floors::at(WritePlace(0)));
     }
@@ -328,7 +328,7 @@ fn a_full_leaf_drops_only_graves_under_the_floor() {
 // a root left with one child folds into it
 #[test]
 fn a_root_with_one_child_folds() {
-    let index = SortedKeys::new(16, RowCount(10_000));
+    let index = SortedKeys::new(16, RowCount(10_000)).expect("build index");
     let capacity = index.leaf_capacity() as u64;
     for key in 0..2 * capacity {
         index.upsert(&ordered_key(key), entry(key + 1, false), Floors::at(WritePlace(0)));
@@ -342,7 +342,7 @@ fn a_root_with_one_child_folds() {
 // a scan over a run of graves stops after a fixed count of entries and goes on from the last one it looked at
 #[test]
 fn a_scan_over_graves_stops_and_goes_on() {
-    let index = SortedKeys::new(16, RowCount(10_000));
+    let index = SortedKeys::new(16, RowCount(10_000)).expect("build index");
     let graves = 1_000;
     for key in 0..graves {
         index.upsert(&ordered_key(key), entry(key + 1, true), Floors::at(WritePlace(0)));
@@ -371,7 +371,7 @@ fn a_scan_over_graves_stops_and_goes_on() {
 // two versions of a key in one run, newest first as a seal hands them over, leave one entry
 #[test]
 fn a_run_with_two_versions_of_a_key_keeps_one_entry() {
-    let index = SortedKeys::new(16, RowCount(10_000));
+    let index = SortedKeys::new(16, RowCount(10_000)).expect("build index");
     index.upsert(&ordered_key(0), entry(1, false), Floors::at(WritePlace(0)));
     let mut keys = Vec::new();
     let mut entries = Vec::new();
@@ -393,7 +393,7 @@ fn a_run_with_two_versions_of_a_key_keeps_one_entry() {
 // flag, both ways
 #[test]
 fn starts_of_another_width() {
-    let index = SortedKeys::new(4, RowCount(100));
+    let index = SortedKeys::new(4, RowCount(100)).expect("build index");
     let stored = [[1, 2, 0, 0], [1, 2, 3, 4], [1, 2, 3, 5]];
     for (place, key) in stored.iter().enumerate() {
         index.upsert(key, entry(place as u64 + 1, false), Floors::at(WritePlace(0)));
@@ -420,7 +420,7 @@ fn starts_of_another_width() {
 // a width that fills no whole word packs a long start's extra bytes into the last word's padding, and orders it all the same
 #[test]
 fn starts_past_a_part_word() {
-    let index = SortedKeys::new(6, RowCount(100));
+    let index = SortedKeys::new(6, RowCount(100)).expect("build index");
     let stored = [[1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 7]];
     for (place, key) in stored.iter().enumerate() {
         index.upsert(key, entry(place as u64 + 1, false), Floors::at(WritePlace(0)));
@@ -443,8 +443,32 @@ fn starts_past_a_part_word() {
 #[test]
 fn planned_bytes_match_the_built_index() {
     for (width, rows) in [(8, 1_000), (16, 100_000), (17, 2_000_000), (64, 300_000)] {
-        let index = SortedKeys::new(width, RowCount(rows));
+        let index = SortedKeys::new(width, RowCount(rows)).expect("build index");
         assert_eq!(reel::index::sorted_keys::planned_index_bytes(width, RowCount(rows)), index.heap_bytes(), "{width} B keys, {rows} rows");
     }
 }
 
+
+// a fresh index fills the pages it starts with, takes no row past them, and takes rows again once its room grows, every one found
+#[test]
+fn fresh_index_grows_with_its_room() {
+    let rows = 200_000u64;
+    let index = SortedKeys::growing(16, RowCount(rows), RowCount(0)).expect("build index");
+    let start = index.page_count();
+    assert!(start < index.room().reserved() as u32 / 4096 / 2, "a fresh index started with {start} pages");
+    let mut first_miss = None;
+    for key in 0..rows {
+        if index.upsert(&ordered_key(key), entry(key + 1, false), Floors::at(WritePlace(0))) == Upserted::NoRoom {
+            first_miss = Some(key);
+            break;
+        }
+    }
+    let first_miss = first_miss.expect("the first part held every row");
+    index.room().grow_to(index.room().reserved()).expect("grow");
+    assert!(index.page_count() > start);
+    for key in first_miss..rows {
+        assert_eq!(index.upsert(&ordered_key(key), entry(key + 1, false), Floors::at(WritePlace(0))), Upserted::Added);
+    }
+    assert_eq!(index.check(), Ok(()));
+    assert!((0..rows).all(|key| index.find(&ordered_key(key)).is_some()));
+}

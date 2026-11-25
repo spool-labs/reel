@@ -153,7 +153,9 @@ impl<Backend: Io> ReelStore<Backend> {
         let (sizing, sorted_sizes) = size_sorted_indexes(config, &sizing, &summaries);
         let mut state = build_state(OpenInputs { io, config, sizing: &sizing, disks: &disks, superblock, locks, scan: &scan, summaries }).map_err(open_error("reserving the write index"))?;
         state.complete = complete_tables(config);
-        state.sorted = sorted_indexes(config, &sorted_sizes);
+        state.sorted = sorted_indexes(config, &sorted_sizes, false).map_err(open_error("reserving a sorted index"))?;
+        let sorted_rooms: Vec<_> = state.sorted.iter().flatten().map(|index| index.room().clone()).collect();
+        state.pool_rooms.extend(sorted_rooms);
         state.sorted_sizes = sorted_sizes;
         state.complete_images = complete_images(config);
         state.attach_ring(ring);
@@ -1937,6 +1939,8 @@ pub struct SortedSize {
     pub asked: ByteCount,
     pub got: ByteCount,
     pub rows: RowCount,
+    /// The column's rows on disk at open, which size the part of the index that starts in memory
+    pub disk_rows: RowCount,
     /// Value pages its leaves keep values in: its share of the held values by the rows it holds
     pub value_pages: u32,
 }
@@ -1992,7 +1996,7 @@ pub fn size_sorted_indexes(config: &StoreConfig, sizing: &EngineSizing, summarie
         // the caches give up what the pool holds, which a grant rounds down to
         let held = if rows.0 == 0 { 0 } else { planned_index_bytes(width, rows).0 };
         taken += held;
-        sizes[column.id.0 as usize] = Some(SortedSize { asked, got: ByteCount(held), rows, value_pages: 0 });
+        sizes[column.id.0 as usize] = Some(SortedSize { asked, got: ByteCount(held), rows, disk_rows: RowCount(rows_on_disk[column.id.0 as usize]), value_pages: 0 });
     }
     // in a store of sorted columns the spot share pays first, and what it has left goes to the block and record caches
     let (from_caches, to_caches) = if is_all_sorted { (taken.saturating_sub(spot), spot.saturating_sub(taken)) } else { (taken, 0) };
@@ -2017,7 +2021,7 @@ pub fn size_sorted_indexes(config: &StoreConfig, sizing: &EngineSizing, summarie
 }
 
 /// Allocate and touch each sorted column's index at the rows open sized it for
-pub fn sorted_indexes(config: &StoreConfig, sizes: &[Option<SortedSize>]) -> Vec<Option<SortedKeys>> {
+pub fn sorted_indexes(config: &StoreConfig, sizes: &[Option<SortedSize>], is_read_only: bool) -> Result<Vec<Option<SortedKeys>>, Error> {
     let mut indexes: Vec<Option<SortedKeys>> = (0..MAX_COLUMNS).map(|_column| None).collect();
     // every index's share of value pages goes in one pool, so the columns walks read take what the others leave, and each index
     // may always take its own share
@@ -2031,10 +2035,12 @@ pub fn sorted_indexes(config: &StoreConfig, sizes: &[Option<SortedSize>]) -> Vec
         .collect();
     let pool = Arc::new(ValuePages::shared(pages, &floors));
     for (sharer, (column, size)) in sized.into_iter().enumerate() {
-        let index = SortedKeys::new(column.key_shape.widest(), size.rows).holding_values(Arc::clone(&pool), (sharer, sharer == 0));
+        // a reader runs no reserve job, so its index starts whole
+        let first_rows = if is_read_only { size.rows } else { size.disk_rows };
+        let index = SortedKeys::growing(column.key_shape.widest(), size.rows, first_rows)?.holding_values(Arc::clone(&pool), (sharer, sharer == 0));
         indexes[column.id.0 as usize] = Some(index);
     }
-    indexes
+    Ok(indexes)
 }
 
 /// Name each complete column's image files and allocate its buffer

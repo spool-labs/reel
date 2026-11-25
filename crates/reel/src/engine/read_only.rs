@@ -61,7 +61,7 @@ pub fn try_load<Backend: Io>(io: &Backend, config: &StoreConfig) -> Result<Arc<E
     let (sizing, sorted_sizes) = size_sorted_indexes(config, &sizing, &summaries);
     let mut state = build_state(OpenInputs { io: io.clone(), config, sizing: &sizing, disks: &disks, superblock, locks, scan: &scan, summaries }).map_err(open_error("reserving the write index"))?;
     state.is_read_only = true;
-    state.sorted = sorted_indexes(config, &sorted_sizes);
+    state.sorted = sorted_indexes(config, &sorted_sizes, true).map_err(open_error("reserving a sorted index"))?;
     state.sorted_sizes = sorted_sizes;
     let state = Arc::new(state);
     let outcome = bring_up_read_only(&state, &mut scan);

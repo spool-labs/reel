@@ -6,7 +6,6 @@
 //! one part to another through the pool with no unsafe code. Keys are packed big-endian into words, so a word compare orders them.
 
 use std::cmp::Ordering;
-use std::hint::black_box;
 use std::sync::{Arc, Mutex, RwLockWriteGuard};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as Memory};
 
@@ -14,11 +13,14 @@ use reel_core::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
 use crate::guard::{Shards, hold};
 use crate::index::value_pages::{HeldChain, NO_VALUE_PAGE, ValuePages};
-use crate::pool::{ask_huge_pages, touched_capacity};
+use crate::pool::touched_capacity;
+use crate::pool_room::{FIRST_PART_DIVISOR, PoolRoom};
 use crate::segment::segment_tail::SegmentNumber;
 
 /// Words of one page
 pub const PAGE_WORDS: usize = 1024;
+/// Bytes in one page
+pub const PAGE_BYTES: usize = PAGE_WORDS * size_of::<AtomicU32>();
 /// The span of an entry that came with no held value
 pub const NO_HELD: HeldRef = HeldRef { chain: HeldChain::NONE, slot: u32::MAX };
 
@@ -149,6 +151,8 @@ pub struct PartTree {
 pub struct FreePages {
     pub head: u32,
     pub count: u32,
+    /// The first page never handed out. Pages below it are in memory
+    pub fresh: u32,
 }
 
 /// Where a scan starts
@@ -192,7 +196,9 @@ pub struct SortedKeys {
     leaf_capacity: usize,
     inner_stride: usize,
     inner_capacity: usize,
-    words: Vec<AtomicU32>,
+    /// The pages' words, reserved for every page the index can grow to
+    room: Arc<PoolRoom>,
+    most_pages: u32,
     free: Mutex<FreePages>,
     parts: Shards<PartTree>,
     /// Each part's entry count, set under its lock, so a scan passes an empty part with no lock taken
@@ -320,8 +326,14 @@ impl KeyBatch {
 }
 
 impl SortedKeys {
-    /// Allocate and touch an index with room for these rows of keys this wide
-    pub fn new(width: usize, rows: RowCount) -> Self {
+    /// Build an index with room for these rows of keys this wide, all of it in memory
+    pub fn new(width: usize, rows: RowCount) -> std::io::Result<Self> {
+        Self::growing(width, rows, rows)
+    }
+
+    /// Build an index with room for these rows of keys this wide, with the pages for its first rows in memory: twice the rows it
+    /// starts with, and at least an eighth of its room. The rest comes in as the reserve job grows it
+    pub fn growing(width: usize, rows: RowCount, first_rows: RowCount) -> std::io::Result<Self> {
         assert!((1..=MOST_KEY_BYTES).contains(&width), "a sorted index holds keys of 1 to {MOST_KEY_BYTES} bytes");
         let key_words = width.div_ceil(size_of::<u32>());
         let leaf_stride = key_words + ENTRY_TAIL_WORDS;
@@ -329,15 +341,19 @@ impl SortedKeys {
         let leaf_capacity = (PAGE_WORDS - HEAD_WORDS) / leaf_stride;
         let inner_capacity = (PAGE_WORDS - HEAD_WORDS) / inner_stride;
         let pages = planned_pages(width, rows);
-        Self {
+        let first = if first_rows >= rows { pages } else { planned_pages(width, RowCount(first_rows.0.saturating_mul(2))).max(pages / FIRST_PART_DIVISOR as u32).min(pages) };
+        let bytes = |count: u32| ByteCount(u64::from(count) * PAGE_BYTES as u64);
+        let room = PoolRoom::reserve(bytes(pages), bytes(first))?;
+        Ok(Self {
             width,
             key_words,
             leaf_stride,
             leaf_capacity,
             inner_stride,
             inner_capacity,
-            words: touched_words(pages as usize * PAGE_WORDS),
-            free: Mutex::new(chain_pages(pages)),
+            room: Arc::new(room),
+            most_pages: pages,
+            free: Mutex::new(FreePages { head: NO_PAGE, count: 0, fresh: 0 }),
             parts: Shards((0..PARTS).map(|_part| std::sync::RwLock::new(PartTree::empty())).collect()),
             filled: (0..PARTS).map(|_part| AtomicU64::new(0)).collect(),
             entries: AtomicU64::new(0),
@@ -348,18 +364,24 @@ impl SortedKeys {
             owns_values: false,
             sharer: 0,
             told_rows: rows,
-        }
-        .chained()
+        })
     }
 
-    /// Write the free chain into the pages
-    fn chained(self) -> Self {
-        let count = hold(&self.free).count;
-        for page in 0..count {
-            let next = if page + 1 == count { NO_PAGE } else { page + 1 };
-            self.store(page, 1, next);
-        }
-        self
+    /// Read the room, which the growing job raises
+    pub fn room(&self) -> &Arc<PoolRoom> {
+        &self.room
+    }
+
+    /// Read every word of the pages the index can grow to. Only pages handed out are read or written, and all of those are in memory
+    fn words(&self) -> &[AtomicU32] {
+        // SAFETY: the room is reserved for this many pages, readable and writable, and zero until written; a page past the limit is
+        // never handed out, so no access reaches it while the growing job brings it in
+        unsafe { std::slice::from_raw_parts(self.room.base().cast::<AtomicU32>(), self.most_pages as usize * PAGE_WORDS) }
+    }
+
+    /// Note the bytes of the pages in use, so the growing job sees the fill
+    fn note_used(&self, free: &FreePages) {
+        self.room.note_used((free.fresh - free.count) as usize * PAGE_BYTES);
     }
 
     /// Read the width of the index's keys
@@ -374,17 +396,18 @@ impl SortedKeys {
 
     /// Read the heap the index holds
     pub fn heap_bytes(&self) -> ByteCount {
-        ByteCount((self.words.capacity() * size_of::<AtomicU32>()) as u64 + if self.owns_values { self.values.heap_bytes().0 } else { 0 })
+        ByteCount(u64::from(self.page_count()) * PAGE_BYTES as u64 + if self.owns_values { self.values.heap_bytes().0 } else { 0 })
     }
 
     /// Count the pages the pool has
     pub fn page_count(&self) -> u32 {
-        (self.words.len() / PAGE_WORDS) as u32
+        ((self.room.committed() / PAGE_BYTES) as u32).min(self.most_pages)
     }
 
     /// Count the pages no part holds
     pub fn free_pages(&self) -> u32 {
-        hold(&self.free).count
+        let free = hold(&self.free);
+        free.count + self.page_count().saturating_sub(free.fresh)
     }
 
     /// Read the levels of the deepest part, for tests
@@ -1443,7 +1466,7 @@ impl SortedKeys {
     fn leaf_view(&self, leaf: u32, batch: &KeyBatch) -> LeafView<'_> {
         let start = leaf as usize * PAGE_WORDS;
         let chain = if batch.is_with_values { self.chain_of(leaf) } else { HeldChain::NONE };
-        LeafView { words: &self.words[start..start + PAGE_WORDS], chain }
+        LeafView { words: &self.words()[start..start + PAGE_WORDS], chain }
     }
 
     /// Read an entry
@@ -1583,14 +1606,21 @@ impl SortedKeys {
     /// Take pages from the pool, all or none
     fn take_pages(&self, pages: &mut [u32]) -> bool {
         let mut free = hold(&self.free);
-        if (free.count as usize) < pages.len() {
+        let fresh = self.page_count().saturating_sub(free.fresh);
+        if (free.count as usize + fresh as usize) < pages.len() {
             return false;
         }
         for page in pages.iter_mut() {
-            *page = free.head;
-            free.head = self.load(free.head, 1);
+            if free.count > 0 {
+                *page = free.head;
+                free.head = self.load(free.head, 1);
+                free.count -= 1;
+            } else {
+                *page = free.fresh;
+                free.fresh += 1;
+            }
         }
-        free.count -= pages.len() as u32;
+        self.note_used(&free);
         true
     }
 
@@ -1605,6 +1635,7 @@ impl SortedKeys {
             free.head = page;
         }
         free.count += pages.len() as u32;
+        self.note_used(&free);
     }
 
     /// Read a page's count
@@ -1640,12 +1671,12 @@ impl SortedKeys {
 
     /// Read a word of a page
     fn load(&self, page: u32, at: usize) -> u32 {
-        self.words[page as usize * PAGE_WORDS + at].load(Memory::Relaxed)
+        self.words()[page as usize * PAGE_WORDS + at].load(Memory::Relaxed)
     }
 
     /// Write a word of a page
     fn store(&self, page: u32, at: usize, word: u32) {
-        self.words[page as usize * PAGE_WORDS + at].store(word, Memory::Relaxed);
+        self.words()[page as usize * PAGE_WORDS + at].store(word, Memory::Relaxed);
     }
 }
 
@@ -1675,27 +1706,6 @@ impl EntryWords {
 /// Read the part a packed key sits in
 fn first_byte(key: &PackedKey) -> usize {
     (key.words[0] >> 24) as usize
-}
-
-/// Chain every page into the free list
-fn chain_pages(pages: u32) -> FreePages {
-    FreePages {
-        head: if pages == 0 { NO_PAGE } else { 0 },
-        count: pages,
-    }
-}
-
-/// Allocate words with every page written, and huge pages asked for first
-fn touched_words(length: usize) -> Vec<AtomicU32> {
-    let mut words: Vec<AtomicU32> = Vec::with_capacity(length);
-    ask_huge_pages(words.as_mut_ptr(), length);
-    black_box(words.as_mut_ptr());
-    words.resize_with(length, || AtomicU32::new(u32::MAX));
-    for word in &words {
-        word.store(0, Memory::Relaxed);
-    }
-    black_box(words.as_ptr());
-    words
 }
 
 /// Work out the pages an index for these rows of keys this wide holds

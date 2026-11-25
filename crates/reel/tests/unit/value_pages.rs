@@ -118,7 +118,7 @@ mod in_an_index {
     // replaced since its fill, or a leaf split under it, answers nothing until filled again
     #[test]
     fn held_answers_are_always_the_entrys_row() {
-        let index = SortedKeys::new(WIDTH, RowCount(KEYS * 2)).holding_values(std::sync::Arc::new(reel::index::value_pages::ValuePages::new(8)), (0, true));
+        let index = SortedKeys::new(WIDTH, RowCount(KEYS * 2)).expect("build index").holding_values(std::sync::Arc::new(reel::index::value_pages::ValuePages::new(8)), (0, true));
         for number in 0..KEYS {
             index.upsert(&key(number), entry(row(number, 0)), Floors::at(WritePlace(0)));
         }
@@ -167,7 +167,7 @@ mod in_an_index {
     // matches answers nothing for a row the entry no longer names, or for a neighbour's slot
     #[test]
     fn a_noted_spot_never_answers_a_neighbour() {
-        let index = SortedKeys::new(WIDTH, RowCount(64)).holding_values(std::sync::Arc::new(reel::index::value_pages::ValuePages::new(8)), (0, true));
+        let index = SortedKeys::new(WIDTH, RowCount(64)).expect("build index").holding_values(std::sync::Arc::new(reel::index::value_pages::ValuePages::new(8)), (0, true));
         let (first, second) = (part_key(7, 10), part_key(7, 20));
         index.upsert(&first, entry(row(1, 0)), Floors::at(WritePlace(0)));
         index.upsert(&second, entry(row(2, 0)), Floors::at(WritePlace(0)));

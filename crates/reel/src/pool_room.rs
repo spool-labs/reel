@@ -793,6 +793,32 @@ fn take_pages_back(start: *mut u8, bytes: usize) {
     let _unused = (start, bytes);
 }
 
+/// Hand the whole pages inside a buffer back to the kernel, and return the bytes given. The caller holds every reader and writer of
+/// the buffer off until it takes them back with take_back_buffer and fills them again
+pub fn give_back_buffer(start: *mut u8, bytes: usize) -> usize {
+    let Some((first, length)) = whole_pages(start, bytes) else {
+        return 0;
+    };
+    give_pages_back(first, length);
+    length
+}
+
+/// Ready the whole pages of a buffer given back for use, before the caller fills them again
+pub fn take_back_buffer(start: *mut u8, bytes: usize) {
+    if let Some((first, length)) = whole_pages(start, bytes) {
+        take_pages_back(first, length);
+    }
+}
+
+/// Find the whole pages a buffer covers, if it covers any
+fn whole_pages(start: *mut u8, bytes: usize) -> Option<(*mut u8, usize)> {
+    let page = crate::region::page_bytes();
+    let begin = (start as usize).next_multiple_of(page);
+    let end = (start as usize + bytes) / page * page;
+    // the pointer keeps the buffer's provenance, so the kernel gets an address inside it
+    (end > begin).then(|| (start.wrapping_add(begin - start as usize), end - begin))
+}
+
 /// Close an extent to every access while it is out of memory, in debug builds, so a stray touch stops the test, and open it again
 /// before it comes back
 fn guard_extent(base: *mut u8, start: usize, bytes: usize, is_open: bool) {

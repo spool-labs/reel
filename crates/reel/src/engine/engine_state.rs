@@ -218,6 +218,8 @@ pub struct EngineState<Backend: Io> {
     pub sorted_drops: AtomicU64,
     /// Dropped sorted indexes a refill brought back, since open
     pub sorted_refills: AtomicU64,
+    /// Shards of the spot index and the block caches the ladder gave back, since open
+    pub cache_shards_given: AtomicU64,
     /// Held by a drop of a sorted index and by the end of its refill with the recount, so a column's counts stop and start in the
     /// order its index leaves and comes back
     pub sorted_drop_lock: Mutex<()>,
@@ -835,6 +837,9 @@ impl<Backend: Io> EngineState<Backend> {
             pressed_steps: self.pressed_steps.load(Ordering::Relaxed),
             sorted_drops: self.sorted_drops.load(Ordering::Relaxed),
             sorted_refills: self.sorted_refills.load(Ordering::Relaxed),
+            spot_absent_shards: self.spot.absent_shards() as u64,
+            block_absent_shards: (self.row_cache.absent_shards() + self.filter_cache.absent_shards() + self.complete_cache.as_ref().map_or(0, BlockCache::absent_shards)) as u64,
+            cache_shards_given: self.cache_shards_given.load(Ordering::Relaxed),
             write_index: self.index.heap_bytes(),
             spot_cache: self.spot.heap_bytes(),
             record_cache: self.record_cache.heap_bytes(),

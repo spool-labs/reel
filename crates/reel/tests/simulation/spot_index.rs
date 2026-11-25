@@ -73,3 +73,33 @@ fn hot_keys() {
     let streamed = KEYS - HOT_KEYS;
     assert!(hot_hits * 10 > streamed * 9);
 }
+
+// a shard given back answers no lookup and keeps no insert, and it comes back empty and takes keys again
+#[test]
+fn a_shard_given_back_reads_as_missing_and_comes_back_empty() {
+    let index = SpotIndex::new(ByteCount(16 * 1024 * 1024));
+    for number in 0..10_000 {
+        index.insert(hash_of(number), &location(number));
+    }
+    let held: Vec<u64> = (0..10_000).filter(|number| index.lookup(hash_of(*number)).is_some()).collect();
+    assert!(held.len() > 9_000);
+    let mut given = 0;
+    for shard in 0..index.shard_count() {
+        given += index.give_back_shard(shard);
+    }
+    assert!(given > 0, "no page went back");
+    assert_eq!(index.absent_shards(), index.shard_count());
+    for &number in &held {
+        assert_eq!(index.lookup(hash_of(number)), None, "an absent shard answered");
+        index.insert(hash_of(number), &location(number + 1));
+        index.insert_newer(hash_of(number), &location(number + 2));
+        index.remove_older(hash_of(number), WritePlace(number + 3));
+    }
+    for shard in 0..index.shard_count() {
+        assert!(index.bring_back_shard(shard));
+    }
+    assert_eq!(index.absent_shards(), 0);
+    assert!(held.iter().all(|number| index.lookup(hash_of(*number)).is_none()), "a shard came back with old keys");
+    index.insert(hash_of(held[0]), &location(held[0]));
+    assert_eq!(index.lookup(hash_of(held[0])), Some(location(held[0])));
+}

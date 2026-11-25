@@ -58,7 +58,7 @@ fn writers_keep_their_tails(codec: Codec) {
     let root = std::env::temp_dir().join(format!("reel-large-writers-{codec:?}-{}", process::id()));
     let _gone = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).expect("root");
-    let store = ReelStore::open(PlainIo::new(), &config(&root, codec)).expect("open");
+    let store = ReelStore::open(PlainIo::for_tests(), &config(&root, codec)).expect("open");
     std::thread::scope(|scope| {
         for writer in 0..WRITERS {
             let store = &store;

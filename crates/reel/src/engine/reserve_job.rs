@@ -18,6 +18,8 @@ use crate::pool::touched_filled;
 use crate::pool_room::{GrowPolicy, decay_nanos, grow_policy};
 use crate::io::host_memory::{HostMemory, PRESSURE_READ_MARK};
 use crate::index::value_pages::VALUE_PAGE_BYTES;
+use crate::index::spot_index::SpotIndex;
+use crate::segment::block_cache::BlockCache;
 use reel_core::memory_report::PressureSource;
 use crate::segment::segment_tail::SegmentNumber;
 
@@ -192,7 +194,8 @@ impl<Backend: Io> ReserveJob<Backend> {
     /// Read the memory the store holds now: what lies outside its rooms, measured at open, and every room's bytes in memory
     pub fn held_bytes(&self) -> u64 {
         let rooms: u64 = self.state.pool_rooms.iter().map(|room| room.committed() as u64).sum();
-        self.state.fixed_heap.load(Ordering::Acquire) + rooms
+        // the heap measured at open counts the whole caches, whose shards given back hold no memory
+        (self.state.fixed_heap.load(Ordering::Acquire) + rooms).saturating_sub(caches_given_back(&self.state))
     }
 
     /// Walk the ladder down to the store's memory target when it holds more, lift the caps once it has held well under the target
@@ -245,6 +248,8 @@ impl<Backend: Io> ReserveJob<Backend> {
                 // a dropped index comes back once the store has room past the decay for every row it held, and the compact job
                 // refills it
                 let room = (target - held).min(host_left(&memory));
+                // the whole caches come back first, empty, and fill from reads
+                let room = room.saturating_sub(bring_back_caches(state, room));
                 for index in state.sorted.iter().flatten().filter(|index| index.is_dropped()) {
                     let rows = RowCount(index.past_capacity().0 + index.entry_count().0);
                     let may = pressed.is_none() && planned_index_bytes(index.width(), rows).0 <= room;
@@ -286,6 +291,11 @@ impl<Backend: Io> ReserveJob<Backend> {
             }
             // an extent waiting on its readers is out of the room's count already, so what is still over comes from the count
             over = self.held_bytes().saturating_sub(target) as usize;
+        }
+        // the spot index and the block caches go next, a shard at a time: a miss reads the segment again, and they fill again from
+        // reads once the decay brings them back
+        if over > 0 {
+            over = over.saturating_sub(give_back_caches(state, over));
         }
         if over > 0 {
             for room in state.pool_rooms.iter().filter(|room| room.is_paged()) {
@@ -363,4 +373,112 @@ impl<Backend: Io> Job for ReserveJob<Backend> {
             deadline: Nanoseconds(now.0 + if self.state.is_host_tight.load(Ordering::Acquire) { TIGHT_PERIOD.0 } else { RESERVE_PERIOD.0 }),
         }
     }
+}
+
+/// A cache the ladder gives up a shard at a time and brings back once the store has room. A miss reads the segment again, so
+/// nothing but speed waits on it, and it fills again from reads and seals
+pub trait WholeCache {
+    /// Give a shard's pages back, and return the bytes given
+    fn give_back_shard(&self, shard: usize) -> usize;
+    /// Bring a shard back empty, and say whether it was absent
+    fn bring_back_shard(&self, shard: usize) -> bool;
+    /// Count the shards given back
+    fn absent_shards(&self) -> usize;
+    /// Read the bytes one shard takes
+    fn shard_bytes(&self) -> usize;
+    /// Count the shards
+    fn shard_count(&self) -> usize;
+}
+
+impl WholeCache for SpotIndex {
+    fn give_back_shard(&self, shard: usize) -> usize {
+        SpotIndex::give_back_shard(self, shard)
+    }
+
+    fn bring_back_shard(&self, shard: usize) -> bool {
+        SpotIndex::bring_back_shard(self, shard)
+    }
+
+    fn absent_shards(&self) -> usize {
+        SpotIndex::absent_shards(self)
+    }
+
+    fn shard_bytes(&self) -> usize {
+        SpotIndex::shard_bytes(self)
+    }
+
+    fn shard_count(&self) -> usize {
+        SpotIndex::shard_count(self)
+    }
+}
+
+impl WholeCache for BlockCache {
+    fn give_back_shard(&self, shard: usize) -> usize {
+        BlockCache::give_back_shard(self, shard)
+    }
+
+    fn bring_back_shard(&self, shard: usize) -> bool {
+        BlockCache::bring_back_shard(self, shard)
+    }
+
+    fn absent_shards(&self) -> usize {
+        BlockCache::absent_shards(self)
+    }
+
+    fn shard_bytes(&self) -> usize {
+        BlockCache::shard_bytes(self)
+    }
+
+    fn shard_count(&self) -> usize {
+        BlockCache::shard_count(self)
+    }
+}
+
+/// List the caches the ladder gives up whole, the spot index first
+pub fn whole_caches<Backend: Io>(state: &EngineState<Backend>) -> impl Iterator<Item = &dyn WholeCache> {
+    let fixed: [&dyn WholeCache; 3] = [&state.spot, &state.row_cache, &state.filter_cache];
+    fixed.into_iter().chain(state.complete_cache.as_ref().map(|cache| cache as &dyn WholeCache))
+}
+
+/// Read the bytes the whole caches have given back, which the heap measured at open still counts
+pub fn caches_given_back<Backend: Io>(state: &EngineState<Backend>) -> u64 {
+    whole_caches(state).map(|cache| (cache.absent_shards() * cache.shard_bytes()) as u64).sum()
+}
+
+/// Give the whole caches' shards back, the highest first, until this many bytes are given or none is left, and return the bytes
+pub fn give_back_caches<Backend: Io>(state: &EngineState<Backend>, wanted: usize) -> usize {
+    let mut given = 0;
+    for cache in whole_caches(state) {
+        for shard in (0..cache.shard_count()).rev() {
+            if given >= wanted {
+                return given;
+            }
+            let bytes = cache.give_back_shard(shard);
+            if bytes > 0 {
+                given += bytes;
+                state.cache_shards_given.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    given
+}
+
+/// Bring the whole caches' shards back, the spot index first, while each fits in this many bytes, and return the bytes taken
+pub fn bring_back_caches<Backend: Io>(state: &EngineState<Backend>, room: u64) -> u64 {
+    let mut taken = 0;
+    for cache in whole_caches(state) {
+        if cache.absent_shards() == 0 {
+            continue;
+        }
+        let bytes = cache.shard_bytes() as u64;
+        for shard in 0..cache.shard_count() {
+            if taken + bytes > room {
+                return taken;
+            }
+            if cache.bring_back_shard(shard) {
+                taken += bytes;
+            }
+        }
+    }
+    taken
 }

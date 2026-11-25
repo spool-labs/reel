@@ -70,7 +70,7 @@ fn torn_record_drops(loss: Loss) {
     let _gone = fs::remove_dir_all(&base);
     let (live, copy) = (base.join("live"), base.join("copy"));
     fs::create_dir_all(&live).expect("root");
-    let store = ReelStore::open(PlainIo::new(), &config(&live)).expect("open");
+    let store = ReelStore::open(PlainIo::for_tests(), &config(&live)).expect("open");
     for number in 0..SYNCED {
         store.put(COLUMN, &number.to_be_bytes(), &number.to_le_bytes()).expect("put");
     }
@@ -102,7 +102,7 @@ fn torn_record_drops(loss: Loss) {
         },
     }
 
-    let store = ReelStore::open(PlainIo::new(), &config(&copy)).unwrap_or_else(|error| panic!("{loss:?}: the open refused the copy: {error}"));
+    let store = ReelStore::open(PlainIo::for_tests(), &config(&copy)).unwrap_or_else(|error| panic!("{loss:?}: the open refused the copy: {error}"));
     let mut value = Vec::new();
     assert!(!store.get(COLUMN, &LAST.to_be_bytes(), &mut value).expect("get the last"), "{loss:?}: the lost record read back");
     for number in 0..SYNCED {

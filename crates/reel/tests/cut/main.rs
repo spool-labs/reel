@@ -57,7 +57,7 @@ fn count_of(value: &[u8]) -> u64 {
 fn cue_never_shows_the_later_write_alone() {
     let root = std::env::temp_dir().join(format!("reel-cut-{}", std::process::id()));
     let _gone = fs::remove_dir_all(&root);
-    let store = ReelStore::open(PlainIo::new(), &config(&root)).expect("open");
+    let store = ReelStore::open(PlainIo::for_tests(), &config(&root)).expect("open");
     let is_done = AtomicBool::new(false);
     let cues = thread::scope(|scope| {
         scope.spawn(|| {

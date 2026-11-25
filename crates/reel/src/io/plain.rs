@@ -69,6 +69,9 @@ pub const PAUSE_WAIT: Duration = Duration::from_micros(100);
 #[derive(Clone, Debug)]
 pub struct PlainIo {
     origin: Instant,
+    /// The host memory a test pins, so a store reads a fixed host and not what else the machine runs
+    #[cfg(feature = "test-hooks")]
+    pinned_host: Option<HostMemory>,
 }
 
 /// A held file lock, released when the file closes
@@ -80,7 +83,25 @@ pub struct PlainLock {
 impl PlainIo {
     /// Start a backend whose clock counts from now
     pub fn new() -> Self {
-        Self { origin: Instant::now() }
+        Self {
+            origin: Instant::now(),
+            #[cfg(feature = "test-hooks")]
+            pinned_host: None,
+        }
+    }
+
+    /// Start a backend for a test, which reads a roomy host: 64 GiB with 48 free and no control group, whatever else the machine
+    /// runs. A test of pressure pins its own
+    #[cfg(feature = "test-hooks")]
+    pub fn for_tests() -> Self {
+        Self::new().with_host_memory(HostMemory { total: ByteCount(64 << 30), available: ByteCount(48 << 30), group_room: None, group_limit: None, group_anon_room: None })
+    }
+
+    /// Pin the host memory the store reads, for a test that must not hang on the machine's own load
+    #[cfg(feature = "test-hooks")]
+    pub fn with_host_memory(mut self, memory: HostMemory) -> Self {
+        self.pinned_host = Some(memory);
+        self
     }
 }
 
@@ -231,6 +252,10 @@ impl Io for PlainIo {
     }
 
     fn host_memory(&self) -> HostMemory {
+        #[cfg(feature = "test-hooks")]
+        if let Some(memory) = self.pinned_host {
+            return memory;
+        }
         read_host_memory()
     }
 

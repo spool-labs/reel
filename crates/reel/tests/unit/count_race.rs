@@ -41,7 +41,7 @@ fn counts_beside_seals_stay_in_bounds() {
         }],
         columns: vec![ColumnConfig { index: ColumnIndex::Plain, ..ColumnConfig::new(COLUMN, "count", KeyShape::Fixed { width: 8 }) }],
     };
-    let store = ReelStore::open(PlainIo::new(), &config).expect("open");
+    let store = ReelStore::open(PlainIo::for_tests(), &config).expect("open");
     // rows the writer has acknowledged, and rows it has started: a put is seen once it returns, a moment before `written` moves
     let written = AtomicU64::new(0);
     let started = AtomicU64::new(0);
@@ -103,7 +103,7 @@ fn race_store(name: &str) -> (ReelStore<PlainIo>, std::path::PathBuf) {
         }],
         columns: vec![ColumnConfig { index: ColumnIndex::Plain, ..ColumnConfig::new(COLUMN, "walk", KeyShape::Fixed { width: 8 }) }],
     };
-    (ReelStore::open(PlainIo::new(), &config).expect("open"), root)
+    (ReelStore::open(PlainIo::for_tests(), &config).expect("open"), root)
 }
 
 // a writer puts new keys and seals while walks run: every key that landed before a walk began appears once, and no key twice
@@ -188,7 +188,7 @@ fn cue_counts_beside_deleting_seals_match_their_walks() {
         }],
         columns: vec![ColumnConfig { index: ColumnIndex::Sorted, ..ColumnConfig::new(COLUMN, "sorted", KeyShape::Fixed { width: 8 }) }],
     };
-    let store = ReelStore::open(PlainIo::new(), &config).expect("open");
+    let store = ReelStore::open(PlainIo::for_tests(), &config).expect("open");
     let done = AtomicBool::new(false);
     let runs = AtomicU64::new(0);
     let counts = std::thread::scope(|scope| {
@@ -263,7 +263,7 @@ fn walks_and_counts_beside_drops_and_refills() {
         }],
         columns: vec![ColumnConfig { index: ColumnIndex::Sorted, ..ColumnConfig::new(COLUMN, "drop", KeyShape::Fixed { width: 8 }) }],
     };
-    let store = ReelStore::open(PlainIo::new(), &config).expect("open");
+    let store = ReelStore::open(PlainIo::for_tests(), &config).expect("open");
     let written = AtomicU64::new(0);
     let started = AtomicU64::new(0);
     let done = AtomicBool::new(false);
@@ -344,11 +344,85 @@ fn walks_and_counts_beside_drops_and_refills() {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
-    assert_eq!(index.mark(), None, "no refill cleared the mark");
+    let report = store.memory_report();
+    assert_eq!(index.mark(), None, "no refill cleared the mark: pressed {} steps {} source {:?} drops {} held {} target {} waits {}", report.is_under_pressure, report.pressed_steps, report.pressure_source, report.sorted_drops, report.memory_held.0 >> 20, report.memory_target.0 >> 20, store.state.sorted_index(COLUMN).map_or(0, reel::index::sorted_keys::SortedKeys::refill_waits));
     let mut value = Vec::new();
     let lost = (0..written.load(Ordering::Acquire)).filter(|number| !store.get(COLUMN, &key(*number), &mut value).expect("get")).count();
     assert_eq!(lost, 0, "{lost} keys lost after the refill");
     assert_eq!(store.count_prefix(COLUMN, &[]).expect("count").0, written.load(Ordering::Acquire));
+    store.close().expect("close");
+    let _gone = fs::remove_dir_all(&root);
+}
+
+// one thread gives the spot index and the block caches back and brings them back, again and again, while a writer puts and seals a
+// plain column and readers get landed keys and walk: every landed key reads, and a walk sees each landed key once
+#[test]
+fn gets_and_walks_beside_caches_given_back() {
+    let (store, root) = race_store("caches");
+    let written = AtomicU64::new(0);
+    let done = AtomicBool::new(false);
+    let runs = AtomicU64::new(0);
+    let rounds = AtomicU64::new(0);
+    std::thread::scope(|scope| {
+        let (store, written, done, runs, rounds) = (&store, &written, &done, &runs, &rounds);
+        scope.spawn(move || {
+            let _stops = StopOnDrop(done);
+            let mut number = 0;
+            while number < KEYS || ((runs.load(Ordering::Acquire) < 4 * LEAST_RUNS || rounds.load(Ordering::Acquire) < 40) && number < MOST_KEYS) {
+                store.put(COLUMN, &key(number), &number.to_le_bytes()).expect("put");
+                written.store(number + 1, Ordering::Release);
+                if number % 5_000 == 4_999 {
+                    store.seal_now();
+                }
+                number += 1;
+                pace(number, runs, done);
+            }
+        });
+        scope.spawn(move || {
+            let _stops = StopOnDrop(done);
+            while !done.load(Ordering::Acquire) {
+                let _given = reel::engine::reserve_job::give_back_caches(&store.state, usize::MAX);
+                std::thread::yield_now();
+                let _taken = reel::engine::reserve_job::bring_back_caches(&store.state, u64::MAX);
+                rounds.fetch_add(1, Ordering::Relaxed);
+                std::thread::yield_now();
+            }
+        });
+        let getter = scope.spawn(move || {
+            let _stops = StopOnDrop(done);
+            let mut value = Vec::new();
+            let mut number = 0_u64;
+            while !done.load(Ordering::Acquire) {
+                let low = written.load(Ordering::Acquire);
+                if low == 0 {
+                    continue;
+                }
+                number = number.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                let asked = number % low;
+                assert!(store.get(COLUMN, &key(asked), &mut value).expect("get"), "landed key {asked} of {low} missing");
+                assert_eq!(value, asked.to_le_bytes(), "key {asked} read a wrong value");
+            }
+        });
+        let walker = scope.spawn(move || {
+            let _stops = StopOnDrop(done);
+            let mut seen = std::collections::HashSet::new();
+            while !done.load(Ordering::Acquire) {
+                let low = written.load(Ordering::Acquire);
+                seen.clear();
+                let mut scan = store.iter_from(COLUMN, &[], reel_core::direction::Direction::Ascending).expect("scan");
+                let (mut name, mut value) = (Vec::new(), Vec::new());
+                while scan.next_row(&mut name, &mut value).expect("step") == reel_core::scan::ScanStep::Found {
+                    assert!(seen.insert(name.clone()), "key {name:?} walked twice");
+                }
+                let missing = (0..low).filter(|number| !seen.contains(key(*number).as_slice())).count();
+                assert_eq!(missing, 0, "{missing} of {low} landed keys missing from a walk");
+                runs.fetch_add(1, Ordering::Release);
+            }
+        });
+        getter.join().expect("getter");
+        walker.join().expect("walker");
+    });
+    assert!(rounds.load(Ordering::Relaxed) > 3, "only {} rounds ran", rounds.load(Ordering::Relaxed));
     store.close().expect("close");
     let _gone = fs::remove_dir_all(&root);
 }

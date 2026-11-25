@@ -36,7 +36,7 @@ fn single_puts_racing_seals_leave_no_gap() {
         }],
         columns: vec![ColumnConfig { index: ColumnIndex::Plain, ..ColumnConfig::new(COLUMN, "gaps", KeyShape::Fixed { width: 8 }) }],
     };
-    let store = ReelStore::open(PlainIo::new(), &config).expect("open");
+    let store = ReelStore::open(PlainIo::for_tests(), &config).expect("open");
     let done = AtomicBool::new(false);
     std::thread::scope(|scope| {
         let writers: Vec<_> = (0..WRITERS)

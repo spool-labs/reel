@@ -1,11 +1,12 @@
 //! One store-wide cache of checked filter and row blocks, cold blocks out first
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{RwLock, RwLockReadGuard};
 
 use reel_core::units::ByteCount;
 
 use crate::pool::touched_filled;
+use crate::pool_room::{give_back_buffer, take_back_buffer};
 use crate::guard::Shards;
 use crate::segment::segment_tail::SegmentNumber;
 
@@ -41,12 +42,16 @@ pub struct CacheShard {
     keys: Vec<BlockKey>,
     lengths: Vec<u32>,
     bytes: Vec<u8>,
+    /// Cleared while the reserve job has the shard's pages given back. An absent shard holds no block and keeps none
+    is_present: bool,
 }
 
 /// A cache of blocks up to a fixed size
 #[derive(Debug)]
 pub struct BlockCache {
     pub shards: Shards<CacheShard>,
+    /// Shards whose pages are given back
+    absent: AtomicUsize,
     touched: Vec<Vec<AtomicU64>>,
     /// Inserts that found their shard locked and kept nothing, since a reader would otherwise queue behind the wait
     skipped: AtomicU64,
@@ -70,6 +75,7 @@ impl BlockCache {
                 keys: touched_filled(slots, NO_BLOCK),
                 lengths: touched_filled(slots, 0),
                 bytes: touched_filled(slots * slot_bytes, 1),
+                is_present: true,
             }));
             let mut bits = Vec::with_capacity(slots);
             for _slot in 0..slots {
@@ -81,6 +87,7 @@ impl BlockCache {
             shards: Shards(shards),
             touched,
             skipped: AtomicU64::new(0),
+            absent: AtomicUsize::new(0),
             slot_bytes,
             buckets,
         }
@@ -100,7 +107,9 @@ impl BlockCache {
     pub fn clear(&self) {
         for index in 0..self.shards.len() {
             let mut guard = self.shards.write(index);
-            guard.keys.fill(NO_BLOCK);
+            if guard.is_present {
+                guard.keys.fill(NO_BLOCK);
+            }
         }
     }
 
@@ -109,8 +118,10 @@ impl BlockCache {
         let mut total = 0;
         for shard in 0..self.shards.len() {
             let guard = self.shards.read(shard);
-            total += guard.bytes.capacity() + guard.keys.capacity() * size_of::<BlockKey>();
+            if guard.is_present {
+                total += guard.bytes.capacity() + guard.keys.capacity() * size_of::<BlockKey>();
             total += guard.lengths.capacity() * size_of::<u32>();
+            }
             total += self.touched[shard].capacity() * size_of::<AtomicU64>();
         }
         ByteCount(total as u64)
@@ -128,6 +139,9 @@ impl BlockCache {
     pub fn with<Answer>(&self, key: BlockKey, visit: impl FnOnce(&[u8]) -> Answer) -> Option<Answer> {
         let (shard, first) = self.place_of(key);
         let guard = self.shards.read(shard);
+        if !guard.is_present {
+            return None;
+        }
         for slot in first..first + CACHE_WAYS {
             if guard.keys[slot] == key {
                 self.touched[shard][slot].store(1, Ordering::Relaxed);
@@ -163,7 +177,7 @@ impl BlockCache {
         }
         let mut blocks: [Option<&[u8]>; MOST_MANY_BLOCKS] = [None; MOST_MANY_BLOCKS];
         for ((key, &(shard, first)), block) in keys.iter().zip(&places).zip(&mut blocks).take(count) {
-            let Some(guard) = wanted.iter().position(|held| *held == shard).and_then(|at| guards[at].as_ref()) else {
+            let Some(guard) = wanted.iter().position(|held| *held == shard).and_then(|at| guards[at].as_ref()).filter(|guard| guard.is_present) else {
                 continue;
             };
             if let Some(slot) = (first..first + CACHE_WAYS).find(|slot| guard.keys[*slot] == *key) {
@@ -187,11 +201,66 @@ impl BlockCache {
             self.skipped.fetch_add(1, Ordering::Relaxed);
             return;
         };
+        if !guard.is_present {
+            return;
+        }
         let slot = self.pick_slot(shard, &guard, first, key);
         guard.keys[slot] = key;
         guard.lengths[slot] = block.len() as u32;
         let start = slot * self.slot_bytes;
         guard.bytes[start..start + block.len()].copy_from_slice(block);
+    }
+
+    /// Give one shard's pages back to the kernel, and return the bytes given. Its blocks read as missing until it comes back
+    pub fn give_back_shard(&self, shard: usize) -> usize {
+        let mut guard = self.shards.write(shard);
+        if !guard.is_present {
+            return 0;
+        }
+        guard.is_present = false;
+        self.absent.fetch_add(1, Ordering::AcqRel);
+        let keys = guard.keys.len() * size_of::<BlockKey>();
+        let lengths = guard.lengths.len() * size_of::<u32>();
+        let bytes = guard.bytes.len();
+        give_back_buffer(guard.keys.as_mut_ptr().cast(), keys) + give_back_buffer(guard.lengths.as_mut_ptr().cast(), lengths) + give_back_buffer(guard.bytes.as_mut_ptr(), bytes)
+    }
+
+    /// Bring a shard given back into memory again with every slot empty, touching each page here so no caller faults one in, and
+    /// say whether it was absent
+    pub fn bring_back_shard(&self, shard: usize) -> bool {
+        let mut guard = self.shards.write(shard);
+        if guard.is_present {
+            return false;
+        }
+        let (keys, lengths, bytes) = (guard.keys.len() * size_of::<BlockKey>(), guard.lengths.len() * size_of::<u32>(), guard.bytes.len());
+        take_back_buffer(guard.keys.as_mut_ptr().cast(), keys);
+        take_back_buffer(guard.lengths.as_mut_ptr().cast(), lengths);
+        take_back_buffer(guard.bytes.as_mut_ptr(), bytes);
+        guard.keys.fill(NO_BLOCK);
+        guard.lengths.fill(0);
+        guard.bytes.fill(1);
+        for bit in &self.touched[shard] {
+            bit.store(0, Ordering::Relaxed);
+        }
+        guard.is_present = true;
+        self.absent.fetch_sub(1, Ordering::AcqRel);
+        true
+    }
+
+    /// Count the shards whose pages are given back
+    pub fn absent_shards(&self) -> usize {
+        self.absent.load(Ordering::Acquire)
+    }
+
+    /// Read the bytes one shard's slots take
+    pub fn shard_bytes(&self) -> usize {
+        let guard = self.shards.read(0);
+        guard.keys.len() * size_of::<BlockKey>() + guard.lengths.len() * size_of::<u32>() + guard.bytes.len()
+    }
+
+    /// Count the shards
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
     }
 
     /// Pick the block's own slot, an empty one, a cold one, or age the bucket

@@ -120,7 +120,7 @@ fn churn(has_cue: bool) -> JobsRun {
     // a folder of its own, since its removal at the end would take the folders of the tests running beside it
     let root = scratch_root().join(format!("walks-{has_cue}"));
     fs::create_dir_all(&root).expect("create");
-    let store = ReelStore::open(PlainIo::new(), &config(&root, BUDGET)).expect("open");
+    let store = ReelStore::open(PlainIo::for_tests(), &config(&root, BUDGET)).expect("open");
     for number in 0..KEPT_KEYS {
         let key = kept(number);
         store.put(META, &key, &value_of(&key, FIRST_ROUND)).expect("put");
@@ -156,7 +156,7 @@ fn churn(has_cue: bool) -> JobsRun {
         let viewer = scope.spawn(|| {
             let mut views = 0;
             let config = config(&root, BUDGET);
-            let mut view = ReelStore::open_read_only(PlainIo::new(), &config).expect("open read-only");
+            let mut view = ReelStore::open_read_only(PlainIo::for_tests(), &config).expect("open read-only");
             while !is_done.load(Ordering::Acquire) && views < MOST_VIEWS {
                 check_walk("view", view.iter_from(META, b"", Direction::Ascending).expect("scan"), Direction::Ascending, None);
                 view.refresh().expect("refresh");
@@ -254,7 +254,7 @@ fn model_store(root: &std::path::Path, index: ColumnIndex) -> Store {
     let volume = VolumeConfig { segment_bytes: Some(SMALL_SEGMENT), ..VolumeConfig::new("model", vec![root.to_path_buf()], SyncPolicy::Never) };
     let column = ColumnConfig { index, least_rows: Some(RowCount(2 * KEY_SPACE)), ..ColumnConfig::new(MODEL_COLUMN, "model", KeyShape::Fixed { width: FIXED_WIDTH }) };
     let config = StoreConfig { memory_budget: MODEL_BUDGET, max_memory: None, threads: ThreadCounts::default(), volumes: vec![volume], columns: vec![column] };
-    ReelStore::open(PlainIo::new(), &config).expect("open")
+    ReelStore::open(PlainIo::for_tests(), &config).expect("open")
 }
 
 fn block_on<Output>(future: impl Future<Output = Output>) -> Output {

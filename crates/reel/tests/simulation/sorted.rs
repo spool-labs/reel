@@ -3713,3 +3713,140 @@ fn a_walk_across_a_counting_switch_loses_no_key() {
         store.close().expect("close");
     }
 }
+
+/// A plain column beside the sorted one, whose gets ask the spot index
+const PLAIN: ColumnId = ColumnId(2);
+
+/// Steps a cache seed runs
+const CACHE_STEPS: u64 = 700;
+
+// random puts, deletes, gets, scans, seals and merges on a sorted and a plain column, with the spot index and the block caches
+// given back and brought back in part or whole at steps the seed picks: every get and scan answers the model at the step it runs
+#[test]
+fn caches_given_back_match_the_model() {
+    for seed in seeds([1_125_700, 1_125_701, 1_125_702, 1_125_703]) {
+        run_cache_seed(seed);
+    }
+}
+
+fn run_cache_seed(seed: u64) {
+    let io = SimulatedIo::new(Seed(seed));
+    let mut both = config(CAPACITY);
+    both.columns.push(ColumnConfig { id: PLAIN, name: "plain".to_string(), index: ColumnIndex::Plain, least_rows: None, ..both.columns[0].clone() });
+    let store = ReelStore::open(io.clone(), &both).expect("open");
+    assert!(store.state.spot.shard_bytes() >= 4_096, "the store has no spot index to give back");
+    store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
+    store.state.volumes[0].holds.reclaim.store(true, Ordering::Release);
+    let mut random = SeededRandom::new(Seed(seed));
+    let mut models = [Model::new(), Model::new()];
+    let mut value = Vec::new();
+    let (mut given_steps, mut brought_steps) = (0, 0);
+    for step in 0..CACHE_STEPS {
+        let side = random.below(2) as usize;
+        let column = [COLUMN, PLAIN][side];
+        let name = key(random.below(DROP_KEYS));
+        match random.below(100) {
+            0..35 => {
+                let put = format!("{seed}-{step}").into_bytes();
+                store.put(column, &name, &put).expect("put");
+                models[side].insert(name, put);
+            },
+            35..42 => {
+                store.delete(column, &name).expect("delete");
+                models[side].remove(&name);
+            },
+            42..65 => {
+                let found = store.get(column, &name, &mut value).expect("get").then(|| value.clone());
+                assert_eq!(found, models[side].get(&name).cloned(), "seed {seed} step {step}: a get of column {}", column.0);
+            },
+            65..69 => {
+                let whole: Rows = models[side].iter().map(|(name, value)| (name.clone(), value.clone())).collect();
+                assert_eq!(rows(store.iter_from(column, b"", Direction::Ascending).expect("scan")), whole, "seed {seed} step {step}: a scan");
+            },
+            69..76 => seal_all(&store, &io),
+            76..79 => {
+                let _merged = merge_once(&store);
+            },
+            79..85 => {
+                // a part of the caches or all of them
+                let wanted = if random.one_in(2) { usize::MAX } else { 1 + random.below(1 << 20) as usize };
+                if reel::engine::reserve_job::give_back_caches(&store.state, wanted) > 0 {
+                    given_steps += 1;
+                }
+            },
+            85..90 => {
+                let room = if random.one_in(2) { u64::MAX } else { random.below(1 << 22) };
+                if reel::engine::reserve_job::bring_back_caches(&store.state, room) > 0 {
+                    brought_steps += 1;
+                }
+            },
+            _ => {},
+        }
+    }
+    assert!(given_steps > 0 && brought_steps > 0, "seed {seed}: {given_steps} give-backs and {brought_steps} bring-backs ran");
+    let _brought = reel::engine::reserve_job::bring_back_caches(&store.state, u64::MAX);
+    let report = store.memory_report();
+    assert_eq!((report.spot_absent_shards, report.block_absent_shards), (0, 0));
+    for (side, column) in [COLUMN, PLAIN].into_iter().enumerate() {
+        for number in 0..DROP_KEYS {
+            let found = store.get(column, &key(number), &mut value).expect("get").then(|| value.clone());
+            assert_eq!(found, models[side].get(&key(number)).cloned(), "seed {seed}: a last get");
+        }
+        let whole: Rows = models[side].iter().map(|(name, value)| (name.clone(), value.clone())).collect();
+        assert_eq!(rows(store.iter_from(column, b"", Direction::Ascending).expect("scan")), whole, "seed {seed}: a last scan");
+    }
+    store.close().expect("close");
+}
+
+// a pressed store gives the spot index and the block caches back before it drops a sorted index, every get still answers, and once
+// the host has room past the decay they come back whole
+#[test]
+fn the_ladder_gives_caches_back_before_an_index() {
+    let io = SimulatedIo::new(Seed(53));
+    let mut both = config(CAPACITY);
+    both.columns.push(ColumnConfig { id: PLAIN, name: "plain".to_string(), index: ColumnIndex::Plain, least_rows: None, ..both.columns[0].clone() });
+    let store = ReelStore::open(io.clone(), &both).expect("open");
+    let model = fill_for_reopen(&store, &io, KEYS);
+    for number in 0..KEYS {
+        store.put(PLAIN, &key(number), b"plain").expect("put");
+    }
+    seal_all(&store, &io);
+    let job = reel::engine::reserve_job::ReserveJob::new(Arc::clone(&store.state));
+    io.set_host_memory(reel::io::host_memory::HostMemory {
+        total: ByteCount(1 << 30),
+        available: ByteCount(0),
+        group_room: Some(ByteCount(0)),
+        group_limit: Some(ByteCount(1 << 30)),
+        group_anon_room: Some(ByteCount(0)),
+    });
+    let mut now = io.now().0;
+    let mut gave_before_drop = false;
+    for _step in 0..256 {
+        now += 100_000_000;
+        job.hold_to_target(now);
+        let report = store.memory_report();
+        if report.sorted_drops > 0 {
+            break;
+        }
+        gave_before_drop |= report.cache_shards_given > 0;
+    }
+    assert!(gave_before_drop, "the ladder dropped an index before it gave a cache back");
+    let report = store.memory_report();
+    assert!(report.spot_absent_shards > 0 && report.block_absent_shards > 0, "a cache stayed whole under pressure: {report:?}");
+    let written: Vec<Vec<u8>> = (0..KEYS).map(key).collect();
+    check(&store, &model, &written);
+    let mut value = Vec::new();
+    for number in (0..KEYS).step_by(7) {
+        assert!(store.get(PLAIN, &key(number), &mut value).expect("get") && value == b"plain", "a plain get missed with the caches given back");
+    }
+    io.set_host_memory(reel_sim::simulated_disk::SIMULATED_HOST);
+    now += 1;
+    job.hold_to_target(now);
+    job.hold_to_target(now + reel::pool_room::DECAY_NANOS);
+    let report = store.memory_report();
+    assert_eq!((report.spot_absent_shards, report.block_absent_shards), (0, 0), "a cache stayed given back with room");
+    for number in (0..KEYS).step_by(7) {
+        assert!(store.get(PLAIN, &key(number), &mut value).expect("get") && value == b"plain");
+    }
+    store.close().expect("close");
+}

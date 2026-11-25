@@ -677,9 +677,9 @@ fn a_missing_relative_root_sits_on_the_current_directory() {
     use reel::io::plain::PlainIo;
     let root = std::path::Path::new("no-such-reel-dir-for-a-test/store");
     assert!(!root.exists());
-    assert_eq!(disk_root(&PlainIo::new(), root), std::path::PathBuf::from("."));
+    assert_eq!(disk_root(&PlainIo::for_tests(), root), std::path::PathBuf::from("."));
     let absolute = std::env::temp_dir().join("no-such-reel-dir-for-a-test").join("store");
-    assert_eq!(disk_root(&PlainIo::new(), &absolute), std::env::temp_dir());
+    assert_eq!(disk_root(&PlainIo::for_tests(), &absolute), std::env::temp_dir());
 }
 
 // a seal list holds the rows its blocks can take by the volume's widest key, and the check at open refuses a row limit one past it

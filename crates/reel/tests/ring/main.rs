@@ -88,13 +88,13 @@ fn value(number: u64) -> Vec<u8> {
 
 // a store with its keys sealed and nothing cached, so reads reach the device
 fn filled(root: &Path) -> Store {
-    let store = ReelStore::open(PlainIo::new(), &config(root)).expect("open");
+    let store = ReelStore::open(PlainIo::for_tests(), &config(root)).expect("open");
     for number in 0..KEYS {
         store.put(COLUMN, &key(number), &value(number)).expect("put");
     }
     store.close().expect("close");
     drop(store);
-    let store = ReelStore::open(PlainIo::new(), &config(root)).expect("open");
+    let store = ReelStore::open(PlainIo::for_tests(), &config(root)).expect("open");
     // this kernel gives the store a ring, so every test here reads through it
     assert!(store.state.ring.is_some());
     store

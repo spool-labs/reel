@@ -55,7 +55,7 @@ impl Job for Worker {
 // a hand-out that races a worker's way to sleep always reaches a worker: no block stays assigned while every worker sleeps
 #[test]
 fn hand_out_racing_sleep_wakes_a_worker() {
-    let io = PlainIo::new();
+    let io = PlainIo::for_tests();
     let workers = Arc::new(Workers::<PlainTask>::new(WORKERS));
     let slots: Arc<[AtomicU8; SLOTS]> = Arc::new([const { AtomicU8::new(FREE) }; SLOTS]);
     for (index, cell) in workers.cells.iter().enumerate() {

@@ -359,7 +359,7 @@ fn open(root: &Path) -> Store {
     if let Some(workers) = env::var(WORKERS_VARIABLE).ok().and_then(|workers| workers.parse().ok()) {
         config.threads.maintenance_workers = Some(workers);
     }
-    ReelStore::open(PlainIo::new(), &config).expect("open")
+    ReelStore::open(PlainIo::for_tests(), &config).expect("open")
 }
 
 // rows past one group's buffer, so they go out in pieces

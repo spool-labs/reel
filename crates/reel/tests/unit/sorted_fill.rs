@@ -116,7 +116,7 @@ fn all_entries(store: &Store) -> u64 {
 // every live entry of the index after an open. A merge after the open moves an entry's segment and offset and keeps its place,
 // so the places say what the fill gave
 fn live_entries(root: &Path, workers: usize) -> Vec<([u8; 16], WritePlace)> {
-    let store = ReelStore::open(PlainIo::new(), &config(root, workers)).expect("open");
+    let store = ReelStore::open(PlainIo::for_tests(), &config(root, workers)).expect("open");
     let entries = index_entries(&store);
     store.close().expect("close");
     entries
@@ -168,7 +168,7 @@ fn root_files(root: &Path) -> BTreeMap<PathBuf, (Vec<u8>, SystemTime)> {
 fn a_fill_on_eight_threads_matches_one_every_time() {
     let root = fresh_root("sorted-fill");
     {
-        let store = ReelStore::open(PlainIo::new(), &config(&root, FILL_THREADS)).expect("open");
+        let store = ReelStore::open(PlainIo::for_tests(), &config(&root, FILL_THREADS)).expect("open");
         write_rounds(&store, KEYS, Store::seal_now);
         store.finish().expect("finish");
     }
@@ -185,15 +185,15 @@ fn a_fill_on_eight_threads_matches_one_every_time() {
 fn a_read_only_open_fills_the_sorted_index_a_writer_open_does() {
     let root = fresh_root("sorted-read-only-fill");
     {
-        let store = ReelStore::open(PlainIo::new(), &config(&root, FILL_THREADS)).expect("open");
+        let store = ReelStore::open(PlainIo::for_tests(), &config(&root, FILL_THREADS)).expect("open");
         write_rounds(&store, VIEW_KEYS, Store::seal_now);
         store.finish().expect("finish");
     }
-    let writer = ReelStore::open(PlainIo::new(), &config(&root, 0)).expect("open");
+    let writer = ReelStore::open(PlainIo::for_tests(), &config(&root, 0)).expect("open");
     let (entries, writer_reading, writer_gets, writer_rows) = (index_entries(&writer), sorted_reading(&writer), gets(&writer, VIEW_KEYS), scan_rows(&writer));
     writer.close().expect("close");
 
-    let reader = ReelStore::open_read_only(PlainIo::new(), &config(&root, 0)).expect("open read-only");
+    let reader = ReelStore::open_read_only(PlainIo::for_tests(), &config(&root, 0)).expect("open read-only");
     assert!(index_entries(&reader) == entries, "the read-only fill gave other entries than the writer's");
     let reading = sorted_reading(&reader);
     // used counts graves, and a merge between the two opens can drop some, so only the live entries above must agree
@@ -213,7 +213,7 @@ fn a_read_only_open_fills_the_sorted_index_a_writer_open_does() {
 #[test]
 fn a_read_only_open_beside_a_writer_reads_every_sealed_row() {
     let root = fresh_root("sorted-read-only-live");
-    let writer = ReelStore::open(PlainIo::new(), &config(&root, FILL_THREADS)).expect("open");
+    let writer = ReelStore::open(PlainIo::for_tests(), &config(&root, FILL_THREADS)).expect("open");
     write_rounds(&writer, VIEW_KEYS, seal_all);
     let sealed = gets(&writer, VIEW_KEYS);
     thread::scope(|scope| {
@@ -222,7 +222,7 @@ fn a_read_only_open_beside_a_writer_reads_every_sealed_row() {
                 writer.put(COLUMN, &key(number), b"late").expect("put");
             }
         });
-        let reader = ReelStore::open_read_only(PlainIo::new(), &config(&root, 0)).expect("open read-only");
+        let reader = ReelStore::open_read_only(PlainIo::for_tests(), &config(&root, 0)).expect("open read-only");
         let reading = sorted_reading(&reader);
         let live = sealed.iter().filter(|value| value.is_some()).count() as u64;
         assert!(reading.used.0 >= live, "the index holds {} entries under {live} sealed live keys", reading.used.0);
@@ -243,12 +243,12 @@ fn a_read_only_open_beside_a_writer_reads_every_sealed_row() {
 fn a_read_only_open_leaves_the_roots_as_they_were() {
     let root = fresh_root("sorted-read-only-files");
     {
-        let store = ReelStore::open(PlainIo::new(), &config(&root, FILL_THREADS)).expect("open");
+        let store = ReelStore::open(PlainIo::for_tests(), &config(&root, FILL_THREADS)).expect("open");
         write_rounds(&store, VIEW_KEYS, Store::seal_now);
         store.finish().expect("finish");
     }
     let before = root_files(&root);
-    let reader = ReelStore::open_read_only(PlainIo::new(), &config(&root, 0)).expect("open read-only");
+    let reader = ReelStore::open_read_only(PlainIo::for_tests(), &config(&root, 0)).expect("open read-only");
     assert!(sorted_reading(&reader).used.0 > 0, "the read-only open filled no index");
     let _gets = gets(&reader, VIEW_KEYS);
     let _rows = scan_rows(&reader);

@@ -93,6 +93,12 @@ pub struct MemoryReport {
     pub sorted_drops: u64,
     /// Dropped sorted indexes a refill brought back since open
     pub sorted_refills: u64,
+    /// Spot index shards given back, which read as missing until they come back. 0 when the spot index is whole
+    pub spot_absent_shards: u64,
+    /// Block cache shards given back, filter, row and complete caches together. 0 when they are whole
+    pub block_absent_shards: u64,
+    /// Shards of the spot index and the block caches the ladder gave back since open
+    pub cache_shards_given: u64,
 }
 
 impl MemoryReport {

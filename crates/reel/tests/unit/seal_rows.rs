@@ -31,7 +31,7 @@ fn every_width_and_budget_opens_within_its_list() {
                         columns: vec![ColumnConfig { codec, index: ColumnIndex::Plain, ..ColumnConfig::new(ColumnId(1), "rows", shape) }],
                     };
                     let cell = format!("{shape:?} {codec:?} {} MiB, segment {:?} MiB", budget / MIB, segment.map(|bytes| bytes.0 / MIB));
-                    let store = ReelStore::open(PlainIo::new(), &config).unwrap_or_else(|error| panic!("{cell}: {error}"));
+                    let store = ReelStore::open(PlainIo::for_tests(), &config).unwrap_or_else(|error| panic!("{cell}: {error}"));
                     let volume = &store.state.volumes[0];
                     let listed = rows_within_blocks(volume.seal_blocks, shape.widest());
                     println!("{cell}: row limit {}, list of {} blocks holds {listed}", volume.segment_rows.0, volume.seal_blocks.0);

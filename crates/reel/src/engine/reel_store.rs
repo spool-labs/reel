@@ -1745,6 +1745,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> Result<Engin
         sorted_moves_missed: AtomicU64::new(0),
         sorted_drops: AtomicU64::new(0),
         sorted_refills: AtomicU64::new(0),
+        cache_shards_given: AtomicU64::new(0),
         sorted_drop_lock: Mutex::new(()),
         sorted_fill_ns: AtomicU64::new(0),
         sorted_fill_bytes: AtomicU64::new(0),

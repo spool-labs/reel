@@ -183,7 +183,7 @@ fn check_clock<Backend: Io>(io: &Backend) {
 #[test]
 fn file_contract() {
     let root = plain_root("files");
-    check_files(&PlainIo::new(), &root);
+    check_files(&PlainIo::for_tests(), &root);
     let _removed = fs::remove_dir_all(&root);
 
     let (io, root) = simulated(SEED);
@@ -194,7 +194,7 @@ fn file_contract() {
 #[test]
 fn lock_clock() {
     let root = plain_root("lock");
-    let plain = PlainIo::new();
+    let plain = PlainIo::for_tests();
     check_lock(&plain, &root);
     check_clock(&plain);
     let _removed = fs::remove_dir_all(&root);
@@ -209,7 +209,7 @@ fn lock_clock() {
 fn lock_holder() {
     let root = plain_root("holder");
     let path = root.join("lock");
-    let plain = PlainIo::new();
+    let plain = PlainIo::for_tests();
     let held = plain.lock(&path).expect("lock");
     let refused = plain.lock(&path).expect("second lock");
     assert!(matches!(held, LockOutcome::Held(_)));
@@ -231,7 +231,7 @@ fn lock_holder() {
 // a job runs to its end on a real thread
 #[test]
 fn plain_jobs() {
-    let io = PlainIo::new();
+    let io = PlainIo::for_tests();
     let count = Arc::new(AtomicU64::new(0));
     let job = CountingJob {
         count: Arc::clone(&count),
@@ -245,7 +245,7 @@ fn plain_jobs() {
 // an idle job sleeps with no timer until a wake, and a stop ends it
 #[test]
 fn plain_idle() {
-    let io = PlainIo::new();
+    let io = PlainIo::for_tests();
     let steps = Arc::new(AtomicU64::new(0));
     let job = IdleJob {
         steps: Arc::clone(&steps),
@@ -264,7 +264,7 @@ fn plain_idle() {
 // a job with a deadline runs again when the clock reaches it
 #[test]
 fn plain_deadline() {
-    let io = PlainIo::new();
+    let io = PlainIo::for_tests();
     let steps = Arc::new(AtomicU64::new(0));
     let job = IdleJob {
         steps: Arc::clone(&steps),
@@ -589,7 +589,7 @@ fn self_stop() {
     assert_eq!(steps.load(Ordering::Relaxed), 1);
     assert_eq!(io.live_jobs(), JobCount(0));
 
-    let plain = PlainIo::new();
+    let plain = PlainIo::for_tests();
     let steps = check_self_stop(&plain);
     wait_until(|| steps.load(Ordering::Relaxed) > 0, "the job never stepped");
 

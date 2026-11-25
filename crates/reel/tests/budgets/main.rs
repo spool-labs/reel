@@ -75,7 +75,7 @@ fn main() {
         let budget = ByteCount(budget * MIB);
         let mut config = config(&root, budget);
         config.threads.maintenance_workers = Some(workers);
-        let store = match ReelStore::open(PlainIo::new(), &config) {
+        let store = match ReelStore::open(PlainIo::for_tests(), &config) {
             Ok(store) => store,
             // a count this budget can't hold is the refusal the store promises
             Err(StoreError::ThreadsPastBudget { .. }) => {
@@ -150,10 +150,10 @@ fn check_default_cell() -> u32 {
     let budget = ByteCount(DEFAULT_CELL_MIB * MIB);
     let config = config(&root, budget);
     let mut failures = 0;
-    match ReelStore::open(PlainIo::new(), &config) {
+    match ReelStore::open(PlainIo::for_tests(), &config) {
         Ok(store) => {
             let report = store.memory_report();
-            let disks = volume_disks(&PlainIo::new(), &config).expect("disks");
+            let disks = volume_disks(&PlainIo::for_tests(), &config).expect("disks");
             println!("the default at {DEFAULT_CELL_MIB} MiB: ring fits {}, least {:?}", ring_fits(&config, &disks), report.least_budget);
             failures += u32::from(!ring_fits(&config, &disks) || report.least_budget.0 == 0 || report.least_budget > budget);
             store.close().expect("close");
@@ -189,17 +189,17 @@ fn check_least_cell() -> u32 {
     let root = scratch_root();
     let budget = ByteCount(LEAST_CELL_MIB * MIB);
     let config = config(&root, budget);
-    let disks = volume_disks(&PlainIo::new(), &config).expect("disks");
+    let disks = volume_disks(&PlainIo::for_tests(), &config).expect("disks");
     let (ring, no_ring) = (store_shape(&config, true, &disks).least_budget(), store_shape(&config, false, &disks).least_budget());
     println!("least budget at {LEAST_CELL_MIB} MiB: {ring:?} with the ring, {no_ring:?} without");
     let mut failures = 0;
-    match ReelStore::open(PlainIo::new(), &config) {
+    match ReelStore::open(PlainIo::for_tests(), &config) {
         Ok(store) => {
             let mut report = MaintenanceReport::new();
             store.maintenance_report(&mut report);
             println!("the default at {LEAST_CELL_MIB} MiB has_ring {}", report.has_ring);
             // a ring runs where the budget fits it and the platform gives one, which macOS never does
-            let has_platform_ring = PlainIo::new().open_ring().ok().flatten().is_some();
+            let has_platform_ring = PlainIo::for_tests().open_ring().ok().flatten().is_some();
             failures += u32::from(report.has_ring != (ring_fits(&config, &disks) && has_platform_ring));
             store.close().expect("close");
         },

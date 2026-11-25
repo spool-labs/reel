@@ -96,8 +96,16 @@ impl Io for HarnessIo {
         self.plain.capacity(path)
     }
 
+    fn set_io_idle(&self, is_idle: bool) {
+        self.plain.set_io_idle(is_idle);
+    }
+
     fn host_memory(&self) -> HostMemory {
         self.plain.host_memory()
+    }
+
+    fn has_io_classes(&self, path: &Path) -> Option<bool> {
+        self.plain.has_io_classes(path)
     }
 
     fn is_rotational(&self, path: &Path) -> Option<bool> {

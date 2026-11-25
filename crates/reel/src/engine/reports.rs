@@ -310,6 +310,7 @@ impl<Backend: Io> EngineState<Backend> {
                 settle_retries: volume.settle_retries.load(Ordering::Acquire),
                 used_bytes: ByteCount(used_bytes),
                 is_spinning: volume.is_spinning,
+                has_io_classes: volume.has_io_classes,
                 is_device_set: volume.is_device_set,
                 rewrites_by_lane: lane_counts(volume),
                 lifetime_groups: lifetime_groups(&hold(&volume.claims)),

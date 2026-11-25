@@ -7,6 +7,7 @@ mod block_filter;
 mod chunk_table;
 mod column_directory;
 mod cue;
+mod io_class;
 mod complete_table;
 mod crowd_answers;
 mod dead_bits;

@@ -452,6 +452,13 @@ pub trait Io: Clone + Send + Sync + 'static {
     /// Say whether any disk under a path spins, or nothing when this backend can't tell
     fn is_rotational(&self, path: &Path) -> Option<bool>;
 
+    /// Say whether the disk under a path runs a scheduler that serves I/O classes, so the idle class the maintenance work takes
+    /// does something there, or nothing when this backend can't tell
+    fn has_io_classes(&self, path: &Path) -> Option<bool> {
+        let _unused = path;
+        None
+    }
+
     /// Take a process-wide lock on a file, or learn which process holds it
     fn lock(&self, path: &Path) -> Result<LockOutcome<Self::Lock>>;
 
@@ -483,6 +490,11 @@ pub trait Io: Clone + Send + Sync + 'static {
     /// thread read back once it set it
     fn spawn_worker<Work: Job>(&self, name: &'static str, job: Work) -> Result<(Self::Task, WorkerPriority)> {
         Ok((self.spawn_job(name, job)?, WorkerPriority::default()))
+    }
+
+    /// Put the calling thread's disk I/O in the idle class, or back in the default one, where the platform has classes
+    fn set_io_idle(&self, is_idle: bool) {
+        let _unused = is_idle;
     }
 
     /// Read the stack a job's thread holds, which memory_report shows

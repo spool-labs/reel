@@ -167,7 +167,11 @@ impl<Backend: Io> Job for Planner<Backend> {
         }
         // the scrub goes last, at its own rate, so it takes only what every other job leaves
         for scrub in &mut self.scrubs {
+            // the scrub's reads are optional, so they take the idle I/O class, and the planner's thread goes back to the default
+            // one for the filters reads wait on
+            self.state.io.set_io_idle(true);
             let step = scrub.step_unit(now);
+            self.state.io.set_io_idle(false);
             if Self::note_scrub(step, &mut soonest) {
                 return JobStep::Worked;
             }

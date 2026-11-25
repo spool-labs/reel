@@ -390,6 +390,8 @@ pub struct Volume<Backend: Io> {
     pub marked_seal_bytes: AtomicU64,
     pub marks_dropped: AtomicU64,
     pub is_spinning: bool,
+    /// The disk's scheduler serves I/O classes, as open read it, or nothing where the kernel didn't say
+    pub has_io_classes: Option<bool>,
     pub is_device_set: bool,
     /// One lane for each rewrite that can run at once: the planner's, then a worker's each
     pub lanes: Vec<RewriteLane<Backend::File>>,

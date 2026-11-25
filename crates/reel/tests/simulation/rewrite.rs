@@ -2516,6 +2516,7 @@ fn seat_lock_is_held_for_a_swap() {
         seats: vec![Arc::clone(&job.seats)],
         rewrite: None,
         seat: (0, 0),
+        is_io_idle: true,
     };
     // the planner claims and leaves the populate to the worker: the first step maps the region and opens the output, and the steps
     // after it read

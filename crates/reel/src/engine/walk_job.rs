@@ -335,6 +335,8 @@ pub struct WalkWorker<Backend: Io> {
     pub seats: Vec<Arc<Vec<RewriteSeat<Backend>>>>,
     pub rewrite: Option<RewriteJob<Backend>>,
     pub seat: (usize, usize),
+    /// The I/O class the worker's thread holds now: idle while reclaim can wait, the default once a volume runs short of room
+    pub is_io_idle: bool,
 }
 
 impl<Backend: Io> BlockCounter<Backend> {
@@ -1155,8 +1157,21 @@ impl<Backend: Io> WalkWorker<Backend> {
     }
 }
 
+impl<Backend: Io> WalkWorker<Backend> {
+    /// Keep the thread's disk I/O in the idle class while reclaim can wait, and in the default class once a volume runs short of
+    /// room, so a caller-busy spinning disk never starves the merges that would free it. One syscall, and only on a change
+    fn follow_urgency(&mut self) {
+        let is_idle = !self.state.volumes.iter().any(Volume::is_short_of_room);
+        if is_idle != self.is_io_idle {
+            self.state.io.set_io_idle(is_idle);
+            self.is_io_idle = is_idle;
+        }
+    }
+}
+
 impl<Backend: Io> Job for WalkWorker<Backend> {
     fn step(&mut self) -> JobStep {
+        self.follow_urgency();
         // a handed-out block goes first, so walk units run between a rewrite's units
         if self.count_one() {
             return JobStep::Worked;

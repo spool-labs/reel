@@ -278,6 +278,9 @@ pub struct VolumeReading {
     pub covers_held_by_cues: u64,
     pub settle_retries: u64,
     pub used_bytes: ByteCount,
+    /// The disk's scheduler serves I/O classes (mq-deadline or bfq), so the scrub and the merges that can wait give way to
+    /// callers there. Nothing where the kernel didn't say
+    pub has_io_classes: Option<bool>,
     pub is_spinning: bool,
     /// The class came from the config, where a false here means it was detected
     pub is_device_set: bool,

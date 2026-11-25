@@ -965,6 +965,7 @@ pub fn start_jobs<Backend: Io>(state: &Arc<EngineState<Backend>>) -> Result<(), 
             seats: seats.clone(),
             rewrite: None,
             seat: (0, 0),
+            is_io_idle: true,
         };
         state.walk_heap.fetch_add(worker.counter.heap_bytes().0, Ordering::AcqRel);
         let (task, priority) = state.io.spawn_worker("reel-walk", worker).map_err(open_error("starting a job"))?;
@@ -1852,6 +1853,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         marked_seal_bytes: AtomicU64::new(0),
         marks_dropped: AtomicU64::new(0),
         is_spinning: is_spinning(io, volume),
+        has_io_classes: volume.roots.first().and_then(|root| io.has_io_classes(root)),
         is_device_set: volume.device != DeviceClass::Detect,
         seal_point: AtomicU64::new(volume_rows(config, index, sizing.segment_rows).0),
         seal_rate: AtomicU64::new(0),

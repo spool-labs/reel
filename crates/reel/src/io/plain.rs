@@ -203,6 +203,10 @@ impl Io for PlainIo {
         rotational_under(path)
     }
 
+    fn has_io_classes(&self, path: &Path) -> Option<bool> {
+        io_classes_under(path)
+    }
+
     fn free_space(&self, path: &Path) -> Result<ByteCount> {
         let stats = disk_stats(path)?;
         Ok(ByteCount(widen(stats.f_bavail).saturating_mul(widen(stats.f_frsize))))
@@ -216,6 +220,10 @@ impl Io for PlainIo {
 
     fn host_memory(&self) -> HostMemory {
         read_host_memory()
+    }
+
+    fn set_io_idle(&self, is_idle: bool) {
+        set_thread_io_idle(is_idle);
     }
 
     fn lock(&self, path: &Path) -> Result<LockOutcome<PlainLock>> {
@@ -398,6 +406,38 @@ pub fn rotational_under(_path: &Path) -> Option<bool> {
     None
 }
 
+/// Say whether the disk under a path runs a scheduler that serves I/O classes, mq-deadline or bfq, following a partition to its
+/// disk and a stacked device to its first slave. none and kyber ignore the classes
+#[cfg(target_os = "linux")]
+pub fn io_classes_under(path: &Path) -> Option<bool> {
+    use std::os::linux::fs::MetadataExt;
+
+    let device = fs::metadata(path).ok()?.st_dev();
+    // the kernel's encoding of a device number
+    let major = ((device >> 8) & 0xFFF) | ((device >> 32) & !0xFFF);
+    let minor = (device & 0xFF) | ((device >> 12) & !0xFF);
+    let mut block = fs::canonicalize(format!("/sys/dev/block/{major}:{minor}")).ok()?;
+    for _depth in 0..MOST_STACK_DEPTH {
+        if let Some(slave) = fs::read_dir(block.join("slaves")).ok().and_then(|mut entries| entries.next()).and_then(Result::ok) {
+            block = fs::canonicalize(slave.path()).ok()?;
+        } else if block.join("partition").exists() {
+            block = block.parent()?.to_path_buf();
+        } else {
+            break;
+        }
+    }
+    let schedulers = fs::read_to_string(block.join("queue/scheduler")).ok()?;
+    // the scheduler in force is the one in brackets
+    let active = schedulers.split_whitespace().find(|name| name.starts_with('['))?.trim_matches(['[', ']']);
+    Some(matches!(active, "mq-deadline" | "bfq"))
+}
+
+/// Say nothing of I/O classes, for an operating system with no way to ask
+#[cfg(not(target_os = "linux"))]
+pub fn io_classes_under(_path: &Path) -> Option<bool> {
+    None
+}
+
 /// Check a block device or anything stacked under it spins. A partition asks its disk
 #[cfg(target_os = "linux")]
 pub fn block_spins(block: &Path, depth: usize) -> Option<bool> {
@@ -464,6 +504,22 @@ fn take_idle_io(thread: libc::pid_t) -> bool {
     // SAFETY: as above, and the call reads a number
     let taken = unsafe { libc::syscall(libc::SYS_ioprio_get, IOPRIO_WHO_PROCESS, libc::c_long::from(thread)) };
     taken >> IOPRIO_CLASS_SHIFT == IOPRIO_CLASS_IDLE
+}
+
+/// Put the calling thread's disk I/O in the idle class, or back in the default one, which follows its nice value
+#[cfg(target_os = "linux")]
+pub fn set_thread_io_idle(is_idle: bool) {
+    let class = if is_idle { IOPRIO_CLASS_IDLE << IOPRIO_CLASS_SHIFT } else { 0 };
+    // SAFETY: gettid reads the calling thread's id
+    let thread = unsafe { libc::gettid() };
+    // SAFETY: the call sets one thread's I/O class and touches no memory of ours
+    let _set = unsafe { libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, libc::c_long::from(thread), class) };
+}
+
+/// Leave the thread as it is where the platform has no I/O classes
+#[cfg(not(target_os = "linux"))]
+pub fn set_thread_io_idle(is_idle: bool) {
+    let _unused = is_idle;
 }
 
 /// Put the calling thread in the utility QoS class, the nearest macOS has to a per-thread nice 19, since background throttles

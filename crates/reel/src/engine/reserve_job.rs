@@ -22,6 +22,8 @@ use crate::segment::segment_tail::SegmentNumber;
 
 /// How often the job looks: half a run of places lasts over half an hour at a million rows a second
 pub const RESERVE_PERIOD: Nanoseconds = Nanoseconds(1_000_000_000);
+/// How often the job looks while the group's room is under twice the margin
+pub const TIGHT_PERIOD: Nanoseconds = Nanoseconds(100_000_000);
 /// The least a host keeps free past every pool's growth
 pub const HOST_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
 /// A host keeps free at least this share of its memory past every pool's growth
@@ -34,7 +36,10 @@ pub fn host_left(memory: &HostMemory) -> u64 {
     if total == 0 {
         return u64::MAX;
     }
-    memory.free().0.saturating_sub(HOST_MARGIN_BYTES.max(total / HOST_MARGIN_DIVISOR))
+    // in a control group the room past what the kernel can't evict is the honest measure, since free counts page cache a neighbour
+    // is about to take
+    let free = memory.group_anon_room.map_or(memory.free().0, |room| room.0.min(memory.available.0));
+    free.saturating_sub(host_margin(total))
 }
 
 /// Bytes an open segment gathers before they start for the device
@@ -213,7 +218,9 @@ impl<Backend: Io> ReserveJob<Backend> {
             _ => false,
         };
         let kernel_pressed = is_kernel_pressed.then(|| held.saturating_sub(held / UNDER_DIVISOR).max(least));
-        let host_pressed = pressed_target(&state.io.host_memory(), held, least);
+        let memory = state.io.host_memory();
+        state.is_host_tight.store(is_host_tight(&memory), Ordering::Release);
+        let host_pressed = pressed_target(&memory, held, least);
         let pressed = match (kernel_pressed, host_pressed) {
             (Some(kernel), Some(host)) => Some(kernel.min(host)),
             (kernel, host) => kernel.or(host),
@@ -264,6 +271,13 @@ impl<Backend: Io> ReserveJob<Backend> {
                 room.set_cap(room.committed());
             }
         }
+        // the write index holds the open rows, and only a seal gives their pages back, so a store still over seals early: smaller
+        // segments and more merges, and the pages come back to the next step
+        if over > 0 {
+            for volume in &state.volumes {
+                state.seal_fullest(volume);
+            }
+        }
         state.is_target_short.store(over > 0, Ordering::Release);
         target
     }
@@ -272,16 +286,35 @@ impl<Backend: Io> ReserveJob<Backend> {
 /// A store holds well under its target once it holds less than the target by this share of it
 pub const UNDER_DIVISOR: u64 = 16;
 
-/// Read the target the host's pressure sets: with less than half the margin free, the store gives back what it lacks, down to its
-/// least budget. Nothing when the host has room or says nothing
+/// Read the target the host's pressure sets, or nothing when the host has room or says nothing. In a control group the measure is
+/// the room left past what the kernel can't evict, which falls from the first byte a neighbour takes: under the whole margin the
+/// store gives back a sixteenth of what it holds each step, which outruns a neighbour that grows by the second. Elsewhere, with
+/// less than half the margin free, it gives back what it lacks. A neighbour that takes the rest in one second still wins. Either way
+/// the target goes no lower than the least budget
 pub fn pressed_target(memory: &HostMemory, held: u64, least: u64) -> Option<u64> {
     let total = memory.reserve_total().0;
     if total == 0 {
         return None;
     }
-    let mark = HOST_MARGIN_BYTES.max(total / HOST_MARGIN_DIVISOR) / 2;
+    let margin = host_margin(total);
+    if let Some(anon_room) = memory.group_anon_room {
+        return (anon_room.0 < margin).then(|| held.saturating_sub(held / UNDER_DIVISOR).max(least));
+    }
+    let mark = margin / 2;
     let free = memory.free().0;
     (free < mark).then(|| held.saturating_sub(mark - free).max(least))
+}
+
+/// Read the margin a host keeps free past every pool: a thirty-second of it, and 64 MiB at least
+pub fn host_margin(total: u64) -> u64 {
+    HOST_MARGIN_BYTES.max(total / HOST_MARGIN_DIVISOR)
+}
+
+/// Check the group's room past what the kernel can't evict is under twice the margin, where the job looks ten times a second so a
+/// neighbour's ramp meets a step before it meets the limit
+pub fn is_host_tight(memory: &HostMemory) -> bool {
+    let total = memory.reserve_total().0;
+    total > 0 && memory.group_anon_room.is_some_and(|room| room.0 < 2 * host_margin(total))
 }
 
 impl<Backend: Io> Job for ReserveJob<Backend> {
@@ -296,7 +329,7 @@ impl<Backend: Io> Job for ReserveJob<Backend> {
         }
         let now = self.state.io.now();
         JobStep::IdleUntil {
-            deadline: Nanoseconds(now.0 + RESERVE_PERIOD.0),
+            deadline: Nanoseconds(now.0 + if self.state.is_host_tight.load(Ordering::Acquire) { TIGHT_PERIOD.0 } else { RESERVE_PERIOD.0 }),
         }
     }
 }

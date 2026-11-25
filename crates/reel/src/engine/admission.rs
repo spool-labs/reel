@@ -184,7 +184,7 @@ mod tests {
 
     #[test]
     fn room_takes_a_share_without_a_limit() {
-        let open = HostMemory { total: ByteCount(32 * GIB), available: ByteCount(28 * GIB), group_room: None, group_limit: None };
+        let open = HostMemory { total: ByteCount(32 * GIB), available: ByteCount(28 * GIB), group_room: None, group_limit: None, group_anon_room: None };
         assert_eq!(room_for(&open, ByteCount(4 * GIB)), ByteCount(6 * GIB));
         let limited = HostMemory { group_room: Some(ByteCount(GIB)), group_limit: Some(ByteCount(2 * GIB)), ..open };
         assert_eq!(limited.reserve_total(), ByteCount(2 * GIB));

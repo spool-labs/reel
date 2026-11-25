@@ -2651,7 +2651,7 @@ fn cut_merge_copies_in_offset_order() {
 #[test]
 fn short_host_copies_in_key_order() {
     let io = SimulatedIo::new(Seed(75));
-    io.set_host_memory(HostMemory { total: ByteCount(1 << 30), available: ByteCount(0), group_room: None, group_limit: None });
+    io.set_host_memory(HostMemory { total: ByteCount(1 << 30), available: ByteCount(0), group_room: None, group_limit: None, group_anon_room: None });
     let store = open(&io);
     hold_compaction(&store, true);
     set_of_inputs(&store, &io);

@@ -17,7 +17,7 @@ use crate::seeded_random::{Seed, SeededRandom};
 /// The disk size used under a path with no declared disk
 pub const UNBOUNDED_CAPACITY: ByteCount = ByteCount(1 << 50);
 /// The host a simulation runs on: 64 GiB with 48 free and no control group limit, so admission always has room
-pub const SIMULATED_HOST: HostMemory = HostMemory { total: ByteCount(64 << 30), available: ByteCount(48 << 30), group_room: None, group_limit: None };
+pub const SIMULATED_HOST: HostMemory = HostMemory { total: ByteCount(64 << 30), available: ByteCount(48 << 30), group_room: None, group_limit: None, group_anon_room: None };
 /// Process ids in a simulation count up from here
 pub const FIRST_PROCESS: ProcessId = ProcessId(1_000);
 /// Each unsynced directory change survives a power cut one time in this many

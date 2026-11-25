@@ -14,6 +14,9 @@ pub struct HostMemory {
     pub group_room: Option<ByteCount>,
     /// The tightest limit on the way from the process's control group to the root, when one is set
     pub group_limit: Option<ByteCount>,
+    /// What the control group may still take before its anonymous memory meets its tightest limit, with file pages left out,
+    /// when a limit is set. File pages are what the kernel evicts first, so this falls from the first byte a neighbour takes
+    pub group_anon_room: Option<ByteCount>,
 }
 
 impl HostMemory {
@@ -49,8 +52,11 @@ pub fn read_host_memory() -> HostMemory {
     let meminfo = &buffer[..length];
     let total = field_kib(meminfo, b"MemTotal:").unwrap_or(0) * 1_024;
     let available = field_kib(meminfo, b"MemAvailable:").unwrap_or(0) * 1_024;
-    let (group_room, group_limit) = group_room().unzip();
-    HostMemory { total: ByteCount(total), available: ByteCount(available), group_room, group_limit }
+    let (group_room, group_limit, group_anon_room) = match group_room() {
+        Some((room, limit, anon_room)) => (Some(room), Some(limit), Some(anon_room)),
+        None => (None, None, None),
+    };
+    HostMemory { total: ByteCount(total), available: ByteCount(available), group_room, group_limit, group_anon_room }
 }
 
 /// Read the host's memory now: the total, and the share of it the kernel's pressure level calls free
@@ -58,7 +64,7 @@ pub fn read_host_memory() -> HostMemory {
 pub fn read_host_memory() -> HostMemory {
     let total = sysctl_u64(c"hw.memsize").unwrap_or(0);
     let level = sysctl_u64(c"kern.memorystatus_level").unwrap_or(0).min(100);
-    HostMemory { total: ByteCount(total), available: ByteCount(total / 100 * level), group_room: None, group_limit: None }
+    HostMemory { total: ByteCount(total), available: ByteCount(total / 100 * level), group_room: None, group_limit: None, group_anon_room: None }
 }
 
 /// Read the host's memory now, where no reading is known
@@ -67,30 +73,32 @@ pub fn read_host_memory() -> HostMemory {
     HostMemory::default()
 }
 
-/// Read the room under the tightest memory.max on the way from the process's control group to the root, and that limit
+/// Read the room under the tightest memory.max on the way from the process's control group to the root, that limit, and the room
+/// past what the kernel can't evict
 #[cfg(target_os = "linux")]
-fn group_room() -> Option<(ByteCount, ByteCount)> {
+fn group_room() -> Option<(ByteCount, ByteCount, ByteCount)> {
     let mut buffer = [0u8; READ_BYTES];
     let length = read_small(c"/proc/self/cgroup".to_bytes_with_nul(), &mut buffer)?;
     // the unified hierarchy's line is "0::/path"
     let line = buffer[..length].split(|byte| *byte == b'\n').find(|line| line.starts_with(b"0::"))?;
     let mut group = &line[3..];
-    let mut room: Option<(u64, u64)> = None;
+    let mut room: Option<(u64, u64, u64)> = None;
     loop {
-        if let Some((level, limit)) = level_room(group) {
-            room = Some(room.map_or((level, limit), |(room, tightest)| (room.min(level), tightest.min(limit))));
+        if let Some((level, limit, anon)) = level_room(group) {
+            room = Some(room.map_or((level, limit, anon), |(room, tightest, anon_room)| (room.min(level), tightest.min(limit), anon_room.min(anon))));
         }
         let Some(parent) = group.iter().rposition(|byte| *byte == b'/').filter(|at| *at > 0) else {
             break;
         };
         group = &group[..parent];
     }
-    room.map(|(room, limit)| (ByteCount(room), ByteCount(limit)))
+    room.map(|(room, limit, anon)| (ByteCount(room), ByteCount(limit), ByteCount(anon)))
 }
 
-/// Read one control group's limit less its use past its inactive file pages, and the limit, or nothing when it has none
+/// Read one control group's limit less its use past its inactive file pages, the limit, and the limit less what the kernel can't
+/// evict, or nothing when it has none
 #[cfg(target_os = "linux")]
-fn level_room(group: &[u8]) -> Option<(u64, u64)> {
+fn level_room(group: &[u8]) -> Option<(u64, u64, u64)> {
     let mut path = [0u8; PATH_BYTES];
     let mut buffer = [0u8; READ_BYTES];
     let length = read_small(group_file(group, b"memory.max", &mut path)?, &mut buffer)?;
@@ -98,8 +106,11 @@ fn level_room(group: &[u8]) -> Option<(u64, u64)> {
     let length = read_small(group_file(group, b"memory.current", &mut path)?, &mut buffer)?;
     let current = parse_number(&buffer[..length]).unwrap_or(0);
     let length = read_small(group_file(group, b"memory.stat", &mut path)?, &mut buffer).unwrap_or(0);
-    let inactive = field_number(&buffer[..length], b"inactive_file ").unwrap_or(0);
-    Some((limit.saturating_sub(current.saturating_sub(inactive)), limit))
+    let stat = &buffer[..length];
+    let inactive = field_number(stat, b"inactive_file ").unwrap_or(0);
+    // memory the kernel can't evict to make room: anonymous pages and what is locked or unevictable
+    let pinned = field_number(stat, b"anon ").unwrap_or(0) + field_number(stat, b"unevictable ").unwrap_or(0);
+    Some((limit.saturating_sub(current.saturating_sub(inactive)), limit, limit.saturating_sub(pinned)))
 }
 
 /// Lay a control group file's path out in a buffer, ending in a nul

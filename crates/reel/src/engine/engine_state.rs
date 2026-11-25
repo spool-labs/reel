@@ -229,6 +229,8 @@ pub struct EngineState<Backend: Io> {
     pub memory_budget: ByteCount,
     /// The most a raised target may reach, max_memory or the budget
     pub max_memory: ByteCount,
+    /// The budget the config asked for, above the one in force when the host had less free at open
+    pub budget_asked: ByteCount,
     /// The memory the store holds itself to now, which set_memory_target moves between the least budget and the budget
     pub memory_target: AtomicU64,
     /// The heap the store holds outside its rooms, measured once open has built everything, which the ladder counts beside them
@@ -239,6 +241,8 @@ pub struct EngineState<Backend: Io> {
     pub is_under_pressure: AtomicBool,
     /// Set while the ladder could not bring the store down to its target with what the pools can give
     pub is_target_short: AtomicBool,
+    /// Set while the group's room past what the kernel can't evict is under twice the margin, so the reserve job looks often
+    pub is_host_tight: AtomicBool,
     /// Where the store learns of memory pressure, chosen as the jobs start
     pub pressure_source: OnceLock<PressureSource>,
     /// The thread that waits on the kernel's pressure trigger, which close stops
@@ -810,6 +814,7 @@ impl<Backend: Io> EngineState<Backend> {
             budget: self.memory_budget,
             pool_committed: ByteCount(self.pool_rooms.iter().map(|room| room.committed() as u64).sum()),
             pool_shares: ByteCount(self.pool_rooms.iter().map(|room| room.reserved() as u64).sum()),
+            budget_asked: self.budget_asked,
             pools_short: self.pool_rooms.iter().filter(|room| room.is_short()).count(),
             pool_given_back: ByteCount(self.pool_rooms.iter().map(|room| room.given_back()).sum()),
             memory_target: ByteCount(self.memory_target.load(Ordering::Acquire)),

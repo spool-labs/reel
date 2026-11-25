@@ -3308,7 +3308,7 @@ fn a_reopen_on_a_host_with_no_room_runs_short() {
     let model = fill_for_reopen(&store, &io, SHORT_KEYS);
     store.close().expect("close");
     drop(store);
-    io.set_host_memory(reel::io::host_memory::HostMemory { total: ByteCount(1 << 30), available: ByteCount(0), group_room: None, group_limit: None });
+    io.set_host_memory(reel::io::host_memory::HostMemory { total: ByteCount(1 << 30), available: ByteCount(0), group_room: None, group_limit: None, group_anon_room: None });
     let store = open(&io, CAPACITY);
     assert!(store.memory_report().pools_short > 0, "a host with no room left no pool short");
     let written: Vec<Vec<u8>> = (0..SHORT_KEYS).map(key).collect();

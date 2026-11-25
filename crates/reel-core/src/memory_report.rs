@@ -69,6 +69,8 @@ pub struct MemoryReport {
     pub pool_committed: ByteCount,
     /// Bytes those pools can grow to, their shares of the budget
     pub pool_shares: ByteCount,
+    /// The budget the config asked for. Over the budget in force when the host had less free at open, which the store planned from
+    pub budget_asked: ByteCount,
     /// Pools the host had no room to grow, which run as full pools until a step fits
     pub pools_short: usize,
     /// Bytes the pools have given back to the kernel since open

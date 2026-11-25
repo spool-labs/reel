@@ -130,6 +130,23 @@ impl<Backend: Io> ReelStore<Backend> {
         let disks = volume_disks(&io, config).map_err(open_error("reading a disk's size"))?;
         let ring = if ring_fits(config, &disks) { io.open_ring().map_err(open_error("opening a ring"))? } else { None };
         let sizing = store_sizing(config, ring.is_some(), &disks)?;
+        // a budget past what the host has free would die at open, since the tables are sized from it, so the store plans from what
+        // fits, runs short, and may be raised back to the budget asked once the host has room. It refuses only a host whose whole
+        // memory is under its least budget
+        let asked = config.memory_budget;
+        let host = io.host_memory();
+        let host_total = host.reserve_total();
+        if host_total.0 > 0 && host_total < sizing.least_budget {
+            return Err(StoreError::BudgetTooSmall { budget: host_total, least: sizing.least_budget });
+        }
+        let fits = ByteCount(host_left(&host).max(sizing.least_budget.0));
+        let fitted;
+        let (config, sizing) = if fits < asked {
+            fitted = StoreConfig { memory_budget: fits, max_memory: Some(config.max_memory.unwrap_or(asked).max(asked)), ..config.clone() };
+            (&fitted, store_sizing(&fitted, ring.is_some(), &disks)?)
+        } else {
+            (config, sizing)
+        };
 
         // every root is listed before any tail is read, and the table is sized from what they hold
         let mut roots = Vec::with_capacity(config.volumes.len());
@@ -152,6 +169,7 @@ impl<Backend: Io> ReelStore<Backend> {
         // the sorted indexes take their room from the caches before anything is built, by the keys they held at open
         let (sizing, sorted_sizes) = size_sorted_indexes(config, &sizing, &summaries);
         let mut state = build_state(OpenInputs { io, config, sizing: &sizing, disks: &disks, superblock, locks, scan: &scan, summaries }).map_err(open_error("reserving the write index"))?;
+        state.budget_asked = asked;
         state.complete = complete_tables(config);
         state.sorted = sorted_indexes(config, &sorted_sizes, false).map_err(open_error("reserving a sorted index"))?;
         let sorted_rooms: Vec<_> = state.sorted.iter().flatten().map(|index| index.room().clone()).collect();
@@ -1735,11 +1753,13 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> Result<Engin
         unlinks_refused: AtomicU64::new(0),
         memory_budget: config.memory_budget,
         max_memory: config.max_memory.unwrap_or(config.memory_budget).max(config.memory_budget),
+        budget_asked: config.memory_budget,
         memory_target: AtomicU64::new(config.memory_budget.0),
         fixed_heap: AtomicU64::new(0),
         under_since: AtomicU64::new(0),
         is_under_pressure: AtomicBool::new(false),
         is_target_short: AtomicBool::new(false),
+        is_host_tight: AtomicBool::new(false),
         pressure_source: OnceLock::new(),
         pressure_watch: Mutex::new(None),
         is_pressure_fired: AtomicBool::new(false),

@@ -182,3 +182,19 @@ fn fresh_cache_grows_with_its_room() {
         }
     }
 }
+
+// a small cut takes one whole shard, and the values in the others still answer
+#[test]
+fn a_small_cut_empties_one_shard() {
+    let cache = RecordCache::new(CACHE_BYTES, None).expect("build cache");
+    for offset in 0..VALUES {
+        read_twice(&cache, offset, &value(offset, 200));
+    }
+    let before = cache.value_count();
+    assert!(cache.give_back(1) > 0, "a cut gave nothing back");
+    let after = cache.value_count();
+    assert!(after < before && after >= before - before.div_ceil(CACHE_SHARDS) * 2, "{before} values before, {after} after");
+    let mut out = Vec::new();
+    let hits = (0..VALUES).filter(|&offset| cache.get(SEGMENT, FileOffset(offset), KEY, &mut out) == CacheLookup::Hit).count();
+    assert_eq!(hits, after, "a value left in the cache stopped answering");
+}

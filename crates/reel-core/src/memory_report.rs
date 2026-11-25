@@ -73,6 +73,13 @@ pub struct MemoryReport {
     pub pools_short: usize,
     /// Bytes the pools have given back to the kernel since open
     pub pool_given_back: ByteCount,
+    /// The memory the store holds itself to now, and what it holds: the heap outside its pools, measured at open, and the pools
+    pub memory_target: ByteCount,
+    pub memory_held: ByteCount,
+    /// The host has less than half its margin free, and the store gives back what the host lacks
+    pub is_under_pressure: bool,
+    /// The ladder could not bring the store down to its target: the caches are spent, and what is left holds data
+    pub is_target_short: bool,
 }
 
 impl MemoryReport {

@@ -6,6 +6,7 @@
 //! leaves the old entry to age out.
 
 use std::io::Result;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use reel_core::units::{ByteCount, FileOffset};
@@ -92,6 +93,8 @@ pub struct RecordCache {
     pub misses: CallerCounts,
     /// Values it took in on a miss
     pub admits: CallerCounts,
+    /// The shard a give-back starts from, which moves each time
+    next_to_give: AtomicUsize,
 }
 
 /// Mix a record's place into a hash
@@ -418,7 +421,7 @@ impl RecordCache {
         for shard in &shards {
             drop(hold(shard));
         }
-        Ok(Self { shards, hits: CallerCounts::default(), misses: CallerCounts::default(), admits: CallerCounts::default() })
+        Ok(Self { shards, hits: CallerCounts::default(), misses: CallerCounts::default(), admits: CallerCounts::default(), next_to_give: AtomicUsize::new(0) })
     }
 
     /// Build a cache whose arenas start at an eighth of their share
@@ -426,33 +429,40 @@ impl RecordCache {
         Self::growing(bytes, mean_record, false)
     }
 
-    /// Cap every shard so the cache gives back about this many bytes between them, and shorten them to it. Returns the bytes given
-    /// back
+    /// Give back at least this many bytes, a whole shard at a time: each one taken drops what it holds and keeps one extent, and its
+    /// cap lifts with the others once the store holds well under its target. Returns the bytes given back
     pub fn give_back(&self, bytes: usize) -> usize {
-        let cut = bytes.div_ceil(self.shards.len().max(1));
-        for shard in &self.shards {
-            let room = Arc::clone(hold(shard).room());
-            room.set_cap(room.committed().saturating_sub(cut));
-        }
-        self.shorten_to_caps()
-    }
-
-    /// Shorten every shard whose room the ladder capped under its log: the shard drops what it holds, starts its log over within
-    /// the cap, and gives the rest back. Returns the bytes given back
-    pub fn shorten_to_caps(&self) -> usize {
+        let count = self.shards.len();
+        let first = self.next_to_give.fetch_add(1, Ordering::Relaxed);
         let mut given = 0;
-        for shard in &self.shards {
-            let mut held = hold(shard);
-            let cap = held.room.cap();
-            if held.capacity <= cap {
+        // whole shards go one at a time, from a start that moves each time, so a small cut empties a sixty-fourth of the cache and
+        // the same keys don't always pay
+        for turn in 0..count {
+            if given >= bytes {
+                break;
+            }
+            let shard = &self.shards[(first + turn) % count];
+            let room = Arc::clone(hold(shard).room());
+            if room.committed() <= room.extent() {
                 continue;
             }
-            held.start_over(cap);
-            let room = Arc::clone(&held.room);
-            drop(held);
-            given += room.release_above(cap);
+            room.set_cap(room.extent());
+            given += self.shorten_shard(shard);
         }
         given
+    }
+
+    /// Shorten one shard to its cap, and return the bytes given back
+    fn shorten_shard(&self, shard: &Mutex<CacheShard>) -> usize {
+        let mut held = hold(shard);
+        let cap = held.room.cap();
+        if held.capacity <= cap {
+            return 0;
+        }
+        held.start_over(cap);
+        let room = Arc::clone(&held.room);
+        drop(held);
+        room.release_above(cap)
     }
 
     /// Read every shard's arena room, for the job that grows them

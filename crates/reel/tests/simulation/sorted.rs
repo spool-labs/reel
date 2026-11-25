@@ -3343,3 +3343,23 @@ fn a_target_down_and_back_up() {
     check(&store, &model, &written);
     store.close().expect("close");
 }
+
+// a small cut comes out of the record cache, and no index pool is held under its share for it
+#[test]
+fn a_small_cut_leaves_the_index_pools_alone() {
+    let io = SimulatedIo::new(Seed(42));
+    let store = open(&io, CAPACITY);
+    let model = fill_for_reopen(&store, &io, SHORT_KEYS);
+    let written: Vec<Vec<u8>> = (0..SHORT_KEYS).map(key).collect();
+    check(&store, &model, &written);
+    check(&store, &model, &written);
+    let job = reel::engine::reserve_job::ReserveJob::new(Arc::clone(&store.state));
+    let before = job.held_bytes();
+    store.state.memory_target.store(before - 1, Ordering::Release);
+    job.hold_to_target(io.now().0);
+    assert!(job.held_bytes() < before, "the cut gave nothing back");
+    assert!(store.state.pool_rooms.iter().filter(|room| room.is_paged()).all(|room| room.cap() == room.reserved()), "an index pool was held for a small cut");
+    assert!(!store.memory_report().is_target_short);
+    check(&store, &model, &written);
+    store.close().expect("close");
+}

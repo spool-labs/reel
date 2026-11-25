@@ -553,11 +553,11 @@ impl PoolRoom {
         given
     }
 
-    /// Give back the highest empty extents of a paged pool until it holds no more than its cap, with no decay, and return the bytes
-    /// given back. The ladder lowers a cap when the store must hold less
-    pub fn release_over_cap(&self) -> usize {
+    /// Give back the highest empty extents of a paged pool past what it wants now, with no decay and no cap, and return the bytes
+    /// given back. The ladder's first step, which costs the pool nothing
+    pub fn release_spare(&self) -> usize {
         match &self.pages {
-            Some(pages) => self.release_down_to(pages, self.cap()),
+            Some(pages) => self.release_down_to(pages, self.used() + self.lead_bytes()),
             None => 0,
         }
     }

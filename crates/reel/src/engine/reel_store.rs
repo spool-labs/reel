@@ -233,14 +233,16 @@ impl<Backend: Io> ReelStore<Backend> {
     }
 
     /// Hold the store to less memory than its budget, or let it back up to the budget. The target goes no lower than the least
-    /// budget, and the reserve job walks the ladder down to it: empty extents first, then the record cache's logs and the value
-    /// pages' growth. A target raised again lifts the caps once the store has held well under it for the decay
-    pub fn set_memory_target(&self, target: ByteCount) {
+    /// budget, and the reserve job walks the ladder down to it: empty extents first, then whole record cache shards, then the index
+    /// pools held where they are. A target raised again lifts the caps once the store has held well under it for the decay. Returns
+    /// the target in force, the least budget for one asked under it
+    pub fn set_memory_target(&self, target: ByteCount) -> ByteCount {
         let target = target.0.clamp(self.state.sizing.least_budget.0, self.state.memory_budget.0);
         self.state.memory_target.store(target, Ordering::Release);
         if let Some(task) = self.state.reserve_task.get() {
             task.wake();
         }
+        ByteCount(target)
     }
 
     /// Count the segments open kept and couldn't read
@@ -1687,6 +1689,8 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> Result<Engin
         memory_target: AtomicU64::new(config.memory_budget.0),
         fixed_heap: AtomicU64::new(0),
         under_since: AtomicU64::new(0),
+        is_under_pressure: AtomicBool::new(false),
+        is_target_short: AtomicBool::new(false),
         seal_heap: AtomicU64::new(0),
         walk_heap: AtomicU64::new(0),
         worker_priority: Mutex::new(WorkerPriority::default()),

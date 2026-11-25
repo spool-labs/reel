@@ -231,6 +231,10 @@ pub struct EngineState<Backend: Io> {
     pub fixed_heap: AtomicU64,
     /// Since when the store has held well under its target, or 0, so caps the ladder lowered rise only after the decay
     pub under_since: AtomicU64,
+    /// Set while the host has less than half its margin free, so the ladder gives back what the host lacks
+    pub is_under_pressure: AtomicBool,
+    /// Set while the ladder could not bring the store down to its target with what the pools can give
+    pub is_target_short: AtomicBool,
     pub seal_heap: AtomicU64,
     pub walk_heap: AtomicU64,
     pub worker_priority: Mutex<WorkerPriority>,
@@ -793,6 +797,10 @@ impl<Backend: Io> EngineState<Backend> {
             pool_shares: ByteCount(self.pool_rooms.iter().map(|room| room.reserved() as u64).sum()),
             pools_short: self.pool_rooms.iter().filter(|room| room.is_short()).count(),
             pool_given_back: ByteCount(self.pool_rooms.iter().map(|room| room.given_back()).sum()),
+            memory_target: ByteCount(self.memory_target.load(Ordering::Acquire)),
+            memory_held: ByteCount(self.fixed_heap.load(Ordering::Acquire) + self.pool_rooms.iter().map(|room| room.committed() as u64).sum::<u64>()),
+            is_under_pressure: self.is_under_pressure.load(Ordering::Acquire),
+            is_target_short: self.is_target_short.load(Ordering::Acquire),
             write_index: self.index.heap_bytes(),
             spot_cache: self.spot.heap_bytes(),
             record_cache: self.record_cache.heap_bytes(),

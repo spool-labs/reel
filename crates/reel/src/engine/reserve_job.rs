@@ -162,12 +162,18 @@ impl<Backend: Io> ReserveJob<Backend> {
             let _finished = room.finish_releases();
             let _given = room.release_idle(now);
         }
-        self.hold_to_target(now);
+        let target = self.hold_to_target(now);
         if !self.state.pool_rooms.iter().any(|room| room.next_step(room.used()).is_some()) {
             return;
         }
+        // an index pool that wants its next step takes it from the record cache when the target leaves no room for it
+        let wanted: u64 = self.state.pool_rooms.iter().filter(|room| room.is_paged()).filter_map(|room| room.next_step(room.used()).map(|step| (step - room.committed()) as u64)).sum();
+        let target_left = target.saturating_sub(self.held_bytes());
+        if wanted > target_left {
+            let _given = self.state.record_cache.give_back((wanted - target_left) as usize);
+        }
         // a step takes no more than the host has left past its margin, and no more than the store's target leaves
-        let target_left = self.state.memory_target.load(Ordering::Acquire).saturating_sub(self.held_bytes());
+        let target_left = target.saturating_sub(self.held_bytes());
         let mut room_left = host_left(&self.state.io.host_memory()).min(target_left);
         for room in &self.state.pool_rooms {
             let _grew = room.grow_step(&mut room_left);
@@ -180,14 +186,18 @@ impl<Backend: Io> ReserveJob<Backend> {
         self.state.fixed_heap.load(Ordering::Acquire) + rooms
     }
 
-    /// Walk the ladder down to the store's memory target when it holds more, and lift the caps once it has held well under the
-    /// target for the decay. Step 0 gives back every paged pool's empty extents at once and caps them there. Step 1 shortens the
-    /// record cache's logs and caps the value pages, which keep what their leaves hold. The summaries never shrink, since their
-    /// rows must stay
-    pub fn hold_to_target(&self, now: u64) {
+    /// Walk the ladder down to the store's memory target when it holds more, lift the caps once it has held well under the target
+    /// for the decay, and return the target in force. Step 0 gives back every paged pool's empty extents past what it wants, with
+    /// no cap. Step 1 takes whole record cache shards until the store is under. Step 2 holds the index pools at what they hold now
+    /// for whatever is still over, and the report says the target isn't reached. The summaries never shrink, since their rows must
+    /// stay
+    pub fn hold_to_target(&self, now: u64) -> u64 {
         let state = &self.state;
-        let target = state.memory_target.load(Ordering::Acquire);
         let held = self.held_bytes();
+        // the host's own pressure lowers the target in force at once, and it rises back only through the decay below
+        let pressed = pressed_target(&state.io.host_memory(), held, state.sizing.least_budget.0);
+        state.is_under_pressure.store(pressed.is_some(), Ordering::Release);
+        let target = state.memory_target.load(Ordering::Acquire).min(pressed.unwrap_or(u64::MAX));
         if held <= target {
             let is_well_under = held + target / UNDER_DIVISOR <= target || target >= state.memory_budget.0;
             let since = state.under_since.load(Ordering::Relaxed);
@@ -200,25 +210,41 @@ impl<Backend: Io> ReserveJob<Backend> {
                     room.set_cap(usize::MAX);
                 }
             }
-            return;
+            state.is_target_short.store(false, Ordering::Release);
+            return target;
         }
         state.under_since.store(0, Ordering::Relaxed);
         let mut over = (held - target) as usize;
         for room in state.pool_rooms.iter().filter(|room| room.is_paged()) {
-            if over == 0 {
-                return;
-            }
-            room.set_cap(room.committed().saturating_sub(over).max(room.used() + room.extent()));
-            over = over.saturating_sub(room.release_over_cap());
+            over = over.saturating_sub(room.release_spare());
         }
         if over > 0 {
-            let _given = state.record_cache.give_back(over);
+            over = over.saturating_sub(state.record_cache.give_back(over));
         }
+        if over > 0 {
+            for room in state.pool_rooms.iter().filter(|room| room.is_paged()) {
+                room.set_cap(room.committed());
+            }
+        }
+        state.is_target_short.store(over > 0, Ordering::Release);
+        target
     }
 }
 
 /// A store holds well under its target once it holds less than the target by this share of it
 pub const UNDER_DIVISOR: u64 = 16;
+
+/// Read the target the host's pressure sets: with less than half the margin free, the store gives back what it lacks, down to its
+/// least budget. Nothing when the host has room or says nothing
+pub fn pressed_target(memory: &HostMemory, held: u64, least: u64) -> Option<u64> {
+    let total = memory.reserve_total().0;
+    if total == 0 {
+        return None;
+    }
+    let mark = HOST_MARGIN_BYTES.max(total / HOST_MARGIN_DIVISOR) / 2;
+    let free = memory.free().0;
+    (free < mark).then(|| held.saturating_sub(mark - free).max(least))
+}
 
 impl<Backend: Io> Job for ReserveJob<Backend> {
     fn step(&mut self) -> JobStep {

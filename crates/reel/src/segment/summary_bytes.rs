@@ -109,6 +109,8 @@ impl SummaryBytes {
                 if length > rows.room.committed() {
                     // the job grows the room ahead of the rows, and a writer that outran it brings the next part in itself. A
                     // populate that fails leaves the pages to fault in as they are written
+                    // writers are jobs, but for two damage paths: a read that met a bad block widens its row, and clear_damage saves
+                    // the summary. Those may populate on a caller, which only a job half a plan behind would make happen
                     let _grown = rows.room.grow_to(length.max(rows.room.committed() + rows.room.step()));
                 }
                 if length > rows.length {

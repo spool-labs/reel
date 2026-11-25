@@ -38,6 +38,8 @@ pub enum GrowPolicy {
     Demand,
     /// Keep the fill of the last stretch of time ready ahead of use
     Lead,
+    /// Lead for the pools data arrives in, and extents for the caches, which have no fill rate of their own and starve on a lead
+    Mixed,
 }
 
 /// Read the arm the process runs, once
@@ -46,6 +48,7 @@ pub fn grow_policy() -> GrowPolicy {
     *POLICY.get_or_init(|| match std::env::var(POLICY_VARIABLE).as_deref() {
         Ok("demand") => GrowPolicy::Demand,
         Ok("lead") => GrowPolicy::Lead,
+        Ok("mixed") => GrowPolicy::Mixed,
         _ => GrowPolicy::Extent,
     })
 }
@@ -191,6 +194,8 @@ pub struct PoolRoom {
     growing: Mutex<()>,
     /// The most the room may grow to now, which the ladder lowers when the store must hold less
     cap: AtomicUsize,
+    /// The room is a cache's, which has no fill rate of its own
+    is_cache: bool,
     /// Bytes the pool uses now, which its owner notes and the job reads
     used: AtomicUsize,
     /// Set once the pool asked for its next extent, until the job brings it in
@@ -272,6 +277,7 @@ impl PoolRoom {
             given_back: AtomicU64::new(0),
             growing: Mutex::new(()),
             cap: AtomicUsize::new(usize::MAX),
+            is_cache: false,
             used: AtomicUsize::new(0),
             has_asked: AtomicBool::new(false),
             wake: OnceLock::new(),
@@ -423,10 +429,26 @@ impl PoolRoom {
         self.committed() < self.cap() && !self.has_failed() && !self.is_short()
     }
 
+    /// Read the arm this room grows by: the process's, and under the mixed arm a lead for a pool data arrives in and extents for a
+    /// cache
+    fn policy(&self) -> GrowPolicy {
+        match grow_policy() {
+            GrowPolicy::Mixed if !self.is_cache => GrowPolicy::Lead,
+            policy => policy,
+        }
+    }
+
+    /// Mark the room a cache's, which the mixed arm grows by extents
+    pub fn for_cache(mut self) -> Self {
+        self.is_cache = true;
+        self
+    }
+
+
     /// Read the bytes the arm keeps ready past use
     fn lead_bytes(&self) -> usize {
-        match grow_policy() {
-            GrowPolicy::Extent => self.step(),
+        match self.policy() {
+            GrowPolicy::Extent | GrowPolicy::Mixed => self.step(),
             GrowPolicy::Demand => self.unit,
             GrowPolicy::Lead => self.lead.load(Ordering::Relaxed),
         }
@@ -439,8 +461,8 @@ impl PoolRoom {
             return None;
         }
         let free = committed.saturating_sub(used);
-        let target = match grow_policy() {
-            GrowPolicy::Extent => (free < self.step()).then_some(committed + self.step()),
+        let target = match self.policy() {
+            GrowPolicy::Extent | GrowPolicy::Mixed => (free < self.step()).then_some(committed + self.step()),
             GrowPolicy::Demand => (free < self.unit).then_some(committed + self.extent),
             GrowPolicy::Lead => {
                 let lead = self.lead.load(Ordering::Relaxed);
@@ -501,6 +523,8 @@ impl PoolRoom {
             }
             let (start, end) = self.extent_range(extent);
             guard_extent(self.base.as_ptr(), start, end - start, true);
+            // SAFETY: the extent lies inside the reservation and isn't ready, so no caller reads or writes it
+            take_pages_back(unsafe { self.base.as_ptr().add(start) }, end - start);
             // SAFETY: the extent lies inside the reservation and isn't ready, so no caller reads or writes it
             if let Err(error) = populate(unsafe { self.base.as_ptr().add(start) }, end - start, page_bytes()) {
                 self.has_failed.store(true, Ordering::Release);
@@ -658,7 +682,7 @@ impl PoolRoom {
     fn give_back_extent(&self, extent: usize) -> usize {
         let (start, end) = self.extent_range(extent);
         // SAFETY: the extent lies inside the reservation, isn't ready, holds no page in use, and no reader is left in it
-        unsafe { libc::madvise(self.base.as_ptr().add(start).cast(), end - start, libc::MADV_DONTNEED) };
+        give_pages_back(unsafe { self.base.as_ptr().add(start) }, end - start);
         guard_extent(self.base.as_ptr(), start, end - start, false);
         self.given_back.fetch_add((end - start) as u64, Ordering::Relaxed);
         end - start
@@ -744,6 +768,29 @@ impl RoomPages {
         self.ready_now.store(state.ready_pages, Ordering::Release);
         self.free_now.store(state.ready_pages - state.in_use_total, Ordering::Release);
     }
+}
+
+/// Hand an extent's pages back to the kernel. Linux drops them at once with MADV_DONTNEED. On Apple MADV_DONTNEED is a hint the
+/// footprint doesn't show, and MADV_FREE_REUSABLE takes the pages out of it at once
+fn give_pages_back(start: *mut u8, bytes: usize) {
+    #[cfg(target_vendor = "apple")]
+    let advice = libc::MADV_FREE_REUSABLE;
+    #[cfg(not(target_vendor = "apple"))]
+    let advice = libc::MADV_DONTNEED;
+    // SAFETY: the caller passes a range inside a reservation that holds nothing in use, and the advice only drops its pages
+    let _answer = unsafe { libc::madvise(start.cast(), bytes, advice) };
+}
+
+/// Tell the kernel an extent given back is in use again before it is populated, which Apple asks for after MADV_FREE_REUSABLE so
+/// the footprint counts the pages once more. Elsewhere there is nothing to say
+fn take_pages_back(start: *mut u8, bytes: usize) {
+    #[cfg(target_vendor = "apple")]
+    {
+        // SAFETY: the caller passes a range inside a reservation that no caller reads or writes yet
+        let _answer = unsafe { libc::madvise(start.cast(), bytes, libc::MADV_FREE_REUSE) };
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    let _unused = (start, bytes);
 }
 
 /// Close an extent to every access while it is out of memory, in debug builds, so a stray touch stops the test, and open it again

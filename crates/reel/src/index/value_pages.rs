@@ -97,7 +97,7 @@ impl ValuePages {
     pub fn growing(pages: u32, floors: &[u32], first: u32, most_pages: u32) -> Result<Self> {
         let pages = pages.max(most_pages).min(u32::MAX - 1);
         let bytes = |count: u32| ByteCount(u64::from(count) * VALUE_PAGE_BYTES as u64);
-        let room = PoolRoom::reserve_paged(bytes(pages), bytes(first.min(pages)), VALUE_PAGE_BYTES)?.read_unlocked();
+        let room = PoolRoom::reserve_paged(bytes(pages), bytes(first.min(pages)), VALUE_PAGE_BYTES)?.read_unlocked().for_cache();
         Ok(Self {
             room: Arc::new(room),
             most_pages: pages,

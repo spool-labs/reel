@@ -152,7 +152,7 @@ impl<Backend: Io> ReserveJob<Backend> {
     /// the pool at its size for the next step to try again
     pub fn grow_pools(&self) {
         let now = self.state.io.now().0;
-        if grow_policy() == GrowPolicy::Lead {
+        if matches!(grow_policy(), GrowPolicy::Lead | GrowPolicy::Mixed) {
             for room in &self.state.pool_rooms {
                 room.note_rate(now);
             }

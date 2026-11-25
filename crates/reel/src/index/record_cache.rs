@@ -137,7 +137,7 @@ impl CacheShard {
         let arena = bytes.saturating_sub(slots * size_of::<CacheEntry>() + seen).max(LEAST_SHARD_BYTES) / 8 * 8;
         // the arena may grow past its budget share to what max_memory allows, and the index and counts stay sized from the budget
         let arena = arena + most_bytes.saturating_sub(bytes);
-        let room = PoolRoom::reserve(ByteCount(arena as u64), ByteCount(if is_whole { arena as u64 } else { 0 }))?;
+        let room = PoolRoom::reserve(ByteCount(arena as u64), ByteCount(if is_whole { arena as u64 } else { 0 }))?.for_cache();
         let mut shard = Self {
             room: Arc::new(room),
             share: arena,

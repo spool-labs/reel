@@ -118,8 +118,8 @@ pub const LANE_JOB_BYTES: u64 = 4 * 1024 + CURSOR_BYTES;
 pub const CURSOR_BYTES: u64 = 256 * 1024;
 /// Bytes a job's stack is planned at
 pub const JOB_STACK_PLAN_BYTES: u64 = 1024 * 1024;
-/// Jobs a store runs beside one seal job a volume: row write-out, reservations, the planner and the scrub
-pub const SHARED_JOBS: u64 = 4;
+/// Jobs a store runs beside one seal job a volume: row write-out, reservations and the planner. The scrub adds one when it runs
+pub const SHARED_JOBS: u64 = 3;
 /// Bytes a row of the write index really takes, node, page and table share included, with a long batch's length of it
 pub const PLANNED_ROW_BYTES: u64 = 227;
 /// A volume seals at this share of what the index holds, in eighths, to keep room for writers in flight. With one
@@ -330,7 +330,8 @@ impl StoreShape {
         if self.is_read_only {
             return self.threads.read_threads as u64;
         }
-        SHARED_JOBS + self.threads.read_threads as u64 + self.volumes as u64
+        // the scrub runs on its own thread only when a rate is set
+        SHARED_JOBS + u64::from(self.threads.scrub_bytes_per_second > 0) + self.threads.read_threads as u64 + self.volumes as u64
     }
 
     /// Read the fixed room the plan keeps for heap no part names, in place of a share of the budget: the rounding, and room a

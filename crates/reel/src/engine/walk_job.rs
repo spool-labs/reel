@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::Ordering;
 
 use reel_core::column_id::ColumnId;
-use reel_core::maintenance_report::{JobKind, PickKind, UnitKind};
+use reel_core::maintenance_report::{JobKind, PickKind, PickOutcome, UnitKind};
 use reel_core::store_error::StoreError;
 use reel_core::units::{ByteCount, FileOffset, Nanoseconds, WritePlace};
 
@@ -1169,7 +1169,10 @@ impl<Backend: Io> WalkWorker<Backend> {
     fn follow_urgency(&mut self) {
         let state = &self.state;
         let is_short = state.volumes.iter().any(Volume::is_short_of_room);
-        let is_forced = self.rewrite.as_ref().is_some_and(|rewrite| rewrite.forced.is_some() || rewrite.asked_rebuild.is_some());
+        // the pick takes the forced segment out of `forced`, so what it decided says whether callers wait on this copy
+        let is_forced = self.rewrite.as_ref().is_some_and(|rewrite| {
+            matches!(rewrite.picked_as, Some(PickOutcome::Forced | PickOutcome::Rebuild)) || rewrite.asked_rebuild.is_some()
+        });
         let is_writer_held = state.index_waiters.load(Ordering::Acquire) > 0 || state.volumes.iter().any(|volume| volume.is_room_refused.load(Ordering::Acquire));
         let is_idle = is_io_idle_for(is_short, is_forced, is_writer_held);
         if is_idle != self.is_io_idle {

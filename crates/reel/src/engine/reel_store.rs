@@ -988,9 +988,12 @@ pub fn start_jobs<Backend: Io>(state: &Arc<EngineState<Backend>>) -> Result<(), 
     };
     let task = state.io.spawn_job("reel-planner", planner).map_err(open_error("starting a job"))?;
     let _set = state.planner_task.set(task);
-    // the scrub runs apart from the planner, in the idle I/O class, so a read the disk holds back holds up no planning
-    let task = state.io.spawn_job("reel-scrub", ScrubRunner::new(Arc::clone(state))).map_err(open_error("starting a job"))?;
-    let _set = state.scrub_task.set(task);
+    // the scrub runs apart from the planner, in the idle I/O class, so a read the disk holds back holds up no planning. A store
+    // with no scrub rate starts no thread for it
+    if state.scrub_rate > 0 {
+        let task = state.io.spawn_job("reel-scrub", ScrubRunner::new(Arc::clone(state))).map_err(open_error("starting a job"))?;
+        let _set = state.scrub_task.set(task);
+    }
     let reserve_job = ReserveJob::new(Arc::clone(state));
     let task = state.io.spawn_job("reel-reserve", reserve_job).map_err(open_error("starting a job"))?;
     let _set = state.reserve_task.set(task);

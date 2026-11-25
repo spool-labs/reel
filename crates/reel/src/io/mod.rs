@@ -452,6 +452,24 @@ pub trait Io: Clone + Send + Sync + 'static {
     /// Say whether any disk under a path spins, or nothing when this backend can't tell
     fn is_rotational(&self, path: &Path) -> Option<bool>;
 
+    /// Start a watch on the kernel's memory pressure events for the store's control group that calls `wake` on each, or nothing
+    /// where this backend can't
+    fn watch_pressure(&self, wake: std::sync::Arc<dyn Fn() + Send + Sync>) -> Option<crate::io::host_memory::PressureWatch> {
+        let _unused = wake;
+        None
+    }
+
+    /// Read the share of the last ten seconds some task of the store's control group stalled on memory, in hundredths of a
+    /// percent, or nothing where this backend can't tell
+    fn memory_pressure(&self) -> Option<u32> {
+        None
+    }
+
+    /// Count the times the store's control group hit its memory.high or memory.max, or nothing where this backend can't tell
+    fn memory_limit_hits(&self) -> Option<u64> {
+        None
+    }
+
     /// Say whether the disk under a path runs a scheduler that serves I/O classes, so the idle class the maintenance work takes
     /// does something there, or nothing when this backend can't tell
     fn has_io_classes(&self, path: &Path) -> Option<bool> {

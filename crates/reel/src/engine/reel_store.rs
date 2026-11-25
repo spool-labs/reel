@@ -10,7 +10,7 @@ use std::time::Duration;
 use reel_core::column_id::ColumnId;
 use reel_core::direction::Direction;
 use reel_core::maintenance_report::MaintenanceReport;
-use reel_core::memory_report::MemoryReport;
+use reel_core::memory_report::{MemoryReport, PressureSource};
 use reel_core::reads::ValueWindow;
 use reel_core::store_error::StoreError;
 use reel_core::value_list::ValueList;
@@ -719,6 +719,8 @@ impl<Backend: Io> EngineState<Backend> {
     /// Stop every job
     pub(crate) fn stop_jobs(&self) -> Result<(), Error> {
         self.is_stopping.store(true, Ordering::Release);
+        // the pressure watch looks whether to stop every quarter second, and joins here
+        drop(hold(&self.pressure_watch).take());
         // the jobs with long steps all stop at once, so the joins below wait for the slowest step and not the sum
         self.workers.ask_stop();
         if let Some(task) = self.planner_task.get() {
@@ -1012,6 +1014,29 @@ pub fn start_jobs<Backend: Io>(state: &Arc<EngineState<Backend>>) -> Result<(), 
     // the heap and stacks outside the rooms barely move after open, so the ladder counts them once beside the rooms it can shrink
     let report = state.memory_report();
     state.fixed_heap.store((report.heap_total().0 + report.thread_stacks.0).saturating_sub(report.pool_committed.0), Ordering::Release);
+    // the store learns of memory pressure the best way the host offers: a trigger the kernel fires, else a read of the group's
+    // pressure each step, else the host's free memory
+    let engine = Arc::downgrade(state);
+    let fired: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        if let Some(state) = engine.upgrade() {
+            state.is_pressure_fired.store(true, Ordering::Release);
+            state.pressure_events.fetch_add(1, Ordering::Relaxed);
+            if let Some(task) = state.reserve_task.get() {
+                task.wake();
+            }
+        }
+    });
+    let source = match state.io.watch_pressure(fired) {
+        Some(watch) => {
+            *hold(&state.pressure_watch) = Some(watch);
+            PressureSource::Trigger
+        },
+        None if state.io.memory_pressure().is_some() || state.io.memory_limit_hits().is_some() => PressureSource::Read,
+        None => PressureSource::Host,
+    };
+    let _set = state.pressure_source.set(source);
+    // a lock can build its state on first use, so open takes it here and close allocates nothing
+    drop(hold(&state.pressure_watch));
     for cell in &state.read_tasks {
         let worker = ReadWorker {
             state: Arc::clone(state),
@@ -1715,6 +1740,11 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> Result<Engin
         under_since: AtomicU64::new(0),
         is_under_pressure: AtomicBool::new(false),
         is_target_short: AtomicBool::new(false),
+        pressure_source: OnceLock::new(),
+        pressure_watch: Mutex::new(None),
+        is_pressure_fired: AtomicBool::new(false),
+        pressure_events: AtomicU64::new(0),
+        limit_hits: AtomicU64::new(u64::MAX),
         seal_heap: AtomicU64::new(0),
         walk_heap: AtomicU64::new(0),
         worker_priority: Mutex::new(WorkerPriority::default()),

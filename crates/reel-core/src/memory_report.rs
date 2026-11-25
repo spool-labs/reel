@@ -80,6 +80,10 @@ pub struct MemoryReport {
     pub is_under_pressure: bool,
     /// The ladder could not bring the store down to its target: the caches are spent, and what is left holds data
     pub is_target_short: bool,
+    /// Where the store learns of memory pressure, chosen at open
+    pub pressure_source: PressureSource,
+    /// Pressure events the kernel sent through a trigger since open
+    pub pressure_events: u64,
 }
 
 impl MemoryReport {
@@ -106,4 +110,16 @@ impl MemoryReport {
                 + self.compaction.0,
         )
     }
+}
+
+/// Where a store learns of memory pressure, the best the host offers, chosen at open
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PressureSource {
+    /// A trigger on the control group's memory.pressure, which the kernel fires once tasks stall past a mark
+    Trigger,
+    /// A read of the control group's memory.pressure each step, where the store may not write a trigger
+    Read,
+    /// The host's free memory, read each step, where the kernel keeps no pressure for the group
+    #[default]
+    Host,
 }

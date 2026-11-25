@@ -177,9 +177,153 @@ fn sysctl_u64(name: &std::ffi::CStr) -> Option<u64> {
     }
 }
 
+/// The mark a trigger asks the kernel for: some task stalled on memory for 150 ms of any one-second window
+#[cfg(target_os = "linux")]
+pub const PRESSURE_TRIGGER: &[u8] = b"some 150000 1000000";
+/// The share of the last ten seconds some task stalled on memory past which a read counts as pressure, in hundredths of a percent
+pub const PRESSURE_READ_MARK: u32 = 1_000;
+/// How long the watch waits on the kernel before it looks whether the store closed, in milliseconds
+#[cfg(target_os = "linux")]
+pub const PRESSURE_WAIT_MILLIS: libc::c_int = 250;
+
+/// A thread that waits on the kernel's pressure events for the store's control group, which stops and joins when it drops
+pub struct PressureWatch {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for PressureWatch {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _joined = thread.join();
+        }
+    }
+}
+
+/// Copy the process's control group, as /proc/self/cgroup gives it, into a buffer, and return its length
+#[cfg(target_os = "linux")]
+fn own_group(group: &mut [u8; PATH_BYTES]) -> Option<usize> {
+    let mut buffer = [0u8; READ_BYTES];
+    let length = read_small(c"/proc/self/cgroup".to_bytes_with_nul(), &mut buffer)?;
+    // the unified hierarchy's line is "0::/path"
+    let line = buffer[..length].split(|byte| *byte == b'\n').find(|line| line.starts_with(b"0::"))?;
+    let name = &line[3..];
+    let target = group.get_mut(..name.len())?;
+    target.copy_from_slice(name);
+    Some(name.len())
+}
+
+/// Read the share of the last ten seconds some task of the store's control group stalled on memory, in hundredths of a percent,
+/// or nothing where the kernel keeps no pressure for the group
+#[cfg(target_os = "linux")]
+pub fn group_pressure() -> Option<u32> {
+    let mut group = [0u8; PATH_BYTES];
+    let length = own_group(&mut group)?;
+    let mut path = [0u8; PATH_BYTES];
+    let mut buffer = [0u8; READ_BYTES];
+    let read = read_small(group_file(&group[..length], b"memory.pressure", &mut path)?, &mut buffer)?;
+    parse_avg10(&buffer[..read])
+}
+
+/// Read no pressure where the kernel keeps none
+#[cfg(not(target_os = "linux"))]
+pub fn group_pressure() -> Option<u32> {
+    None
+}
+
+/// Count the times the store's control group hit its memory.high or memory.max, which the kernel keeps in memory.events, or nothing
+/// where the group has no such file
+#[cfg(target_os = "linux")]
+pub fn group_limit_hits() -> Option<u64> {
+    let mut group = [0u8; PATH_BYTES];
+    let length = own_group(&mut group)?;
+    let mut path = [0u8; PATH_BYTES];
+    let mut buffer = [0u8; READ_BYTES];
+    let read = read_small(group_file(&group[..length], b"memory.events", &mut path)?, &mut buffer)?;
+    let events = &buffer[..read];
+    Some(field_number(events, b"high ").unwrap_or(0) + field_number(events, b"max ").unwrap_or(0))
+}
+
+/// Count no hits where the kernel keeps none
+#[cfg(not(target_os = "linux"))]
+pub fn group_limit_hits() -> Option<u64> {
+    None
+}
+
+/// Read the "some" line's avg10 from a pressure file, in hundredths of a percent
+#[cfg(any(target_os = "linux", test))]
+pub fn parse_avg10(text: &[u8]) -> Option<u32> {
+    let line = text.split(|byte| *byte == b'\n').find(|line| line.starts_with(b"some "))?;
+    let at = line.windows(6).position(|window| window == b"avg10=")? + 6;
+    let field = line[at..].split(|byte| *byte == b' ').next()?;
+    let mut parts = field.split(|byte| *byte == b'.');
+    let whole = parse_number(parts.next()?)?;
+    let fraction = parts.next().map_or(0, |digits| parse_number(&digits[..digits.len().min(2)]).unwrap_or(0) * if digits.len() == 1 { 10 } else { 1 });
+    u32::try_from(whole * 100 + fraction).ok()
+}
+
+/// Write a trigger on the store's control group's memory.pressure and start a thread that calls `wake` on each event, or nothing
+/// where the store may not write one
+#[cfg(target_os = "linux")]
+pub fn watch_pressure(wake: std::sync::Arc<dyn Fn() + Send + Sync>) -> Option<PressureWatch> {
+    let mut group = [0u8; PATH_BYTES];
+    let length = own_group(&mut group)?;
+    let mut path = [0u8; PATH_BYTES];
+    let file = group_file(&group[..length], b"memory.pressure", &mut path)?;
+    // SAFETY: the path ends in a nul and lives for the call
+    let descriptor = unsafe { libc::open(file.as_ptr().cast(), libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+    if descriptor < 0 {
+        return None;
+    }
+    // SAFETY: the descriptor is open, and the trigger's bytes live for the call
+    let written = unsafe { libc::write(descriptor, PRESSURE_TRIGGER.as_ptr().cast(), PRESSURE_TRIGGER.len()) };
+    if written < 0 {
+        // SAFETY: the descriptor is open and closes once
+        unsafe { libc::close(descriptor) };
+        return None;
+    }
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopped = std::sync::Arc::clone(&stop);
+    let thread = std::thread::Builder::new()
+        .name("reel-pressure".to_string())
+        .spawn(move || {
+            while !stopped.load(std::sync::atomic::Ordering::Acquire) {
+                let mut wait = libc::pollfd { fd: descriptor, events: libc::POLLPRI, revents: 0 };
+                // SAFETY: the descriptor is open while the thread runs, and the poll entry lives for the call
+                let ready = unsafe { libc::poll(&mut wait, 1, PRESSURE_WAIT_MILLIS) };
+                if ready > 0 && wait.revents & libc::POLLERR != 0 {
+                    break;
+                }
+                if ready > 0 && wait.revents & libc::POLLPRI != 0 {
+                    wake();
+                }
+            }
+            // SAFETY: the descriptor is open and closes once, here
+            unsafe { libc::close(descriptor) };
+        })
+        .ok()?;
+    Some(PressureWatch { stop, thread: Some(thread) })
+}
+
+/// Start no watch where the kernel offers no trigger
+#[cfg(not(target_os = "linux"))]
+pub fn watch_pressure(wake: std::sync::Arc<dyn Fn() + Send + Sync>) -> Option<PressureWatch> {
+    let _unused = wake;
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_a_pressure_file() {
+        let pressure = b"some avg10=12.34 avg60=1.00 avg300=0.50 total=123\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
+        assert_eq!(parse_avg10(pressure), Some(1_234));
+        assert_eq!(parse_avg10(b"some avg10=0.5 avg60=0.00\n"), Some(50));
+        assert_eq!(parse_avg10(b"full avg10=3.00\n"), None);
+    }
 
     #[test]
     fn reads_meminfo_fields() {

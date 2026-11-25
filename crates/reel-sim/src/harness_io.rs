@@ -108,6 +108,18 @@ impl Io for HarnessIo {
         self.plain.has_io_classes(path)
     }
 
+    fn watch_pressure(&self, wake: std::sync::Arc<dyn Fn() + Send + Sync>) -> Option<reel::io::host_memory::PressureWatch> {
+        self.plain.watch_pressure(wake)
+    }
+
+    fn memory_pressure(&self) -> Option<u32> {
+        self.plain.memory_pressure()
+    }
+
+    fn memory_limit_hits(&self) -> Option<u64> {
+        self.plain.memory_limit_hits()
+    }
+
     fn is_rotational(&self, path: &Path) -> Option<bool> {
         self.plain.is_rotational(path)
     }

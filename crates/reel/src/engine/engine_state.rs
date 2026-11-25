@@ -41,6 +41,8 @@ use crate::index::open_slots::OpenSlot;
 use crate::index::spot_index::SpotIndex;
 use crate::index::write_index::WriteIndex;
 use crate::pool_room::PoolRoom;
+use crate::io::host_memory::PressureWatch;
+use reel_core::memory_report::PressureSource;
 use crate::io::ring::{ReadRing, RingDriver};
 use crate::io::{InPlace, Io, IoFile, IoTask, in_place};
 use crate::engine::read_path::newest_of;
@@ -237,6 +239,15 @@ pub struct EngineState<Backend: Io> {
     pub is_under_pressure: AtomicBool,
     /// Set while the ladder could not bring the store down to its target with what the pools can give
     pub is_target_short: AtomicBool,
+    /// Where the store learns of memory pressure, chosen as the jobs start
+    pub pressure_source: OnceLock<PressureSource>,
+    /// The thread that waits on the kernel's pressure trigger, which close stops
+    pub pressure_watch: Mutex<Option<PressureWatch>>,
+    /// Set by a trigger event, and taken by the next ladder step
+    pub is_pressure_fired: AtomicBool,
+    pub pressure_events: AtomicU64,
+    /// The control group's memory.high and memory.max hits at the last ladder step, so a step that sees them grow counts as pressure
+    pub limit_hits: AtomicU64,
     pub seal_heap: AtomicU64,
     pub walk_heap: AtomicU64,
     pub worker_priority: Mutex<WorkerPriority>,
@@ -805,6 +816,8 @@ impl<Backend: Io> EngineState<Backend> {
             memory_held: ByteCount(self.fixed_heap.load(Ordering::Acquire) + self.pool_rooms.iter().map(|room| room.committed() as u64).sum::<u64>()),
             is_under_pressure: self.is_under_pressure.load(Ordering::Acquire),
             is_target_short: self.is_target_short.load(Ordering::Acquire),
+            pressure_source: self.pressure_source.get().copied().unwrap_or_default(),
+            pressure_events: self.pressure_events.load(Ordering::Relaxed),
             write_index: self.index.heap_bytes(),
             spot_cache: self.spot.heap_bytes(),
             record_cache: self.record_cache.heap_bytes(),

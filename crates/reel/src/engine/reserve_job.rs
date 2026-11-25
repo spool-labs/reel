@@ -15,7 +15,8 @@ use crate::io::job::{Job, JobStep};
 use crate::io::{Io, IoFile, IoTask};
 use crate::pool::touched_filled;
 use crate::pool_room::{GrowPolicy, decay_nanos, grow_policy};
-use crate::io::host_memory::HostMemory;
+use crate::io::host_memory::{HostMemory, PRESSURE_READ_MARK};
+use reel_core::memory_report::PressureSource;
 use crate::segment::segment_tail::SegmentNumber;
 
 /// How often the job looks: half a run of places lasts over half an hour at a million rows a second
@@ -196,7 +197,26 @@ impl<Backend: Io> ReserveJob<Backend> {
         let state = &self.state;
         let held = self.held_bytes();
         // the host's own pressure lowers the target in force at once, and it rises back only through the decay below
-        let pressed = pressed_target(&state.io.host_memory(), held, state.sizing.least_budget.0);
+        let least = state.sizing.least_budget.0;
+        // the kernel's own word comes first: a trigger that fired, or a group whose tasks stall on memory past the mark. Either
+        // gives back a sixteenth of what the store holds each step it lasts
+        let is_kernel_pressed = match state.pressure_source.get() {
+            Some(PressureSource::Trigger) => state.is_pressure_fired.swap(false, Ordering::AcqRel),
+            Some(PressureSource::Read) => {
+                let is_stalled = state.io.memory_pressure().is_some_and(|stall| stall > PRESSURE_READ_MARK);
+                // the first read only sets the mark, and a later one counts as pressure when the group hit its limits since
+                let hits = state.io.memory_limit_hits().unwrap_or(0);
+                let before = state.limit_hits.swap(hits, Ordering::AcqRel);
+                is_stalled || (before != u64::MAX && hits > before)
+            },
+            _ => false,
+        };
+        let kernel_pressed = is_kernel_pressed.then(|| held.saturating_sub(held / UNDER_DIVISOR).max(least));
+        let host_pressed = pressed_target(&state.io.host_memory(), held, least);
+        let pressed = match (kernel_pressed, host_pressed) {
+            (Some(kernel), Some(host)) => Some(kernel.min(host)),
+            (kernel, host) => kernel.or(host),
+        };
         state.is_under_pressure.store(pressed.is_some(), Ordering::Release);
         let target = state.memory_target.load(Ordering::Acquire).min(pressed.unwrap_or(u64::MAX));
         if held <= target {

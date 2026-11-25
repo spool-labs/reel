@@ -65,6 +65,10 @@ pub struct MemoryReport {
     pub disk_bytes: ByteCount,
     /// The disk bytes the entries cover, short of the disks when the line met its cap, and seals stop past it
     pub disk_covered: ByteCount,
+    /// Bytes the pools that grow with their data hold in memory now, which they map apart from the allocator
+    pub pool_committed: ByteCount,
+    /// Bytes those pools can grow to, their shares of the budget
+    pub pool_shares: ByteCount,
 }
 
 impl MemoryReport {

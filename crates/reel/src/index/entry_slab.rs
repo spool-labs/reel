@@ -5,7 +5,11 @@ use reel_core::units::{ByteCount, FileOffset, WritePlace};
 
 use crate::index::open_slots::OpenSlot;
 use crate::index::write_row::WriteRow;
-use crate::pool::{TOUCH_BYTE, touched_filled};
+use std::io::Result;
+use std::sync::Arc;
+
+use crate::pool::touched_filled;
+use crate::pool_room::PoolRoom;
 use crate::row_kind::RowKind;
 use crate::segment::segment_tail::SegmentNumber;
 
@@ -69,13 +73,17 @@ pub struct PageChain {
     pub pages: PageCount,
 }
 
-/// A shard's pages, all allocated and touched at open
+/// A shard's pages in a room that grows with them. Pages below `fresh` have been handed out, and every page under the room's limit
+/// is in memory
 #[derive(Debug)]
 pub struct EntrySlab {
-    bytes: Vec<u8>,
+    room: Arc<PoolRoom>,
     next_page: Vec<PageIndex>,
+    /// Pages given back, as a chain
     free_head: PageIndex,
-    free_pages: PageCount,
+    given_back: PageCount,
+    /// The first page never handed out
+    fresh: PageCount,
 }
 
 impl PageChain {
@@ -91,36 +99,70 @@ impl PageChain {
 }
 
 impl EntrySlab {
-    /// Allocate and touch a whole number of pages
-    pub fn new(pages: PageCount) -> Self {
-        let mut next_page = Vec::with_capacity(pages.0 as usize);
-        for page in 0..pages.0 {
-            let next = page.saturating_add(1);
-            next_page.push(if next == pages.0 { NO_PAGE } else { PageIndex(next) });
-        }
-
-        Self {
-            bytes: touched_filled(pages.0 as usize * PAGE_BYTES, TOUCH_BYTE),
-            next_page,
-            free_head: if pages.0 == 0 { NO_PAGE } else { PageIndex(0) },
-            free_pages: pages,
-        }
+    /// Reserve room for a whole number of pages with every page in memory
+    pub fn new(pages: PageCount) -> Result<Self> {
+        Self::growing(pages, pages)
     }
 
-    /// Read the heap this slab holds
+    /// Reserve room for a whole number of pages and bring the first of them into memory
+    pub fn growing(pages: PageCount, first: PageCount) -> Result<Self> {
+        let bytes = |count: PageCount| ByteCount(u64::from(count.0) * PAGE_BYTES as u64);
+        let room = PoolRoom::reserve(bytes(pages), bytes(first.min(pages)))?;
+        Ok(Self {
+            room: Arc::new(room),
+            next_page: touched_filled(pages.0 as usize, NO_PAGE),
+            free_head: NO_PAGE,
+            given_back: PageCount(0),
+            fresh: PageCount(0),
+        })
+    }
+
+    /// Read the room, which the growing job raises
+    pub fn room(&self) -> &Arc<PoolRoom> {
+        &self.room
+    }
+
+    /// Read the heap this slab holds: the pages in memory and the links
     pub fn heap_bytes(&self) -> ByteCount {
         let links = self.next_page.capacity() * size_of::<PageIndex>();
-        ByteCount((self.bytes.capacity() + links) as u64)
+        ByteCount((self.total_pages().0 as usize * PAGE_BYTES + links) as u64)
+    }
+
+    /// Count the pages free now: the ones given back and the ones in memory never handed out
+    pub fn free_pages(&self) -> PageCount {
+        PageCount(self.given_back.0 + self.total_pages().0.saturating_sub(self.fresh.0))
     }
 
     /// Check this many pages are free
     pub fn has_free_pages(&self, pages: PageCount) -> bool {
-        self.free_pages >= pages
+        self.free_pages() >= pages
     }
 
-    /// Count every page of this slab
+    /// Count the pages in memory now, which goes up as the room grows
     pub fn total_pages(&self) -> PageCount {
+        PageCount(((self.room.committed() / PAGE_BYTES) as u32).min(self.next_page.len() as u32))
+    }
+
+    /// Count the pages the slab can grow to
+    pub fn most_pages(&self) -> PageCount {
         PageCount(self.next_page.len() as u32)
+    }
+
+    /// Note the bytes the pages in use take, so the growing job sees the fill
+    fn note_used(&self) {
+        self.room.note_used((self.fresh.0 - self.given_back.0) as usize * PAGE_BYTES);
+    }
+
+    /// Read the bytes of the pages handed out, all of them in memory
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: the pages below fresh lie under the room's limit, and the growing job only writes past it
+        unsafe { std::slice::from_raw_parts(self.room.base(), self.fresh.0 as usize * PAGE_BYTES) }
+    }
+
+    /// Write the bytes of the pages handed out
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as in bytes, and the slab's own borrow is unique
+        unsafe { std::slice::from_raw_parts_mut(self.room.base(), self.fresh.0 as usize * PAGE_BYTES) }
     }
 
     /// Check a row of this key length could be stored
@@ -130,7 +172,7 @@ impl EntrySlab {
 
     /// Check a row of this many bytes could be stored
     pub fn has_room_for(&self, chain: &PageChain, size: usize, held: PageCount) -> bool {
-        chain.used + size <= PAGE_BYTES || self.free_pages > held
+        chain.used + size <= PAGE_BYTES || self.free_pages() > held
     }
 
     /// Store a row and return where it went, or nothing when the pages ran out
@@ -146,10 +188,10 @@ impl EntrySlab {
         let start = self.claim(chain, size)?;
         let value_at = start + KEY_AT + key.len();
         if let Some(value) = inline {
-            self.bytes[value_at..value_at + INLINE_LENGTH_BYTES].copy_from_slice(&(value.len() as u16).to_le_bytes());
-            self.bytes[value_at + INLINE_LENGTH_BYTES..value_at + INLINE_LENGTH_BYTES + value.len()].copy_from_slice(value);
+            self.bytes_mut()[value_at..value_at + INLINE_LENGTH_BYTES].copy_from_slice(&(value.len() as u16).to_le_bytes());
+            self.bytes_mut()[value_at + INLINE_LENGTH_BYTES..value_at + INLINE_LENGTH_BYTES + value.len()].copy_from_slice(value);
         }
-        let bytes = &mut self.bytes[start..value_at];
+        let bytes = &mut self.bytes_mut()[start..value_at];
         bytes[PLACE_AT..OFFSET_AT].copy_from_slice(&row.place.0.to_le_bytes());
         bytes[OFFSET_AT..LENGTH_AT].copy_from_slice(&(row.offset.0 as u32).to_le_bytes());
         bytes[LENGTH_AT..OLDER_AT].copy_from_slice(&(row.length.0 as u32).to_le_bytes());
@@ -167,12 +209,19 @@ impl EntrySlab {
     /// Claim bytes in the chain's newest page, taking a free page when it's full
     pub fn claim(&mut self, chain: &mut PageChain, size: usize) -> Option<usize> {
         if chain.used + size > PAGE_BYTES {
-            let page = self.free_head;
-            if page == NO_PAGE {
+            let page = if self.free_head != NO_PAGE {
+                let page = self.free_head;
+                self.free_head = self.next_page[page.0 as usize];
+                self.given_back = PageCount(self.given_back.0 - 1);
+                page
+            } else if self.fresh < self.total_pages() {
+                let page = PageIndex(self.fresh.0);
+                self.fresh = PageCount(self.fresh.0 + 1);
+                page
+            } else {
                 return None;
-            }
-            self.free_head = self.next_page[page.0 as usize];
-            self.free_pages = PageCount(self.free_pages.0 - 1);
+            };
+            self.note_used();
             self.next_page[page.0 as usize] = chain.newest;
             if chain.oldest == NO_PAGE {
                 chain.oldest = page;
@@ -192,7 +241,8 @@ impl EntrySlab {
         if chain.oldest != NO_PAGE {
             self.next_page[chain.oldest.0 as usize] = self.free_head;
             self.free_head = chain.newest;
-            self.free_pages = PageCount(self.free_pages.0 + chain.pages.0);
+            self.given_back = PageCount(self.given_back.0 + chain.pages.0);
+            self.note_used();
         }
         *chain = PageChain::empty();
     }
@@ -200,13 +250,13 @@ impl EntrySlab {
     /// Read the key of a row
     pub fn key(&self, address: EntryAddress) -> &[u8] {
         let start = byte_of(address);
-        let length = u16::from_le_bytes([self.bytes[start + KEY_LENGTH_AT], self.bytes[start + KEY_LENGTH_AT + 1]]);
-        &self.bytes[start + KEY_AT..start + KEY_AT + length as usize]
+        let length = u16::from_le_bytes([self.bytes()[start + KEY_LENGTH_AT], self.bytes()[start + KEY_LENGTH_AT + 1]]);
+        &self.bytes()[start + KEY_AT..start + KEY_AT + length as usize]
     }
 
     /// Read the column of a row
     pub fn column(&self, address: EntryAddress) -> ColumnId {
-        ColumnId(self.bytes[byte_of(address) + COLUMN_AT])
+        ColumnId(self.bytes()[byte_of(address) + COLUMN_AT])
     }
 
     /// Read the place of a row
@@ -216,7 +266,7 @@ impl EntrySlab {
 
     /// Read the open slot of a row
     pub fn slot(&self, address: EntryAddress) -> OpenSlot {
-        OpenSlot(self.bytes[byte_of(address) + SLOT_AT])
+        OpenSlot(self.bytes()[byte_of(address) + SLOT_AT])
     }
 
     /// Read a whole row, or nothing when its kind byte is unknown
@@ -226,7 +276,7 @@ impl EntrySlab {
             place: WritePlace(self.word(start + PLACE_AT)),
             offset: FileOffset(u64::from(self.half(start + OFFSET_AT))),
             length: ByteCount(u64::from(self.half(start + LENGTH_AT))),
-            kind: RowKind::from_byte(self.bytes[start + KIND_AT] & !(NEWER_SEALED_FLAG | ENTERED_FLAG | INLINE_FLAG))?,
+            kind: RowKind::from_byte(self.bytes()[start + KIND_AT] & !(NEWER_SEALED_FLAG | ENTERED_FLAG | INLINE_FLAG))?,
             slot: self.slot(address),
             segment: SegmentNumber(0),
             has_newer_sealed: self.has_newer_sealed(address),
@@ -236,12 +286,12 @@ impl EntrySlab {
     /// Read the value a row keeps after its key, when it keeps one
     pub fn inline_value(&self, address: EntryAddress) -> Option<&[u8]> {
         let start = byte_of(address);
-        if self.bytes[start + KIND_AT] & INLINE_FLAG == 0 {
+        if self.bytes()[start + KIND_AT] & INLINE_FLAG == 0 {
             return None;
         }
-        let at = start + KEY_AT + usize::from(u16::from_le_bytes([self.bytes[start + KEY_LENGTH_AT], self.bytes[start + KEY_LENGTH_AT + 1]]));
-        let length = usize::from(u16::from_le_bytes([self.bytes[at], self.bytes[at + 1]]));
-        Some(&self.bytes[at + INLINE_LENGTH_BYTES..at + INLINE_LENGTH_BYTES + length])
+        let at = start + KEY_AT + usize::from(u16::from_le_bytes([self.bytes()[start + KEY_LENGTH_AT], self.bytes()[start + KEY_LENGTH_AT + 1]]));
+        let length = usize::from(u16::from_le_bytes([self.bytes()[at], self.bytes()[at + 1]]));
+        Some(&self.bytes()[at + INLINE_LENGTH_BYTES..at + INLINE_LENGTH_BYTES + length])
     }
 
     /// Read the next older version of a row's key
@@ -252,7 +302,7 @@ impl EntrySlab {
     /// Link a row to the next older version of its key
     pub fn set_older(&mut self, address: EntryAddress, older: EntryAddress) {
         let at = byte_of(address) + OLDER_AT;
-        self.bytes[at..at + size_of::<u32>()].copy_from_slice(&older.0.to_le_bytes());
+        self.bytes_mut()[at..at + size_of::<u32>()].copy_from_slice(&older.0.to_le_bytes());
     }
 
     /// Read the next newer version of a row's key
@@ -263,40 +313,40 @@ impl EntrySlab {
     /// Link a row to the next newer version of its key
     pub fn set_newer(&mut self, address: EntryAddress, newer: EntryAddress) {
         let at = byte_of(address) + NEWER_AT;
-        self.bytes[at..at + size_of::<u32>()].copy_from_slice(&newer.0.to_le_bytes());
+        self.bytes_mut()[at..at + size_of::<u32>()].copy_from_slice(&newer.0.to_le_bytes());
     }
 
     /// Check whether a newer version of this row's key sits in a sealed segment
     pub fn has_newer_sealed(&self, address: EntryAddress) -> bool {
-        self.bytes[byte_of(address) + KIND_AT] & NEWER_SEALED_FLAG != 0
+        self.bytes()[byte_of(address) + KIND_AT] & NEWER_SEALED_FLAG != 0
     }
 
     /// Note that a newer version of this row's key sits in a sealed segment
     pub fn mark_newer_sealed(&mut self, address: EntryAddress) {
-        self.bytes[byte_of(address) + KIND_AT] |= NEWER_SEALED_FLAG;
+        self.bytes_mut()[byte_of(address) + KIND_AT] |= NEWER_SEALED_FLAG;
     }
 
     /// Check a row went into its column's sorted index before its seal
     pub fn is_entered(&self, address: EntryAddress) -> bool {
-        self.bytes[byte_of(address) + KIND_AT] & ENTERED_FLAG != 0
+        self.bytes()[byte_of(address) + KIND_AT] & ENTERED_FLAG != 0
     }
 
     /// Note a row went into its column's sorted index before its seal
     pub fn mark_entered(&mut self, address: EntryAddress) {
-        self.bytes[byte_of(address) + KIND_AT] |= ENTERED_FLAG;
+        self.bytes_mut()[byte_of(address) + KIND_AT] |= ENTERED_FLAG;
     }
 
     /// Read one little-endian word
     pub fn word(&self, at: usize) -> u64 {
         let mut word = [0; size_of::<u64>()];
-        word.copy_from_slice(&self.bytes[at..at + size_of::<u64>()]);
+        word.copy_from_slice(&self.bytes()[at..at + size_of::<u64>()]);
         u64::from_le_bytes(word)
     }
 
     /// Read one little-endian half word
     pub fn half(&self, at: usize) -> u32 {
         let mut half = [0; size_of::<u32>()];
-        half.copy_from_slice(&self.bytes[at..at + size_of::<u32>()]);
+        half.copy_from_slice(&self.bytes()[at..at + size_of::<u32>()]);
         u32::from_le_bytes(half)
     }
 }

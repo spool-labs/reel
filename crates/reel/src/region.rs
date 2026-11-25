@@ -58,7 +58,8 @@ impl Region {
             return Err(Error::other("mmap gave a null mapping"));
         };
         if !populate_written(memory, mapped) {
-            touch_pages(memory.cast::<u8>(), mapped, page);
+            // SAFETY: the range is the mapping just made, which nothing else holds yet
+            unsafe { touch_pages(memory.cast::<u8>(), mapped, page) };
         }
         // the faults the map and its populate took on this thread, which a fault gate can tell apart from a job's own
         note_populate(thread_faults().saturating_sub(faults_before));
@@ -123,7 +124,7 @@ pub unsafe fn release_head(head: NonNull<RegionHead>) {
 }
 
 /// Read the size of a page
-fn page_bytes() -> usize {
+pub fn page_bytes() -> usize {
     // SAFETY: sysconf reads a number and touches no memory of ours
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     usize::try_from(page).unwrap_or(4_096).max(4_096)
@@ -131,7 +132,7 @@ fn page_bytes() -> usize {
 
 /// The madvise that has the kernel write-fault every page of a range in, from Linux 5.14
 #[cfg(target_os = "linux")]
-const MADV_POPULATE_WRITE: libc::c_int = 23;
+pub const MADV_POPULATE_WRITE: libc::c_int = 23;
 
 /// Have the kernel write every page in, where MAP_POPULATE alone left them to fault at a job's first write on Linux 7.0, and
 /// say whether it did
@@ -160,7 +161,10 @@ fn populate_flag() -> libc::c_int {
 }
 
 /// Write one byte a page, so the pages are in memory before a step reads them
-fn touch_pages(memory: *mut u8, mapped: usize, page: usize) {
+///
+/// # Safety
+/// The range must lie inside a mapping the caller owns, with no reader or writer on it
+pub unsafe fn touch_pages(memory: *mut u8, mapped: usize, page: usize) {
     for offset in (0..mapped).step_by(page) {
         // SAFETY: the offset is inside the mapping, and the write keeps the page's zero
         unsafe { ptr::write_volatile(memory.add(offset), 0) };
@@ -176,7 +180,7 @@ pub const POPULATE_THREADS: usize = 64;
 pub static POPULATE_FAULTS: [(AtomicU64, AtomicU64); POPULATE_THREADS] = [const { (AtomicU64::new(0), AtomicU64::new(0)) }; POPULATE_THREADS];
 
 /// Add a populate's faults to the calling thread's total, in the slot its id took first
-fn note_populate(faults: u64) {
+pub fn note_populate(faults: u64) {
     let id = thread_id();
     for (slot_id, total) in &POPULATE_FAULTS {
         if slot_id.load(Ordering::Acquire) == id || slot_id.compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire).is_ok() {
@@ -207,7 +211,7 @@ fn thread_id() -> u64 {
 
 /// Read the minor faults the calling thread has taken
 #[cfg(target_os = "linux")]
-fn thread_faults() -> u64 {
+pub fn thread_faults() -> u64 {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
     // SAFETY: the call writes one rusage into the buffer, which is that size
     if unsafe { libc::getrusage(libc::RUSAGE_THREAD, usage.as_mut_ptr()) } != 0 {
@@ -219,16 +223,16 @@ fn thread_faults() -> u64 {
 
 /// Read no faults where the kernel keeps no count for one thread
 #[cfg(not(target_os = "linux"))]
-fn thread_faults() -> u64 {
+pub fn thread_faults() -> u64 {
     0
 }
 
 /// One map under way, counted from its start to its end whichever way it ends
-struct MapInFlight;
+pub struct MapInFlight;
 
 impl MapInFlight {
     /// Count a map as under way
-    fn enter() -> Self {
+    pub fn enter() -> Self {
         MAPS_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
         Self
     }

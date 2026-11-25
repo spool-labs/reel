@@ -2,6 +2,7 @@
 
 use std::cmp::Ordering;
 use std::hint;
+use std::io::Result;
 
 use reel_core::column_id::ColumnId;
 use reel_core::direction::Direction;
@@ -104,15 +105,20 @@ pub struct WriteShard {
 }
 
 impl WriteShard {
-    /// Allocate and touch every pool
-    pub fn new(sizing: &ShardSizing) -> Self {
-        Self {
+    /// Build every pool with all of it in memory
+    pub fn new(sizing: &ShardSizing) -> Result<Self> {
+        Self::growing(sizing, sizing.pages)
+    }
+
+    /// Build every pool, with the slab's first pages in memory and the rest reserved for it to grow into
+    pub fn growing(sizing: &ShardSizing, first_pages: PageCount) -> Result<Self> {
+        Ok(Self {
             nodes: NodePool::new(sizing.nodes),
-            slab: EntrySlab::new(sizing.pages),
+            slab: EntrySlab::growing(sizing.pages, first_pages)?,
             table: KeyTable::new(sizing.table_slots),
             trees: vec![WriteTree::empty(); sizing.open_slots],
             held: ShardHold::default(),
-        }
+        })
     }
 
     /// Read the heap this shard holds
@@ -129,6 +135,15 @@ impl WriteShard {
             && self.table.has_room_for(self.held.rows + 1)
             && self.slab.has_room(&tree.pages, key_length, self.held.pages)
             && (self.held.rows == 0 || self.rows_fit_nodes(self.held.rows + 1))
+    }
+
+    /// Check the slab is what lacks room and it can still grow, so a writer waits for its next part instead of sealing early
+    pub fn waits_for_slab(&self) -> bool {
+        let room = self.slab.room();
+        self.slab.total_pages() < self.slab.most_pages()
+            && !room.has_failed()
+            && self.nodes.free_count >= MAX_NEW_NODES
+            && self.table.has_room_for(self.held.rows + 1)
     }
 
     /// Count the rows this shard's nodes can always hold: every node but a root is at least half full
@@ -168,7 +183,7 @@ impl WriteShard {
     pub fn could_hold(&self, need: &ShardNeed) -> bool {
         need.rows <= self.table.most_rows()
             && need.rows <= self.node_row_limit()
-            && need.pages() <= self.slab.total_pages()
+            && need.pages() <= self.slab.most_pages()
     }
 
     /// Add a row, or return false when a pool ran out
@@ -199,7 +214,7 @@ impl WriteShard {
     /// Count the slab bytes kept values may take: the share shard_for_rows adds for them, less a page for each open slot's
     /// partly used tail
     pub fn kept_room(&self) -> u64 {
-        let total = u64::from(self.slab.total_pages().0) * PAGE_BYTES as u64;
+        let total = u64::from(self.slab.most_pages().0) * PAGE_BYTES as u64;
         (total / KEPT_SHARE_DIVISOR).saturating_sub((self.trees.len() * PAGE_BYTES) as u64)
     }
 

@@ -191,9 +191,16 @@ impl<Backend: Io> EngineState<Backend> {
         let _waiting = IndexWait::new(&self.index_waiters);
         let deadline = self.io.now().0.saturating_add(INDEX_WAIT.0);
         let own = &self.volumes[self.column(column)?.volume.0 as usize];
+        // the slab may only need its next part, which the reserve job brings in
+        if let Some(task) = self.reserve_task.get() {
+            task.wake();
+        }
         loop {
-            for volume in &self.volumes {
-                self.seal_fullest(volume);
+            // a slab that can still grow fills from its next part, and an early seal would only cut segments short
+            if !self.index.waits_for_slab(column, key) {
+                for volume in &self.volumes {
+                    self.seal_fullest(volume);
+                }
             }
             if self.index.has_room(column, key, slot) {
                 self.longest_index_wait.fetch_max(self.io.now().0.saturating_sub(started.0), Ordering::Relaxed);

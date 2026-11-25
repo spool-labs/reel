@@ -14,7 +14,8 @@ use crate::index::open_slots::{OpenSlot, OpenSlots};
 use crate::index::shard_cursor::ShardCursor;
 use crate::index::write_row::{WriteLookup, WriteRow};
 use crate::index::write_shard::{ShardNeed, ShardSizing, WalkBound, WriteShard};
-use crate::index::entry_slab::{EntryAddress, NO_ENTRY};
+use crate::index::entry_slab::{EntryAddress, NO_ENTRY, PageCount};
+use crate::pool_room::PoolRoom;
 use crate::index::sorted_keys::{Floors, KeyEntry, MOST_KEY_BYTES, SortedKeys, Upserted};
 use crate::pool::{touched_capacity, touched_from};
 use crate::index::write_tree::{entry_at, step_forward};
@@ -40,16 +41,21 @@ pub struct WriteIndex {
 }
 
 impl WriteIndex {
-    /// Allocate and touch every shard
-    pub fn new(sizing: &ShardSizing) -> Self {
+    /// Build every shard with its slab's first pages in memory
+    pub fn new(sizing: &ShardSizing, first_pages: PageCount) -> std::io::Result<Self> {
         let mut shards = Vec::with_capacity(SHARD_COUNT);
         for _shard in 0..SHARD_COUNT {
-            shards.push(RwLock::new(WriteShard::new(sizing)));
+            shards.push(RwLock::new(WriteShard::growing(sizing, first_pages)?));
         }
         let counts = (0..SHARD_COUNT).map(|_shard| OpenCounts::new(sizing.buckets)).collect();
         let classes = std::array::from_fn(|_column| AtomicU8::new(PLAIN_COUNTS));
         let column_open = touched_from(SHARD_COUNT, || std::array::from_fn(|_column| AtomicU32::new(0)));
-        Self { shards: Shards(shards), counts, classes, column_open, changes: Default::default() }
+        Ok(Self { shards: Shards(shards), counts, classes, column_open, changes: Default::default() })
+    }
+
+    /// Read every shard's slab room, for the job that grows them
+    pub fn rooms(&self) -> Vec<std::sync::Arc<PoolRoom>> {
+        (0..SHARD_COUNT).map(|index| self.shards.read(index).slab.room().clone()).collect()
     }
 
     /// Read the heap every shard holds
@@ -203,6 +209,11 @@ impl WriteIndex {
     pub fn has_room(&self, column: ColumnId, key: &[u8], slot: OpenSlot) -> bool {
         let hash = hash_key(column, key);
         self.shards.read(shard_of(hash)).has_room(slot, key.len())
+    }
+
+    /// Check a key's shard waits only for its slab to grow
+    pub fn waits_for_slab(&self, column: ColumnId, key: &[u8]) -> bool {
+        self.shards.read(shard_of(hash_key(column, key))).waits_for_slab()
     }
 
     /// Find a slot's highest key in a column, in any shard

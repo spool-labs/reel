@@ -351,7 +351,7 @@ fn shrink_keeps_a_quarter() {
 #[test]
 fn shard_sizing_reads_the_built_heap() {
     let planned = EngineSizing::for_store(&shape(ByteCount(256 * 1024 * 1024), 1));
-    let built = reel::index::write_shard::WriteShard::new(&planned.shard);
+    let built = reel::index::write_shard::WriteShard::new(&planned.shard).expect("build shard");
     let counts = reel::index::open_counts::OpenCounts::new(planned.shard.buckets);
     assert_eq!(planned.shard.heap_bytes().0, built.heap_bytes().0 + counts.heap_bytes().0);
 }

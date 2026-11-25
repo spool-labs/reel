@@ -40,6 +40,7 @@ use crate::region::Region;
 use crate::index::open_slots::OpenSlot;
 use crate::index::spot_index::SpotIndex;
 use crate::index::write_index::WriteIndex;
+use crate::pool_room::PoolRoom;
 use crate::io::ring::{ReadRing, RingDriver};
 use crate::io::{InPlace, Io, IoFile, IoTask, in_place};
 use crate::engine::read_path::newest_of;
@@ -101,6 +102,8 @@ pub struct EngineState<Backend: Io> {
     pub volumes: Vec<Volume<Backend>>,
     pub places: Arc<PlaceCount>,
     pub index: WriteIndex,
+    /// The rooms of the pools that grow with their data, which the reserve job raises
+    pub pool_rooms: Vec<Arc<PoolRoom>>,
     pub spot: SpotIndex,
     pub filter_cache: BlockCache,
     pub filter_arena: FilterArena,
@@ -780,6 +783,8 @@ impl<Backend: Io> EngineState<Backend> {
         let (arena_used, arena_room) = self.filter_arena.used_bytes();
         let mut report = MemoryReport {
             budget: self.memory_budget,
+            pool_committed: ByteCount(self.pool_rooms.iter().map(|room| room.committed() as u64).sum()),
+            pool_shares: ByteCount(self.pool_rooms.iter().map(|room| room.reserved() as u64).sum()),
             write_index: self.index.heap_bytes(),
             spot_cache: self.spot.heap_bytes(),
             record_cache: self.record_cache.heap_bytes(),

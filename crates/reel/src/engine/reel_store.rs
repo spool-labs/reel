@@ -28,7 +28,7 @@ use crate::engine::admission::Admission;
 use reel_core::maintenance_report::WorkerPriority;
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::engine_sizing::{
-    check_seal_blocks, complete_block_rows, complete_row_limit, index_headroom, rows_within_blocks, seal_blocks, set_segment_rows, split_idle_room,
+    check_seal_blocks, complete_block_rows, shard_for_rows, complete_row_limit, index_headroom, rows_within_blocks, seal_blocks, set_segment_rows, split_idle_room,
     EngineSizing, FILTER_CACHE_QUARTERS, FILTER_SLOT_BYTES, GROUP_BYTES, LEAST_LZ4_BUDGET, LEAST_SHARD_ENTRIES, PLANNED_LINE_BYTES,
     SHARED_JOBS, StoreShape, GATHER_BYTES, assumed_segment_bytes, capped_entries, disk_entries, entry_cost, entry_cover, floor_entries,
     dead_bits_bytes, segment_bytes_for, target_rows, IndexAsk, index_ask, index_cap, is_index_exact, share_indexes,
@@ -68,6 +68,8 @@ use crate::io::{DeviceReads, InPlace, in_place};
 use crate::row_kind::RowKind;
 use crate::segment::row_block::RowBlockWalk;
 use crate::index::open_slots::OpenSlot;
+use crate::index::entry_slab::PageCount;
+use crate::pool_room::FIRST_PART_DIVISOR;
 use crate::engine::complete_image::ImageFiles;
 use crate::index::complete_table::CompleteTable;
 use crate::index::complete_table::planned_table_bytes;
@@ -149,7 +151,7 @@ impl<Backend: Io> ReelStore<Backend> {
         let touched_from = io.now();
         // the sorted indexes take their room from the caches before anything is built, by the keys they held at open
         let (sizing, sorted_sizes) = size_sorted_indexes(config, &sizing, &summaries);
-        let mut state = build_state(OpenInputs { io, config, sizing: &sizing, disks: &disks, superblock, locks, scan: &scan, summaries });
+        let mut state = build_state(OpenInputs { io, config, sizing: &sizing, disks: &disks, superblock, locks, scan: &scan, summaries }).map_err(open_error("reserving the write index"))?;
         state.complete = complete_tables(config);
         state.sorted = sorted_indexes(config, &sorted_sizes);
         state.sorted_sizes = sorted_sizes;
@@ -1392,7 +1394,7 @@ pub struct OpenInputs<'open, Backend: Io> {
 }
 
 /// Allocate and touch everything the engine will hold
-pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<Backend> {
+pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> Result<EngineState<Backend>, Error> {
     let OpenInputs { io, config, sizing, disks, superblock, mut locks, scan, summaries } = inputs;
     // the write index holds what a segment of the store's mean record needs, and the record cache takes the rest
     let mean = mean_record(&summaries);
@@ -1523,13 +1525,18 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
     let reserved = superblock.next_segment.0;
     let first_number = reserved.saturating_sub(SEGMENT_NUMBER_BATCH);
 
+    // the slabs start with room for twice the open rows on disk and at least an eighth of their share, and grow from there. A
+    // reader runs no reserve job, so its slabs start whole
+    let first_pages = if sizing.is_read_only { sizing.shard.pages } else { shard_for_rows(open_rows.0.saturating_mul(2), sizing.shard.open_slots).pages.max(PageCount(sizing.shard.pages.0 / FIRST_PART_DIVISOR as u32)).min(sizing.shard.pages) };
+    let index = WriteIndex::new(&sizing.shard, first_pages)?;
+    let pool_rooms = index.rooms();
     // a sorted column's rows count apart from the start, so its walks see only the rows its index lacks
-    let index = WriteIndex::new(&sizing.shard);
     for column in config.columns.iter().filter(|column| column.is_sorted()) {
         index.mark_sorted(column.id);
     }
     let opened_at = io.now();
-    EngineState {
+    Ok(EngineState {
+        pool_rooms,
         io,
         record_key: superblock.record_key,
         sizing: *sizing,
@@ -1656,7 +1663,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> EngineState<
         index_waiters: AtomicU64::new(0),
         cues: CueTable::new(config.volumes.len()),
         is_stopping: AtomicBool::new(false),
-    }
+    })
 }
 
 /// What every volume's state is built from, which open read once for the whole store

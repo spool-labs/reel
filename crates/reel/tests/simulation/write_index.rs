@@ -131,7 +131,7 @@ fn next_across_shards(
 fn model_lookups() {
     for seed in seeds(0..SEED_COUNT) {
         let mut random = SeededRandom::new(Seed(seed));
-        let index = WriteIndex::new(&SIZING);
+        let index = WriteIndex::new(&SIZING, SIZING.pages).expect("build index");
         let mut model: BTreeMap<Vec<u8>, BTreeMap<u64, RowKind>> = BTreeMap::new();
         let view = OpenSlots::only(OpenSlot(0)).with(OpenSlot(1)).with(OpenSlot(2));
 
@@ -173,7 +173,7 @@ fn model_lookups() {
 #[test]
 fn tree_order() {
     for is_reversed in [false, true] {
-        let index = WriteIndex::new(&SIZING);
+        let index = WriteIndex::new(&SIZING, SIZING.pages).expect("build index");
         let mut expected = Vec::new();
         for number in 0..ROWS {
             let written = if is_reversed { ROWS - number } else { number + 1 };
@@ -194,7 +194,7 @@ fn tree_order() {
 #[test]
 fn seal_order() {
     let mut random = SeededRandom::new(Seed(1));
-    let index = WriteIndex::new(&SIZING);
+    let index = WriteIndex::new(&SIZING, SIZING.pages).expect("build index");
     let mut expected: Vec<(Vec<u8>, u64)> = Vec::new();
 
     for place in 1..=ROWS {
@@ -222,7 +222,7 @@ fn walk_gaps() {
         2 => WALK_RUN_ROWS,
         _ => 2 * WALK_RUN_ROWS + 1,
     };
-    let index = WriteIndex::new(&SIZING);
+    let index = WriteIndex::new(&SIZING, SIZING.pages).expect("build index");
     let mut counts = [0; SHARD_COUNT];
     let mut expected = Vec::new();
     for number in 0..KEY_SEARCH {
@@ -252,7 +252,7 @@ fn walk_gaps() {
 // after the switch a closed slot answers nothing, before any cleanup has run
 #[test]
 fn switch_before_cleanup() {
-    let index = WriteIndex::new(&SIZING);
+    let index = WriteIndex::new(&SIZING, SIZING.pages).expect("build index");
     add(&index, b"sealed-only", row(3, SEALED, RowKind::Value));
 
     let before = index.lookup(COLUMN, b"sealed-only", LATEST, both());
@@ -267,7 +267,7 @@ fn switch_before_cleanup() {
 // a closed slot's grave stops answering at the switch
 #[test]
 fn grave_at_switch() {
-    let index = WriteIndex::new(&SIZING);
+    let index = WriteIndex::new(&SIZING, SIZING.pages).expect("build index");
     add(&index, b"gone", row(3, SEALED, RowKind::Grave));
 
     let after = index.lookup(COLUMN, b"gone", LATEST, after_seal());
@@ -279,7 +279,7 @@ fn grave_at_switch() {
 // part way through cleanup no reader can tell which rows are gone
 #[test]
 fn switch_mid_cleanup() {
-    let index = WriteIndex::new(&SIZING);
+    let index = WriteIndex::new(&SIZING, SIZING.pages).expect("build index");
     for number in 0..ROWS {
         add(&index, &key_of(number), row(number + 1, SEALED, RowKind::Value));
     }
@@ -304,7 +304,7 @@ fn switch_mid_cleanup() {
 // row in another slot stays
 #[test]
 fn clean_versions() {
-    let index = WriteIndex::new(&SIZING);
+    let index = WriteIndex::new(&SIZING, SIZING.pages).expect("build index");
     for place in 1..=CLEAN_VERSIONS {
         add(&index, b"gone", row(place, SEALED, RowKind::Value));
         add(&index, b"kept", row(CLEAN_VERSIONS + place, SEALED, RowKind::Value));
@@ -328,7 +328,7 @@ fn clean_versions() {
 // a view loaded before the switch either finds the row or goes to the footers
 #[test]
 fn view_before_switch() {
-    let index = WriteIndex::new(&SIZING);
+    let index = WriteIndex::new(&SIZING, SIZING.pages).expect("build index");
     add(&index, b"key", row(3, SEALED, RowKind::Value));
 
     let early = index.lookup(COLUMN, b"key", LATEST, both());
@@ -344,7 +344,7 @@ fn view_before_switch() {
 // an older row in a segment that stays open can't hide a newer sealed one
 #[test]
 fn stale_version() {
-    let index = WriteIndex::new(&SIZING);
+    let index = WriteIndex::new(&SIZING, SIZING.pages).expect("build index");
     add(&index, b"key", row(5, STAYING, RowKind::Value));
     add(&index, b"key", row(10, SEALED, RowKind::Value));
 
@@ -362,7 +362,7 @@ fn stale_version() {
 // a newer write over a stale row needs no footers again
 #[test]
 fn newer_after_stale() {
-    let index = WriteIndex::new(&SIZING);
+    let index = WriteIndex::new(&SIZING, SIZING.pages).expect("build index");
     add(&index, b"key", row(5, STAYING, RowKind::Value));
     add(&index, b"key", row(10, SEALED, RowKind::Value));
     assert!(index.clean_slot(SEALED, CLEAN_ALL));
@@ -377,7 +377,7 @@ fn newer_after_stale() {
 // a cue below a sealed row still reads the older row and checks the footers
 #[test]
 fn cue_stale() {
-    let index = WriteIndex::new(&SIZING);
+    let index = WriteIndex::new(&SIZING, SIZING.pages).expect("build index");
     add(&index, b"key", row(5, STAYING, RowKind::Value));
     add(&index, b"key", row(10, SEALED, RowKind::Value));
     assert!(index.clean_slot(SEALED, CLEAN_ALL));
@@ -390,7 +390,7 @@ fn cue_stale() {
 // a slot takes rows again once cleanup has freed it
 #[test]
 fn slot_reuse() {
-    let index = WriteIndex::new(&TIGHT);
+    let index = WriteIndex::new(&TIGHT, TIGHT.pages).expect("build index");
     for round in 0..4 {
         for number in 0..ROWS / 4 {
             let place = round * ROWS + number + 1;
@@ -406,7 +406,7 @@ fn slot_reuse() {
 // a full shard refuses a row and keeps every row it took
 #[test]
 fn full_shard() {
-    let index = WriteIndex::new(&TIGHT);
+    let index = WriteIndex::new(&TIGHT, TIGHT.pages).expect("build index");
     let mut taken = Vec::new();
     for number in 0..ROWS * 8 {
         let key = key_of(number);
@@ -426,7 +426,7 @@ fn full_shard() {
 // the delete shortcut needs a visible grave as the key's newest row in an open slot
 #[test]
 fn grave_shortcut() {
-    let index = WriteIndex::new(&SIZING);
+    let index = WriteIndex::new(&SIZING, SIZING.pages).expect("build index");
     add(&index, b"grave", row(3, SEALED, RowKind::Grave));
     add(&index, b"value", row(4, SEALED, RowKind::Value));
     add(&index, b"revived", row(5, SEALED, RowKind::Grave));
@@ -444,7 +444,7 @@ fn grave_shortcut() {
 // a stale grave in a segment that stays open can't stand in for a sealed newer write
 #[test]
 fn shortcut_stale() {
-    let index = WriteIndex::new(&SIZING);
+    let index = WriteIndex::new(&SIZING, SIZING.pages).expect("build index");
     add(&index, b"key", row(5, STAYING, RowKind::Grave));
     add(&index, b"key", row(10, SEALED, RowKind::Value));
     assert!(index.clean_slot(SEALED, CLEAN_ALL));
@@ -455,7 +455,7 @@ fn shortcut_stale() {
 // walks reach every key once in both directions and stay in their column
 #[test]
 fn walk_keys() {
-    let index = WriteIndex::new(&SIZING);
+    let index = WriteIndex::new(&SIZING, SIZING.pages).expect("build index");
     let mut expected: BTreeSet<Vec<u8>> = BTreeSet::new();
     let mut random = SeededRandom::new(Seed(2));
     for place in 1..=ROWS {
@@ -514,7 +514,7 @@ fn walk_keys() {
 fn bound_at_every_edge() {
     for seed in seeds(0..SEED_COUNT) {
         let mut random = SeededRandom::new(Seed(seed));
-        let index = WriteIndex::new(&SIZING);
+        let index = WriteIndex::new(&SIZING, SIZING.pages).expect("build index");
         let mut expected: BTreeSet<Vec<u8>> = BTreeSet::new();
         for place in 1..=ROWS / 4 {
             let key = key_of(KEY_SPACE / 4 + random.below(KEY_SPACE / 2));
@@ -547,7 +547,7 @@ fn bound_at_every_edge() {
 // a shard refuses a row when its table is near full, and never spins in a probe
 #[test]
 fn table_limit() {
-    let index = WriteIndex::new(&SMALL_TABLE);
+    let index = WriteIndex::new(&SMALL_TABLE, SMALL_TABLE.pages).expect("build index");
     let mut taken = 0;
     for number in 0..ROWS {
         if index.insert(COLUMN, &key_of(number), &row(number + 1, SEALED, RowKind::Value), None) {
@@ -565,7 +565,7 @@ fn table_limit() {
 fn middle_clean() {
     let middle = OpenSlot(2);
     let view = both().with(middle);
-    let index = WriteIndex::new(&SIZING);
+    let index = WriteIndex::new(&SIZING, SIZING.pages).expect("build index");
     add(&index, b"key", row(1, STAYING, RowKind::Value));
     add(&index, b"key", row(2, middle, RowKind::Value));
     add(&index, b"key", row(3, SEALED, RowKind::Value));
@@ -584,7 +584,7 @@ fn middle_clean() {
 // a cue far behind a much rewritten key finds its version among all the newer ones
 #[test]
 fn cue_versions() {
-    let index = WriteIndex::new(&SIZING);
+    let index = WriteIndex::new(&SIZING, SIZING.pages).expect("build index");
     for place in 1..=MANY_VERSIONS {
         let slot = if place % 2 == 0 { SEALED } else { STAYING };
         add(&index, b"key", row(place, slot, RowKind::Value));
@@ -600,7 +600,7 @@ fn cue_versions() {
 // a much rewritten key cleans out of one slot and keeps its versions in the other
 #[test]
 fn hot_key_clean() {
-    let index = WriteIndex::new(&SIZING);
+    let index = WriteIndex::new(&SIZING, SIZING.pages).expect("build index");
     for place in 1..=MANY_VERSIONS {
         let slot = if place % 2 == 0 { SEALED } else { STAYING };
         add(&index, b"key", row(place, slot, RowKind::Value));
@@ -616,7 +616,7 @@ fn hot_key_clean() {
 // a walk keeps going through rows written under it, with no key twice and none lost
 #[test]
 fn walk_under_writes() {
-    let index = WriteIndex::new(&SIZING);
+    let index = WriteIndex::new(&SIZING, SIZING.pages).expect("build index");
     let mut expected: BTreeSet<Vec<u8>> = BTreeSet::new();
     for number in 0..KEY_SPACE {
         let key = key_of(number * 2);
@@ -681,7 +681,7 @@ fn need_pages() {
         for key in &keys {
             need.add(key.len());
         }
-        let mut shard = WriteShard::new(&BATCH_SIZING);
+        let mut shard = WriteShard::new(&BATCH_SIZING).expect("build shard");
         assert!(shard.hold_room(&need), "seed {seed}");
 
         for (place, key) in keys.iter().enumerate() {
@@ -696,7 +696,7 @@ fn need_pages() {
 // rows up to the limit the nodes promise always go in, falling keys being the order that leaves every node half full
 #[test]
 fn node_limit() {
-    let mut shard = WriteShard::new(&BATCH_SIZING);
+    let mut shard = WriteShard::new(&BATCH_SIZING).expect("build shard");
     let limit = shard.node_row_limit();
     let keys: Vec<Vec<u8>> = (0..limit).rev().map(key_of).collect();
     let mut need = ShardNeed::default();
@@ -720,7 +720,7 @@ fn node_limit() {
 // a put beside a hold can't take the pages held, and gets them once they're given back
 #[test]
 fn hold_blocks() {
-    let mut shard = WriteShard::new(&TIGHT);
+    let mut shard = WriteShard::new(&TIGHT).expect("build shard");
     let key = vec![b'k'; LONG_KEY_BYTES];
     let mut need = ShardNeed::default();
     while need.pages() < shard.slab.total_pages() {
@@ -737,7 +737,7 @@ fn hold_blocks() {
 // a hold that a later shard can't take leaves nothing held in the shards before it
 #[test]
 fn hold_whole() {
-    let index = WriteIndex::new(&TIGHT);
+    let index = WriteIndex::new(&TIGHT, TIGHT.pages).expect("build index");
     let key = key_of(1);
     let mut needs = [ShardNeed::default(); SHARD_COUNT];
     needs[0].add(key.len());
@@ -762,7 +762,7 @@ const SHORT_KEY_BYTES: usize = 8;
 fn kept_values_leave_planned_rows_their_room() {
     let sizing = shard_for_rows(PLANNED_ROWS * SHARD_COUNT as u64, 4);
     for wide in [64_usize, 99] {
-        let mut shard = WriteShard::new(&sizing);
+        let mut shard = WriteShard::new(&sizing).expect("build shard");
         let value = vec![3_u8; MOST_INLINE_VALUE];
         let mut rows = 0_u64;
         loop {

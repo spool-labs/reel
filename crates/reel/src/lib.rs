@@ -59,6 +59,7 @@ inner_modules!(
     little_endian,
     record,
     region,
+    pool_room,
     pool,
     prefetch,
     row_kind,

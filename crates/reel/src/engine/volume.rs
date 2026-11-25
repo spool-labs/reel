@@ -230,6 +230,8 @@ pub struct TestHolds {
     between_run_looks: Mutex<Option<RunHook>>,
     /// Set while between_run_looks holds a hook, so a scan with none skips its lock
     is_run_hooked: AtomicBool,
+    /// Work a walk step does between reading the sorted index's drop count and its mark, run once and then cleared
+    between_path_reads: Mutex<Option<RunHook>>,
     /// Merges ask every row, to compare against the dead bits
     pub no_bits: AtomicBool,
     /// Merges ask one bit decision in so many, as a release build does, so a bench measures the bits and not the check
@@ -249,6 +251,11 @@ impl TestHolds {
         let mut slot = hold(&self.between_run_looks);
         self.is_run_hooked.store(hook.is_some(), Ordering::Release);
         *slot = hook;
+    }
+
+    /// Install the work the next walk step runs between reading the drop count and the mark
+    pub fn set_between_path_reads(&self, hook: Option<RunHook>) {
+        *hold(&self.between_path_reads) = hook;
     }
 }
 
@@ -560,6 +567,19 @@ impl<Backend: Io> Volume<Backend> {
     /// Run nothing between a run's two looks, in a build without the hooks
     #[cfg(not(feature = "test-hooks"))]
     pub const fn between_run_looks(&self) {}
+
+    /// Run the work a test set between a walk step's read of the drop count and of the mark, once
+    #[cfg(feature = "test-hooks")]
+    pub fn between_path_reads(&self) {
+        let hook = hold(&self.holds.between_path_reads).take();
+        if let Some(RunHook(work)) = hook {
+            work();
+        }
+    }
+
+    /// Run nothing between the two reads, in a build without the hooks
+    #[cfg(not(feature = "test-hooks"))]
+    pub const fn between_path_reads(&self) {}
 
     /// Check a test holds compaction off
     #[cfg(feature = "test-hooks")]

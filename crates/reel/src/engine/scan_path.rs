@@ -259,9 +259,12 @@ impl<Backend: Io> EngineState<Backend> {
         // a sorted column with no mark, read at a point no sealed row hides, takes its sealed keys from the index and seats no
         // segment. A count takes whole blocks by their lines, so it keeps to the segments. A walk that changes path between steps
         // starts its places over, as one that meets a new list does
+        // the drop count goes before the mark: a whole drop that lands between the two moves the count after it was read, so the
+        // check after the batch read sees it
+        let drops = self.sorted_index(scan.column).map_or(0, SortedKeys::drops_seen);
+        volume.between_path_reads();
         let index = self.sorted_index(scan.column)
             .filter(|index| !scan.is_counting && index.mark().is_none() && !volume.may_hide_under_sealed(point));
-        let drops = index.map_or(0, SortedKeys::drops_seen);
         let is_path_changed = index.is_some() != scan.is_on_index || (index.is_some() && drops != scan.sorted_drops);
         scan.is_on_index = index.is_some();
         scan.sorted_drops = drops;
@@ -277,7 +280,7 @@ impl<Backend: Io> EngineState<Backend> {
             (Some(index), _directory) => {
                 fill_sorted(index, scan, &mut None);
                 // a drop moves its count before it empties a part, so a batch read beside one sees the count here and seeks again
-                if index.drops_seen() != scan.sorted_drops {
+                if index.drops_seen() != scan.sorted_drops || index.mark().is_some() {
                     return Ok(StepOutcome::Moved);
                 }
             },
@@ -546,7 +549,7 @@ impl<Backend: Io> EngineState<Backend> {
             }
             fill_sorted(index, scan, &mut passed);
             // a drop moves its count before it empties a part, and the next step seeks again
-            if index.drops_seen() != scan.sorted_drops {
+            if index.drops_seen() != scan.sorted_drops || index.mark().is_some() {
                 break;
             }
             let sorted = scan.sorted_key();

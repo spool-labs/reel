@@ -3633,3 +3633,35 @@ fn run_drop_seed(seed: u64) {
     check_scans(&store, &model, &mut SeededRandom::new(Seed(seed + 1)));
     store.close().expect("close");
 }
+
+// a whole drop that lands between a walk step's read of the drop count and its read of the mark sends the walk off the index, and
+// the walk still returns every key
+#[test]
+fn a_drop_between_a_steps_reads_loses_no_key() {
+    let io = SimulatedIo::new(Seed(48));
+    let store = open(&io, CAPACITY);
+    store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
+    store.state.volumes[0].holds.reclaim.store(true, Ordering::Release);
+    let model = fill_for_reopen(&store, &io, KEYS);
+    let whole: Rows = model.iter().map(|(name, value)| (name.clone(), value.clone())).collect();
+    let mut scan = store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan");
+    let (mut name, mut value) = (Vec::new(), Vec::new());
+    let mut walked = Vec::new();
+    for _first in 0..10 {
+        assert_eq!(scan.next_row(&mut name, &mut value).expect("step"), ScanStep::Found);
+        walked.push((name.clone(), value.clone()));
+    }
+    let state = Arc::clone(&store.state);
+    store.state.volumes[0].holds.set_between_path_reads(Some(reel::engine::volume::RunHook(Arc::new(move || {
+        let index = state.sorted_index(COLUMN).expect("an index");
+        let _freed = state.drop_sorted(index);
+    }))));
+    while scan.next_row(&mut name, &mut value).expect("step") == ScanStep::Found {
+        walked.push((name.clone(), value.clone()));
+    }
+    drop(scan);
+    assert_eq!(store.memory_report().sorted_drops + u64::from(store.state.sorted_index(COLUMN).expect("an index").is_dropped()), 1, "the hook never ran");
+    assert_eq!(walked.len(), whole.len(), "the walk lost keys to a drop between its reads");
+    assert_eq!(walked, whole);
+    store.close().expect("close");
+}

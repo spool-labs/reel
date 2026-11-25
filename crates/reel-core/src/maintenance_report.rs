@@ -577,6 +577,12 @@ pub struct SortedReading {
     pub capacity: RowCount,
     pub rows_past_capacity: RowCount,
     pub is_marked: bool,
+    /// The reserve job dropped the index under pressure and no refill has brought it back, so the column reads from the footers
+    pub is_dropped: bool,
+    /// Ticks a due refill waited for a seal or a merge output in flight
+    pub refill_waits: u64,
+    /// The column's open rows count, so a walk on the index skips the shards that hold none. A drop stops this until a restart
+    pub is_counted: bool,
     /// The bytes its sizing rule asked of the caches at open, and the bytes it got under the cap
     pub asked_bytes: ByteCount,
     pub got_bytes: ByteCount,

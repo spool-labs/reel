@@ -289,8 +289,7 @@ fn walks_and_counts_beside_drops_and_refills() {
             let _stops = StopOnDrop(done);
             let index = store.state.sorted_index(COLUMN).expect("a sorted index");
             while !done.load(Ordering::Acquire) {
-                let _freed = index.drop_entries();
-                store.state.stop_counting_full_indexes();
+                let _freed = store.state.drop_sorted(index);
                 drops.fetch_add(1, Ordering::Relaxed);
                 std::thread::yield_now();
                 index.set_may_refill(true);

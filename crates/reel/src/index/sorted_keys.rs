@@ -212,6 +212,12 @@ pub struct SortedKeys {
     is_dropped: std::sync::atomic::AtomicBool,
     /// Set by the reserve job while the store has room to bring a dropped index back
     may_refill: std::sync::atomic::AtomicBool,
+    /// When the last refill met a block it couldn't read, or 0
+    refill_failed_at: AtomicU64,
+    /// Ticks a due refill waited for a seal or a merge output in flight
+    refill_waits: AtomicU64,
+    /// Drops so far, which moves before a drop marks the index
+    drops: AtomicU64,
 }
 
 impl PackedKey {
@@ -365,6 +371,9 @@ impl SortedKeys {
             next_to_drop: std::sync::atomic::AtomicUsize::new(0),
             is_dropped: std::sync::atomic::AtomicBool::new(false),
             may_refill: std::sync::atomic::AtomicBool::new(false),
+            refill_failed_at: AtomicU64::new(0),
+            refill_waits: AtomicU64::new(0),
+            drops: AtomicU64::new(0),
         })
     }
 
@@ -493,14 +502,17 @@ impl SortedKeys {
 
 
     /// Drop every entry and give every page back, and return the pages freed. The entries count as rows past capacity and the
-    /// mark goes to segment 0 first, so a read that finds a part empty sees the mark after it and asks the footers, and a refill
-    /// that began before can't clear the mark
-    pub fn drop_entries(&self) -> u32 {
+    /// mark goes to segment 0 first, so a read that finds a part empty sees the mark after it and asks the footers. `between` runs
+    /// after the mark and before any part empties: the store stops counting the column there. The drop count is odd while a drop
+    /// runs, so no refill starts or ends inside one, and a refill from before it clears no mark
+    pub fn drop_entries(&self, between: impl FnOnce()) -> u32 {
         let before = self.room.free_pages();
+        self.drops.fetch_add(1, Memory::AcqRel);
         self.is_dropped.store(true, Memory::Release);
         self.may_refill.store(false, Memory::Release);
         self.past_capacity.fetch_add(self.entries.load(Memory::Acquire), Memory::AcqRel);
         self.mark.fetch_min(0, Memory::AcqRel);
+        between();
         for part in 0..PARTS {
             let mut tree = self.write_part(part);
             if tree.levels > 0 {
@@ -512,6 +524,7 @@ impl SortedKeys {
             drop(tree);
             self.entries.fetch_sub(entries, Memory::AcqRel);
         }
+        self.drops.fetch_add(1, Memory::AcqRel);
         self.room.free_pages().saturating_sub(before)
     }
 
@@ -545,15 +558,58 @@ impl SortedKeys {
         self.may_refill.load(Memory::Acquire) && self.is_dropped()
     }
 
-    /// End a refill: clear the mark it made good, or give up with the mark standing when a block couldn't be read
-    pub fn end_refill(&self, mark: SegmentNumber, missed: RowCount, is_whole: bool) -> bool {
-        let is_cleared = is_whole && self.clear_mark(mark, missed);
-        // a second refill that found the mark gone ends the drop as well
-        if is_cleared || !is_whole || self.mark().is_none() {
+    /// End a refill that walked every segment since the drop it counted: clear the mark it made good, and say whether it went. A
+    /// refill from before a later drop clears nothing, and a drop that comes while the mark clears puts it back. A second refill that
+    /// found the mark gone ends the drop as well
+    pub fn end_refill(&self, mark: SegmentNumber, missed: RowCount, drops: u64) -> bool {
+        if self.drops.load(Memory::Acquire) != drops {
+            return false;
+        }
+        let is_cleared = self.clear_mark(mark, missed);
+        if is_cleared && self.drops.load(Memory::Acquire) != drops {
+            self.past_capacity.fetch_add(missed.0, Memory::AcqRel);
+            self.mark.fetch_min(mark.0, Memory::AcqRel);
+            return false;
+        }
+        if is_cleared || self.mark().is_none() {
             self.is_dropped.store(false, Memory::Release);
+            self.refill_failed_at.store(0, Memory::Release);
         }
         is_cleared
     }
+
+    /// Read how many times a drop began or ended, which moves before a drop marks the index or empties a part
+    pub fn drops_seen(&self) -> u64 {
+        self.drops.load(Memory::Acquire)
+    }
+
+    /// Read the drop count a refill notes at its start, or nothing while a drop runs
+    pub fn drop_count(&self) -> Option<u64> {
+        let drops = self.drops.load(Memory::Acquire);
+        drops.is_multiple_of(2).then_some(drops)
+    }
+
+    /// Note a refill met a block it couldn't read. The index stays dropped, and a refill starts again after the back-off
+    pub fn refill_failed(&self, now: u64) {
+        self.refill_failed_at.store(now.max(1), Memory::Release);
+    }
+
+    /// Check a refill that failed has waited out its back-off, or none failed
+    pub fn is_refill_due(&self, now: u64) -> bool {
+        let failed = self.refill_failed_at.load(Memory::Acquire);
+        failed == 0 || now.saturating_sub(failed) >= REFILL_RETRY_NANOS
+    }
+
+    /// Count a tick a refill was due and a seal or a merge output in flight held it back
+    pub fn note_refill_wait(&self) {
+        self.refill_waits.fetch_add(1, Memory::Relaxed);
+    }
+
+    /// Read the ticks refills were held back by a seal or a merge output in flight
+    pub fn refill_waits(&self) -> u64 {
+        self.refill_waits.load(Memory::Relaxed)
+    }
+
     /// Find the part a key sits in
     pub fn part_of(&self, key: &[u8]) -> usize {
         key.first().map_or(0, |byte| usize::from(*byte))
@@ -1780,6 +1836,9 @@ fn first_byte(key: &PackedKey) -> usize {
     (key.words[0] >> 24) as usize
 }
 
+
+/// How long a refill that met an unreadable block waits before it starts again
+pub const REFILL_RETRY_NANOS: u64 = 60_000_000_000;
 /// Work out the pages an index for these rows of keys this wide holds
 pub fn planned_pages(width: usize, rows: RowCount) -> u32 {
     let key_words = width.clamp(1, MOST_KEY_BYTES).div_ceil(size_of::<u32>());

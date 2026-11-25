@@ -3486,6 +3486,8 @@ fn a_pressed_store_drops_its_index_and_refills_it() {
     assert_eq!(index.mark(), None, "the refill left the mark: {} past capacity, {} missed at start, {} free pages", index.past_capacity().0, refill.missed.0, index.free_pages());
     assert!(!index.is_dropped());
     assert_eq!(store.memory_report().sorted_refills, 1);
+    assert!(!sorted_reading(&store).is_counted, "a refilled column counts its open rows again");
+    assert!(!sorted_reading(&store).is_dropped);
     check_all(&store, &model, KEYS + KEYS / 2, 48);
     store.close().expect("close");
 }
@@ -3502,4 +3504,132 @@ fn merge_once(store: &Store) -> bool {
         job.rewrite.step();
     }
     true
+}
+
+// a refill that meets a block it can't read keeps the index dropped and its mark standing, and once the back-off passes a refill
+// starts again on its own and brings the index back whole, with no restart
+#[test]
+fn a_refill_past_an_unreadable_block_tries_again() {
+    let io = SimulatedIo::new(Seed(47));
+    let store = open(&io, CAPACITY);
+    store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
+    store.state.volumes[0].holds.reclaim.store(true, Ordering::Release);
+    let model = fill_for_reopen(&store, &io, KEYS);
+    let index = store.state.sorted_index(COLUMN).expect("an index");
+    let _freed = store.state.drop_sorted(index);
+    index.set_may_refill(true);
+    let mut refill = store.state.start_sorted_refill(0).expect("a refill");
+    // the next read fails, so the refill's first block can't be read
+    io.fail_reads_after(reel_sim::simulated_disk::OperationCount(0));
+    while store.state.sorted_refill_step(0, &mut refill).unwrap_or(false) {}
+    assert_eq!(index.mark(), Some(SegmentNumber(0)), "a refill past an unreadable block cleared the mark");
+    assert!(index.is_dropped(), "a failed refill ended the drop");
+    assert!(store.state.start_sorted_refill(0).is_none(), "a refill started inside the back-off");
+    let written: Vec<Vec<u8>> = (0..KEYS).map(key).collect();
+    check(&store, &model, &written);
+    io.advance_clock(Nanoseconds(reel::index::sorted_keys::REFILL_RETRY_NANOS));
+    let mut refill = store.state.start_sorted_refill(0).expect("a refill after the back-off");
+    while store.state.sorted_refill_step(0, &mut refill).expect("refill step") {}
+    assert_eq!(index.mark(), None);
+    assert!(!index.is_dropped());
+    assert!(!sorted_reading(&store).is_counted);
+    check_all(&store, &model, KEYS, 47);
+    store.close().expect("close");
+}
+
+/// Steps a drop seed runs
+const DROP_STEPS: u64 = 700;
+/// Keys a drop seed writes among
+const DROP_KEYS: u64 = 600;
+
+// random puts, deletes, range deletes, seals and merges, with a drop, refill steps and a refill pressure ends at steps the seed
+// picks: every get, count and scan answers the model at the step it runs, and a last refill brings the index back whole
+#[test]
+fn drops_and_refills_match_the_model() {
+    for seed in seeds([1_125_500, 1_125_501, 1_125_502, 1_125_503]) {
+        run_drop_seed(seed);
+    }
+}
+
+fn run_drop_seed(seed: u64) {
+    let io = SimulatedIo::new(Seed(seed));
+    let store = open(&io, CAPACITY);
+    store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
+    store.state.volumes[0].holds.reclaim.store(true, Ordering::Release);
+    let mut random = SeededRandom::new(Seed(seed));
+    let mut model = Model::new();
+    let index = store.state.sorted_index(COLUMN).expect("an index");
+    let mut refill = None;
+    let mut drops = 0;
+    for step in 0..DROP_STEPS {
+        let pick = random.below(100);
+        let name = key(random.below(DROP_KEYS));
+        match pick {
+            0..40 => {
+                let value = format!("{seed}-{step}").into_bytes();
+                store.put(COLUMN, &name, &value).expect("put");
+                model.insert(name, value);
+            },
+            40..50 => {
+                store.delete(COLUMN, &name).expect("delete");
+                model.remove(&name);
+            },
+            50..52 => {
+                let other = key(random.below(DROP_KEYS));
+                let (start, end) = if name < other { (name, other) } else { (other, name) };
+                store.delete_range(COLUMN, &start, &end).expect("delete range");
+                model.retain(|kept, _value| *kept < start || *kept >= end);
+            },
+            52..64 => assert_eq!(read(&store, &name), model.get(&name).cloned(), "seed {seed} step {step}: a get"),
+            64..67 => {
+                let whole: Rows = model.iter().map(|(name, value)| (name.clone(), value.clone())).collect();
+                assert_eq!(rows(store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan")), whole, "seed {seed} step {step}: a scan");
+            },
+            67..70 => assert_eq!(store.count_prefix(COLUMN, &[]).expect("count").0, model.len() as u64, "seed {seed} step {step}: a count"),
+            70..76 => seal_all(&store, &io),
+            76..79 => {
+                let _merged = merge_once(&store);
+            },
+            79..81 if !index.is_dropped() => {
+                let _freed = store.state.drop_sorted(index);
+                refill = None;
+                drops += 1;
+            },
+            81..90 if index.is_dropped() => {
+                index.set_may_refill(true);
+                if refill.is_none() {
+                    refill = store.state.start_sorted_refill(0);
+                }
+                // pressure ends one refill in eight partway
+                if random.one_in(8) {
+                    index.set_may_refill(false);
+                }
+                if let Some(mut going) = refill {
+                    refill = store.state.sorted_refill_step(0, &mut going).expect("refill step").then_some(going);
+                }
+            },
+            _ => {},
+        }
+    }
+    seal_all(&store, &io);
+    for _try in 0..10_000 {
+        if !index.is_dropped() {
+            break;
+        }
+        index.set_may_refill(true);
+        if refill.is_none() {
+            refill = store.state.start_sorted_refill(0);
+        }
+        let Some(mut going) = refill else {
+            break;
+        };
+        refill = store.state.sorted_refill_step(0, &mut going).expect("refill step").then_some(going);
+    }
+    assert_eq!(index.mark(), None, "seed {seed}: the last refill left the mark");
+    println!("seed {seed}: {drops} drops, {} refills", store.state.sorted_refills.load(Ordering::Relaxed));
+    let written: Vec<Vec<u8>> = (0..DROP_KEYS).map(key).collect();
+    check(&store, &model, &written);
+    check_entries(&store, &model);
+    check_scans(&store, &model, &mut SeededRandom::new(Seed(seed + 1)));
+    store.close().expect("close");
 }

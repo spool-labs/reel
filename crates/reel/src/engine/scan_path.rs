@@ -261,8 +261,10 @@ impl<Backend: Io> EngineState<Backend> {
         // starts its places over, as one that meets a new list does
         let index = self.sorted_index(scan.column)
             .filter(|index| !scan.is_counting && index.mark().is_none() && !volume.may_hide_under_sealed(point));
-        let is_path_changed = index.is_some() != scan.is_on_index;
+        let drops = index.map_or(0, SortedKeys::drops_seen);
+        let is_path_changed = index.is_some() != scan.is_on_index || (index.is_some() && drops != scan.sorted_drops);
         scan.is_on_index = index.is_some();
+        scan.sorted_drops = drops;
         if generation != scan.generation || is_path_changed {
             // a block taken by its line has no key to seek from, so a count that took one starts over and steps every row
             if generation != scan.generation && scan.taken > 0 {
@@ -274,8 +276,8 @@ impl<Backend: Io> EngineState<Backend> {
         match (index, directory) {
             (Some(index), _directory) => {
                 fill_sorted(index, scan, &mut None);
-                // a drop marks the index before it empties a part, so a batch read beside one sees the mark here and seeks again
-                if index.mark().is_some() {
+                // a drop moves its count before it empties a part, so a batch read beside one sees the count here and seeks again
+                if index.drops_seen() != scan.sorted_drops {
                     return Ok(StepOutcome::Moved);
                 }
             },
@@ -543,8 +545,8 @@ impl<Backend: Io> EngineState<Backend> {
                 scan.pass_sorted(at);
             }
             fill_sorted(index, scan, &mut passed);
-            // a drop marks the index before it empties a part, and the next step seeks again off the index
-            if index.mark().is_some() {
+            // a drop moves its count before it empties a part, and the next step seeks again
+            if index.drops_seen() != scan.sorted_drops {
                 break;
             }
             let sorted = scan.sorted_key();
@@ -1905,7 +1907,12 @@ impl<Backend: Io> EngineState<Backend> {
     /// shard holds no open row of the column it lacks, and no cover, damage or newer sealed row stands over the point. Nothing
     /// when it can't, and the walk counts
     pub fn count_on_index(&self, volume: &Volume<Backend>, column: ColumnId, prefix: &[u8], point: WritePlace) -> Option<u64> {
-        let index = self.sorted_index(column).filter(|index| index.mark().is_none())?;
+        let index = self.sorted_index(column)?;
+        // the drop count goes first, so a drop and a refill that both pass during the count show
+        let drops = index.drops_seen();
+        if index.mark().is_some() {
+            return None;
+        }
         if !volume.covers.is_empty() || !volume.damage.is_empty() || volume.may_hide_under_sealed(point) {
             return None;
         }
@@ -1914,8 +1921,8 @@ impl<Backend: Io> EngineState<Backend> {
             return None;
         }
         let count = index.count_live(prefix, point)?;
-        // a drop marks the index before it empties a part
-        if index.mark().is_some() {
+        // a drop moves its count before it empties a part, and a drop and a refill can both pass inside one count
+        if index.drops_seen() != drops || index.mark().is_some() {
             return None;
         }
         // a seal that started during the count can drop an entry under a grave, and it marks the volume before it does

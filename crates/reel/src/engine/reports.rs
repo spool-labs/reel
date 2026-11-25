@@ -424,6 +424,9 @@ impl<Backend: Io> EngineState<Backend> {
                 capacity: index.map_or(RowCount(0), SortedKeys::told_rows),
                 rows_past_capacity: index.map_or(RowCount(0), SortedKeys::past_capacity),
                 is_marked: index.is_some_and(|index| index.mark().is_some()),
+                is_dropped: index.is_some_and(SortedKeys::is_dropped),
+                refill_waits: index.map_or(0, SortedKeys::refill_waits),
+                is_counted: self.index.is_sorted_counted(ColumnId(id as u8)),
                 asked_bytes: size.asked,
                 got_bytes: size.got,
             });

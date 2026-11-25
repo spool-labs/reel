@@ -331,6 +331,9 @@ pub struct ScanState {
     pub sorted_entered: u64,
     /// The walk takes its sealed keys from the column's sorted index, and seats no segment
     pub is_on_index: bool,
+    /// The index's drops when the walk went on it. A drop and a refill can both pass between two steps, so a walk that sees the count
+    /// move starts its places over, as one that changes path does
+    pub sorted_drops: u64,
     /// The first key a batch passed for an open row newer than its point, and the batch's length then. A batch that located nothing
     /// after it goes back to it, so the walk takes the key once its put returns
     pub newer_passed: Vec<u8>,
@@ -700,6 +703,7 @@ impl ScanState {
             is_sorted_done: false,
             sorted_entered: u64::MAX,
             is_on_index: false,
+            sorted_drops: 0,
             newer_passed: touched_capacity(widest_key, 0),
             newer_passed_at: None,
             wanted: u64::MAX,

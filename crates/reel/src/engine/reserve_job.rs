@@ -304,8 +304,7 @@ impl<Backend: Io> ReserveJob<Backend> {
         if over > 0 && pressed.is_some() && was_short {
             let largest = state.sorted.iter().flatten().filter(|index| index.entry_count().0 > 0).max_by_key(|index| index.page_count());
             if let Some(index) = largest {
-                let _freed = index.drop_entries();
-                state.stop_counting_full_indexes();
+                let _freed = state.drop_sorted(index);
                 state.sorted_drops.fetch_add(1, Ordering::Relaxed);
                 over = over.saturating_sub(index.room().release_spare());
             }

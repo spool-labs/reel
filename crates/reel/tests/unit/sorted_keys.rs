@@ -302,7 +302,7 @@ fn a_drop_empties_the_index_and_a_refill_brings_it_back() {
     }
     let used = index.page_count() - index.free_pages();
     assert!(used > 10, "{used} pages in use");
-    let freed = index.drop_entries();
+    let freed = index.drop_entries(|| {});
     assert_eq!(freed, used, "the drop left pages in use");
     assert_eq!(index.check(), Ok(()));
     assert_eq!(index.entry_count(), RowCount(0));
@@ -315,20 +315,26 @@ fn a_drop_empties_the_index_and_a_refill_brings_it_back() {
     assert!(batch.is_empty());
     // a refill that started before a second drop can't clear the mark
     let missed = index.past_capacity();
+    let drops = index.drop_count().expect("no drop runs");
     for key in 0..10_000u64 {
         index.upsert(&key_of(key), entry(key + 1, false), Floors::at(WritePlace(0)));
     }
-    let _freed = index.drop_entries();
-    assert!(!index.end_refill(SegmentNumber(0), missed, true));
+    let _freed = index.drop_entries(|| {});
+    assert!(!index.end_refill(SegmentNumber(0), missed, drops));
     assert_eq!(index.mark(), Some(SegmentNumber(0)));
     assert!(index.is_dropped());
     let missed = index.past_capacity();
     index.set_may_refill(true);
     assert!(index.may_refill());
+    // a refill that met an unreadable block keeps the drop, and the next waits out the back-off
+    index.refill_failed(1_000);
+    assert!(index.is_dropped());
+    assert!(!index.is_refill_due(1_000 + reel::index::sorted_keys::REFILL_RETRY_NANOS - 1));
+    assert!(index.is_refill_due(1_000 + reel::index::sorted_keys::REFILL_RETRY_NANOS));
     for key in 0..10_000u64 {
         index.upsert(&key_of(key), entry(key + 1, false), Floors::at(WritePlace(0)));
     }
-    assert!(index.end_refill(SegmentNumber(0), missed, true));
+    assert!(index.end_refill(SegmentNumber(0), missed, index.drop_count().expect("no drop runs")));
     assert_eq!(index.mark(), None);
     assert!(!index.is_dropped() && !index.may_refill());
     assert_eq!(index.past_capacity(), RowCount(0));

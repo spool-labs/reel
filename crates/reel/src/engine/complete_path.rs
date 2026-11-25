@@ -44,7 +44,7 @@ pub struct BlockSpan {
     pub end: u32,
 }
 
-/// A refill of a complete table past its mark, a few row blocks a step
+/// A refill of a complete table past its mark, or of a dropped sorted index, a few row blocks a step
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Refill {
     pub column: ColumnId,
@@ -52,6 +52,8 @@ pub struct Refill {
     pub missed: RowCount,
     pub segment: Option<SegmentNumber>,
     pub block: u32,
+    /// The sorted index's drops when the refill began, so a refill from before a later drop clears no mark
+    pub drops: u64,
 }
 
 impl<Backend: Io> EngineState<Backend> {
@@ -196,6 +198,8 @@ impl<Backend: Io> EngineState<Backend> {
         read: &KeyRead<'_>,
         index: &SortedKeys,
     ) -> Result<(Option<SealedRow>, LeafAt), StoreError> {
+        // the drop count goes first: a drop and a refill that both pass during the find show, and the read asks the footers
+        let drops = index.drops_seen();
         let noted = index.find_at(read.key);
         let entry = noted.map(|(entry, _at)| entry);
         let leaf = noted.map_or(LeafAt::NONE, |(_entry, at)| at);
@@ -206,9 +210,16 @@ impl<Backend: Io> EngineState<Backend> {
             return Ok((self.search_footers(device, volume, read).await?, LeafAt::NONE));
         }
         let found = entry.as_ref().map(sealed_of);
-        let Some(mark) = index.mark() else {
-            self.sorted_answers.fetch_add(1, Ordering::Relaxed);
-            return Ok((found, leaf));
+        let mark = match index.mark() {
+            None if index.drops_seen() == drops => {
+                self.sorted_answers.fetch_add(1, Ordering::Relaxed);
+                return Ok((found, leaf));
+            },
+            None => {
+                self.sorted_footer_asks.fetch_add(1, Ordering::Relaxed);
+                return Ok((self.search_footers(device, volume, read).await?, LeafAt::NONE));
+            },
+            Some(mark) => mark,
         };
         self.sorted_footer_asks.fetch_add(1, Ordering::Relaxed);
         let Some(directory) = &self.directories[read.column.0 as usize] else {
@@ -636,6 +647,11 @@ impl<Backend: Io> EngineState<Backend> {
         }
     }
 
+    /// Drop a sorted index whole and stop counting its column, and return the pages freed
+    pub fn drop_sorted(&self, index: &SortedKeys) -> u32 {
+        index.drop_entries(|| self.stop_counting_full_indexes())
+    }
+
     /// Take out of a sorted index the entries of rows a cover hides, after rows went in from the footers
     pub fn remove_sorted_covers(&self, volume: &Volume<Backend>, column: ColumnId, index: &SortedKeys) {
         volume.covers.read().visit(|cover, start, end| {
@@ -651,7 +667,7 @@ impl<Backend: Io> EngineState<Backend> {
             let (Some(sorted), Some(info)) = (sorted, self.columns[id]) else {
                 continue;
             };
-            if info.volume.0 as usize != index || !sorted.may_refill() {
+            if info.volume.0 as usize != index || !sorted.may_refill() || !sorted.is_refill_due(self.io.now().0) {
                 continue;
             }
             let Some(mark) = sorted.mark() else {
@@ -660,17 +676,22 @@ impl<Backend: Io> EngineState<Backend> {
             let volume = &self.volumes[index];
             let sealing = volume.sealing.load(Ordering::Acquire);
             if (sealing != NO_SEAL && sealing >= mark.0) || volume.output_floor() != NO_SEAL {
+                sorted.note_refill_wait();
                 continue;
             }
             // the reserve job grows a room a step at a time and a refill takes pages faster, so the refill brings in the pages for
             // every row the index held before it starts. The job let it run only with room for them
+            // the drop count goes first: a drop after it moves it, so this refill clears no mark that drop set
+            let Some(drops) = sorted.drop_count() else {
+                continue;
+            };
             let missed = sorted.past_capacity();
             let rows = RowCount(missed.0 + sorted.entry_count().0);
             if sorted.room().grow_to(planned_index_bytes(sorted.width(), rows).0 as usize).is_err() {
                 continue;
             }
             let segment = hold(&volume.summary).orders().present().iter().rev().find(|segment| **segment >= mark).copied();
-            return Some(Refill { column: ColumnId(id as u8), mark, missed, segment, block: 0 });
+            return Some(Refill { column: ColumnId(id as u8), mark, missed, segment, block: 0, drops });
         }
         None
     }
@@ -686,7 +707,8 @@ impl<Backend: Io> EngineState<Backend> {
             return Ok(false);
         }
         let Some(segment) = refill.segment else {
-            if sorted.end_refill(refill.mark, refill.missed, true) {
+            // the column stays out of the open counts: its walks read every shard head from here on
+            if sorted.end_refill(refill.mark, refill.missed, refill.drops) {
                 self.sorted_refills.fetch_add(1, Ordering::Relaxed);
             }
             return Ok(false);
@@ -700,9 +722,11 @@ impl<Backend: Io> EngineState<Backend> {
         };
         let from = first + refill.block;
         let end = (from + REFILL_STEP_BLOCKS).min(first + count);
-        if !self.fill_sorted_span(volume, (refill.column, sorted), segment, |_first, _count| (from, end), &self.job_footer_readers)? {
-            sorted.end_refill(refill.mark, refill.missed, false);
-            return Ok(false);
+        // a block that can't be read, or a fault, ends the refill with the mark standing, and another starts after the back-off
+        let filled = self.fill_sorted_span(volume, (refill.column, sorted), segment, |_first, _count| (from, end), &self.job_footer_readers);
+        if !matches!(filled, Ok(true)) {
+            sorted.refill_failed(self.io.now().0);
+            return filled.map(|_filled| false);
         }
         // a row the refill put in may sit under a cover that sealed before it
         self.remove_sorted_covers(volume, refill.column, sorted);
@@ -763,7 +787,7 @@ impl<Backend: Io> EngineState<Backend> {
             }
             // newest first, so a key's newest row past the mark takes its slot ahead of the rows it superseded
             let segment = hold(&self.volumes[index].summary).orders().after(SegmentNumber(mark.0.saturating_sub(1))).last().copied();
-            return Some(Refill { column: ColumnId(id as u8), mark, missed: table.past_capacity(), segment, block: 0 });
+            return Some(Refill { column: ColumnId(id as u8), mark, missed: table.past_capacity(), segment, block: 0, drops: 0 });
         }
         None
     }

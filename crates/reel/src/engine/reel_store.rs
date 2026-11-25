@@ -1529,7 +1529,9 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> Result<Engin
     // reader runs no reserve job, so its slabs start whole
     let first_pages = if sizing.is_read_only { sizing.shard.pages } else { shard_for_rows(open_rows.0.saturating_mul(2), sizing.shard.open_slots).pages.max(PageCount(sizing.shard.pages.0 / FIRST_PART_DIVISOR as u32)).min(sizing.shard.pages) };
     let index = WriteIndex::new(&sizing.shard, first_pages)?;
-    let pool_rooms = index.rooms();
+    // a reader runs no reserve job, so its cache starts whole too
+    let record_cache = if sizing.is_read_only { RecordCache::new(record_share, cache_mean)? } else { RecordCache::fresh(record_share, cache_mean)? };
+    let pool_rooms = [index.rooms(), record_cache.rooms()].concat();
     // a sorted column's rows count apart from the start, so its walks see only the rows its index lacks
     for column in config.columns.iter().filter(|column| column.is_sorted()) {
         index.mark_sorted(column.id);
@@ -1549,7 +1551,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> Result<Engin
         filter_cache: BlockCache::new(ByteCount(split.filter_cache), FILTER_SLOT_BYTES),
         filter_arena: FilterArena::new(arena_share, planned.iter().map(|table| table.segments_per_shard * TABLE_SHARDS).sum()),
         row_cache: BlockCache::new(row_share, ROW_BLOCK_BYTES),
-        record_cache: RecordCache::new(record_share, cache_mean),
+        record_cache,
         complete_cache: is_complete.then(|| BlockCache::new(complete_share, COMPLETE_BLOCK_BYTES)),
         complete_line_bytes: ByteCount(complete_lines(config) * size_of::<BlockEntry>() as u64),
         queues,

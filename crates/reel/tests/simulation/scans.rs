@@ -993,7 +993,7 @@ fn scans_use_the_cache_that_holds_the_column() {
         let io = SimulatedIo::new(Seed(seed));
         let store = open(&io);
         hold_compaction(&store, true);
-        let room = store.state.record_cache.heap_bytes().0;
+        let room = store.state.record_cache.share_bytes().0;
         // a small column takes a tenth of the cache, and a large one twice the cache
         let (count, value_bytes) = if is_small { (room / 10 / CACHE_TEST_VALUE, CACHE_TEST_VALUE) } else { (room * 2 / CACHE_TEST_VALUE, CACHE_TEST_VALUE) };
         let mut model = Model::new();

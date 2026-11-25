@@ -5,13 +5,15 @@
 //! leaves the hot set in place. A record never changes where it sits, so an entry can't go stale: a merge that moves a record
 //! leaves the old entry to age out.
 
-use std::sync::Mutex;
+use std::io::Result;
+use std::sync::{Arc, Mutex};
 
 use reel_core::units::{ByteCount, FileOffset};
 
 use crate::engine::caller_activity::CallerCounts;
 use crate::guard::hold;
 use crate::pool::touched_filled;
+use crate::pool_room::{FIRST_PART_DIVISOR, PoolRoom};
 use crate::segment::segment_tail::SegmentNumber;
 
 /// Shards of the cache, each behind its own lock
@@ -54,10 +56,16 @@ pub struct CacheEntry {
     pub length: u32,
 }
 
-/// One shard: the arena, its log positions, the index and the admission counts
+/// One shard: the arena, its log positions, the index and the admission counts. The arena grows into its room until the log
+/// first wraps, and keeps its size from then on
 #[derive(Debug)]
 pub struct CacheShard {
-    arena: Vec<u8>,
+    room: Arc<PoolRoom>,
+    /// The arena bytes the shard plans for, which it grows to
+    share: usize,
+    /// The arena bytes the log runs over now
+    capacity: usize,
+    is_wrapped: bool,
     head: u64,
     tail: u64,
     slots: Vec<CacheEntry>,
@@ -110,7 +118,9 @@ impl CacheShard {
     /// Allocate and touch a shard whose arena, index and admission counts together take some bytes. A store of wide records
     /// plans its index for the values its arena holds and keeps a count a value, so a first miss is soon forgotten and only a
     /// record missed twice close together comes in. Small records, or a store with none on disk, plan a slot for each stretch
-    pub fn new(bytes: usize, mean_record: Option<u64>) -> Self {
+    ///
+    /// The arena starts at one part in `divisor` of its share and grows into the rest
+    pub fn growing(bytes: usize, mean_record: Option<u64>, divisor: usize) -> Result<Self> {
         let entry = mean_record.map_or(0, |bytes| padded(ENTRY_HEADER_BYTES + bytes as usize));
         let stretch = (entry / SLOTS_PER_VALUE).max(BYTES_PER_INDEX_SLOT);
         let is_wide = stretch > BYTES_PER_INDEX_SLOT;
@@ -122,14 +132,54 @@ impl CacheShard {
         let values = bytes / entry.max(1);
         let seen = if is_wide { values.next_power_of_two().max(LEAST_SEEN_COUNTS) } else { slots };
         let arena = bytes.saturating_sub(slots * size_of::<CacheEntry>() + seen).max(LEAST_SHARD_BYTES) / 8 * 8;
-        Self {
-            arena: touched_filled(arena, 0),
+        let room = PoolRoom::reserve(ByteCount(arena as u64), ByteCount((arena / divisor.max(1)) as u64))?;
+        let mut shard = Self {
+            room: Arc::new(room),
+            share: arena,
+            capacity: 0,
+            is_wrapped: false,
             head: 0,
             tail: 0,
             slots: touched_filled(slots, CacheEntry::empty()),
             used: 0,
             seen: touched_filled(seen, 0),
+        };
+        shard.follow_room();
+        Ok(shard)
+    }
+
+    /// Run the log over every arena byte in memory, until the log first wraps
+    fn follow_room(&mut self) {
+        if !self.is_wrapped {
+            self.capacity = (self.room.committed().min(self.share) / 8 * 8).max(ENTRY_HEADER_BYTES);
         }
+    }
+
+    /// Check the room can still grow, so a full log waits for its next part
+    fn can_grow(&self) -> bool {
+        self.capacity < self.share && !self.room.has_failed()
+    }
+
+    /// Read the arena's bytes the log runs over
+    fn arena(&self) -> &[u8] {
+        // SAFETY: the capacity lies under the room's limit, and the growing job only writes past it
+        unsafe { std::slice::from_raw_parts(self.room.base(), self.capacity) }
+    }
+
+    /// Write the arena's bytes the log runs over
+    fn arena_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as in arena, and the shard's own borrow is unique
+        unsafe { std::slice::from_raw_parts_mut(self.room.base(), self.capacity) }
+    }
+
+    /// Read the arena's room, which the growing job raises
+    pub fn room(&self) -> &Arc<PoolRoom> {
+        &self.room
+    }
+
+    /// Read the heap the shard holds: the arena in memory, the index and the counts
+    pub fn heap_bytes(&self) -> usize {
+        self.room.committed().min(self.room.reserved()) + self.slots.len() * size_of::<CacheEntry>() + self.seen.len()
     }
 
     /// Find a record's index slot
@@ -180,20 +230,20 @@ impl CacheShard {
     /// Read a word of the arena
     fn word(&self, at: usize) -> u64 {
         let mut bytes = [0; 8];
-        bytes.copy_from_slice(&self.arena[at..at + 8]);
+        bytes.copy_from_slice(&self.arena()[at..at + 8]);
         u64::from_le_bytes(bytes)
     }
 
     /// Write a word of the arena
     fn set_word(&mut self, at: usize, word: u64) {
-        self.arena[at..at + 8].copy_from_slice(&word.to_le_bytes());
+        self.arena_mut()[at..at + 8].copy_from_slice(&word.to_le_bytes());
     }
 
     /// Drop the oldest thing in the log: a skip at the arena's end, or a value and its index slot
     fn evict_one(&mut self) {
-        let capacity = self.arena.len() as u64;
+        let capacity = self.capacity as u64;
         let physical = (self.tail % capacity) as usize;
-        let left = self.arena.len() - physical;
+        let left = self.capacity - physical;
         if left < ENTRY_HEADER_BYTES || self.word(physical) == NO_RECORD {
             self.tail += left as u64;
             return;
@@ -211,11 +261,27 @@ impl CacheShard {
         self.tail += (ENTRY_HEADER_BYTES + padded(stored as usize)) as u64;
     }
 
-    /// Make room at the head for an entry of some bytes, skipping the arena's end when the entry won't fit before it
-    fn make_room(&mut self, need: usize) {
-        let capacity = self.arena.len() as u64;
+    /// Make room at the head for an entry of some bytes, skipping the arena's end when the entry won't fit before it, and say
+    /// whether it did. Until the log first wraps it evicts nothing: a full log that can still grow takes nothing in until its
+    /// next part comes, and one that can't grows no further and wraps
+    fn make_room(&mut self, need: usize) -> bool {
+        self.follow_room();
+        if need.saturating_mul(4) > self.capacity {
+            return false;
+        }
+        let is_index_full = self.used * 4 >= self.slots.len() * 3;
+        let is_arena_full = self.head + need as u64 > self.capacity as u64;
+        if !self.is_wrapped && (is_arena_full || is_index_full) {
+            if is_arena_full && !is_index_full && self.can_grow() {
+                return false;
+            }
+            // the log keeps this size from here, so the job grows it no further
+            self.is_wrapped = true;
+            self.room.note_used(0);
+        }
+        let capacity = self.capacity as u64;
         let physical = (self.head % capacity) as usize;
-        let left = self.arena.len() - physical;
+        let left = self.capacity - physical;
         let skip = if left < need { left } else { 0 };
         while capacity - (self.head - self.tail) < (skip + need) as u64 || self.used * 4 >= self.slots.len() * 3 {
             self.evict_one();
@@ -226,19 +292,22 @@ impl CacheShard {
             }
             self.head += skip as u64;
         }
+        true
     }
 
     /// Write a key and its value at the head and list them
     fn append(&mut self, segment: u64, offset: u64, key: &[u8], value: &[u8]) {
         let need = ENTRY_HEADER_BYTES + padded(key.len() + value.len());
-        self.make_room(need);
-        let physical = (self.head % self.arena.len() as u64) as usize;
+        if !self.make_room(need) {
+            return;
+        }
+        let physical = (self.head % self.capacity as u64) as usize;
         self.set_word(physical, segment);
         self.set_word(physical + 8, offset);
         self.set_word(physical + 16, (value.len() as u64) << KEY_LENGTH_BITS | key.len() as u64);
         let start = physical + ENTRY_HEADER_BYTES;
-        self.arena[start..start + key.len()].copy_from_slice(key);
-        self.arena[start + key.len()..start + key.len() + value.len()].copy_from_slice(value);
+        self.arena_mut()[start..start + key.len()].copy_from_slice(key);
+        self.arena_mut()[start + key.len()..start + key.len() + value.len()].copy_from_slice(value);
         self.add_slot(CacheEntry {
             segment,
             offset,
@@ -247,6 +316,9 @@ impl CacheShard {
             length: value.len() as u32,
         });
         self.head += need as u64;
+        if !self.is_wrapped {
+            self.room.note_used(self.head as usize);
+        }
     }
 
     /// Copy a cached value into a buffer, or note a whole read's miss
@@ -260,11 +332,11 @@ impl CacheShard {
         let Some((slot, entry)) = self.find(segment, offset).map(|slot| (slot, self.slots[slot])) else {
             return self.note_miss(segment, offset, length);
         };
-        let capacity = self.arena.len() as u64;
+        let capacity = self.capacity as u64;
         let physical = (entry.at % capacity) as usize;
         let key_length = usize::from(entry.key_length);
         // a place another key's lookup led to answers nothing
-        if self.arena[physical..physical + key_length] != *key {
+        if self.arena()[physical..physical + key_length] != *key {
             return self.note_miss(segment, offset, length);
         }
         let value_at = physical + key_length;
@@ -272,7 +344,7 @@ impl CacheShard {
         let from = start.min(end);
         let to = length.map_or(end, |length| (from + length).min(end));
         out.truncate(at);
-        out.extend_from_slice(&self.arena[value_at + from..value_at + to]);
+        out.extend_from_slice(&self.arena()[value_at + from..value_at + to]);
         // a whole read near the tail moves to the head from the caller's copy, since making room can evict the source
         if length.is_none() && from == 0 && entry.at - self.tail < capacity / PROMOTE_PART {
             self.remove_slot(slot);
@@ -297,7 +369,7 @@ impl CacheShard {
     /// Take in a key and its value that a read admitted on its miss
     pub fn admit(&mut self, segment: u64, offset: u64, key: &[u8], value: &[u8]) {
         let stored = key.len() + value.len();
-        if value.len() > MOST_CACHED_BYTES || key.len() > MOST_CACHED_KEY_BYTES || ENTRY_HEADER_BYTES + padded(stored) > self.arena.len() / 4 {
+        if value.len() > MOST_CACHED_BYTES || key.len() > MOST_CACHED_KEY_BYTES || ENTRY_HEADER_BYTES + padded(stored) > self.share / 4 {
             return;
         }
         if self.find(segment, offset).is_some() {
@@ -313,20 +385,47 @@ impl CacheShard {
 }
 
 impl RecordCache {
-    /// Allocate and touch a cache of some bytes across every shard
     /// Read the least a record cache holds, whatever share it gets
     pub const fn least_bytes() -> u64 {
         (CACHE_SHARDS * 2 * LEAST_SHARD_BYTES) as u64
     }
 
-    pub fn new(bytes: ByteCount, mean_record: Option<u64>) -> Self {
+    /// Build a cache of some bytes across every shard, all of it in memory
+    pub fn new(bytes: ByteCount, mean_record: Option<u64>) -> Result<Self> {
+        Self::growing(bytes, mean_record, 1)
+    }
+
+    /// Build a cache whose arenas start at one part in `divisor` of their share and grow into the rest
+    pub fn growing(bytes: ByteCount, mean_record: Option<u64>, divisor: usize) -> Result<Self> {
         let shard_bytes = (bytes.0 as usize / CACHE_SHARDS).max(2 * LEAST_SHARD_BYTES);
-        let shards: Vec<_> = (0..CACHE_SHARDS).map(|_shard| Mutex::new(CacheShard::new(shard_bytes, mean_record))).collect();
+        let mut shards = Vec::with_capacity(CACHE_SHARDS);
+        for _shard in 0..CACHE_SHARDS {
+            shards.push(Mutex::new(CacheShard::growing(shard_bytes, mean_record, divisor)?));
+        }
         // a lock can build its state on first use, so each takes it here, at open
         for shard in &shards {
             drop(hold(shard));
         }
-        Self { shards, hits: CallerCounts::default(), misses: CallerCounts::default(), admits: CallerCounts::default() }
+        Ok(Self { shards, hits: CallerCounts::default(), misses: CallerCounts::default(), admits: CallerCounts::default() })
+    }
+
+    /// Build a cache whose arenas start at an eighth of their share
+    pub fn fresh(bytes: ByteCount, mean_record: Option<u64>) -> Result<Self> {
+        Self::growing(bytes, mean_record, FIRST_PART_DIVISOR)
+    }
+
+    /// Read every shard's arena room, for the job that grows them
+    pub fn rooms(&self) -> Vec<Arc<PoolRoom>> {
+        self.shards.iter().map(|shard| hold(shard).room().clone()).collect()
+    }
+
+    /// Read the bytes the cache grows to: every arena's share, the index and the counts
+    pub fn share_bytes(&self) -> ByteCount {
+        let shards = self.shards.iter().map(|shard| {
+            let shard = hold(shard);
+            shard.share + shard.slots.len() * size_of::<CacheEntry>() + shard.seen.len()
+        });
+        ByteCount(shards.sum::<usize>() as u64)
     }
 
     /// Pick a record's shard
@@ -373,11 +472,7 @@ impl RecordCache {
 
     /// Read the heap the cache holds
     pub fn heap_bytes(&self) -> ByteCount {
-        let shard = self.shards.first().map_or(0, |shard| {
-            let shard = hold(shard);
-            shard.arena.len() + shard.slots.len() * size_of::<CacheEntry>() + shard.seen.len()
-        });
-        ByteCount((shard * CACHE_SHARDS) as u64)
+        ByteCount(self.shards.iter().map(|shard| hold(shard).heap_bytes()).sum::<usize>() as u64)
     }
 
     /// Count the index slots every shard planned, which shows the layout its mean gave

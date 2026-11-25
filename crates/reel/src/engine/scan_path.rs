@@ -696,7 +696,7 @@ impl<Backend: Io> EngineState<Backend> {
     /// Weigh again whether the record cache can hold most of a volume's live records
     pub fn weigh_scan_cache(&self, volume: &Volume<Backend>) {
         let live = hold(&volume.summary).orders().live_bytes();
-        let room = self.record_cache.heap_bytes().0;
+        let room = self.record_cache.share_bytes().0;
         let is_most = live > 0 && room.saturating_mul(SCAN_CACHE_PARTS) >= live.saturating_mul(SCAN_CACHE_PARTS - 1);
         volume.scans_use_cache.store(is_most, Ordering::Relaxed);
         volume.is_scan_cache_weighed.store(true, Ordering::Relaxed);

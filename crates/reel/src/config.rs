@@ -218,7 +218,8 @@ pub struct StoreConfig {
     /// that scans from several threads on a small budget bounds its own scans
     pub memory_budget: ByteCount,
     /// The most the store may hold once a target is raised past the budget with no restart. Open reserves address space for its
-    /// growing pools up to it, and every table stays sized from the budget. None is the budget
+    /// growing pools up to it, and every table stays sized from the budget. The write index stays at the budget too, so a raised
+    /// target gives the caches and the sorted indexes room and leaves the open rows where the budget put them. None is the budget
     pub max_memory: Option<ByteCount>,
     pub threads: ThreadCounts,
     pub volumes: Vec<VolumeConfig>,

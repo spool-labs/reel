@@ -360,7 +360,7 @@ impl SortedKeys {
             mark: AtomicU64::new(NO_MARK),
             past_capacity: AtomicU64::new(0),
             entered: AtomicU64::new(0),
-            values: Arc::new(ValuePages::new(0)),
+            values: Arc::new(ValuePages::new(0)?),
             owns_values: false,
             sharer: 0,
             told_rows: rows,

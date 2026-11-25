@@ -12,7 +12,7 @@ fn value(index: usize, length: usize) -> Vec<u8> {
 // every entry a leaf filled reads back as it went in, across as many pages as its values take, and an unfilled one reads nothing
 #[test]
 fn fills_read_back() {
-    let pages = ValuePages::new(16);
+    let pages = ValuePages::new(16).expect("build pool");
     let mut chain = HeldChain::NONE;
     let mut filled = 0;
     for index in (0..ENTRIES).step_by(2) {
@@ -36,7 +36,7 @@ fn fills_read_back() {
 // a value over the cap is never held, and the leaf keeps the chain it had
 #[test]
 fn long_values_stay_out() {
-    let pages = ValuePages::new(4);
+    let pages = ValuePages::new(4).expect("build pool");
     assert_eq!(pages.fill((0, LEAF), HeldChain::NONE, (0, ENTRIES), &value(0, MOST_HELD_VALUE + 1)), None);
     assert_eq!(pages.free_pages(), 4);
 }
@@ -44,7 +44,7 @@ fn long_values_stay_out() {
 // a dropped chain reads nothing, even through a reader that kept the chain, and its pages go back to the pool
 #[test]
 fn a_dropped_chain_reads_nothing() {
-    let pages = ValuePages::new(8);
+    let pages = ValuePages::new(8).expect("build pool");
     let chain = pages.fill((0, LEAF), HeldChain::NONE, (3, ENTRIES), &value(3, 500)).expect("a fill").0;
     pages.drop_chain(0, chain);
     let mut out = Vec::new();
@@ -61,7 +61,7 @@ fn a_dropped_chain_reads_nothing() {
 // a full pool takes no more values, and a dropped chain gives its pages back for the next fill
 #[test]
 fn a_full_pool_fills_again_once_a_chain_drops() {
-    let pages = ValuePages::new(2);
+    let pages = ValuePages::new(2).expect("build pool");
     let mut first = HeldChain::NONE;
     let mut second = HeldChain::NONE;
     for index in 0..3 {
@@ -81,7 +81,7 @@ fn a_full_pool_fills_again_once_a_chain_drops() {
 // a fill of an entry that already holds a value keeps the first
 #[test]
 fn a_second_fill_keeps_the_first() {
-    let pages = ValuePages::new(4);
+    let pages = ValuePages::new(4).expect("build pool");
     let chain = pages.fill((0, LEAF), HeldChain::NONE, (5, ENTRIES), b"first").expect("a fill").0;
     let again = pages.fill((0, LEAF), chain, (5, ENTRIES), b"second").expect("a fill").0;
     assert_eq!(chain, again);
@@ -118,7 +118,7 @@ mod in_an_index {
     // replaced since its fill, or a leaf split under it, answers nothing until filled again
     #[test]
     fn held_answers_are_always_the_entrys_row() {
-        let index = SortedKeys::new(WIDTH, RowCount(KEYS * 2)).expect("build index").holding_values(std::sync::Arc::new(reel::index::value_pages::ValuePages::new(8)), (0, true));
+        let index = SortedKeys::new(WIDTH, RowCount(KEYS * 2)).expect("build index").holding_values(std::sync::Arc::new(reel::index::value_pages::ValuePages::new(8).expect("build pool")), (0, true));
         for number in 0..KEYS {
             index.upsert(&key(number), entry(row(number, 0)), Floors::at(WritePlace(0)));
         }
@@ -167,7 +167,7 @@ mod in_an_index {
     // matches answers nothing for a row the entry no longer names, or for a neighbour's slot
     #[test]
     fn a_noted_spot_never_answers_a_neighbour() {
-        let index = SortedKeys::new(WIDTH, RowCount(64)).expect("build index").holding_values(std::sync::Arc::new(reel::index::value_pages::ValuePages::new(8)), (0, true));
+        let index = SortedKeys::new(WIDTH, RowCount(64)).expect("build index").holding_values(std::sync::Arc::new(reel::index::value_pages::ValuePages::new(8).expect("build pool")), (0, true));
         let (first, second) = (part_key(7, 10), part_key(7, 20));
         index.upsert(&first, entry(row(1, 0)), Floors::at(WritePlace(0)));
         index.upsert(&second, entry(row(2, 0)), Floors::at(WritePlace(0)));
@@ -203,7 +203,7 @@ mod in_an_index {
 // still takes the half it's owed, and a page given back goes to the one still under its floor
 #[test]
 fn a_sharer_never_takes_another_sharer_floor() {
-    let pages = ValuePages::shared(8, &[4, 4]);
+    let pages = ValuePages::shared(8, &[4, 4]).expect("build pool");
     let mut walked = Vec::new();
     for leaf in 0..8 {
         if let Some((chain, _is_new)) = pages.fill((0, LEAF + leaf), HeldChain::NONE, (0, ENTRIES), &value(leaf as usize, 100)) {
@@ -225,7 +225,7 @@ fn a_sharer_never_takes_another_sharer_floor() {
 // of the others still gets its half, whichever goes first
 #[test]
 fn every_sharer_keeps_half_its_floor() {
-    let pages = ValuePages::shared(12, &[4, 4, 4]);
+    let pages = ValuePages::shared(12, &[4, 4, 4]).expect("build pool");
     let take_all = |sharer: usize, base: u32| (0..12).filter(|leaf| pages.fill((sharer, base + leaf), HeldChain::NONE, (0, ENTRIES), &value(*leaf as usize, 100)).is_some()).count();
     assert_eq!(take_all(0, LEAF), 8, "the walk took past the others' halves");
     assert_eq!(take_all(1, LEAF + 100), 2, "the second index missed its half");

@@ -17,14 +17,14 @@
 //! - A value over MOST_HELD_VALUE is never held, a chain stops at MOST_CHAIN_PAGES, and a scan's index batch carries
 //!   HELD_BYTES_PER_ENTRY for each entry, so values past that share ride its batch as misses.
 
-use std::sync::Mutex;
+use std::io::Result;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use reel_core::units::ByteCount;
 
 use crate::guard::hold;
-use crate::pool::ask_huge_pages;
-use std::hint::black_box;
+use crate::pool_room::PoolRoom;
 
 /// Words of one value page
 pub const VALUE_PAGE_WORDS: usize = 512;
@@ -53,6 +53,8 @@ const OFFSET_BITS: u32 = 12;
 struct FreeValuePages {
     head: u32,
     count: u32,
+    /// The first page never handed out. Pages below it are in memory
+    fresh: u32,
     /// The pages each index sharing the pool holds now
     taken: Vec<u32>,
 }
@@ -72,8 +74,12 @@ impl HeldChain {
 /// The value pages of one sorted index
 #[derive(Debug)]
 pub struct ValuePages {
-    words: Vec<AtomicU64>,
+    /// The pages' words, reserved for every page the pool can grow to
+    room: Arc<PoolRoom>,
+    most_pages: u32,
     free: Mutex<FreeValuePages>,
+    /// The free list's first page never handed out, readable with no lock
+    fresh_now: AtomicU32,
     /// The pages each index sharing the pool is sized for. Every index is sure of half its floor: no take leaves fewer free pages
     /// than the others still lack of their halves. Past its floor, an index takes a page only while half of every other index's
     /// unused floor stays free, so a busy column uses what idle ones leave and a walk of a cold column never starves a hot one
@@ -90,54 +96,92 @@ pub struct ValuePages {
 
 impl ValuePages {
     /// Allocate and touch a pool of this many pages, every one free, for one index
-    pub fn new(pages: u32) -> Self {
+    pub fn new(pages: u32) -> Result<Self> {
         Self::shared(pages, &[pages])
     }
 
-    /// Allocate and touch a pool of this many pages for indexes that share it, each with the floor it is sized for, every page free
-    pub fn shared(pages: u32, floors: &[u32]) -> Self {
+    /// Build a pool of this many pages for indexes that share it, each with the floor it is sized for, all of it in memory
+    pub fn shared(pages: u32, floors: &[u32]) -> Result<Self> {
+        Self::growing(pages, floors, pages)
+    }
+
+    /// Build a shared pool with its first pages in memory, which grows into the rest on the reserve job
+    pub fn growing(pages: u32, floors: &[u32], first: u32) -> Result<Self> {
         let pages = pages.min(u32::MAX - 1);
-        let words = touched_words(pages as usize * VALUE_PAGE_WORDS);
-        let pool = Self {
-            words,
-            free: Mutex::new(FreeValuePages { head: if pages == 0 { NO_VALUE_PAGE } else { 0 }, count: pages, taken: vec![0; floors.len()] }),
+        let bytes = |count: u32| ByteCount(u64::from(count) * VALUE_PAGE_BYTES as u64);
+        let room = PoolRoom::reserve(bytes(pages), bytes(first.min(pages)))?;
+        Ok(Self {
+            room: Arc::new(room),
+            most_pages: pages,
+            free: Mutex::new(FreeValuePages { head: NO_VALUE_PAGE, count: 0, fresh: 0, taken: vec![0; floors.len()] }),
+            fresh_now: AtomicU32::new(0),
             floors: floors.to_vec(),
             taken_now: floors.iter().map(|_floor| AtomicU32::new(0)).collect(),
-            free_count: AtomicU64::new(u64::from(pages)),
+            free_count: AtomicU64::new(0),
             held: AtomicU64::new(0),
             fills: AtomicU64::new(0),
             drops: AtomicU64::new(0),
-        };
-        for page in 0..pages {
-            let next = if page + 1 == pages { NO_VALUE_PAGE } else { page + 1 };
-            pool.set_links(page, NO_VALUE_PAGE, next);
-        }
-        pool
+        })
     }
 
-    /// Read the heap the pool holds
+    /// Read the room, which the growing job raises
+    pub fn room(&self) -> &Arc<PoolRoom> {
+        &self.room
+    }
+
+    /// Read every word of the pages the pool can grow to. Only pages handed out are read or written, and all of those are in memory
+    fn words(&self) -> &[AtomicU64] {
+        // SAFETY: the room is reserved for this many pages, readable and writable, and zero until written; a page past the limit is
+        // never handed out, so no access reaches it while the growing job brings it in
+        unsafe { std::slice::from_raw_parts(self.room.base().cast::<AtomicU64>(), self.most_pages as usize * VALUE_PAGE_WORDS) }
+    }
+
+    /// Read the heap the pool holds: its pages in memory
     pub fn heap_bytes(&self) -> ByteCount {
-        ByteCount((self.words.capacity() * size_of::<AtomicU64>()) as u64)
+        ByteCount(u64::from(self.page_count()) * VALUE_PAGE_BYTES as u64)
     }
 
-    /// Count the pool's pages
+    /// Count the pool's pages in memory, which goes up as the room grows
     pub fn page_count(&self) -> u32 {
-        (self.words.len() / VALUE_PAGE_WORDS) as u32
+        ((self.room.committed() / VALUE_PAGE_BYTES) as u32).min(self.most_pages)
+    }
+
+    /// Count the pages the pool can grow to
+    pub fn most_pages(&self) -> u32 {
+        self.most_pages
+    }
+
+    /// Count the pages free now from a free list count and the first page never handed out
+    fn free_with(&self, count: u32, fresh: u32) -> u32 {
+        count + self.page_count().saturating_sub(fresh)
     }
 
     /// Count the pages no leaf holds
     pub fn free_pages(&self) -> u32 {
-        hold(&self.free).count
+        let free = hold(&self.free);
+        self.free_with(free.count, free.fresh)
+    }
+
+    /// Read the free pages with no lock, a moment old at most
+    fn free_now(&self) -> u32 {
+        self.free_with(self.free_count.load(Ordering::Relaxed) as u32, self.fresh_now.load(Ordering::Relaxed))
     }
 
     /// Check the pool has no free page, so no fill can start a chain or add a page
     pub fn is_full(&self) -> bool {
-        self.free_count.load(Ordering::Relaxed) == 0
+        self.free_now() == 0
+    }
+
+    /// Note the bytes of the pages in use and the lock-free counts, after a take or a give
+    fn note_free(&self, free: &FreeValuePages) {
+        self.free_count.store(u64::from(free.count), Ordering::Relaxed);
+        self.fresh_now.store(free.fresh, Ordering::Relaxed);
+        self.room.note_used((free.fresh - free.count) as usize * VALUE_PAGE_BYTES);
     }
 
     /// Check a chain a leaf names is still the one it filled
     pub fn is_live(&self, chain: HeldChain) -> bool {
-        chain.first != NO_VALUE_PAGE && (chain.first as usize) < self.words.len() / VALUE_PAGE_WORDS && self.generation(chain.first) == chain.generation
+        chain.first != NO_VALUE_PAGE && chain.first < self.page_count() && self.generation(chain.first) == chain.generation
     }
 
     /// Check a leaf's entry holds a value, with no copy
@@ -251,20 +295,27 @@ impl ValuePages {
     fn take(&self, sharer: usize, owner: u32) -> Option<u32> {
         let page = {
             let mut free = hold(&self.free);
-            if free.head == NO_VALUE_PAGE {
+            let available = self.free_with(free.count, free.fresh);
+            if available == 0 {
                 return None;
             }
-            if !self.may_take(sharer, |index| free.taken[index], free.count) {
+            if !self.may_take(sharer, |index| free.taken[index], available) {
                 return None;
             }
             if let Some(taken) = free.taken.get_mut(sharer) {
                 *taken += 1;
                 self.taken_now[sharer].store(*taken, Ordering::Relaxed);
             }
-            let page = free.head;
-            free.head = self.next(page);
-            free.count -= 1;
-            self.free_count.store(u64::from(free.count), Ordering::Relaxed);
+            let page = if free.head != NO_VALUE_PAGE {
+                let page = free.head;
+                free.head = self.next(page);
+                free.count -= 1;
+                page
+            } else {
+                free.fresh += 1;
+                free.fresh - 1
+            };
+            self.note_free(&free);
             page
         };
         self.set_links(page, owner, NO_VALUE_PAGE);
@@ -297,7 +348,7 @@ impl ValuePages {
     /// Check, with no lock, whether an index could take a page now, so a fill the pool would refuse takes no part's lock. The
     /// counts may be a moment old, so a take still checks under the lock
     pub fn could_take(&self, sharer: usize) -> bool {
-        let free = self.free_count.load(Ordering::Relaxed) as u32;
+        let free = self.free_now();
         free > 0 && self.may_take(sharer, |index| self.taken_now[index].load(Ordering::Relaxed), free)
     }
 
@@ -322,7 +373,7 @@ impl ValuePages {
             *taken = taken.saturating_sub(count as u32);
             self.taken_now[sharer].store(*taken, Ordering::Relaxed);
         }
-        self.free_count.store(u64::from(free.count), Ordering::Relaxed);
+        self.note_free(&free);
     }
 
     fn count_slots(&self, first: u32) -> u64 {
@@ -356,7 +407,7 @@ impl ValuePages {
     fn copy_out(&self, page: u32, offset: usize, length: usize, out: &mut Vec<u8>) {
         // the page's words are found once, and each lands in the buffer's spare room with no fill before it
         let first = page as usize * VALUE_PAGE_WORDS + offset / size_of::<u64>();
-        let words = &self.words[first..first + length.div_ceil(size_of::<u64>())];
+        let words = &self.words()[first..first + length.div_ceil(size_of::<u64>())];
         let start = out.len();
         out.reserve(length);
         let room = out.spare_capacity_mut();
@@ -406,21 +457,8 @@ impl ValuePages {
     }
 
     fn word(&self, page: u32, at: usize) -> &AtomicU64 {
-        &self.words[page as usize * VALUE_PAGE_WORDS + at]
+        &self.words()[page as usize * VALUE_PAGE_WORDS + at]
     }
-}
-
-/// Allocate words, every page of them written, so no read faults later
-fn touched_words(length: usize) -> Vec<AtomicU64> {
-    let mut words: Vec<AtomicU64> = Vec::with_capacity(length);
-    ask_huge_pages(words.as_mut_ptr(), length);
-    black_box(words.as_mut_ptr());
-    words.resize_with(length, || AtomicU64::new(u64::MAX));
-    for word in &words {
-        word.store(0, Ordering::Relaxed);
-    }
-    black_box(words.as_ptr());
-    words
 }
 
 /// Words a first page's slot table takes for a leaf of this many entries

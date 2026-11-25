@@ -156,6 +156,10 @@ impl<Backend: Io> ReelStore<Backend> {
         state.sorted = sorted_indexes(config, &sorted_sizes, false).map_err(open_error("reserving a sorted index"))?;
         let sorted_rooms: Vec<_> = state.sorted.iter().flatten().map(|index| index.room().clone()).collect();
         state.pool_rooms.extend(sorted_rooms);
+        // the sorted indexes share one value pool, which grows once
+        if let Some(index) = state.sorted.iter().flatten().next() {
+            state.pool_rooms.push(index.values.room().clone());
+        }
         state.sorted_sizes = sorted_sizes;
         state.complete_images = complete_images(config);
         state.attach_ring(ring);
@@ -2033,7 +2037,9 @@ pub fn sorted_indexes(config: &StoreConfig, sizes: &[Option<SortedSize>], is_rea
         .iter()
         .map(|(column, size)| if column.least_value.is_some_and(|least| least.0 as usize > MOST_HELD_VALUE) { 0 } else { size.value_pages })
         .collect();
-    let pool = Arc::new(ValuePages::shared(pages, &floors));
+    // the pool fills as reads hold values, so it starts at an eighth of its pages, and a reader runs no reserve job and starts whole
+    let first = if is_read_only { pages } else { pages / FIRST_PART_DIVISOR as u32 };
+    let pool = Arc::new(ValuePages::growing(pages, &floors, first)?);
     for (sharer, (column, size)) in sized.into_iter().enumerate() {
         // a reader runs no reserve job, so its index starts whole
         let first_rows = if is_read_only { size.rows } else { size.disk_rows };

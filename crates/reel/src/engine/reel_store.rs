@@ -69,7 +69,7 @@ use crate::row_kind::RowKind;
 use crate::segment::row_block::RowBlockWalk;
 use crate::index::open_slots::OpenSlot;
 use crate::index::entry_slab::PageCount;
-use crate::pool_room::FIRST_PART_DIVISOR;
+use crate::pool_room::{FIRST_PART_DIVISOR, GrowWake};
 use crate::engine::complete_image::ImageFiles;
 use crate::index::complete_table::CompleteTable;
 use crate::index::complete_table::planned_table_bytes;
@@ -964,6 +964,18 @@ pub fn start_jobs<Backend: Io>(state: &Arc<EngineState<Backend>>) -> Result<(), 
     let reserve_job = ReserveJob::new(Arc::clone(state));
     let task = state.io.spawn_job("reel-reserve", reserve_job).map_err(open_error("starting a job"))?;
     let _set = state.reserve_task.set(task);
+    // a pool with less than one extent free wakes the job, which grows it on its own thread
+    let engine = Arc::downgrade(state);
+    let wake: GrowWake = Arc::new(move || {
+        if let Some(state) = engine.upgrade()
+            && let Some(task) = state.reserve_task.get()
+        {
+            task.wake();
+        }
+    });
+    for room in &state.pool_rooms {
+        room.set_wake(Arc::clone(&wake));
+    }
     for cell in &state.read_tasks {
         let worker = ReadWorker {
             state: Arc::clone(state),

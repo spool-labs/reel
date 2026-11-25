@@ -17,8 +17,6 @@ use crate::segment::segment_tail::SegmentNumber;
 
 /// How often the job looks: half a run of places lasts over half an hour at a million rows a second
 pub const RESERVE_PERIOD: Nanoseconds = Nanoseconds(1_000_000_000);
-/// How often the job looks while a pool can still grow, so a pool filling at full ingest finds its next part ready
-pub const GROW_PERIOD: Nanoseconds = Nanoseconds(50_000_000);
 /// Bytes an open segment gathers before they start for the device
 pub const WRITEBACK_STEP_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -132,21 +130,18 @@ impl<Backend: Io> ReserveJob<Backend> {
         }
     }
 
-    /// Grow every pool that has used half the part it holds in memory. A populate that fails leaves the pool at its size, and the
-    /// next step tries again
-    pub fn grow_pools(&self) -> bool {
-        let mut can_grow = false;
+    /// Grow every pool with less than one extent free. A pool wakes the job when it gets there, and a populate that fails leaves
+    /// the pool at its size for the next step to try again
+    pub fn grow_pools(&self) {
         for room in &self.state.pool_rooms {
             let _grew = room.grow_step();
-            can_grow |= room.committed() < room.reserved();
         }
-        can_grow
     }
 }
 
 impl<Backend: Io> Job for ReserveJob<Backend> {
     fn step(&mut self) -> JobStep {
-        let can_grow = self.grow_pools();
+        self.grow_pools();
         self.hold_room();
         self.start_writeback();
         self.state.prepare_segments();
@@ -154,10 +149,9 @@ impl<Backend: Io> Job for ReserveJob<Backend> {
             // a root that took nothing failed its volume, and writers there hear it
             let _is_held = self.state.reserve_ahead();
         }
-        let period = if can_grow { GROW_PERIOD } else { RESERVE_PERIOD };
         let now = self.state.io.now();
         JobStep::IdleUntil {
-            deadline: Nanoseconds(now.0 + period.0),
+            deadline: Nanoseconds(now.0 + RESERVE_PERIOD.0),
         }
     }
 }

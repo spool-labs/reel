@@ -44,6 +44,9 @@ const WORKERS_VARIABLE: &str = "REEL_STEADY_WORKERS";
 // set in the child that runs the store again at 512 MiB, with the complete table on META and a sorted column of its own
 const INDEXED_VARIABLE: &str = "REEL_STEADY_INDEXED";
 const INDEXED_BUDGET: ByteCount = ByteCount(512 * 1024 * 1024);
+// a run that puts fresh sorted keys in every window round, so the sorted index grows inside the window
+const GROWTH_VARIABLE: &str = "REEL_STEADY_GROWTH";
+const GROWTH_KEYS: u64 = 64;
 const SORTED_ROWS: RowCount = RowCount(100_000);
 const SORTED: ColumnId = ColumnId(4);
 // the width of every steady key, "key-" and six digits
@@ -674,6 +677,24 @@ fn indexed_arm() -> u64 {
     u64::from(!status.success())
 }
 
+// put fresh keys in the sorted column, each new, so its index takes rows past the part it started with
+fn put_fresh(store: &Store, value: &[u8], round: u64) {
+    let mut key = [0u8; SORTED_WIDTH as usize];
+    key[0] = b'g';
+    for number in 0..GROWTH_KEYS {
+        key[2..].copy_from_slice(&(round * GROWTH_KEYS + number).to_be_bytes());
+        store.put(SORTED, &key, value).expect("put a fresh sorted key");
+    }
+}
+
+// the sorted index grows inside the window, and every populate lands on the reserve job with none on a caller
+fn growth_arm() -> u64 {
+    let program = env::current_exe().expect("path");
+    let status = Command::new(program).env(INDEXED_VARIABLE, "1").env(GROWTH_VARIABLE, "1").status().expect("run");
+    println!("growth arm at 512 MiB: {status}");
+    u64::from(!status.success())
+}
+
 // an earlier open leaves the allocator holding freed pages, so the process that counts runs none
 fn prepare(root: &Path) {
     let program = env::current_exe().expect("path");
@@ -764,6 +785,8 @@ fn main() {
     IS_OPENING.store(false, Ordering::Release);
     let live_grown = LIVE_BYTES.load(Ordering::Acquire) - live_before;
     let report = store.memory_report();
+    // the pools that grow map their memory apart from the allocator, so the heap the report names is the allocator's and theirs
+    let live_grown = live_grown + report.pool_committed.0;
     let reported = report.heap_total().0;
     let pools = reported + report.thread_stacks.0;
     let resident_grown = resident_bytes().zip(resident_before).map(|(after, before)| after.saturating_sub(before));
@@ -811,6 +834,8 @@ fn main() {
     let freed_before = store.state.volumes[0].bytes_freed.load(Ordering::Acquire);
     let rewritten_before = store.state.volumes[0].segments_rewritten.load(Ordering::Acquire);
     let sorted_before = sorted_counts(&store);
+    let is_growing = env::var_os(GROWTH_VARIABLE).is_some();
+    let committed_before = store.memory_report().pool_committed;
     touch_stack();
     let mut faults = FaultCounter::new();
     let _first_read = faults.read();
@@ -826,10 +851,14 @@ fn main() {
             break;
         }
         round(&store, &mut inputs, rounds);
+        if is_growing {
+            put_fresh(&store, &inputs.small, rounds as u64);
+        }
     }
     IS_WINDOW.store(false, Ordering::Release);
     let main_after = main_thread_faults();
     let after = counts(&mut faults);
+    let committed_after = store.memory_report().pool_committed;
     let unlinked = store.state.volumes[0].segments_unlinked.load(Ordering::Acquire) - unlinked_before;
     let freed = store.state.volumes[0].bytes_freed.load(Ordering::Acquire) - freed_before;
     let store_can_free = store.state.volumes[0].can_free_blocks;
@@ -870,8 +899,13 @@ fn main() {
     if inputs.is_indexed {
         failures += check_sorted(sorted_before, sorted_after);
     }
+    if is_growing && committed_after <= committed_before {
+        println!("the pools never grew in the window: {committed_before:?} before, {committed_after:?} after");
+        failures += 1;
+    }
     if env::var_os(INDEXED_VARIABLE).is_none() {
         failures += indexed_arm();
+        failures += growth_arm();
     }
     if unlinked == 0 || (freed == 0 && store_can_free) || rewritten == 0 {
         println!("the window had too little maintenance: {unlinked} unlinks, {freed} bytes freed in place, {rewritten} rewrites");

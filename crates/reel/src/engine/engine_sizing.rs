@@ -11,6 +11,7 @@ use crate::index::entry_slab::{PAGE_BYTES, PageCount};
 use crate::index::sorted_keys::planned_index_bytes;
 use crate::index::node_pool::{NODE_FANOUT, NodeCount};
 use crate::index::open_slots::MAX_OPEN_SLOTS;
+use crate::io::host_memory::PRESSURE_STACK_BYTES;
 use crate::io::ring::{RING_READ_BYTES, RING_READS, RING_SLOT_BYTES, RING_SLOTS};
 use crate::index::write_index::SHARD_COUNT;
 use crate::index::write_shard::ShardSizing;
@@ -308,7 +309,10 @@ impl StoreShape {
         let encoders = counts.write_buffers as u64 * ENCODER_BYTES + large;
         let spans = 4 * MOST_DAMAGED_SPANS as u64 * (SPAN_KEY_BYTES as u64 * 2);
         let seats = volumes * self.walk_slots() as u64;
-        let stacks = self.job_count() * JOB_STACK_PLAN_BYTES;
+        // a writer also starts the pressure watch where the kernel offers a trigger, on a small stack of its own, counted wherever it
+        // could start so the plan is the same on every host
+        let watch = if self.is_read_only { 0 } else { PRESSURE_STACK_BYTES as u64 };
+        let stacks = self.job_count() * JOB_STACK_PLAN_BYTES + watch;
         // the pool holds both keys of every cover, and a seal job has room to write them all to a footer
         let cover_keys = 2 * MOST_RANGE_COVERS as u64 * self.widest_keys;
         let cover_fixed = (COVER_SLOT_BYTES + COVER_RECORD_BYTES) as u64 * MOST_RANGE_COVERS as u64;

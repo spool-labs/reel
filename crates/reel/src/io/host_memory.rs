@@ -184,7 +184,6 @@ pub const PRESSURE_TRIGGER: &[u8] = b"some 300000 2000000";
 /// The share of the last ten seconds some task stalled on memory past which a read counts as pressure, in hundredths of a percent
 pub const PRESSURE_READ_MARK: u32 = 1_000;
 /// The watch thread's stack: it polls two descriptors and calls the wake, so a small one holds it
-#[cfg(target_os = "linux")]
 pub const PRESSURE_STACK_BYTES: usize = 64 * 1024;
 
 /// A thread that waits on the kernel's pressure events for the store's control group, which stops and joins when it drops

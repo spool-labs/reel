@@ -538,6 +538,9 @@ pub struct WorkerPriority {
     pub class: PriorityClass,
     /// The nice value, 19 the lowest normal one
     pub nice: i32,
+    /// The worker's disk reads and writes take the idle I/O class, which a disk scheduler that has classes (mq-deadline, bfq) serves
+    /// after every caller's. Linux only
+    pub is_io_idle: bool,
 }
 
 /// Buckets the offset-order copy's run lengths fall in, a power of two each, the last holding every longer run

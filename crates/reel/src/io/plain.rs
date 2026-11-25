@@ -442,7 +442,28 @@ pub fn lower_priority() -> WorkerPriority {
         libc::SCHED_OTHER => PriorityClass::Normal,
         _ => PriorityClass::Unknown,
     };
-    WorkerPriority { class, nice }
+    WorkerPriority { class, nice, is_io_idle: take_idle_io(thread) }
+}
+
+/// The idle I/O class, and where ioprio_set reads a class in the priority value
+#[cfg(target_os = "linux")]
+const IOPRIO_CLASS_IDLE: libc::c_long = 3;
+#[cfg(target_os = "linux")]
+const IOPRIO_CLASS_SHIFT: libc::c_long = 13;
+/// ioprio_set's target kind for one thread
+#[cfg(target_os = "linux")]
+const IOPRIO_WHO_PROCESS: libc::c_long = 1;
+
+/// Put the thread's disk reads and writes in the idle class, so a disk scheduler with classes serves every caller's first, and say
+/// whether the kernel took it
+#[cfg(target_os = "linux")]
+fn take_idle_io(thread: libc::pid_t) -> bool {
+    let idle = IOPRIO_CLASS_IDLE << IOPRIO_CLASS_SHIFT;
+    // SAFETY: the call sets one thread's I/O class and touches no memory of ours
+    let _set = unsafe { libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, libc::c_long::from(thread), idle) };
+    // SAFETY: as above, and the call reads a number
+    let taken = unsafe { libc::syscall(libc::SYS_ioprio_get, IOPRIO_WHO_PROCESS, libc::c_long::from(thread)) };
+    taken >> IOPRIO_CLASS_SHIFT == IOPRIO_CLASS_IDLE
 }
 
 /// Put the calling thread in the utility QoS class, the nearest macOS has to a per-thread nice 19, since background throttles
@@ -455,7 +476,7 @@ pub fn lower_priority() -> WorkerPriority {
     // SAFETY: the class is read as its plain number, so an unknown one can't make a bad enum, and both outs live for the call
     unsafe { libc::pthread_get_qos_class_np(libc::pthread_self(), (&raw mut class).cast(), &mut relative) };
     let class = if class == libc::qos_class_t::QOS_CLASS_UTILITY as u32 { PriorityClass::Utility } else { PriorityClass::Unknown };
-    WorkerPriority { class, nice: relative }
+    WorkerPriority { class, nice: relative, is_io_idle: false }
 }
 
 /// Leave the thread as it is where no lower class is known

@@ -27,6 +27,7 @@ use crate::segment::range_covers::RangeCovers;
 use crate::segment::summary::{LostRows, SavedSummary, SummaryPaths, SummaryRows};
 use crate::superblock::SuperblockPaths;
 use crate::write_order::WriteOrder;
+use crate::segment::summary_bytes::SummaryBytes;
 
 /// A volume's `sealing` number between seals
 pub const NO_SEAL: u64 = u64::MAX;
@@ -529,7 +530,7 @@ pub struct Volume<Backend: Io> {
     pub lost_rows: Mutex<LostRows>,
     /// What both summary copies hold, when it is known, so a save of the same rows writes nothing
     pub saved_summary: Mutex<Option<SavedSummary>>,
-    pub summary_buffer: Pool<Vec<u8>>,
+    pub summary_buffer: Pool<SummaryBytes>,
     pub damage: DamageList,
     pub covers: RangeCovers,
     pub damaged: Mutex<Vec<SegmentNumber>>,

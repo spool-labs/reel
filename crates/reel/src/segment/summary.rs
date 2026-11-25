@@ -9,6 +9,7 @@ use reel_core::column_id::ColumnId;
 use reel_core::units::{ByteCount, DeathMark, FileOffset, RowCount, WritePlace};
 
 use crate::fixed_list::{ListFull, ListOut};
+use crate::segment::summary_bytes::SummaryBytes;
 use crate::io::replace::replace_whole;
 use crate::io::device_error::{SECTOR_BYTES, read_or_damaged};
 use crate::io::{Io, IoFile};
@@ -145,7 +146,7 @@ pub struct SpanFacts<'key> {
 #[derive(Debug)]
 pub struct SummaryRows {
     pub highest_forward: SegmentNumber,
-    bytes: Vec<u8>,
+    bytes: SummaryBytes,
     index: NumberMap,
     listed: usize,
     is_index_whole: bool,
@@ -242,7 +243,7 @@ impl SummaryRows {
     pub fn new(capacity: ByteCount) -> Self {
         Self {
             highest_forward: SegmentNumber(0),
-            bytes: Vec::with_capacity(capacity.0 as usize),
+            bytes: SummaryBytes::heap(capacity.0 as usize),
             index: NumberMap::new(0),
             listed: 0,
             is_index_whole: false,
@@ -259,9 +260,31 @@ impl SummaryRows {
         let wanted = capacity.0 as usize;
         let length = self.bytes.len();
         self.bytes.reserve_exact(wanted.saturating_sub(length));
-        black_box(self.bytes.as_mut_ptr());
         self.bytes.resize(wanted.max(length), 0);
+        black_box(&mut *self.bytes);
         self.bytes.truncate(length);
+    }
+
+    /// Move the rows into a room planned for this many bytes, which a volume's own summary does once at open, so their memory
+    /// follows them from then on
+    pub fn move_to_room(&mut self, capacity: ByteCount) -> std::io::Result<()> {
+        let rows = std::mem::replace(&mut self.bytes, SummaryBytes::heap(0));
+        self.bytes = SummaryBytes::in_room(capacity.0 as usize, &rows)?;
+        Ok(())
+    }
+
+    /// Take what a settled copy holds, keeping these rows' own memory, so a summary that moved into a room stays in it
+    pub fn settle_from(&mut self, settled: SummaryRows) {
+        let mut bytes = std::mem::replace(&mut self.bytes, SummaryBytes::heap(0));
+        bytes.clear();
+        bytes.extend_from_slice(&settled.bytes);
+        *self = SummaryRows { bytes, ..settled };
+    }
+
+
+    /// Read the room the rows live in, once they moved to one
+    pub fn room(&self) -> Option<&std::sync::Arc<crate::pool_room::PoolRoom>> {
+        self.bytes.room()
     }
 
     /// Size the lookup from a segment to its row and the orders the picks ask, so a walk step and a pick go to their rows with no
@@ -367,7 +390,7 @@ impl SummaryRows {
 
     /// Read the heap the rows hold
     pub fn heap_bytes(&self) -> ByteCount {
-        ByteCount((self.bytes.capacity() + self.index.heap_bytes()) as u64 + self.orders.heap_bytes().0)
+        ByteCount((self.bytes.heap_bytes() + self.index.heap_bytes()) as u64 + self.orders.heap_bytes().0)
     }
 
     /// Add a row, or return false when it doesn't fit
@@ -1094,12 +1117,12 @@ pub fn read_summary<Backend: Io>(
 
     let mark = newer.mark();
     rows.highest_forward = forward.unwrap_or(FORWARD_UNKNOWN);
-    rows.bytes = newer.rows;
+    rows.bytes = SummaryBytes::Heap(newer.rows);
     rows.is_checked = false;
     if let Some(older) = older {
         let has_two_marks = mark.is_some() && older.mark().is_some() && mark != older.mark();
         let mut older_rows = SummaryRows::new(ByteCount(0));
-        older_rows.bytes = older.rows;
+        older_rows.bytes = SummaryBytes::Heap(older.rows);
         older_rows.is_checked = false;
         let listed = rows.offsets();
         // with two marks, a row the newer copy lost may hold more than the older copy's, so it can't stand as it is

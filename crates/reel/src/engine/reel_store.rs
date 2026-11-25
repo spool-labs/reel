@@ -78,7 +78,8 @@ use crate::index::spot_index::SpotIndex;
 use crate::index::write_index::WriteIndex;
 use crate::io::lock_outcome::LockOutcome;
 use crate::io::{Io, IoFile, IoTask};
-use crate::pool::{Pool, touched_buffer, touched_capacity, touched_filled, touched_room, touched_zeroes};
+use crate::pool::{Pool, touched_capacity, touched_filled, touched_room, touched_zeroes};
+use crate::segment::summary_bytes::SummaryBytes;
 use crate::record::codec::Codec;
 use crate::record::record_check::RecordKey;
 use crate::record::record_encoder::{RecordEncoder, SHARE_BYTES};
@@ -1476,7 +1477,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> Result<Engin
         let Some(summary) = summaries.next() else {
             continue;
         };
-        volumes.push(build_volume(&context, index, held, summary));
+        volumes.push(build_volume(&context, index, held, summary)?);
     }
 
     let mut queues = Vec::with_capacity(open_slots);
@@ -1556,7 +1557,12 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> Result<Engin
     let index = WriteIndex::new(&sizing.shard, first_pages)?;
     // a reader runs no reserve job, so its cache starts whole too
     let record_cache = if sizing.is_read_only { RecordCache::new(record_share, cache_mean)? } else { RecordCache::fresh(record_share, cache_mean)? };
-    let pool_rooms = index.rooms();
+    // the write index first, then each volume's summary and the buffer its saves copy it through
+    let mut pool_rooms = index.rooms();
+    for volume in &volumes {
+        pool_rooms.extend(hold(&volume.summary).room().cloned());
+        pool_rooms.extend(volume.summary_buffer.with(|buffer| buffer.room().cloned()));
+    }
     // a sorted column's rows count apart from the start, so its walks see only the rows its index lacks
     for column in config.columns.iter().filter(|column| column.is_sorted()) {
         index.mark_sorted(column.id);
@@ -1708,7 +1714,7 @@ pub struct VolumeContext<'open, Backend: Io> {
 }
 
 /// Build one volume's state: its summary's room, its table, and every count it keeps
-pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: usize, held: Vec<Backend::Lock>, mut summary: SummaryFound) -> Volume<Backend> {
+pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: usize, held: Vec<Backend::Lock>, mut summary: SummaryFound) -> Result<Volume<Backend>, Error> {
     let VolumeContext { io, config, sizing, disks, scan, places, planned, open_slots, all_row_room, progress } = *context;
     let volume = &config.volumes[index];
     let mut paths = Vec::with_capacity(volume.roots.len());
@@ -1723,7 +1729,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
     // open never drops a row, so a segment's damage keeps its rank through every open
     let span_room = MOST_DAMAGED_SPANS * (MOST_ROW_SPAN_FIXED_BYTES + 2 * SPAN_KEY_BYTES);
     let summary_room = span_room + found_summary.max(planned_summary).max(scan.least_summary_room(index, columns_here) * 2);
-    summary.rows.make_room(ByteCount(summary_room as u64));
+    summary.rows.move_to_room(ByteCount(summary_room as u64))?;
     let mut room = table_room(&planned[index], &scan.least_sizing(index));
     let cover_segment = volume_segment_bytes(config, index, sizing.segment_rows);
     room.blocks_per_shard += complete_shard_lines(config, index);
@@ -1734,7 +1740,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
     let dead_share = ByteCount(dead_bits_bytes(rows_here).min(sizing.record_share.0 / 2 / config.volumes.len() as u64));
     let open_place = summary.rows.rows().map(|row| row.facts.places.highest).max().unwrap_or(WritePlace(0));
     let open_segment = summary.rows.rows().map(|row| row.facts.segment).max().unwrap_or(SegmentNumber(0));
-    Volume {
+    Ok(Volume {
         dead_bits: DeadBits::new(dead_share, room.segments_per_shard * TABLE_SHARDS),
         id: VolumeId(index as u8),
         name: volume.name.clone(),
@@ -1903,13 +1909,13 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         bits_saved_at: AtomicU64::new(0),
         summary_paths: summary.paths,
         lost_rows: Mutex::new(summary.lost),
-        summary_buffer: Pool::new(vec![touched_buffer(summary_room)]),
+        summary_buffer: Pool::new(vec![SummaryBytes::in_room(summary_room, &[])?]),
         damage: DamageList::new(),
         covers: RangeCovers::new(config.widest_key(index)),
         damaged: Mutex::new(touched_room(MOST_DAMAGED_SPANS)),
         is_clearing: AtomicBool::new(false),
         rebuild_asked: AtomicU64::new(NO_REBUILD),
-    }
+    })
 }
 
 

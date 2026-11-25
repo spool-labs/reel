@@ -152,7 +152,9 @@ struct RoomPages {
 /// One pool's reserved room, split into extents that come into memory and go back to the kernel as the pool's use moves
 pub struct PoolRoom {
     base: NonNull<u8>,
-    /// Bytes reserved, a whole number of units
+    /// Bytes the mapping takes, a whole number of units
+    mapped: usize,
+    /// Bytes the room can grow to: the share, in whole system pages
     reserved: usize,
     /// The bytes every extent is a multiple of: a page, a huge page in a large room, and a pool page in a paged room
     unit: usize,
@@ -175,6 +177,8 @@ pub struct PoolRoom {
     first_part: AtomicUsize,
     /// Bytes the room has given back to the kernel, for the report
     given_back: AtomicU64,
+    /// Held across a grow, so two growers never bring in one extent at once
+    growing: Mutex<()>,
     /// Bytes the pool uses now, which its owner notes and the job reads
     used: AtomicUsize,
     /// Set once the pool asked for its next extent, until the job brings it in
@@ -214,9 +218,12 @@ impl PoolRoom {
         let wanted = (share.0 as usize).next_multiple_of(system_page).max(system_page);
         let huge = if wanted >= HUGE_ROOM_BYTES { HUGE_PAGE_BYTES } else { system_page };
         let unit = huge.max(page.unwrap_or(0));
-        let reserved = wanted.next_multiple_of(unit);
-        let base = map_aligned(reserved, huge)?;
-        advise_huge_pages(base.as_ptr().cast(), reserved, huge == HUGE_PAGE_BYTES);
+        // the mapping rounds to whole units, and the room counts and fills only the share, so nothing past the pool's own bytes
+        // comes into memory or into the report
+        let mapped = wanted.next_multiple_of(unit);
+        let base = map_aligned(mapped, huge)?;
+        advise_huge_pages(base.as_ptr().cast(), mapped, huge == HUGE_PAGE_BYTES);
+        let reserved = wanted;
         let extent = (reserved / EXTENTS).next_multiple_of(unit).max(unit);
         let extent_count = reserved.div_ceil(extent);
         let pages = page.map(|page| RoomPages {
@@ -238,6 +245,7 @@ impl PoolRoom {
         let room = Self {
             base,
             reserved,
+            mapped,
             unit,
             extent,
             extent_count,
@@ -249,6 +257,7 @@ impl PoolRoom {
             over_since: AtomicU64::new(0),
             first_part: AtomicUsize::new(0),
             given_back: AtomicU64::new(0),
+            growing: Mutex::new(()),
             used: AtomicUsize::new(0),
             has_asked: AtomicBool::new(false),
             wake: OnceLock::new(),
@@ -266,6 +275,12 @@ impl PoolRoom {
         }
         Ok(room)
     }
+
+    /// Set the part open brings in through the host check, past what the room holds now
+    pub fn set_first_part(&self, bytes: usize) {
+        self.first_part.store(bytes, Ordering::Relaxed);
+    }
+
 
     /// Set what the pool calls when it wants its next extent
     pub fn set_wake(&self, wake: GrowWake) {
@@ -458,6 +473,8 @@ impl PoolRoom {
     /// populate that fails leaves the room as it was
     pub fn grow_to(&self, bytes: usize) -> Result<()> {
         let target = bytes.min(self.reserved);
+        // a writer that grows its own room inline and the job never populate one extent at once, since a touch writes the page
+        let _growing = hold(&self.growing);
         while self.committed() < target {
             let ready = self.ready.load(Ordering::Acquire);
             // an extent whose readers haven't all left since its release stays out until its pages have gone back
@@ -678,7 +695,7 @@ fn guard_extent(base: *mut u8, start: usize, bytes: usize, is_open: bool) {
 impl Drop for PoolRoom {
     fn drop(&mut self) {
         // SAFETY: the room owns the mapping, and the pool that read it is gone
-        unsafe { libc::munmap(self.base.as_ptr().cast(), self.reserved) };
+        unsafe { libc::munmap(self.base.as_ptr().cast(), self.mapped) };
     }
 }
 
@@ -913,7 +930,7 @@ mod tests {
     fn a_large_room_keeps_its_limits_on_huge_pages() {
         let room = PoolRoom::reserve(ByteCount(10 * HUGE_PAGE_BYTES as u64 + 5), ByteCount(1)).expect("reserve");
         assert_eq!(room.base() as usize % HUGE_PAGE_BYTES, 0);
-        assert_eq!(room.reserved(), 11 * HUGE_PAGE_BYTES);
+        assert_eq!(room.reserved(), (10 * HUGE_PAGE_BYTES + 5).next_multiple_of(page_bytes()));
         assert_eq!(room.extent(), HUGE_PAGE_BYTES);
         assert_eq!(room.committed() % HUGE_PAGE_BYTES, 0);
         room.note_used(room.committed());

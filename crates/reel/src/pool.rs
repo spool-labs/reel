@@ -359,11 +359,6 @@ impl<Item> Pool<Item> {
     }
 }
 
-/// Allocate a buffer with every page written, since zeroed memory from the allocator is mapped on first use
-pub fn touched_buffer(capacity: usize) -> Vec<u8> {
-    touched_capacity(capacity, TOUCH_BYTE)
-}
-
 /// Allocate zeroed bytes with every page written
 pub fn touched_zeroes(length: usize) -> Vec<u8> {
     touched_filled(length, 0)

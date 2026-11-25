@@ -378,14 +378,14 @@ impl<Backend: Io> EngineState<Backend> {
             let forward = rows.highest_forward;
             drop(rows);
             // both copies already hold these rows, as after a clean close and the open that follows it
-            let saving = SavedSummary::of(buffer, forward);
+            let saving = SavedSummary::of(&buffer[..], forward);
             if *hold(&volume.saved_summary) == Some(saving) {
                 return self.save_dead_bits_if_due(volume);
             }
             volume.summary_saves.fetch_add(1, Ordering::Relaxed);
             let bytes = buffer.len() as u64;
             self.note_unit(UnitKind::SummaryCopy, bytes, started, cpu_started);
-            let saved = write_summary(&self.io, &volume.summary_paths, self.read_point(volume), forward, buffer);
+            let saved = write_summary(&self.io, &volume.summary_paths, self.read_point(volume), forward, &buffer[..]);
             // a failed save can leave one copy new and one old
             *hold(&volume.saved_summary) = saved.is_ok().then_some(saving);
             self.note_unit(UnitKind::SummarySave, bytes, started, cpu_started);
@@ -830,7 +830,7 @@ impl<Backend: Io> EngineState<Backend> {
             report.segment_table = ByteCount(report.segment_table.0 + volume.table.heap_bytes().0);
             report.damaged_spans = ByteCount(report.damaged_spans.0 + volume.damage.heap_bytes().0);
             report.range_deletes = ByteCount(report.range_deletes.0 + volume.covers.heap_bytes().0);
-            let buffer = volume.summary_buffer.heap_bytes(|buffer| ByteCount(buffer.capacity() as u64));
+            let buffer = volume.summary_buffer.heap_bytes(|buffer| ByteCount(buffer.heap_bytes() as u64));
             report.summary = ByteCount(report.summary.0 + hold(&volume.summary).heap_bytes().0 + buffer.0);
         }
         let readers = self.record_readers.heap_bytes(RecordReader::heap_bytes);

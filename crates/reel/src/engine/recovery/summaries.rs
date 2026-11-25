@@ -121,7 +121,7 @@ pub fn settle_summaries<Backend: Io>(state: &EngineState<Backend>, scan: &mut Ro
         carry_rows(volume, &rows, &listed, (&held, &open, &cleared), &mut settled);
         settled.highest_forward = held.last().map_or(SegmentNumber(0), |highest| rows.highest_forward.min(*highest));
         let index_room = rows.index_room();
-        *rows = settled;
+        rows.settle_from(settled);
         rows.make_index(index_room);
         drop(rows);
         state.save_summary(volume)?;

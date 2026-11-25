@@ -14,5 +14,6 @@ pub mod segment_table;
 pub mod summary;
 pub mod summary_orders;
 pub mod row_block;
+pub mod summary_bytes;
 pub mod segment_tail;
 pub mod varint;

@@ -144,7 +144,8 @@ impl BlockCache {
 
     /// Spread blocks over the first shards alone, the rest given back above a lowered ceiling, so every block keeps a place a reopen
     /// at the smaller share would give it. A block whose shard moves misses until it is kept again, and a lookup compares the whole
-    /// block key, so its old slot answers for nothing else
+    /// block key, so its old slot answers for nothing else. The count may be any number: a block's key is its segment and offset,
+    /// whose bytes never change, so a slot a key's shard left behind can only miss. The spot index answers gets and halves instead
     pub fn set_live_shards(&self, shards: usize) {
         self.live_shards.store(shards.clamp(1, self.shards.len()), Ordering::Release);
     }

@@ -310,15 +310,22 @@ fn free_shards<Backend: Io>(state: &EngineState<Backend>, cache: usize, bytes: u
         let mut freed = 0;
         while freed < part {
             let shards = whole.shard_count().min(state.cache_ceilings[place].load(Ordering::Acquire));
+            // the spot index halves, so its live count stays a power of two: a key's shard among fewer is then its shard among more
+            // taken modulo, and no key's shard comes back to a slot an older version of it left. A spot slot answers a get, while a
+            // block or record slot holds bytes that never change, so the block caches give one shard at a time
+            let kept = if place == SPOT_CACHE { shards / 2 } else { shards - 1 };
+            let bytes = (shards - kept) as u64 * whole.shard_bytes() as u64;
             // a cache keeps one shard, so its keys still have a place, and gives none that would take it past its room
-            if shards <= 1 || freed + whole.shard_bytes() as u64 > limit {
+            if kept == 0 || freed + bytes > limit {
                 break;
             }
-            state.cache_ceilings[place].store(shards - 1, Ordering::Release);
-            if whole.give_back_shard(shards - 1) > 0 {
-                state.cache_shards_given.fetch_add(1, Ordering::Relaxed);
+            state.cache_ceilings[place].store(kept, Ordering::Release);
+            for shard in kept..shards {
+                if whole.give_back_shard(shard) > 0 {
+                    state.cache_shards_given.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            freed += whole.shard_bytes() as u64;
+            freed += bytes;
         }
         given += freed;
         let live = whole.shard_count().min(state.cache_ceilings[place].load(Ordering::Acquire));

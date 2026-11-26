@@ -336,10 +336,12 @@ impl SpotIndex {
     }
 
     /// Spread keys over the first shards alone, the rest given back above a lowered ceiling, so every key keeps a place a reopen
-    /// at the smaller share would give it. A key whose shard moves misses until it is cached again. Its old slot keeps a tag a lookup
-    /// of another key matches only as two keys' tags in one bucket can today, and a spot hit is checked against the record it reads
+    /// at the smaller share would give it. The count only halves, so a key whose shard moves misses until it is cached again and never
+    /// reaches the slot an older version of it left
     pub fn set_live_shards(&self, shards: usize) {
-        self.live_shards.store(shards.clamp(1, SHARD_COUNT), Ordering::Release);
+        // a spot slot answers a get, so the count stays a power of two, rounded down here whatever the caller asks
+        let live = shards.clamp(1, SHARD_COUNT);
+        self.live_shards.store(1 << live.ilog2(), Ordering::Release);
     }
 
     /// Read the bytes the shards given back hold no more

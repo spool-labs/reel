@@ -537,7 +537,8 @@ impl RecordCache {
     }
 
     /// Spread records over the shards a rebalance hasn't held to an extent. A record whose shard moves misses until it is
-    /// admitted again
+    /// admitted again. The count may be any number: a record's key is its segment and offset, whose bytes never change, so a slot a
+    /// key's shard left behind can only miss. The spot index answers gets and halves instead
     pub fn spread_over_unheld(&self) {
         self.live_shards.store((self.shards.len() - self.held_shards()).max(1), Ordering::Release);
     }

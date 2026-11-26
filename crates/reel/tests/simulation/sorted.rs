@@ -4964,3 +4964,55 @@ fn gets_after_a_rebalance_read_as_after_a_reopen() {
     store.close().expect("close");
     assert!(after_rebalance <= after_reopen * 1.15 + 0.02, "a get read the device {after_rebalance:.3} times after the rebalance, {after_reopen:.3} after a reopen");
 }
+
+// a plain column's gets answer with each key's newest value across three spot cache shrinks in a row, 16 shards to 8 to 3 to 2 as
+// asked, with writes at each but the last: a key whose shard moves twice must never find a location an older version of it left in
+// a shard the spot index kept
+#[test]
+fn plain_gets_stay_newest_across_successive_spot_shrinks() {
+    const PLAIN: ColumnId = ColumnId(2);
+    const PLAIN_KEYS: u64 = 3_000;
+    for seed in seeds(0..4) {
+        let io = SimulatedIo::new(Seed(seed));
+        let mut config = config(RowCount(0));
+        let mut plain = ColumnConfig::new(PLAIN, "plain", KeyShape::Variable { most: 64 });
+        plain.index = ColumnIndex::Plain;
+        config.columns.push(plain);
+        let store = ReelStore::open(io.clone(), &config).expect("open");
+        // no merge rewrites or frees the segments the older versions sit in, so a stale slot still points at a record a get can read
+        store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
+        store.state.volumes[0].holds.reclaim.store(true, Ordering::Release);
+        let mut random = SeededRandom::new(Seed(seed));
+        let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        let mut value = Vec::new();
+        let shard_bytes = store.memory_report().cache_present[0].0 / 16;
+        let mut live = 16;
+        for (round, next) in [16, 8, 3, 2].into_iter().enumerate() {
+            if next < live {
+                reel::engine::rebalance::shrink_cache(&store.state, 0, (live - next) * shard_bytes);
+                live = store.memory_report().cache_present[0].0 / shard_bytes;
+            }
+            // the shrink to 3 overwrites half the keys, so the segment before it keeps live rows and stays, and the last shrink is read
+            // only, so no seal at it refreshes the slot a key's shard moves back to
+            for number in (0..PLAIN_KEYS).filter(|number| next != 2 && (next != 3 || number % 2 == 0)) {
+                let name = format!("plain-{number:06}").into_bytes();
+                if random.one_in(10) {
+                    store.delete(PLAIN, &name).expect("delete");
+                    model.remove(&name);
+                } else {
+                    let written = format!("{seed}-{round}-{number}").into_bytes();
+                    store.put(PLAIN, &name, &written).expect("put");
+                    model.insert(name, written);
+                }
+            }
+            seal_all(&store, &io);
+            for number in 0..PLAIN_KEYS {
+                let name = format!("plain-{number:06}").into_bytes();
+                let found = store.get(PLAIN, &name, &mut value).expect("get");
+                assert_eq!(found.then_some(value.as_slice()), model.get(&name).map(Vec::as_slice), "seed {seed} round {round}, {live} spot shards: {}", String::from_utf8_lossy(&name));
+            }
+        }
+        assert!(live < 16, "seed {seed}: the spot cache never shrank");
+        store.close().expect("close");
+    }
+}

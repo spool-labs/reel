@@ -269,11 +269,16 @@ impl ValuePages {
     fn take(&self, sharer: usize, owner: u32) -> Option<u32> {
         let page = {
             let mut taken = hold(&self.taken);
-            let available = self.room.free_pages();
+            let in_memory = self.room.free_pages();
+            let available = in_memory + self.growable_pages();
             if available == 0 || !self.may_take(sharer, |index| taken[index], available) {
                 return None;
             }
-            let page = self.room.take_page()?;
+            // the rule allows the page but none is in memory yet: the refusal counts as use, so the job brings in the next step
+            let Some(page) = (in_memory > 0).then(|| self.room.take_page()).flatten() else {
+                self.room.note_wanted();
+                return None;
+            };
             if let Some(count) = taken.get_mut(sharer) {
                 *count += 1;
                 self.taken_now[sharer].store(*count, Ordering::Relaxed);
@@ -292,9 +297,9 @@ impl ValuePages {
         Some(page)
     }
 
-    /// Check an index may take one more page, from the pages each index holds and the free count. No take leaves fewer free pages
-    /// than the other indexes still lack of half their floors, and past its own floor an index also leaves half of every other
-    /// index's unused floor free
+    /// Check an index may take one more page, from the pages each index holds and the free count, the pages the room can still bring
+    /// in among them. No take leaves fewer free pages than the other indexes still lack of half their floors, and past its own floor
+    /// an index also leaves half of every other index's unused floor free
     fn may_take(&self, sharer: usize, taken: impl Fn(usize) -> u32, free: u32) -> bool {
         let Some(&own_floor) = self.floors.get(sharer) else {
             return false;
@@ -314,8 +319,22 @@ impl ValuePages {
     /// Check, with no lock, whether an index could take a page now, so a fill the pool would refuse takes no part's lock. The
     /// counts may be a moment old, so a take still checks under the lock
     pub fn could_take(&self, sharer: usize) -> bool {
-        let free = self.free_pages();
-        free > 0 && self.may_take(sharer, |index| self.taken_now[index].load(Ordering::Relaxed), free)
+        let in_memory = self.free_pages();
+        let free = in_memory + self.growable_pages();
+        let is_allowed = free > 0 && self.may_take(sharer, |index| self.taken_now[index].load(Ordering::Relaxed), free);
+        // a fill the rule allows but no page in memory can take asks the room to grow, as a take does
+        if is_allowed && in_memory == 0 {
+            self.room.note_wanted();
+            return false;
+        }
+        is_allowed
+    }
+
+    /// Count the pages the room can still bring in before its cap. The floors are promises over the whole pool, so a take judges
+    /// them against these as well as the free pages in memory, and at the cap against those alone
+    fn growable_pages(&self) -> u32 {
+        let cap = (self.room.cap() / VALUE_PAGE_BYTES) as u32;
+        cap.min(self.most_pages).saturating_sub(self.room.ready_pages())
     }
 
     /// Move each page's generation, then give the chain to the free list and take its pages off the index's count

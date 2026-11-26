@@ -557,6 +557,12 @@ impl PoolRoom {
         RoomRead(Some(slot))
     }
 
+    /// Note a take refused for want of a free page in memory as use of every byte in it, so the job brings in the next step. The
+    /// next take or give notes the real use
+    pub fn note_wanted(&self) {
+        self.note_used(self.committed().max(self.used()));
+    }
+
     /// Note the bytes the pool uses now, and wake the job the first time the arm wants the next step
     pub fn note_used(&self, bytes: usize) {
         self.used.store(bytes, Ordering::Relaxed);

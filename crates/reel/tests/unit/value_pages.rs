@@ -232,3 +232,63 @@ fn every_sharer_keeps_half_its_floor() {
     assert_eq!(take_all(2, LEAF + 200), 2, "the third index missed its half");
     assert!(!pages.could_take(0) && !pages.could_take(1) && !pages.could_take(2), "a full pool said it could give a page");
 }
+
+const SHARERS: usize = 14;
+const FLOOR: u32 = 64;
+
+// a pool that starts at an eighth fills from its first take though fourteen sharers' half floors pass what is in memory, a take the
+// rule allows with no free page in memory asks the room to grow, and the job's steps bring the rest in
+#[test]
+fn a_growing_pool_fills_from_an_eighth() {
+    let most = FLOOR * SHARERS as u32;
+    let pages = ValuePages::growing(most, &[FLOOR; SHARERS], most / 8, most).expect("build pool");
+    let first = pages.page_count();
+    assert!(first < most / 2, "the pool started past half its pages: {first} of {most}");
+    assert!(pages.fill((0, LEAF), HeldChain::NONE, (0, ENTRIES), &value(0, 100)).is_some(), "the first take was refused");
+    let mut leaf = LEAF + 1;
+    while pages.fill((0, leaf), HeldChain::NONE, (0, ENTRIES), &value(0, 100)).is_some() {
+        leaf += 1;
+    }
+    let room = pages.room();
+    assert_eq!(room.used(), room.committed(), "a take short of memory noted no demand");
+    assert!(room.next_step(room.used()).is_some(), "the room wants no step after a refused take");
+    room.grow_to(room.cap()).expect("grow");
+    assert_eq!(pages.page_count(), most, "the room didn't reach its cap");
+    assert!(pages.fill((0, leaf), HeldChain::NONE, (0, ENTRIES), &value(0, 100)).is_some(), "a grown pool refused a take");
+}
+
+// fourteen sharers taking in a seeded order while the job grows the pool fill it to its cap, and each ends with at least the half of
+// its floor the rule promises, as a pool that started whole gives them
+#[test]
+fn every_sharer_keeps_half_its_floor_at_the_cap() {
+    let most = FLOOR * SHARERS as u32;
+    for seed in 1..=16_u64 {
+        let pages = ValuePages::growing(most, &[FLOOR; SHARERS], most / 8, most).expect("build pool");
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut taken = [0_u32; SHARERS];
+        let mut refused_in_a_row = 0;
+        let mut leaf = LEAF;
+        while refused_in_a_row < SHARERS * 8 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let sharer = (state % SHARERS as u64) as usize;
+            leaf += 1;
+            if pages.fill((sharer, leaf), HeldChain::NONE, (0, ENTRIES), &value(sharer, 100)).is_some() {
+                taken[sharer] += 1;
+                refused_in_a_row = 0;
+            } else {
+                refused_in_a_row += 1;
+                // the job's step, which a refused take asked for
+                let room = pages.room();
+                if let Some(target) = room.next_step(room.used()) {
+                    room.grow_to(target).expect("grow");
+                    refused_in_a_row = 0;
+                }
+            }
+        }
+        assert_eq!(pages.page_count(), most, "seed {seed}: the pool stopped short of its cap");
+        assert_eq!(taken.iter().sum::<u32>(), most, "seed {seed}: pages stayed free at the cap: {taken:?}");
+        assert!(taken.iter().all(|count| *count >= FLOOR / 2), "seed {seed}: a sharer ended under half its floor: {taken:?}");
+    }
+}

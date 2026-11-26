@@ -5016,3 +5016,72 @@ fn plain_gets_stay_newest_across_successive_spot_shrinks() {
         store.close().expect("close");
     }
 }
+
+// a store of fourteen sorted columns, reopened, holds every value its gets read in their leaves within a few of the job's steps
+// though its value pool starts at an eighth, and a get then reads the device about as often as on a read-only open, whose pool
+// starts whole
+#[test]
+fn a_reopened_store_holds_values_in_a_few_job_steps() {
+    const SORTED: u8 = 14;
+    const KEYS: u64 = 200_000;
+    let io = SimulatedIo::new(Seed(71));
+    SIM_BUDGET.with(|budget| budget.set(HELD_BUDGET));
+    let mut config = config(RowCount(0));
+    SIM_BUDGET.with(|budget| budget.set(BUDGET));
+    reel::engine::engine_sizing::EXACT_INDEX_ROWS.with(|exact| exact.set(false));
+    config.columns[0].least_rows = None;
+    for id in 2..=SORTED {
+        let mut column = config.columns[0].clone();
+        column.id = ColumnId(id);
+        column.name = format!("sorted-{id}");
+        config.columns.push(column);
+    }
+    let value = |number: u64| {
+        let mut bytes = number.to_le_bytes().to_vec();
+        bytes.resize(128, (number % 251) as u8);
+        bytes
+    };
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    for number in 0..KEYS {
+        store.put(COLUMN, &key(number), &value(number)).expect("put");
+        if number % 16_384 == 16_383 {
+            seal_all(&store, &io);
+        }
+    }
+    seal_all(&store, &io);
+    store.close().expect("close");
+    drop(store);
+    let mut buf = Vec::new();
+    let reads_a_get = |store: &Store, buf: &mut Vec<u8>| {
+        let reads = io.read_count().0;
+        for number in 0..KEYS {
+            assert!(store.get(COLUMN, &key(number), buf).expect("get"));
+            assert_eq!(*buf, value(number));
+        }
+        (io.read_count().0 - reads) as f64 / KEYS as f64
+    };
+    let held_values = |store: &Store| {
+        let mut report = reel_core::maintenance_report::MaintenanceReport::new();
+        store.maintenance_report(&mut report);
+        report.held_values
+    };
+    let store = ReelStore::open(io.clone(), &config).expect("reopen");
+    let job = reel::engine::reserve_job::ReserveJob::new(Arc::clone(&store.state));
+    // each pass of gets holds what the pool has room for and asks for more, and each job step brings it in
+    let mut steps = 0;
+    while held_values(&store) < KEYS && steps < 4 {
+        let _per_get = reads_a_get(&store, &mut buf);
+        job.grow_pools();
+        steps += 1;
+    }
+    let held = held_values(&store);
+    assert_eq!(held, KEYS, "the leaves held {held} of {KEYS} values after {steps} job steps");
+    let after_steps = reads_a_get(&store, &mut buf);
+    store.close().expect("close");
+    drop(store);
+    let view = ReelStore::open_read_only(io.clone(), &config).expect("open read-only");
+    let _warm = reads_a_get(&view, &mut buf);
+    let whole = reads_a_get(&view, &mut buf);
+    eprintln!("held {held} of {KEYS} after {steps} job steps: {after_steps:.3} device reads a get, {whole:.3} on a read-only open");
+    assert!(after_steps <= whole * 1.15 + 0.02, "a get read the device {after_steps:.3} times, {whole:.3} with the pool whole");
+}

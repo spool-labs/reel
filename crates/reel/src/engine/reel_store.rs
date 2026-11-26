@@ -167,7 +167,7 @@ impl<Backend: Io> ReelStore<Backend> {
         // the pools are built and touched here and as the jobs start, and open reports that time apart
         let touched_from = io.now();
         // the sorted indexes take their room from the caches before anything is built, by the keys they held at open
-        let (sizing, sorted_sizes) = size_sorted_indexes(config, &sizing, &summaries);
+        let (sizing, sorted_sizes, rebalance_plan) = size_sorted_indexes(config, &sizing, &summaries);
         let mut state = build_state(OpenInputs { io, config, sizing: &sizing, disks: &disks, superblock, locks, scan: &scan, summaries }).map_err(open_error("reserving the write index"))?;
         state.budget_asked = asked;
         state.complete = complete_tables(config);
@@ -187,6 +187,8 @@ impl<Backend: Io> ReelStore<Backend> {
             room.fill_first(&mut room_left).map_err(open_error("bringing in a pool's first part"))?;
         }
         state.sorted_sizes = sorted_sizes;
+        // a sim's exact indexes keep the rows they declared, so only a store that sizes its own indexes shares them again
+        state.rebalance_plan = (!is_index_exact() && !rebalance_plan.columns.is_empty()).then_some(rebalance_plan);
         state.complete_images = complete_images(config);
         state.attach_ring(ring);
         state.prefault_time.store(state.io.now().0.saturating_sub(touched_from.0), Ordering::Release);
@@ -1749,6 +1751,10 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> Result<Engin
         sorted_drops: AtomicU64::new(0),
         sorted_refills: AtomicU64::new(0),
         cache_shards_given: AtomicU64::new(0),
+        rebalance_plan: None,
+        cache_ceilings: std::array::from_fn(|_cache| AtomicUsize::new(usize::MAX)),
+        rebalances: AtomicU64::new(0),
+        indexes_at_cap: AtomicU64::new(0),
         sorted_drop_lock: Mutex::new(()),
         sorted_fill_ns: AtomicU64::new(0),
         sorted_fill_bytes: AtomicU64::new(0),
@@ -2083,7 +2089,11 @@ pub struct SortedSize {
 /// Size each sorted column's index from the keys it held at open: its rows on disk, every row counted, since a dead row counted
 /// costs room and a live row missed costs keys. The indexes share the spot, block and record caches past their floor, and the
 /// caches give up what the indexes take
-pub fn size_sorted_indexes(config: &StoreConfig, sizing: &EngineSizing, summaries: &[SummaryFound]) -> (EngineSizing, Vec<Option<SortedSize>>) {
+pub fn size_sorted_indexes(
+    config: &StoreConfig,
+    sizing: &EngineSizing,
+    summaries: &[SummaryFound],
+) -> (EngineSizing, Vec<Option<SortedSize>>, crate::engine::rebalance::RebalancePlan) {
     let mut rows_on_disk = [0_u64; MAX_COLUMNS];
     for summary in summaries {
         for row in summary.rows.rows() {
@@ -2152,7 +2162,16 @@ pub fn size_sorted_indexes(config: &StoreConfig, sizing: &EngineSizing, summarie
         record_share: ByteCount(changed(record) + unheld),
         ..*sizing
     };
-    (shared, sizes)
+    let plan = crate::engine::rebalance::RebalancePlan {
+        caches: [spot, block, record],
+        opened: [shared.spot_share.0, shared.cache_share.0, shared.record_share.0],
+        taken: std::array::from_fn(|_cache| std::sync::atomic::AtomicU64::new(0)),
+        is_all_sorted,
+        cap,
+        headroom,
+        columns: sorted.iter().map(|column| (column.id, column.key_shape.widest(), column.sorted_least())).collect(),
+    };
+    (shared, sizes, plan)
 }
 
 /// Allocate and touch each sorted column's index at the rows open sized it for
@@ -2176,7 +2195,11 @@ pub fn sorted_indexes(config: &StoreConfig, sizes: &[Option<SortedSize>], is_rea
         // a reader runs no reserve job, so its index starts whole
         let first_rows = if is_read_only { size.rows } else { size.disk_rows };
         let most_rows = if is_read_only { size.rows } else { RowCount(past_budget(config, size.rows.0)) };
-        let index = SortedKeys::growing(column.key_shape.widest(), size.rows, first_rows, most_rows)?.holding_values(Arc::clone(&pool), (sharer, sharer == 0));
+        // a writer's index reserves address space for as many rows as all of max_memory holds, so it grows past its plan as the
+        // data does. A reader's starts whole and stays, and a sim's exact index keeps the rows it declared so it fills and marks
+        let is_fixed = is_read_only || crate::engine::engine_sizing::is_index_exact();
+        let past = if is_fixed { ByteCount(0) } else { config.max_memory.unwrap_or(config.memory_budget).max(config.memory_budget) };
+        let index = SortedKeys::growing(column.key_shape.widest(), size.rows, first_rows, most_rows, past)?.holding_values(Arc::clone(&pool), (sharer, sharer == 0));
         indexes[column.id.0 as usize] = Some(index);
     }
     Ok(indexes)

@@ -8,6 +8,7 @@ use reel_core::units::{ByteCount, FileOffset, Nanoseconds, RowCount};
 use crate::index::sorted_keys::planned_index_bytes;
 
 use crate::engine::complete_path::refill_ceiling;
+use crate::engine::rebalance::rebalance;
 use crate::engine::engine_state::EngineState;
 use crate::engine::open_segment::SegmentPhase;
 use crate::engine::write_path::reserve_target;
@@ -206,7 +207,7 @@ impl<Backend: Io> ReserveJob<Backend> {
     /// stay
     pub fn hold_to_target(&self, now: u64) -> u64 {
         let state = &self.state;
-        let held = self.held_bytes();
+        let mut held = self.held_bytes();
         // the host's own pressure lowers the target in force at once, and it rises back only through the decay below
         let least = state.sizing.least_budget.0;
         // the kernel's own word comes first: a trigger that fired, or a group whose tasks stall on memory past the mark. Either
@@ -234,6 +235,11 @@ impl<Backend: Io> ReserveJob<Backend> {
         if pressed.is_some() {
             state.pressed_steps.fetch_add(1, Ordering::Relaxed);
         }
+        // a sorted index past its room gets what a reopen would give its keys, out of the caches' ceilings, which give back their
+        // shards first, so held only falls
+        if pressed.is_none() && rebalance(state) {
+            held = self.held_bytes();
+        }
         let target = state.memory_target.load(Ordering::Acquire).min(pressed.unwrap_or(u64::MAX));
         if held <= target {
             let is_well_under = held + target / UNDER_DIVISOR <= target || target >= state.memory_budget.0;
@@ -246,17 +252,19 @@ impl<Backend: Io> ReserveJob<Backend> {
                 for room in &state.pool_rooms {
                     room.set_cap(usize::MAX);
                 }
-                // a dropped index comes back once the store has room past the decay for every row it held, the quarter its
-                // refill may grow past that and the extent the last growth may end in, and the compact job refills it
+                // a dropped index, or one with rows past its room, comes back once the store has room past the decay for every
+                // row it holds and missed, the quarter its refill may grow past that and the extent the last growth may end in,
+                // and the compact job refills it. An index its ceiling can't hold stays marked until a rebalance raises it
                 let room = (target - held).min(host_left(&memory));
                 // the whole caches come back first, empty, and fill from reads
                 let room = room.saturating_sub(bring_back_caches(state, room));
                 // a cache still away brings the next step on soon
                 state.is_bringing_back.store(whole_caches(state).any(|cache| cache.absent_shards() > 0), Ordering::Release);
-                for index in state.sorted.iter().flatten().filter(|index| index.is_dropped()) {
+                for index in state.sorted.iter().flatten().filter(|index| index.mark().is_some()) {
                     let rows = RowCount(index.past_capacity().0 + index.entry_count().0);
-                    let ask = refill_ceiling(planned_index_bytes(index.width(), rows).0 as usize) + index.room().extent();
-                    let may = pressed.is_none() && ask as u64 <= room;
+                    let plan = planned_index_bytes(index.width(), rows).0 as usize;
+                    let ask = (refill_ceiling(plan) + index.room().extent()).saturating_sub(index.room().committed());
+                    let may = pressed.is_none() && plan <= index.room().ceiling() && ask as u64 <= room;
                     if may && !index.may_refill() {
                         index.set_may_refill(true);
                         state.ask_compaction();
@@ -481,15 +489,17 @@ pub fn give_back_caches<Backend: Io>(state: &EngineState<Backend>, wanted: usize
 /// Bring one shard of the whole caches back, the spot index first, when it fits in this many bytes, and return the bytes taken. One
 /// a step, so the job looks at pressure and the pools between fills, and the next step comes soon while one is still away
 pub fn bring_back_caches<Backend: Io>(state: &EngineState<Backend>, room: u64) -> u64 {
-    for cache in whole_caches(state) {
-        if cache.absent_shards() == 0 {
+    for (place, cache) in whole_caches(state).enumerate() {
+        // a shard over the ceiling a rebalance set stays away until a reopen
+        let ceiling = cache.shard_count().min(state.cache_ceilings[place].load(Ordering::Acquire));
+        if cache.absent_shards() <= cache.shard_count() - ceiling {
             continue;
         }
         let bytes = cache.shard_bytes() as u64;
         if bytes > room {
             return 0;
         }
-        for shard in 0..cache.shard_count() {
+        for shard in 0..ceiling {
             if cache.bring_back_shard(shard) {
                 return bytes;
             }

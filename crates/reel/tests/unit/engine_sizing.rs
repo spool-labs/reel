@@ -450,7 +450,7 @@ fn an_all_sorted_store_gives_its_spot_share_to_the_indexes() {
     for budget in [512 * 1024 * 1024, 2_048 * 1024 * 1024] {
         let config = sorted_config(budget, 1);
         let before = store_sizing(&config, false, &[None]).expect("sizing");
-        let (after, sizes) = size_sorted_indexes(&config, &before, &[]);
+        let (after, sizes, _plan) = size_sorted_indexes(&config, &before, &[]);
         let held: u64 = sizes.iter().flatten().map(|size| size.got.0).sum();
         assert_eq!(after.spot_share, ByteCount(0), "{budget} B");
         assert_eq!(after.segment_rows, before.segment_rows, "the write index keeps its share at {budget} B");
@@ -478,7 +478,7 @@ fn a_grant_under_the_pool_floor_builds_no_index() {
         let config = sorted_config(least, columns);
         let before = store_sizing(&config, false, &[None]).expect("sizing");
         let caches = before.spot_share.0 + before.cache_share.0 + before.record_share.0;
-        let (after, sizes) = size_sorted_indexes(&config, &before, &[]);
+        let (after, sizes, _plan) = size_sorted_indexes(&config, &before, &[]);
         let built: Vec<_> = sizes.iter().flatten().collect();
         assert_eq!(built.len(), usize::from(columns));
         for size in &built {
@@ -519,7 +519,7 @@ fn large_stores_keep_their_sizes() {
         let sizing = store_sizing(&config, true, &[None]).expect("sizing");
         let shape = store_shape(&config, true, &[None]).with_workers_settled();
         let scans = MOST_SCANS as u64 * planned_scan_bytes(shape.widest_keys, shape.open_slots());
-        let (shared, sizes) = size_sorted_indexes(&config, &sizing, &[]);
+        let (shared, sizes, _plan) = size_sorted_indexes(&config, &sizing, &[]);
         let index = sizes[1].expect("a sorted column");
         found.push([
             sizing.segment_bytes.0,

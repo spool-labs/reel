@@ -67,8 +67,11 @@ pub struct MemoryReport {
     pub disk_covered: ByteCount,
     /// Bytes the pools that grow with their data hold in memory now, which they map apart from the allocator
     pub pool_committed: ByteCount,
-    /// Bytes those pools can grow to, their shares of the budget
+    /// Bytes of those pools' shares of the budget, which a sorted index's pool can grow past while the target has room
     pub pool_shares: ByteCount,
+    /// Pools that asked for address space past their share and reserved the share alone, because the process passed its ceiling
+    /// or the host refused the map. A sorted index among them marks once it outgrows its plan, and comes back at the next open
+    pub pools_held_to_share: u64,
     /// The budget the config asked for. Over the budget in force when the host had less free at open, which the store planned from
     pub budget_asked: ByteCount,
     /// Pools the host had no room to grow, which run as full pools until a step fits
@@ -99,6 +102,17 @@ pub struct MemoryReport {
     pub block_absent_shards: u64,
     /// Shards of the spot index and the block caches the ladder gave back since open
     pub cache_shards_given: u64,
+    /// The bytes the spot, block and record caches may hold, which a rebalance lowers by whole shards to their floors
+    pub cache_ceilings: [ByteCount; 3],
+    /// The bytes the spot, block and record caches hold now, under their ceilings
+    pub cache_present: [ByteCount; 3],
+    /// Bytes the sorted indexes may grow past the shares open gave them, which rebalances moved off the caches
+    pub index_past_share: ByteCount,
+    /// Times a rebalance moved room from the caches to a sorted index since open
+    pub rebalances: u64,
+    /// Sorted indexes past their room that the open-time rule gives no more, since the caches are at their floor or the cap is
+    /// shared out
+    pub indexes_at_cap: u64,
 }
 
 impl MemoryReport {

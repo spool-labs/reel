@@ -220,6 +220,17 @@ pub struct EngineState<Backend: Io> {
     pub sorted_refills: AtomicU64,
     /// Shards of the spot index and the block caches the ladder gave back, since open
     pub cache_shards_given: AtomicU64,
+    /// What open shared the caches and the sorted indexes from, so the store shares them again at run time. None for a reader and
+    /// for a sim's exact indexes, whose sizes stay as declared
+    pub rebalance_plan: Option<crate::engine::rebalance::RebalancePlan>,
+    /// The shards each whole cache may bring back, in whole_caches' order. A rebalance lowers one, and nothing raises it again
+    /// before a reopen
+    pub cache_ceilings: [AtomicUsize; 4],
+    /// Times a rebalance moved room from the caches to a sorted index, since open
+    pub rebalances: AtomicU64,
+    /// Sorted indexes past their room that the open-time rule gives no more, since the caches are at their floor or the cap is
+    /// shared out, as the last rebalance found them
+    pub indexes_at_cap: AtomicU64,
     /// Held by a drop of a sorted index and by the end of its refill with the recount, so a column's counts stop and start in the
     /// order its index leaves and comes back
     pub sorted_drop_lock: Mutex<()>,
@@ -826,7 +837,8 @@ impl<Backend: Io> EngineState<Backend> {
         let mut report = MemoryReport {
             budget: self.memory_budget,
             pool_committed: ByteCount(self.pool_rooms.iter().map(|room| room.committed() as u64).sum()),
-            pool_shares: ByteCount(self.pool_rooms.iter().map(|room| room.reserved() as u64).sum()),
+            pool_shares: ByteCount(self.pool_rooms.iter().map(|room| room.share() as u64).sum()),
+            pools_held_to_share: self.pool_rooms.iter().filter(|room| room.is_held_to_share()).count() as u64,
             budget_asked: self.budget_asked,
             pools_short: self.pool_rooms.iter().filter(|room| room.is_short()).count(),
             pool_given_back: ByteCount(self.pool_rooms.iter().map(|room| room.given_back()).sum()),
@@ -842,6 +854,11 @@ impl<Backend: Io> EngineState<Backend> {
             spot_absent_shards: self.spot.absent_shards() as u64,
             block_absent_shards: (self.row_cache.absent_shards() + self.filter_cache.absent_shards() + self.complete_cache.as_ref().map_or(0, BlockCache::absent_shards)) as u64,
             cache_shards_given: self.cache_shards_given.load(Ordering::Relaxed),
+            cache_ceilings: crate::engine::rebalance::cache_ceilings(self).map(ByteCount),
+            cache_present: crate::engine::rebalance::cache_present(self).map(ByteCount),
+            index_past_share: ByteCount(self.sorted.iter().flatten().map(|index| index.room().ceiling().saturating_sub(index.room().share()) as u64).sum()),
+            rebalances: self.rebalances.load(Ordering::Relaxed),
+            indexes_at_cap: self.indexes_at_cap.load(Ordering::Relaxed),
             write_index: self.index.heap_bytes(),
             spot_cache: self.spot.heap_bytes(),
             record_cache: self.record_cache.heap_bytes(),

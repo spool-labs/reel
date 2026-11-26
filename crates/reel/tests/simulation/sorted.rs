@@ -3998,3 +3998,619 @@ fn a_fixed_key_past_the_index_width_opens_by_keys() {
     }
     store.close().expect("close");
 }
+
+// fill a sized store's index past the rows it planned at open, to this many halves of them, faster than its pool grows, so it
+// marks, and return the keys
+fn outgrow_the_plan(store: &Store, io: &SimulatedIo, model: &mut Model, halves: u64) -> u64 {
+    let capacity = sorted_reading(store).capacity.0;
+    let keys = (capacity * halves / 2).max(KEYS * 4);
+    // no seal between the puts, so no job step grows the pool under them
+    for number in 0..keys {
+        let value = format!("past-{number}").into_bytes();
+        store.put(COLUMN, &key(number), &value).expect("put");
+        model.insert(key(number), value);
+    }
+    seal_all(store, io);
+    keys
+}
+
+// an index that outgrows the plan it sized at open, with max_memory left out, gets its room back once the store has it: past the
+// decay a refill grows its pool past the plan and clears the mark with no reopen, the column counts again, and every key answers
+// from the index
+#[test]
+fn an_index_past_its_plan_comes_back_with_no_reopen() {
+    // the reopen plans the index from the few rows on disk
+    let (io, store, mut model) = small_plan_store(49, BUDGET);
+    let index = store.state.sorted_index(COLUMN).expect("an index");
+    assert!(index.room().reserved() > index.room().share(), "the index reserved no room past its plan");
+    assert_eq!(store.memory_report().pools_held_to_share, 0);
+    // half again past the plan, which the open-time rule's cap still covers
+    let keys = outgrow_the_plan(&store, &io, &mut model, 3);
+    let reading = sorted_reading(&store);
+    assert!(reading.is_marked && reading.rows_past_capacity.0 > 0, "the fill never outran the pool: {reading:?}");
+    let written: Vec<Vec<u8>> = (0..keys).map(key).collect();
+    check(&store, &model, &written);
+
+    // the target has room, and past the decay the job lets a refill run on the pool past the plan
+    let job = reel::engine::reserve_job::ReserveJob::new(Arc::clone(&store.state));
+    let mut now = io.now().0 + 1;
+    job.hold_to_target(now);
+    now += reel::pool_room::DECAY_NANOS;
+    job.hold_to_target(now);
+    assert!(index.may_refill(), "the store had room and no refill may run");
+    // the rebalance covered the index, so it only waits for its refill and isn't at the cap
+    assert_eq!(store.memory_report().indexes_at_cap, 0, "an index the rebalance covered reads as at the cap");
+    let volume = store.state.columns[COLUMN.0 as usize].expect("a column").volume.0 as usize;
+    let mut refill = store.state.start_sorted_refill(volume).expect("a refill");
+    while store.state.sorted_refill_step(volume, &mut refill).expect("refill step") {}
+    let reading = sorted_reading(&store);
+    assert!(!reading.is_marked && reading.rows_past_capacity.0 == 0 && reading.is_counted, "the refill left the mark: {reading:?}");
+    assert!(index.room().committed() > index.room().share(), "the pool never grew past its plan");
+    assert_eq!(index.entry_count().0, model.len() as u64);
+    let asks = report(&store).sorted_footer_asks;
+    check(&store, &model, &written);
+    assert_eq!(report(&store).sorted_footer_asks, asks, "a key past the old plan asked the footers");
+    SIM_BUDGET.with(|budget| budget.set(BUDGET));
+    store.close().expect("close");
+}
+
+// with the target too tight for the rows past the plan, the index stays marked and says so, and every key still reads
+#[test]
+fn an_index_past_its_plan_stays_marked_under_a_tight_target() {
+    let (io, store, mut model) = small_plan_store(50, BUDGET);
+    let keys = outgrow_the_plan(&store, &io, &mut model, 6);
+    let index = store.state.sorted_index(COLUMN).expect("an index");
+    assert!(index.mark().is_some(), "the fill never outran the pool");
+    let job = reel::engine::reserve_job::ReserveJob::new(Arc::clone(&store.state));
+    let held = job.held_bytes();
+    store.state.memory_target.store(held, Ordering::Release);
+    let mut now = io.now().0 + 1;
+    for _step in 0..4 {
+        job.hold_to_target(now);
+        now += reel::pool_room::DECAY_NANOS;
+    }
+    assert!(!index.may_refill(), "a refill may run with no room for it");
+    assert!(store.state.start_sorted_refill(store.state.columns[COLUMN.0 as usize].expect("a column").volume.0 as usize).is_none());
+    let reading = sorted_reading(&store);
+    assert!(reading.is_marked && reading.rows_past_capacity.0 > 0, "{reading:?}");
+    let written: Vec<Vec<u8>> = (0..keys).map(key).collect();
+    check(&store, &model, &written);
+    store.close().expect("close");
+}
+
+// a store whose host refuses the reservations past the shares opens on the shares, reports them, and holds at open what a store
+// past its shares holds
+#[test]
+fn a_store_with_its_past_refused_opens_on_its_shares() {
+    let past = open_sized(&SimulatedIo::new(Seed(51)));
+    reel::pool_room::REFUSE_PAST.with(|refuse| refuse.set(true));
+    let io = SimulatedIo::new(Seed(51));
+    let held = open_sized(&io);
+    reel::pool_room::REFUSE_PAST.with(|refuse| refuse.set(false));
+    assert_eq!(past.memory_report().pools_held_to_share, 0);
+    assert!(held.memory_report().pools_held_to_share > 0, "a refused past went unreported");
+    assert_eq!(held.memory_report().pool_committed, past.memory_report().pool_committed, "a room past its share held more at open");
+    let index = held.state.sorted_index(COLUMN).expect("an index");
+    assert_eq!(index.room().reserved(), index.room().share());
+    let mut model = Model::new();
+    for number in 0..KEYS {
+        held.put(COLUMN, &key(number), b"held").expect("put");
+        model.insert(key(number), b"held".to_vec());
+    }
+    seal_all(&held, &io);
+    check(&held, &model, &(0..KEYS).map(key).collect::<Vec<_>>());
+    held.close().expect("close");
+    past.close().expect("close");
+}
+
+
+// an index filled to four times its plan gets its room from the caches and leaves the write index its own: a burst of ingest after
+// it meets no more waits for index room and no more short pools than a store whose index stayed held to its share, the write
+// index's rooms grow as they do there, and the index's mark is gone with no reopen
+#[test]
+fn an_index_past_its_plan_leaves_ingest_its_room() {
+    let held = ingest_after_an_index_fills(true);
+    let ruled = ingest_after_an_index_fills(false);
+    eprintln!("ingest held to share: {held:?}, {} puts a second", held.puts_a_second);
+    eprintln!("ingest under the rule: {ruled:?}, {} puts a second", ruled.puts_a_second);
+    assert_eq!(held.capacity, ruled.capacity, "the two arms planned the index apart");
+    assert!(held.is_marked_before && held.is_marked && held.rebalances == 0, "the index held to its share: {held:?}");
+    assert!(!ruled.is_marked_before && !ruled.is_marked && ruled.rebalances > 0, "the rule left the index marked: {ruled:?}");
+    // the burst outruns the write index in both arms alike, so the waits match to within a twentieth
+    assert!(ruled.index_waits <= held.index_waits + held.index_waits / 20 + 4, "the burst waited more for index room: {ruled:?} against {held:?}");
+    assert!(ruled.most_short <= held.most_short + 1, "the burst ran more pools short: {ruled:?} against {held:?}");
+    assert!(ruled.write_rooms.iter().zip(&held.write_rooms).all(|(ruled, held)| ruled + (2 << 20) >= *held), "the write index grew less: {ruled:?} against {held:?}");
+}
+
+/// What a burst of ingest met after the sorted keys filled to four times their plan
+#[derive(Debug)]
+struct Ingest {
+    capacity: u64,
+    is_marked_before: bool,
+    puts_a_second: u64,
+    index_waits: u64,
+    most_short: usize,
+    write_rooms: Vec<usize>,
+    is_marked: bool,
+    rebalances: u64,
+}
+
+// fill a sorted column to four times its plan beside a plain column, give the job its decays and a refill, then a burst across
+// both columns with the job's steps 100 ms apart past a decay, and say what the burst met
+fn ingest_after_an_index_fills(is_held: bool) -> Ingest {
+    const PLAIN: ColumnId = ColumnId(2);
+    const BURST: u64 = 600_000;
+    let io = SimulatedIo::new(Seed(53));
+    // a budget where the caches' shards cover what the rule moves
+    SIM_BUDGET.with(|budget| budget.set(HELD_BUDGET));
+    let mut config = config(RowCount(0));
+    SIM_BUDGET.with(|budget| budget.set(BUDGET));
+    reel::engine::engine_sizing::EXACT_INDEX_ROWS.with(|exact| exact.set(false));
+    config.columns[0].least_rows = None;
+    let mut plain = ColumnConfig::new(PLAIN, "plain", KeyShape::Variable { most: 64 });
+    plain.index = ColumnIndex::Plain;
+    config.columns.push(plain);
+    // a small headroom and a reopen on a few rows plan the index small, so four times its plan still fits the open-time cap
+    reel::engine::engine_sizing::TEST_INDEX_HEADROOM.with(|headroom| headroom.set(Some(4 << 20)));
+    let first = ReelStore::open(io.clone(), &config).expect("open");
+    for number in 0..KEYS / 4 {
+        first.put(COLUMN, &key(number), b"first").expect("put");
+    }
+    seal_all(&first, &io);
+    first.close().expect("close");
+    drop(first);
+    reel::pool_room::REFUSE_PAST.with(|refuse| refuse.set(is_held));
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    reel::pool_room::REFUSE_PAST.with(|refuse| refuse.set(false));
+    reel::engine::engine_sizing::TEST_INDEX_HEADROOM.with(|headroom| headroom.set(None));
+    let job = reel::engine::reserve_job::ReserveJob::new(Arc::clone(&store.state));
+    let index = store.state.sorted_index(COLUMN).expect("an index");
+    let capacity = sorted_reading(&store).capacity.0;
+    let mut now = io.now().0;
+    for number in 0..capacity * 4 {
+        store.put(COLUMN, &key(number), b"sorted-value").expect("put");
+        if number % 4_096 == 4_095 {
+            seal_all(&store, &io);
+            now += 100_000_000;
+            job.grow_pools();
+        }
+    }
+    seal_all(&store, &io);
+    // past the decays a marked index the rule has room for refills
+    let volume = store.state.columns[COLUMN.0 as usize].expect("a column").volume.0 as usize;
+    for _decay in 0..3 {
+        now += reel::pool_room::DECAY_NANOS;
+        let _target = job.hold_to_target(now);
+        if let Some(mut refill) = store.state.start_sorted_refill(volume) {
+            while store.state.sorted_refill_step(volume, &mut refill).expect("refill step") {}
+        }
+    }
+    let is_marked_before = index.mark().is_some();
+    let write_rooms = |store: &Store| store.state.index.rooms().iter().map(|room| room.committed()).collect::<Vec<_>>();
+    let waits_before = store.state.index_waits.load(Ordering::Relaxed);
+    let mut most_short = 0;
+    let started = std::time::Instant::now();
+    for number in 0..BURST {
+        store.put(PLAIN, format!("burst-{number:012}").as_bytes(), &[7; 48]).expect("put");
+        // the burst's sorted rows overwrite keys the index holds, so they fill the write index and leave the index's keys as they are
+        store.put(COLUMN, &key(number % (capacity * 4)), b"burst-sorted").expect("put");
+        // the seals settle rarely, so open rows pile up and the write index wants its whole share
+        if number % 65_536 == 65_535 {
+            settle(&io);
+            now += 100_000_000;
+            job.grow_pools();
+            most_short = most_short.max(store.memory_report().pools_short);
+        }
+    }
+    let seconds = started.elapsed().as_secs_f64();
+    let rooms = write_rooms(&store);
+    let waits = store.state.index_waits.load(Ordering::Relaxed) - waits_before;
+    // the burst's own sorted keys can outrun the pool again, and the next decays bring the index back once more
+    seal_all(&store, &io);
+    for _decay in 0..3 {
+        now += reel::pool_room::DECAY_NANOS;
+        let _target = job.hold_to_target(now);
+        if let Some(mut refill) = store.state.start_sorted_refill(volume) {
+            while store.state.sorted_refill_step(volume, &mut refill).expect("refill step") {}
+        }
+    }
+    let ingest = Ingest {
+        is_marked_before,
+        capacity,
+        puts_a_second: ((2 * BURST) as f64 / seconds) as u64,
+        index_waits: waits,
+        most_short,
+        write_rooms: rooms,
+        is_marked: index.mark().is_some(),
+        rebalances: store.memory_report().rebalances,
+    };
+    store.close().expect("close");
+    ingest
+}
+
+
+// open a sized store at the full budget on a few rows, so its index plans small, fill the index to this many halves of the plan,
+// and step the job past a decay so a rebalance runs. Returns the store, its model and the keys written
+fn rebalanced_store(seed: u64, halves: u64, budget: ByteCount) -> (SimulatedIo, Store, Model, u64) {
+    let (io, store, mut model) = small_plan_store(seed, budget);
+    SIM_BUDGET.with(|set| set.set(budget));
+    let keys = outgrow_the_plan(&store, &io, &mut model, halves);
+    let job = reel::engine::reserve_job::ReserveJob::new(Arc::clone(&store.state));
+    let mut now = io.now().0 + 1;
+    for _step in 0..3 {
+        job.hold_to_target(now);
+        now += reel::pool_room::DECAY_NANOS;
+    }
+    SIM_BUDGET.with(|set| set.set(BUDGET));
+    (io, store, model, keys)
+}
+
+// a sized store at this budget opened again on a few rows, so its index plans small
+fn small_plan_store(seed: u64, budget: ByteCount) -> (SimulatedIo, Store, Model) {
+    SIM_BUDGET.with(|set| set.set(budget));
+    reel::engine::engine_sizing::TEST_INDEX_HEADROOM.with(|headroom| headroom.set(Some(SMALL_HEADROOM)));
+    let io = SimulatedIo::new(Seed(seed));
+    let store = open_sized(&io);
+    let mut model = Model::new();
+    for number in 0..KEYS / 4 {
+        store.put(COLUMN, &key(number), b"first").expect("put");
+        model.insert(key(number), b"first".to_vec());
+    }
+    seal_all(&store, &io);
+    store.close().expect("close");
+    drop(store);
+    let store = open_sized(&io);
+    store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
+    SIM_BUDGET.with(|set| set.set(BUDGET));
+    reel::engine::engine_sizing::TEST_INDEX_HEADROOM.with(|headroom| headroom.set(None));
+    (io, store, model)
+}
+
+/// The headroom a small plan's index asks past its keys, so a few rows on disk plan it at tens of thousands of rows
+const SMALL_HEADROOM: u64 = 4 << 20;
+
+// the bytes one shard of each cache gives a rebalance: the spot and block caches' shards, and a record cache shard's share past
+// its extent
+fn cache_shards(store: &Store) -> [u64; 3] {
+    use reel::engine::reserve_job::{WholeCache, whole_caches};
+    let caches: Vec<&dyn WholeCache> = whole_caches(&store.state).collect();
+    [caches[0].shard_bytes() as u64, caches[1].shard_bytes() as u64, store.state.record_cache.shard_give()]
+}
+
+// an index whose keys pass even what the open-time rule's cap gives stays marked, the caches sit at their floors to within a
+// shard, and no other pool's ceiling moved
+#[test]
+fn an_index_past_the_cap_stays_marked_with_the_caches_at_their_floor() {
+    // twelve halves of the plan pass what the cap gives at the small budget
+    let (_io, store, model, keys) = rebalanced_store(54, 12, BUDGET);
+    let index = store.state.sorted_index(COLUMN).expect("an index");
+    let memory = store.memory_report();
+    assert!(index.mark().is_some() && memory.indexes_at_cap > 0, "{memory:?}");
+    assert!(memory.rebalances > 0 && index.room().ceiling() > index.room().share(), "no rebalance ran");
+    let floors = store.state.rebalance_plan.as_ref().expect("a plan").floors();
+    let shards = cache_shards(&store);
+    for cache in 0..3 {
+        let ceiling = memory.cache_ceilings[cache].0;
+        assert!(ceiling >= floors[cache], "cache {cache} went under its floor: {ceiling} < {}", floors[cache]);
+        // a cache stops at its floor, short of it by under a shard or a page, or where its shards can free no more: the filter
+        // arena and the dead bits hold the rest of its share
+        let slack = shards[cache].max(reel::index::sorted_keys::PAGE_BYTES as u64);
+        let left = reel::engine::rebalance::freeable(&store.state, cache);
+        assert!(ceiling - floors[cache] < slack || left < shards[cache].max(1), "cache {cache} kept a shard it could free past its floor: {ceiling} {} with {left} free", floors[cache]);
+    }
+    // the write index, the summaries and the value pages keep their ceilings
+    let sorted_room = index.room();
+    let record_rooms = store.state.record_cache.rooms();
+    for room in store.state.pool_rooms.iter().filter(|room| !Arc::ptr_eq(room, sorted_room) && !record_rooms.iter().any(|record| Arc::ptr_eq(room, record))) {
+        assert!(room.ceiling() >= room.reserved(), "a pool past the indexes and the caches lost room");
+    }
+    let written: Vec<Vec<u8>> = (0..keys).map(key).collect();
+    check(&store, &model, &written);
+    store.close().expect("close");
+}
+
+// a reopen after a rebalance shares the caches and the index as the rebalance did: the index's share and each cache's bytes
+// match the run-time ceilings to within an extent and a shard
+#[test]
+fn a_reopen_after_a_rebalance_shares_as_the_rebalance_did() {
+    // fill a batch at a time and stop on the batch a rebalance ran in, so the reopen counts the keys that rebalance did, to a batch
+    // a budget where the caches' shards cover what the rule moves, so the run-time shares can match a reopen's
+    let (io, store, mut model) = small_plan_store(55, HELD_BUDGET);
+    let index = store.state.sorted_index(COLUMN).expect("an index");
+    // two rebalances come within a few doublings of the plan, so a fill past sixteen times it says why it never saw them
+    let bound = sorted_reading(&store).capacity.0 * 16;
+    let (mut keys, mut rebalances) = (0, 0);
+    while keys < bound {
+        for number in keys..keys + 4_096 {
+            store.put(COLUMN, &key(number), b"batch").expect("put");
+            model.insert(key(number), b"batch".to_vec());
+        }
+        keys += 4_096;
+        seal_all(&store, &io);
+        let now = store.memory_report().rebalances;
+        if now > rebalances && rebalances > 0 {
+            break;
+        }
+        rebalances = now;
+    }
+    let memory = store.memory_report();
+    assert!(
+        memory.rebalances > 1,
+        "the fill never rebalanced twice: rebalances {} held_to_share {} at_cap {} ceiling {} reserved {} plan {:?}",
+        memory.rebalances,
+        memory.pools_held_to_share,
+        memory.indexes_at_cap,
+        index.room().ceiling(),
+        index.room().reserved(),
+        store.state.rebalance_plan.as_ref().map(|plan| plan.cap),
+    );
+    let ceiling = index.room().ceiling() as u64;
+    let extent = index.room().extent() as u64;
+    let ceilings = store.memory_report().cache_ceilings;
+    let shards = cache_shards(&store);
+    store.close().expect("close");
+    drop(store);
+    reel::engine::engine_sizing::TEST_INDEX_HEADROOM.with(|headroom| headroom.set(Some(SMALL_HEADROOM)));
+    SIM_BUDGET.with(|budget| budget.set(HELD_BUDGET));
+    let store = open_sized(&io);
+    SIM_BUDGET.with(|budget| budget.set(BUDGET));
+    reel::engine::engine_sizing::TEST_INDEX_HEADROOM.with(|headroom| headroom.set(None));
+    let reopened = store.state.sorted_index(COLUMN).expect("an index").room().share() as u64;
+    let within = |run: u64, open: u64, slack: u64| run.abs_diff(open) <= slack;
+    assert!(within(ceiling, reopened, extent + shards.iter().max().copied().unwrap_or(0)), "the index: {ceiling} at run time, {reopened} at the reopen");
+    let again = store.memory_report().cache_ceilings;
+    for cache in 0..3 {
+        assert!(within(ceilings[cache].0, again[cache].0, extent + shards[cache]), "cache {cache}: {} at run time, {} at the reopen", ceilings[cache].0, again[cache].0);
+    }
+    let written: Vec<Vec<u8>> = (0..keys).map(key).collect();
+    check(&store, &model, &written);
+    store.close().expect("close");
+}
+
+// pressure after a rebalance: the ladder still gives the caches' shards back and brings them back past it, and no shard comes back
+// over a ceiling the rebalance lowered
+#[test]
+fn the_ladder_after_a_rebalance_brings_nothing_back_past_a_ceiling() {
+    let (io, store, _model, _keys) = rebalanced_store(56, 3, BUDGET);
+    let memory = store.memory_report();
+    assert!(memory.rebalances > 0, "no rebalance ran");
+    let ceilings = memory.cache_ceilings;
+    let given = memory.cache_shards_given;
+    // a cache of shards under a page can give none of them back, so it holds them whatever its share
+    let (shards, page) = (cache_shards(&store), 4_096);
+    let job = reel::engine::reserve_job::ReserveJob::new(Arc::clone(&store.state));
+    io.set_host_memory(reel::io::host_memory::HostMemory {
+        total: ByteCount(1 << 30),
+        available: ByteCount(0),
+        group_room: Some(ByteCount(0)),
+        group_limit: Some(ByteCount(1 << 30)),
+        group_anon_room: Some(ByteCount(0)),
+    });
+    let mut now = io.now().0 + 1;
+    for _step in 0..64 {
+        now += 100_000_000;
+        job.hold_to_target(now);
+        let memory = store.memory_report();
+        for cache in (0..3).filter(|cache| shards[*cache] >= page) {
+            assert!(memory.cache_present[cache] <= memory.cache_ceilings[cache], "cache {cache} held past its ceiling under pressure");
+        }
+    }
+    let could_give = reel::engine::reserve_job::whole_caches(&store.state)
+        .enumerate()
+        .any(|(place, cache)| cache.shard_bytes() >= page as usize && cache.shard_count().min(store.state.cache_ceilings[place].load(Ordering::Acquire)) > 0);
+    assert!(!could_give || store.memory_report().cache_shards_given > given, "the ladder gave no cache shard back under pressure");
+    io.set_host_memory(reel_sim::simulated_disk::SIMULATED_HOST);
+    for _step in 0..256 {
+        now += reel::pool_room::DECAY_NANOS / 4;
+        job.hold_to_target(now);
+        let memory = store.memory_report();
+        assert_eq!(memory.cache_ceilings, ceilings, "a ceiling moved back up before a reopen");
+        for cache in (0..3).filter(|cache| shards[*cache] >= page) {
+            assert!(memory.cache_present[cache] <= memory.cache_ceilings[cache], "cache {cache} came back past its ceiling");
+        }
+    }
+    let memory = store.memory_report();
+    // every block cache shard under its ceiling came back, and only those over it stay away
+    let over: u64 = reel::engine::reserve_job::whole_caches(&store.state)
+        .enumerate()
+        .skip(1)
+        .map(|(place, cache)| cache.shard_count().saturating_sub(store.state.cache_ceilings[place].load(Ordering::Acquire)) as u64)
+        .sum();
+    assert_eq!(memory.block_absent_shards, over, "the block caches never came back to their ceilings: {memory:?}");
+    store.close().expect("close");
+}
+
+// the caches filled first, through reads of a plain column, then the index driven past the cap: held stays at or under the target
+// at every step, and the caches' bytes in memory, the filter arena and the dead bits with them, stay at or under their ceilings
+#[test]
+fn a_rebalance_over_full_caches_keeps_held_under_the_target() {
+    const PLAIN: ColumnId = ColumnId(2);
+    const PLAIN_ROWS: u64 = 150_000;
+    let io = SimulatedIo::new(Seed(57));
+    let mut config = config(RowCount(0));
+    reel::engine::engine_sizing::EXACT_INDEX_ROWS.with(|exact| exact.set(false));
+    config.columns[0].least_rows = None;
+    let mut plain = ColumnConfig::new(PLAIN, "plain", KeyShape::Variable { most: 64 });
+    plain.index = ColumnIndex::Plain;
+    config.columns.push(plain);
+    reel::engine::engine_sizing::TEST_INDEX_HEADROOM.with(|headroom| headroom.set(Some(SMALL_HEADROOM)));
+    let first = ReelStore::open(io.clone(), &config).expect("open");
+    for number in 0..KEYS / 4 {
+        first.put(COLUMN, &key(number), b"first").expect("put");
+    }
+    seal_all(&first, &io);
+    first.close().expect("close");
+    drop(first);
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    reel::engine::engine_sizing::TEST_INDEX_HEADROOM.with(|headroom| headroom.set(None));
+    let job = reel::engine::reserve_job::ReserveJob::new(Arc::clone(&store.state));
+    let plain_key = |number: u64| format!("plain-{number:010}").into_bytes();
+    for number in 0..PLAIN_ROWS {
+        store.put(PLAIN, &plain_key(number), &[(number % 251) as u8; 200]).expect("put");
+        if number % 4_096 == 4_095 {
+            seal_all(&store, &io);
+            job.grow_pools();
+        }
+    }
+    seal_all(&store, &io);
+    // reads over the plain rows until the caches stop growing
+    let mut value = Vec::new();
+    let mut last = [ByteCount(0); 3];
+    for _round in 0..8 {
+        for number in (0..PLAIN_ROWS).step_by(3) {
+            let _found = store.get(PLAIN, &plain_key(number), &mut value).expect("get");
+        }
+        job.grow_pools();
+        let present = store.memory_report().cache_present;
+        if present == last {
+            break;
+        }
+        last = present;
+    }
+    let caches_held = |memory: &reel_core::memory_report::MemoryReport| {
+        memory.cache_present.iter().map(|bytes| bytes.0).sum::<u64>() + memory.arena_room.0 + memory.dead_bits.0
+    };
+    let check_bounds = |label: &str| {
+        let memory = store.memory_report();
+        assert!(memory.memory_held <= memory.memory_target, "{label}: held passed the target: {memory:?}");
+        let ceilings: u64 = memory.cache_ceilings.iter().map(|bytes| bytes.0).sum();
+        assert!(caches_held(&memory) <= ceilings, "{label}: the caches hold {} past their ceilings {ceilings}: {memory:?}", caches_held(&memory));
+    };
+    check_bounds("caches full");
+    let capacity = sorted_reading(&store).capacity.0;
+    for number in 0..capacity * 6 {
+        store.put(COLUMN, &key(number), b"sorted-value").expect("put");
+        if number % 4_096 == 4_095 {
+            seal_all(&store, &io);
+            job.grow_pools();
+            check_bounds("index filling");
+        }
+    }
+    let memory = store.memory_report();
+    assert!(memory.rebalances > 0, "no rebalance ran: {memory:?}");
+    store.close().expect("close");
+}
+
+/// Sorted columns in the split tests, as many as a tape node keeps
+const SPLIT_COLUMNS: u8 = 17;
+
+// a sized store of seventeen sorted columns of the sims' keys, each asking by the keys it holds
+fn split_config() -> StoreConfig {
+    let mut config = config(RowCount(0));
+    reel::engine::engine_sizing::EXACT_INDEX_ROWS.with(|exact| exact.set(false));
+    let first = config.columns[0].clone();
+    config.columns = (1..=SPLIT_COLUMNS)
+        .map(|id| ColumnConfig { id: ColumnId(id), name: format!("sorted-{id}"), least_rows: None, ..first.clone() })
+        .collect();
+    config
+}
+
+// fill some of the split store's columns far past their first shares, the others with a few keys, stepping the job between
+// batches, and check after every step that the indexes' ceilings stay under the cap, no cache moves, and no index's ceiling
+// falls under what it holds and a step. Returns each busy column's keys
+fn fill_split(store: &Store, io: &SimulatedIo, busy: &[ColumnId], times: u64) -> Vec<u64> {
+    let plan = store.state.rebalance_plan.as_ref().expect("a plan");
+    let job = reel::engine::reserve_job::ReserveJob::new(Arc::clone(&store.state));
+    let caches = store.memory_report().cache_ceilings;
+    let given = store.memory_report().cache_shards_given;
+    for id in (1..=SPLIT_COLUMNS).map(ColumnId).filter(|id| !busy.contains(id)) {
+        for number in 0..64 {
+            store.put(id, &key(number), b"idle").expect("put");
+        }
+    }
+    let first = store.state.sorted_index(busy[0]).expect("an index").room().share();
+    let rows = reel::index::sorted_keys::rows_for_bytes(WIDTH as usize, ByteCount(first as u64)).0;
+    // past the times asked, the fill stops on the batch a rebalance ran in, so a reopen counts the keys that rebalance did
+    let (least, bound) = (rows * times, rows * times * 4);
+    let mut keys = 0;
+    let mut rebalances = store.memory_report().rebalances;
+    while keys < bound {
+        for number in keys..keys + 4_096 {
+            for id in busy {
+                store.put(*id, &key(number), b"busy").expect("put");
+            }
+        }
+        keys += 4_096;
+        {
+            seal_all(store, io);
+            job.grow_pools();
+            let indexes: Vec<_> = store.state.sorted.iter().flatten().collect();
+            let ceilings: u64 = indexes.iter().map(|index| index.room().ceiling() as u64).sum();
+            assert!(ceilings <= plan.cap, "the indexes' ceilings {ceilings} passed the cap {}", plan.cap);
+            for index in &indexes {
+                let room = index.room();
+                assert!(room.ceiling() >= room.committed() + room.step() || room.ceiling() >= room.reserved(), "a ceiling fell under what its index holds and a step");
+            }
+            let memory = store.memory_report();
+            assert_eq!(memory.cache_ceilings, caches, "a cache's ceiling moved when the room came from the indexes");
+            assert_eq!(memory.cache_shards_given, given, "a cache shard went back when the room came from the indexes");
+            let now = memory.rebalances;
+            if keys >= least && now > rebalances {
+                break;
+            }
+            rebalances = now;
+        }
+    }
+    assert!(keys < bound, "the fill never rebalanced past {least} keys: {:?}", store.memory_report());
+    // past the decays a refill brings back what the fill marked
+    for _decay in 0..3 {
+        io.advance_clock(reel_core::units::Nanoseconds(reel::pool_room::DECAY_NANOS));
+        let _target = job.hold_to_target(io.now().0);
+        for volume in 0..store.state.volumes.len() {
+            while let Some(mut refill) = store.state.start_sorted_refill(volume) {
+                while store.state.sorted_refill_step(volume, &mut refill).expect("refill step") {}
+            }
+        }
+    }
+    busy.iter().map(|_id| keys).collect()
+}
+
+// read a split store's index ceilings, then close it and open it again, and read the shares the reopen gives each busy column
+fn reopen_shares(store: Store, io: &SimulatedIo, busy: &[ColumnId]) -> (Vec<u64>, Vec<u64>, u64) {
+    let ceilings: Vec<u64> = busy.iter().map(|id| store.state.sorted_index(*id).expect("an index").room().ceiling() as u64).collect();
+    // an extent, and the grant for the one batch of keys the reopen counts past the rebalance's look
+    let batch = reel::index::sorted_keys::planned_index_bytes(WIDTH as usize, RowCount(2 * 4_096)).0;
+    let extent = store.state.sorted_index(busy[0]).expect("an index").room().extent() as u64 + batch;
+    store.close().expect("close");
+    drop(store);
+    let store = ReelStore::open(io.clone(), &split_config()).expect("open");
+    let shares = busy.iter().map(|id| store.state.sorted_index(*id).expect("an index").room().share() as u64).collect();
+    store.close().expect("close");
+    (ceilings, shares, extent)
+}
+
+// one column of seventeen filled far past its first share, the rest near empty: it takes the room the idle columns never used,
+// with no cache moved, comes back unmarked with no reopen, and its ceiling matches what a reopen gives it to within an extent and
+// a batch
+#[test]
+fn a_busy_index_takes_the_room_idle_indexes_never_used() {
+    let io = SimulatedIo::new(Seed(58));
+    let store = ReelStore::open(io.clone(), &split_config()).expect("open");
+    store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
+    let busy = [ColumnId(5)];
+    let _keys = fill_split(&store, &io, &busy, 6);
+    let reading = report(&store).sorted_columns.iter().find(|reading| reading.column == busy[0]).copied().expect("a reading");
+    assert!(!reading.is_marked && reading.rows_past_capacity.0 == 0, "the busy column stayed marked: {reading:?}");
+    assert!(reading.ceiling.0 > store.state.sorted_index(busy[0]).expect("an index").room().share() as u64, "the busy column took no room");
+    assert!(store.memory_report().rebalances > 0);
+    let (ceilings, shares, extent) = reopen_shares(store, &io, &busy);
+    assert!(ceilings[0].abs_diff(shares[0]) <= extent, "the busy column: {} at run time, {} at the reopen", ceilings[0], shares[0]);
+}
+
+// two busy columns at once share the idle columns' room by their keys, as share_indexes would, and neither starves the other
+#[test]
+fn two_busy_indexes_share_the_idle_room_by_their_keys() {
+    let io = SimulatedIo::new(Seed(59));
+    let store = ReelStore::open(io.clone(), &split_config()).expect("open");
+    store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
+    let busy = [ColumnId(3), ColumnId(11)];
+    let _keys = fill_split(&store, &io, &busy, 4);
+    for id in busy {
+        let reading = report(&store).sorted_columns.iter().find(|reading| reading.column == id).copied().expect("a reading");
+        assert!(!reading.is_marked, "column {id:?} stayed marked: {reading:?}");
+    }
+    let (ceilings, shares, extent) = reopen_shares(store, &io, &busy);
+    for (place, id) in busy.iter().enumerate() {
+        assert!(ceilings[place].abs_diff(shares[place]) <= extent, "column {id:?}: {} at run time, {} at the reopen", ceilings[place], shares[place]);
+    }
+}

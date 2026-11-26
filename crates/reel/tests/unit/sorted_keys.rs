@@ -508,7 +508,7 @@ fn planned_bytes_match_the_built_index() {
 #[test]
 fn fresh_index_grows_with_its_room() {
     let rows = 200_000u64;
-    let index = SortedKeys::growing(16, RowCount(rows), RowCount(0), RowCount(rows)).expect("build index");
+    let index = SortedKeys::growing(16, RowCount(rows), RowCount(0), RowCount(rows), ByteCount(0)).expect("build index");
     let start = index.page_count();
     assert!(start < index.room().reserved() as u32 / 4096 / 2, "a fresh index started with {start} pages");
     let mut first_miss = None;

@@ -58,7 +58,7 @@ pub fn try_load<Backend: Io>(io: &Backend, config: &StoreConfig) -> Result<Arc<E
     let mut scan = scan_roots(io, superblock.record_key, &listings, mode).map_err(open_error("reading a tail"))?;
     let locks = config.volumes.iter().map(|_volume| Vec::new()).collect();
     // the sorted indexes take their room from the caches by the same rule a writer's open uses
-    let (sizing, sorted_sizes) = size_sorted_indexes(config, &sizing, &summaries);
+    let (sizing, sorted_sizes, _plan) = size_sorted_indexes(config, &sizing, &summaries);
     let mut state = build_state(OpenInputs { io: io.clone(), config, sizing: &sizing, disks: &disks, superblock, locks, scan: &scan, summaries }).map_err(open_error("reserving the write index"))?;
     state.is_read_only = true;
     state.sorted = sorted_indexes(config, &sorted_sizes, true).map_err(open_error("reserving a sorted index"))?;

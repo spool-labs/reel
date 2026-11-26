@@ -585,6 +585,10 @@ pub struct SortedReading {
     pub refill_skips: u64,
     /// The column's open rows count, so a walk on the index skips the shards that hold none. A drop stops this until its refill
     pub is_counted: bool,
+    /// The bytes its pool may grow past the share open gave it, which rebalances moved off the caches and other indexes
+    pub past_share: ByteCount,
+    /// The most its pool may grow to now: its share, moved by rebalances in either direction
+    pub ceiling: ByteCount,
     /// The bytes its sizing rule asked of the caches at open, and the bytes it got under the cap
     pub asked_bytes: ByteCount,
     pub got_bytes: ByteCount,

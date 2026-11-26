@@ -467,6 +467,53 @@ impl RecordCache {
         room.release_above(cap)
     }
 
+    /// Hold the last `count` shards to one extent of arena for good, since a rebalance gave the rest of their share to a sorted
+    /// index, and return the bytes of share the newly held ones gave up. A shard held already gives nothing again
+    pub fn hold_shards(&self, count: usize) -> u64 {
+        let total = self.shards.len();
+        let mut given = 0;
+        for shard in &self.shards[total - count.min(total)..] {
+            let (room, share) = {
+                let held = hold(shard);
+                (Arc::clone(held.room()), held.share)
+            };
+            if room.ceiling() <= room.extent() {
+                continue;
+            }
+            room.set_ceiling(room.extent());
+            given += share.saturating_sub(room.extent()) as u64;
+            let _shortened = self.shorten_shard(shard);
+        }
+        given
+    }
+
+    /// Count the shards a rebalance holds to one extent
+    pub fn held_shards(&self) -> usize {
+        self.shards.iter().filter(|shard| {
+            let room = Arc::clone(hold(shard).room());
+            room.ceiling() <= room.extent()
+        }).count()
+    }
+
+    /// Read the bytes of share a shard gives up when a rebalance holds it, the last shard's, which the others match or pass
+    pub fn shard_give(&self) -> u64 {
+        let held = hold(&self.shards[self.shards.len() - 1]);
+        held.share.saturating_sub(held.room().extent()) as u64
+    }
+
+    /// Count the shards
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    /// Read the bytes the shards' arenas may hold now: each one's share, or one extent for a shard a rebalance holds
+    pub fn ceiling_bytes(&self) -> u64 {
+        self.shards.iter().map(|shard| {
+            let held = hold(shard);
+            held.share.min(held.room().ceiling()) as u64
+        }).sum()
+    }
+
     /// Read every shard's arena room, for the job that grows them
     pub fn rooms(&self) -> Vec<Arc<PoolRoom>> {
         self.shards.iter().map(|shard| hold(shard).room().clone()).collect()

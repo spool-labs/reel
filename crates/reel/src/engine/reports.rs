@@ -428,6 +428,8 @@ impl<Backend: Io> EngineState<Backend> {
                 refill_waits: index.map_or(0, SortedKeys::refill_waits),
                 refill_skips: index.map_or(0, SortedKeys::refill_skips),
                 is_counted: self.index.is_sorted_counted(ColumnId(id as u8)),
+                past_share: ByteCount(index.map_or(0, |index| index.room().ceiling().saturating_sub(index.room().share()) as u64)),
+                ceiling: ByteCount(index.map_or(0, |index| index.room().ceiling() as u64)),
                 asked_bytes: size.asked,
                 got_bytes: size.got,
             });

@@ -332,13 +332,13 @@ impl KeyBatch {
 impl SortedKeys {
     /// Build an index with room for these rows of keys this wide, all of it in memory
     pub fn new(width: usize, rows: RowCount) -> std::io::Result<Self> {
-        Self::growing(width, rows, rows, rows)
+        Self::growing(width, rows, rows, rows, ByteCount(0))
     }
 
     /// Build an index with room for these rows of keys this wide, with the pages for its first rows in memory: twice the rows it
     /// starts with, and at least what its arm keeps ready. The rest comes in as the reserve job grows it, up to the pages for
-    /// `most_rows`
-    pub fn growing(width: usize, rows: RowCount, first_rows: RowCount, most_rows: RowCount) -> std::io::Result<Self> {
+    /// `most_rows`, and past them up to `past` bytes of address space, so an index that outgrows its plan grows on with no reopen
+    pub fn growing(width: usize, rows: RowCount, first_rows: RowCount, most_rows: RowCount, past: ByteCount) -> std::io::Result<Self> {
         assert!((1..=MOST_KEY_BYTES).contains(&width), "a sorted index holds keys of 1 to {MOST_KEY_BYTES} bytes");
         let key_words = width.div_ceil(size_of::<u32>());
         let leaf_stride = key_words + ENTRY_TAIL_WORDS;
@@ -350,7 +350,8 @@ impl SortedKeys {
         let pages = planned_pages(width, most_rows.max(rows));
         let first = if first_rows >= rows { budget_pages } else { planned_pages(width, RowCount(first_rows.0.saturating_mul(2))).min(budget_pages) };
         let bytes = |count: u32| ByteCount(u64::from(count) * PAGE_BYTES as u64);
-        let room = PoolRoom::reserve_paged(bytes(pages), bytes(first), PAGE_BYTES)?;
+        let room = PoolRoom::reserve_paged_past(bytes(pages), past, bytes(first), PAGE_BYTES)?;
+        let pages = room.most_pages();
         Ok(Self {
             width,
             key_words,
@@ -551,14 +552,14 @@ impl SortedKeys {
         self.is_dropped.load(Memory::Acquire)
     }
 
-    /// Let a refill bring a dropped index back, or stop one
+    /// Let a refill bring a dropped index, or one with rows past its room, back, or stop one
     pub fn set_may_refill(&self, may: bool) {
         self.may_refill.store(may, Memory::Release);
     }
 
-    /// Check a refill may bring the index back now
+    /// Check a refill may bring the index back now: the job let it, and a mark still stands
     pub fn may_refill(&self) -> bool {
-        self.may_refill.load(Memory::Acquire) && self.is_dropped()
+        self.may_refill.load(Memory::Acquire) && self.mark().is_some()
     }
 
     /// End a refill that walked every segment since the drop it counted: clear the mark it made good, and say whether it went. A

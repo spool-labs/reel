@@ -29,6 +29,7 @@ pub mod dead_bits;
 pub mod read_pool;
 pub mod recovery;
 pub mod reel_store;
+pub mod rebalance;
 pub mod reserve_job;
 pub mod rewrite_job;
 pub mod ring_job;

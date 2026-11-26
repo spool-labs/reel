@@ -59,6 +59,8 @@ pub struct SpotIndex {
     clocks: Vec<Vec<AtomicU64>>,
     /// Shards whose pages are given back
     absent: AtomicUsize,
+    /// The shards keys spread over: all of them, or fewer once a rebalance lowered the cache's ceiling by whole shards
+    live_shards: AtomicUsize,
     /// Each shard's presence, read with no lock so a reader misses an absent shard without waiting on a fill
     present: Vec<AtomicBool>,
     /// Bytes the shards given back hold no more
@@ -148,7 +150,7 @@ impl SpotIndex {
             }
             clocks.push(clock);
         }
-        Self { shards: Shards(shards), clocks, absent: AtomicUsize::new(0), present: (0..SHARD_COUNT).map(|_shard| AtomicBool::new(true)).collect(), given: AtomicU64::new(0) }
+        Self { shards: Shards(shards), clocks, absent: AtomicUsize::new(0), live_shards: AtomicUsize::new(SHARD_COUNT), present: (0..SHARD_COUNT).map(|_shard| AtomicBool::new(true)).collect(), given: AtomicU64::new(0) }
     }
 
     /// Read the heap the cache holds
@@ -163,7 +165,7 @@ impl SpotIndex {
 
     /// Find a key's location, and mark it as recently used
     pub fn lookup(&self, hash: KeyHash) -> Option<SpotLocation> {
-        let shard = shard_of(hash);
+        let shard = self.shard_for(hash);
         if !self.is_present(shard) {
             return None;
         }
@@ -196,7 +198,7 @@ impl SpotIndex {
 
     /// Fill a slot from a read, unless a seal has started handing rows over since the read began
     pub fn insert_from_read(&self, hash: KeyHash, location: &SpotLocation, is_current: impl Fn() -> bool) {
-        let shard = shard_of(hash);
+        let shard = self.shard_for(hash);
         if !self.is_present(shard) {
             return;
         }
@@ -208,7 +210,7 @@ impl SpotIndex {
 
     /// Point a key at a new location, taking the slot of a cold key when its bucket is full
     pub fn insert(&self, hash: KeyHash, location: &SpotLocation) {
-        let shard = shard_of(hash);
+        let shard = self.shard_for(hash);
         if !self.is_present(shard) {
             return;
         }
@@ -218,7 +220,7 @@ impl SpotIndex {
 
     /// Point a key at a location, unless its slot holds a newer place
     pub fn insert_newer(&self, hash: KeyHash, location: &SpotLocation) {
-        let shard = shard_of(hash);
+        let shard = self.shard_for(hash);
         if !self.is_present(shard) {
             return;
         }
@@ -230,7 +232,7 @@ impl SpotIndex {
 
     /// Forget a key, unless its slot holds a newer place than this one
     pub fn remove_older(&self, hash: KeyHash, place: WritePlace) {
-        let shard = shard_of(hash);
+        let shard = self.shard_for(hash);
         if !self.is_present(shard) {
             return;
         }
@@ -328,6 +330,18 @@ impl SpotIndex {
         true
     }
 
+    /// Find a key's shard among the live ones
+    fn shard_for(&self, hash: KeyHash) -> usize {
+        shard_of(hash) % self.live_shards.load(Ordering::Acquire).max(1)
+    }
+
+    /// Spread keys over the first shards alone, the rest given back above a lowered ceiling, so every key keeps a place a reopen
+    /// at the smaller share would give it. A key whose shard moves misses until it is cached again. Its old slot keeps a tag a lookup
+    /// of another key matches only as two keys' tags in one bucket can today, and a spot hit is checked against the record it reads
+    pub fn set_live_shards(&self, shards: usize) {
+        self.live_shards.store(shards.clamp(1, SHARD_COUNT), Ordering::Release);
+    }
+
     /// Read the bytes the shards given back hold no more
     pub fn given_bytes(&self) -> u64 {
         self.given.load(Ordering::Acquire)
@@ -355,13 +369,14 @@ impl SpotIndex {
 
     /// Forget a key
     pub fn remove(&self, hash: KeyHash) {
-        if !self.is_present(shard_of(hash)) {
+        let shard = self.shard_for(hash);
+        if !self.is_present(shard) {
             return;
         }
-        let mut guard = self.shards.write(shard_of(hash));
+        let mut guard = self.shards.write(shard);
         if let Some(index) = guard.find(hash) {
             guard.slots[index] = SpotSlot::empty();
-            self.clear_touch(shard_of(hash), index);
+            self.clear_touch(shard, index);
         }
     }
 }

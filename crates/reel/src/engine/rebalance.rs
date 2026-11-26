@@ -143,7 +143,10 @@ pub fn rebalance<Backend: Io>(state: &EngineState<Backend>) -> bool {
         let under_cap = (plan.cap as usize).saturating_sub(ceilings + from_indexes);
         // a remainder under the taker's own step is page rounding between the grants and the ceilings, which isn't worth a cache
         let left = wanted - from_indexes;
-        let from_caches = if left < index.room().step() { 0 } else { take_from_caches(state, plan, left.min(under_cap) as u64) as usize };
+        // the caches free whole shards and may give a little past what was asked, which stays off them unused, so the index takes
+        // no more than it asked and the ceilings together stay under the cap
+        let asked = left.min(under_cap);
+        let from_caches = if left < index.room().step() { 0 } else { (take_from_caches(state, plan, asked as u64) as usize).min(asked) };
         let taken = from_indexes + from_caches;
         if taken > 0 {
             index.room().set_ceiling(ceiling + taken);
@@ -205,46 +208,70 @@ fn take_from_caches<Backend: Io>(state: &EngineState<Backend>, plan: &RebalanceP
         }
         for cache in (0..CACHES).filter(|cache| rooms[*cache] > 0) {
             let part = (u128::from(plan.caches[cache]) * u128::from(left)).div_ceil(u128::from(shares)) as u64;
-            // a cache gives whole shards, rounded up to cover its part and down to fit its room, so the rounding left past a
-            // floor frees no shard
-            let shard = shard_bytes(state, cache).max(1);
-            let bytes = (part.min(wanted.saturating_sub(taken)).div_ceil(shard) * shard).min(rooms[cache] / shard * shard);
-            if bytes > 0 {
-                free_shards(state, cache, bytes);
-                plan.taken[cache].fetch_add(bytes, Ordering::AcqRel);
-                taken += bytes;
+            // a share past what its cache's structures hold, the spot index's buckets rounded down to a power of two and the like,
+            // goes first and cuts no shard. Past it the shards give whole, one for one, so the structures stay under the share and
+            // held under the target, and each cache keeps shards as a reopen at the smaller share sizes them
+            let wanted_here = part.min(wanted.saturating_sub(taken)).min(rooms[cache]);
+            let slack = cache_slack(state, plan, cache).min(wanted_here);
+            let freed = if wanted_here > slack { free_shards(state, cache, wanted_here - slack, rooms[cache] - slack) } else { 0 };
+            let given = (slack + freed).min(rooms[cache]);
+            if given > 0 {
+                plan.taken[cache].fetch_add(given, Ordering::AcqRel);
+                taken += given;
             }
         }
     }
     taken
 }
 
-/// Read the bytes a cache's shards could still free: the spot cache's and the block caches' shards under their ceilings, of a
-/// page or more, and the record cache's shards not held yet
-pub fn freeable<Backend: Io>(state: &EngineState<Backend>, cache: usize) -> u64 {
-    if cache == 2 {
-        let record = &state.record_cache;
-        return (record.shard_count() - record.held_shards()) as u64 * record.shard_give();
-    }
+/// Read the bytes of a cache's share its structures leave unused: the share's ceiling past the shards under the cache's ceilings,
+/// the filter arena and the dead bits, which never give back. Open lets the arena take from the record share what the filter share
+/// can't hold, so the arena counts in the block share up to its room and the rest in the record share
+fn cache_slack<Backend: Io>(state: &EngineState<Backend>, plan: &RebalancePlan, cache: usize) -> u64 {
+    let ceilings = plan.ceilings();
+    let arena = state.filter_arena.heap_bytes().0;
+    let arena_in_block = arena.min(ceilings[1].saturating_sub(shards_held(state, 1)));
+    let held = match cache {
+        0 => shards_held(state, cache),
+        1 => shards_held(state, cache) + arena_in_block,
+        _ => state.record_cache.ceiling_bytes() + state.volumes.iter().map(|volume| volume.dead_bits.heap_bytes().0).sum::<u64>() + (arena - arena_in_block),
+    };
+    ceilings[cache].saturating_sub(held)
+}
+
+/// Read the bytes a whole cache's shards hold under its ceilings, the spot index's or the row, filter and complete caches' together
+fn shards_held<Backend: Io>(state: &EngineState<Backend>, cache: usize) -> u64 {
     places(cache)
         .iter()
         .filter_map(|place| whole_caches(state).nth(*place).map(|whole| (*place, whole)))
-        .filter(|(_place, whole)| whole.shard_bytes() >= crate::region::page_bytes())
         .map(|(place, whole)| whole.shard_count().min(state.cache_ceilings[place].load(Ordering::Acquire)) as u64 * whole.shard_bytes() as u64)
         .sum()
 }
 
-/// Read the bytes one shard of a cache frees: the first of its whole caches with shards of a page or more, or a record cache
-/// shard's share past its extent. 0 when it has none to give
-fn shard_bytes<Backend: Io>(state: &EngineState<Backend>, cache: usize) -> u64 {
-    if cache == 2 {
-        return state.record_cache.shard_give();
+/// Find a block cache by its place among the whole caches
+fn block_at<Backend: Io>(state: &EngineState<Backend>, place: usize) -> Option<&crate::segment::block_cache::BlockCache> {
+    match place {
+        1 => Some(&state.row_cache),
+        2 => Some(&state.filter_cache),
+        3 => state.complete_cache.as_ref(),
+        _ => None,
     }
+}
+
+/// Read the bytes a cache's shards could still free: the spot cache's and the block caches' shards under their ceilings, of a
+/// page or more, past the one shard each keeps, and the record cache's shards not held yet past the last
+pub fn freeable<Backend: Io>(state: &EngineState<Backend>, cache: usize) -> u64 {
+    if cache == 2 {
+        let record = &state.record_cache;
+        return record.shard_count().saturating_sub(record.held_shards() + 1) as u64 * record.shard_give();
+    }
+    // each whole cache keeps one shard, so its keys keep a place
     places(cache)
         .iter()
-        .filter_map(|place| whole_caches(state).nth(*place))
-        .find(|whole| whole.shard_bytes() >= crate::region::page_bytes() && whole.shard_count() > 0)
-        .map_or(0, |whole| whole.shard_bytes() as u64)
+        .filter_map(|place| whole_caches(state).nth(*place).map(|whole| (*place, whole)))
+        .filter(|(_place, whole)| whole.shard_bytes() >= crate::region::page_bytes())
+        .map(|(place, whole)| whole.shard_count().min(state.cache_ceilings[place].load(Ordering::Acquire)).saturating_sub(1) as u64 * whole.shard_bytes() as u64)
+        .sum()
 }
 
 /// Read the whole caches a cache's shards come from: the spot index, or the row, filter and complete caches, the row cache first
@@ -252,28 +279,39 @@ fn places(cache: usize) -> &'static [usize] {
     if cache == 0 { &[SPOT_CACHE] } else { &[ROW_CACHE, ROW_CACHE + 1, ROW_CACHE + 2] }
 }
 
-/// Free at least these bytes of a cache's shards, whole shards from the top: lower the spot or block caches' shard ceilings and
-/// give the shards over them back to the kernel now, or hold the record cache's next shards to an extent
-fn free_shards<Backend: Io>(state: &EngineState<Backend>, cache: usize, bytes: u64) {
-    let mut freed = 0;
+/// Free at least these bytes of a cache in whole shards from the top, the block share's taken from the row, filter and complete
+/// caches in proportion to what each holds, and spread the keys over the shards left, so every key keeps a place in the cache as a
+/// reopen at the smaller share gives it. A cache keeps one shard. The shards over a lowered ceiling go back to the kernel now
+fn free_shards<Backend: Io>(state: &EngineState<Backend>, cache: usize, bytes: u64, room: u64) -> u64 {
     if cache == 2 {
-        let record = &state.record_cache;
-        while freed < bytes && record.held_shards() < record.shard_count() {
-            freed += record.hold_shards(record.held_shards() + 1);
-        }
-        return;
+        let freed = hold_record_shards(state, bytes, room);
+        state.record_cache.spread_over_unheld();
+        return freed;
     }
+    // the bytes each whole cache holds under its ceiling, counted twice over the few places so the job allocates nothing
+    let holds = |place: usize| {
+        whole_caches(state)
+            .nth(place)
+            .filter(|whole| whole.shard_bytes() >= crate::region::page_bytes())
+            .map_or(0, |whole| whole.shard_count().min(state.cache_ceilings[place].load(Ordering::Acquire)) as u64 * whole.shard_bytes() as u64)
+    };
+    let total: u64 = places(cache).iter().map(|place| holds(*place)).sum();
+    let mut given = 0;
     for &place in places(cache) {
-        let Some(whole) = whole_caches(state).nth(place) else {
+        let held = holds(place);
+        let Some(whole) = whole_caches(state).nth(place).filter(|_whole| held > 0) else {
             continue;
         };
-        // a shard under a page frees nothing, so a cache of them stays as it is
-        if whole.shard_bytes() < crate::region::page_bytes() {
-            continue;
-        }
-        while freed < bytes {
+        let share = |bytes: u64, is_up: bool| {
+            let scaled = u128::from(bytes) * u128::from(held);
+            (if is_up { scaled.div_ceil(u128::from(total.max(1))) } else { scaled / u128::from(total.max(1)) }) as u64
+        };
+        let (part, limit) = (share(bytes, true), share(room, false));
+        let mut freed = 0;
+        while freed < part {
             let shards = whole.shard_count().min(state.cache_ceilings[place].load(Ordering::Acquire));
-            if shards == 0 {
+            // a cache keeps one shard, so its keys still have a place, and gives none that would take it past its room
+            if shards <= 1 || freed + whole.shard_bytes() as u64 > limit {
                 break;
             }
             state.cache_ceilings[place].store(shards - 1, Ordering::Release);
@@ -282,5 +320,30 @@ fn free_shards<Backend: Io>(state: &EngineState<Backend>, cache: usize, bytes: u
             }
             freed += whole.shard_bytes() as u64;
         }
+        given += freed;
+        let live = whole.shard_count().min(state.cache_ceilings[place].load(Ordering::Acquire));
+        match block_at(state, place) {
+            Some(block) => block.set_live_shards(live),
+            None => state.spot.set_live_shards(live),
+        }
     }
+    given
+}
+
+/// Lower one cache, the spot (0), block (1) or record (2) cache, by these bytes as a rebalance would, for the tests that check
+/// reads across a ceiling change
+#[cfg(feature = "test-hooks")]
+pub fn shrink_cache<Backend: Io>(state: &EngineState<Backend>, cache: usize, bytes: u64) {
+    let _freed = free_shards(state, cache, bytes, u64::MAX);
+}
+
+/// Hold the record cache's next shards to an extent until they give these bytes of share, never past its room and never the
+/// last shard, and return the bytes of share they gave
+fn hold_record_shards<Backend: Io>(state: &EngineState<Backend>, bytes: u64, room: u64) -> u64 {
+    let record = &state.record_cache;
+    let mut freed = 0;
+    while freed < bytes && record.held_shards() + 1 < record.shard_count() && freed + record.shard_give() <= room {
+        freed += record.hold_shards(record.held_shards() + 1);
+    }
+    freed
 }

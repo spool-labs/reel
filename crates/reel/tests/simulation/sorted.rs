@@ -4823,3 +4823,144 @@ fn an_empty_index_that_wakes_gets_room_back() {
     assert!(reading.ceiling.0 >= share, "the late column holds less room than its first share");
     store.close().expect("close");
 }
+
+// gets, overwrites and deletes on a sorted and a plain column answer as the model does across cache shrinks: the spot, block and
+// record caches cut by half, then to one shard each, with the keys spread over the shards left
+#[test]
+fn reads_match_the_model_across_a_cache_shrink() {
+    const PLAIN: ColumnId = ColumnId(2);
+    const STEPS: u64 = 6_000;
+    for seed in seeds(0..4) {
+        let io = SimulatedIo::new(Seed(seed));
+        let mut config = config(RowCount(0));
+        reel::engine::engine_sizing::EXACT_INDEX_ROWS.with(|exact| exact.set(false));
+        config.columns[0].least_rows = None;
+        let mut plain = ColumnConfig::new(PLAIN, "plain", KeyShape::Variable { most: 64 });
+        plain.index = ColumnIndex::Plain;
+        config.columns.push(plain);
+        let store = ReelStore::open(io.clone(), &config).expect("open");
+        let mut model: BTreeMap<(ColumnId, Vec<u8>), Vec<u8>> = BTreeMap::new();
+        let mut random = SeededRandom::new(Seed(seed));
+        let mut value = Vec::new();
+        for step in 0..STEPS {
+            let column = if random.one_in(2) { COLUMN } else { PLAIN };
+            let number = random.below(800);
+            let name = if column == COLUMN { key(number) } else { format!("plain-{number:05}").into_bytes() };
+            match random.below(10) {
+                0..=3 => {
+                    let mut written = format!("{seed}-{step}-").into_bytes();
+                    written.resize(written.len() + random.below(3_000) as usize, b'v');
+                    store.put(column, &name, &written).expect("put");
+                    model.insert((column, name), written);
+                },
+                4 => {
+                    store.delete(column, &name).expect("delete");
+                    model.remove(&(column, name));
+                },
+                _ => {
+                    let found = store.get(column, &name, &mut value).expect("get");
+                    assert_eq!(found.then_some(value.as_slice()), model.get(&(column, name.clone())).map(Vec::as_slice), "seed {seed} step {step}");
+                },
+            }
+            if step % 500 == 499 {
+                seal_all(&store, &io);
+            }
+            // the caches lose half their room, then all but a shard each, while keys stay cached in them
+            if step == STEPS / 3 || step == 2 * STEPS / 3 {
+                let present = store.memory_report().cache_present;
+                for (cache, held) in present.iter().enumerate() {
+                    let bytes = if step == STEPS / 3 { held.0 / 2 } else { u64::MAX / 4 };
+                    reel::engine::rebalance::shrink_cache(&store.state, cache, bytes);
+                }
+            }
+        }
+        for ((column, name), written) in &model {
+            assert!(store.get(*column, name, &mut value).expect("get"), "seed {seed}: {name:?} is missing");
+            assert_eq!(&value, written, "seed {seed}");
+        }
+        let given = store.memory_report().cache_shards_given;
+        assert!(given > 0, "seed {seed}: no shard went back");
+        store.close().expect("close");
+    }
+}
+
+// device reads a get on a plain column read with skewed gets, after one column's index grew enough that rebalances took room from the
+// caches, against a reopen at the same shares: the caches spread their keys over the shards left, so a get misses no more often
+// than after the reopen, which shrinks every shard instead. Gets a second print beside it, a wall clock that loaded hosts move
+#[test]
+fn gets_after_a_rebalance_read_as_after_a_reopen() {
+    const PLAIN: ColumnId = ColumnId(2);
+    const PLAIN_ROWS: u64 = 60_000;
+    const SORTED_KEYS: u64 = 20_000;
+    const GROWN_KEYS: u64 = 900_000;
+    const GETS: u64 = 40_000;
+    let io = SimulatedIo::new(Seed(69));
+    let mut config = config(RowCount(0));
+    reel::engine::engine_sizing::EXACT_INDEX_ROWS.with(|exact| exact.set(false));
+    config.columns[0].least_rows = None;
+    let mut plain = ColumnConfig::new(PLAIN, "plain", KeyShape::Variable { most: 64 });
+    plain.index = ColumnIndex::Plain;
+    config.columns.push(plain);
+    let open_store = || {
+        reel::engine::engine_sizing::TEST_INDEX_HEADROOM.with(|headroom| headroom.set(Some(SMALL_HEADROOM)));
+        let store = ReelStore::open(io.clone(), &config).expect("open");
+        reel::engine::engine_sizing::TEST_INDEX_HEADROOM.with(|headroom| headroom.set(None));
+        store
+    };
+    let plain_key = |number: u64| format!("plain-{number:010}").into_bytes();
+    let store = open_store();
+    for number in 0..PLAIN_ROWS {
+        store.put(PLAIN, &plain_key(number), &[(number % 251) as u8; 1024]).expect("put");
+        if number % 8_192 == 8_191 {
+            seal_all(&store, &io);
+        }
+    }
+    for number in 0..SORTED_KEYS {
+        store.put(COLUMN, &key(number), b"sorted").expect("put");
+    }
+    seal_all(&store, &io);
+    store.close().expect("close");
+    drop(store);
+    // a cube of a uniform draw puts most gets on a few keys, spread over the shards by their hashes
+    let skewed = |random: &mut SeededRandom| {
+        let draw = random.below(1 << 20) as f64 / f64::from(1 << 20);
+        (draw * draw * draw * PLAIN_ROWS as f64) as u64
+    };
+    let reads_a_get = |label: &str, store: &Store, seed: u64| {
+        let mut random = SeededRandom::new(Seed(seed));
+        let mut value = Vec::new();
+        for _get in 0..GETS * 2 {
+            let _found = store.get(PLAIN, &plain_key(skewed(&mut random)), &mut value).expect("get");
+        }
+        let reads = io.read_count().0;
+        let started = std::time::Instant::now();
+        for _get in 0..GETS {
+            assert!(store.get(PLAIN, &plain_key(skewed(&mut random)), &mut value).expect("get"));
+        }
+        let rate = GETS as f64 / started.elapsed().as_secs_f64();
+        let per_get = (io.read_count().0 - reads) as f64 / GETS as f64;
+        let memory = store.memory_report();
+        eprintln!("{label}: {per_get:.3} device reads a get, {rate:.0} gets a second, caches present {:?} MiB of ceilings {:?}, rebalances {}", memory.cache_present.map(|bytes| bytes.0 >> 20), memory.cache_ceilings.map(|bytes| bytes.0 >> 20), memory.rebalances);
+        (per_get, memory.rebalances)
+    };
+    let store = open_store();
+    let job = reel::engine::reserve_job::ReserveJob::new(Arc::clone(&store.state));
+    for number in SORTED_KEYS..GROWN_KEYS {
+        store.put(COLUMN, &key(number), b"grown").expect("put");
+        if number % 8_192 == 8_191 {
+            seal_all(&store, &io);
+            job.grow_pools();
+        }
+    }
+    seal_all(&store, &io);
+    job.grow_pools();
+    let given = store.memory_report().cache_shards_given;
+    let (after_rebalance, rebalances) = reads_a_get("after the rebalance", &store, 2);
+    assert!(rebalances > 0 && given > 0, "no rebalance took a cache shard: rebalances {rebalances}, shards given {given}");
+    store.close().expect("close");
+    drop(store);
+    let store = open_store();
+    let (after_reopen, _rebalances) = reads_a_get("after a reopen", &store, 3);
+    store.close().expect("close");
+    assert!(after_rebalance <= after_reopen * 1.15 + 0.02, "a get read the device {after_rebalance:.3} times after the rebalance, {after_reopen:.3} after a reopen");
+}

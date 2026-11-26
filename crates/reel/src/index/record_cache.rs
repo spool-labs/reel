@@ -95,6 +95,8 @@ pub struct RecordCache {
     pub admits: CallerCounts,
     /// The shard a give-back starts from, which moves each time
     next_to_give: AtomicUsize,
+    /// The shards records spread over: all of them, or the ones a rebalance left past those it holds to an extent
+    live_shards: AtomicUsize,
 }
 
 /// Mix a record's place into a hash
@@ -423,7 +425,7 @@ impl RecordCache {
         for shard in &shards {
             drop(hold(shard));
         }
-        Ok(Self { shards, hits: CallerCounts::default(), misses: CallerCounts::default(), admits: CallerCounts::default(), next_to_give: AtomicUsize::new(0) })
+        Ok(Self { shards, hits: CallerCounts::default(), misses: CallerCounts::default(), admits: CallerCounts::default(), next_to_give: AtomicUsize::new(0), live_shards: AtomicUsize::new(CACHE_SHARDS) })
     }
 
     /// Build a cache whose arenas start at an eighth of their share
@@ -531,7 +533,13 @@ impl RecordCache {
     /// Pick a record's shard
     fn shard(&self, segment: SegmentNumber, offset: FileOffset) -> &Mutex<CacheShard> {
         let hash = place_hash(segment.0, offset.0);
-        &self.shards[(hash >> 58) as usize % CACHE_SHARDS]
+        &self.shards[(hash >> 58) as usize % self.live_shards.load(Ordering::Acquire).clamp(1, CACHE_SHARDS)]
+    }
+
+    /// Spread records over the shards a rebalance hasn't held to an extent. A record whose shard moves misses until it is
+    /// admitted again
+    pub fn spread_over_unheld(&self) {
+        self.live_shards.store((self.shards.len() - self.held_shards()).max(1), Ordering::Release);
     }
 
     /// Copy a key's cached value into a buffer, or note the miss

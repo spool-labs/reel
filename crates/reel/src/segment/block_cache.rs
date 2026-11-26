@@ -61,6 +61,8 @@ pub struct BlockCache {
     skipped: AtomicU64,
     slot_bytes: usize,
     buckets: usize,
+    /// The shards blocks spread over: all of them, or fewer once a rebalance lowered the cache's ceiling by whole shards
+    live_shards: AtomicUsize,
 }
 
 impl BlockCache {
@@ -96,6 +98,7 @@ impl BlockCache {
             given: AtomicU64::new(0),
             slot_bytes,
             buckets,
+            live_shards: AtomicUsize::new(shard_count),
         }
     }
 
@@ -134,9 +137,16 @@ impl BlockCache {
     /// Find a block's shard and first slot
     pub fn place_of(&self, key: BlockKey) -> (usize, usize) {
         let mixed = key.segment.0.wrapping_add(u64::from(key.offset)).wrapping_mul(OFFSET_MIX);
-        let shard = (mixed >> 56) as usize % self.shards.len();
+        let shard = (mixed >> 56) as usize % self.live_shards.load(Ordering::Acquire).clamp(1, self.shards.len());
         let bucket = (mixed >> 20) as usize % self.buckets;
         (shard, bucket * CACHE_WAYS)
+    }
+
+    /// Spread blocks over the first shards alone, the rest given back above a lowered ceiling, so every block keeps a place a reopen
+    /// at the smaller share would give it. A block whose shard moves misses until it is kept again, and a lookup compares the whole
+    /// block key, so its old slot answers for nothing else
+    pub fn set_live_shards(&self, shards: usize) {
+        self.live_shards.store(shards.clamp(1, self.shards.len()), Ordering::Release);
     }
 
     /// Run a function over a cached block, with no lock held past it

@@ -35,7 +35,9 @@ impl SummaryBytes {
     /// Move these rows into a room planned for `plan` bytes, with room past it for rows that must stay. The rows come into
     /// memory now, and twice them comes in at open through the host check
     pub fn in_room(plan: usize, rows: &[u8]) -> std::io::Result<Self> {
-        let room = PoolRoom::reserve(ByteCount((plan * ROOM_PAST_PLAN).max(1) as u64), ByteCount(rows.len() as u64))?;
+        // the plan is the share, so the room's first part and its steps go by the plan, and the room past it is there for rows that
+        // must stay
+        let room = PoolRoom::reserve_past(ByteCount(plan.max(1) as u64), ByteCount((plan * ROOM_PAST_PLAN).max(1) as u64), ByteCount(rows.len() as u64))?;
         room.set_first_part(rows.len().saturating_mul(2));
         let mut bytes = Self::Room(RoomRows { room: Arc::new(room), length: 0, capacity: plan.max(rows.len()) });
         bytes.extend_from_slice(rows);

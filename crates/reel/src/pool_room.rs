@@ -335,6 +335,14 @@ impl PoolRoom {
         Self::reserve_with(share, share, first, None)
     }
 
+    /// Reserve a share, and address space past it up to `most` that the room may grow into whole, so its steps and first part go by
+    /// the share while rows that must stay still have room
+    pub fn reserve_past(share: ByteCount, most: ByteCount, first: ByteCount) -> Result<Self> {
+        let room = Self::reserve_with(share, most, first, None)?;
+        room.set_ceiling(room.reserved);
+        Ok(room)
+    }
+
     /// Reserve a share for a pool of pages of this size, which takes and gives its pages through the room
     pub fn reserve_paged(share: ByteCount, first: ByteCount, page: usize) -> Result<Self> {
         Self::reserve_with(share, share, first, Some(page))

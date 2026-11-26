@@ -117,6 +117,29 @@ fn scrub_one_pass(store: &Store, io: &SimulatedIo, job: &mut ScrubJob<SimulatedI
     panic!("the scrub never ended a pass");
 }
 
+// the scrub holds the key of the record it finds rotten, so the damage is that key alone: every other key of the column reads, the
+// rotten one refuses, its segment is still listed for a rebuild, and a reopen keeps it so
+#[test]
+fn a_rotten_record_the_scrub_finds_damages_its_key_alone() {
+    let io = SimulatedIo::new(Seed(61));
+    let store = open(&io, 0);
+    let (segment, name) = rot_and_scrub(&store, &io);
+    let check = |store: &Store| {
+        let mut buf = Vec::new();
+        assert!(matches!(store.get(COLUMN, &name, &mut buf), Err(StoreError::Corruption { .. })), "the rotten key read");
+        for number in (0..KEYS).filter(|number| key(*number) != name) {
+            assert_eq!(read(store, &key(number)), Some(value(number, 0)), "key {number} refused beside one rotten key");
+        }
+        assert_eq!(store.damaged_segment_list(), vec![(VolumeId(0), segment)]);
+    };
+    check(&store);
+    store.close().expect("close");
+    drop(store);
+    let store = open(&io, 0);
+    check(&store);
+    store.close().expect("close");
+}
+
 // a flipped byte in a sealed record is found within one pass: its segment is damaged, and the counters show the failure and the
 // bytes checked
 #[test]

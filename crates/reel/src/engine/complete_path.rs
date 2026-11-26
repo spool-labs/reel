@@ -13,7 +13,8 @@ use crate::config::MAX_KEY_BYTES;
 use crate::engine::engine_state::EngineState;
 use crate::engine::read_path::{KeyRead, Located, SealedRow, WalkAsk, corruption};
 use crate::index::write_row::WriteRow;
-use crate::engine::recovery::{whole_columns, widen_row};
+use crate::engine::recovery::{point_row, whole_columns, widen_row};
+use crate::segment::damage_list::DamagedRange;
 use crate::engine::volume::{NO_SEAL, Volume};
 use crate::fixed_list::{FixedList, ListFull, ListOut, full};
 use crate::guard::hold;
@@ -790,6 +791,28 @@ impl<Backend: Io> EngineState<Backend> {
         }
         drop(damaged);
         widen_row(self, index, &mut hold(&volume.summary), number, counter);
+    }
+
+    /// Damage the one record a merge or the scrub found failing its check, by its key. A read of that key whose newest row is at or
+    /// below the record's place refuses, and every other key of the column reads on. The segment is listed damaged, so a caller
+    /// finds it and can rebuild it once the key is put back. A row block nobody can read damages whole columns instead, since its
+    /// keys are unknown
+    pub fn damage_record(&self, index: usize, number: SegmentNumber, column: ColumnId, key: &[u8], place: WritePlace) {
+        let volume = &self.volumes[index];
+        // the merge that met it stopped part way, so the bits stop answering as they do for any damage
+        volume.dead_bits.spoil_all();
+        // the span ends at the next key past this one, so it holds this key alone
+        let mut end = key.to_vec();
+        end.push(0);
+        let range = DamagedRange { column, segment: number, highest_place: place, start: key.to_vec(), end: Some(end) };
+        volume.damage.add(&range);
+        let mut damaged = hold(&volume.damaged);
+        if !damaged.contains(&number) {
+            damaged.push(number);
+            self.damaged_segments.fetch_add(1, Ordering::AcqRel);
+        }
+        drop(damaged);
+        point_row(self, &mut hold(&volume.summary), number, &range);
     }
 
     /// Give one segment's rows of a column their slots, and say whether every block read clean

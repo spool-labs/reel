@@ -616,6 +616,16 @@ impl<Backend: Io> RewriteJob<Backend> {
     pub fn note_lost(&mut self, segment: SegmentNumber, error: Error) -> Error {
         if is_device_error(&error) || error.kind() == ErrorKind::InvalidData {
             self.unreadable = Some(segment);
+            self.unreadable_record = None;
+        }
+        error
+    }
+
+    /// Note one record of an input that failed its check, whose key the merge holds, so its damage is that key alone
+    pub fn note_lost_record(&mut self, segment: SegmentNumber, (column, place): (reel_core::column_id::ColumnId, WritePlace), error: Error) -> Error {
+        let error = self.note_lost(segment, error);
+        if self.unreadable == Some(segment) {
+            self.unreadable_record = Some((column, self.key.to_vec(), place));
         }
         error
     }

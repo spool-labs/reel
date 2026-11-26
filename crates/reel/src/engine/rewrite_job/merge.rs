@@ -176,9 +176,13 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.state.volumes[self.volume].footer_reads[pass].fetch_add(read, Ordering::Relaxed);
         self.state.note_unit(self.unit.0, self.unit.1, started, cpu_started);
         if outcome.is_err() {
-            // a lost or rotten block fails every merge it joins, so its segment is damage the way a get would find it
+            // a lost or rotten block fails every merge it joins, so its segment is damage the way a get would find it, and a record
+            // whose key the merge holds is that key's damage alone
             if let Some(segment) = self.unreadable.take() {
-                self.state.damage_unread(self.volume, segment);
+                match self.unreadable_record.take() {
+                    Some((column, key, place)) => self.state.damage_record(self.volume, segment, column, &key, place),
+                    None => self.state.damage_unread(self.volume, segment),
+                }
             }
             // an asked rebuild that met a rotten record ends its ask, so the caller puts the key back and asks again while the
             // planner tries no failing merge each tick. One that stopped for any other cause keeps the ask and goes again
@@ -558,7 +562,7 @@ impl<Backend: Io> RewriteJob<Backend> {
                         return Ok(());
                     }
                     let failed = self.failed_check();
-                    return Err(self.note_lost(pin.head.segment, failed));
+                    return Err(self.note_lost_record(pin.head.segment, (column, row.place), failed));
                 }
                 offset
             },
@@ -568,6 +572,8 @@ impl<Backend: Io> RewriteJob<Backend> {
                 match self.copy_record(&pin.file, &output.file, (column, row)) {
                     Ok(offset) => offset,
                     Err(error) if error.kind() == ErrorKind::InvalidData && self.drop_freed(column, row) => return Ok(()),
+                    // a record that failed its check is its key's damage alone, and a read the device lost is its block's
+                    Err(error) if error.kind() == ErrorKind::InvalidData => return Err(self.note_lost_record(pin.head.segment, (column, row.place), error)),
                     Err(error) => return Err(self.note_lost(pin.head.segment, error)),
                 }
             },

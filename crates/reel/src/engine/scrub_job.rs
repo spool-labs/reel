@@ -385,7 +385,8 @@ impl<Backend: Io> ScrubJob<Backend> {
                 continue;
             }
             state.scrub_failures.fetch_add(1, Ordering::Relaxed);
-            state.damage_unread(self.volume, segment);
+            // the scrub holds the failed record's key, so the damage is that key alone and every other key reads on
+            state.damage_record(self.volume, segment, line.column, &self.key, row.place);
             self.note_checked(checked);
             return false;
         }

@@ -5273,6 +5273,12 @@ fn a_merge_damages_a_record_that_fails_its_check() {
             assert_eq!(failures, 1, "the flipped record passed the merge's check");
             assert!(is_damaged, "the segment the merge failed on is not damaged");
             assert!(volume.table.holds(only), "the merge carried its input away past a failed record");
+            // the merge held the failed record's key, so the damage is that key alone and the rest of the column reads
+            let mut buf = Vec::new();
+            assert!(matches!(store.get(COLUMN, &set_key(1), &mut buf), Err(reel_core::store_error::StoreError::Corruption { .. })), "the flipped key read");
+            for number in (0..SET_KEYS).filter(|number| *number != 1) {
+                assert_eq!(read(&store, &set_key(number)), Some(set_value(number, if number % 2 == 0 { 2 } else { 1 })), "key {number} refused");
+            }
         } else {
             assert_eq!(failures, 0, "a clean merge counted a failure");
             assert!(!is_damaged, "a clean merge damaged its input");

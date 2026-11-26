@@ -203,6 +203,30 @@ pub fn widen_row<Backend: Io>(
     state.note_dropped_rows(rows.push_kept(&facts, columns.iter().map(column_of), ranges.iter().map(span_of)));
 }
 
+/// Damage one record's key in a segment's row at its place, keeping the row's facts and the spans a damaged row already holds. A
+/// clean row's spans start from this one alone, since its columns stay readable
+pub fn point_row<Backend: Io>(state: &EngineState<Backend>, rows: &mut SummaryRows, number: SegmentNumber, range: &DamagedRange) {
+    let mut facts = SegmentFacts {
+        segment: number,
+        ..SegmentFacts::default()
+    };
+    let mut columns = Vec::new();
+    let mut ranges = Vec::new();
+    if let Some(row) = rows.get(number) {
+        facts = row.facts;
+        let spans = row_ranges(&row, number, &mut columns);
+        if row.facts.is_damaged {
+            ranges = spans;
+        }
+    }
+    // a row keeps one damaged place for all its spans, the highest any of them needs
+    facts.damage_place = if facts.is_damaged { facts.damage_place.max(range.highest_place) } else { range.highest_place };
+    facts.is_damaged = true;
+    ranges.push(range.clone());
+    rows.remove(number);
+    state.note_dropped_rows(rows.push_kept(&facts, columns.iter().map(column_of), ranges.iter().map(span_of)));
+}
+
 /// Damage whole what a row the newer summary copy lost could have spoken for: an older row may lack the
 /// newer row's spans, and a segment with no row may have had some. Older rows keep their facts
 pub fn mark_lost_rows<Backend: Io>(

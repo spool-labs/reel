@@ -193,6 +193,6 @@ mod summaries;
 
 pub use replay::{ReplayTarget, RowsWalked, is_tail_stale, load_covers, next_group, pass_open_rows, recover_segments, walk_listed_rows, walk_rows};
 pub use scan::{has_rows, holds_nothing, list_roots, open_for, root_of_path, scan_roots};
-pub use summaries::{damage_open, read_summaries, row_ranges, save_cleared_spans, settle_summaries, whole_columns, widen_row};
+pub use summaries::{damage_open, point_row, read_summaries, row_ranges, save_cleared_spans, settle_summaries, whole_columns, widen_row};
 #[cfg(any(test, feature = "test-hooks"))]
 pub use replay::{copy_row, seal_every_open};

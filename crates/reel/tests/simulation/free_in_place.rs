@@ -836,6 +836,12 @@ fn a_merge_that_keeps_a_freed_record_drops_it() {
     assert_eq!(store.state.merge_check_failures.load(Ordering::Relaxed), 0);
     assert!(store.state.merge_freed_drops.load(Ordering::Relaxed) > 0, "the merge never met the freed record");
     assert!(!volume.table.holds(older), "the merge never installed");
+    // the freed record's bytes went across in the run and no row names them: they count as the output's gap, which a pick takes as
+    // dead
+    let rows = hold(&volume.summary);
+    let gap: u64 = rows.rows().map(|row| reel::segment::summary_orders::row_gap_bytes(&row)).sum();
+    assert!(gap >= FREE_IN_PLACE_BYTES.0, "the output's dead bytes left out the freed record: a gap of {gap}");
+    drop(rows);
     assert_eq!(read(&store, b"key"), Some(large(2)));
     assert_eq!(read(&store, b"twice"), Some(b"second".to_vec()));
     assert_eq!(read(&store, b"keep-1"), Some(large(3)));

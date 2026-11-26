@@ -1683,6 +1683,8 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> Result<Engin
         free_slots: Mutex::new(free_slots),
         encoders: Pool::new(encoders),
         stored_shares: Pool::new(shares),
+        are_shares_given: AtomicBool::new(false),
+        shares_given_bytes: AtomicU64::new(0),
         batch_rows: Pool::new((0..counts.write_buffers).map(|_buffer| RowGroupBuffer::new(GROUP_BYTES)).collect()),
         batch_records: Pool::new((0..counts.write_buffers).map(|_buffer| touched_zeroes(GATHER_BYTES)).collect()),
         batch_lengths: Pool::new(vec![touched_filled(if sizing.is_read_only { 0 } else { sizing.segment_rows.0 as usize }, 0)]),

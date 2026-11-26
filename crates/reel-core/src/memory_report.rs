@@ -67,6 +67,8 @@ pub struct MemoryReport {
     pub disk_covered: ByteCount,
     /// Bytes the pools that grow with their data hold in memory now, which they map apart from the allocator
     pub pool_committed: ByteCount,
+    /// Bytes of the compress shares' pages the ladder gave back, out of compress_buffers and held until they come back
+    pub compress_given_back: ByteCount,
     /// Bytes the lists that grow with their segments hold in memory now, which they map apart from the allocator. The block indexes
     /// and the segment table count them too
     pub list_committed: ByteCount,

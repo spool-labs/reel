@@ -93,6 +93,8 @@ pub fn store_error<Backend: Io>(volume: &Volume<Backend>, action: &'static str, 
 
 mod claims;
 mod records;
+#[cfg(feature = "test-hooks")]
+pub use records::STALE_SHARES_FLAG;
 mod sending;
 
 pub use claims::lifetime_groups;

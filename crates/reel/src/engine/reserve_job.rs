@@ -211,7 +211,8 @@ impl<Backend: Io> ReserveJob<Backend> {
         let rooms: u64 = self.state.pool_rooms.iter().map(|room| room.committed() as u64).sum();
         // the heap measured at open counts the whole caches, whose shards given back hold no memory
         // the growing lists count by what they hold now, so lists that grow with the segments press on the target as pools do
-        (self.state.fixed_heap.load(Ordering::Acquire) + rooms + self.state.lists_in_memory()).saturating_sub(caches_given_back(&self.state))
+        let given = caches_given_back(&self.state) + self.state.shares_given_bytes.load(Ordering::Acquire);
+        (self.state.fixed_heap.load(Ordering::Acquire) + rooms + self.state.lists_in_memory()).saturating_sub(given)
     }
 
     /// Walk the ladder down to the store's memory target when it holds more, lift the caps once it has held well under the target
@@ -223,7 +224,9 @@ impl<Backend: Io> ReserveJob<Backend> {
         let state = &self.state;
         let mut held = self.held_bytes();
         // the host's own pressure lowers the target in force at once, and it rises back only through the decay below
-        let least = state.sizing.least_budget.0;
+        // the compress shares are a step of the ladder, so pressure may take the store under its least budget by them
+        let shares = (state.stored_shares.item_count() * crate::record::record_encoder::SHARE_BYTES) as u64;
+        let least = state.sizing.least_budget.0.saturating_sub(shares);
         // the kernel's own word comes first: a trigger that fired, or a group whose tasks stall on memory past the mark. Either
         // gives back a sixteenth of what the store holds each step it lasts
         let is_kernel_pressed = match state.pressure_source.get() {
@@ -270,8 +273,9 @@ impl<Backend: Io> ReserveJob<Backend> {
                 // row it holds and missed, the quarter its refill may grow past that and the extent the last growth may end in,
                 // and the compact job refills it. An index its ceiling can't hold stays marked until a rebalance raises it
                 let room = (target - held).min(host_left(&memory));
-                // the whole caches come back first, empty, and fill from reads
+                // the whole caches come back first, empty, and fill from reads, and the compress shares after them
                 let room = room.saturating_sub(bring_back_caches(state, room));
+                let room = room.saturating_sub(bring_back_shares(state, room));
                 // a cache still away brings the next step on soon
                 state.is_bringing_back.store(whole_caches(state).any(|cache| cache.absent_shards() > 0), Ordering::Release);
                 for index in state.sorted.iter().flatten().filter(|index| index.mark().is_some()) {
@@ -325,6 +329,10 @@ impl<Backend: Io> ReserveJob<Backend> {
         // reads once the decay brings them back
         if over > 0 {
             over = over.saturating_sub(give_back_caches(state, over));
+        }
+        // the compress shares go after the caches: a large lz4 value is stored as written until they come back
+        if over > 0 {
+            over = over.saturating_sub(give_back_shares(state));
         }
         if over > 0 {
             for room in state.pool_rooms.iter().filter(|room| room.is_paged()) {
@@ -482,6 +490,55 @@ pub fn whole_caches<Backend: Io>(state: &EngineState<Backend>) -> impl Iterator<
 /// Read the bytes the whole caches have given back, which the heap measured at open still counts
 pub fn caches_given_back<Backend: Io>(state: &EngineState<Backend>) -> u64 {
     whole_caches(state).map(WholeCache::given_bytes).sum()
+}
+
+/// Give the free compress shares' pages back, after raising the flag that keeps every new large lz4 value off them, and return the
+/// bytes given. A share an encoder holds now comes back to the pool in memory and goes on the next step
+pub fn give_back_shares<Backend: Io>(state: &EngineState<Backend>) -> usize {
+    state.are_shares_given.store(true, Ordering::Release);
+    let page = crate::region::page_bytes();
+    let mut given = 0;
+    state.stored_shares.visit_free(|share| {
+        // a share given back already reads as empty, and only whole pages inside it go
+        if share.is_empty() {
+            return;
+        }
+        let base = share.as_mut_ptr() as usize;
+        let (first, end) = (base.next_multiple_of(page), (base + share.capacity()) / page * page);
+        if end > first {
+            crate::pool_room::give_pages_back(first as *mut u8, end - first);
+            given += end - first;
+        }
+        // its length marks it given back, and the bring-back writes it again
+        share.clear();
+    });
+    state.shares_given_bytes.fetch_add(given as u64, Ordering::AcqRel);
+    given
+}
+
+/// Bring every given-back compress share's pages in again on this thread, while the room holds them, and lower the flag once all
+/// are back. Return the bytes brought back
+pub fn bring_back_shares<Backend: Io>(state: &EngineState<Backend>, room: u64) -> u64 {
+    let given = state.shares_given_bytes.load(Ordering::Acquire);
+    if !state.are_shares_given.load(Ordering::Acquire) || given > room {
+        return 0;
+    }
+    let page = crate::region::page_bytes();
+    state.stored_shares.visit_free(|share| {
+        if !share.is_empty() {
+            return;
+        }
+        let base = share.as_mut_ptr() as usize;
+        let (first, end) = (base.next_multiple_of(page), (base + share.capacity()) / page * page);
+        if end > first {
+            crate::pool_room::take_pages_back(first as *mut u8, end - first);
+        }
+        // a write of every byte brings the pages in here, on the job, and gives the share its length back
+        share.resize(share.capacity(), 0);
+    });
+    state.shares_given_bytes.store(0, Ordering::Release);
+    state.are_shares_given.store(false, Ordering::Release);
+    given
 }
 
 /// Give the whole caches' shards back, the highest first, until this many bytes are given or none is left, and return the bytes

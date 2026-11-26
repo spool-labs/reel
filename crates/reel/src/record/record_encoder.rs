@@ -140,6 +140,11 @@ impl RecordEncoder {
         true
     }
 
+    /// Check a share this encoder took is one the ladder handed back, which holds no length and takes no write
+    pub fn holds_given_share(&self) -> bool {
+        self.shares.iter().any(Vec::is_empty)
+    }
+
     /// Give every share back
     pub fn give_shares(&mut self, pool: &Pool<Vec<u8>>) {
         pool.give_back_all(&mut self.shares);

@@ -118,6 +118,10 @@ pub struct EngineState<Backend: Io> {
     pub free_slots: Mutex<Vec<OpenSlot>>,
     pub encoders: Pool<RecordEncoder>,
     pub stored_shares: Pool<Vec<u8>>,
+    /// Set while the ladder has the compress shares' pages given back, so a large lz4 value is stored as written and takes none
+    pub are_shares_given: AtomicBool,
+    /// The bytes of the shares' pages given back, which held leaves out
+    pub shares_given_bytes: AtomicU64,
     pub batch_rows: Pool<RowGroupBuffer>,
     pub batch_records: Pool<Vec<u8>>,
     pub batch_lengths: Pool<Vec<u32>>,
@@ -860,6 +864,7 @@ impl<Backend: Io> EngineState<Backend> {
             sorted_drops: self.sorted_drops.load(Ordering::Relaxed),
             sorted_refills: self.sorted_refills.load(Ordering::Relaxed),
             populate_failures: self.populate_failures.load(Ordering::Relaxed),
+            compress_given_back: ByteCount(self.shares_given_bytes.load(Ordering::Acquire)),
             spot_absent_shards: self.spot.absent_shards() as u64,
             block_absent_shards: (self.row_cache.absent_shards() + self.filter_cache.absent_shards() + self.complete_cache.as_ref().map_or(0, BlockCache::absent_shards)) as u64,
             cache_shards_given: self.cache_shards_given.load(Ordering::Relaxed),

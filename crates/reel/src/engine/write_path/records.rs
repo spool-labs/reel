@@ -21,6 +21,12 @@ use crate::index::open_slots::OpenSlot;
 use crate::index::write_row::WriteRow;
 use crate::io::{Io, IoFile, IoTask};
 use crate::record::codec::{CHUNK_BYTES, Codec};
+
+#[cfg(feature = "test-hooks")]
+thread_local! {
+    /// Makes a put on this thread read the shares' flag as down, as one that read it just before the job raised it would
+    pub static STALE_SHARES_FLAG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 use crate::record::record_check::RecordIdentity;
 use crate::record::record_encoder::{PlainRecord, RecordEncoder, RecordShape, write_parts_range};
 use crate::record::record_head::{SMALL_HEAD_BYTES, plain_length};
@@ -354,8 +360,20 @@ impl<Backend: Io> EngineState<Backend> {
         codec: Codec,
         value: &[u8],
     ) -> Result<RecordShape, StoreError> {
-        let shape = encoder
-            .take_shares(&self.stored_shares, codec, value)
+        // while the ladder has the shares given back a large value is stored as written: its record says so, and it takes no share
+        let are_given = self.are_shares_given.load(Ordering::Acquire);
+        #[cfg(feature = "test-hooks")]
+        let are_given = are_given && !STALE_SHARES_FLAG.with(std::cell::Cell::get);
+        let mut codec = if codec == Codec::Lz4 && value.len() > CHUNK_BYTES && are_given { Codec::None } else { codec };
+        let mut is_taken = encoder.take_shares(&self.stored_shares, codec, value);
+        // a put that read the flag down just before the ladder raised it can take a share the ladder handed back. That share holds
+        // no length, so no write reaches its pages, and the value is stored as written in its place
+        if is_taken && encoder.holds_given_share() {
+            encoder.give_shares(&self.stored_shares);
+            codec = Codec::None;
+            is_taken = encoder.take_shares(&self.stored_shares, codec, value);
+        }
+        let shape = is_taken
             .then(|| encoder.encode(identity, codec, value))
             .flatten();
         shape.ok_or_else(|| {

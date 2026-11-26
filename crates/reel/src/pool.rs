@@ -148,6 +148,20 @@ impl<Item> Pool<Item> {
         ByteCount(total)
     }
 
+    /// Count the items the pool holds, free or out
+    pub fn item_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Run a function over every free item, each under its slot's lock, for a job that changes what they hold in place
+    pub fn visit_free(&self, mut visit: impl FnMut(&mut Item)) {
+        for slot in &self.slots {
+            if let Some(item) = hold(&slot.item).as_mut() {
+                visit(item);
+            }
+        }
+    }
+
     /// Count the takes that found every item out or a line ahead, and queued
     pub fn waits(&self) -> u64 {
         self.waits.load(Ordering::Relaxed)

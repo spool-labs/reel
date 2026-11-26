@@ -5145,3 +5145,89 @@ fn a_fresh_store_after_a_fast_sync_ends_unmarked() {
     assert!(marked.is_empty(), "indexes stayed marked or uncounted: {marked:?}");
     store.close().expect("close");
 }
+
+// pressure gives the compress shares' pages back after the caches: large lz4 values still land, stored as written, and read back,
+// and the shares come back in memory once the store has held under its target for the decay, when large values compress again
+#[test]
+fn the_ladder_gives_the_compress_shares_back_and_brings_them_back() {
+    let io = SimulatedIo::new(Seed(73));
+    SIM_CODEC.with(|codec| codec.set(Codec::Lz4));
+    let config = config(CAPACITY);
+    SIM_CODEC.with(|codec| codec.set(Codec::None));
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let large = |number: u64| {
+        let mut value = format!("large-{number:06}-").into_bytes();
+        value.resize(3 * reel::record::codec::CHUNK_BYTES + 100, b'x');
+        value
+    };
+    let job = reel::engine::reserve_job::ReserveJob::new(Arc::clone(&store.state));
+    let pressed = reel::io::host_memory::HostMemory {
+        total: ByteCount(1 << 30),
+        available: ByteCount(0),
+        group_room: Some(ByteCount(0)),
+        group_limit: Some(ByteCount(1 << 30)),
+        group_anon_room: Some(ByteCount(0)),
+    };
+    io.set_host_memory(pressed);
+    let mut now = io.now().0;
+    for _step in 0..256 {
+        now += 100_000_000;
+        job.hold_to_target(now);
+        if store.memory_report().compress_given_back.0 > 0 {
+            break;
+        }
+    }
+    let report = store.memory_report();
+    assert!(report.compress_given_back.0 > 0 && store.state.are_shares_given.load(Ordering::Acquire), "pressure kept the shares: {report:?}");
+    let mut value = Vec::new();
+    for number in 0..8 {
+        store.put(COLUMN, &key(number), &large(number)).expect("put with the shares given back");
+        assert!(store.get(COLUMN, &key(number), &mut value).expect("get") && value == large(number), "a large value read back wrong");
+    }
+    seal_all(&store, &io);
+    io.set_host_memory(reel_sim::simulated_disk::SIMULATED_HOST);
+    for _step in 0..4_096 {
+        now += 100_000_000;
+        job.hold_to_target(now);
+        if !store.state.are_shares_given.load(Ordering::Acquire) {
+            break;
+        }
+    }
+    let report = store.memory_report();
+    assert!(report.compress_given_back.0 == 0 && !store.state.are_shares_given.load(Ordering::Acquire), "the shares never came back: {report:?}");
+    for number in 8..16 {
+        store.put(COLUMN, &key(number), &large(number)).expect("put with the shares back");
+    }
+    seal_all(&store, &io);
+    for number in 0..16 {
+        assert!(store.get(COLUMN, &key(number), &mut value).expect("get") && value == large(number), "value {number} read back wrong");
+    }
+    store.close().expect("close");
+}
+
+// a put that read the shares' flag as down just before the job raised it takes shares the job already handed back: it finds them
+// empty, never writes into them, and stores its value as written, which reads back right
+#[test]
+fn a_put_that_missed_the_shares_flag_stores_its_value_as_written() {
+    let io = SimulatedIo::new(Seed(74));
+    SIM_CODEC.with(|codec| codec.set(Codec::Lz4));
+    let config = config(CAPACITY);
+    SIM_CODEC.with(|codec| codec.set(Codec::None));
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let large = |number: u64| {
+        let mut value = format!("stale-{number:06}-").into_bytes();
+        value.resize(3 * reel::record::codec::CHUNK_BYTES + 100, b'y');
+        value
+    };
+    assert!(reel::engine::reserve_job::give_back_shares(&store.state) > 0, "no share went back");
+    reel::engine::write_path::STALE_SHARES_FLAG.with(|stale| stale.set(true));
+    let landed: Vec<_> = (0..4).map(|number| store.put(COLUMN, &key(number), &large(number))).collect();
+    reel::engine::write_path::STALE_SHARES_FLAG.with(|stale| stale.set(false));
+    for (number, result) in landed.iter().enumerate() {
+        assert!(result.is_ok(), "a put that took given-back shares failed: {result:?}");
+        let mut value = Vec::new();
+        assert!(store.get(COLUMN, &key(number as u64), &mut value).expect("get") && value == large(number as u64), "value {number} read back wrong");
+    }
+    seal_all(&store, &io);
+    store.close().expect("close");
+}

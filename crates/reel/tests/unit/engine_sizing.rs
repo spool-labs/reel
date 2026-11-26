@@ -223,8 +223,8 @@ fn planned_entries_cover_the_heap() {
         for per_shard in [8, 100, 1_700, 1_848] {
             let segments = per_shard * TABLE_SHARDS;
             let sizing = TableSizing { segments_per_shard: per_shard, columns_per_shard: per_shard * columns, blocks_per_shard: 0 };
-            let table: SegmentTable<PlainFile> = SegmentTable::new(&sizing);
-            let directories = (columns as u64 + 1) * ColumnDirectory::new(segments).heap_bytes().0;
+            let table: SegmentTable<PlainFile> = SegmentTable::new(&sizing).expect("reserve a table");
+            let directories = (columns as u64 + 1) * ColumnDirectory::new(segments).expect("reserve a directory").heap_bytes().0;
             let lookup = NumberMap::new(segments).heap_bytes() as u64;
             let covered = (2 * segments * size_of::<u64>()) as u64;
             let held = table.heap_bytes().0 + directories + lookup + covered;

@@ -67,6 +67,9 @@ pub struct MemoryReport {
     pub disk_covered: ByteCount,
     /// Bytes the pools that grow with their data hold in memory now, which they map apart from the allocator
     pub pool_committed: ByteCount,
+    /// Bytes the lists that grow with their segments hold in memory now, which they map apart from the allocator. The block indexes
+    /// and the segment table count them too
+    pub list_committed: ByteCount,
     /// Bytes of those pools' shares of the budget, which a sorted index's pool can grow past while the target has room
     pub pool_shares: ByteCount,
     /// Pools that asked for address space past their share and reserved the share alone, because the process passed its ceiling
@@ -96,6 +99,8 @@ pub struct MemoryReport {
     pub sorted_drops: u64,
     /// Dropped sorted indexes a refill brought back since open
     pub sorted_refills: u64,
+    /// Seals and merges whose table or directory lines couldn't come into memory, since open, each retried later
+    pub populate_failures: u64,
     /// Spot index shards given back, which read as missing until they come back. 0 when the spot index is whole
     pub spot_absent_shards: u64,
     /// Block cache shards given back, filter, row and complete caches together. 0 when they are whole

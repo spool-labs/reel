@@ -8,7 +8,7 @@ use reel_core::units::{ByteCount, WritePlace};
 
 use crate::fixed_list::ListOut;
 use crate::guard::hold;
-use crate::pool::touched_capacity;
+use crate::growing_list::GrowingList;
 use crate::record::record_check::{Checksum, checksum};
 use crate::segment::block_entry::{KeyBound, KeyPrefix};
 use crate::segment::segment_tail::{ColumnTail, SegmentNumber};
@@ -49,11 +49,26 @@ pub struct Candidate {
 }
 
 /// The list, with the generation of its last change
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct DirectoryList {
-    pub entries: Vec<DirectoryEntry>,
-    pub ranges: Vec<RangeEntry>,
+    pub entries: GrowingList<DirectoryEntry>,
+    pub ranges: GrowingList<RangeEntry>,
     pub generation: u64,
+}
+
+impl DirectoryList {
+    /// Bring in the pages this many listings take in both lists, on the thread that builds the list
+    fn make_ready(&mut self, count: usize) -> std::io::Result<()> {
+        self.entries.make_ready(count)?;
+        self.ranges.make_ready(count)
+    }
+
+    /// Hand back the pages past the listings the list holds, which no reader reaches since a read stays inside the length
+    fn give_back_past_length(&mut self) {
+        let count = self.entries.len();
+        self.entries.give_back_past(count);
+        self.ranges.give_back_past(count);
+    }
 }
 
 /// What one pass over the list left out
@@ -124,17 +139,17 @@ impl<Out> PageFill<'_, Out> {
 
 impl ColumnDirectory {
     /// Allocate room for a number of segments, with a spare of its own
-    pub fn new(capacity: usize) -> Self {
-        Self::with_spare(capacity, Arc::new(Mutex::new(empty_list(capacity))))
+    pub fn new(capacity: usize) -> std::io::Result<Self> {
+        Self::with_spare(capacity, Arc::new(Mutex::new(empty_list(capacity)?)))
     }
 
     /// Allocate room for a number of segments, with a spare other columns of the volume share. The spare has the same room
-    pub fn with_spare(capacity: usize, spare: Arc<Mutex<DirectoryList>>) -> Self {
-        Self {
-            list: RwLock::new(empty_list(capacity)),
+    pub fn with_spare(capacity: usize, spare: Arc<Mutex<DirectoryList>>) -> std::io::Result<Self> {
+        Ok(Self {
+            list: RwLock::new(empty_list(capacity)?),
             spare,
             generation: AtomicU64::new(0),
-        }
+        })
     }
 
     /// Read the heap the spare holds
@@ -216,22 +231,25 @@ impl ColumnDirectory {
     /// Publish a list of every listing at once, sorted here, or return false when they don't fit. A listing at a time copies the
     /// whole list for each one, and one sort fills a directory of any size
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn publish_all(&self, listings: &[Listing]) -> bool {
+    pub fn publish_all(&self, listings: &[Listing]) -> std::io::Result<bool> {
         let mut target = hold(&self.spare);
         if listings.len() > target.entries.capacity() {
-            return false;
+            return Ok(false);
         }
+        target.make_ready(listings.len())?;
         target.entries.clear();
         target.ranges.clear();
-        target.entries.extend(listings.iter().map(|listing| listing.entry));
-        target.ranges.extend(listings.iter().map(|listing| listing.range));
+        let is_in = target.entries.extend_from(listings.iter().map(|listing| listing.entry)) && target.ranges.extend_from(listings.iter().map(|listing| listing.range));
+        if !is_in {
+            return Ok(false);
+        }
         target.entries.sort_unstable_by_key(sort_key);
         target.ranges.sort_unstable_by_key(|range| range.lowest);
         refresh_groups(&mut target.entries);
         let count = target.ranges.len();
         refresh_range_reach(&mut target.ranges, 0, count);
         self.swap_in(&mut target);
-        true
+        Ok(true)
     }
 
     /// Put a list built in the spare in place, and leave the old one there as the next spare
@@ -239,6 +257,8 @@ impl ColumnDirectory {
         let mut list = write_list(&self.list);
         spare.generation = list.generation + 1;
         mem::swap(&mut *list, spare);
+        // the new list came from a spare another column may have built longer in, and a read stays inside its length
+        list.give_back_past_length();
         drop(list);
         self.generation.fetch_add(1, Ordering::AcqRel);
     }
@@ -264,7 +284,7 @@ impl ColumnDirectory {
     }
 
     /// Publish a list with a segment added and some gone, or return false when it doesn't fit
-    pub fn replace(&self, added: Option<&Listing>, removed: &[SegmentNumber]) -> bool {
+    pub fn replace(&self, added: Option<&Listing>, removed: &[SegmentNumber]) -> std::io::Result<bool> {
         let mut target = hold(&self.spare);
         target.entries.clear();
         target.ranges.clear();
@@ -272,54 +292,42 @@ impl ColumnDirectory {
             // the spare's one writer is this one, so the list can't change under the copy
             let source = read_list(&self.list);
             let kept = source.entries.iter().filter(|entry| !removed.contains(&entry.segment)).count();
-            if kept + usize::from(added.is_some()) > target.entries.capacity() {
-                return false;
+            let count = kept + usize::from(added.is_some());
+            if count > target.entries.capacity() {
+                return Ok(false);
             }
-            target.entries.extend(source.entries.iter().filter(|entry| !removed.contains(&entry.segment)));
-            target.ranges.extend(source.ranges.iter().filter(|range| !removed.contains(&range.segment)));
+            target.make_ready(count)?;
+            let is_in = target.entries.extend_from(source.entries.iter().copied().filter(|entry| !removed.contains(&entry.segment)))
+                && target.ranges.extend_from(source.ranges.iter().copied().filter(|range| !removed.contains(&range.segment)));
+            if !is_in {
+                return Ok(false);
+            }
         }
         if let Some(listing) = added {
             let entry = &listing.entry;
             let at = target.entries.partition_point(|existing| sort_key(existing) <= sort_key(entry));
-            target.entries.insert(at, *entry);
-            let at = target.ranges.partition_point(|existing| existing.lowest <= listing.range.lowest);
-            target.ranges.insert(at, listing.range);
+            let at_range = target.ranges.partition_point(|existing| existing.lowest <= listing.range.lowest);
+            if !target.entries.insert(at, *entry) || !target.ranges.insert(at_range, listing.range) {
+                return Ok(false);
+            }
         }
         refresh_groups(&mut target.entries);
         let count = target.ranges.len();
         refresh_range_reach(&mut target.ranges, 0, count);
         self.swap_in(&mut target);
-        true
+        Ok(true)
     }
 }
 
 /// Read the heap a list holds
 pub fn list_bytes(list: &DirectoryList) -> ByteCount {
-    ByteCount((list.entries.capacity() * size_of::<DirectoryEntry>() + list.ranges.capacity() * size_of::<RangeEntry>()) as u64)
+    ByteCount((list.entries.ready_bytes() + list.ranges.ready_bytes()) as u64)
 }
 
-/// Build an empty copy with fixed room
-pub fn empty_list(capacity: usize) -> DirectoryList {
-    let blank_range = RangeEntry {
-        lowest: KeyBound::of_key(&[]),
-        highest: KeyBound::of_key(&[]),
-        reach: 0,
-        segment: SegmentNumber(0),
-    };
-    let blank = DirectoryEntry {
-        shared_length: 0,
-        shared_sum: Checksum(0),
-        lowest: KeyPrefix::default(),
-        highest: KeyPrefix::default(),
-        reach: 0,
-        segment: SegmentNumber(0),
-        newest_place: WritePlace(0),
-    };
-    DirectoryList {
-        entries: touched_capacity(capacity, blank),
-        ranges: touched_capacity(capacity, blank_range),
-        generation: 0,
-    }
+/// Build an empty list with room reserved for this many segments, none of it in memory yet
+pub fn empty_list(capacity: usize) -> std::io::Result<DirectoryList> {
+    // the room is reserved for every segment the table can hold, and comes into memory as segments are listed
+    Ok(DirectoryList { entries: GrowingList::reserved(capacity)?, ranges: GrowingList::reserved(capacity)?, generation: 0 })
 }
 
 /// Order entries by group, then by lowest key

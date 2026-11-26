@@ -1033,7 +1033,8 @@ pub fn start_jobs<Backend: Io>(state: &Arc<EngineState<Backend>>) -> Result<(), 
     }
     // the heap and stacks outside the rooms barely move after open, so the ladder counts them once beside the rooms it can shrink
     let report = state.memory_report();
-    state.fixed_heap.store((report.heap_total().0 + report.thread_stacks.0).saturating_sub(report.pool_committed.0), Ordering::Release);
+    // the pools and the growing lists count apart, by what they hold whenever held is read
+    state.fixed_heap.store((report.heap_total().0 + report.thread_stacks.0).saturating_sub(report.pool_committed.0 + report.list_committed.0), Ordering::Release);
     // the store learns of memory pressure the best way the host offers: a trigger the kernel fires, else a read of the group's
     // pressure each step, else the host's free memory
     let engine = Arc::downgrade(state);
@@ -1546,8 +1547,11 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> Result<Engin
         });
         let found = scan.sealed.len();
         let room = (planned[column.volume.0 as usize].segments_per_shard * TABLE_SHARDS).max(found * 2);
-        let spare = spares[column.volume.0 as usize].get_or_insert_with(|| Arc::new(Mutex::new(empty_list(room))));
-        directories[column.id.0 as usize] = Some(ColumnDirectory::with_spare(room, Arc::clone(spare)));
+        let spare = match &spares[column.volume.0 as usize] {
+            Some(spare) => Arc::clone(spare),
+            None => Arc::clone(spares[column.volume.0 as usize].insert(Arc::new(Mutex::new(empty_list(room)?)))),
+        };
+        directories[column.id.0 as usize] = Some(ColumnDirectory::with_spare(room, spare)?);
     }
 
     let open_slots = sizing.shard.open_slots;
@@ -1751,6 +1755,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> Result<Engin
         sorted_moves_missed: AtomicU64::new(0),
         sorted_drops: AtomicU64::new(0),
         sorted_refills: AtomicU64::new(0),
+        populate_failures: AtomicU64::new(0),
         cache_shards_given: AtomicU64::new(0),
         rebalance_plan: None,
         cache_ceilings: std::array::from_fn(|_cache| AtomicUsize::new(usize::MAX)),
@@ -1867,7 +1872,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
             wants_prepared: false,
             next_root: 0,
         }),
-        table: SegmentTable::new(&room),
+        table: SegmentTable::new(&room)?,
         view: AtomicU64::new(0),
         handovers: AtomicU64::new(0),
         highest_sealed: AtomicU64::new(0),

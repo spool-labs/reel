@@ -123,7 +123,7 @@ fn fill(store: &Store, is_crowded: bool, facts_of: fn(u64) -> SegmentFacts) {
     }
     drop(rows);
     let directory = store.state.directories[COLUMN.0 as usize].as_ref().expect("a directory");
-    assert!(directory.publish_all(&listings), "the directory has no room for every segment");
+    assert!(directory.publish_all(&listings).expect("populate"), "the directory has no room for every segment");
 }
 
 // a segment's listing in the column's directory, from its lowest key to the last key under its bound
@@ -273,7 +273,7 @@ fn dead_queue(workers: usize) {
     for number in SEGMENTS + 1..=SEGMENTS + ahead {
         let head = TailHead { segment: SegmentNumber(number), ..TailHead::default() };
         let mut blocks = DEAD_BLOCKS as usize;
-        while !volume.table.install(file.clone(), RootId(0), &head, &[], &lines[..blocks]) {
+        while !volume.table.install(file.clone(), RootId(0), &head, &[], &lines[..blocks]).expect("populate") {
             assert!(blocks > 0, "the table has no slot for segment {number}");
             blocks /= 2;
         }

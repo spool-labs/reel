@@ -60,9 +60,9 @@ fn a_set_row_and_a_walk_count_once_in_either_order() {
 #[test]
 fn a_whole_block_cover_after_two_charges_sets_every_bit() {
     let bits = bits();
-    let table = SegmentTable::new(&TableSizing { segments_per_shard: 4, columns_per_shard: 4, blocks_per_shard: 8 });
+    let table = SegmentTable::new(&TableSizing { segments_per_shard: 4, columns_per_shard: 4, blocks_per_shard: 8 }).expect("reserve a table");
     let head = TailHead { segment: SEGMENT, ..TailHead::default() };
-    assert!(table.install(0_u32, RootId(0), &head, &[], &[BlockEntry { live_rows: BLOCK_ROWS, ..BlockEntry::default() }]));
+    assert!(table.install(0_u32, RootId(0), &head, &[], &[BlockEntry { live_rows: BLOCK_ROWS, ..BlockEntry::default() }]).expect("populate"));
     let mut walk = counts(2);
     bits.land(&[row(0), row(4)], &mut walk);
     table.drop_live(SEGMENT, 0, walk[0].rows, WritePlace(9));

@@ -197,7 +197,8 @@ impl<Backend: Io> ReserveJob<Backend> {
     pub fn held_bytes(&self) -> u64 {
         let rooms: u64 = self.state.pool_rooms.iter().map(|room| room.committed() as u64).sum();
         // the heap measured at open counts the whole caches, whose shards given back hold no memory
-        (self.state.fixed_heap.load(Ordering::Acquire) + rooms).saturating_sub(caches_given_back(&self.state))
+        // the growing lists count by what they hold now, so lists that grow with the segments press on the target as pools do
+        (self.state.fixed_heap.load(Ordering::Acquire) + rooms + self.state.lists_in_memory()).saturating_sub(caches_given_back(&self.state))
     }
 
     /// Walk the ladder down to the store's memory target when it holds more, lift the caps once it has held well under the target

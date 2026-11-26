@@ -552,7 +552,10 @@ impl<Backend: Io> SealJob<Backend> {
                 &totals.head,
                 self.writer.columns(),
                 self.writer.entries(),
-            );
+            )
+            .inspect_err(|_error| {
+                state.populate_failures.fetch_add(1, Ordering::Relaxed);
+            })?;
             if !installed {
                 volume.stuck_shard.store(shard_of(target.number), Ordering::Release);
                 self.note_stuck();
@@ -575,7 +578,7 @@ impl<Backend: Io> SealJob<Backend> {
         while let Some(column) = self.writer.columns().get(self.columns_listed) {
             let entry = Listing::of_column(column, target.number, totals.head.places.highest);
             if let Some(directory) = &state.directories[column.column.0 as usize]
-                && !directory.replace(Some(&entry), &[])
+                && !directory.replace(Some(&entry), &[])?
             {
                 self.note_stuck();
                 return Err(Error::other("column directory is full"));

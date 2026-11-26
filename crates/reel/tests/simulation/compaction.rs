@@ -903,7 +903,7 @@ fn rotted_replacement() {
 
     state.damage_whole(0, newer);
     for directory in state.directories.iter().flatten() {
-        directory.replace(None, &[newer]);
+        directory.replace(None, &[newer]).expect("populate");
     }
     let retired = volume.table.retire(newer).expect("retired");
     io.close_file(retired.file);

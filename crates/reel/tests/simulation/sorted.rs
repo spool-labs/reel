@@ -5085,3 +5085,63 @@ fn a_reopened_store_holds_values_in_a_few_job_steps() {
     eprintln!("held {held} of {KEYS} after {steps} job steps: {after_steps:.3} device reads a get, {whole:.3} on a read-only open");
     assert!(after_steps <= whole * 1.15 + 0.02, "a get read the device {after_steps:.3} times, {whole:.3} with the pool whole");
 }
+
+// a fresh store of fourteen sorted columns at 2 GiB that a fast first sync fills half again past six indexes' first rooms, with no job step
+// during the fill, ends with every index unmarked after a few idle decays of the job and the compact job's refills
+#[test]
+fn a_fresh_store_after_a_fast_sync_ends_unmarked() {
+    const SORTED: u8 = 14;
+    let io = SimulatedIo::new(Seed(72));
+    SIM_BUDGET.with(|budget| budget.set(ByteCount(2 << 30)));
+    let mut config = config(RowCount(0));
+    SIM_BUDGET.with(|budget| budget.set(BUDGET));
+    reel::engine::engine_sizing::EXACT_INDEX_ROWS.with(|exact| exact.set(false));
+    let first = config.columns[0].clone();
+    config.columns = (1..=SORTED).map(|id| ColumnConfig { id: ColumnId(id), name: format!("sorted-{id}"), least_rows: None, ..first.clone() }).collect();
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let busy: Vec<ColumnId> = (1..=6).map(ColumnId).collect();
+    let share = store.state.sorted_index(busy[0]).expect("an index").room().share();
+    let rows = reel::index::sorted_keys::rows_for_bytes(WIDTH as usize, ByteCount(share as u64)).0 * 3 / 2;
+    eprintln!("each busy column takes {rows} keys, past a first room of {} MiB", share >> 20);
+    for number in 0..rows {
+        for id in &busy {
+            store.put(*id, &key(number), b"sync").expect("put");
+        }
+        if number % 16_384 == 16_383 {
+            seal_all(&store, &io);
+        }
+    }
+    seal_all(&store, &io);
+    let show = |label: &str| {
+        for reading in report(&store).sorted_columns.iter().filter(|reading| busy.contains(&reading.column)) {
+            let index = store.state.sorted_index(reading.column).expect("an index");
+            let plan = reel::index::sorted_keys::planned_index_bytes(WIDTH as usize, RowCount(reading.used.0 + reading.rows_past_capacity.0)).0;
+            eprintln!(
+                "{label} {:?}: marked {} counted {} used {} past {} plan {} MiB ceiling {} MiB reserved {} MiB committed {} MiB may_refill {} refill_waits {}",
+                reading.column, reading.is_marked, reading.is_counted, reading.used.0, reading.rows_past_capacity.0, plan >> 20,
+                index.room().ceiling() >> 20, index.room().reserved() >> 20, index.room().committed() >> 20, index.may_refill(), reading.refill_waits,
+            );
+        }
+        let memory = store.memory_report();
+        eprintln!("{label}: held {} MiB target {} MiB rebalances {} refills {} caches {:?}", memory.memory_held.0 >> 20, memory.memory_target.0 >> 20, memory.rebalances, memory.sorted_refills, memory.cache_ceilings.map(|bytes| bytes.0 >> 20));
+    };
+    show("after the sync");
+    let job = reel::engine::reserve_job::ReserveJob::new(Arc::clone(&store.state));
+    let mut value = Vec::new();
+    for decay in 0..6 {
+        for number in (0..rows).step_by(97) {
+            let _found = store.get(busy[decay % busy.len()], &key(number), &mut value).expect("get");
+        }
+        io.advance_clock(reel_core::units::Nanoseconds(reel::pool_room::DECAY_NANOS));
+        let _target = job.hold_to_target(io.now().0);
+        for volume in 0..store.state.volumes.len() {
+            while let Some(mut refill) = store.state.start_sorted_refill(volume) {
+                while store.state.sorted_refill_step(volume, &mut refill).expect("refill step") {}
+            }
+        }
+        show(&format!("decay {decay}"));
+    }
+    let marked: Vec<_> = report(&store).sorted_columns.iter().filter(|reading| reading.is_marked || !reading.is_counted).map(|reading| reading.column).collect();
+    assert!(marked.is_empty(), "indexes stayed marked or uncounted: {marked:?}");
+    store.close().expect("close");
+}

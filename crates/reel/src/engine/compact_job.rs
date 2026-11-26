@@ -1109,7 +1109,7 @@ impl<Backend: Io> CompactJob<Backend> {
         // a merge's grave check runs beside this, and the segment counts as leaving before any list drops it
         volume.segments_leaving.fetch_add(1, Ordering::AcqRel);
         for directory in state.directories.iter().flatten() {
-            if !directory.replace(None, &[segment]) {
+            if !directory.replace(None, &[segment])? {
                 volume.segments_leaving.fetch_sub(1, Ordering::AcqRel);
                 return Err(Error::from(ErrorKind::OutOfMemory));
             }

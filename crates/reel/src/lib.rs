@@ -52,6 +52,7 @@ inner_modules!(
     config,
     engine,
     fixed_list,
+    growing_list,
     guard,
     index,
     io,

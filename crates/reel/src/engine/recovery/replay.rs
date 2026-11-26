@@ -64,13 +64,13 @@ impl<Backend: Io> EngineState<Backend> {
         for column in &found.columns {
             let entry = Listing::of_column(column, found.head.segment, found.head.places.highest);
             if let Some(directory) = &self.directories[column.column.0 as usize]
-                && !directory.replace(Some(&entry), &[])
+                && !directory.replace(Some(&entry), &[])?
             {
                 return Err(Error::other("column directory sized below what the roots hold"));
             }
         }
         // the table takes the file last, so a failure before it leaves one owner, the scan
-        if !volume.table.install(found.file.clone(), root_of_path(volume, &found.path), &found.head, &found.columns, &found.entries) {
+        if !volume.table.install(found.file.clone(), root_of_path(volume, &found.path), &found.head, &found.columns, &found.entries)? {
             return Err(Error::other("segment table sized below what the roots hold"));
         }
         Ok(())

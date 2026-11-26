@@ -44,11 +44,11 @@ fn found(directory: &ColumnDirectory, key: &[u8]) -> Vec<u64> {
 // ordered ranges give one segment, overlaps give each of them, and a gap gives none
 #[test]
 fn range_search() {
-    let directory = ColumnDirectory::new(CAPACITY);
-    assert!(directory.replace(Some(&entry(1, b"a", b"c")), &[]));
-    assert!(directory.replace(Some(&entry(2, b"d", b"f")), &[]));
-    assert!(directory.replace(Some(&entry(3, b"b", b"e")), &[]));
-    assert!(directory.replace(Some(&entry(4, b"m", b"p")), &[]));
+    let directory = ColumnDirectory::new(CAPACITY).expect("reserve a directory");
+    assert!(directory.replace(Some(&entry(1, b"a", b"c")), &[]).expect("populate"));
+    assert!(directory.replace(Some(&entry(2, b"d", b"f")), &[]).expect("populate"));
+    assert!(directory.replace(Some(&entry(3, b"b", b"e")), &[]).expect("populate"));
+    assert!(directory.replace(Some(&entry(4, b"m", b"p")), &[]).expect("populate"));
 
     assert_eq!(found(&directory, b"a"), vec![1]);
     assert_eq!(found(&directory, b"c"), vec![1, 3]);
@@ -60,10 +60,10 @@ fn range_search() {
 // a wide old segment stays in reach of keys past the narrow ones after it
 #[test]
 fn wide_segment() {
-    let directory = ColumnDirectory::new(CAPACITY);
-    assert!(directory.replace(Some(&entry(1, b"a", b"z")), &[]));
-    assert!(directory.replace(Some(&entry(2, b"b", b"c")), &[]));
-    assert!(directory.replace(Some(&entry(3, b"d", b"e")), &[]));
+    let directory = ColumnDirectory::new(CAPACITY).expect("reserve a directory");
+    assert!(directory.replace(Some(&entry(1, b"a", b"z")), &[]).expect("populate"));
+    assert!(directory.replace(Some(&entry(2, b"b", b"c")), &[]).expect("populate"));
+    assert!(directory.replace(Some(&entry(3, b"d", b"e")), &[]).expect("populate"));
 
     assert_eq!(found(&directory, b"m"), vec![1]);
 }
@@ -71,10 +71,10 @@ fn wide_segment() {
 // keys sharing a long prefix still rule out the segments of other ranges
 #[test]
 fn long_prefix() {
-    let directory = ColumnDirectory::new(CAPACITY);
-    assert!(directory.replace(Some(&entry(1, b"address-of-one-tape-0001", b"address-of-one-tape-0100")), &[]));
-    assert!(directory.replace(Some(&entry(2, b"address-of-one-tape-0101", b"address-of-one-tape-0200")), &[]));
-    assert!(directory.replace(Some(&entry(3, b"address-of-one-tape-0201", b"address-of-one-tape-0300")), &[]));
+    let directory = ColumnDirectory::new(CAPACITY).expect("reserve a directory");
+    assert!(directory.replace(Some(&entry(1, b"address-of-one-tape-0001", b"address-of-one-tape-0100")), &[]).expect("populate"));
+    assert!(directory.replace(Some(&entry(2, b"address-of-one-tape-0101", b"address-of-one-tape-0200")), &[]).expect("populate"));
+    assert!(directory.replace(Some(&entry(3, b"address-of-one-tape-0201", b"address-of-one-tape-0300")), &[]).expect("populate"));
 
     assert_eq!(found(&directory, b"address-of-one-tape-0150"), vec![2]);
     assert_eq!(found(&directory, b"address-of-one-tape-0250"), vec![3]);
@@ -84,11 +84,11 @@ fn long_prefix() {
 // a merge swaps its inputs for its output in one publish
 #[test]
 fn merge_swap() {
-    let directory = ColumnDirectory::new(CAPACITY);
-    assert!(directory.replace(Some(&entry(1, b"a", b"c")), &[]));
-    assert!(directory.replace(Some(&entry(2, b"b", b"d")), &[]));
+    let directory = ColumnDirectory::new(CAPACITY).expect("reserve a directory");
+    assert!(directory.replace(Some(&entry(1, b"a", b"c")), &[]).expect("populate"));
+    assert!(directory.replace(Some(&entry(2, b"b", b"d")), &[]).expect("populate"));
 
-    assert!(directory.replace(Some(&entry(3, b"a", b"d")), &[SegmentNumber(1), SegmentNumber(2)]));
+    assert!(directory.replace(Some(&entry(3, b"a", b"d")), &[SegmentNumber(1), SegmentNumber(2)]).expect("populate"));
 
     assert_eq!(found(&directory, b"b"), vec![3]);
 }
@@ -96,9 +96,9 @@ fn merge_swap() {
 // a small buffer gets every overlapping segment page by page
 #[test]
 fn cut_pages() {
-    let directory = ColumnDirectory::new(CAPACITY);
+    let directory = ColumnDirectory::new(CAPACITY).expect("reserve a directory");
     for number in 0..10 {
-        assert!(directory.replace(Some(&entry(number, b"a", b"z")), &[]));
+        assert!(directory.replace(Some(&entry(number, b"a", b"z")), &[]).expect("populate"));
     }
 
     let mut out = Vec::with_capacity(4);
@@ -122,12 +122,12 @@ fn cut_pages() {
 // a wide segment among many narrow ones finds just the two that hold a key
 #[test]
 fn wide_among_many() {
-    let directory = ColumnDirectory::new(MANY as usize + 1);
-    assert!(directory.replace(Some(&entry(MANY, b"a0000", b"z9999")), &[]));
+    let directory = ColumnDirectory::new(MANY as usize + 1).expect("reserve a directory");
+    assert!(directory.replace(Some(&entry(MANY, b"a0000", b"z9999")), &[]).expect("populate"));
     for number in 0..MANY {
         let lowest = format!("k{number:04}0");
         let highest = format!("k{number:04}9");
-        assert!(directory.replace(Some(&entry(number, lowest.as_bytes(), highest.as_bytes())), &[]));
+        assert!(directory.replace(Some(&entry(number, lowest.as_bytes(), highest.as_bytes())), &[]).expect("populate"));
     }
 
     let key = b"k05005";
@@ -139,10 +139,10 @@ fn wide_among_many() {
 // a full directory refuses a segment and keeps its list
 #[test]
 fn full_directory() {
-    let directory = ColumnDirectory::new(1);
+    let directory = ColumnDirectory::new(1).expect("reserve a directory");
 
-    assert!(directory.replace(Some(&entry(1, b"a", b"c")), &[]));
-    assert!(!directory.replace(Some(&entry(2, b"d", b"f")), &[]));
+    assert!(directory.replace(Some(&entry(1, b"a", b"c")), &[]).expect("populate"));
+    assert!(!directory.replace(Some(&entry(2, b"d", b"f")), &[]).expect("populate"));
 
     assert_eq!(found(&directory, b"b"), vec![1]);
 }
@@ -157,17 +157,17 @@ fn meeting(directory: &ColumnDirectory, low: &[u8], high: &[u8]) -> Vec<u64> {
 // a range finds every segment it meets, lowest first, and a gap finds none
 #[test]
 fn overlapping_ranges() {
-    let directory = ColumnDirectory::new(CAPACITY);
-    assert!(directory.replace(Some(&entry(1, b"a", b"c")), &[]));
-    assert!(directory.replace(Some(&entry(2, b"d", b"f")), &[]));
-    assert!(directory.replace(Some(&entry(3, b"b", b"z")), &[]));
-    assert!(directory.replace(Some(&entry(4, b"m", b"p")), &[]));
+    let directory = ColumnDirectory::new(CAPACITY).expect("reserve a directory");
+    assert!(directory.replace(Some(&entry(1, b"a", b"c")), &[]).expect("populate"));
+    assert!(directory.replace(Some(&entry(2, b"d", b"f")), &[]).expect("populate"));
+    assert!(directory.replace(Some(&entry(3, b"b", b"z")), &[]).expect("populate"));
+    assert!(directory.replace(Some(&entry(4, b"m", b"p")), &[]).expect("populate"));
 
     assert_eq!(meeting(&directory, b"a", b"z"), vec![1, 3, 2, 4]);
     assert_eq!(meeting(&directory, b"c", b"d"), vec![1, 3, 2]);
     assert_eq!(meeting(&directory, b"g", b"h"), vec![3]);
     assert_eq!(meeting(&directory, b"n", b"n"), vec![3, 4]);
-    assert!(directory.replace(None, &[SegmentNumber(3)]));
+    assert!(directory.replace(None, &[SegmentNumber(3)]).expect("populate"));
     assert_eq!(meeting(&directory, b"g", b"h"), Vec::<u64>::new());
     assert_eq!(meeting(&directory, b"o", b"zz"), vec![4]);
 }
@@ -175,9 +175,9 @@ fn overlapping_ranges() {
 // a page takes what fits, and the next one goes on from it
 #[test]
 fn overlapping_pages() {
-    let directory = ColumnDirectory::new(CAPACITY);
+    let directory = ColumnDirectory::new(CAPACITY).expect("reserve a directory");
     for number in 0..10 {
-        assert!(directory.replace(Some(&entry(number, &[number as u8], &[number as u8, 1])), &[]));
+        assert!(directory.replace(Some(&entry(number, &[number as u8], &[number as u8, 1])), &[]).expect("populate"));
     }
     let (low, high) = (KeyBound::of_key(&[]), KeyBound::HIGHEST);
     let mut out = Vec::with_capacity(4);
@@ -192,11 +192,11 @@ fn overlapping_pages() {
 // the walk's next stop is the nearest start above and the nearest end below, whatever stands wide around it
 #[test]
 fn next_stops() {
-    let directory = ColumnDirectory::new(CAPACITY);
-    assert!(directory.replace(Some(&entry(1, b"a", b"z")), &[]));
-    assert!(directory.replace(Some(&entry(2, b"c", b"d")), &[]));
-    assert!(directory.replace(Some(&entry(3, b"f", b"g")), &[]));
-    assert!(directory.replace(Some(&entry(4, b"m", b"n")), &[]));
+    let directory = ColumnDirectory::new(CAPACITY).expect("reserve a directory");
+    assert!(directory.replace(Some(&entry(1, b"a", b"z")), &[]).expect("populate"));
+    assert!(directory.replace(Some(&entry(2, b"c", b"d")), &[]).expect("populate"));
+    assert!(directory.replace(Some(&entry(3, b"f", b"g")), &[]).expect("populate"));
+    assert!(directory.replace(Some(&entry(4, b"m", b"n")), &[]).expect("populate"));
 
     assert_eq!(directory.next_above(&KeyBound::of_key(b"d")), Some(KeyBound::of_key(b"f")));
     assert_eq!(directory.next_above(&KeyBound::of_key(b"m")), None);

@@ -220,6 +220,8 @@ pub struct EngineState<Backend: Io> {
     pub sorted_drops: AtomicU64,
     /// Dropped sorted indexes a refill brought back, since open
     pub sorted_refills: AtomicU64,
+    /// Seals and merges whose table or directory lines couldn't come into memory, each retried later
+    pub populate_failures: AtomicU64,
     /// Shards of the spot index and the block caches the ladder gave back, since open
     pub cache_shards_given: AtomicU64,
     /// What open shared the caches and the sorted indexes from, so the store shares them again at run time. None for a reader and
@@ -845,7 +847,7 @@ impl<Backend: Io> EngineState<Backend> {
             pools_short: self.pool_rooms.iter().filter(|room| room.is_short()).count(),
             pool_given_back: ByteCount(self.pool_rooms.iter().map(|room| room.given_back()).sum()),
             memory_target: ByteCount(self.memory_target.load(Ordering::Acquire)),
-            memory_held: ByteCount(self.fixed_heap.load(Ordering::Acquire) + self.pool_rooms.iter().map(|room| room.committed() as u64).sum::<u64>()),
+            memory_held: ByteCount(self.fixed_heap.load(Ordering::Acquire) + self.pool_rooms.iter().map(|room| room.committed() as u64).sum::<u64>() + self.lists_in_memory()),
             is_under_pressure: self.is_under_pressure.load(Ordering::Acquire),
             is_target_short: self.is_target_short.load(Ordering::Acquire),
             pressure_source: self.pressure_source.get().copied().unwrap_or_default(),
@@ -853,6 +855,7 @@ impl<Backend: Io> EngineState<Backend> {
             pressed_steps: self.pressed_steps.load(Ordering::Relaxed),
             sorted_drops: self.sorted_drops.load(Ordering::Relaxed),
             sorted_refills: self.sorted_refills.load(Ordering::Relaxed),
+            populate_failures: self.populate_failures.load(Ordering::Relaxed),
             spot_absent_shards: self.spot.absent_shards() as u64,
             block_absent_shards: (self.row_cache.absent_shards() + self.filter_cache.absent_shards() + self.complete_cache.as_ref().map_or(0, BlockCache::absent_shards)) as u64,
             cache_shards_given: self.cache_shards_given.load(Ordering::Relaxed),
@@ -894,14 +897,17 @@ impl<Backend: Io> EngineState<Backend> {
         };
         for (index, directory) in self.directories.iter().enumerate().filter_map(|(index, directory)| Some((index, directory.as_ref()?))) {
             report.block_indexes = ByteCount(report.block_indexes.0 + directory.heap_bytes().0);
+            report.list_committed = ByteCount(report.list_committed.0 + directory.heap_bytes().0);
             // a volume's columns share one spare, which counts once
             let is_first = !self.directories[..index].iter().flatten().any(|earlier| earlier.shares_spare(directory));
             if is_first {
                 report.block_indexes = ByteCount(report.block_indexes.0 + directory.spare_bytes().0);
+                report.list_committed = ByteCount(report.list_committed.0 + directory.spare_bytes().0);
             }
         }
         for volume in &self.volumes {
             report.segment_table = ByteCount(report.segment_table.0 + volume.table.heap_bytes().0);
+            report.list_committed = ByteCount(report.list_committed.0 + volume.table.lines_in_memory());
             report.damaged_spans = ByteCount(report.damaged_spans.0 + volume.damage.heap_bytes().0);
             report.range_deletes = ByteCount(report.range_deletes.0 + volume.covers.heap_bytes().0);
             let buffer = volume.summary_buffer.heap_bytes(|buffer| ByteCount(buffer.heap_bytes() as u64));
@@ -941,6 +947,19 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Add up the heap the shared parts hold
+    /// Read the bytes the lists that grow with the segments hold in memory: every column directory's list, each volume's shared
+    /// spare once, and the tables' line lists
+    pub fn lists_in_memory(&self) -> u64 {
+        let mut total = 0;
+        for (index, directory) in self.directories.iter().enumerate().filter_map(|(index, directory)| Some((index, directory.as_ref()?))) {
+            total += directory.heap_bytes().0;
+            if !self.directories[..index].iter().flatten().any(|earlier| earlier.shares_spare(directory)) {
+                total += directory.spare_bytes().0;
+            }
+        }
+        total + self.volumes.iter().map(|volume| volume.table.lines_in_memory()).sum::<u64>()
+    }
+
     pub fn heap_bytes(&self) -> ByteCount {
         self.memory_report().heap_total()
     }

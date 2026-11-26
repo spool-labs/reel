@@ -1236,7 +1236,7 @@ fn no_room_for_the_second_output() {
         let filler = SegmentNumber(number);
         if shard_of(filler) == shard
             && filler != data.number
-            && !volume.table.install(graves.file.clone(), RootId(0), &TailHead { segment: filler, ..head }, &[], &[])
+            && !volume.table.install(graves.file.clone(), RootId(0), &TailHead { segment: filler, ..head }, &[], &[]).expect("populate")
         {
             break;
         }
@@ -2433,7 +2433,7 @@ struct ChangesList<'list> {
 impl ChangesList<'_> {
     fn change(&self) {
         if !self.has_changed.swap(true, Ordering::AcqRel) {
-            self.directory.replace(None, &[SegmentNumber(u64::MAX)]);
+            self.directory.replace(None, &[SegmentNumber(u64::MAX)]).expect("populate");
         }
     }
 }
@@ -5291,4 +5291,76 @@ fn a_merge_damages_a_record_that_fails_its_check() {
         assert_eq!(report.merge_check_failures, failures);
         store.close().expect("close");
     }
+}
+
+// a store reopened over many segments brings in the table's and the directory's lines for the segments it holds, about what they
+// held before the close and far under the room reserved for every segment the table can hold
+#[test]
+fn a_reopen_commits_lines_for_its_segments() {
+    const SEGMENTS: u64 = 300;
+    let io = SimulatedIo::new(Seed(31));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let lines = |store: &Store| {
+        let memory = store.memory_report();
+        memory.segment_table.0 + memory.block_indexes.0
+    };
+    let empty = lines(&store);
+    for segment in 0..SEGMENTS {
+        for number in 0..64 {
+            let key = format!("key-{segment:05}-{number:03}").into_bytes();
+            store.put(COLUMN, &key, &segment.to_le_bytes()).expect("put");
+        }
+        let _number = seal(&store, &io);
+    }
+    let before = lines(&store);
+    // held counts the lists by what they hold now: past the pools and the lists, it stays the heap fixed at open
+    let fixed = |store: &Store| {
+        let memory = store.memory_report();
+        memory.memory_held.0 - memory.pool_committed.0 - memory.list_committed.0
+    };
+    let grown = store.memory_report();
+    assert_eq!(fixed(&store), store.state.fixed_heap.load(Ordering::Acquire), "held left the lists out");
+    assert!(grown.list_committed.0 > 0 && grown.list_committed.0 >= before - empty, "the lists' {} bytes missed what the seals added", grown.list_committed.0);
+    let capacity = store.state.volumes[0].table.capacity() as u64;
+    store.close().expect("close");
+    drop(store);
+    let store = open(&io);
+    let after = lines(&store);
+    eprintln!("lines: {empty} empty, {before} over {SEGMENTS} segments, {after} after the reopen, room for {capacity} segments");
+    assert!(after <= before * 2, "a reopen brought in {after} bytes of lines, {before} before the close");
+    let held = read(&store, b"key-00150-007").expect("a key");
+    assert_eq!(held, 150_u64.to_le_bytes());
+    store.close().expect("close");
+}
+
+// a seal whose table lines can't come into memory fails with the populate's error, not a full table, the store keeps answering
+// every key from its open rows, and the seal goes through once memory is back
+#[test]
+fn a_failed_populate_stops_the_seal_and_reads_go_on() {
+    let io = SimulatedIo::new(Seed(32));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let key = |number: u64| format!("held-{number:04}").into_bytes();
+    for number in 0..200 {
+        store.put(COLUMN, &key(number), &number.to_le_bytes()).expect("put");
+    }
+    reel::growing_list::FAIL_POPULATE.with(|fail| fail.set(true));
+    store.seal_now();
+    settle(&io);
+    let failures = store.memory_report().populate_failures;
+    assert!(failures > 0, "the seal failed for some other reason than memory");
+    for number in 0..200 {
+        assert_eq!(read(&store, &key(number)), Some(number.to_le_bytes().to_vec()), "key {number} after the failed seal");
+    }
+    assert!(!store.state.volumes[0].table.holds_any(), "a segment went in with its lines out of memory, after {failures} failures");
+    reel::growing_list::FAIL_POPULATE.with(|fail| fail.set(false));
+    store.seal_now();
+    settle(&io);
+    cool(&store, &io);
+    assert!(store.state.volumes[0].table.holds_any(), "the seal never went through once memory was back");
+    for number in 0..200 {
+        assert_eq!(read(&store, &key(number)), Some(number.to_le_bytes().to_vec()), "key {number} after the seal");
+    }
+    store.close().expect("close");
 }

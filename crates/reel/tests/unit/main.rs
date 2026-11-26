@@ -16,6 +16,7 @@ mod device_error;
 mod filter_arena;
 mod job_tally;
 mod engine_sizing;
+mod growing_list;
 mod lifetime;
 mod large_writers;
 mod count_race;

@@ -800,6 +800,8 @@ fn main() {
     println!("{report:?}");
     // the gate has to fail a fault outside a populate before its pass over the window means anything
     let mut failures = gate_catches_faults();
+    // the lists that grow with their segments map their memory apart from the allocator
+    let live_grown = live_grown + report.list_committed.0;
     if live_grown.abs_diff(reported) > reported / REPORT_SLACK_DIVISOR {
         println!("memory_report misses the heap by more than a tenth");
         failures += 1;

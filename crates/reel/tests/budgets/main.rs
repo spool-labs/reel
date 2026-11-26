@@ -104,7 +104,8 @@ fn main() {
         );
         println!("{report:?}");
         // the report may miss the heap by the plan's named room, so a hole past it shows at any budget
-        if held > report.budget.0 || (live + report.pool_committed.0).abs_diff(report.heap_total().0) > report.room.0 {
+        // the pools and the lists that grow with their segments map their memory apart from the allocator
+        if held > report.budget.0 || (live + report.pool_committed.0 + report.list_committed.0).abs_diff(report.heap_total().0) > report.room.0 {
             println!("budget {} MiB fails", budget.0 / MIB);
             failures += 1;
         }

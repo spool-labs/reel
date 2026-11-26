@@ -108,7 +108,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.writer.clears_damage = self.is_asked_rebuild();
         let totals = self.writer.finish(&output.file, output.number, self.records_end, &[], state.record_key, &numbers[..self.input_count])?;
         self.name_output(output, self.data_slot)?;
-        if !volume.table.install(output.file.clone(), RootId(output.root as u8), &totals.head, self.writer.columns(), self.writer.entries()) {
+        if !volume.table.install(output.file.clone(), RootId(output.root as u8), &totals.head, self.writer.columns(), self.writer.entries())? {
             return Err(Error::from(ErrorKind::OutOfMemory));
         }
         volume.dead_bits.begin(output.number, self.writer.entries().len() as u32, totals.most_block_rows);
@@ -345,7 +345,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         volume.segments_leaving.fetch_add(leaving, Ordering::AcqRel);
         // a column every row of which went has no entry to swap in
         for directory in state.directories.iter().flatten() {
-            if !directory.replace(None, inputs) {
+            if !directory.replace(None, inputs)? {
                 volume.fail();
             }
         }
@@ -446,12 +446,12 @@ impl<Backend: Io> RewriteJob<Backend> {
     /// Put the outputs in the table, both or neither. No list holds them yet, so no read can have found the first
     pub fn enter_table(&self, volume: &Volume<Backend>) -> Result<()> {
         if let (Some(totals), Some(output)) = (self.totals, &self.output)
-            && !volume.table.install(output.file.clone(), RootId(output.root as u8), &totals.head, self.writer.columns(), self.writer.entries())
+            && !volume.table.install(output.file.clone(), RootId(output.root as u8), &totals.head, self.writer.columns(), self.writer.entries())?
         {
             return Err(Error::from(ErrorKind::OutOfMemory));
         }
         if let (Some(totals), Some(output)) = (self.grave_totals, &self.grave_output)
-            && !volume.table.install(output.file.clone(), RootId(output.root as u8), &totals.head, self.grave_writer.columns(), self.grave_writer.entries())
+            && !volume.table.install(output.file.clone(), RootId(output.root as u8), &totals.head, self.grave_writer.columns(), self.grave_writer.entries())?
         {
             if let (Some(_totals), Some(output)) = (self.totals, &self.output)
                 && let Some(retired) = volume.table.retire(output.number)
@@ -715,8 +715,9 @@ pub fn list_output<'tail, Backend: Io>(
 ) {
     for column in columns {
         let entry = Listing::of_column(column, number, newest_place);
+        // a listing that fits nowhere, or whose pages can't come into memory, fails the volume as before
         if let Some(directory) = &state.directories[column.column.0 as usize]
-            && !directory.replace(Some(&entry), &[])
+            && !matches!(directory.replace(Some(&entry), &[]), Ok(true))
         {
             volume.fail();
         }

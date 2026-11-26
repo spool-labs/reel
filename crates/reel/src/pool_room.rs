@@ -981,7 +981,7 @@ impl RoomPages {
 
 /// Hand an extent's pages back to the kernel. Linux drops them at once with MADV_DONTNEED. On Apple MADV_DONTNEED is a hint the
 /// footprint doesn't show, and MADV_FREE_REUSABLE takes the pages out of it at once
-fn give_pages_back(start: *mut u8, bytes: usize) {
+pub(crate) fn give_pages_back(start: *mut u8, bytes: usize) {
     #[cfg(target_vendor = "apple")]
     let advice = libc::MADV_FREE_REUSABLE;
     #[cfg(not(target_vendor = "apple"))]
@@ -992,7 +992,7 @@ fn give_pages_back(start: *mut u8, bytes: usize) {
 
 /// Tell the kernel an extent given back is in use again before it is populated, which Apple asks for after MADV_FREE_REUSABLE so
 /// the footprint counts the pages once more. Elsewhere there is nothing to say
-fn take_pages_back(start: *mut u8, bytes: usize) {
+pub(crate) fn take_pages_back(start: *mut u8, bytes: usize) {
     #[cfg(target_vendor = "apple")]
     {
         // SAFETY: the caller passes a range inside a reservation that no caller reads or writes yet
@@ -1079,6 +1079,17 @@ fn reserve_flags() -> libc::c_int {
 }
 
 /// Reserve address space that starts on a multiple of `align`, giving back the slack around it
+/// Map room the kernel doesn't charge until a page is written, for a list that grows into it
+pub(crate) fn map_room(bytes: usize) -> Result<NonNull<u8>> {
+    map_aligned(bytes, page_bytes())
+}
+
+/// Unmap room map_room gave
+pub(crate) fn unmap_room(start: *mut u8, bytes: usize) {
+    // SAFETY: the caller passes a whole mapping map_room gave, which nothing reads or writes any more
+    unsafe { libc::munmap(start.cast(), bytes) };
+}
+
 fn map_aligned(bytes: usize, align: usize) -> Result<NonNull<u8>> {
     let slack = if align > page_bytes() { align } else { 0 };
     // SAFETY: an anonymous private mapping with no address asked for touches no memory of ours
@@ -1114,7 +1125,7 @@ fn advise_huge_pages(memory: *mut libc::c_void, reserved: usize, is_huge: bool) 
 
 /// Bring a range into memory, counting its faults as a populate's. On Linux the kernel does it and says when memory ran out, and
 /// a kernel without the advice has the pages touched
-fn populate(start: *mut u8, bytes: usize, page: usize) -> Result<()> {
+pub(crate) fn populate(start: *mut u8, bytes: usize, page: usize) -> Result<()> {
     let _in_flight = MapInFlight::enter();
     let faults_before = thread_faults();
     let populated = populate_written(start, bytes);

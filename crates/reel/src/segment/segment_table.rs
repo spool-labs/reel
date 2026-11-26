@@ -8,7 +8,8 @@ use reel_core::column_id::ColumnId;
 use reel_core::direction::Direction;
 use reel_core::units::{ByteCount, RootId, WritePlace};
 
-use crate::pool::{touched_capacity, touched_filled};
+use crate::growing_list::GrowingList;
+use crate::pool::touched_filled;
 use crate::guard::Shards;
 use crate::segment::block_entry::{BlockEntry, KeyPrefix, SHARED_HEAD_BYTES};
 use crate::segment::footer_reader::first_candidate;
@@ -127,8 +128,11 @@ pub struct TableShard<File> {
     pub segments: Vec<Option<TableEntry<File>>>,
     pub map: NumberMap,
     pub free_slots: Vec<u32>,
-    pub columns: Vec<ColumnTail>,
-    pub blocks: Vec<BlockEntry>,
+    pub columns: GrowingList<ColumnTail>,
+    pub blocks: GrowingList<BlockEntry>,
+    /// Lines live segments hold in the column and block lists, which the holes of retired ones leave short of their lengths
+    pub live_columns: usize,
+    pub live_blocks: usize,
 }
 
 /// The table of a volume
@@ -236,7 +240,7 @@ impl NumberMap {
 
 impl<File: Clone> SegmentTable<File> {
     /// Allocate every pool
-    pub fn new(sizing: &TableSizing) -> Self {
+    pub fn new(sizing: &TableSizing) -> std::io::Result<Self> {
         let mut shards = Vec::with_capacity(TABLE_SHARDS);
         let mut pins = Vec::with_capacity(TABLE_SHARDS);
         let mut walked = Vec::with_capacity(TABLE_SHARDS);
@@ -255,13 +259,16 @@ impl<File: Clone> SegmentTable<File> {
                 segments,
                 map: NumberMap::new(sizing.segments_per_shard),
                 free_slots,
-                columns: touched_capacity(sizing.columns_per_shard, ColumnTail::default()),
-                blocks: touched_capacity(sizing.blocks_per_shard, BlockEntry::default()),
+                // reserved for every segment the shard can hold, and in memory as segments come in
+                columns: GrowingList::reserved(sizing.columns_per_shard)?,
+                blocks: GrowingList::reserved(sizing.blocks_per_shard)?,
+                live_columns: 0,
+                live_blocks: 0,
             }));
             pins.push(shard_pins);
             walked.push(shard_walked);
         }
-        Self { shards: Shards(shards), pins, walked, past_half: AtomicU32::new(0) }
+        Ok(Self { shards: Shards(shards), pins, walked, past_half: AtomicU32::new(0) })
     }
 
     /// Read the heap every shard holds
@@ -270,8 +277,8 @@ impl<File: Clone> SegmentTable<File> {
         for shard in 0..TABLE_SHARDS {
             let guard = self.shards.read(shard);
             total += guard.segments.capacity() * size_of::<Option<TableEntry<File>>>();
-            total += guard.columns.capacity() * size_of::<ColumnTail>();
-            total += guard.blocks.capacity() * size_of::<BlockEntry>();
+            total += guard.columns.ready_bytes();
+            total += guard.blocks.ready_bytes();
             total += guard.free_slots.capacity() * size_of::<u32>();
             total += guard.map.slots.capacity() * (size_of::<u32>() + size_of::<SegmentNumber>());
             total += self.pins[shard].capacity() * size_of::<AtomicU32>() + self.walked[shard].capacity() * size_of::<AtomicBool>();
@@ -279,29 +286,59 @@ impl<File: Clone> SegmentTable<File> {
         ByteCount(total as u64)
     }
 
-    /// Install a sealed segment, or return false when its shard has no room
-    pub fn install(&self, file: File, root: RootId, head: &TailHead, columns: &[ColumnTail], blocks: &[BlockEntry]) -> bool {
+    /// Check the table holds any segment
+    pub fn holds_any(&self) -> bool {
+        (0..TABLE_SHARDS).any(|shard| self.shards.read(shard).segments.iter().any(Option::is_some))
+    }
+
+    /// Read the bytes the shards' line lists hold in memory, which they map apart from the allocator
+    pub fn lines_in_memory(&self) -> u64 {
+        (0..TABLE_SHARDS)
+            .map(|shard| {
+                let guard = self.shards.read(shard);
+                (guard.columns.ready_bytes() + guard.blocks.ready_bytes()) as u64
+            })
+            .sum()
+    }
+
+    /// Install a sealed segment, or return false when its shard has no room. A failure to bring the lines' pages into memory is an
+    /// error of its own, so a caller tells memory from table room
+    pub fn install(&self, file: File, root: RootId, head: &TailHead, columns: &[ColumnTail], blocks: &[BlockEntry]) -> std::io::Result<bool> {
         let mut guard = self.shards.write(shard_of(head.segment));
-        if !guard.has_room(columns, blocks) {
+        // a full list, or one about to bring in pages while retired segments' holes outweigh its live lines, closes the holes first
+        // and hands back the pages past its new end
+        let needs_pages = !guard.columns.is_ready_for(guard.columns.len() + columns.len()) || !guard.blocks.is_ready_for(guard.blocks.len() + blocks.len());
+        if !guard.has_room(columns, blocks) || (needs_pages && guard.has_more_holes_than_live()) {
             guard.compact();
+            let (live_columns, live_blocks) = (guard.columns.len(), guard.blocks.len());
+            guard.columns.give_back_past(live_columns);
+            guard.blocks.give_back_past(live_blocks);
         }
         if !guard.has_room(columns, blocks) {
-            return false;
+            return Ok(false);
         }
+        let (column_count, block_count) = (guard.columns.len() + columns.len(), guard.blocks.len() + blocks.len());
+        guard.columns.make_ready(column_count)?;
+        guard.blocks.make_ready(block_count)?;
         let Some(slot) = guard.free_slots.pop() else {
-            return false;
+            return Ok(false);
         };
+        guard.live_columns += columns.len();
+        guard.live_blocks += blocks.len();
 
         let column_extent = Extent {
             start: guard.columns.len() as u32,
             length: columns.len() as u32,
         };
-        guard.columns.extend_from_slice(columns);
+        // the lines' pages came in above, so they fit
+        let is_in = guard.columns.extend_from_slice(columns);
+        debug_assert!(is_in);
         let block_extent = Extent {
             start: guard.blocks.len() as u32,
             length: blocks.len() as u32,
         };
-        guard.blocks.extend_from_slice(blocks);
+        let is_in = guard.blocks.extend_from_slice(blocks);
+        debug_assert!(is_in);
         guard.segments[slot as usize] = Some(TableEntry {
             number: head.segment,
             file,
@@ -321,7 +358,7 @@ impl<File: Clone> SegmentTable<File> {
         self.walked[shard_of(head.segment)][slot as usize].store(false, Ordering::Release);
         guard.map.insert(head.segment, slot);
         self.note_fill(shard_of(head.segment), &guard);
-        true
+        Ok(true)
     }
 
     /// Read how many segments the table has room for
@@ -560,6 +597,8 @@ impl<File: Clone> SegmentTable<File> {
         let mut guard = self.shards.write(shard);
         let slot = guard.map.get(number)?;
         let entry = guard.segments[slot as usize].take()?;
+        guard.live_columns -= entry.columns.length as usize;
+        guard.live_blocks -= entry.blocks.length as usize;
         guard.map.remove(number);
         Some(RetiredSegment {
             file: entry.file,
@@ -769,6 +808,11 @@ impl<File> TableShard<File> {
     pub fn has_room(&self, columns: &[ColumnTail], blocks: &[BlockEntry]) -> bool {
         self.columns.len() + columns.len() <= self.columns.capacity()
             && self.blocks.len() + blocks.len() <= self.blocks.capacity()
+    }
+
+    /// Check the holes retired segments left outweigh the live lines in either list
+    pub fn has_more_holes_than_live(&self) -> bool {
+        self.columns.len() > 2 * self.live_columns || self.blocks.len() > 2 * self.live_blocks
     }
 
     /// Find a segment's tail of one column

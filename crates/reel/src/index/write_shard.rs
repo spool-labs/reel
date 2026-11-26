@@ -47,7 +47,8 @@ impl ShardSizing {
         // nodes sit several to a page, and the pool keeps a list of the pages it took
         let node_pages = u64::from(self.nodes.0.div_ceil(NODES_PER_PAGE));
         let nodes = node_pages * (NODE_PAGE_BYTES + size_of::<u32>()) as u64;
-        let table = (self.table_slots.next_power_of_two() * size_of::<TableSlot>()) as u64;
+        // the table lives in a mapping of its own, whole system pages of it
+        let table = (self.table_slots.next_power_of_two() * size_of::<TableSlot>()).next_multiple_of(crate::region::page_bytes()) as u64;
         let trees = (self.open_slots * size_of::<WriteTree>()) as u64;
         ByteCount(pages + nodes + table + trees + self.buckets.max(1).next_power_of_two() as u64)
     }
@@ -120,7 +121,8 @@ impl WriteShard {
         Ok(Self {
             nodes: NodePool::growing(sizing.nodes, NodeCount(first_nodes + spare))?,
             slab: EntrySlab::growing(sizing.pages, first_pages)?,
-            table: KeyTable::new(sizing.table_slots),
+            // the table starts in the slab's proportion too, and the reserve job grows it ahead of its keys
+            table: KeyTable::growing(sizing.table_slots, (sizing.table_slots * first_pages.0 as usize).div_ceil(sizing.pages.0.max(1) as usize))?,
             trees: vec![WriteTree::empty(); sizing.open_slots],
             held: ShardHold::default(),
         })
@@ -150,7 +152,12 @@ impl WriteShard {
         // neither can grow
         let are_nodes_short = !self.has_nodes() || !self.rows_fit_nodes(self.held.rows + 1);
         let is_nodes_growing = are_nodes_short && self.nodes.can_grow();
-        (is_nodes_growing || (is_slab_growing && !are_nodes_short)) && self.table.has_room_for(self.held.rows + 1)
+        // a table short of slots waits for the job's grow too
+        let is_table_short = !self.table.has_room_for(self.held.rows + 1);
+        let is_table_growing = is_table_short && self.table.can_grow();
+        // every pool that is short can grow, and one of them is growing
+        let can_wait = (!is_table_short || is_table_growing) && (!are_nodes_short || is_nodes_growing);
+        can_wait && (is_table_growing || is_nodes_growing || is_slab_growing)
     }
 
     /// Check enough nodes are in memory for a row's splits, and ask the job for more when not
@@ -204,13 +211,25 @@ impl WriteShard {
     pub fn waits_for_nodes(&self, need: &ShardNeed) -> Option<bool> {
         let rows = self.held.rows + need.rows;
         let pages = PageCount(self.held.pages.0 + need.pages().0);
-        if !self.table.has_room_for(rows) || !self.slab.has_free_pages(pages) {
+        if !self.slab.has_free_pages(pages) {
             return None;
         }
-        if self.rows_fit_nodes(rows) {
-            return Some(false);
+        // a table or a node pool short of what the job can still bring in waits for it, and either that can't grow seals
+        let is_table_short = !self.table.has_room_for(rows);
+        let are_nodes_short = !self.rows_fit_nodes(rows);
+        if (is_table_short && !self.table.can_grow()) || (are_nodes_short && !self.nodes.can_grow()) {
+            return None;
         }
-        self.nodes.can_grow().then_some(true)
+        Some(is_table_short || are_nodes_short)
+    }
+
+    /// Grow the key table when it is past half the keys its size takes or a writer found it short, and say whether it grew. The
+    /// reserve job runs this under the shard's write lock
+    pub fn grow_table(&mut self) -> Result<bool> {
+        if self.table.wants_to_grow() || (self.table.can_grow() && !self.table.has_room_for(self.held.rows + 1)) {
+            return self.table.grow();
+        }
+        Ok(false)
     }
 
     /// Give back what a batch held

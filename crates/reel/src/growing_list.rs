@@ -161,6 +161,7 @@ impl<Item: Copy> Default for GrowingList<Item> {
 impl<Item: Copy> Deref for GrowingList<Item> {
     type Target = [Item];
 
+    #[inline]
     fn deref(&self) -> &[Item] {
         // SAFETY: the first `length` items are written, in pages in memory
         unsafe { std::slice::from_raw_parts(self.base.as_ptr(), self.length) }

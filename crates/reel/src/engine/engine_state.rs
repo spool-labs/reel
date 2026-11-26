@@ -917,6 +917,8 @@ impl<Backend: Io> EngineState<Backend> {
             let buffer = volume.summary_buffer.heap_bytes(|buffer| ByteCount(buffer.heap_bytes() as u64));
             report.summary = ByteCount(report.summary.0 + hold(&volume.summary).heap_bytes().0 + buffer.0);
         }
+        // the write index's key tables grow the same way, and count in its heap too
+        report.list_committed = ByteCount(report.list_committed.0 + self.index.key_tables_in_memory());
         let readers = self.record_readers.heap_bytes(RecordReader::heap_bytes);
         let footers = self.footer_readers.heap_bytes(FooterReader::heap_bytes);
         report.read_buffers = ByteCount(readers.0 + footers.0 + self.job_footer_readers.heap_bytes(FooterReader::heap_bytes).0);
@@ -961,7 +963,7 @@ impl<Backend: Io> EngineState<Backend> {
                 total += directory.spare_bytes().0;
             }
         }
-        total + self.volumes.iter().map(|volume| volume.table.lines_in_memory()).sum::<u64>()
+        total + self.volumes.iter().map(|volume| volume.table.lines_in_memory()).sum::<u64>() + self.index.key_tables_in_memory()
     }
 
     pub fn heap_bytes(&self) -> ByteCount {

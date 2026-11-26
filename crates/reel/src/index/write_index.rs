@@ -72,9 +72,36 @@ impl WriteIndex {
     pub fn step_node_pools(&self, is_pressed: bool) -> bool {
         let mut is_given = false;
         for index in 0..SHARD_COUNT {
-            is_given |= self.shards.write(index).nodes.step_idle(is_pressed);
+            let mut shard = self.shards.write(index);
+            if shard.nodes.step_idle(is_pressed) {
+                is_given = true;
+                // a shard whose nodes went back holds no key, so its table goes back to its first size too
+                let _shrunk = shard.table.shrink_if_empty();
+            }
         }
         is_given
+    }
+
+    /// Grow every shard's key table that is past half its keys or that a writer found short, ahead of the writers. The reserve job
+    /// runs this on its own thread. Say whether any grew
+    pub fn grow_key_tables(&self) -> bool {
+        let mut is_grown = false;
+        for index in 0..SHARD_COUNT {
+            // a look under the read lock first, so a step that grows nothing takes no write lock
+            let wants = {
+                let shard = self.shards.read(index);
+                shard.table.wants_to_grow() || (shard.table.can_grow() && !shard.table.has_room_for(shard.held.rows + 1))
+            };
+            if wants {
+                is_grown |= self.shards.write(index).grow_table().unwrap_or(false);
+            }
+        }
+        is_grown
+    }
+
+    /// Read the bytes every shard's key table holds in memory, which it maps apart from the allocator
+    pub fn key_tables_in_memory(&self) -> u64 {
+        (0..SHARD_COUNT).map(|index| self.shards.read(index).table.heap_bytes().0).sum()
     }
 
     /// Read the heap every shard holds

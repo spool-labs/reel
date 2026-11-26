@@ -175,6 +175,8 @@ impl<Backend: Io> ReserveJob<Backend> {
         #[cfg(not(feature = "test-hooks"))]
         let is_asked = false;
         let _given = self.state.index.step_node_pools(is_asked);
+        // key tables grow ahead of their keys, on this thread, so a writer seldom waits for one
+        let _grown = self.state.index.grow_key_tables();
         if is_asked {
             for room in &self.state.index.rooms() {
                 let _given = room.release_spare();

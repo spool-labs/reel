@@ -858,10 +858,26 @@ impl ScanState {
         self.closest_head.is_some_and(|head| !self.heads[head].is_bound && self.heads[head].key == key)
     }
 
-    /// End a batch: one that passed a key for a row newer than its point and located nothing after it takes the walk back to that
-    /// key, since the walk would otherwise end past a key whose put returned before the walk's next step
+    /// End a batch. One that passed rows it hides after its last entry, graves, rows under a range delete or rows newer than its
+    /// point, takes the walk back to that entry: a put that lands between the entry and the passed rows while the caller steps the
+    /// batch out is at or below the next batch's point, and the next batch would otherwise start past it. A row passed newer than
+    /// the point lies past the last entry too, so going back to the entry takes it in. A batch with no entries passed rows alone
+    /// and reached the end, or a newer row, and keeps going from there, so a tail of hidden rows longer than a batch still ends.
+    /// One that passed a key for a row newer than its point and located nothing goes back to that key, since the walk would
+    /// otherwise end past a key whose put returned before the walk's next step
     pub fn end_batch(&mut self) {
-        if self.newer_passed_at.take() == Some(self.batch.entries.len()) {
+        let is_newer_last = self.newer_passed_at.take() == Some(self.batch.entries.len());
+        if let Some(last) = self.batch.entries.last() {
+            let key = key_in(&self.batch.keys, (&self.sorted, &self.sorted_spare, self.sorted_turn), last);
+            if self.is_inclusive || self.position != key {
+                self.position.clear();
+                self.position.extend_from_slice(key);
+                self.is_inclusive = false;
+                self.reseat(self.generation);
+            }
+            return;
+        }
+        if is_newer_last {
             mem::swap(&mut self.position, &mut self.newer_passed);
             self.is_inclusive = true;
             self.reseat(self.generation);

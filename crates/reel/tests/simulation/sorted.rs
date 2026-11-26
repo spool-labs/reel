@@ -1956,6 +1956,20 @@ fn walk_beside_writer(store: &Store, io: &SimulatedIo, model: &mut Model, random
 #[test]
 fn writes_beside_batches_match_the_model() {
     for seed in seeds(0..WRITER_SEEDS) {
+        writes_beside_batches(seed);
+    }
+}
+
+// seed 1127449: a batch answered up to a key, passed the graves past it to the column's end, and a put landed between the key and
+// the graves while the batch stepped out. The next batch, at a point past the put, started past the graves and ended early
+#[test]
+fn a_put_behind_passed_graves_shows_in_the_next_batch() {
+    writes_beside_batches(1_127_449);
+}
+
+// one seed of the walks beside a writer, each batch answering every row at or below its point
+fn writes_beside_batches(seed: u64) {
+    {
         let io = SimulatedIo::new(Seed(seed));
         let store = open(&io, CAPACITY);
         let mut model = Model::new();
@@ -4612,5 +4626,99 @@ fn two_busy_indexes_share_the_idle_room_by_their_keys() {
     let (ceilings, shares, extent) = reopen_shares(store, &io, &busy);
     for (place, id) in busy.iter().enumerate() {
         assert!(ceilings[place].abs_diff(shares[place]) <= extent, "column {id:?}: {} at run time, {} at the reopen", ceilings[place], shares[place]);
+    }
+}
+
+/// How a walk's tail of rows is hidden in the tail-walk tests
+#[derive(Clone, Copy, Debug)]
+enum Hidden {
+    /// Each tail key deleted on its own, a grave a row
+    Graves,
+    /// One range delete over the whole tail
+    Range,
+}
+
+// a walk told to want every row takes them all in one batch, which then passes the hidden tail to the column's end. A put lands
+// just past the last live key, between it and the hidden tail, while the walk steps the batch out: the next batch, at a point past
+// the put, answers it, and the walk ends after it. With a seal between the put and that batch, the put shows from a segment
+fn walk_past_a_hidden_tail(seed: u64, direction: Direction, hidden: Hidden, is_seal_between: bool, tail: u64) {
+    let io = SimulatedIo::new(Seed(seed));
+    let store = open(&io, CAPACITY);
+    let total = KEYS;
+    let mut names: Vec<Vec<u8>> = (0..total).map(key).collect();
+    for name in &names {
+        store.put(COLUMN, name, b"live").expect("put");
+    }
+    seal_all(&store, &io);
+    names.sort();
+    if direction == Direction::Descending {
+        names.reverse();
+    }
+    // the tail is the last keys in the walk's direction, hidden past the live ones
+    let (live, hidden_keys) = names.split_at((total - tail) as usize);
+    match hidden {
+        Hidden::Graves => {
+            for name in hidden_keys {
+                store.delete(COLUMN, name).expect("delete");
+            }
+        },
+        Hidden::Range => match direction {
+            // the range takes keys of the column's width, and no key the sims write is all 0xFF or all zero
+            Direction::Ascending => store.delete_range(COLUMN, &hidden_keys[0], &[0xFF; WIDTH as usize]).expect("range delete"),
+            Direction::Descending => store.delete_range(COLUMN, &[0; WIDTH as usize], &live[live.len() - 1]).expect("range delete"),
+        },
+    }
+    let last_live = live.last().expect("a live key").clone();
+    // a key between the last live one and the hidden tail, one step further in the walk's direction
+    let mut behind = last_live.clone();
+    match direction {
+        Direction::Ascending => *behind.last_mut().expect("a byte") += 1,
+        Direction::Descending => *behind.last_mut().expect("a byte") -= 1,
+    }
+    assert!(!names.contains(&behind));
+    let start = match direction {
+        Direction::Ascending => Vec::new(),
+        Direction::Descending => vec![0xFF; WIDTH as usize + 1],
+    };
+    let range = reel::engine::scan_state::from_key(COLUMN, &start, direction).wanting(RowCount(total));
+    let mut scan = store.state.take_scan(&range, None).expect("scan");
+    let (mut name, mut value) = (Vec::new(), Vec::new());
+    let mut answered = Vec::new();
+    loop {
+        let step = store.state.step_scan(&mut scan, &mut name, reel::engine::scan_path::ScanWant::Value(&mut value)).expect("step");
+        match step {
+            ScanStep::Found => answered.push(name.clone()),
+            ScanStep::End => break,
+            ScanStep::Corrupt => panic!("a corrupt record"),
+        }
+        // the put lands once the walk has the last live key, from the batch that went on to pass the tail
+        if answered.len() == live.len() {
+            store.put(COLUMN, &behind, b"behind").expect("put");
+            if is_seal_between {
+                store.seal_now();
+                settle(&io);
+            }
+        }
+    }
+    store.state.give_back_scan(scan);
+    let mut expected: Vec<Vec<u8>> = live.to_vec();
+    expected.push(behind);
+    assert_eq!(answered.len(), expected.len(), "{direction:?} {hidden:?} sealed {is_seal_between} tail {tail}: the walk answered {} of {} rows", answered.len(), expected.len());
+    assert_eq!(answered, expected, "{direction:?} {hidden:?} sealed {is_seal_between} tail {tail}");
+    store.close().expect("close");
+}
+
+// a put that lands behind a batch's passed tail of graves or a range delete shows in the next batch, either way the walk goes,
+// with or without a seal between, and a tail longer than one batch still ends
+#[test]
+fn a_put_behind_a_hidden_tail_shows_either_way() {
+    for direction in [Direction::Ascending, Direction::Descending] {
+        for hidden in [Hidden::Graves, Hidden::Range] {
+            for is_seal_between in [false, true] {
+                walk_past_a_hidden_tail(62, direction, hidden, is_seal_between, 8);
+            }
+        }
+        // a tail of graves far past a batch's keys
+        walk_past_a_hidden_tail(63, direction, Hidden::Graves, false, KEYS / 2);
     }
 }

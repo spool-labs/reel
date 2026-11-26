@@ -655,6 +655,8 @@ pub struct MaintenanceReport {
     pub heads_together: u64,
     /// Records merges found failing their check as they copied them, each of which damaged its segment
     pub merge_check_failures: u64,
+    /// Large records a merge found punched because the walk freed them in place as dead, and dropped as superseded
+    pub merge_freed_drops: u64,
     /// Bytes of sealed records the scrub checked, the passes it ended, and the records that failed their check, each of which
     /// damaged its segment
     pub scrub_bytes: u64,
@@ -800,6 +802,7 @@ impl MaintenanceReport {
             seats_together: 0,
             heads_together: 0,
             merge_check_failures: 0,
+            merge_freed_drops: 0,
             scrub_bytes: 0,
             scrub_passes: 0,
             scrub_failures: 0,

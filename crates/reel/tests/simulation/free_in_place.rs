@@ -805,3 +805,78 @@ fn an_open_record_payload_is_not_summed() {
     assert_ne!(found, written, "the open record was summed");
     store.close().expect("close");
 }
+
+// a merge that goes by its own rows, as one does whose dead counts a crash took, keeps a large record the walk freed as dead and
+// finds its blocks punched: a get finds a newer row for its key, so the merge drops it as superseded, damages nothing, and every
+// key reads. A record still its key's newest fails as before
+#[test]
+fn a_merge_that_keeps_a_freed_record_drops_it() {
+    let io = SimulatedIo::new(Seed(45));
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    volume.holds.compaction.store(true, Ordering::Release);
+    keep_live(&store);
+    store.put(COLUMN, b"key", &large(1)).expect("put");
+    // a dead row of its own, so a merge of the segment alone has something to drop
+    store.put(COLUMN, b"twice", b"first").expect("put");
+    store.put(COLUMN, b"twice", b"second").expect("put");
+    let older = seal(&store, &io);
+    store.put(COLUMN, b"key", &large(2)).expect("put");
+    seal(&store, &io);
+    assert!(volume.bytes_freed.load(Ordering::Acquire) > 0, "the walk freed nothing");
+    assert!(volume.table.holds(older), "the older segment left before the merge");
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    job.rewrite.forced = Some(older);
+    job.rewrite.is_blind_outside = true;
+    assert!(job.rewrite.start(), "the merge never started");
+    while job.rewrite.is_running() {
+        job.rewrite.step();
+    }
+    assert!(hold(&volume.damaged).is_empty(), "the merge damaged a segment over a record freed as dead");
+    assert_eq!(store.state.merge_check_failures.load(Ordering::Relaxed), 0);
+    assert!(store.state.merge_freed_drops.load(Ordering::Relaxed) > 0, "the merge never met the freed record");
+    assert!(!volume.table.holds(older), "the merge never installed");
+    assert_eq!(read(&store, b"key"), Some(large(2)));
+    assert_eq!(read(&store, b"twice"), Some(b"second".to_vec()));
+    assert_eq!(read(&store, b"keep-1"), Some(large(3)));
+    store.close().expect("close");
+}
+
+// a power cut before any sync, while seals and the walk free the old value under an unsynced replacement: the old value or the new
+// one reads whole, and nothing is damaged, since a free names only a replacement a seal has synced
+#[test]
+fn a_power_cut_before_the_replacement_syncs_loses_no_value() {
+    for crash_at in 0..CRASH_POINTS {
+        let io = SimulatedIo::new(Seed(46));
+        let store = open(&io);
+        keep_live(&store);
+        store.put(COLUMN, b"key", &large(1)).expect("put");
+        seal(&store, &io);
+        // no flush: the replacement is in the open segment until its seal syncs it
+        store.put(COLUMN, b"key", &large(2)).expect("put");
+        store.seal_now();
+        io.arm_crash(OperationCount(crash_at));
+        for _step in 0..STEPS {
+            if io.is_crashed() {
+                break;
+            }
+            if io.step_any().is_none() {
+                io.advance_clock(TICK);
+                if io.step_any().is_none() {
+                    break;
+                }
+            }
+        }
+        io.power_cut();
+        drop(store);
+
+        let store = open(&io);
+        store.seal_now();
+        settle(&io);
+        let value = read(&store, b"key");
+        assert!(value == Some(large(1)) || value == Some(large(2)), "crash at {crash_at}: the key read {:?}", value.map(|value| value.len()));
+        assert_eq!(read(&store, b"keep-1"), Some(large(3)), "crash at {crash_at}");
+        assert!(hold(&store.state.volumes[0].damaged).is_empty(), "crash at {crash_at}");
+        store.close().expect("close");
+    }
+}

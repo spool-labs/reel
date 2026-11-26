@@ -853,6 +853,13 @@ fn random_faults() {
     }
 }
 
+// seed 1127197: a merge that went by its own rows after crashes kept a large record the walk had freed as dead, found it punched,
+// and damaged its segment's whole column, so a get of another key refused
+#[test]
+fn a_merge_after_crashes_drops_a_freed_record() {
+    Run::new(1_127_197, false).run();
+}
+
 // the same with rot: a read matches or says it can't, and never answers older or missing
 #[test]
 fn random_rot() {

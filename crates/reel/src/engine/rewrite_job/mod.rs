@@ -493,6 +493,9 @@ pub struct RewriteJob<Backend: Io> {
     /// A test stops the install at its retire, and finishes it with finish_held_install
     #[cfg(feature = "test-hooks")]
     pub stop_after_retire: bool,
+    /// A test has the merge go by its own rows, as one does whose dead counts a crash took, so a row dead elsewhere stays
+    #[cfg(feature = "test-hooks")]
+    pub is_blind_outside: bool,
     #[cfg(feature = "test-hooks")]
     pub held_install: Option<Retiring<Backend::File>>,
     pub rebuild_blocks: u32,
@@ -621,6 +624,8 @@ impl<Backend: Io> RewriteJob<Backend> {
             rebuild: None,
             #[cfg(feature = "test-hooks")]
             stop_after_retire: false,
+            #[cfg(feature = "test-hooks")]
+            is_blind_outside: false,
             #[cfg(feature = "test-hooks")]
             held_install: None,
             rebuild_blocks: 0,

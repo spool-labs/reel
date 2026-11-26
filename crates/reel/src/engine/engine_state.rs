@@ -179,6 +179,8 @@ pub struct EngineState<Backend: Io> {
     pub heads_together: AtomicU64,
     /// Records a merge found failing their check as it copied them, each of which damaged its segment
     pub merge_check_failures: AtomicU64,
+    /// Large records a merge found punched because the walk freed them in place as dead, which it dropped as superseded
+    pub merge_freed_drops: AtomicU64,
     /// The scrub's rate in bytes a second, 0 for none, and its bytes checked, passes ended and records that failed their check
     pub scrub_rate: u64,
     pub scrub_bytes: AtomicU64,
@@ -968,15 +970,17 @@ impl Drop for IndexWait<'_> {
 impl<Backend: Io> EngineState<Backend> {
     /// Check the row at a place is still its key's newest. A failed lookup reads as no
     pub fn is_newest_row(&self, index: usize, column: ColumnId, key: &[u8], place: WritePlace) -> bool {
+        self.newest_place(index, column, key) == Some(place)
+    }
+
+    /// Find the place of a key's newest row below the read point, as a get finds it: its open row or its newest sealed one. None
+    /// when it has none, or the search couldn't say
+    pub fn newest_place(&self, index: usize, column: ColumnId, key: &[u8]) -> Option<WritePlace> {
         let volume = &self.volumes[index];
-        let Ok(read) = self.key_read(column, key, self.read_point(volume), false) else {
-            return false;
-        };
+        let read = self.key_read(column, key, self.read_point(volume), false).ok()?;
         let found = self.index.lookup(column, key, read.read_point, volume.view());
-        let Ok(sealed) = in_place(self.search_sealed(&InPlace, volume, &read)) else {
-            return false;
-        };
-        newest_of(found.row, sealed).place() == Some(place)
+        let sealed = in_place(self.search_sealed(&InPlace, volume, &read)).ok()?;
+        newest_of(found.row, sealed).place()
     }
 
     /// Move the count and every volume's mark past a place an open found, so no volume starts below a row it holds

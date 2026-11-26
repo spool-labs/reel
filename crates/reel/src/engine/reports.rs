@@ -191,6 +191,7 @@ impl<Backend: Io> EngineState<Backend> {
         report.seats_together = self.seats_together.load(Ordering::Relaxed);
         report.heads_together = self.heads_together.load(Ordering::Relaxed);
         report.merge_check_failures = self.merge_check_failures.load(Ordering::Relaxed);
+        report.merge_freed_drops = self.merge_freed_drops.load(Ordering::Relaxed);
         report.scrub_bytes = self.scrub_bytes.load(Ordering::Relaxed);
         report.scrub_passes = self.scrub_passes.load(Ordering::Relaxed);
         report.scrub_failures = self.scrub_failures.load(Ordering::Relaxed);

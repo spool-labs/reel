@@ -20,7 +20,7 @@ use crate::engine::read_path::SealedRow;
 use crate::engine::open_segment::output_path;
 use crate::engine::seal_job::MOST_SEGMENT_BLOCKS;
 use crate::engine::volume::{GRAVE_SLOT, MOST_MERGE_OUTPUTS, RewriteOutput, Volume};
-use crate::engine::walk_job::add_count;
+use crate::engine::walk_job::{FREE_IN_PLACE_BYTES, add_count};
 use crate::guard::hold;
 use crate::io::{InPlace, Io, IoFile, in_place};
 use crate::record::record_check::RecordIdentity;
@@ -362,6 +362,12 @@ impl<Backend: Io> RewriteJob<Backend> {
             // a cover whose walk has counted what it hides replaces a row as a newer row does
             self.cover_place = if self.is_unwalked { None } else { volume.covers.newest_applied(column, &self.key) };
             // an unwalked merge goes by its own rows, so it runs at the disk's rate and leaves the rest to the output's walk
+            #[cfg(feature = "test-hooks")]
+            if self.is_blind_outside {
+                self.newest_place = None;
+                let own = (!is_top).then_some(self.top_place);
+                return Ok(own.max(self.cover_place).filter(|place| *place > row.place));
+            }
             self.newest_place = match self.bit_answer(volume, column, row)? {
                 Some(answer) => answer,
                 None => {
@@ -547,6 +553,10 @@ impl<Backend: Io> RewriteJob<Backend> {
             // is in hand. The copy just read it, so the check reads the page cache
             Some(offset) if row.kind == RowKind::Value && row.length.0 > SUMMED_RECORD_BYTES => {
                 if !self.is_record_sound(&pin.file, (column, row), None) {
+                    // its bytes are already across in the run, where they stay as dead space no row names
+                    if self.drop_freed(column, row) {
+                        return Ok(());
+                    }
                     let failed = self.failed_check();
                     return Err(self.note_lost(pin.head.segment, failed));
                 }
@@ -555,7 +565,11 @@ impl<Backend: Io> RewriteJob<Backend> {
             Some(offset) => offset,
             None => {
                 volume.keyed_copies.fetch_add(1, Ordering::Relaxed);
-                self.copy_record(&pin.file, &output.file, (column, row)).map_err(|error| self.note_lost(pin.head.segment, error))?
+                match self.copy_record(&pin.file, &output.file, (column, row)) {
+                    Ok(offset) => offset,
+                    Err(error) if error.kind() == ErrorKind::InvalidData && self.drop_freed(column, row) => return Ok(()),
+                    Err(error) => return Err(self.note_lost(pin.head.segment, error)),
+                }
             },
         };
         let kept = FooterRow { offset, ..*row };
@@ -751,6 +765,24 @@ impl<Backend: Io> RewriteJob<Backend> {
         let location = RecordLocation { offset: row.offset, length: row.length };
         let mut reader = self.state.record_reader_for(&InPlace);
         matches!(in_place(reader.check_stored(&InPlace, from, location, &identity)), Ok(RecordRead::Valid))
+    }
+
+    /// Drop a large record that failed its check because the walk freed it in place as dead, and say whether it went. A crash can
+    /// take the walk's count of its death from the dead bits the merge decided by, and then the merge keeps it and finds its
+    /// blocks punched. A key with a newer row than the record, as a get finds it, says it was superseded, and it drops as any
+    /// superseded row does. A record still the newest stays a failure, which damages its segment
+    pub fn drop_freed(&mut self, column: ColumnId, row: &FooterRow) -> bool {
+        if row.kind != RowKind::Value || row.length < FREE_IN_PLACE_BYTES {
+            return false;
+        }
+        let Some(newer) = self.state.newest_place(self.volume, column, &self.key).filter(|newer| *newer > row.place) else {
+            return false;
+        };
+        self.lowest_dropped = self.lowest_dropped.min(row.place);
+        self.highest_replacement = self.highest_replacement.max(newer);
+        self.dropped_rows += 1;
+        self.state.merge_freed_drops.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     /// Stop the merge over a record that failed its check. A free since the merge began can have punched a record it keeps, so

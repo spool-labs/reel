@@ -1728,6 +1728,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> Result<Engin
         seats_together: AtomicU64::new(0),
         heads_together: AtomicU64::new(0),
         merge_check_failures: AtomicU64::new(0),
+        merge_freed_drops: AtomicU64::new(0),
         scrub_rate: config.threads.scrub_bytes_per_second,
         scrub_bytes: AtomicU64::new(0),
         scrub_passes: AtomicU64::new(0),

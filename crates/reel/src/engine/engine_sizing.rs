@@ -611,7 +611,8 @@ pub fn split_idle_room(cache_room: u64, stripe: u64, base_rows: u64, row_block_b
     }
 }
 
-/// What one sorted index asks of the caches: its bytes, or its whole part of the cap for an empty index with no least rows
+/// What one sorted index asks of the caches: its bytes, or its whole part of the cap for an empty index with no least rows in a
+/// store whose every index is empty
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IndexAsk {
     Bytes(ByteCount),
@@ -619,9 +620,10 @@ pub enum IndexAsk {
 }
 
 /// Work out a sorted index's ask: the keys it held at open times the growth with the headroom past them, and at least its least
-/// rows
-pub fn index_ask(width: usize, keys: u64, least_rows: Option<RowCount>, headroom: ByteCount) -> IndexAsk {
-    if keys == 0 && least_rows.is_none() {
+/// rows. An empty index with no least rows asks its whole part of the cap only while every index is empty, a fresh store with no
+/// keys to share by, and its headroom alone once any index holds keys, so a busy column takes the room an idle one never used
+pub fn index_ask(width: usize, keys: u64, least_rows: Option<RowCount>, headroom: ByteCount, is_store_empty: bool) -> IndexAsk {
+    if keys == 0 && least_rows.is_none() && is_store_empty {
         return IndexAsk::Part;
     }
     let rows = keys.saturating_mul(INDEX_GROWTH).max(least_rows.map_or(0, |least| least.0));

@@ -109,10 +109,11 @@ pub fn rebalance<Backend: Io>(state: &EngineState<Backend>) -> bool {
     }
     // the open-time rule over every index's keys now, the keys it holds and the rows past its room, as share_indexes shares it,
     // each grant rounded down to whole rows' pages as open rounds it
+    let keys_of = |place: usize| index_at(place).map_or(0, |index| index.entry_count().0 + index.past_capacity().0);
+    let is_store_empty = places.clone().all(|place| keys_of(place) == 0);
     let ask = |place: usize| {
         let (_column, width, least) = plan.columns[place];
-        let keys = index_at(place).map_or(0, |index| index.entry_count().0 + index.past_capacity().0);
-        match index_ask(width, keys, least, plan.headroom) {
+        match index_ask(width, keys_of(place), least, plan.headroom, is_store_empty) {
             IndexAsk::Bytes(bytes) => bytes.0,
             IndexAsk::Part => plan.cap / plan.columns.len().max(1) as u64,
         }

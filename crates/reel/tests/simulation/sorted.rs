@@ -4523,12 +4523,18 @@ fn split_config() -> StoreConfig {
 // batches, and check after every step that the indexes' ceilings stay under the cap, no cache moves, and no index's ceiling
 // falls under what it holds and a step. Returns each busy column's keys
 fn fill_split(store: &Store, io: &SimulatedIo, busy: &[ColumnId], times: u64) -> Vec<u64> {
+    fill_split_beside(store, io, busy, times, (64, true))
+}
+
+// fill_split with this many keys in each idle column, none for truly empty ones. A fill that takes past what the idle columns
+// leave reaches the caches past their floors' rounding, so it says whether the caches must stay as they are
+fn fill_split_beside(store: &Store, io: &SimulatedIo, busy: &[ColumnId], times: u64, (idle_keys, is_caches_fixed): (u64, bool)) -> Vec<u64> {
     let plan = store.state.rebalance_plan.as_ref().expect("a plan");
     let job = reel::engine::reserve_job::ReserveJob::new(Arc::clone(&store.state));
     let caches = store.memory_report().cache_ceilings;
     let given = store.memory_report().cache_shards_given;
     for id in (1..=SPLIT_COLUMNS).map(ColumnId).filter(|id| !busy.contains(id)) {
-        for number in 0..64 {
+        for number in 0..idle_keys {
             store.put(id, &key(number), b"idle").expect("put");
         }
     }
@@ -4556,8 +4562,10 @@ fn fill_split(store: &Store, io: &SimulatedIo, busy: &[ColumnId], times: u64) ->
                 assert!(room.ceiling() >= room.committed() + room.step() || room.ceiling() >= room.reserved(), "a ceiling fell under what its index holds and a step");
             }
             let memory = store.memory_report();
-            assert_eq!(memory.cache_ceilings, caches, "a cache's ceiling moved when the room came from the indexes");
-            assert_eq!(memory.cache_shards_given, given, "a cache shard went back when the room came from the indexes");
+            if is_caches_fixed {
+                assert_eq!(memory.cache_ceilings, caches, "a cache's ceiling moved when the room came from the indexes");
+                assert_eq!(memory.cache_shards_given, given, "a cache shard went back when the room came from the indexes");
+            }
             let now = memory.rebalances;
             if keys >= least && now > rebalances {
                 break;
@@ -4721,4 +4729,97 @@ fn a_put_behind_a_hidden_tail_shows_either_way() {
         // a tail of graves far past a batch's keys
         walk_past_a_hidden_tail(63, direction, Hidden::Graves, false, KEYS / 2);
     }
+}
+
+// a fresh store whose every index is empty gives each its whole part of the cap, as before the rule, and a reopen with one busy
+// column and the rest empty asks the empty ones their headroom alone and gives the busy one the rest
+#[test]
+fn empty_indexes_ask_a_part_only_while_every_index_is_empty() {
+    let io = SimulatedIo::new(Seed(66));
+    let store = ReelStore::open(io.clone(), &split_config()).expect("open");
+    let plan = store.state.rebalance_plan.as_ref().expect("a plan");
+    let (cap, headroom) = (plan.cap, plan.headroom);
+    let part = cap / u64::from(SPLIT_COLUMNS);
+    for reading in report(&store).sorted_columns.iter() {
+        assert_eq!(reading.asked_bytes.0, part, "a fresh store's empty index asked other than its part: {reading:?}");
+    }
+    let busy = ColumnId(5);
+    for number in 0..20_000 {
+        store.put(busy, &key(number), b"busy").expect("put");
+    }
+    seal_all(&store, &io);
+    store.close().expect("close");
+    drop(store);
+    let store = ReelStore::open(io.clone(), &split_config()).expect("open");
+    let empty_ask = reel::index::sorted_keys::planned_index_bytes(WIDTH as usize, RowCount(0)).0 + headroom.0;
+    let busy_ask = reel::index::sorted_keys::planned_index_bytes(WIDTH as usize, RowCount(20_000 * reel::engine::engine_sizing::INDEX_GROWTH)).0 + headroom.0;
+    for reading in report(&store).sorted_columns.iter() {
+        let asked = if reading.column == busy { busy_ask } else { empty_ask };
+        assert_eq!(reading.asked_bytes.0, asked, "{reading:?}");
+    }
+    let got = report(&store).sorted_columns.iter().find(|reading| reading.column == busy).expect("a reading").got_bytes.0;
+    // the busy column gets its whole ask while the asks fit the cap, up to the cap less the empty columns' headroom
+    let others = empty_ask * (u64::from(SPLIT_COLUMNS) - 1);
+    assert!(got <= busy_ask && got + others <= cap && got + reel::index::sorted_keys::PAGE_BYTES as u64 * 4 >= busy_ask.min(cap - others), "the busy column got {got} of {busy_ask}");
+    store.close().expect("close");
+}
+
+// one busy column among seventeen truly empty ones takes far more than half the cap with no reopen, since the empty ones ask
+// their headroom once it holds keys
+#[test]
+fn a_busy_index_beside_empty_ones_takes_most_of_the_cap() {
+    let io = SimulatedIo::new(Seed(67));
+    let store = ReelStore::open(io.clone(), &split_config()).expect("open");
+    store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
+    let cap = store.state.rebalance_plan.as_ref().expect("a plan").cap;
+    let busy = [ColumnId(5)];
+    let _keys = fill_split_beside(&store, &io, &busy, 12, (0, false));
+    let reading = report(&store).sorted_columns.iter().find(|reading| reading.column == busy[0]).copied().expect("a reading");
+    assert!(!reading.is_marked, "the busy column stayed marked: {reading:?}");
+    assert!(reading.ceiling.0 > cap / 2, "the busy column's ceiling {} stopped under half the cap {cap}", reading.ceiling.0);
+    store.close().expect("close");
+}
+
+// an empty column that wakes up after a busy one took the room gets its own back by the rule, with at most one mark and refill
+#[test]
+fn an_empty_index_that_wakes_gets_room_back() {
+    let io = SimulatedIo::new(Seed(68));
+    let store = ReelStore::open(io.clone(), &split_config()).expect("open");
+    store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
+    // the busy column takes a few parts' worth, leaving room it doesn't use for a column that wakes later
+    let _keys = fill_split_beside(&store, &io, &[ColumnId(5)], 3, (0, true));
+    let late = ColumnId(9);
+    let job = reel::engine::reserve_job::ReserveJob::new(Arc::clone(&store.state));
+    let share = store.state.sorted_index(late).expect("an index").room().share() as u64;
+    let rows = reel::index::sorted_keys::rows_for_bytes(WIDTH as usize, ByteCount(share)).0;
+    // a mark that stands across steps is one mark: count the times one began
+    let (mut marks, mut was_marked) = (0, false);
+    let refills = store.memory_report().sorted_refills;
+    for number in 0..rows * 2 {
+        store.put(late, &key(number), b"late").expect("put");
+        if number % 4_096 == 4_095 {
+            seal_all(&store, &io);
+            job.grow_pools();
+            let is_marked = store.state.sorted_index(late).expect("an index").mark().is_some();
+            marks += u64::from(is_marked && !was_marked);
+            was_marked = is_marked;
+        }
+    }
+    seal_all(&store, &io);
+    for _decay in 0..3 {
+        io.advance_clock(reel_core::units::Nanoseconds(reel::pool_room::DECAY_NANOS));
+        let _target = job.hold_to_target(io.now().0);
+        for volume in 0..store.state.volumes.len() {
+            while let Some(mut refill) = store.state.start_sorted_refill(volume) {
+                while store.state.sorted_refill_step(volume, &mut refill).expect("refill step") {}
+            }
+        }
+    }
+    let reading = report(&store).sorted_columns.iter().find(|reading| reading.column == late).copied().expect("a reading");
+    let refilled = store.memory_report().sorted_refills - refills;
+    eprintln!("the late column marked {marks} times and was refilled {refilled} times, and ended {reading:?}");
+    assert!(marks <= 1, "the late column marked {marks} times on its way to its room");
+    assert!(!reading.is_marked && reading.rows_past_capacity.0 == 0, "the late column stayed marked: {reading:?}");
+    assert!(reading.ceiling.0 >= share, "the late column holds less room than its first share");
+    store.close().expect("close");
 }

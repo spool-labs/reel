@@ -2115,6 +2115,7 @@ pub fn size_sorted_indexes(
     let cap = if is_all_sorted { spot + index_cap(block + record) } else { index_cap(spot + block + record) };
     // the store keeps one headroom for all its indexes, a quarter of the cap shared evenly
     let headroom = index_headroom(cap, sorted.len());
+    let is_store_empty = sorted.iter().all(|column| rows_on_disk[column.id.0 as usize] == 0);
     let asks: Vec<IndexAsk> = sorted
         .iter()
         .map(|column| {
@@ -2124,7 +2125,7 @@ pub fn size_sorted_indexes(
             if is_index_exact() {
                 return IndexAsk::Bytes(planned_index_bytes(width, least.unwrap_or(RowCount(0))));
             }
-            index_ask(width, rows_on_disk[column.id.0 as usize], least, headroom)
+            index_ask(width, rows_on_disk[column.id.0 as usize], least, headroom, is_store_empty)
         })
         .collect();
     // an exact index asks for what it declared, and past the cap it gets its share as any index does

@@ -399,10 +399,12 @@ fn a_sorted_index_asks_by_its_keys() {
     use reel::index::sorted_keys::planned_index_bytes;
     const HEADROOM: ByteCount = ByteCount(30 * 1024 * 1024);
 
-    assert_eq!(index_ask(16, 0, None, HEADROOM), IndexAsk::Part);
+    // an empty index asks its whole part in a store whose every index is empty, and its headroom alone beside one with keys
+    assert_eq!(index_ask(16, 0, None, HEADROOM, true), IndexAsk::Part);
+    assert_eq!(index_ask(16, 0, None, HEADROOM, false), IndexAsk::Bytes(ByteCount(planned_index_bytes(16, RowCount(0)).0 + HEADROOM.0)));
     let grown = planned_index_bytes(16, RowCount(1_000_000 * INDEX_GROWTH)).0 + HEADROOM.0;
-    assert_eq!(index_ask(16, 1_000_000, None, HEADROOM), IndexAsk::Bytes(ByteCount(grown)));
-    assert_eq!(index_ask(16, 1_000_000, Some(RowCount(10_000_000)), HEADROOM), IndexAsk::Bytes(ByteCount(planned_index_bytes(16, RowCount(10_000_000)).0 + HEADROOM.0)));
+    assert_eq!(index_ask(16, 1_000_000, None, HEADROOM, false), IndexAsk::Bytes(ByteCount(grown)));
+    assert_eq!(index_ask(16, 1_000_000, Some(RowCount(10_000_000)), HEADROOM, false), IndexAsk::Bytes(ByteCount(planned_index_bytes(16, RowCount(10_000_000)).0 + HEADROOM.0)));
 }
 
 // the indexes get their asks while they fit the cap, each the same fraction of its ask past it, and an empty one its part

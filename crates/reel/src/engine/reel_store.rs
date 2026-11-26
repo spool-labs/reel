@@ -1238,8 +1238,11 @@ pub fn check_config(config: &StoreConfig) -> Result<(), StoreError> {
     for column in &config.columns {
         // a sorted index holds keys of one width, and a complete table holds the rows it was given
         let has_fixed_keys = matches!(column.key_shape, KeyShape::Fixed { width } if (1..=MOST_KEY_BYTES).contains(&usize::from(width)));
-        if column.index == ColumnIndex::Sorted && !has_fixed_keys {
+        if column.index == ColumnIndex::Sorted && !matches!(column.key_shape, KeyShape::Fixed { .. }) {
             return Err(StoreError::BadIndex { column: column.name.clone(), reason: "a sorted index takes keys of one fixed width" });
+        }
+        if column.index == ColumnIndex::Sorted && !has_fixed_keys {
+            return Err(StoreError::BadIndex { column: column.name.clone(), reason: "a sorted index takes keys of 1 to 64 bytes" });
         }
         if column.index == ColumnIndex::Complete && column.least_rows.is_none() {
             return Err(StoreError::BadIndex { column: column.name.clone(), reason: "a complete table takes least_rows, the rows it holds" });

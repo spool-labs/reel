@@ -3965,3 +3965,36 @@ fn a_refill_passes_a_segment_a_merge_retires_under_it() {
     store.close().expect("close");
     SIM_BUDGET.with(|budget| budget.set(BUDGET));
 }
+
+// a sorted index refuses a fixed key past 64 bytes with that reason, and the same directory then opens with the default index,
+// which keeps no sorted index on such keys and answers from the footers
+#[test]
+fn a_fixed_key_past_the_index_width_opens_by_keys() {
+    let io = SimulatedIo::new(Seed(48));
+    let wide = |width: u16, index: ColumnIndex| {
+        let mut config = config(CAPACITY);
+        config.columns[0].key_shape = KeyShape::Fixed { width };
+        config.columns[0].index = index;
+        config.columns[0].least_rows = None;
+        config
+    };
+    for width in [65, 96] {
+        match ReelStore::open(io.clone(), &wide(width, ColumnIndex::Sorted)) {
+            Err(reel_core::store_error::StoreError::BadIndex { reason, .. }) => assert_eq!(reason, "a sorted index takes keys of 1 to 64 bytes"),
+            other => panic!("width {width} opened as {:?}", other.map(|_store| ())),
+        }
+    }
+    let store = ReelStore::open(io.clone(), &wide(96, ColumnIndex::ByKeys)).expect("open by keys");
+    assert!(store.state.sorted_index(COLUMN).is_none(), "a 96 byte key took a sorted index");
+    let name = |number: u64| [key(number), vec![7; 96 - WIDTH as usize]].concat();
+    for number in 0..64 {
+        store.put(COLUMN, &name(number), format!("wide-{number}").as_bytes()).expect("put");
+    }
+    seal_all(&store, &io);
+    let mut value = Vec::new();
+    for number in 0..64 {
+        assert!(store.get(COLUMN, &name(number), &mut value).expect("get"), "key {number} is missing");
+        assert_eq!(value, format!("wide-{number}").into_bytes());
+    }
+    store.close().expect("close");
+}

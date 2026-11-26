@@ -66,7 +66,7 @@ pub enum DeviceClass {
 /// The index a column keeps over its sealed segments
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ColumnIndex {
-    /// A sorted index on a column of fixed-width keys, and none on one of variable width
+    /// A sorted index on a column of fixed-width keys of 1 to 64 bytes, and none on any other
     #[default]
     ByKeys,
     /// None: gets and scans read the footers of the sealed segments
@@ -133,11 +133,13 @@ impl ColumnConfig {
         Self { id, name: name.into(), key_shape, codec: Codec::None, volume: VolumeId(0), index: ColumnIndex::ByKeys, least_rows: None, least_value: None }
     }
 
-    /// Check the column keeps a sorted index: asked for, or by default on keys of one fixed width
+    /// Check the column keeps a sorted index: asked for, or by default on keys of one fixed width the index can hold
     pub fn is_sorted(&self) -> bool {
         match self.index {
             ColumnIndex::Sorted => true,
-            ColumnIndex::ByKeys => matches!(self.key_shape, KeyShape::Fixed { .. }),
+            ColumnIndex::ByKeys => {
+                matches!(self.key_shape, KeyShape::Fixed { width } if (1..=crate::index::sorted_keys::MOST_KEY_BYTES).contains(&usize::from(width)))
+            }
             ColumnIndex::Plain | ColumnIndex::Complete => false,
         }
     }

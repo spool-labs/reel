@@ -54,6 +54,19 @@ pub struct Refill {
     pub block: u32,
     /// The sorted index's drops when the refill began, so a refill from before a later drop clears no mark
     pub drops: u64,
+    /// The bytes the sorted index planned for its rows when the refill began. Its room grows to a quarter past them at most
+    pub plan: usize,
+}
+
+/// The most room a sorted index refill grows to, a quarter past its plan for the leaves random inserts split
+pub fn refill_ceiling(plan: usize) -> usize {
+    plan + plan / 4
+}
+
+/// Read the bytes a refill step grows its room to: an eighth of the plan more once a sixteenth is all that is free, and no
+/// further than the ceiling
+pub fn refill_growth(plan: usize, committed: usize, free: usize) -> Option<usize> {
+    (committed < refill_ceiling(plan) && free < plan / 16).then(|| (committed + plan / 8).min(refill_ceiling(plan)))
 }
 
 impl<Backend: Io> EngineState<Backend> {
@@ -688,11 +701,12 @@ impl<Backend: Io> EngineState<Backend> {
             };
             let missed = sorted.past_capacity();
             let rows = RowCount(missed.0 + sorted.entry_count().0);
-            if sorted.room().grow_to(planned_index_bytes(sorted.width(), rows).0 as usize).is_err() {
+            let plan = planned_index_bytes(sorted.width(), rows).0 as usize;
+            if sorted.room().grow_to(plan).is_err() {
                 continue;
             }
             let segment = hold(&volume.summary).orders().present().iter().rev().find(|segment| **segment >= mark).copied();
-            return Some(Refill { column: ColumnId(id as u8), mark, missed, segment, block: 0, drops });
+            return Some(Refill { column: ColumnId(id as u8), mark, missed, segment, block: 0, drops, plan });
         }
         None
     }
@@ -726,8 +740,24 @@ impl<Backend: Io> EngineState<Backend> {
         };
         let from = first + refill.block;
         let end = (from + REFILL_STEP_BLOCKS).min(first + count);
+        // leaves split by random inserts fill less than the plan's share on a bad run, so the room grows as the refill goes, an
+        // eighth of the plan at a time once a sixteenth is all that is free, up to a quarter past the plan. The plan is fixed at
+        // the start: the rows the refill puts in are already in it. The reserve job takes the refill back if the store goes over
+        // its target
+        let free = sorted.free_pages() as usize * crate::index::sorted_keys::PAGE_BYTES;
+        if let Some(bytes) = refill_growth(refill.plan, sorted.room().committed(), free) {
+            let _grown = sorted.room().grow_to(bytes);
+        }
         // a block that can't be read, or a fault, ends the refill with the mark standing, and another starts after the back-off
         let filled = self.fill_sorted_span(volume, (refill.column, sorted), segment, |_first, _count| (from, end), &self.job_footer_readers);
+        // a merge that retired the segment under the step took its lines with it, and nothing on disk is wrong: the merge gave its
+        // output's rows their entries, so the refill goes on to the next segment
+        if matches!(filled, Ok(false)) && !volume.table.is_readable(segment) {
+            sorted.note_refill_skip();
+            refill.segment = next(segment);
+            refill.block = 0;
+            return Ok(true);
+        }
         if !matches!(filled, Ok(true)) {
             sorted.refill_failed(self.io.now().0);
             return filled.map(|_filled| false);
@@ -791,7 +821,7 @@ impl<Backend: Io> EngineState<Backend> {
             }
             // newest first, so a key's newest row past the mark takes its slot ahead of the rows it superseded
             let segment = hold(&self.volumes[index].summary).orders().after(SegmentNumber(mark.0.saturating_sub(1))).last().copied();
-            return Some(Refill { column: ColumnId(id as u8), mark, missed: table.past_capacity(), segment, block: 0, drops: 0 });
+            return Some(Refill { column: ColumnId(id as u8), mark, missed: table.past_capacity(), segment, block: 0, drops: 0, plan: 0 });
         }
         None
     }

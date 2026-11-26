@@ -97,3 +97,36 @@ fn a_shard_given_back_reads_as_missing_and_comes_back_empty() {
     cache.insert(key(held[0]), b"fresh");
     assert_eq!(cache.with(key(held[0]), <[u8]>::to_vec), Some(b"fresh".to_vec()));
 }
+
+// a shard whose blocks fill no whole page gives nothing back and stays present
+#[test]
+fn a_shard_under_a_page_stays_present() {
+    let cache = BlockCache::new(ByteCount(1024), SLOT);
+    assert!(cache.shard_bytes() < 4_096);
+    assert_eq!(cache.give_back_shard(0), 0);
+    assert_eq!(cache.absent_shards(), 0);
+    cache.insert(key(1), b"block");
+    assert!((0..cache.shard_count()).any(|_shard| cache.with(key(1), <[u8]>::len).is_some()));
+}
+
+// a visit and an insert on a shard that is coming back return at once, with no wait on the fill's lock
+#[test]
+fn a_shard_coming_back_holds_up_no_visit() {
+    let cache = std::sync::Arc::new(BlockCache::new(ByteCount(4 * 1024 * 1024), SLOT));
+    let (shard, _first) = cache.place_of(key(9));
+    assert!(cache.give_back_shard(shard) > 0);
+    let held = cache.shards.write(shard);
+    let visitor = std::sync::Arc::clone(&cache);
+    let answer = std::thread::spawn(move || {
+        visitor.insert(key(9), b"block");
+        let many = visitor.with_many(&[key(9)], |blocks| blocks[0].is_some());
+        (visitor.with(key(9), <[u8]>::len), many)
+    });
+    let started = std::time::Instant::now();
+    while !answer.is_finished() {
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "a visit waited on a fill");
+        std::thread::yield_now();
+    }
+    drop(held);
+    assert_eq!(answer.join().expect("visitor"), (None, false));
+}

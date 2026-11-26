@@ -345,7 +345,8 @@ fn walks_and_counts_beside_drops_and_refills() {
         }
     }
     let report = store.memory_report();
-    assert_eq!(index.mark(), None, "no refill cleared the mark: pressed {} steps {} source {:?} drops {} held {} target {} waits {}", report.is_under_pressure, report.pressed_steps, report.pressure_source, report.sorted_drops, report.memory_held.0 >> 20, report.memory_target.0 >> 20, store.state.sorted_index(COLUMN).map_or(0, reel::index::sorted_keys::SortedKeys::refill_waits));
+    let volume = &store.state.volumes[0];
+    assert_eq!(index.mark(), None, "no refill cleared the mark: pressed {} drops {} held {} target {} waits {} sealing {} output floor {} dropped {} may {} due {} skips {}", report.is_under_pressure, report.sorted_drops, report.memory_held.0 >> 20, report.memory_target.0 >> 20, index.refill_waits(), volume.sealing.load(Ordering::Acquire), volume.output_floor(), index.is_dropped(), index.may_refill(), index.is_refill_due(reel::io::Io::now(&store.state.io).0), index.refill_skips());
     let mut value = Vec::new();
     let lost = (0..written.load(Ordering::Acquire)).filter(|number| !store.get(COLUMN, &key(*number), &mut value).expect("get")).count();
     assert_eq!(lost, 0, "{lost} keys lost after the refill");
@@ -383,7 +384,7 @@ fn gets_and_walks_beside_caches_given_back() {
             while !done.load(Ordering::Acquire) {
                 let _given = reel::engine::reserve_job::give_back_caches(&store.state, usize::MAX);
                 std::thread::yield_now();
-                let _taken = reel::engine::reserve_job::bring_back_caches(&store.state, u64::MAX);
+                while reel::engine::reserve_job::bring_back_caches(&store.state, u64::MAX) > 0 {}
                 rounds.fetch_add(1, Ordering::Relaxed);
                 std::thread::yield_now();
             }

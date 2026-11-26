@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 use reel_core::units::{ByteCount, FileOffset, Nanoseconds, RowCount};
 use crate::index::sorted_keys::planned_index_bytes;
 
+use crate::engine::complete_path::refill_ceiling;
 use crate::engine::engine_state::EngineState;
 use crate::engine::open_segment::SegmentPhase;
 use crate::engine::write_path::reserve_target;
@@ -245,14 +246,17 @@ impl<Backend: Io> ReserveJob<Backend> {
                 for room in &state.pool_rooms {
                     room.set_cap(usize::MAX);
                 }
-                // a dropped index comes back once the store has room past the decay for every row it held, and the compact job
-                // refills it
+                // a dropped index comes back once the store has room past the decay for every row it held, the quarter its
+                // refill may grow past that and the extent the last growth may end in, and the compact job refills it
                 let room = (target - held).min(host_left(&memory));
                 // the whole caches come back first, empty, and fill from reads
                 let room = room.saturating_sub(bring_back_caches(state, room));
+                // a cache still away brings the next step on soon
+                state.is_bringing_back.store(whole_caches(state).any(|cache| cache.absent_shards() > 0), Ordering::Release);
                 for index in state.sorted.iter().flatten().filter(|index| index.is_dropped()) {
                     let rows = RowCount(index.past_capacity().0 + index.entry_count().0);
-                    let may = pressed.is_none() && planned_index_bytes(index.width(), rows).0 <= room;
+                    let ask = refill_ceiling(planned_index_bytes(index.width(), rows).0 as usize) + index.room().extent();
+                    let may = pressed.is_none() && ask as u64 <= room;
                     if may && !index.may_refill() {
                         index.set_may_refill(true);
                         state.ask_compaction();
@@ -268,6 +272,7 @@ impl<Backend: Io> ReserveJob<Backend> {
         for index in state.sorted.iter().flatten() {
             index.set_may_refill(false);
         }
+        state.is_bringing_back.store(false, Ordering::Release);
         let was_short = state.is_target_short.load(Ordering::Acquire);
         let mut over = (held - target) as usize;
         for room in state.pool_rooms.iter().filter(|room| room.is_paged()) {
@@ -370,7 +375,7 @@ impl<Backend: Io> Job for ReserveJob<Backend> {
         }
         let now = self.state.io.now();
         JobStep::IdleUntil {
-            deadline: Nanoseconds(now.0 + if self.state.is_host_tight.load(Ordering::Acquire) { TIGHT_PERIOD.0 } else { RESERVE_PERIOD.0 }),
+            deadline: Nanoseconds(now.0 + if self.state.is_host_tight.load(Ordering::Acquire) || self.state.is_bringing_back.load(Ordering::Acquire) { TIGHT_PERIOD.0 } else { RESERVE_PERIOD.0 }),
         }
     }
 }
@@ -388,6 +393,8 @@ pub trait WholeCache {
     fn shard_bytes(&self) -> usize;
     /// Count the shards
     fn shard_count(&self) -> usize;
+    /// Read the bytes the shards given back hold no more
+    fn given_bytes(&self) -> u64;
 }
 
 impl WholeCache for SpotIndex {
@@ -409,6 +416,10 @@ impl WholeCache for SpotIndex {
 
     fn shard_count(&self) -> usize {
         SpotIndex::shard_count(self)
+    }
+
+    fn given_bytes(&self) -> u64 {
+        SpotIndex::given_bytes(self)
     }
 }
 
@@ -432,6 +443,10 @@ impl WholeCache for BlockCache {
     fn shard_count(&self) -> usize {
         BlockCache::shard_count(self)
     }
+
+    fn given_bytes(&self) -> u64 {
+        BlockCache::given_bytes(self)
+    }
 }
 
 /// List the caches the ladder gives up whole, the spot index first
@@ -442,7 +457,7 @@ pub fn whole_caches<Backend: Io>(state: &EngineState<Backend>) -> impl Iterator<
 
 /// Read the bytes the whole caches have given back, which the heap measured at open still counts
 pub fn caches_given_back<Backend: Io>(state: &EngineState<Backend>) -> u64 {
-    whole_caches(state).map(|cache| (cache.absent_shards() * cache.shard_bytes()) as u64).sum()
+    whole_caches(state).map(WholeCache::given_bytes).sum()
 }
 
 /// Give the whole caches' shards back, the highest first, until this many bytes are given or none is left, and return the bytes
@@ -463,22 +478,22 @@ pub fn give_back_caches<Backend: Io>(state: &EngineState<Backend>, wanted: usize
     given
 }
 
-/// Bring the whole caches' shards back, the spot index first, while each fits in this many bytes, and return the bytes taken
+/// Bring one shard of the whole caches back, the spot index first, when it fits in this many bytes, and return the bytes taken. One
+/// a step, so the job looks at pressure and the pools between fills, and the next step comes soon while one is still away
 pub fn bring_back_caches<Backend: Io>(state: &EngineState<Backend>, room: u64) -> u64 {
-    let mut taken = 0;
     for cache in whole_caches(state) {
         if cache.absent_shards() == 0 {
             continue;
         }
         let bytes = cache.shard_bytes() as u64;
+        if bytes > room {
+            return 0;
+        }
         for shard in 0..cache.shard_count() {
-            if taken + bytes > room {
-                return taken;
-            }
             if cache.bring_back_shard(shard) {
-                taken += bytes;
+                return bytes;
             }
         }
     }
-    taken
+    0
 }

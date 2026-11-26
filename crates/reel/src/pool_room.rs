@@ -811,7 +811,7 @@ pub fn take_back_buffer(start: *mut u8, bytes: usize) {
 }
 
 /// Find the whole pages a buffer covers, if it covers any
-fn whole_pages(start: *mut u8, bytes: usize) -> Option<(*mut u8, usize)> {
+pub fn whole_pages(start: *mut u8, bytes: usize) -> Option<(*mut u8, usize)> {
     let page = crate::region::page_bytes();
     let begin = (start as usize).next_multiple_of(page);
     let end = (start as usize + bytes) / page * page;

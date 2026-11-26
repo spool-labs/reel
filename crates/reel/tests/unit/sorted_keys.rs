@@ -527,3 +527,22 @@ fn fresh_index_grows_with_its_room() {
     assert_eq!(index.check(), Ok(()));
     assert!((0..rows).all(|key| index.find(&ordered_key(key)).is_some()));
 }
+
+#[test]
+fn a_refill_grows_its_room_to_a_quarter_past_its_plan() {
+    use reel::engine::complete_path::{refill_ceiling, refill_growth};
+    let plan = 1 << 20;
+    // a refill short of pages at every step grows an eighth of the plan at a time and stops at the ceiling
+    let mut committed = plan;
+    let mut steps = 0;
+    while let Some(bytes) = refill_growth(plan, committed, 0) {
+        assert!(bytes > committed && bytes <= refill_ceiling(plan));
+        committed = bytes;
+        steps += 1;
+    }
+    assert_eq!(committed, refill_ceiling(plan));
+    assert_eq!(steps, 2);
+    // a sixteenth of the plan free is enough
+    assert_eq!(refill_growth(plan, plan, plan / 16), None);
+    assert_eq!(refill_growth(plan, plan, plan / 16 - 1), Some(plan + plan / 8));
+}

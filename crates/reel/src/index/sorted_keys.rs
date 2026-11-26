@@ -216,6 +216,8 @@ pub struct SortedKeys {
     refill_failed_at: AtomicU64,
     /// Ticks a due refill waited for a seal or a merge output in flight
     refill_waits: AtomicU64,
+    /// Segments a merge retired under a refill step
+    refill_skips: AtomicU64,
     /// Drops so far, which moves before a drop marks the index
     drops: AtomicU64,
 }
@@ -373,6 +375,7 @@ impl SortedKeys {
             may_refill: std::sync::atomic::AtomicBool::new(false),
             refill_failed_at: AtomicU64::new(0),
             refill_waits: AtomicU64::new(0),
+            refill_skips: AtomicU64::new(0),
             drops: AtomicU64::new(0),
         })
     }
@@ -598,6 +601,16 @@ impl SortedKeys {
     pub fn is_refill_due(&self, now: u64) -> bool {
         let failed = self.refill_failed_at.load(Memory::Acquire);
         failed == 0 || now.saturating_sub(failed) >= REFILL_RETRY_NANOS
+    }
+
+    /// Count a segment a merge retired under a refill step, which the refill passes with no back-off
+    pub fn note_refill_skip(&self) {
+        self.refill_skips.fetch_add(1, Memory::Relaxed);
+    }
+
+    /// Read the segments refills passed because a merge retired them under a step
+    pub fn refill_skips(&self) -> u64 {
+        self.refill_skips.load(Memory::Relaxed)
     }
 
     /// Count a tick a refill was due and a seal or a merge output in flight held it back

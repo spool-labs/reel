@@ -3472,15 +3472,21 @@ fn a_pressed_store_drops_its_index_and_refills_it() {
     assert!(index.may_refill(), "the store had room and no refill may run");
     let volume = store.state.columns[COLUMN.0 as usize].expect("a column").volume.0 as usize;
     let mut refill = store.state.start_sorted_refill(volume).expect("a refill");
+    // the room grows to a quarter past the plan at most, however many rows the refill has put in. It grows in whole extents,
+    // so the last one may end past that
+    let mut ceiling = index.room().committed().max(reel::engine::complete_path::refill_ceiling(refill.plan) + index.room().extent());
     // a write lands in the middle of the refill
     let mut steps = 0;
     while store.state.sorted_refill_step(volume, &mut refill).expect("refill step") {
+        assert!(index.room().committed() <= ceiling, "the refill grew its room to {} past {ceiling}", index.room().committed());
         steps += 1;
         if steps == 2 {
             store.put(COLUMN, &key(1), b"mid-refill").expect("put");
             model.insert(key(1), b"mid-refill".to_vec());
             seal_all(&store, &io);
             let _merged = merge_once(&store);
+            // the pool job grows the room for the write, apart from the refill
+            ceiling = ceiling.max(index.room().committed());
         }
     }
     assert_eq!(index.mark(), None, "the refill left the mark: {} past capacity, {} missed at start, {} free pages", index.past_capacity().0, refill.missed.0, index.free_pages());
@@ -3495,8 +3501,16 @@ fn a_pressed_store_drops_its_index_and_refills_it() {
 /// Run one merge on volume 0 to its end, and say whether one ran
 fn merge_once(store: &Store) -> bool {
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
-    while !job.rewrite.start() {
-        if !job.rewrite.has_looks_left() {
+    // a pick goes on only while its look moves, as the compact job's does: a pick refused for room keeps looks left and moves
+    // nothing, as with reclaim held and the park full. The tries are bounded as well
+    let mut tries = 0;
+    loop {
+        let looked = job.rewrite.looked_up_to();
+        if job.rewrite.start() {
+            break;
+        }
+        tries += 1;
+        if !job.rewrite.has_looks_left() || job.rewrite.looked_up_to() == looked || tries == 1_000 {
             return false;
         }
     }
@@ -3784,7 +3798,7 @@ fn run_cache_seed(seed: u64) {
         }
     }
     assert!(given_steps > 0 && brought_steps > 0, "seed {seed}: {given_steps} give-backs and {brought_steps} bring-backs ran");
-    let _brought = reel::engine::reserve_job::bring_back_caches(&store.state, u64::MAX);
+    while reel::engine::reserve_job::bring_back_caches(&store.state, u64::MAX) > 0 {}
     let report = store.memory_report();
     assert_eq!((report.spot_absent_shards, report.block_absent_shards), (0, 0));
     for (side, column) in [COLUMN, PLAIN].into_iter().enumerate() {
@@ -3842,11 +3856,112 @@ fn the_ladder_gives_caches_back_before_an_index() {
     io.set_host_memory(reel_sim::simulated_disk::SIMULATED_HOST);
     now += 1;
     job.hold_to_target(now);
-    job.hold_to_target(now + reel::pool_room::DECAY_NANOS);
+    // one shard comes back a step, and the steps come soon while one is away
+    let mut steps = 0;
+    let mut at = now + reel::pool_room::DECAY_NANOS;
+    while store.memory_report().spot_absent_shards + store.memory_report().block_absent_shards > 0 && steps < 10_000 {
+        job.hold_to_target(at);
+        at += 100_000_000;
+        steps += 1;
+    }
     let report = store.memory_report();
     assert_eq!((report.spot_absent_shards, report.block_absent_shards), (0, 0), "a cache stayed given back with room");
+    assert!(steps > 1, "every shard came back in one step");
     for number in (0..KEYS).step_by(7) {
         assert!(store.get(PLAIN, &key(number), &mut value).expect("get") && value == b"plain");
     }
     store.close().expect("close");
+}
+
+// with room for every shard, a bring-back still brings one shard a call
+#[test]
+fn caches_come_back_one_shard_a_call() {
+    let io = SimulatedIo::new(Seed(54));
+    let mut both = config(CAPACITY);
+    both.columns.push(ColumnConfig { id: PLAIN, name: "plain".to_string(), index: ColumnIndex::Plain, least_rows: None, ..both.columns[0].clone() });
+    let store = ReelStore::open(io.clone(), &both).expect("open");
+    assert!(reel::engine::reserve_job::give_back_caches(&store.state, usize::MAX) > 0);
+    let absent = |report: reel_core::memory_report::MemoryReport| report.spot_absent_shards + report.block_absent_shards;
+    let mut left = absent(store.memory_report());
+    assert!(left > 1);
+    while left > 0 {
+        assert!(reel::engine::reserve_job::bring_back_caches(&store.state, u64::MAX) > 0);
+        let now = absent(store.memory_report());
+        assert_eq!(now, left - 1, "a call brought back more than one shard");
+        left = now;
+    }
+    store.close().expect("close");
+}
+
+// a merge that retires a segment after a refill entered part of its blocks ends nothing: the refill passes the segment with no
+// back-off, clears its mark in the same pass, and every key answers by value, a key that moved to the merge's output and a key a
+// grave deleted among them
+#[test]
+fn a_refill_passes_a_segment_a_merge_retires_under_it() {
+    let io = SimulatedIo::new(Seed(55));
+    // room for the whole index past the rest, as the reserve job asks of a refill before it lets one run
+    SIM_BUDGET.with(|budget| budget.set(ByteCount(BUDGET.0 * 4)));
+    let store = open(&io, CAPACITY);
+    store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
+    // the merges retire their inputs as they go, so reclaim runs
+    let mut model = fill_for_reopen(&store, &io, SHORT_KEYS);
+    // every live key takes a newer row, so the oldest segment holds only dead rows and a merge picks it
+    for name in model.keys().cloned().collect::<Vec<_>>() {
+        store.put(COLUMN, &name, b"third").expect("put");
+        model.insert(name, b"third".to_vec());
+    }
+    seal_all(&store, &io);
+    let oldest = hold(&store.state.volumes[0].summary).orders().present().first().copied().expect("a segment");
+    let index = store.state.sorted_index(COLUMN).expect("an index");
+    let _freed = store.state.drop_sorted(index);
+    index.set_may_refill(true);
+    let mut refill = store.state.start_sorted_refill(0).expect("a refill");
+    let mut retired = None;
+    let mut steps = 0;
+    loop {
+        // partway through a segment, a merge takes it
+        if retired.is_none() && refill.block > 0 && refill.segment == Some(oldest) && let Some(segment) = refill.segment {
+            // the store's own jobs run with compaction let go and no refill of theirs, until the dead segment leaves the table
+            index.set_may_refill(false);
+            store.state.volumes[0].holds.compaction.store(false, Ordering::Release);
+            store.state.ask_compaction();
+            for _round in 0..200 {
+                if !store.state.volumes[0].table.is_readable(segment) {
+                    break;
+                }
+                io.advance_clock(TICK);
+                settle(&io);
+            }
+            store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
+            index.set_may_refill(true);
+            if !store.state.volumes[0].table.is_readable(segment) {
+                retired = Some(segment);
+            }
+        }
+        steps += 1;
+        if !store.state.sorted_refill_step(0, &mut refill).expect("refill step") {
+            break;
+        }
+    }
+    let segment = retired.expect("no merge retired a segment the refill was partway through");
+    assert!(steps > 1);
+    assert!(index.is_refill_due(io.now().0), "a retired segment set the back-off");
+    // a segment that leaves between steps is passed before any fill, and only one that leaves during a fill counts as a skip
+    assert!(index.refill_skips() <= 1, "segment {segment:?} was passed more than once");
+    // rows that found no page partway keep the mark, and the next refill starts from the top as the compact job's does, with no
+    // back-off
+    for _again in 0..8 {
+        if index.mark().is_none() {
+            break;
+        }
+        let mut again = store.state.start_sorted_refill(0).expect("a refill starts again at once");
+        while store.state.sorted_refill_step(0, &mut again).expect("refill step") {}
+    }
+    assert_eq!(index.mark(), None, "no refill cleared the mark: past capacity {} drops {:?} dropped {}", index.past_capacity().0, index.drop_count(), index.is_dropped());
+    assert!(sorted_reading(&store).is_counted);
+    let written: Vec<Vec<u8>> = (0..SHORT_KEYS).map(key).collect();
+    check(&store, &model, &written);
+    check_entries(&store, &model);
+    store.close().expect("close");
+    SIM_BUDGET.with(|budget| budget.set(BUDGET));
 }

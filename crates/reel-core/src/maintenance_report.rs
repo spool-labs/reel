@@ -581,6 +581,8 @@ pub struct SortedReading {
     pub is_dropped: bool,
     /// Ticks a due refill waited for a seal or a merge output in flight
     pub refill_waits: u64,
+    /// Segments refills passed because a merge retired them under a step
+    pub refill_skips: u64,
     /// The column's open rows count, so a walk on the index skips the shards that hold none. A drop stops this until its refill
     pub is_counted: bool,
     /// The bytes its sizing rule asked of the caches at open, and the bytes it got under the cap

@@ -252,6 +252,8 @@ pub struct EngineState<Backend: Io> {
     pub is_target_short: AtomicBool,
     /// Set while the group's room past what the kernel can't evict is under twice the margin, so the reserve job looks often
     pub is_host_tight: AtomicBool,
+    /// Set while a whole cache has shards away and the job brings one back a step, so the next step comes soon
+    pub is_bringing_back: AtomicBool,
     /// Ladder steps that found the store under pressure since open, which a scrape sees whatever moment it reads
     pub pressed_steps: AtomicU64,
     /// Where the store learns of memory pressure, chosen as the jobs start

@@ -245,7 +245,9 @@ impl<Backend: Io> ScrubJob<Backend> {
             return JobStep::IdleUntil { deadline: Nanoseconds(now.0.saturating_add(wait.max(1))) };
         }
         let Some(segment) = self.segment.or_else(|| self.next_segment(None)) else {
-            // a store with nothing sealed yet has nothing to check, so the scrub looks again soon instead of resting a whole pass
+            // a store with nothing sealed yet has nothing to check, so the scrub looks again soon instead of resting a whole pass, and
+            // its rate reads 0 since it reads nothing
+            self.state.volumes[self.volume].scrub_rate.store(0, Ordering::Relaxed);
             self.rest_until = Nanoseconds(now.0.saturating_add(SCRUB_LOOK_PERIOD.0));
             return JobStep::IdleUntil { deadline: self.rest_until };
         };

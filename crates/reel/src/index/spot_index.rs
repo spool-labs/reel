@@ -1,12 +1,12 @@
 //! A cache of sealed live keys' locations, one slot per key, cold keys out first
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::RwLock;
 
 use reel_core::units::{ByteCount, FileOffset, WritePlace};
 
 use crate::pool::touched_filled;
-use crate::pool_room::{give_back_buffer, take_back_buffer};
+use crate::pool_room::{give_back_buffer, take_back_buffer, whole_pages};
 use crate::index::key_hash::KeyHash;
 use crate::guard::Shards;
 use crate::index::write_index::{SHARD_COUNT, shard_of};
@@ -59,6 +59,10 @@ pub struct SpotIndex {
     clocks: Vec<Vec<AtomicU64>>,
     /// Shards whose pages are given back
     absent: AtomicUsize,
+    /// Each shard's presence, read with no lock so a reader misses an absent shard without waiting on a fill
+    present: Vec<AtomicBool>,
+    /// Bytes the shards given back hold no more
+    given: AtomicU64,
 }
 
 impl SpotSlot {
@@ -144,26 +148,25 @@ impl SpotIndex {
             }
             clocks.push(clock);
         }
-        Self { shards: Shards(shards), clocks, absent: AtomicUsize::new(0) }
+        Self { shards: Shards(shards), clocks, absent: AtomicUsize::new(0), present: (0..SHARD_COUNT).map(|_shard| AtomicBool::new(true)).collect(), given: AtomicU64::new(0) }
     }
 
     /// Read the heap the cache holds
     pub fn heap_bytes(&self) -> ByteCount {
         let mut total = 0;
         for index in 0..SHARD_COUNT {
-            let guard = self.shards.read(index);
-            if guard.is_present {
-                total += guard.slots.capacity() * size_of::<SpotSlot>();
-            }
-            drop(guard);
+            total += self.shards.read(index).slots.capacity() * size_of::<SpotSlot>();
             total += self.clocks[index].capacity() * size_of::<AtomicU64>();
         }
-        ByteCount(total as u64)
+        ByteCount((total as u64).saturating_sub(self.given_bytes()))
     }
 
     /// Find a key's location, and mark it as recently used
     pub fn lookup(&self, hash: KeyHash) -> Option<SpotLocation> {
         let shard = shard_of(hash);
+        if !self.is_present(shard) {
+            return None;
+        }
         let guard = self.shards.read(shard);
         let index = guard.find(hash)?;
         self.touch(shard, index);
@@ -194,6 +197,9 @@ impl SpotIndex {
     /// Fill a slot from a read, unless a seal has started handing rows over since the read began
     pub fn insert_from_read(&self, hash: KeyHash, location: &SpotLocation, is_current: impl Fn() -> bool) {
         let shard = shard_of(hash);
+        if !self.is_present(shard) {
+            return;
+        }
         let mut guard = self.shards.write(shard);
         if is_current() && !holds_newer(&guard, hash, location.place) {
             self.store(shard, &mut guard, hash, location);
@@ -203,6 +209,9 @@ impl SpotIndex {
     /// Point a key at a new location, taking the slot of a cold key when its bucket is full
     pub fn insert(&self, hash: KeyHash, location: &SpotLocation) {
         let shard = shard_of(hash);
+        if !self.is_present(shard) {
+            return;
+        }
         let mut guard = self.shards.write(shard);
         self.store(shard, &mut guard, hash, location);
     }
@@ -210,6 +219,9 @@ impl SpotIndex {
     /// Point a key at a location, unless its slot holds a newer place
     pub fn insert_newer(&self, hash: KeyHash, location: &SpotLocation) {
         let shard = shard_of(hash);
+        if !self.is_present(shard) {
+            return;
+        }
         let mut guard = self.shards.write(shard);
         if !holds_newer(&guard, hash, location.place) {
             self.store(shard, &mut guard, hash, location);
@@ -219,6 +231,9 @@ impl SpotIndex {
     /// Forget a key, unless its slot holds a newer place than this one
     pub fn remove_older(&self, hash: KeyHash, place: WritePlace) {
         let shard = shard_of(hash);
+        if !self.is_present(shard) {
+            return;
+        }
         let mut guard = self.shards.write(shard);
         if let Some(index) = guard.find(hash).filter(|index| guard.slots[*index].place < place.0) {
             guard.slots[index] = SpotSlot::empty();
@@ -277,17 +292,23 @@ impl SpotIndex {
 
     /// Give one shard's slot pages back to the kernel, and return the bytes given. Its keys read as missing until it comes back
     pub fn give_back_shard(&self, shard: usize) -> usize {
+        // a shard with no whole page gives nothing, and stays
         let mut guard = self.shards.write(shard);
-        if !guard.is_present {
+        let bytes = guard.slots.len() * size_of::<SpotSlot>();
+        if !guard.is_present || whole_pages(guard.slots.as_mut_ptr().cast(), bytes).is_none() {
             return 0;
         }
+        // a reader that loads the flag false misses with no lock taken
+        self.present[shard].store(false, Ordering::Release);
         guard.is_present = false;
         self.absent.fetch_add(1, Ordering::AcqRel);
-        let bytes = guard.slots.len() * size_of::<SpotSlot>();
-        give_back_buffer(guard.slots.as_mut_ptr().cast(), bytes)
+        let given = give_back_buffer(guard.slots.as_mut_ptr().cast(), bytes);
+        self.given.fetch_add(given as u64, Ordering::AcqRel);
+        given
     }
 
-    /// Bring a shard given back into memory again with every slot empty, and say whether it was absent
+    /// Bring a shard given back into memory again with every slot empty, and say whether it was absent. Readers load the flag false
+    /// for the whole fill and miss with no lock taken, so the fill holds up nobody
     pub fn bring_back_shard(&self, shard: usize) -> bool {
         let mut guard = self.shards.write(shard);
         if guard.is_present {
@@ -299,9 +320,22 @@ impl SpotIndex {
         for word in &self.clocks[shard] {
             word.store(0, Ordering::Relaxed);
         }
+        let given = whole_pages(guard.slots.as_mut_ptr().cast(), bytes).map_or(0, |(_first, length)| length);
+        self.given.fetch_sub(given as u64, Ordering::AcqRel);
         guard.is_present = true;
+        self.present[shard].store(true, Ordering::Release);
         self.absent.fetch_sub(1, Ordering::AcqRel);
         true
+    }
+
+    /// Read the bytes the shards given back hold no more
+    pub fn given_bytes(&self) -> u64 {
+        self.given.load(Ordering::Acquire)
+    }
+
+    /// Check a shard is present, with no lock taken
+    fn is_present(&self, shard: usize) -> bool {
+        self.present[shard].load(Ordering::Acquire)
     }
 
     /// Count the shards whose pages are given back
@@ -321,6 +355,9 @@ impl SpotIndex {
 
     /// Forget a key
     pub fn remove(&self, hash: KeyHash) {
+        if !self.is_present(shard_of(hash)) {
+            return;
+        }
         let mut guard = self.shards.write(shard_of(hash));
         if let Some(index) = guard.find(hash) {
             guard.slots[index] = SpotSlot::empty();

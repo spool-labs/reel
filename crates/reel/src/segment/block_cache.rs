@@ -1,12 +1,12 @@
 //! One store-wide cache of checked filter and row blocks, cold blocks out first
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{RwLock, RwLockReadGuard};
 
 use reel_core::units::ByteCount;
 
 use crate::pool::touched_filled;
-use crate::pool_room::{give_back_buffer, take_back_buffer};
+use crate::pool_room::{give_back_buffer, take_back_buffer, whole_pages};
 use crate::guard::Shards;
 use crate::segment::segment_tail::SegmentNumber;
 
@@ -52,6 +52,10 @@ pub struct BlockCache {
     pub shards: Shards<CacheShard>,
     /// Shards whose pages are given back
     absent: AtomicUsize,
+    /// Each shard's presence, read with no lock so a reader misses an absent shard without waiting on a fill
+    present: Vec<AtomicBool>,
+    /// Bytes the shards given back hold no more
+    given: AtomicU64,
     touched: Vec<Vec<AtomicU64>>,
     /// Inserts that found their shard locked and kept nothing, since a reader would otherwise queue behind the wait
     skipped: AtomicU64,
@@ -88,6 +92,8 @@ impl BlockCache {
             touched,
             skipped: AtomicU64::new(0),
             absent: AtomicUsize::new(0),
+            present: (0..shard_count).map(|_shard| AtomicBool::new(true)).collect(),
+            given: AtomicU64::new(0),
             slot_bytes,
             buckets,
         }
@@ -118,13 +124,11 @@ impl BlockCache {
         let mut total = 0;
         for shard in 0..self.shards.len() {
             let guard = self.shards.read(shard);
-            if guard.is_present {
-                total += guard.bytes.capacity() + guard.keys.capacity() * size_of::<BlockKey>();
+            total += guard.bytes.capacity() + guard.keys.capacity() * size_of::<BlockKey>();
             total += guard.lengths.capacity() * size_of::<u32>();
-            }
             total += self.touched[shard].capacity() * size_of::<AtomicU64>();
         }
-        ByteCount(total as u64)
+        ByteCount((total as u64).saturating_sub(self.given_bytes()))
     }
 
     /// Find a block's shard and first slot
@@ -138,6 +142,9 @@ impl BlockCache {
     /// Run a function over a cached block, with no lock held past it
     pub fn with<Answer>(&self, key: BlockKey, visit: impl FnOnce(&[u8]) -> Answer) -> Option<Answer> {
         let (shard, first) = self.place_of(key);
+        if !self.present[shard].load(Ordering::Acquire) {
+            return None;
+        }
         let guard = self.shards.read(shard);
         if !guard.is_present {
             return None;
@@ -164,7 +171,7 @@ impl BlockCache {
         let mut wanted_count = 0;
         for (key, place) in keys.iter().zip(&mut places).take(count) {
             *place = self.place_of(*key);
-            if !wanted[..wanted_count].contains(&place.0) {
+            if self.present[place.0].load(Ordering::Acquire) && !wanted[..wanted_count].contains(&place.0) {
                 wanted[wanted_count] = place.0;
                 wanted_count += 1;
             }
@@ -196,6 +203,9 @@ impl BlockCache {
         }
 
         let (shard, first) = self.place_of(key);
+        if !self.present[shard].load(Ordering::Acquire) {
+            return;
+        }
         // a cache can go without a block, so an insert never waits for a shard a visit holds
         let Some(mut guard) = self.shards.try_write(shard) else {
             self.skipped.fetch_add(1, Ordering::Relaxed);
@@ -213,20 +223,24 @@ impl BlockCache {
 
     /// Give one shard's pages back to the kernel, and return the bytes given. Its blocks read as missing until it comes back
     pub fn give_back_shard(&self, shard: usize) -> usize {
+        // a shard whose blocks fill no whole page gives nothing, and stays
         let mut guard = self.shards.write(shard);
-        if !guard.is_present {
+        let bytes = guard.bytes.len();
+        if !guard.is_present || whole_pages(guard.bytes.as_mut_ptr(), bytes).is_none() {
             return 0;
         }
+        // a reader that loads the flag false misses with no lock taken
+        self.present[shard].store(false, Ordering::Release);
         guard.is_present = false;
         self.absent.fetch_add(1, Ordering::AcqRel);
-        let keys = guard.keys.len() * size_of::<BlockKey>();
-        let lengths = guard.lengths.len() * size_of::<u32>();
-        let bytes = guard.bytes.len();
-        give_back_buffer(guard.keys.as_mut_ptr().cast(), keys) + give_back_buffer(guard.lengths.as_mut_ptr().cast(), lengths) + give_back_buffer(guard.bytes.as_mut_ptr(), bytes)
+        let (keys, lengths) = (guard.keys.len() * size_of::<BlockKey>(), guard.lengths.len() * size_of::<u32>());
+        let given = give_back_buffer(guard.keys.as_mut_ptr().cast(), keys) + give_back_buffer(guard.lengths.as_mut_ptr().cast(), lengths) + give_back_buffer(guard.bytes.as_mut_ptr(), bytes);
+        self.given.fetch_add(given as u64, Ordering::AcqRel);
+        given
     }
 
     /// Bring a shard given back into memory again with every slot empty, touching each page here so no caller faults one in, and
-    /// say whether it was absent
+    /// say whether it was absent. Readers load the flag false for the whole fill and miss with no lock taken
     pub fn bring_back_shard(&self, shard: usize) -> bool {
         let mut guard = self.shards.write(shard);
         if guard.is_present {
@@ -242,9 +256,18 @@ impl BlockCache {
         for bit in &self.touched[shard] {
             bit.store(0, Ordering::Relaxed);
         }
+        let pages = |start: *mut u8, length: usize| whole_pages(start, length).map_or(0, |(_first, whole)| whole);
+        let given = pages(guard.keys.as_mut_ptr().cast(), keys) + pages(guard.lengths.as_mut_ptr().cast(), lengths) + pages(guard.bytes.as_mut_ptr(), bytes);
+        self.given.fetch_sub(given as u64, Ordering::AcqRel);
         guard.is_present = true;
+        self.present[shard].store(true, Ordering::Release);
         self.absent.fetch_sub(1, Ordering::AcqRel);
         true
+    }
+
+    /// Read the bytes the shards given back hold no more
+    pub fn given_bytes(&self) -> u64 {
+        self.given.load(Ordering::Acquire)
     }
 
     /// Count the shards whose pages are given back

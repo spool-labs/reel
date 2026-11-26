@@ -334,6 +334,9 @@ pub struct ScanState {
     /// The index's drops when the walk went on it. A drop and a refill can both pass between two steps, so a walk that sees the count
     /// move starts its places over, as one that changes path does
     pub sorted_drops: u64,
+    /// Set once a drop moved under the walk: it reads the segments for the rest of its run, so drops that keep coming can't send it
+    /// back to its start past its tries
+    pub is_off_index: bool,
     /// The first key a batch passed for an open row newer than its point, and the batch's length then. A batch that located nothing
     /// after it goes back to it, so the walk takes the key once its put returns
     pub newer_passed: Vec<u8>,
@@ -704,6 +707,7 @@ impl ScanState {
             sorted_entered: u64::MAX,
             is_on_index: false,
             sorted_drops: 0,
+            is_off_index: false,
             newer_passed: touched_capacity(widest_key, 0),
             newer_passed_at: None,
             wanted: u64::MAX,
@@ -742,6 +746,7 @@ impl ScanState {
         self.batch.clear();
         self.forget_sorted();
         self.is_on_index = false;
+        self.is_off_index = false;
         self.wanted = range.wanted.map_or(u64::MAX, |rows| rows.0);
         self.asked = 0;
         self.untold_room = FIRST_UNTOLD_KEYS;

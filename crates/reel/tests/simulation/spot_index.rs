@@ -103,3 +103,26 @@ fn a_shard_given_back_reads_as_missing_and_comes_back_empty() {
     index.insert(hash_of(held[0]), &location(held[0]));
     assert_eq!(index.lookup(hash_of(held[0])), Some(location(held[0])));
 }
+
+// a lookup and an insert on a shard that is coming back return at once, with no wait on the fill's lock
+#[test]
+fn a_shard_coming_back_holds_up_no_reader() {
+    let index = std::sync::Arc::new(SpotIndex::new(ByteCount(16 * 1024 * 1024)));
+    let number = 5;
+    let shard = reel::index::write_index::shard_of(hash_of(number));
+    assert!(index.give_back_shard(shard) > 0);
+    // the test holds the shard's lock as a fill does
+    let held = index.shards.write(shard);
+    let reader = std::sync::Arc::clone(&index);
+    let answer = std::thread::spawn(move || {
+        reader.insert(hash_of(number), &location(number));
+        reader.lookup(hash_of(number))
+    });
+    let started = std::time::Instant::now();
+    while !answer.is_finished() {
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "a reader waited on a fill");
+        std::thread::yield_now();
+    }
+    drop(held);
+    assert_eq!(answer.join().expect("reader"), None);
+}

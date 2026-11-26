@@ -204,6 +204,12 @@ pub struct PoolRoom {
     /// A slot a thread for readers that take no lock of the pool, which a release waits out, when the pool has such readers
     read_slots: Option<Box<ReadSlots>>,
     pages: Option<RoomPages>,
+    /// Set by a test to grow the room whole right after a release takes an extent out, where a grower on another thread can come in
+    #[cfg(test)]
+    grow_in_release: AtomicBool,
+    /// Set when that grow took up the extent the release had just taken out
+    #[cfg(test)]
+    took_up_in_release: AtomicBool,
 }
 
 // SAFETY: the room's memory belongs to the pool that owns it, and the ready set is atomic
@@ -283,6 +289,10 @@ impl PoolRoom {
             wake: OnceLock::new(),
             read_slots: None,
             pages,
+            #[cfg(test)]
+            grow_in_release: AtomicBool::new(false),
+            #[cfg(test)]
+            took_up_in_release: AtomicBool::new(false),
         };
         // a whole room comes in at once, with no host check: a reader opens its rooms whole and runs no job to grow them, so a
         // read-only open can still pass what the host holds. Any other room starts with what its arm keeps ready, and the part the
@@ -593,13 +603,17 @@ impl PoolRoom {
             let Some(extent) = self.take_empty_extent(pages) else {
                 break;
             };
-            match &self.read_slots {
-                // readers that came in before the extent left the ready set may still be in it, so its pages go back on a later step
-                Some(slots) => {
-                    hold(&slots.busy)[extent] = slots.busy_now(u64::MAX);
-                    slots.pending.fetch_or(1 << extent, Ordering::AcqRel);
-                },
-                None => given += self.give_back_extent(extent),
+            #[cfg(test)]
+            if self.grow_in_release.load(Ordering::Relaxed) {
+                let _grown = self.grow_to(self.reserved);
+                if self.ready.load(Ordering::Acquire) & (1 << extent) != 0 {
+                    self.took_up_in_release.store(true, Ordering::Relaxed);
+                }
+            }
+            // readers that came in before the extent left the ready set may still be in it, so its pages go back on a later step.
+            // take_empty_extent put it in the pending set with its busy slots
+            if self.read_slots.is_none() {
+                given += self.give_back_extent(extent);
             }
         }
         given
@@ -672,7 +686,20 @@ impl PoolRoom {
         state.fresh[extent] = 0;
         state.has_free &= !(1 << extent);
         state.ready_pages -= self.pages_in(pages, extent);
-        self.ready.fetch_and(!(1 << extent), Ordering::SeqCst);
+        // the extent joins the pending set before it leaves the ready set, so no grower takes it up in between, and its busy slots
+        // are read after it left, so every reader that saw it ready is among them. A finish waits on the busy lock held across all
+        // three, so it never reads the slots of an earlier release
+        match &self.read_slots {
+            Some(slots) => {
+                let mut busy = hold(&slots.busy);
+                slots.pending.fetch_or(1 << extent, Ordering::AcqRel);
+                self.ready.fetch_and(!(1 << extent), Ordering::SeqCst);
+                busy[extent] = slots.busy_now(u64::MAX);
+            },
+            None => {
+                self.ready.fetch_and(!(1 << extent), Ordering::SeqCst);
+            },
+        }
         pages.publish(&state);
         Some(extent)
     }
@@ -1020,6 +1047,28 @@ mod tests {
         assert!(room.is_ready_at(63 * page));
     }
 
+
+    // a grow that comes in while a release takes an extent out never takes the extent up under a reader that came in before
+    #[test]
+    fn a_grow_inside_a_release_waits_for_its_readers() {
+        let page = page_bytes();
+        let room = PoolRoom::reserve_paged(ByteCount(64 * page as u64), ByteCount(64 * page as u64), page).expect("reserve").read_unlocked();
+        let taken: Vec<u32> = (0..64).map(|_page| room.take_page().expect("take")).collect();
+        for &page_number in &taken[8..] {
+            room.give_page(page_number);
+        }
+        let reading = room.reading();
+        room.grow_in_release.store(true, Ordering::Relaxed);
+        assert_eq!(room.release_idle(1), 0);
+        let _given = room.release_idle(1 + DECAY_NANOS);
+        room.grow_in_release.store(false, Ordering::Relaxed);
+        assert!(!room.took_up_in_release.load(Ordering::Relaxed), "a grow took up an extent its reader hadn't left");
+        assert!(!room.is_ready_at(63 * page));
+        drop(reading);
+        assert!(room.finish_releases() > 0);
+        room.grow_to(64 * page).expect("grow");
+        assert!(room.is_ready_at(63 * page));
+    }
 
     // two readers on one slot: the one that came in before the release holds it back after the later one has come and gone
     #[test]

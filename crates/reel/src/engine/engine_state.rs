@@ -222,6 +222,10 @@ pub struct EngineState<Backend: Io> {
     pub sorted_refills: AtomicU64,
     /// Seals and merges whose table or directory lines couldn't come into memory, each retried later
     pub populate_failures: AtomicU64,
+    /// Asks the reserve job's next step to hand every free write index shard's node pages back and give their empty extents back,
+    /// for the tests that race walks against node pages going back
+    #[cfg(feature = "test-hooks")]
+    pub release_node_pages: AtomicBool,
     /// Shards of the spot index and the block caches the ladder gave back, since open
     pub cache_shards_given: AtomicU64,
     /// What open shared the caches and the sorted indexes from, so the store shares them again at run time. None for a reader and

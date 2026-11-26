@@ -284,8 +284,11 @@ impl<Backend: Io> EngineState<Backend> {
         let deadline = started.0.saturating_add(INDEX_WAIT.0);
         let own = &self.volumes[plan.volume.0 as usize];
         loop {
-            for volume in &self.volumes {
-                self.seal_fullest(volume);
+            // a batch short only of nodes the job is bringing in waits for them, and seals early only when sealing is what frees room
+            if !self.index.waits_for_nodes(&plan.needs) {
+                for volume in &self.volumes {
+                    self.seal_fullest(volume);
+                }
             }
             check_seal_room(own)?;
             if self.io.now().0 > deadline {

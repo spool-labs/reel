@@ -108,7 +108,17 @@ fn race_store(name: &str) -> (ReelStore<PlainIo>, std::path::PathBuf) {
 
 // a writer puts new keys and seals while walks run: every key that landed before a walk began appears once, and no key twice
 fn walks_beside_seals(with_values: bool) {
-    let (store, root) = race_store(if with_values { "walk-values" } else { "walk-keys" });
+    walks_beside_seals_and(with_values, false);
+}
+
+// walks beside seals, and with `gives_back` a thread that gives the emptied node pages back to the kernel all the while
+fn walks_beside_seals_and(with_values: bool, gives_back: bool) {
+    let name = match (with_values, gives_back) {
+        (_, true) => "walk-give-back",
+        (true, false) => "walk-values",
+        (false, false) => "walk-keys",
+    };
+    let (store, root) = race_store(name);
     let written = AtomicU64::new(0);
     let done = AtomicBool::new(false);
     let runs = AtomicU64::new(0);
@@ -129,6 +139,21 @@ fn walks_beside_seals(with_values: bool) {
                 pace(number, runs, done);
             }
         });
+        if gives_back {
+            scope.spawn(move || {
+                let mut given = 0;
+                // the reserve job gives the pages back on its own thread, as a store does, and this asks it each round
+                while !done.load(Ordering::Acquire) {
+                    store.state.release_node_pages.store(true, Ordering::Release);
+                    if let Some(task) = store.state.reserve_task.get() {
+                        reel::io::IoTask::wake(task);
+                    }
+                    given += u64::from(store.memory_report().pool_given_back.0 > 0);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                assert!(given > 0, "no node page went back beside the walks");
+            });
+        }
         let walker = scope.spawn(move || {
             // a reader that panics stops the writer waiting on it
             let _stops = StopOnDrop(done);
@@ -158,6 +183,12 @@ fn walks_beside_seals(with_values: bool) {
     assert!(walks > 1, "only {walks} walks ran");
     store.close().expect("close");
     let _gone = fs::remove_dir_all(&root);
+}
+
+// node pages a seal emptied go back to the kernel while walks run beside the seals, and every walk sees every landed key once
+#[test]
+fn walks_beside_node_pages_given_back() {
+    walks_beside_seals_and(true, true);
 }
 
 #[test]

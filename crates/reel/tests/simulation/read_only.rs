@@ -388,7 +388,8 @@ fn a_finished_store_is_viewed_with_the_least_index() {
     let store = open(&io);
     put_keys(&store, b"value");
     finish_stepped(&store, &io);
-    let writer_index = store.memory_report().write_index;
+    // a writer's pools grow with what it holds, so its plan is what a viewer's least index stays under
+    let writer_index = ByteCount(store.state.sizing.shard.heap_bytes().0 * SHARD_COUNT as u64);
     drop(store);
     let viewer = view(&io);
     let memory = viewer.memory_report();

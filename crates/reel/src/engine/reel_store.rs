@@ -1756,6 +1756,8 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> Result<Engin
         sorted_drops: AtomicU64::new(0),
         sorted_refills: AtomicU64::new(0),
         populate_failures: AtomicU64::new(0),
+        #[cfg(feature = "test-hooks")]
+        release_node_pages: AtomicBool::new(false),
         cache_shards_given: AtomicU64::new(0),
         rebalance_plan: None,
         cache_ceilings: std::array::from_fn(|_cache| AtomicUsize::new(usize::MAX)),

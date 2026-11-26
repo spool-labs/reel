@@ -12,7 +12,7 @@ use crate::index::entry_slab::{ENTRY_ALIGNMENT, EntryAddress, EntrySlab, MOST_IN
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::index::key_table::{KeyTable, TableSlot};
 use crate::index::write_index::ShardCounts;
-use crate::index::node_pool::{NO_NODE, NODE_FANOUT, NodeCount, NodeIndex, NodePool, TreeNode};
+use crate::index::node_pool::{NO_NODE, NODE_FANOUT, NODE_PAGE_BYTES, NODES_PER_PAGE, NodeCount, NodeIndex, NodePool};
 use crate::index::open_slots::{MAX_OPEN_SLOTS, OpenSlot, OpenSlots};
 use crate::index::seek_target::SeekTarget;
 use crate::index::shard_cursor::{MAX_CURSOR_STEPS, ShardCursor, TreeCursor};
@@ -44,7 +44,9 @@ impl ShardSizing {
     /// Read the heap a shard of this sizing allocates, as heap_bytes reads it once built
     pub fn heap_bytes(&self) -> ByteCount {
         let pages = u64::from(self.pages.0) * (PAGE_BYTES + size_of::<PageIndex>()) as u64;
-        let nodes = u64::from(self.nodes.0) * size_of::<TreeNode>() as u64;
+        // nodes sit several to a page, and the pool keeps a list of the pages it took
+        let node_pages = u64::from(self.nodes.0.div_ceil(NODES_PER_PAGE));
+        let nodes = node_pages * (NODE_PAGE_BYTES + size_of::<u32>()) as u64;
         let table = (self.table_slots.next_power_of_two() * size_of::<TableSlot>()) as u64;
         let trees = (self.open_slots * size_of::<WriteTree>()) as u64;
         ByteCount(pages + nodes + table + trees + self.buckets.max(1).next_power_of_two() as u64)
@@ -112,8 +114,11 @@ impl WriteShard {
 
     /// Build every pool, with the slab's first pages in memory and the rest reserved for it to grow into
     pub fn growing(sizing: &ShardSizing, first_pages: PageCount) -> Result<Self> {
+        // the nodes start in the slab's proportion, past the spare every tree keeps for its splits, and the job grows both
+        let first_nodes = (u64::from(sizing.nodes.0) * u64::from(first_pages.0)).div_ceil(u64::from(sizing.pages.0.max(1))) as u32;
+        let spare = MAX_NEW_NODES.0 * sizing.open_slots as u32;
         Ok(Self {
-            nodes: NodePool::new(sizing.nodes),
+            nodes: NodePool::growing(sizing.nodes, NodeCount(first_nodes + spare))?,
             slab: EntrySlab::growing(sizing.pages, first_pages)?,
             table: KeyTable::new(sizing.table_slots),
             trees: vec![WriteTree::empty(); sizing.open_slots],
@@ -131,7 +136,7 @@ impl WriteShard {
     /// Check the pools can take one more row of this key length in a slot
     pub fn has_room(&self, slot: OpenSlot, key_length: usize) -> bool {
         let tree = &self.trees[slot.0 as usize];
-        self.nodes.free_count >= MAX_NEW_NODES
+        self.has_nodes()
             && self.table.has_room_for(self.held.rows + 1)
             && self.slab.has_room(&tree.pages, key_length, self.held.pages)
             && (self.held.rows == 0 || self.rows_fit_nodes(self.held.rows + 1))
@@ -140,23 +145,44 @@ impl WriteShard {
     /// Check the slab is what lacks room and it can still grow, so a writer waits for its next part instead of sealing early
     pub fn waits_for_slab(&self) -> bool {
         let room = self.slab.room();
-        self.slab.total_pages() < self.slab.most_pages()
-            && room.can_grow()
-            && self.nodes.free_count >= MAX_NEW_NODES
-            && self.table.has_room_for(self.held.rows + 1)
+        let is_slab_growing = self.slab.total_pages() < self.slab.most_pages() && room.can_grow();
+        // a writer short of nodes in memory waits for the job's next step as it does for the slab's, and seals early only once
+        // neither can grow
+        let are_nodes_short = !self.has_nodes() || !self.rows_fit_nodes(self.held.rows + 1);
+        let is_nodes_growing = are_nodes_short && self.nodes.can_grow();
+        (is_nodes_growing || (is_slab_growing && !are_nodes_short)) && self.table.has_room_for(self.held.rows + 1)
     }
 
-    /// Count the rows this shard's nodes can always hold: every node but a root is at least half full
-    pub fn node_row_limit(&self) -> u64 {
+    /// Check enough nodes are in memory for a row's splits, and ask the job for more when not
+    pub fn has_nodes(&self) -> bool {
+        let has = self.nodes.free_count() >= MAX_NEW_NODES;
+        if !has {
+            self.nodes.note_short();
+        }
+        has
+    }
+
+    /// Count the rows this many nodes can always hold beside the trees' spares: every node but a root is at least half full
+    fn rows_for_nodes(&self, nodes: NodeCount) -> u64 {
         let spare = self.trees.len() * MAX_NEW_NODES.0 as usize;
-        let usable = self.nodes.nodes.len().saturating_sub(spare) as u64;
+        let usable = (nodes.0 as usize).saturating_sub(spare) as u64;
         usable * (NODE_FANOUT as u64 / 2 - 1)
     }
 
-    /// Check the nodes can take this many more rows beside the rows every tree holds
+    /// Count the rows the shard's nodes can hold once the pool has grown to its most
+    pub fn node_row_limit(&self) -> u64 {
+        self.rows_for_nodes(self.nodes.capacity())
+    }
+
+    /// Check the nodes in memory can take this many more rows beside the rows every tree holds, so a row or a batch never runs out
+    /// of nodes midway, and ask the job for more when they can't
     pub fn rows_fit_nodes(&self, rows: u64) -> bool {
         let held: u64 = self.trees.iter().map(|tree| tree.row_count.0).sum();
-        held + rows <= self.node_row_limit()
+        let fits = held + rows <= self.rows_for_nodes(self.nodes.in_memory());
+        if !fits {
+            self.nodes.note_short();
+        }
+        fits
     }
 
     /// Hold room for a batch's rows, or hold nothing
@@ -171,6 +197,20 @@ impl WriteShard {
         }
         self.held = ShardHold { rows, pages };
         true
+    }
+
+    /// Say whether a batch's room in this shard is short of nodes the job can still bring in: Some(true) when only nodes are short
+    /// and they can grow, Some(false) when the shard holds it already, and None when another pool is short or the nodes can't grow
+    pub fn waits_for_nodes(&self, need: &ShardNeed) -> Option<bool> {
+        let rows = self.held.rows + need.rows;
+        let pages = PageCount(self.held.pages.0 + need.pages().0);
+        if !self.table.has_room_for(rows) || !self.slab.has_free_pages(pages) {
+            return None;
+        }
+        if self.rows_fit_nodes(rows) {
+            return Some(false);
+        }
+        self.nodes.can_grow().then_some(true)
     }
 
     /// Give back what a batch held
@@ -573,6 +613,8 @@ impl WriteShard {
                 if self.is_past_bound(entry, bound) {
                     cursor.position = Some(position);
                     cursor.version = self.nodes.node(position.leaf).version;
+        cursor.pool_resets = self.nodes.resets();
+                    cursor.pool_resets = self.nodes.resets();
                     return Some(entry);
                 }
                 let next = match bound.direction {
@@ -603,7 +645,10 @@ impl WriteShard {
     /// Check a cursor's leaf hasn't changed since it stood there
     pub fn is_cursor_standing(&self, cursor: &TreeCursor) -> bool {
         match cursor.position {
-            Some(position) => self.nodes.node(position.leaf).version == cursor.version,
+            // the pool gives its pages back only at a reset, and the room protects an extent it gave back, so a cursor from before
+            // the last reset stands no more with no read of its leaf. A leaf since is on a page the pool holds, and its version tells
+            // a reused node from the one the cursor stood on
+            Some(position) => cursor.pool_resets == self.nodes.resets() && self.nodes.node(position.leaf).version == cursor.version,
             None => true,
         }
     }

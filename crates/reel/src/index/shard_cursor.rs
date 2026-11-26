@@ -10,6 +10,8 @@ pub const MAX_CURSOR_STEPS: u32 = 8;
 pub struct TreeCursor {
     pub position: Option<TreePosition>,
     pub version: u32,
+    /// The node pool's reset count when the cursor stood, so a cursor from before the pool gave its pages back never reads them
+    pub pool_resets: u32,
     pub is_placed: bool,
 }
 

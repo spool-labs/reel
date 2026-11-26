@@ -169,6 +169,17 @@ impl<Backend: Io> ReserveJob<Backend> {
                 room.note_rate(now);
             }
         }
+        // a write index shard whose nodes stayed free hands its pages to its room first, and a test can ask for it at once
+        #[cfg(feature = "test-hooks")]
+        let is_asked = self.state.release_node_pages.swap(false, Ordering::AcqRel);
+        #[cfg(not(feature = "test-hooks"))]
+        let is_asked = false;
+        let _given = self.state.index.step_node_pools(is_asked);
+        if is_asked {
+            for room in &self.state.index.rooms() {
+                let _given = room.release_spare();
+            }
+        }
         // a paged pool that has held more than an extent past what it wants for the decay gives its highest empty extents back
         for room in &self.state.pool_rooms {
             let _finished = room.finish_releases();
@@ -284,6 +295,8 @@ impl<Backend: Io> ReserveJob<Backend> {
         state.is_bringing_back.store(false, Ordering::Release);
         let was_short = state.is_target_short.load(Ordering::Acquire);
         let mut over = (held - target) as usize;
+        // pressed, every wholly free write index shard hands its node pages to its room before the paged pools give back
+        let _given = state.index.step_node_pools(true);
         for room in state.pool_rooms.iter().filter(|room| room.is_paged()) {
             over = over.saturating_sub(room.release_spare());
         }

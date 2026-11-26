@@ -58,7 +58,23 @@ impl WriteIndex {
 
     /// Read every shard's slab room, for the job that grows them
     pub fn rooms(&self) -> Vec<std::sync::Arc<PoolRoom>> {
-        (0..SHARD_COUNT).map(|index| self.shards.read(index).slab.room().clone()).collect()
+        // each shard's slab and node pool grow on the job
+        (0..SHARD_COUNT)
+            .flat_map(|index| {
+                let shard = self.shards.read(index);
+                [shard.slab.room().clone(), shard.nodes.room().clone()]
+            })
+            .collect()
+    }
+
+    /// Count a reserve job step for every shard's node pool, giving back the pages of one that stayed free, or of every free one
+    /// when pressed. The job runs this on the thread that grows the pools, before it gives empty extents back
+    pub fn step_node_pools(&self, is_pressed: bool) -> bool {
+        let mut is_given = false;
+        for index in 0..SHARD_COUNT {
+            is_given |= self.shards.write(index).nodes.step_idle(is_pressed);
+        }
+        is_given
     }
 
     /// Read the heap every shard holds
@@ -195,6 +211,19 @@ impl WriteIndex {
         for (index, need) in needs.iter().enumerate() {
             self.shards.write(index).release_room(need);
         }
+    }
+
+    /// Check a batch's room is short only of nodes the job can still bring in, so it waits for them instead of sealing early
+    pub fn waits_for_nodes(&self, needs: &[ShardNeed; SHARD_COUNT]) -> bool {
+        let mut is_short = false;
+        for (index, need) in needs.iter().enumerate().filter(|(_index, need)| need.rows > 0) {
+            match self.shards.read(index).waits_for_nodes(need) {
+                Some(true) => is_short = true,
+                Some(false) => {},
+                None => return false,
+            }
+        }
+        is_short
     }
 
     /// Check empty shards could hold a batch

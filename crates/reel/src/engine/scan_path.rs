@@ -90,6 +90,8 @@ pub struct SeatAt<'key> {
     pub direction: Direction,
     pub point: WritePlace,
     pub is_counting: bool,
+    /// The walk keeps one point for its life, a cue's or a caller's. A live walk's later batches take newer points
+    pub is_point_fixed: bool,
 }
 
 /// What a step does with the key it lands on
@@ -467,6 +469,7 @@ impl<Backend: Io> EngineState<Backend> {
         scan.batch.counts = (!self.is_read_only).then(|| self.cues.counts());
         let point = scan.point.unwrap_or_else(|| self.read_point(volume));
         scan.batch.point = point;
+        volume.between_batch_point_and_seat();
         // each head stands at the batch's point: a shard whose count read after the point hasn't moved keeps its head
         if scan.is_on_index && point > scan.heads_mark {
             for (shard, head) in scan.heads.iter_mut().enumerate() {
@@ -1547,7 +1550,7 @@ impl<Backend: Io> EngineState<Backend> {
         point: WritePlace,
     ) -> Result<(), StoreError> {
         let ReadOn { device, target: volume } = on;
-        let ScanState { column, position, is_inclusive, direction, is_counting, sources, source_count, is_tree_stale, touched_sources, .. } = scan;
+        let ScanState { column, position, is_inclusive, direction, is_counting, sources, source_count, is_tree_stale, touched_sources, point: walk_point, .. } = scan;
         let at = SeatAt {
             column: *column,
             key: position,
@@ -1555,6 +1558,7 @@ impl<Backend: Io> EngineState<Backend> {
             direction: *direction,
             point,
             is_counting: *is_counting,
+            is_point_fixed: walk_point.is_some(),
         };
         let count = segments.len().min(SEAT_BATCH).min(sources.len() - *source_count);
         *touched_sources = (*touched_sources).max(*source_count + count);
@@ -1650,7 +1654,7 @@ impl<Backend: Io> EngineState<Backend> {
         point: WritePlace,
         is_spill: bool,
     ) -> Result<SourceMove, StoreError> {
-        let ScanState { column, position, is_inclusive, direction, is_counting, sources, spill, source_count, touched_sources, .. } = scan;
+        let ScanState { column, position, is_inclusive, direction, is_counting, sources, spill, source_count, touched_sources, point: walk_point, .. } = scan;
         let at = SeatAt {
             column: *column,
             key: position,
@@ -1658,6 +1662,7 @@ impl<Backend: Io> EngineState<Backend> {
             direction: *direction,
             point,
             is_counting: *is_counting,
+            is_point_fixed: walk_point.is_some(),
         };
         if !is_spill {
             *touched_sources = (*touched_sources).max(*source_count + 1);
@@ -1864,9 +1869,10 @@ impl<Backend: Io> EngineState<Backend> {
             Seat::NoColumn => return SeatPlace::Moved(SourceMove::Done),
             Seat::Line(seat) => seat,
         };
-        // a segment whose every row is newer than the walk's point holds nothing it shows, so it takes no source. A count
-        // seats it all the same: its keys keep the count from taking an older block by its live rows, which its graves cut
-        if !at.is_counting && seat.head.places.lowest > at.point {
+        // a segment whose every row is newer than a fixed point holds nothing the walk shows, so it takes no source. A live walk
+        // seats it, since a later batch's point can pass its rows and the list it came in won't change again. A count seats it
+        // all the same: its keys keep the count from taking an older block by its live rows, which its graves cut
+        if at.is_point_fixed && !at.is_counting && seat.head.places.lowest > at.point {
             return SeatPlace::Moved(SourceMove::Done);
         }
         let tail = seat.tail;

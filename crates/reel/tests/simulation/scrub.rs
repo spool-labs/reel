@@ -1113,3 +1113,58 @@ fn an_offset_order_merge_carries_a_rotten_short_record_a_read_still_finds() {
     assert!(matches!(store.get(COLUMN, &key(KEYS / 2), &mut Vec::new()), Err(StoreError::Corruption { .. })), "a read passed the rotten record");
     store.close().expect("close");
 }
+
+// a live walk's batch takes its point, then a segment written and sealed after that point lands before the batch seats its
+// sources. The batches that follow, at points above its rows, see its delete, its overwrite and its new key
+#[test]
+fn a_live_walk_seats_a_segment_sealed_inside_its_first_batch() {
+    let io = SimulatedIo::new(Seed(72));
+    let store = open(&io, 0);
+    let volume = &store.state.volumes[0];
+    volume.holds.compaction.store(true, Ordering::Release);
+    volume.holds.reclaim.store(true, Ordering::Release);
+    for number in 0..KEYS {
+        store.put(COLUMN, &key(number), &value(number, 0)).expect("put");
+    }
+    seal(&store, &io);
+    let mut scan = store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan");
+    let (state, hook_io) = (Arc::clone(&store.state), io.clone());
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_ran = Arc::clone(&ran);
+    volume.holds.set_between_point_and_seat(Some(reel::engine::volume::RunHook(Arc::new(move || {
+        // a row under the batch's first keys, so the sealed segment's span starts where the walk seats its first sources
+        state.write_value(COLUMN, &key(1), &value(1, 1), None).expect("put");
+        state.write_grave(COLUMN, &key(150)).expect("delete");
+        state.write_value(COLUMN, &key(160), &value(160, 1), None).expect("put");
+        state.write_value(COLUMN, b"key-00170-new", b"new", None).expect("put");
+        for volume in &state.volumes {
+            state.seal_fullest(volume);
+        }
+        settle(&hook_io);
+        hook_ran.store(true, Ordering::Release);
+    }))));
+    let (mut name, mut found) = (Vec::new(), Vec::new());
+    let mut walked = std::collections::BTreeMap::new();
+    while scan.next_row(&mut name, &mut found).expect("step") == ScanStep::Found {
+        walked.insert(name.clone(), found.clone());
+    }
+    drop(scan);
+    assert!(ran.load(Ordering::Acquire), "the hook never ran");
+    assert!(hold(&volume.claims).open.iter().all(|segment| segment.row_count.0 == 0), "the hook's rows never sealed");
+    // the store itself answers right: a get, and a walk started now
+    assert_eq!(read(&store, &key(150)), None);
+    assert_eq!(read(&store, &key(160)), Some(value(160, 1)));
+    let mut fresh = std::collections::BTreeMap::new();
+    let mut scan = store.iter_from(COLUMN, b"", Direction::Ascending).expect("scan");
+    while scan.next_row(&mut name, &mut found).expect("step") == ScanStep::Found {
+        fresh.insert(name.clone(), found.clone());
+    }
+    drop(scan);
+    assert!(!fresh.contains_key(&key(150)) && fresh.get(&key(160)) == Some(&value(160, 1)) && fresh.contains_key(b"key-00170-new".as_slice()), "a fresh walk read wrong");
+    // keys 150 and up come in batches whose points are above the sealed rows: the first batch holds 32 keys
+    println!("walk: key 150 {:?}, key 160 {:?}, new key {:?}", walked.get(&key(150)).map(|v| String::from_utf8_lossy(v).to_string()), walked.get(&key(160)).map(|v| String::from_utf8_lossy(v).to_string()), walked.contains_key(b"key-00170-new".as_slice()));
+    assert!(!walked.contains_key(&key(150)), "the walk answered a key deleted before its batch's point");
+    assert_eq!(walked.get(&key(160)), Some(&value(160, 1)), "the walk answered a value overwritten before its batch's point");
+    assert!(walked.contains_key(b"key-00170-new".as_slice()), "the walk missed a key written before its batch's point");
+    store.close().expect("close");
+}

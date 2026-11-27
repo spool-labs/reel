@@ -232,6 +232,8 @@ pub struct TestHolds {
     is_run_hooked: AtomicBool,
     /// Work a walk step does between reading the sorted index's drop count and its mark, run once and then cleared
     between_path_reads: Mutex<Option<RunHook>>,
+    /// Work a walk's batch does between taking its point and seating its sources, run once and then cleared
+    between_point_and_seat: Mutex<Option<RunHook>>,
     /// Merges ask every row, to compare against the dead bits
     pub no_bits: AtomicBool,
     /// Merges ask one bit decision in so many, as a release build does, so a bench measures the bits and not the check
@@ -256,6 +258,11 @@ impl TestHolds {
     /// Install the work the next walk step runs between reading the drop count and the mark
     pub fn set_between_path_reads(&self, hook: Option<RunHook>) {
         *hold(&self.between_path_reads) = hook;
+    }
+
+    /// Install the work the next walk batch runs between taking its point and seating its sources
+    pub fn set_between_point_and_seat(&self, hook: Option<RunHook>) {
+        *hold(&self.between_point_and_seat) = hook;
     }
 }
 
@@ -580,6 +587,19 @@ impl<Backend: Io> Volume<Backend> {
     /// Run nothing between the two reads, in a build without the hooks
     #[cfg(not(feature = "test-hooks"))]
     pub const fn between_path_reads(&self) {}
+
+    /// Run the work a test set between a walk batch's point and its seat, once
+    #[cfg(feature = "test-hooks")]
+    pub fn between_batch_point_and_seat(&self) {
+        let hook = hold(&self.holds.between_point_and_seat).take();
+        if let Some(RunHook(work)) = hook {
+            work();
+        }
+    }
+
+    /// Run nothing between a batch's point and its seat, in a build without the hooks
+    #[cfg(not(feature = "test-hooks"))]
+    pub const fn between_batch_point_and_seat(&self) {}
 
     /// Check a test holds compaction off
     #[cfg(feature = "test-hooks")]

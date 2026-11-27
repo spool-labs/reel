@@ -208,7 +208,7 @@ impl<Backend: Io> ReserveJob<Backend> {
         }
         // the write index and the sorted pages take a step from the record cache when the target leaves no room for it, and the
         // value pages, a cache themselves, grow only into what the target leaves
-        let wanted: u64 = self.state.pool_rooms.iter().filter(|room| room.is_paged() && !room.has_unlocked_readers()).filter_map(|room| room.next_step(room.used()).map(|step| (step - room.committed()) as u64)).sum();
+        let wanted: u64 = self.state.pool_rooms.iter().filter(|room| room.is_paged() && !room.has_unlocked_readers()).filter_map(|room| room.next_step(room.used()).map(|target| (target - room.committed()).min(room.step()) as u64)).sum();
         let target_left = target.saturating_sub(self.held_bytes());
         if wanted > target_left {
             let _given = self.state.record_cache.give_back((wanted - target_left) as usize);

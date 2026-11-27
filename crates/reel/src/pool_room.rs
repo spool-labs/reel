@@ -626,10 +626,15 @@ impl PoolRoom {
     }
 
     /// Grow until the pool wants no more or the room is whole, taking no step past the room the host has left, and say whether it
-    /// grew. A pool the host has no room for stays as it is and reads as short until a step fits
+    /// grew. A lead past the room left grows a plain step instead. A pool the host has no room for even a step of stays as it is
+    /// and reads as short until a step fits
     pub fn grow_step(&self, host_left: &mut u64) -> Result<bool> {
         let mut grew = false;
-        while let Some(target) = self.next_step(self.used()) {
+        while let Some(led) = self.next_step(self.used()) {
+            // a lead the host has no room for falls back to a plain step, which may still fit, so the room grows and isn't short
+            let plain = self.committed().saturating_add(self.step()).min(self.cap());
+            let is_led_past = led.saturating_sub(self.committed()) as u64 > *host_left;
+            let target = if is_led_past && led > plain { plain } else { led };
             let step = target.saturating_sub(self.committed()) as u64;
             if step > *host_left {
                 self.is_short.store(true, Ordering::Release);
@@ -640,6 +645,10 @@ impl PoolRoom {
             *host_left -= step;
             self.is_short.store(false, Ordering::Release);
             grew = true;
+            // the lead is prefetch: once the host's room cut it to a step, the room has what it needs and isn't short of the rest
+            if target < led {
+                break;
+            }
         }
         // a use noted between the last look and this clear asks again on its next note
         self.has_asked.store(false, Ordering::Release);
@@ -1278,6 +1287,24 @@ mod tests {
         plain.note_used(plain.committed() + fill);
         plain.note_rate(1 + LEAD_NANOS);
         assert_eq!(plain.next_step(plain.used()), Some(plain.committed() + plain.step()));
+    }
+
+    // a lead the host has no room for grows the room by a plain step, and the room doesn't read as short while a step still fits
+    #[test]
+    fn a_lead_past_the_room_left_grows_a_step() {
+        let page = page_bytes();
+        let room = PoolRoom::reserve_paged(ByteCount(1024 * page as u64), ByteCount(0), page).expect("reserve");
+        room.lead_by_rate();
+        let step = room.step();
+        room.note_used(room.committed());
+        room.note_rate(1);
+        room.note_used(room.committed() + 4 * step);
+        room.note_rate(1 + LEAD_NANOS);
+        let committed = room.committed();
+        let mut host_left = (2 * step) as u64;
+        assert!(room.grow_step(&mut host_left).expect("grow"), "a room with a step of room left didn't grow");
+        assert!(room.committed() > committed && room.committed() <= committed + 2 * step);
+        assert!(!room.is_short(), "a room that grew a step read as short");
     }
 
     #[test]

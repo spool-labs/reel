@@ -785,3 +785,40 @@ fn kept_values_leave_planned_rows_their_room() {
         assert!(rows >= PLANNED_ROWS, "{wide} B keys: the shard took {rows} of {PLANNED_ROWS} planned rows");
     }
 }
+
+// a cursor stood after a shard's node pool handed its pages back once still stands on its leaf
+#[test]
+fn a_cursor_stands_after_a_pool_reset() {
+    use reel::index::shard_cursor::TreeCursor;
+    let index = WriteIndex::new(&SIZING, SIZING.pages).expect("index");
+    // stand a fresh cursor on the slot's first row in every shard, and count the cursors that stand right after
+    let standing = |index: &WriteIndex| {
+        let (mut placed, mut stood) = (0, 0);
+        for shard in 0..SHARD_COUNT {
+            let guard = index.shards.read(shard);
+            let tree = &guard.trees[STAYING.0 as usize];
+            let mut cursor = TreeCursor::default();
+            let bound = WalkBound { column: COLUMN, key: b"", is_inclusive: true, direction: Direction::Ascending };
+            if guard.place_cursor(&mut cursor, tree, &bound).is_some() {
+                placed += 1;
+                stood += usize::from(guard.is_cursor_standing(&cursor));
+            }
+        }
+        (placed, stood)
+    };
+    for number in 0..400 {
+        add(&index, &key_of(number), row(number + 1, STAYING, RowKind::Value));
+    }
+    let before = standing(&index);
+    // the slot's rows go, as after a seal, and the reserve job hands every free pool's pages back
+    assert!(index.clean_slot(STAYING, CLEAN_ALL));
+    assert!(index.step_node_pools(true), "no pool handed its pages back");
+    let resets: Vec<u32> = (0..SHARD_COUNT).map(|shard| index.shards.read(shard).nodes.resets()).collect();
+    for number in 0..400 {
+        add(&index, &key_of(number), row(1_000 + number, STAYING, RowKind::Value));
+    }
+    let after = standing(&index);
+    println!("cursors placed and standing before the hand-back: {before:?}, after it: {after:?}, pool resets {:?}", &resets[..4]);
+    assert_eq!(before.0, before.1);
+    assert_eq!(after.0, after.1, "a cursor stood after the pool's hand-back reads as not standing, so every step descends");
+}

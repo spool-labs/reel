@@ -658,7 +658,6 @@ impl WriteShard {
                 if self.is_past_bound(entry, bound) {
                     cursor.position = Some(position);
                     cursor.version = self.nodes.node(position.leaf).version;
-        cursor.pool_resets = self.nodes.resets();
                     cursor.pool_resets = self.nodes.resets();
                     return Some(entry);
                 }
@@ -684,6 +683,7 @@ impl WriteShard {
         cursor.position = position;
         let position = position?;
         cursor.version = self.nodes.node(position.leaf).version;
+        cursor.pool_resets = self.nodes.resets();
         Some(entry_at(&self.nodes, position))
     }
 

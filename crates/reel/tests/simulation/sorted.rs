@@ -5256,3 +5256,52 @@ fn an_lz4_column_refuses_a_value_past_its_limit_with_the_shares_given_back() {
     seal_all(&store, &io);
     store.close().expect("close");
 }
+
+// a get whose find runs before a refill's last fill step and whose read of the mark runs after the refill ended reads the footers
+#[test]
+fn a_get_across_a_refill_end_finds_its_key() {
+    let io = SimulatedIo::new(Seed(48));
+    let store = open(&io, CAPACITY);
+    store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
+    store.state.volumes[0].holds.reclaim.store(true, Ordering::Release);
+    let model = fill_for_reopen(&store, &io, KEYS);
+    let index = store.state.sorted_index(COLUMN).expect("an index");
+    // a whole drop and refill, to count the refill's steps
+    let _freed = store.state.drop_sorted(index);
+    index.set_may_refill(true);
+    let mut refill = store.state.start_sorted_refill(0).expect("a refill");
+    let mut steps = 1;
+    while store.state.sorted_refill_step(0, &mut refill).expect("refill step") {
+        steps += 1;
+    }
+    assert_eq!(index.mark(), None);
+    // a second drop, and a refill stopped two steps short: its last fill step and its end are left
+    let _freed = store.state.drop_sorted(index);
+    index.set_may_refill(true);
+    let mut refill = store.state.start_sorted_refill(0).expect("a refill");
+    for _step in 0..steps - 2 {
+        assert!(store.state.sorted_refill_step(0, &mut refill).expect("refill step"));
+    }
+    assert!(refill.segment.is_some() && index.mark().is_some(), "the refill ended early");
+    let (name, value) = model.iter().find(|(name, _value)| index.find(name).is_none()).expect("a key the last step fills");
+    println!("{} of {} live keys wait for the refill's last fill step, {steps} steps in all", model.keys().filter(|name| index.find(name).is_none()).count(), model.len());
+    assert_eq!(read(&store, name).as_ref(), Some(value), "a get beside the refill");
+    // the get's find runs, the refill's last two steps run, and the get reads the mark
+    let state = Arc::clone(&store.state);
+    let left = Arc::new(std::sync::Mutex::new(refill));
+    store.state.volumes[0].holds.set_between_path_reads(Some(reel::engine::volume::RunHook(Arc::new(move || {
+        let mut refill = left.lock().expect("refill");
+        let mut ran = 0;
+        while state.sorted_refill_step(0, &mut refill).expect("refill step") {
+            ran += 1;
+        }
+        println!("the refill ran {} steps between the get's find and its read of the mark", ran + 1);
+    }))));
+    let across = read(&store, name);
+    assert_eq!(index.mark(), None, "the hook never ended the refill");
+    let after = read(&store, name);
+    println!("get across the refill's end: {:?}, get after it: {:?}, model: {:?}", across.as_deref().map(String::from_utf8_lossy), after.as_deref().map(String::from_utf8_lossy), String::from_utf8_lossy(value));
+    assert_eq!(after.as_ref(), Some(value));
+    assert_eq!(across.as_ref(), Some(value), "a get lost a key to a refill that ended between its find and its read of the mark");
+    store.close().expect("close");
+}

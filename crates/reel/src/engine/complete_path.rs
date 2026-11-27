@@ -212,9 +212,11 @@ impl<Backend: Io> EngineState<Backend> {
         read: &KeyRead<'_>,
         index: &SortedKeys,
     ) -> Result<(Option<SealedRow>, LeafAt), StoreError> {
-        // the drop count goes first: a drop and a refill that both pass during the find show, and the read asks the footers
+        // the drop and clear counts go first: a drop, or a mark that clears during the find, shows, and the read asks the footers
         let drops = index.drops_seen();
+        let clears = index.clears_seen();
         let noted = index.find_at(read.key);
+        volume.between_path_reads();
         let entry = noted.map(|(entry, _at)| entry);
         let leaf = noted.map_or(LeafAt::NONE, |(_entry, at)| at);
         let is_behind = volume.may_hide_under_sealed(read.read_point);
@@ -225,7 +227,7 @@ impl<Backend: Io> EngineState<Backend> {
         }
         let found = entry.as_ref().map(sealed_of);
         let mark = match index.mark() {
-            None if index.drops_seen() == drops => {
+            None if index.drops_seen() == drops && index.clears_seen() == clears => {
                 self.sorted_answers.fetch_add(1, Ordering::Relaxed);
                 return Ok((found, leaf));
             },

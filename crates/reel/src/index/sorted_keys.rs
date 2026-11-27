@@ -220,6 +220,8 @@ pub struct SortedKeys {
     refill_skips: AtomicU64,
     /// Drops so far, which moves before a drop marks the index
     drops: AtomicU64,
+    /// Mark clears so far, which moves before a clear, so a get whose find ran while the mark stood sees it moved
+    clears: AtomicU64,
 }
 
 impl PackedKey {
@@ -378,6 +380,7 @@ impl SortedKeys {
             refill_waits: AtomicU64::new(0),
             refill_skips: AtomicU64::new(0),
             drops: AtomicU64::new(0),
+            clears: AtomicU64::new(0),
         })
     }
 
@@ -493,6 +496,7 @@ impl SortedKeys {
 
     /// Clear a mark a refill from it made good, and say whether it went. A row that found no room since the refill began keeps it
     pub fn clear_mark(&self, mark: SegmentNumber, missed: RowCount) -> bool {
+        self.clears.fetch_add(1, Memory::AcqRel);
         if self.mark.compare_exchange(mark.0, NO_MARK, Memory::AcqRel, Memory::Acquire).is_err() {
             return false;
         }
@@ -585,6 +589,12 @@ impl SortedKeys {
     /// Read how many times a drop began or ended, which moves before a drop marks the index or empties a part
     pub fn drops_seen(&self) -> u64 {
         self.drops.load(Memory::Acquire)
+    }
+
+    /// Read how many times a mark began to clear. A get reads it before and after its find, so a refill that ends between the
+    /// two sends it to the footers
+    pub fn clears_seen(&self) -> u64 {
+        self.clears.load(Memory::Acquire)
     }
 
     /// Read the drop count a refill notes at its start, or nothing while a drop runs

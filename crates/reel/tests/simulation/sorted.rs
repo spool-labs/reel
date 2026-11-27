@@ -5426,3 +5426,43 @@ fn an_entering_lets_its_shard_go_between_holds() {
     check(&store, &model, &written);
     check_entries(&store, &model);
 }
+
+const SKIP_KEYS: u64 = 20_000;
+
+// a seal leaves alone the values an entering put in ahead of it, which hold their entries at this segment already, and every key
+// still reads right with every entry where it should be
+#[test]
+fn a_seal_skips_the_rows_an_entering_put_in() {
+    let io = SimulatedIo::new(Seed(62));
+    SIM_BUDGET.with(|budget| budget.set(HOLD_BUDGET));
+    let store = open(&io, RowCount(4 * SKIP_KEYS));
+    SIM_BUDGET.with(|budget| budget.set(BUDGET));
+    let mut model = Model::new();
+    for number in 0..SKIP_KEYS {
+        store.put(COLUMN, &key(number), b"open").expect("put");
+        model.insert(key(number), b"open".to_vec());
+    }
+    // a few keys change and a few go, so the seal meets newer rows, older ones the entering covered, and graves
+    for number in (0..SKIP_KEYS).step_by(97) {
+        store.put(COLUMN, &key(number), b"newer").expect("put");
+        model.insert(key(number), b"newer".to_vec());
+    }
+    for number in (1..SKIP_KEYS).step_by(89) {
+        store.delete(COLUMN, &key(number)).expect("delete");
+        model.remove(&key(number));
+    }
+    let index = store.state.sorted_index(COLUMN).expect("an index");
+    let entered_before = store.state.rows_entered.load(Ordering::Relaxed);
+    let _entered = store.state.enter_open_rows(&mut reel::index::write_index::EnterRun::new());
+    let entered = store.state.rows_entered.load(Ordering::Relaxed) - entered_before;
+    assert!(entered >= SKIP_KEYS / 2, "the entering took {entered} rows");
+    assert_eq!(index.mark(), None);
+    let upserts_before = index.seal_upserts.load(Ordering::Relaxed);
+    store.seal_now();
+    settle(&io);
+    let upserts = index.seal_upserts.load(Ordering::Relaxed) - upserts_before;
+    assert!(upserts < SKIP_KEYS / 10, "the seal put {upserts} rows in again after the entering took {entered}");
+    let written: Vec<Vec<u8>> = (0..SKIP_KEYS).map(key).collect();
+    check(&store, &model, &written);
+    check_entries(&store, &model);
+}

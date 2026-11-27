@@ -198,6 +198,9 @@ pub struct SortedKeys {
     past_capacity: AtomicU64,
     /// Goes up each time open rows go in ahead of their seal, before they leave the open counts
     entered: AtomicU64,
+    /// Rows a seal put in, for a test that the seal skips what the entering took
+    #[cfg(feature = "test-hooks")]
+    pub seal_upserts: AtomicU64,
     /// Values the leaves keep, from one pool every sorted index of the store shares, sized at open
     pub values: Arc<ValuePages>,
     /// This index counts the shared pool's memory and fills, so the store counts them once
@@ -369,6 +372,8 @@ impl SortedKeys {
             mark: AtomicU64::new(NO_MARK),
             past_capacity: AtomicU64::new(0),
             entered: AtomicU64::new(0),
+            #[cfg(feature = "test-hooks")]
+            seal_upserts: AtomicU64::new(0),
             values: Arc::new(ValuePages::new(0)?),
             owns_values: false,
             sharer: 0,

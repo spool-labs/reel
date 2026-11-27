@@ -24,6 +24,8 @@ pub struct WalkHead<'walk> {
     pub key: &'walk [u8],
     pub row: Option<WriteRow>,
     pub is_newest: bool,
+    /// The entering put the row in its sorted index ahead of the seal
+    pub is_entered: bool,
 }
 
 /// One copied row, with its key in the run's key buffer
@@ -34,6 +36,7 @@ pub struct RunRow {
     pub key_end: usize,
     pub row: Option<WriteRow>,
     pub is_newest: bool,
+    pub is_entered: bool,
 }
 
 /// A shard's next rows, copied out so the merge holds no lock
@@ -125,6 +128,7 @@ impl SealWalk {
                 key_end: run.keys.len(),
                 row: guard.slab.row(entry),
                 is_newest: guard.slab.newer(entry) == NO_ENTRY && !guard.slab.has_newer_sealed(entry),
+                is_entered: guard.slab.is_entered(entry),
             };
         }
     }
@@ -138,6 +142,7 @@ impl SealWalk {
             key: &run.keys[row.key_start..row.key_end],
             row: row.row,
             is_newest: row.is_newest,
+            is_entered: row.is_entered,
         }
     }
 

@@ -401,7 +401,7 @@ impl<Backend: Io> SealJob<Backend> {
                 self.last_column = Some(head.column);
                 self.last_key.clear();
                 self.last_key.extend_from_slice(head.key);
-                self.sorted_run.note(&self.state, self.volume, (target.number, target.slot), (head.column, head.key), &footer_row);
+                self.sorted_run.note(&self.state, self.volume, (target.number, target.slot), (head.column, head.key), &footer_row, head.is_entered);
                 // a complete or sorted column answers its gets in memory, and reads no spot cache
                 if self.state.uses_spot(head.column) {
                     let hash = hash_key(head.column, head.key);
@@ -833,8 +833,14 @@ impl SortedRun {
         (number, slot): (SegmentNumber, OpenSlot),
         (column, key): (ColumnId, &[u8]),
         row: &FooterRow,
+        is_entered: bool,
     ) {
-        if row.kind == RowKind::RangeDelete || state.sorted_index(column).is_none() {
+        let Some(index) = state.sorted_index(column).filter(|_index| row.kind != RowKind::RangeDelete) else {
+            return;
+        };
+        // a value the entering put in holds its entry already, at this segment and offset, while its column counts and its index
+        // stands whole. A cover that came later takes it out at the cover's own seal. A grave still goes in, under the seal's floors
+        if is_entered && row.kind == RowKind::Value && state.index.is_sorted_counted(column) && index.mark().is_none() && !index.is_dropped() {
             return;
         }
         let covers = &state.volumes[volume].covers;
@@ -855,6 +861,8 @@ impl SortedRun {
     pub fn flush<Backend: Io>(&mut self, state: &EngineState<Backend>, volume: usize, slot: OpenSlot) {
         if let Some(index) = self.column.and_then(|column| state.sorted_index(column)) {
             let floors = state.sorted_floor(&state.volumes[volume], index, slot);
+            #[cfg(feature = "test-hooks")]
+            index.seal_upserts.fetch_add(self.entries.len() as u64, Ordering::Relaxed);
             index.upsert_many(&self.keys, &self.entries, floors, |_row, _upserted| {});
         }
         self.clear();

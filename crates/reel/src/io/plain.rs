@@ -302,6 +302,10 @@ impl Io for PlainIo {
         line.wait(seen, PAUSE_WAIT);
     }
 
+    fn wait_on(&self, line: &WakeLine, seen: u64, most: Duration) {
+        line.wait(seen, most);
+    }
+
     fn pause(&self) {
         thread::sleep(PAUSE_WAIT);
     }

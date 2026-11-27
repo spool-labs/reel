@@ -255,6 +255,8 @@ pub struct EngineState<Backend: Io> {
     pub caller_ops: CallerCounts,
     /// The line writers wait on, shared with every volume
     pub progress: Arc<WakeLine>,
+    /// The line writers wait on for an open slot: a slot that frees and a segment made move it, and nothing else
+    pub slot_line: WakeLine,
     pub is_arena_full: AtomicBool,
     pub arena_fill: AtomicU64,
     pub unlinks_refused: AtomicU64,
@@ -543,6 +545,7 @@ impl<Backend: Io> EngineState<Backend> {
     /// Give a slot back once nothing uses it
     pub fn free_slot(&self, slot: OpenSlot) {
         hold(&self.free_slots).push(slot);
+        self.slot_line.wake();
     }
 
     /// Note the callers so far on every volume, and read when the last of them could go quiet: a test cools to this time

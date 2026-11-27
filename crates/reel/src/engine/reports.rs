@@ -3,6 +3,7 @@
 use std::array;
 use std::io::Error;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use reel_core::column_id::ColumnId;
 use reel_core::maintenance_report::{UNIT_KINDS, MaintenanceMemory, 
@@ -29,6 +30,9 @@ use crate::segment::key_cursor::CursorCounts;
 use crate::segment::segment_tail::SegmentNumber;
 use crate::segment::summary::{ColumnFacts, SummaryRows};
 
+/// The longest a writer sleeps for an open slot before it looks again, past a wake it missed. A slot that frees wakes it sooner
+pub const SLOT_WAIT: Duration = Duration::from_millis(10);
+
 impl<Backend: Io> EngineState<Backend> {
     /// Count bytes written, by where they came from
     pub fn note_written(&self, source: WriteSource, bytes: ByteCount) {
@@ -48,6 +52,13 @@ impl<Backend: Io> EngineState<Backend> {
         self.pauses[cause.index()].fetch_add(1, Ordering::Relaxed);
         let seen = self.progress.seen();
         self.io.pause_on(&self.progress, seen);
+    }
+
+    /// Wait for an open slot or a segment another writer makes, from a count read before the writer looked, so a slot that
+    /// freed in between ends the wait at once. Only a slot or a made segment moves the line, so a writer sleeps until one comes
+    pub fn pause_for_slot(&self, cause: PauseCause, seen: u64) {
+        self.pauses[cause.index()].fetch_add(1, Ordering::Relaxed);
+        self.io.wait_on(&self.slot_line, seen, SLOT_WAIT);
     }
 
     /// Count bytes a job moved

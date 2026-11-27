@@ -19,7 +19,7 @@ use reel::{ColumnConfig, from_key, ColumnIndex, KeyShape, StoreConfig, SyncPolic
 use reel_core::column_id::ColumnId;
 use reel_core::reads::Reads;
 use reel_core::direction::Direction;
-use reel_core::maintenance_report::MaintenanceReport;
+use reel_core::maintenance_report::{MaintenanceReport, PauseCause};
 use reel_core::scan::ScanStep;
 use reel_core::units::{ByteCount, RowCount};
 
@@ -591,4 +591,40 @@ fn bursts_between_batches_show() {
     store.close().expect("close");
     drop(store);
     let _removed = fs::remove_dir_all(&root);
+}
+
+// a writer that waits for an open slot sleeps until a slot frees or another writer makes a segment, up to SLOT_WAIT, and not the
+// hundred microseconds a wait on the store's progress takes; a slot that freed after the writer read the line ends the wait at once
+#[test]
+fn a_slot_wait_sleeps_until_a_slot_frees() {
+    let root = scratch_root().join("slot-waits");
+    fs::create_dir_all(&root).expect("create");
+    let store = ReelStore::open(PlainIo::for_tests(), &config(&root, BUDGET)).expect("open");
+    let state = &store.state;
+    // nothing frees a slot: the wait runs its whole time
+    let seen = state.slot_line.seen();
+    let started = std::time::Instant::now();
+    state.pause_for_slot(PauseCause::NoSegment, seen);
+    assert!(started.elapsed() >= reel::engine::reports::SLOT_WAIT / 2, "a slot wait woke after {:?} with no slot", started.elapsed());
+    // a slot frees from another thread partway through: the waiter wakes with it
+    let seen = state.slot_line.seen();
+    let started = std::time::Instant::now();
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            thread::sleep(reel::engine::reports::SLOT_WAIT / 4);
+            state.slot_line.wake();
+        });
+        state.pause_for_slot(PauseCause::NoSegment, seen);
+    });
+    assert!(started.elapsed() < reel::engine::reports::SLOT_WAIT, "a slot wait slept past the slot's wake: {:?}", started.elapsed());
+    // a slot that freed after the read ends the wait at once
+    let seen = state.slot_line.seen();
+    let slot = state.take_slot(0).expect("a free slot");
+    state.free_slot(slot);
+    let started = std::time::Instant::now();
+    state.pause_for_slot(PauseCause::Creating, seen);
+    assert!(started.elapsed() < reel::engine::reports::SLOT_WAIT / 4, "a wait missed a slot freed before it slept: {:?}", started.elapsed());
+    store.close().expect("close");
+    drop(store);
+    let _ = fs::remove_dir_all(&root);
 }

@@ -1793,6 +1793,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> Result<Engin
         data_syncs: AtomicU64::new(0),
         caller_ops: CallerCounts::default(),
         progress,
+        slot_line: WakeLine::new(),
         is_arena_full: AtomicBool::new(false),
         arena_fill: AtomicU64::new(0),
         unlinks_refused: AtomicU64::new(0),

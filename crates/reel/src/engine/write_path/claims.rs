@@ -273,6 +273,8 @@ impl<Backend: Io> EngineState<Backend> {
         }
         let deadline = self.io.now().0.saturating_add(INDEX_WAIT.0);
         loop {
+            // a slot that frees or a segment made after this read ends a wait for one below at once
+            let slot_seen = self.slot_line.seen();
             // a failed volume frees no slot, so a wait for one would never end
             check_writable(volume)?;
             if self.io.now().0 > deadline {
@@ -343,7 +345,7 @@ impl<Backend: Io> EngineState<Backend> {
 
             if claims.is_creating {
                 drop(claims);
-                self.pause_for(PauseCause::Creating);
+                self.pause_for_slot(PauseCause::Creating, slot_seen);
                 continue;
             }
             claims.is_creating = true;
@@ -355,6 +357,11 @@ impl<Backend: Io> EngineState<Backend> {
             let mut claims = hold(&volume.claims);
             claims.is_creating = false;
             volume.progress.wake();
+            // a writer waiting on this one wakes for a segment made or an error, and keeps sleeping when it found no slot either:
+            // only a slot that frees ends that wait
+            if !matches!(created, Ok(None)) {
+                self.slot_line.wake();
+            }
             match created {
                 Ok(Some(mut segment)) => {
                     segment.ceiling = pick.ceiling;
@@ -363,7 +370,7 @@ impl<Backend: Io> EngineState<Backend> {
                 },
                 Ok(None) => {
                     drop(claims);
-                    self.pause_for(PauseCause::NoSegment);
+                    self.pause_for_slot(PauseCause::NoSegment, slot_seen);
                 },
                 Err(error) => return Err(error),
             }
@@ -548,6 +555,9 @@ impl<Backend: Io> EngineState<Backend> {
         let mut claims = hold(&volume.claims);
         claims.is_creating = false;
         volume.progress.wake();
+        if !matches!(created, Ok(None)) {
+            self.slot_line.wake();
+        }
         match created {
             Ok(Some(segment)) => {
                 claims.prepared = Some(segment);

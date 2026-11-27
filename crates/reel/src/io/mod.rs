@@ -501,6 +501,13 @@ pub trait Io: Clone + Send + Sync + 'static {
         self.pause();
     }
 
+    /// Wait for a line to move past what a caller saw before it looked, or this long at most, for a wait only that line's moves
+    /// end. A backend that runs the work a waiter waits for pauses as before
+    fn wait_on(&self, line: &WakeLine, seen: u64, most: std::time::Duration) {
+        let _most = most;
+        self.pause_on(line, seen);
+    }
+
     /// Start a job on an engine thread
     fn spawn_job<Work: Job>(&self, name: &'static str, job: Work) -> Result<Self::Task>;
 

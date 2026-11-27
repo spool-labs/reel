@@ -140,6 +140,10 @@ impl Io for HarnessIo {
         self.plain.pause_on(line, seen);
     }
 
+    fn wait_on(&self, line: &WakeLine, seen: u64, most: std::time::Duration) {
+        self.plain.wait_on(line, seen, most);
+    }
+
     fn pause(&self) {
         self.plain.pause();
     }

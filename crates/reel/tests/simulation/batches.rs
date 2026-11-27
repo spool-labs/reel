@@ -1224,3 +1224,39 @@ fn a_batch_past_the_first_key_table_lands() {
         assert!(outcome.is_ok(), "a batch of {rows} rows on a fresh store: {outcome:?} after {waited} ms");
     }
 }
+
+// a batch that waits on a seal for index room leaves the reserve job at its own pace: it wakes the job once, and again only when
+// it finds a key table short of more rows
+#[test]
+fn a_batch_waiting_on_a_seal_leaves_the_reserve_job_at_its_pace() {
+    use std::sync::atomic::Ordering;
+    let io = SimulatedIo::new(Seed(3));
+    let store = ReelStore::open(io.clone(), &config()).expect("open");
+    let rows = 40_000;
+    let batch_of = |from: u64| {
+        let mut batch = WriteBatch::new();
+        for number in from..from + rows {
+            batch.put(PLAIN, &key_of(number), b"v");
+        }
+        batch
+    };
+    // with the seals held, batches fill the index until one waits on a seal for room
+    io.hold_jobs("reel-seal", true);
+    let mut from = 0;
+    let (waited, steps, outcome) = loop {
+        let (steps, started) = (store.state.reserve_steps.load(Ordering::Relaxed), io.now());
+        let outcome = store.write_batch(&batch_of(from));
+        let waited = io.now().0.saturating_sub(started.0);
+        let steps = store.state.reserve_steps.load(Ordering::Relaxed) - steps;
+        from += rows;
+        if waited >= 1_000_000_000 || from > 1_000_000 {
+            break (waited, steps, outcome);
+        }
+    };
+    io.hold_jobs("reel-seal", false);
+    println!("waited {} ms, {steps} reserve steps, outcome {outcome:?}", waited / 1_000_000);
+    assert!(waited >= 1_000_000_000, "no batch waited");
+    // the job steps every 100 ms at the fastest, so a second of waiting is ten steps and a few for the wakes
+    assert!(steps * 100_000_000 <= waited * 2 + 1_000_000_000, "{steps} reserve steps in {} ms of waiting", waited / 1_000_000);
+    store.close().expect("close");
+}

@@ -283,10 +283,19 @@ impl<Backend: Io> EngineState<Backend> {
         let _waiting = IndexWait::new(&self.index_waiters);
         let deadline = started.0.saturating_add(INDEX_WAIT.0);
         let own = &self.volumes[plan.volume.0 as usize];
+        // the job grows what the batch found short on its own thread. A pass wakes it again only when a hold found a table short
+        // of more rows than before, so a batch waiting on a seal doesn't keep it stepping
+        let mut raises = self.index.wanted_raises.load(Ordering::Acquire);
+        if let Some(task) = self.reserve_task.get() {
+            task.wake();
+        }
         loop {
-            // the job grows what the batch found short on its own thread
-            if let Some(task) = self.reserve_task.get() {
-                task.wake();
+            let now_raises = self.index.wanted_raises.load(Ordering::Acquire);
+            if now_raises != raises {
+                raises = now_raises;
+                if let Some(task) = self.reserve_task.get() {
+                    task.wake();
+                }
             }
             // a batch short only of nodes the job is bringing in waits for them, and seals early only when sealing is what frees room
             if !self.index.waits_for_nodes(&plan.needs) {

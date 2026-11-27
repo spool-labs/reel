@@ -1799,6 +1799,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> Result<Engin
         is_host_tight: AtomicBool::new(false),
         is_bringing_back: AtomicBool::new(false),
         pressed_steps: AtomicU64::new(0),
+        reserve_steps: AtomicU64::new(0),
         pressure_source: OnceLock::new(),
         pressure_watch: Mutex::new(None),
         is_pressure_fired: AtomicBool::new(false),

@@ -279,6 +279,8 @@ pub struct EngineState<Backend: Io> {
     pub is_bringing_back: AtomicBool,
     /// Ladder steps that found the store under pressure since open, which a scrape sees whatever moment it reads
     pub pressed_steps: AtomicU64,
+    /// Steps the reserve job has run
+    pub reserve_steps: AtomicU64,
     /// Where the store learns of memory pressure, chosen as the jobs start
     pub pressure_source: OnceLock<PressureSource>,
     /// The thread that waits on the kernel's pressure trigger, which close stops

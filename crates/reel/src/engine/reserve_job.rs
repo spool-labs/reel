@@ -398,6 +398,7 @@ pub fn is_host_tight(memory: &HostMemory) -> bool {
 
 impl<Backend: Io> Job for ReserveJob<Backend> {
     fn step(&mut self) -> JobStep {
+        self.state.reserve_steps.fetch_add(1, Ordering::Relaxed);
         self.grow_pools();
         self.hold_room();
         self.start_writeback();

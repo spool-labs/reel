@@ -1,7 +1,7 @@
 //! Keys, locations and graves of the open segments, sharded by a hash of the key
 
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use reel_core::column_id::ColumnId;
 use reel_core::units::{ByteCount, RowCount, WritePlace};
@@ -30,6 +30,8 @@ pub const SHARD_SHIFT: u32 = u64::BITS - SHARD_COUNT.trailing_zeros();
 #[derive(Debug)]
 pub struct WriteIndex {
     pub shards: Shards<WriteShard>,
+    /// Times a batch found a key table short of more rows than any batch before it, so a waiting batch wakes the job only then
+    pub wanted_raises: AtomicU64,
     /// Each shard's open counts, read with no lock. A row of a sorted column leaves them once its index holds it
     pub counts: Vec<OpenCounts>,
     /// Where each column's open rows count: PLAIN_COUNTS, SORTED_COUNTS or NO_COUNTS
@@ -53,7 +55,7 @@ impl WriteIndex {
         let counts = (0..SHARD_COUNT).map(|_shard| OpenCounts::new(sizing.buckets)).collect();
         let classes = std::array::from_fn(|_column| AtomicU8::new(PLAIN_COUNTS));
         let column_open = touched_from(SHARD_COUNT, || std::array::from_fn(|_column| AtomicU32::new(0)));
-        Ok(Self { shards: Shards(shards), counts, classes, class_changes: std::array::from_fn(|_column| AtomicU32::new(0)), column_open, changes: Default::default() })
+        Ok(Self { shards: Shards(shards), wanted_raises: AtomicU64::new(0), counts, classes, class_changes: std::array::from_fn(|_column| AtomicU32::new(0)), column_open, changes: Default::default() })
     }
 
     /// Read every shard's slab room, for the job that grows them
@@ -224,7 +226,13 @@ impl WriteIndex {
     /// Hold room for a batch in every shard it touches, or hold nothing
     pub fn hold_room(&self, needs: &[ShardNeed; SHARD_COUNT]) -> bool {
         for (index, need) in needs.iter().enumerate() {
-            if !self.shards.write(index).hold_room(need) {
+            let mut shard = self.shards.write(index);
+            let wanted = shard.wanted_rows;
+            if !shard.hold_room(need) {
+                if shard.wanted_rows > wanted {
+                    self.wanted_raises.fetch_add(1, Ordering::AcqRel);
+                }
+                drop(shard);
                 self.release_room(&needs[..index]);
                 return false;
             }

@@ -460,10 +460,13 @@ impl RecordCache {
     fn shorten_shard(&self, shard: &Mutex<CacheShard>) -> usize {
         let mut held = hold(shard);
         let cap = held.room.cap();
-        if held.capacity <= cap {
+        // a shard cut before may hold no more than the cap and still have extents the job grew past it since, all empty
+        if held.capacity <= cap && held.room.committed() <= cap {
             return 0;
         }
-        held.start_over(cap);
+        if held.capacity > cap {
+            held.start_over(cap);
+        }
         let room = Arc::clone(&held.room);
         drop(held);
         room.release_above(cap)

@@ -198,3 +198,25 @@ fn a_small_cut_empties_one_shard() {
     let hits = (0..VALUES).filter(|&offset| cache.get(SEGMENT, FileOffset(offset), KEY, &mut out) == CacheLookup::Hit).count();
     assert_eq!(hits, after, "a value left in the cache stopped answering");
 }
+
+// a second cut gives back what the job grew after the caps lifted, before any value came in
+#[test]
+fn a_second_cut_gives_back_what_grew() {
+    let bytes = ByteCount((CACHE_SHARDS * 4 * 1024 * 1024) as u64);
+    let cache = RecordCache::fresh(bytes, None, bytes).expect("build cache");
+    let committed = |cache: &RecordCache| cache.rooms().iter().map(|room| room.committed()).sum::<usize>();
+    let start = committed(&cache);
+    let first = cache.give_back(usize::MAX);
+    let after_cut = committed(&cache);
+    // the ladder lifts the caps once the store has held under its target for the decay, and the job grows every room a step
+    for room in cache.rooms() {
+        room.set_cap(usize::MAX);
+        let _grew = room.grow_step(&mut u64::MAX.clone()).expect("grow");
+    }
+    let regrown = committed(&cache);
+    let second = cache.give_back(usize::MAX);
+    let after_second = committed(&cache);
+    println!("in memory at open {start}, after a cut {after_cut} ({first} given), after the caps lift and a step {regrown}, after a second cut {after_second} ({second} given)");
+    assert!(regrown > after_cut, "the rooms never grew back");
+    assert_eq!(after_second, after_cut, "a second cut left {} bytes in memory under caps of one extent", after_second - after_cut);
+}

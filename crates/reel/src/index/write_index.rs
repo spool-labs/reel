@@ -18,6 +18,7 @@ use crate::index::entry_slab::{EntryAddress, NO_ENTRY, PageCount};
 use crate::pool_room::PoolRoom;
 use crate::index::sorted_keys::{Floors, KeyEntry, MOST_KEY_BYTES, SortedKeys, Upserted};
 use crate::pool::{touched_capacity, touched_from};
+use crate::index::seek_target::SeekTarget;
 use crate::index::write_tree::{entry_at, step_forward};
 use crate::row_kind::RowKind;
 
@@ -43,6 +44,21 @@ pub struct WriteIndex {
     pub column_open: Vec<[AtomicU32; COLUMN_SLOTS]>,
     /// Each shard's count of changes to its rows, which goes up under its write lock
     pub changes: [PaddedCount; SHARD_COUNT],
+    /// Work a test runs each time an entering lets a shard go partway through a slot's rows
+    #[cfg(feature = "test-hooks")]
+    pub between_enter_holds: std::sync::Mutex<Option<EnterHook>>,
+}
+
+/// A test's work between an entering's holds of a shard, given the shard
+#[cfg(feature = "test-hooks")]
+#[derive(Clone)]
+pub struct EnterHook(pub std::sync::Arc<dyn Fn(usize) + Send + Sync>);
+
+#[cfg(feature = "test-hooks")]
+impl std::fmt::Debug for EnterHook {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("EnterHook")
+    }
 }
 
 impl WriteIndex {
@@ -55,7 +71,10 @@ impl WriteIndex {
         let counts = (0..SHARD_COUNT).map(|_shard| OpenCounts::new(sizing.buckets)).collect();
         let classes = std::array::from_fn(|_column| AtomicU8::new(PLAIN_COUNTS));
         let column_open = touched_from(SHARD_COUNT, || std::array::from_fn(|_column| AtomicU32::new(0)));
-        Ok(Self { shards: Shards(shards), wanted_raises: AtomicU64::new(0), counts, classes, class_changes: std::array::from_fn(|_column| AtomicU32::new(0)), column_open, changes: Default::default() })
+        Ok(Self { shards: Shards(shards), wanted_raises: AtomicU64::new(0), counts, classes, class_changes: std::array::from_fn(|_column| AtomicU32::new(0)), column_open, changes: Default::default(),
+            #[cfg(feature = "test-hooks")]
+            between_enter_holds: std::sync::Mutex::new(None),
+        })
     }
 
     /// Read every shard's slab room, for the job that grows them
@@ -354,10 +373,12 @@ pub fn shard_of(hash: KeyHash) -> usize {
 
 /// Most rows one run of entering puts into a sorted index under a shard's write lock
 pub const ENTER_RUN_ROWS: usize = 256;
+/// Rows an entering walks under one hold of a shard's lock, so the shard's writers and a seal's walk wait no longer than that
+pub const ENTER_HOLD_ROWS: usize = 4096;
 
 impl WriteIndex {
     /// Enter one shard's open rows of sorted columns into their indexes in key order, a run at a time under the shard's write
-    /// lock, and count each out of the open counts once its index holds it. A row its index can't take stays counted, so a walk
+    /// lock and never more than ENTER_HOLD_ROWS rows to a hold, and count each out of the open counts once its index holds it. A row its index can't take stays counted, so a walk
     /// places a real head over it. Slots with no floors are left alone. Says how many rows went in
     pub fn enter_shard<'index>(
         &self,
@@ -366,60 +387,97 @@ impl WriteIndex {
         index_of: impl Fn(ColumnId) -> Option<&'index SortedKeys>,
         run: &mut EnterRun,
     ) -> u64 {
-        let mut guard = self.shards.write(shard);
         let mut entered = 0;
-        for slot in 0..guard.trees.len() {
+        for slot in 0..floors.len() {
             let Some(slot_floors) = floors.get(slot).copied().flatten() else {
                 continue;
             };
-            let segment = guard.trees[slot].segment;
-            let mut position = guard.trees[slot].first_position(&guard.nodes);
-            let mut column: Option<ColumnId> = None;
-            // a tree holds a key's rows newest first, and only the newest goes in, as a seal gives one row a key. The older ones are
-            // covered once it's in
-            let mut newest: Option<(EntryAddress, Newest)> = None;
-            while let Some(at) = position {
-                let address = entry_at(&guard.nodes, at);
-                position = step_forward(&guard.nodes, at);
-                let row_column = guard.slab.column(address);
-                let is_same_key = newest.is_some_and(|(first, _state)| guard.slab.column(first) == row_column && guard.slab.key(first) == guard.slab.key(address));
-                if is_same_key {
-                    match newest.map(|(_first, state)| state) {
-                        Some(Newest::In) if !guard.slab.is_entered(address) => {
-                            guard.slab.mark_entered(address);
-                            self.shard_counts(shard).remove(guard.slab.column(address), guard.slab.key(address));
-                            entered += 1;
-                        },
-                        // past the run's room an older row stays counted, which only places a real head over it
-                        Some(Newest::InRun(row)) if run.older.len() < ENTER_RUN_ROWS => run.older.push((row, address)),
-                        _other => {},
+            // the walk lets the lock go every ENTER_HOLD_ROWS rows, at a key's first row, and picks up past the last whole key. A row
+            // that came in behind it waits for the next entering, and stays counted till then
+            let mut resume: Option<ColumnId> = None;
+            let mut segment_seen = None;
+            loop {
+                let mut guard = self.shards.write(shard);
+                let Some(tree) = guard.trees.get(slot) else {
+                    break;
+                };
+                let segment = tree.segment;
+                // a slot sealed and opened again between holds holds another segment's rows, which the next entering takes
+                if *segment_seen.get_or_insert(segment) != segment {
+                    break;
+                }
+                let mut position = match resume {
+                    None => tree.first_position(&guard.nodes),
+                    Some(column) => tree.seek(&guard.nodes, &guard.slab, &SeekTarget::new(column, &run.resume, WritePlace(0))),
+                };
+                let mut column: Option<ColumnId> = None;
+                // a tree holds a key's rows newest first, and only the newest goes in, as a seal gives one row a key. The older ones
+                // are covered once it's in
+                let mut newest: Option<(EntryAddress, Newest)> = None;
+                let mut walked = 0;
+                let mut is_whole = true;
+                while let Some(at) = position {
+                    let address = entry_at(&guard.nodes, at);
+                    let row_column = guard.slab.column(address);
+                    let is_same_key = newest.is_some_and(|(first, _state)| guard.slab.column(first) == row_column && guard.slab.key(first) == guard.slab.key(address));
+                    if !is_same_key && walked >= ENTER_HOLD_ROWS
+                        && let Some((first, _state)) = newest
+                    {
+                        run.resume.clear();
+                        run.resume.extend_from_slice(guard.slab.key(first));
+                        resume = Some(guard.slab.column(first));
+                        is_whole = false;
+                        break;
                     }
-                    continue;
+                    position = step_forward(&guard.nodes, at);
+                    walked += 1;
+                    if is_same_key {
+                        match newest.map(|(_first, state)| state) {
+                            Some(Newest::In) if !guard.slab.is_entered(address) => {
+                                guard.slab.mark_entered(address);
+                                self.shard_counts(shard).remove(guard.slab.column(address), guard.slab.key(address));
+                                entered += 1;
+                            },
+                            // past the run's room an older row stays counted, which only places a real head over it
+                            Some(Newest::InRun(row)) if run.older.len() < ENTER_RUN_ROWS => run.older.push((row, address)),
+                            _other => {},
+                        }
+                        continue;
+                    }
+                    if column != Some(row_column) || run.entries.len() == ENTER_RUN_ROWS {
+                        entered += self.enter_run(&mut guard, shard, column.and_then(&index_of), slot_floors, run);
+                        column = Some(row_column);
+                    }
+                    newest = Some((address, Newest::Out));
+                    let Some(index) = index_of(row_column) else {
+                        continue;
+                    };
+                    if guard.slab.is_entered(address) {
+                        newest = Some((address, Newest::In));
+                        continue;
+                    }
+                    let (Some(row), key) = (guard.slab.row(address), guard.slab.key(address)) else {
+                        continue;
+                    };
+                    if row.kind == RowKind::RangeDelete || key.len() != index.width() {
+                        continue;
+                    }
+                    newest = Some((address, Newest::InRun(run.entries.len())));
+                    run.keys.extend_from_slice(key);
+                    run.entries.push(KeyEntry { place: row.place, segment, offset: row.offset, length: row.length, is_grave: row.kind == RowKind::Grave });
+                    run.addresses.push(address);
                 }
-                if column != Some(row_column) || run.entries.len() == ENTER_RUN_ROWS {
-                    entered += self.enter_run(&mut guard, shard, column.and_then(&index_of), slot_floors, run);
-                    column = Some(row_column);
+                // the run goes in before the lock does, since its addresses hold only while the shard is held
+                entered += self.enter_run(&mut guard, shard, column.and_then(&index_of), slot_floors, run);
+                if is_whole {
+                    break;
                 }
-                newest = Some((address, Newest::Out));
-                let Some(index) = index_of(row_column) else {
-                    continue;
-                };
-                if guard.slab.is_entered(address) {
-                    newest = Some((address, Newest::In));
-                    continue;
+                drop(guard);
+                #[cfg(feature = "test-hooks")]
+                if let Some(EnterHook(work)) = crate::guard::hold(&self.between_enter_holds).clone() {
+                    work(shard);
                 }
-                let (Some(row), key) = (guard.slab.row(address), guard.slab.key(address)) else {
-                    continue;
-                };
-                if row.kind == RowKind::RangeDelete || key.len() != index.width() {
-                    continue;
-                }
-                newest = Some((address, Newest::InRun(run.entries.len())));
-                run.keys.extend_from_slice(key);
-                run.entries.push(KeyEntry { place: row.place, segment, offset: row.offset, length: row.length, is_grave: row.kind == RowKind::Grave });
-                run.addresses.push(address);
             }
-            entered += self.enter_run(&mut guard, shard, column.and_then(&index_of), slot_floors, run);
         }
         entered
     }
@@ -461,6 +519,8 @@ impl WriteIndex {
 #[derive(Debug)]
 pub struct EnterRun {
     keys: Vec<u8>,
+    /// The last whole key a walk took before it let its shard go, which the next hold seeks past
+    resume: Vec<u8>,
     entries: Vec<KeyEntry>,
     addresses: Vec<EntryAddress>,
     /// Older rows of a run's keys, by the run row of their newest, which cover them once it's in
@@ -483,6 +543,7 @@ impl EnterRun {
     pub fn new() -> Self {
         Self {
             keys: touched_capacity(ENTER_RUN_ROWS * MOST_KEY_BYTES, 0),
+            resume: touched_capacity(MOST_KEY_BYTES, 0),
             entries: touched_capacity(ENTER_RUN_ROWS, KeyEntry::default()),
             addresses: touched_capacity(ENTER_RUN_ROWS, NO_ENTRY),
             older: touched_capacity(ENTER_RUN_ROWS, (0, NO_ENTRY)),

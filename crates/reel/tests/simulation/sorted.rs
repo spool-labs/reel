@@ -5375,3 +5375,54 @@ fn a_share_held_across_the_bring_back_comes_back_on_a_later_step() {
     assert_eq!(state.shares_given_bytes.load(Ordering::Acquire), 0);
     store.close().expect("close");
 }
+
+const HOLD_KEYS: u64 = 120_000;
+const HOLD_LATE_KEYS: u64 = 64;
+const HOLD_BUDGET: ByteCount = ByteCount(1 << 30);
+
+// an entering lets each shard go every ENTER_HOLD_ROWS rows, so a writer or a seal's walk waits for no more than that. Between holds
+// the shard is free, a put lands, and the walk picks up past its last whole key: every key reads right, and every open row of the
+// first pass is in the index once the entering is done
+#[test]
+fn an_entering_lets_its_shard_go_between_holds() {
+    let io = SimulatedIo::new(Seed(61));
+    SIM_BUDGET.with(|budget| budget.set(HOLD_BUDGET));
+    let store = Arc::new(open(&io, RowCount(4 * HOLD_KEYS)));
+    SIM_BUDGET.with(|budget| budget.set(BUDGET));
+    let mut model = Model::new();
+    for number in 0..HOLD_KEYS {
+        store.put(COLUMN, &key(number), b"held").expect("put");
+        model.insert(key(number), b"held".to_vec());
+        // the jobs grow the index as the keys come
+        if number % 4_096 == 0 {
+            settle(&io);
+        }
+    }
+    let lets_go = Arc::new(AtomicU64::new(0));
+    let late = Arc::new(AtomicU64::new(0));
+    let (hook_store, hook_lets_go, hook_late) = (Arc::clone(&store), Arc::clone(&lets_go), Arc::clone(&late));
+    *reel::guard::hold(&store.state.index.between_enter_holds) = Some(reel::index::write_index::EnterHook(Arc::new(move |shard| {
+        assert!(hook_store.state.index.shards.try_write(shard).is_some(), "an entering held shard {shard} between its holds");
+        hook_lets_go.fetch_add(1, Ordering::Relaxed);
+        let number = hook_late.fetch_add(1, Ordering::Relaxed);
+        if number < HOLD_LATE_KEYS {
+            hook_store.put(COLUMN, &key(HOLD_KEYS + number), b"late").expect("put");
+        }
+    })));
+    assert_eq!(store.state.sorted_index(COLUMN).expect("an index").mark(), None, "the index filled before the entering");
+    let _entered = store.state.enter_open_rows(&mut reel::index::write_index::EnterRun::new());
+    *reel::guard::hold(&store.state.index.between_enter_holds) = None;
+    assert!(lets_go.load(Ordering::Relaxed) > 0, "the entering never let a shard go");
+    let entered = store.state.rows_entered.load(Ordering::Relaxed);
+    assert!(entered >= HOLD_KEYS, "{entered} of {HOLD_KEYS} open rows went in");
+    for number in 0..late.load(Ordering::Relaxed).min(HOLD_LATE_KEYS) {
+        model.insert(key(HOLD_KEYS + number), b"late".to_vec());
+    }
+    let written: Vec<Vec<u8>> = model.keys().cloned().collect();
+    check(&store, &model, &written);
+    // the open rows' entries point at open segments, which the check finds once they seal
+    store.seal_now();
+    settle(&io);
+    check(&store, &model, &written);
+    check_entries(&store, &model);
+}

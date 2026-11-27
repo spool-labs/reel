@@ -30,35 +30,6 @@ pub const EXTENT_DIVISOR: usize = 16;
 /// The least room that starts on a huge page and grows in whole ones
 pub const HUGE_ROOM_BYTES: usize = 4 * HUGE_PAGE_BYTES;
 
-/// How far ahead of its fill a pool on the lead arm keeps memory ready, in nanoseconds of writes at its last measured rate
-pub const LEAD_NANOS: u64 = 100_000_000;
-/// The variable that picks the growth arm for the A/B/C runs: extent, demand or lead
-pub const POLICY_VARIABLE: &str = "REEL_GROW_POLICY";
-
-/// When a pool grows, one arm each for the A/B/C runs. The winner stays and the others go
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GrowPolicy {
-    /// Grow an extent when less than one is free
-    Extent,
-    /// Grow a small step once a caller is at the limit
-    Demand,
-    /// Keep the fill of the last stretch of time ready ahead of use
-    Lead,
-    /// Lead for the pools data arrives in, and extents for the caches, which have no fill rate of their own and starve on a lead
-    Mixed,
-}
-
-/// Read the arm the process runs, once
-pub fn grow_policy() -> GrowPolicy {
-    static POLICY: OnceLock<GrowPolicy> = OnceLock::new();
-    *POLICY.get_or_init(|| match std::env::var(POLICY_VARIABLE).as_deref() {
-        Ok("demand") => GrowPolicy::Demand,
-        Ok("lead") => GrowPolicy::Lead,
-        Ok("mixed") => GrowPolicy::Mixed,
-        _ => GrowPolicy::Extent,
-    })
-}
-
 /// Slots for readers that take no lock of a pool. Threads past this many share a slot, which the counts allow
 pub const READ_SLOTS: usize = 64;
 
@@ -268,8 +239,6 @@ pub struct PoolRoom {
     share: usize,
     /// The room reserved its share alone where it asked for more: the process passed MOST_PAST_BYTES or the host refused the map
     is_held_to_share: bool,
-    /// The bytes every extent is a multiple of: a page, a huge page in a large room, and a pool page in a paged room
-    unit: usize,
     /// Bytes of one extent. The last may be shorter
     extent: usize,
     extent_count: usize,
@@ -282,12 +251,12 @@ pub struct PoolRoom {
     /// Set when the host had no room for the next step, and cleared once a step fits. A summary is never short: its rows must stay,
     /// so its writer grows it inline with no host check, and pools_short can read 0 while the summary is what went over
     is_short: AtomicBool,
-    /// The bytes the lead arm keeps ready past use, which the job sets from the fill rate
-    lead: AtomicUsize,
-    /// The job's last look at the fill: when, and the bytes used then
-    sample: Mutex<(u64, usize)>,
-    /// Since when the room has held more than an extent past what it wants, or 0
+    /// Since when the room has held more than an extent past its use with no fill, or 0
     over_since: AtomicU64,
+    /// The least use the job saw since over_since, and the use an idle trim left. Use past it is fill
+    idle_used: AtomicUsize,
+    /// Set by an idle trim, and cleared by the next grow. A trimmed room grows a step once fill comes, and not before
+    is_trimmed: AtomicBool,
     /// The part the data on disk asks for, which open brings in when the host has room
     first_part: AtomicUsize,
     /// Bytes the room has given back to the kernel, for the report
@@ -299,8 +268,6 @@ pub struct PoolRoom {
     /// The most the room may grow to past the ladder's word: the share for a room reserved past it, which only the store's
     /// rebalance raises, and a record cache shard's own size until a rebalance holds it to an extent
     ceiling: AtomicUsize,
-    /// The room is a cache's, which has no fill rate of its own
-    is_cache: bool,
     /// Bytes the pool uses now, which its owner notes and the job reads
     used: AtomicUsize,
     /// Set once the pool asked for its next extent, until the job brings it in
@@ -406,23 +373,21 @@ impl PoolRoom {
             share: wanted,
             is_held_to_share: past > wanted && reserved == wanted,
             mapped,
-            unit,
             extent,
             extent_count,
             ready: ExtentSet::new(extent_count),
             ready_bytes: AtomicUsize::new(0),
             has_failed: AtomicBool::new(false),
             is_short: AtomicBool::new(false),
-            lead: AtomicUsize::new(extent),
-            sample: Mutex::new((0, 0)),
             over_since: AtomicU64::new(0),
+            idle_used: AtomicUsize::new(0),
+            is_trimmed: AtomicBool::new(false),
             first_part: AtomicUsize::new(0),
             given_back: AtomicU64::new(0),
             growing: Mutex::new(()),
             cap: AtomicUsize::new(usize::MAX),
             // the share as granted, before the page rounding, so the indexes' ceilings together stay under the cap open shared
             ceiling: AtomicUsize::new(if reserved > wanted { share.0 as usize } else { usize::MAX }),
-            is_cache: false,
             used: AtomicUsize::new(0),
             has_asked: AtomicBool::new(false),
             wake: OnceLock::new(),
@@ -434,12 +399,12 @@ impl PoolRoom {
             took_up_in_release: AtomicBool::new(false),
         };
         // a whole room comes in at once, with no host check: a reader opens its rooms whole and runs no job to grow them, so a
-        // read-only open can still pass what the host holds. Any other room starts with what its arm keeps ready, and the part the
+        // read-only open can still pass what the host holds. Any other room starts with a step, and the part the
         // data on disk asks for comes in at open through the host check, in the rooms' order
         if first.0 >= share.0 {
             room.grow_to(room.share)?;
         } else {
-            room.grow_to(room.lead_bytes())?;
+            room.grow_to(room.step())?;
             room.first_part.store(first.0 as usize, Ordering::Relaxed);
         }
         Ok(room)
@@ -487,7 +452,7 @@ impl PoolRoom {
         self.extent
     }
 
-    /// Read the bytes the extent arm grows by at a time: a sixteenth of the share in whole extents, and one extent at least
+    /// Read the bytes a pool grows by at a time: a sixteenth of the share in whole extents, and one extent at least
     pub fn step(&self) -> usize {
         (self.share / EXTENT_DIVISOR).next_multiple_of(self.extent).max(self.extent)
     }
@@ -571,7 +536,7 @@ impl PoolRoom {
         self.note_used(self.committed().max(self.used()));
     }
 
-    /// Note the bytes the pool uses now, and wake the job the first time the arm wants the next step
+    /// Note the bytes the pool uses now, and wake the job the first time the pool wants the next step
     pub fn note_used(&self, bytes: usize) {
         self.used.store(bytes, Ordering::Relaxed);
         // a room held short or failed waits for the job's own period, so running short costs no wake a page
@@ -605,65 +570,22 @@ impl PoolRoom {
         self.committed() < self.cap() && !self.has_failed() && !self.is_short()
     }
 
-    /// Read the arm this room grows by: the process's, and under the mixed arm a lead for a pool data arrives in and extents for a
-    /// cache
-    fn policy(&self) -> GrowPolicy {
-        match grow_policy() {
-            GrowPolicy::Mixed if !self.is_cache => GrowPolicy::Lead,
-            policy => policy,
-        }
-    }
-
-    /// Mark the room a cache's, which the mixed arm grows by extents
-    pub fn for_cache(mut self) -> Self {
-        self.is_cache = true;
-        self
-    }
-
-
-    /// Read the bytes the arm keeps ready past use
-    fn lead_bytes(&self) -> usize {
-        match self.policy() {
-            GrowPolicy::Extent | GrowPolicy::Mixed => self.step(),
-            GrowPolicy::Demand => self.unit,
-            GrowPolicy::Lead => self.lead.load(Ordering::Relaxed),
-        }
-    }
-
-    /// Read where the pool grows next with this many bytes used, under the process's arm, up to the room
+    /// Read where the pool grows next with this many bytes used, up to the room. A pool grows a step when less than one is free,
+    /// and a pool an idle trim left grows a step once fill comes
     pub fn next_step(&self, used: usize) -> Option<usize> {
         let committed = self.committed();
         if committed >= self.cap() {
             return None;
         }
-        let free = committed.saturating_sub(used);
-        let target = match self.policy() {
-            GrowPolicy::Extent | GrowPolicy::Mixed => (free < self.step()).then_some(committed + self.step()),
-            GrowPolicy::Demand => (free < self.unit).then_some(committed + self.extent),
-            GrowPolicy::Lead => {
-                let lead = self.lead.load(Ordering::Relaxed);
-                (free < lead).then_some(used + 2 * lead)
-            },
-        }?;
-        Some(target.min(self.cap()))
+        let wants = if self.is_trimmed.load(Ordering::Acquire) {
+            used > self.idle_used.load(Ordering::Relaxed)
+        } else {
+            committed.saturating_sub(used) < self.step()
+        };
+        wants.then(|| (committed + self.step()).min(self.cap()))
     }
 
-    /// Set the lead arm's lead from the fill since the job last looked: the bytes that fill takes in LEAD_NANOS, and never less
-    /// than one unit
-    pub fn note_rate(&self, now: u64) {
-        let used = self.used();
-        let mut sample = self.sample.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (then, used_then) = *sample;
-        *sample = (now, used);
-        let elapsed = now.saturating_sub(then);
-        if then == 0 || elapsed == 0 {
-            return;
-        }
-        let rate_lead = (used.saturating_sub(used_then) as u128 * u128::from(LEAD_NANOS) / u128::from(elapsed)) as usize;
-        self.lead.store(rate_lead.max(self.extent), Ordering::Relaxed);
-    }
-
-    /// Grow until the arm wants no more or the room is whole, taking no step past the room the host has left, and say whether it
+    /// Grow until the pool wants no more or the room is whole, taking no step past the room the host has left, and say whether it
     /// grew. A pool the host has no room for stays as it is and reads as short until a step fits
     pub fn grow_step(&self, host_left: &mut u64) -> Result<bool> {
         let mut grew = false;
@@ -674,6 +596,7 @@ impl PoolRoom {
                 break;
             }
             self.grow_to(target)?;
+            self.is_trimmed.store(false, Ordering::Release);
             *host_left -= step;
             self.is_short.store(false, Ordering::Release);
             grew = true;
@@ -737,26 +660,33 @@ impl PoolRoom {
         Ok(())
     }
 
-    /// Give back the highest empty extents of a paged pool that has held more than an extent past what it wants for DECAY_NANOS,
-    /// and return the bytes given back. A pool keeps its lowest extent
+    /// Give back the highest empty extents of a paged pool that has held more than an extent past its use with no fill for the
+    /// decay, down to its use and one extent, and return the bytes given back. A pool keeps its lowest extent
     pub fn release_idle(&self, now: u64) -> usize {
         let Some(pages) = &self.pages else {
             return 0;
         };
-        let want = self.used() + self.lead_bytes();
-        if self.committed() <= want + self.extent {
+        let used = self.used();
+        let committed = self.committed();
+        if committed <= used + self.extent {
             self.over_since.store(0, Ordering::Relaxed);
             return 0;
         }
+        // fill since the job last looked starts the decay over, so a pool in use keeps its step
         let since = self.over_since.load(Ordering::Relaxed);
-        if since == 0 {
+        if since == 0 || used > self.idle_used.load(Ordering::Relaxed) {
             self.over_since.store(now, Ordering::Relaxed);
+            self.idle_used.store(used, Ordering::Relaxed);
             return 0;
         }
+        self.idle_used.store(used, Ordering::Relaxed);
         if now.saturating_sub(since) < decay_nanos() {
             return 0;
         }
-        let given = self.release_down_to(pages, want + self.extent);
+        let given = self.release_down_to(pages, used + self.extent);
+        if self.committed() < committed {
+            self.is_trimmed.store(true, Ordering::Release);
+        }
         self.over_since.store(0, Ordering::Relaxed);
         given
     }
@@ -765,7 +695,7 @@ impl PoolRoom {
     /// given back. The ladder's first step, which costs the pool nothing
     pub fn release_spare(&self) -> usize {
         match &self.pages {
-            Some(pages) => self.release_down_to(pages, self.used() + self.lead_bytes()),
+            Some(pages) => self.release_down_to(pages, self.used() + self.step()),
             None => 0,
         }
     }
@@ -1250,6 +1180,37 @@ mod tests {
     }
 
     #[test]
+    fn an_idle_room_trims_to_its_use_and_an_extent_then_grows_a_step() {
+        let page = page_bytes();
+        let room = PoolRoom::reserve_paged(ByteCount(256 * page as u64), ByteCount(256 * page as u64), page).expect("reserve");
+        let step = room.step();
+        assert!(step >= 4 * room.extent(), "a step of {step} leaves no room between it and an extent");
+        let taken: Vec<u32> = (0..64).map(|_page| room.take_page().expect("take")).collect();
+        for &page_number in &taken[32..] {
+            room.give_page(page_number);
+        }
+        room.note_used(32 * page);
+        // fill while the decay runs starts it over
+        assert_eq!(room.release_idle(1), 0);
+        room.note_used(33 * page);
+        assert_eq!(room.release_idle(1 + DECAY_NANOS), 0, "a room in use gave back");
+        room.note_used(32 * page);
+        assert_eq!(room.release_idle(2 + DECAY_NANOS), 0, "a room gave back before it decayed");
+        assert!(room.release_idle(2 + 2 * DECAY_NANOS) > 0, "an idle room gave nothing back");
+        assert_eq!(room.committed(), 32 * page + room.extent(), "an idle room kept more than its use and an extent");
+        // the job grows nothing back until fill comes
+        assert_eq!(room.next_step(32 * page), None, "an idle room grew back with no fill");
+        assert!(!room.grow_step(&mut u64::MAX.clone()).expect("grow"));
+        room.note_used(32 * page + 1);
+        let before = room.committed();
+        assert!(room.grow_step(&mut u64::MAX.clone()).expect("grow"));
+        assert_eq!(room.committed(), before + step, "a burst after an idle trim grew other than a step");
+        // past the burst the room grows by its free room again
+        assert_eq!(room.next_step(32 * page + 1), None);
+        assert_eq!(room.next_step(room.committed() - step + 1), Some(room.committed() + step));
+    }
+
+    #[test]
     fn a_release_waits_for_readers_that_came_in_before_it() {
         let page = page_bytes();
         let room = PoolRoom::reserve_paged(ByteCount(64 * page as u64), ByteCount(64 * page as u64), page).expect("reserve").read_unlocked();
@@ -1341,16 +1302,9 @@ mod tests {
     }
 
 
-    // the arms a room grows by, which a child run of the word test takes one at a time
-    const ARMS: [&str; 4] = ["extent", "demand", "lead", "mixed"];
-
-    // the child run of the word test, under the arm its parent set: a paged room past its share grows, gives back and takes back
-    // the extents on both sides of each word's edge
+    // a paged room past its share grows, gives back and takes back the extents on both sides of each word's edge
     #[test]
     fn grow_and_give_back_across_words() {
-        if std::env::var_os("REEL_WORD_ARM").is_none() {
-            return;
-        }
         let page = page_bytes();
         let room = PoolRoom::reserve_paged_past(ByteCount(64 * page as u64), ByteCount(200 * page as u64), ByteCount(0), page)
             .expect("reserve")
@@ -1400,22 +1354,6 @@ mod tests {
         // pages pack low again: the first take after the comeback lands at 8, and the free pages count every extent across the edges
         assert_eq!(room.take_page(), Some(8));
         assert_eq!(room.free_pages() + 9, room.ready_pages());
-    }
-
-    // grows, gives back and takes back across the words of a room's extent sets under every arm, each in a child process since
-    // the arm is the process's
-    #[test]
-    fn extents_cross_words_under_every_arm() {
-        for arm in ARMS {
-            let status = std::process::Command::new(std::env::current_exe().expect("path"))
-                .args(["--exact", "pool_room::tests::grow_and_give_back_across_words", "--test-threads=1"])
-                .env("REEL_WORD_ARM", "1")
-                .env(POLICY_VARIABLE, arm)
-                .stdout(std::process::Stdio::null())
-                .status()
-                .expect("run");
-            assert!(status.success(), "the {arm} arm failed: {status}");
-        }
     }
 
     // a room asks for no more than MOST_EXTENTS extents, and a refused map leaves it its share, which it reports

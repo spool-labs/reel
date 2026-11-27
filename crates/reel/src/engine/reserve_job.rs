@@ -17,7 +17,7 @@ use crate::guard::hold;
 use crate::io::job::{Job, JobStep};
 use crate::io::{Io, IoFile, IoTask};
 use crate::pool::touched_filled;
-use crate::pool_room::{GrowPolicy, decay_nanos, grow_policy};
+use crate::pool_room::decay_nanos;
 use crate::io::host_memory::{HostMemory, PRESSURE_READ_MARK};
 use crate::index::value_pages::VALUE_PAGE_BYTES;
 use crate::index::spot_index::SpotIndex;
@@ -164,11 +164,6 @@ impl<Backend: Io> ReserveJob<Backend> {
     /// the pool at its size for the next step to try again
     pub fn grow_pools(&self) {
         let now = self.state.io.now().0;
-        if matches!(grow_policy(), GrowPolicy::Lead | GrowPolicy::Mixed) {
-            for room in &self.state.pool_rooms {
-                room.note_rate(now);
-            }
-        }
         // a write index shard whose nodes stayed free hands its pages to its room first, and a test can ask for it at once
         #[cfg(feature = "test-hooks")]
         let is_asked = self.state.release_node_pages.swap(false, Ordering::AcqRel);
@@ -182,7 +177,7 @@ impl<Backend: Io> ReserveJob<Backend> {
                 let _given = room.release_spare();
             }
         }
-        // a paged pool that has held more than an extent past what it wants for the decay gives its highest empty extents back
+        // a paged pool that has held more than an extent past its use with no fill for the decay gives its highest empty extents back
         for room in &self.state.pool_rooms {
             let _finished = room.finish_releases();
             let _given = room.release_idle(now);

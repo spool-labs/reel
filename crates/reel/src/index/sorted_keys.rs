@@ -338,7 +338,7 @@ impl SortedKeys {
     }
 
     /// Build an index with room for these rows of keys this wide, with the pages for its first rows in memory: twice the rows it
-    /// starts with, and at least what its arm keeps ready. The rest comes in as the reserve job grows it, up to the pages for
+    /// starts with, and at least a step. The rest comes in as the reserve job grows it, up to the pages for
     /// `most_rows`, and past them up to `past` bytes of address space, so an index that outgrows its plan grows on with no reopen
     pub fn growing(width: usize, rows: RowCount, first_rows: RowCount, most_rows: RowCount, past: ByteCount) -> std::io::Result<Self> {
         assert!((1..=MOST_KEY_BYTES).contains(&width), "a sorted index holds keys of 1 to {MOST_KEY_BYTES} bytes");

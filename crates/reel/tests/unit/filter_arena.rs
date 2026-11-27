@@ -14,7 +14,7 @@ const FIRST: SegmentNumber = SegmentNumber(1);
 const SECOND: SegmentNumber = SegmentNumber(2);
 
 fn arena() -> FilterArena {
-    FilterArena::new(SHARE, SEGMENTS)
+    FilterArena::new(SHARE, SHARE, SEGMENTS).expect("arena")
 }
 
 fn stored(arena: &FilterArena, segment: SegmentNumber, offset: u32) -> Option<Vec<u8>> {
@@ -74,7 +74,7 @@ fn room_comes_back() {
 // the table of segments has its own limit, past which a segment stays out
 #[test]
 fn segment_limit() {
-    let arena = FilterArena::new(SHARE, 1);
+    let arena = FilterArena::new(SHARE, SHARE, 1).expect("arena");
     assert!(arena.begin(FIRST, 1, 1));
     assert!(!arena.begin(SECOND, 1, 1));
 }
@@ -82,7 +82,7 @@ fn segment_limit() {
 // a segment with no filters takes a line in the table and no bytes
 #[test]
 fn empty_extent() {
-    let arena = FilterArena::new(SHARE, SEGMENTS);
+    let arena = FilterArena::new(SHARE, SHARE, SEGMENTS).expect("arena");
     assert!(arena.begin(FIRST, 0, 0));
     assert!(arena.holds(FIRST));
     arena.drop_segment(FIRST);
@@ -92,7 +92,7 @@ fn empty_extent() {
 // a share too small for its tables holds no segment, and refuses one with no harm
 #[test]
 fn tiny_share() {
-    let arena = FilterArena::new(ByteCount(64), SEGMENTS);
+    let arena = FilterArena::new(ByteCount(64), ByteCount(64), SEGMENTS).expect("arena");
     assert!(!arena.begin(FIRST, 1, 1));
     assert!(arena.heap_bytes().0 < 1_024);
 }
@@ -101,7 +101,7 @@ fn tiny_share() {
 #[test]
 fn heap_inside_the_share() {
     let share = ByteCount(1024 * 1024);
-    assert!(FilterArena::new(share, 1_000_000).heap_bytes() <= share);
+    assert!(FilterArena::new(share, share, 1_000_000).expect("arena").heap_bytes() <= share);
 }
 
 const LOW_PATTERN: u8 = 0x5A;
@@ -120,7 +120,7 @@ fn fill(arena: &FilterArena, segment: SegmentNumber, pattern: u8) {
 // a reader racing a drop and a reload of the same room only ever answers from the segment it asked for, or not at all
 #[test]
 fn race_answers_from_the_asked_segment() {
-    let arena = FilterArena::new(ByteCount(64 * 1024), SEGMENTS);
+    let arena = FilterArena::new(ByteCount(64 * 1024), ByteCount(64 * 1024), SEGMENTS).expect("arena");
     let is_done = AtomicBool::new(false);
     let answered = AtomicU64::new(0);
     fill(&arena, FIRST, LOW_PATTERN);
@@ -173,4 +173,86 @@ fn probe_says_nothing_it_cant_prove() {
     assert_eq!(arena.probe(FIRST, 200, hash), Some(false));
     assert_eq!(arena.probe(FIRST, 150, hash), None);
     assert_eq!(arena.probe(SECOND, 100, hash), None);
+}
+
+const GROW_ROUNDS: usize = 40;
+const GROW_SEGMENTS: u64 = 200;
+const GROW_BLOCK_BYTES: usize = 256;
+const GROW_PAGES: usize = 64;
+const GROW_OFFSET: u32 = 9;
+
+// readers probe the newest segment while the arena grows for each one that doesn't fit, and read only words in memory: every
+// answer is the asked segment's, and on Linux no reader faults once it has warmed up
+#[test]
+fn probes_race_grows() {
+    let page = reel::region::page_bytes();
+    let ceiling = ByteCount((GROW_PAGES * page) as u64);
+    let mut grew = 0;
+    for _round in 0..GROW_ROUNDS {
+        let arena = FilterArena::new(ceiling, ByteCount(0), GROW_SEGMENTS as usize).expect("arena");
+        let newest = AtomicU64::new(0);
+        let is_done = AtomicBool::new(false);
+        thread::scope(|scope| {
+            let readers: Vec<_> = (0..RACE_READERS)
+                .map(|_reader| {
+                    scope.spawn(|| {
+                        let mut faults = None;
+                        while !is_done.load(Ordering::Acquire) {
+                            let number = newest.load(Ordering::Acquire);
+                            if number == 0 {
+                                continue;
+                            }
+                            // the first probe brings in the reader's own pages, and the count starts after it
+                            if faults.is_none() {
+                                let _first = arena.probe(SegmentNumber(number), GROW_OFFSET, KeyHash(number));
+                                faults = Some(reel::region::thread_faults());
+                            }
+                            // every block is all ones, so a probe that answers can only say maybe
+                            assert_ne!(arena.probe(SegmentNumber(number), GROW_OFFSET, KeyHash(number)), Some(false), "a probe read words it doesn't own");
+                        }
+                        reel::region::thread_faults().saturating_sub(faults.unwrap_or_else(reel::region::thread_faults))
+                    })
+                })
+                .collect();
+            for number in 1..=GROW_SEGMENTS {
+                let segment = SegmentNumber(number);
+                if !arena.begin(segment, 1, GROW_BLOCK_BYTES as u32) {
+                    assert!(arena.is_short(), "a refused segment asked for no room");
+                    assert!(arena.grow_step(&mut u64::MAX.clone()).expect("grow"), "the arena didn't grow under its ceiling");
+                    grew += 1;
+                    assert!(arena.begin(segment, 1, GROW_BLOCK_BYTES as u32), "a segment didn't fit after a grow");
+                }
+                arena.add(segment, GROW_OFFSET, &[0xFF; GROW_BLOCK_BYTES]);
+                newest.store(number, Ordering::Release);
+            }
+            is_done.store(true, Ordering::Release);
+            for reader in readers {
+                let faults = reader.join().expect("join");
+                // a probe's stack and code come in on its first pass, and nothing after
+                assert!(faults <= READER_WARM_FAULTS, "a reader took {faults} faults beside the grows");
+            }
+        });
+        assert!(arena.ready_bytes() <= ceiling.0);
+    }
+    assert!(grew >= GROW_ROUNDS, "the arena grew {grew} times");
+}
+
+const READER_WARM_FAULTS: u64 = 8;
+
+// an arena at its ceiling grows no more and stops asking, so its segment stays with the block cache
+#[test]
+fn grows_stop_at_the_ceiling() {
+    let page = reel::region::page_bytes();
+    let arena = FilterArena::new(ByteCount(page as u64), ByteCount(0), SEGMENTS).expect("arena");
+    assert_eq!(arena.ready_bytes(), 0);
+    assert!(!arena.begin(FIRST, 1, 8));
+    assert!(arena.is_short());
+    let mut none_left = 0;
+    assert!(!arena.grow_step(&mut none_left).expect("grow"), "a grow passed the room left");
+    assert!(arena.is_short(), "a grow held short stopped asking");
+    assert!(arena.grow_step(&mut u64::MAX.clone()).expect("grow"));
+    assert!(arena.begin(FIRST, 1, 8));
+    assert!(!arena.begin(SECOND, 1, page as u32));
+    assert!(!arena.grow_step(&mut u64::MAX.clone()).expect("grow"), "an arena grew past its ceiling");
+    assert!(!arena.is_short(), "an arena at its ceiling kept asking");
 }

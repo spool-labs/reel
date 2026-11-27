@@ -31,7 +31,7 @@ use crate::engine::engine_sizing::{
     check_seal_blocks, complete_block_rows, shard_for_rows, complete_row_limit, index_headroom, rows_within_blocks, seal_blocks, set_segment_rows, split_idle_room,
     EngineSizing, FILTER_CACHE_QUARTERS, FILTER_SLOT_BYTES, GROUP_BYTES, LEAST_LZ4_BUDGET, LEAST_SHARD_ENTRIES, PLANNED_LINE_BYTES,
     SHARED_JOBS, StoreShape, GATHER_BYTES, assumed_segment_bytes, capped_entries, disk_entries, entry_cost, entry_cover, floor_entries,
-    dead_bits_bytes, segment_bytes_for, target_rows, IndexAsk, index_ask, index_cap, is_index_exact, share_indexes,
+    ARENA_GROWTH, dead_bits_bytes, segment_bytes_for, target_rows, IndexAsk, index_ask, index_cap, is_index_exact, share_indexes,
 };
 use crate::engine::engine_state::{EngineState, PLACE_RUN, SEGMENT_NUMBER_BATCH, SlotFile};
 use crate::engine::open_segment::{RecordWindow, RowQueue, SegmentPhase, fits_a_segment_path, reserve_step, set_reserve_step, window_bytes_for};
@@ -1644,6 +1644,10 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> Result<Engin
     let record_room = sizing.record_share.0.saturating_sub(dead_bits);
     let arena_taken = arena_wanted.saturating_sub(base_arena).min(record_room.saturating_sub(RecordCache::least_bytes()));
     let arena_share = ByteCount(base_arena + arena_taken);
+    // the arena brings in the filters of twice the rows on disk at open and grows from there, into its share and past it to the
+    // filter share less the cache's stripe, taking room from the caches as it goes
+    let arena_floor = ByteCount((rows_on_disk.saturating_mul(ARENA_GROWTH).saturating_mul(BITS_PER_ROW as u64) / 8).min(arena_share.0));
+    let arena_ceiling = ByteCount(whole.saturating_sub(stripe).max(arena_share.0));
     let is_complete = config.columns.iter().any(|column| column.complete_rows().is_some());
     let block_share = ByteCount(sizing.cache_share.0 - filter_share.0);
     // complete columns read small blocks, and a slot sized for a full block would hold a sixteenth of what it could
@@ -1685,7 +1689,7 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> Result<Engin
         index,
         spot: SpotIndex::new(sizing.spot_share),
         filter_cache: BlockCache::new(ByteCount(split.filter_cache), FILTER_SLOT_BYTES),
-        filter_arena: FilterArena::new(arena_share, planned.iter().map(|table| table.segments_per_shard * TABLE_SHARDS).sum()),
+        filter_arena: FilterArena::new(arena_ceiling, arena_floor, planned.iter().map(|table| table.segments_per_shard * TABLE_SHARDS).sum())?.planned(arena_share),
         row_cache: BlockCache::new(row_share, ROW_BLOCK_BYTES),
         record_cache,
         complete_cache: is_complete.then(|| BlockCache::new(complete_share, COMPLETE_BLOCK_BYTES)),

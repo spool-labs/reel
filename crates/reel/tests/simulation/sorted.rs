@@ -3434,6 +3434,8 @@ fn a_pressed_store_drops_its_index_and_refills_it() {
     store.state.volumes[0].holds.reclaim.store(true, Ordering::Release);
     let mut model = fill_for_reopen(&store, &io, KEYS);
     check_all(&store, &model, KEYS, 46);
+    // the store holds its filter arena's whole plan, as one whose filters filled it does, so the ladder has its steps above the least
+    store.state.filter_arena.bring_in_plan().expect("arena");
     let job = reel::engine::reserve_job::ReserveJob::new(Arc::clone(&store.state));
     let tight = reel::io::host_memory::HostMemory {
         total: ByteCount(1 << 30),
@@ -3839,6 +3841,8 @@ fn the_ladder_gives_caches_back_before_an_index() {
         store.put(PLAIN, &key(number), b"plain").expect("put");
     }
     seal_all(&store, &io);
+    // the store holds its filter arena's whole plan, as one whose filters filled it does, so the ladder has its steps above the least
+    store.state.filter_arena.bring_in_plan().expect("arena");
     let job = reel::engine::reserve_job::ReserveJob::new(Arc::clone(&store.state));
     io.set_host_memory(reel::io::host_memory::HostMemory {
         total: ByteCount(1 << 30),

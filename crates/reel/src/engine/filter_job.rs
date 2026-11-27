@@ -11,7 +11,7 @@ use reel_core::units::FileOffset;
 use crate::engine::reports::thread_cpu;
 use crate::engine::engine_state::EngineState;
 use crate::engine::volume::Volume;
-use crate::io::{Io, IoFile};
+use crate::io::{Io, IoFile, IoTask};
 use crate::pool::touched_capacity;
 use crate::segment::block_filter::open_filter;
 use crate::segment::segment_tail::{MAX_COLUMNS, SegmentNumber};
@@ -56,7 +56,7 @@ impl<Backend: Io> FilterLoader<Backend> {
     /// Count what can change which segments want loading
     pub fn changes(&self, volume: &Volume<Backend>) -> u64 {
         let left = volume.segments_rewritten.load(Ordering::Acquire) + volume.segments_unlinked.load(Ordering::Acquire);
-        left + volume.seals_done.load(Ordering::Acquire)
+        left + volume.seals_done.load(Ordering::Acquire) + self.state.filter_arena.grows()
     }
 
     /// Load a few filters, and say whether there's more to do
@@ -117,8 +117,14 @@ impl<Backend: Io> FilterLoader<Backend> {
             return false;
         };
         if !self.plan_extent(volume, segment) {
-            // a segment that doesn't fit stays with the cache, and an older one is smaller or no better off
+            // a segment that doesn't fit stays with the cache, and an older one is smaller or no better off. The reserve job grows
+            // the arena for it when it can, and the grow brings this look back
             self.looked_at = changes;
+            if self.state.filter_arena.is_short()
+                && let Some(task) = self.state.reserve_task.get()
+            {
+                task.wake();
+            }
             return false;
         }
         self.segment = Some(segment);

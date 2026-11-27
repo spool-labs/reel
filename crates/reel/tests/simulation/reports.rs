@@ -516,8 +516,8 @@ const FLOOR_TEST_ROWS: u64 = 200;
 const FLOOR_FILL_KEYS: u64 = 4_000;
 const FLOOR_ROUNDS: u64 = 4;
 
-// a store opened empty gets bits and filters for the floor's rows, and one filled past it answers every key right while the
-// report shows the rows that went without bits
+// a store opened empty gets bits for the floor's rows, and one filled past it answers every key right while the report shows the
+// rows that went without bits. The arena grows past its floor as the segments come, so every segment keeps its filters
 #[test]
 fn past_the_floor_answers_right() {
     reel::engine::engine_sizing::TEST_FLOOR_ROWS.with(|floor| floor.set(FLOOR_TEST_ROWS));
@@ -540,7 +540,10 @@ fn past_the_floor_answers_right() {
     let mut report = MaintenanceReport::new();
     store.maintenance_report(&mut report);
     assert!(report.volumes[0].rows_without_bits > 0, "no row went without a bit past the floor");
-    assert!(store.memory_report().arena_segments_left_out.0 > 0, "no segment went without filters past the floor");
+    settle(&io);
+    let memory = store.memory_report();
+    assert_eq!(memory.arena_segments_left_out, SegmentCount(0), "a segment went without filters past the floor");
+    assert!(memory.arena_room.0 > 0, "the arena never grew");
     store.close().expect("close");
 }
 

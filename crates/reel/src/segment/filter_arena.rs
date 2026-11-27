@@ -4,15 +4,23 @@
 //! and it leaves with its segment. A segment that doesn't fit stays out, and its filters go through the block cache as before.
 //! A probe takes no lock and writes nothing: the bytes are atomic words, and a generation on the extent tells a probe that crossed
 //! a load or a drop to throw its answer away.
+//!
+//! The words are address space reserved at open up to a ceiling the budget sets, with a floor in memory for the rows on disk. A
+//! segment that doesn't fit notes the bytes it lacked, and the reserve job brings that much more in on its own thread before the
+//! filter job tries the segment again. A probe reads only words under the length in memory, so it never faults
 
 use std::hint::black_box;
+use std::io::Result;
+use std::ptr::NonNull;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
 
 use reel_core::units::ByteCount;
 
 use crate::guard::hold;
 use crate::pool::{touched_atomics, touched_capacity, touched_filled};
+use crate::pool_room::{map_room, populate, unmap_room};
+use crate::region::page_bytes;
 use crate::index::key_hash::KeyHash;
 use crate::segment::block_filter::may_contain_bytes;
 use crate::segment::segment_tail::SegmentNumber;
@@ -73,7 +81,19 @@ pub struct ArenaBooks {
 /// The filters of every volume's segments that fit
 #[derive(Debug)]
 pub struct FilterArena {
-    words: Vec<AtomicU32>,
+    /// The words' reservation, `mapped` bytes of address space, of which the first `ready` words are in memory
+    base: NonNull<AtomicU32>,
+    mapped: usize,
+    ceiling_words: usize,
+    ready_words: AtomicUsize,
+    /// The bytes the last segment refused for room wanted, or 0 when none waits for the arena to grow
+    short_by: AtomicUsize,
+    /// Moves at every grow, so the filter job looks again at a segment it left out
+    grows: AtomicU64,
+    /// The bytes the open-time plan gave the arena, which the caches leave it whether or not they are in memory yet
+    planned: u64,
+    /// Held across a grow, so two growers never bring in one range at once
+    growing: Mutex<()>,
     numbers: Vec<AtomicU64>,
     slots: Vec<AtomicU32>,
     mask: usize,
@@ -134,19 +154,41 @@ impl FilterExtent {
     }
 }
 
+// SAFETY: the arena owns its mapping alone, and every word in it is atomic
+unsafe impl Send for FilterArena {}
+// SAFETY: shared readers only load atomic words under the length in memory, and writers hold the books
+unsafe impl Sync for FilterArena {}
+
 impl FilterArena {
-    /// Allocate and touch the arena, with room for a number of segments
-    pub fn new(share: ByteCount, most_segments: usize) -> Self {
-        let most_segments = most_segments.min(share.0 as usize / TABLE_SHARE_DIVISOR / SEGMENT_TABLE_BYTES);
+    /// Reserve the arena up to a ceiling, with a floor of it in memory and room for a number of segments. The segment tables
+    /// come out of the ceiling
+    pub fn new(ceiling: ByteCount, floor: ByteCount, most_segments: usize) -> Result<Self> {
+        let most_segments = most_segments.min(ceiling.0 as usize / TABLE_SHARE_DIVISOR / SEGMENT_TABLE_BYTES);
         let tables = (most_segments * SEGMENT_TABLE_BYTES) as u64;
-        let length = (share.0 - tables).min(u64::from(u32::MAX)) as u32 / WORD_BYTES as u32 * WORD_BYTES as u32;
+        let words_of = |bytes: u64| bytes.min(u64::from(u32::MAX)) as usize / WORD_BYTES;
+        let ceiling_words = words_of(ceiling.0.saturating_sub(tables));
+        let floor_words = words_of(floor.0).min(ceiling_words);
+        let mapped = (ceiling_words * WORD_BYTES).next_multiple_of(page_bytes());
+        let base = if mapped == 0 { NonNull::dangling() } else { map_room(mapped)?.cast::<AtomicU32>() };
+        if floor_words > 0
+            && let Err(error) = populate(base.as_ptr().cast(), (floor_words * WORD_BYTES).next_multiple_of(page_bytes()).min(mapped), page_bytes()) {
+            unmap_room(base.as_ptr().cast(), mapped);
+            return Err(error);
+        }
         let mut free = touched_capacity(most_segments + 2, ArenaSpan::default());
-        if length > 0 {
-            free.push(ArenaSpan { start: 0, length });
+        if floor_words > 0 {
+            free.push(ArenaSpan { start: 0, length: (floor_words * WORD_BYTES) as u32 });
         }
         let size = (most_segments.max(1) * 2).next_power_of_two();
-        Self {
-            words: touched_words(length as usize / WORD_BYTES),
+        Ok(Self {
+            base,
+            mapped,
+            ceiling_words,
+            ready_words: AtomicUsize::new(floor_words),
+            short_by: AtomicUsize::new(0),
+            grows: AtomicU64::new(0),
+            planned: (floor_words * WORD_BYTES) as u64,
+            growing: Mutex::new(()),
             // NO_NUMBER is zero, and zeros collected come back as a zeroed allocation no page of which open has touched
             numbers: touched_atomics(size),
             slots: touched_words(size),
@@ -159,7 +201,107 @@ impl FilterArena {
                 free_extents: (0..most_segments as u32).rev().collect(),
                 free,
             }),
+        })
+    }
+
+    /// Read a word, or nothing past the words in memory
+    fn word(&self, at: usize) -> Option<&AtomicU32> {
+        // SAFETY: a word under the length in memory lies in the mapping, populated, and stays there until the arena drops
+        (at < self.ready_words.load(Ordering::Acquire)).then(|| unsafe { &*self.base.as_ptr().add(at) })
+    }
+
+    /// Set the bytes the open-time plan gave the arena, past its floor
+    #[must_use]
+    pub fn planned(mut self, bytes: ByteCount) -> Self {
+        // the tables come out of the share as they come out of the ceiling
+        self.planned = bytes.0.min((self.ceiling_words * WORD_BYTES) as u64);
+        self
+    }
+
+    /// Read the bytes of the caches' shares the arena counts in: its plan, or what it holds once it grew past it, and its tables
+    pub fn share_bytes(&self) -> ByteCount {
+        let tables = self.heap_bytes().0 - self.ready_bytes();
+        ByteCount(self.planned.max(self.ready_bytes()) + tables)
+    }
+
+    /// Read the bytes of the plan the arena hasn't brought in yet, which it grows into with no cache giving anything
+    pub fn planned_left(&self) -> u64 {
+        self.planned.saturating_sub(self.ready_bytes())
+    }
+
+    /// Read the bytes of the arena in memory
+    pub fn ready_bytes(&self) -> u64 {
+        (self.ready_words.load(Ordering::Acquire) * WORD_BYTES) as u64
+    }
+
+    /// Check a segment waits for the arena to grow
+    pub fn is_short(&self) -> bool {
+        self.short_by.load(Ordering::Acquire) > 0
+    }
+
+    /// Read how many times the arena grew
+    pub fn grows(&self) -> u64 {
+        self.grows.load(Ordering::Acquire)
+    }
+
+    /// Read the bytes the next grow brings in: what the segment the arena last refused lacked, and at least what the arena holds,
+    /// in whole pages up to the ceiling. Nothing when no segment waits. An arena at its ceiling stops asking, and the segment stays
+    /// with the block cache
+    pub fn next_grow(&self) -> Option<u64> {
+        let short = self.short_by.load(Ordering::Acquire);
+        if short == 0 {
+            return None;
         }
+        let page = page_bytes();
+        let ready = self.ready_words.load(Ordering::Acquire) * WORD_BYTES;
+        let ceiling = self.ceiling_words * WORD_BYTES;
+        if ready + short > ceiling {
+            self.short_by.store(0, Ordering::Release);
+            return None;
+        }
+        let target = (ready + short.max(ready).max(page)).next_multiple_of(page).min(ceiling);
+        Some((target - ready) as u64)
+    }
+
+    /// Bring the arena's whole plan into memory, as a store does once its filters fill it, so a test holds what such a store holds
+    #[cfg(feature = "test-hooks")]
+    pub fn bring_in_plan(&self) -> Result<()> {
+        while self.planned_left() > 0 {
+            self.short_by.store(self.planned_left() as usize, Ordering::Release);
+            if !self.grow_step(&mut u64::MAX.clone())? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Bring in the next grow on the calling thread when it fits the room left, and say whether it grew
+    pub fn grow_step(&self, room_left: &mut u64) -> Result<bool> {
+        let _growing = hold(&self.growing);
+        let Some(step) = self.next_grow() else {
+            return Ok(false);
+        };
+        if step > *room_left {
+            return Ok(false);
+        }
+        let page = page_bytes();
+        let ready = self.ready_words.load(Ordering::Acquire) * WORD_BYTES;
+        let target = ready + step as usize;
+        let start = ready.next_multiple_of(page).min(self.mapped);
+        let end = target.next_multiple_of(page).min(self.mapped);
+        if end > start {
+            // SAFETY: the range lies inside the mapping, past every word in memory, where no probe reads
+            populate(unsafe { self.base.as_ptr().cast::<u8>().add(start) }, end - start, page)?;
+        }
+        *room_left -= step;
+        {
+            let mut books = hold(&self.books);
+            self.ready_words.store(target / WORD_BYTES, Ordering::Release);
+            books.give_span(ArenaSpan { start: ready as u32, length: (target - ready) as u32 });
+        }
+        self.short_by.store(0, Ordering::Release);
+        self.grows.fetch_add(1, Ordering::Release);
+        Ok(true)
     }
 
     /// Read how many times any segment's filters changed
@@ -183,7 +325,7 @@ impl FilterArena {
         let extents = self.extents.capacity() * size_of::<FilterExtent>() + books.extents.capacity() * size_of::<ExtentBook>();
         let lists = books.free.capacity() * size_of::<ArenaSpan>() + books.free_extents.capacity() * size_of::<u32>();
         let map = self.numbers.capacity() * size_of::<AtomicU64>() + self.slots.capacity() * size_of::<AtomicU32>();
-        ByteCount((self.words.capacity() * WORD_BYTES + extents + lists + map) as u64)
+        ByteCount(self.ready_bytes() + (extents + lists + map) as u64)
     }
 
     /// Find where a segment sits in the map, with no lock. A place read beside a change only sends the reader to the block cache
@@ -241,10 +383,10 @@ impl FilterArena {
         while low < high {
             let middle = (low + high) / 2;
             let at = lines + middle * FILTER_LINE_WORDS;
-            let line_offset = self.words.get(at)?.load(Ordering::Relaxed);
+            let line_offset = self.word(at)?.load(Ordering::Relaxed);
             if line_offset == offset {
-                let start = self.words.get(at + 1)?.load(Ordering::Relaxed) as usize;
-                let end = self.words.get(at + 2)?.load(Ordering::Relaxed) as usize;
+                let start = self.word(at + 1)?.load(Ordering::Relaxed) as usize;
+                let end = self.word(at + 2)?.load(Ordering::Relaxed) as usize;
                 return Some((start, end));
             }
             if line_offset < offset {
@@ -258,7 +400,7 @@ impl FilterArena {
 
     /// Read one byte of the arena
     pub fn byte_at(&self, at: usize) -> Option<u8> {
-        let word = self.words.get(at / WORD_BYTES)?.load(Ordering::Relaxed);
+        let word = self.word(at / WORD_BYTES)?.load(Ordering::Relaxed);
         Some(word.to_le_bytes()[at % WORD_BYTES])
     }
 
@@ -280,6 +422,8 @@ impl FilterArena {
         };
         let room = blocks * FILTER_LINE_BYTES as u32 + bits + blocks * BLOCK_PAD_BYTES;
         let Some(span) = books.take_span(room.next_multiple_of(WORD_BYTES as u32)) else {
+            // the reserve job grows the arena by what this segment lacked, and the filter job tries it again
+            self.short_by.fetch_max(room as usize, Ordering::AcqRel);
             return false;
         };
         books.free_extents.pop();
@@ -308,14 +452,20 @@ impl FilterArena {
         let mut book = books.extents[slot];
         let bits_at = book.span.start + book.blocks * FILTER_LINE_BYTES as u32 + book.bits_used;
         let line_at = (book.span.start as usize / WORD_BYTES) + book.lines_used as usize * FILTER_LINE_WORDS;
-        for (word, chunk) in self.words[bits_at as usize / WORD_BYTES..].iter().zip(bits.chunks(WORD_BYTES)) {
+        // the extent's span lies in memory, so every word it takes is there
+        let store = |at: usize, value: u32| {
+            if let Some(word) = self.word(at) {
+                word.store(value, Ordering::Relaxed);
+            }
+        };
+        for (index, chunk) in bits.chunks(WORD_BYTES).enumerate() {
             let mut staged = [0; WORD_BYTES];
             staged[..chunk.len()].copy_from_slice(chunk);
-            word.store(u32::from_le_bytes(staged), Ordering::Relaxed);
+            store(bits_at as usize / WORD_BYTES + index, u32::from_le_bytes(staged));
         }
-        self.words[line_at].store(offset, Ordering::Relaxed);
-        self.words[line_at + 1].store(bits_at, Ordering::Relaxed);
-        self.words[line_at + 2].store(bits_at + bits.len() as u32, Ordering::Relaxed);
+        store(line_at, offset);
+        store(line_at + 1, bits_at);
+        store(line_at + 2, bits_at + bits.len() as u32);
         book.bits_used += (bits.len() as u32).next_multiple_of(WORD_BYTES as u32);
         book.lines_used += 1;
         books.extents[slot] = book;
@@ -329,7 +479,7 @@ impl FilterArena {
     pub fn used_bytes(&self) -> (ByteCount, ByteCount) {
         let books = hold(&self.books);
         let free: u64 = books.free.iter().map(|span| u64::from(span.length)).sum();
-        let room = (self.words.len() * WORD_BYTES) as u64;
+        let room = self.ready_bytes();
         (ByteCount(room.saturating_sub(free)), ByteCount(room))
     }
 
@@ -411,4 +561,12 @@ pub fn touched_extents(count: usize) -> Vec<FilterExtent> {
     extents.resize_with(count, FilterExtent::default);
     black_box(extents.as_ptr());
     extents
+}
+
+impl Drop for FilterArena {
+    fn drop(&mut self) {
+        if self.mapped > 0 {
+            unmap_room(self.base.as_ptr().cast(), self.mapped);
+        }
+    }
 }

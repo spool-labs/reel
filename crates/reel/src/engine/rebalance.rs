@@ -190,6 +190,28 @@ fn take_from_indexes<'index>(indexes: impl Iterator<Item = (usize, Option<&'inde
     taken
 }
 
+/// Make room for the filter arena to grow this many bytes inside the caches' ceilings, and return the room there is: what the
+/// caches' structures leave unused, then whole shards of the record cache and the block caches down to their floors, as open lets
+/// the arena take from the record share past the filter share. No ceiling moves, so the caches and the arena stay under them
+/// together. A store with no plan has its shares fixed and leaves the target to bound it
+pub fn room_for_arena<Backend: Io>(state: &EngineState<Backend>, wanted: u64) -> u64 {
+    let Some(plan) = &state.rebalance_plan else {
+        return wanted;
+    };
+    let floors = plan.floors();
+    let mut room = state.filter_arena.planned_left() + cache_slack(state, plan, ROW_CACHE) + cache_slack(state, plan, 2);
+    for cache in [2, ROW_CACHE] {
+        if room >= wanted {
+            break;
+        }
+        let can = plan.ceilings()[cache].saturating_sub(floors[cache]).min(freeable(state, cache));
+        if can > 0 {
+            room += free_shards(state, cache, (wanted - room).min(can), can);
+        }
+    }
+    room.min(wanted)
+}
+
 /// Lower the caches' shares until they give this many bytes or reach their floors, each round split by share among the caches
 /// still past their floor, as open splits what the indexes take, and return the bytes they gave. Each cache frees at least what
 /// it gives, in whole shards, before the bytes count
@@ -229,7 +251,8 @@ fn take_from_caches<Backend: Io>(state: &EngineState<Backend>, plan: &RebalanceP
 /// can't hold, so the arena counts in the block share up to its room and the rest in the record share
 fn cache_slack<Backend: Io>(state: &EngineState<Backend>, plan: &RebalancePlan, cache: usize) -> u64 {
     let ceilings = plan.ceilings();
-    let arena = state.filter_arena.heap_bytes().0;
+    // the arena counts by its plan, which it grows into, so a rebalance never hands on room the arena hasn't brought in yet
+    let arena = state.filter_arena.share_bytes().0;
     let arena_in_block = arena.min(ceilings[1].saturating_sub(shards_held(state, 1)));
     let held = match cache {
         0 => shards_held(state, cache),

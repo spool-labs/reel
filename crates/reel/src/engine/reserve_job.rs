@@ -8,7 +8,7 @@ use reel_core::units::{ByteCount, FileOffset, Nanoseconds, RowCount};
 use crate::index::sorted_keys::planned_index_bytes;
 
 use crate::engine::complete_path::refill_ceiling;
-use crate::engine::rebalance::rebalance;
+use crate::engine::rebalance::{rebalance, room_for_arena};
 use crate::engine::engine_state::EngineState;
 use crate::engine::open_segment::SegmentPhase;
 use crate::engine::write_path::reserve_target;
@@ -183,6 +183,17 @@ impl<Backend: Io> ReserveJob<Backend> {
             let _given = room.release_idle(now);
         }
         let target = self.hold_to_target(now);
+        // a segment the filter arena had no room for gets it here, on this thread, and the planner loads it on its next step
+        if let Some(step) = self.state.filter_arena.next_grow()
+            && room_for_arena(&self.state, step) >= step
+        {
+            let mut room_left = host_left(&self.state.io.host_memory()).min(target.saturating_sub(self.held_bytes()));
+            if matches!(self.state.filter_arena.grow_step(&mut room_left), Ok(true))
+                && let Some(task) = self.state.planner_task.get()
+            {
+                task.wake();
+            }
+        }
         if !self.state.pool_rooms.iter().any(|room| room.next_step(room.used()).is_some()) {
             return;
         }

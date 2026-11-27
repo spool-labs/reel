@@ -707,7 +707,7 @@ fn prepare(root: &Path) {
 
 // readers on real threads race a drop and a reload of one extent's room, and only ever answer from the segment they asked for
 fn check_arena_race() {
-    let arena = FilterArena::new(ARENA_SHARE, ARENA_SEGMENTS);
+    let arena = FilterArena::new(ARENA_SHARE, ARENA_SHARE, ARENA_SEGMENTS).expect("arena");
     let fill = |segment: SegmentNumber, pattern: u8| {
         assert!(arena.begin(segment, 1, ARENA_BLOCK_BYTES as u32));
         arena.add(segment, ARENA_OFFSET, &[pattern; ARENA_BLOCK_BYTES]);

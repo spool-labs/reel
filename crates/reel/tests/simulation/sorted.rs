@@ -5305,3 +5305,40 @@ fn a_get_across_a_refill_end_finds_its_key() {
     assert_eq!(across.as_ref(), Some(value), "a get lost a key to a refill that ended between its find and its read of the mark");
     store.close().expect("close");
 }
+
+// encoders are sized for the largest value a column can store: the lz4 limit on a store whose columns are all lz4, a segment when
+// one column stores values as written
+#[test]
+fn encoders_are_sized_for_the_largest_value_a_column_stores() {
+    let encoder_bytes = |store: &Store| {
+        let pool = &store.state.encoders;
+        pool.heap_bytes(reel::record::record_encoder::RecordEncoder::heap_bytes).0 / pool.item_count().max(1) as u64
+    };
+    let wide = |config: &mut StoreConfig| {
+        for volume in &mut config.volumes {
+            volume.segment_bytes = Some(ByteCount(2 * reel::engine::engine_sizing::LZ4_STORED_LIMIT.0));
+        }
+    };
+    let io = SimulatedIo::new(Seed(76));
+    SIM_CODEC.with(|codec| codec.set(Codec::Lz4));
+    let mut store_config = config(CAPACITY);
+    SIM_CODEC.with(|codec| codec.set(Codec::None));
+    wide(&mut store_config);
+    let store = ReelStore::open(io.clone(), &store_config).expect("open");
+    let lz4_bytes = encoder_bytes(&store);
+    store.close().expect("close");
+    let io = SimulatedIo::new(Seed(77));
+    let mut store_config = config(CAPACITY);
+    wide(&mut store_config);
+    let store = ReelStore::open(io.clone(), &store_config).expect("open");
+    let plain_bytes = encoder_bytes(&store);
+    // a plain column still takes a value past the lz4 limit
+    let value = vec![b'p'; reel::engine::engine_sizing::LZ4_STORED_LIMIT.0 as usize + 1];
+    store.put(COLUMN, &key(1), &value).expect("a plain value past the lz4 limit");
+    assert_eq!(read(&store, &key(1)).as_ref(), Some(&value));
+    seal_all(&store, &io);
+    store.close().expect("close");
+    println!("encoder bytes: all lz4 {lz4_bytes}, with a plain column {plain_bytes}");
+    assert!(lz4_bytes < 300 * 1024, "an all-lz4 store's encoder holds {lz4_bytes} B");
+    assert!(plain_bytes > lz4_bytes, "a plain column's encoder isn't sized past the lz4 limit");
+}

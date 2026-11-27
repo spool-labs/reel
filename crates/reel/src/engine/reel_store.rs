@@ -1600,8 +1600,11 @@ pub fn build_state<Backend: Io>(inputs: OpenInputs<'_, Backend>) -> Result<Engin
         drop(hold(&spare_groups[slot]));
     }
 
-    // a value reaches the largest segment any volume takes, which a set size can raise past the budget's rule
-    let largest_value = config.volumes.iter().filter_map(|volume| volume.segment_bytes).fold(sizing.segment_bytes, ByteCount::max);
+    // a value reaches the largest segment any volume takes, which a set size can raise past the budget's rule. An lz4 column refuses
+    // one past the lz4 limit, so a store with only lz4 columns sizes its encoders to that
+    let largest_segment = config.volumes.iter().filter_map(|volume| volume.segment_bytes).fold(sizing.segment_bytes, ByteCount::max);
+    let has_plain = config.columns.iter().any(|column| column.codec != Codec::Lz4);
+    let largest_value = if has_plain { largest_segment } else { largest_segment.min(sizing.lz4_stored_limit) };
     let most_shares = if has_lz4 && !sizing.is_read_only { sizing.lz4_stored_limit.0 as usize / SHARE_BYTES } else { 0 };
     let counts = sizing.counts;
     let mut encoders = Vec::with_capacity(counts.write_buffers);

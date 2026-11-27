@@ -4123,22 +4123,35 @@ fn a_store_with_its_past_refused_opens_on_its_shares() {
 
 
 // an index filled to four times its plan gets its room from the caches and leaves the write index its own: a burst of ingest after
-// it meets no more waits for index room and no more short pools than a store whose index stayed held to its share, the write
-// index's rooms grow as they do there, and the index's mark is gone with no reopen
+// it runs as fast as in a store whose index stayed held to its share, waits no longer for index room, runs no more pools short,
+// the write index's rooms grow as they do there, and the index's mark is gone with no reopen. It holds with the filter arena at
+// its floor and with its whole plan in. The count of waits lands near one of two values by where the burst meets a seal, which
+// a few MB of held memory moves, so it shows only as context, and so do wall-clock puts a second
 #[test]
 fn an_index_past_its_plan_leaves_ingest_its_room() {
-    let held = ingest_after_an_index_fills(true);
-    let ruled = ingest_after_an_index_fills(false);
-    eprintln!("ingest held to share: {held:?}, {} puts a second", held.puts_a_second);
-    eprintln!("ingest under the rule: {ruled:?}, {} puts a second", ruled.puts_a_second);
-    assert_eq!(held.capacity, ruled.capacity, "the two arms planned the index apart");
-    assert!(held.is_marked_before && held.is_marked && held.rebalances == 0, "the index held to its share: {held:?}");
-    assert!(!ruled.is_marked_before && !ruled.is_marked && ruled.rebalances > 0, "the rule left the index marked: {ruled:?}");
-    // the burst outruns the write index in both arms alike, so the waits match to within a twentieth
-    assert!(ruled.index_waits <= held.index_waits + held.index_waits / 20 + 4, "the burst waited more for index room: {ruled:?} against {held:?}");
-    assert!(ruled.most_short <= held.most_short + 1, "the burst ran more pools short: {ruled:?} against {held:?}");
-    assert!(ruled.write_rooms.iter().zip(&held.write_rooms).all(|(ruled, held)| ruled + (2 << 20) >= *held), "the write index grew less: {ruled:?} against {held:?}");
+    for is_plan_in in [false, true] {
+        let held = ingest_after_an_index_fills(true, is_plan_in);
+        let ruled = ingest_after_an_index_fills(false, is_plan_in);
+        for (arm, ingest) in [("held to share", &held), ("under the rule", &ruled)] {
+            eprintln!(
+                "arena plan in {is_plan_in}: ingest {arm}: {} rows a sim second, {} puts a wall second, {} index waits, {} arena grows, {} arena changes, {} shards given",
+                ingest.rows_a_sim_second, ingest.puts_a_second, ingest.index_waits, ingest.arena_grows, ingest.arena_changes, ingest.shards_given
+            );
+        }
+        assert_eq!(held.capacity, ruled.capacity, "the two arms planned the index apart");
+        assert!(held.is_marked_before && held.is_marked && held.rebalances == 0, "the index held to its share: {held:?}");
+        assert!(!ruled.is_marked_before && !ruled.is_marked && ruled.rebalances > 0, "the rule left the index marked: {ruled:?}");
+        // ingest's room shows on the simulated clock. Wall-clock puts a second also count the jobs' CPU inside the writer's pauses,
+        // and the rule's live index does more of that work than a marked one, so they show only as context
+        assert!(ruled.rows_a_sim_second * 100 >= held.rows_a_sim_second * 95, "the burst ran slower under the rule: {ruled:?} against {held:?}");
+        assert!(ruled.longest_wait <= held.longest_wait * 3 / 2 + LONGEST_WAIT_SLACK, "the burst waited longer for index room: {ruled:?} against {held:?}");
+        assert!(ruled.most_short <= held.most_short + 1, "the burst ran more pools short: {ruled:?} against {held:?}");
+        assert!(ruled.write_rooms.iter().zip(&held.write_rooms).all(|(ruled, held)| ruled + (2 << 20) >= *held), "the write index grew less: {ruled:?} against {held:?}");
+    }
 }
+
+/// A few ms past half again the held arm's longest wait, on the simulated clock
+const LONGEST_WAIT_SLACK: u64 = 5_000_000;
 
 /// What a burst of ingest met after the sorted keys filled to four times their plan
 #[derive(Debug)]
@@ -4147,6 +4160,14 @@ struct Ingest {
     is_marked_before: bool,
     puts_a_second: u64,
     index_waits: u64,
+    /// The longest a burst writer waited for index room, on the simulated clock
+    longest_wait: u64,
+    /// Rows the burst put a second of the simulated clock
+    rows_a_sim_second: u64,
+    /// What the jobs did beside the burst: the arena's grows, its extent changes, and the cache shards given back
+    arena_grows: u64,
+    arena_changes: u64,
+    shards_given: u64,
     most_short: usize,
     write_rooms: Vec<usize>,
     is_marked: bool,
@@ -4155,9 +4176,9 @@ struct Ingest {
 
 // fill a sorted column to four times its plan beside a plain column, give the job its decays and a refill, then a burst across
 // both columns with the job's steps 100 ms apart past a decay, and say what the burst met
-fn ingest_after_an_index_fills(is_held: bool) -> Ingest {
+fn ingest_after_an_index_fills(is_held: bool, is_plan_in: bool) -> Ingest {
     const PLAIN: ColumnId = ColumnId(2);
-    const BURST: u64 = 600_000;
+    const BURST: u64 = 1_200_000;
     let io = SimulatedIo::new(Seed(53));
     // a budget where the caches' shards cover what the rule moves
     SIM_BUDGET.with(|budget| budget.set(HELD_BUDGET));
@@ -4181,6 +4202,10 @@ fn ingest_after_an_index_fills(is_held: bool) -> Ingest {
     let store = ReelStore::open(io.clone(), &config).expect("open");
     reel::pool_room::REFUSE_PAST.with(|refuse| refuse.set(false));
     reel::engine::engine_sizing::TEST_INDEX_HEADROOM.with(|headroom| headroom.set(None));
+    // the filter arena holds its floor at open, or its whole plan as a store whose filters filled it does
+    if is_plan_in {
+        store.state.filter_arena.bring_in_plan().expect("arena");
+    }
     let job = reel::engine::reserve_job::ReserveJob::new(Arc::clone(&store.state));
     let index = store.state.sorted_index(COLUMN).expect("an index");
     let capacity = sorted_reading(&store).capacity.0;
@@ -4206,6 +4231,9 @@ fn ingest_after_an_index_fills(is_held: bool) -> Ingest {
     let is_marked_before = index.mark().is_some();
     let write_rooms = |store: &Store| store.state.index.rooms().iter().map(|room| room.committed()).collect::<Vec<_>>();
     let waits_before = store.state.index_waits.load(Ordering::Relaxed);
+    store.state.longest_index_wait.store(0, Ordering::Relaxed);
+    let (grows_before, changes_before) = (store.state.filter_arena.grows(), store.state.filter_arena.changes());
+    let (shards_before, sim_before) = (store.memory_report().cache_shards_given, io.now().0);
     let mut most_short = 0;
     let started = std::time::Instant::now();
     for number in 0..BURST {
@@ -4223,6 +4251,10 @@ fn ingest_after_an_index_fills(is_held: bool) -> Ingest {
     let seconds = started.elapsed().as_secs_f64();
     let rooms = write_rooms(&store);
     let waits = store.state.index_waits.load(Ordering::Relaxed) - waits_before;
+    let longest_wait = store.state.longest_index_wait.load(Ordering::Relaxed);
+    let sim_seconds = io.now().0.saturating_sub(sim_before).max(1) as f64 / 1e9;
+    let (arena_grows, arena_changes) = (store.state.filter_arena.grows() - grows_before, store.state.filter_arena.changes() - changes_before);
+    let shards_given = store.memory_report().cache_shards_given - shards_before;
     // the burst's own sorted keys can outrun the pool again, and the next decays bring the index back once more
     seal_all(&store, &io);
     for _decay in 0..3 {
@@ -4237,6 +4269,11 @@ fn ingest_after_an_index_fills(is_held: bool) -> Ingest {
         capacity,
         puts_a_second: ((2 * BURST) as f64 / seconds) as u64,
         index_waits: waits,
+        longest_wait,
+        rows_a_sim_second: ((2 * BURST) as f64 / sim_seconds) as u64,
+        arena_grows,
+        arena_changes,
+        shards_given,
         most_short,
         write_rooms: rooms,
         is_marked: index.mark().is_some(),

@@ -533,6 +533,10 @@ impl<Backend: Io> ReelStore<Backend> {
     pub fn rebuild_damaged(&self, volume: VolumeId, segment: SegmentNumber) -> Result<(), StoreError> {
         self.check_writes()?;
         let held = self.state.volumes.get(volume.0 as usize).ok_or(StoreError::UnknownVolume { volume })?;
+        // a rebuild would drop a lost range delete's damage and show the keys it hid
+        if hold(&held.lost_covers).contains(&segment) {
+            return Err(StoreError::LostCover { volume, segment: segment.0 });
+        }
         held.rebuild_asked.store(segment.0, Ordering::Release);
         held.wants_compaction.store(true, Ordering::Release);
         if let Some(task) = self.state.planner_task.get() {
@@ -2038,6 +2042,7 @@ pub fn build_volume<Backend: Io>(context: &VolumeContext<'_, Backend>, index: us
         bits_saved_at: AtomicU64::new(0),
         summary_paths: summary.paths,
         lost_rows: Mutex::new(summary.lost),
+        lost_covers: Mutex::new(Vec::new()),
         summary_buffer: Pool::new(vec![SummaryBytes::in_room(summary_room, &[])?]),
         damage: DamageList::new(),
         covers: RangeCovers::new(config.widest_key(index)),

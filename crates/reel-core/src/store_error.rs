@@ -47,6 +47,8 @@ pub enum StoreError {
     BatchAcrossVolumes,
     #[error("the store has no volume {volume:?}")]
     UnknownVolume { volume: VolumeId },
+    #[error("segment {segment} of volume {volume:?} lost its range delete block, so its damage can't be rebuilt")]
+    LostCover { volume: VolumeId, segment: u64 },
     #[error("a record in column {column:?} failed its check")]
     Corruption { column: ColumnId },
     #[error("the damage pool of volume {volume:?} is full, so a clear that splits a span has to wait")]

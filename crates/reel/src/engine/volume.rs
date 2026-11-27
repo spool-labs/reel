@@ -544,6 +544,8 @@ pub struct Volume<Backend: Io> {
     pub bits_save: Mutex<BitsSave>,
     pub bits_saved_at: AtomicU64,
     pub lost_rows: Mutex<LostRows>,
+    /// Segments whose range delete block didn't read at open. Their damage can't be rebuilt, since nothing says what they hid
+    pub lost_covers: Mutex<Vec<SegmentNumber>>,
     /// What both summary copies hold, when it is known, so a save of the same rows writes nothing
     pub saved_summary: Mutex<Option<SavedSummary>>,
     pub summary_buffer: Pool<SummaryBytes>,

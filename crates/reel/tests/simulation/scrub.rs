@@ -1168,3 +1168,49 @@ fn a_live_walk_seats_a_segment_sealed_inside_its_first_batch() {
     assert!(walked.contains_key(b"key-00170-new".as_slice()), "the walk missed a key written before its batch's point");
     store.close().expect("close");
 }
+
+// a sealed segment's range delete block rots, so open damages the segment's columns whole, since nothing can say what the delete
+// hid. An asked rebuild is refused, so the keys the delete hid never read again
+#[test]
+fn a_rebuild_keeps_the_damage_a_lost_range_delete_left() {
+    let io = SimulatedIo::new(Seed(73));
+    let store = open(&io, 0);
+    for number in 0..KEYS {
+        store.put(COLUMN, &key(number), &value(number, 0)).expect("put");
+    }
+    seal(&store, &io);
+    store.delete_range(COLUMN, &key(100), &key(200)).expect("range delete");
+    for number in KEYS..KEYS + 20 {
+        store.put(COLUMN, &key(number), &value(number, 0)).expect("put");
+    }
+    let second = seal(&store, &io);
+    assert_eq!(read(&store, &key(150)), None, "the range delete hid nothing");
+    let volume = &store.state.volumes[0];
+    let head = volume.table.pin(second).expect("the second segment").head;
+    assert!(head.ranges_length.0 > 0, "the second segment sealed with no range delete block");
+    let path = data_path(&volume.roots[0], second).to_path_buf();
+    store.close().expect("close");
+    drop(store);
+    io.rot(&path, FileOffset(head.ranges_at.0 + 2), BitMask(1)).expect("rot");
+
+    let store = open(&io, 0);
+    println!("cover: damaged after reopen {:?}", store.damaged_segment_list());
+    let mut buf = Vec::new();
+    let before = store.get(COLUMN, &key(150), &mut buf);
+    println!("cover: get of a hidden key before the rebuild: {before:?}");
+    assert!(matches!(before, Err(StoreError::Corruption { .. })), "the lost range delete left its keys readable at open");
+    let segments = store.damaged_segment_list();
+    for (volume, segment) in &segments {
+        let mut keys = Vec::new();
+        store.damaged_keys(*volume, *segment, |column, key| keys.push((column, key.to_vec()))).expect("damaged keys");
+        println!("cover: damaged_keys of {segment:?}: {} keys", keys.len());
+        if store.rebuild_damaged(*volume, *segment).is_ok() {
+            compact_until(&store, &io, |store| !store.damaged_segment_list().contains(&(*volume, *segment)));
+        }
+    }
+    println!("cover: damaged after the rebuilds {:?}", store.damaged_segment_list());
+    let after = store.get(COLUMN, &key(150), &mut buf);
+    println!("cover: get of a hidden key after the rebuild: {after:?}");
+    assert!(!matches!(after, Ok(true)), "a key under a range delete reads again once the rebuild cleared its lost cover's damage");
+    store.close().expect("close");
+}

@@ -423,6 +423,7 @@ pub fn load_covers<Backend: Io>(state: &EngineState<Backend>, scan: &RootScan<Ba
             && read_block(&bytes, found.head.segment, &volume.covers, is_applied);
         if !is_whole {
             hold(&volume.lost_rows).unread_covers.push(found.head.segment);
+            hold(&volume.lost_covers).push(found.head.segment);
         }
     }
     Ok(())

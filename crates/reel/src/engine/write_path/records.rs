@@ -360,6 +360,10 @@ impl<Backend: Io> EngineState<Backend> {
         codec: Codec,
         value: &[u8],
     ) -> Result<RecordShape, StoreError> {
+        // an lz4 column refuses a value past its limit at all times, also while its value would be stored as written
+        if codec == Codec::Lz4 && value.len() as u64 > self.sizing.lz4_stored_limit.0 {
+            return Err(StoreError::ValueTooLarge { length: ByteCount(value.len() as u64), limit: self.sizing.lz4_stored_limit });
+        }
         // while the ladder has the shares given back a large value is stored as written: its record says so, and it takes no share
         let are_given = self.are_shares_given.load(Ordering::Acquire);
         #[cfg(feature = "test-hooks")]

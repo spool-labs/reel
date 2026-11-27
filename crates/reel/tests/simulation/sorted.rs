@@ -5231,3 +5231,28 @@ fn a_put_that_missed_the_shares_flag_stores_its_value_as_written() {
     seal_all(&store, &io);
     store.close().expect("close");
 }
+
+// an lz4 column refuses a value past the lz4 limit whether or not the ladder has the shares, since a value stored as written while
+// they are away would be one the column refuses at every other time
+#[test]
+fn an_lz4_column_refuses_a_value_past_its_limit_with_the_shares_given_back() {
+    let io = SimulatedIo::new(Seed(75));
+    SIM_CODEC.with(|codec| codec.set(Codec::Lz4));
+    let mut config = config(CAPACITY);
+    // a segment past the lz4 limit, so only the codec's limit can refuse the value
+    for volume in &mut config.volumes {
+        volume.segment_bytes = Some(ByteCount(2 * reel::engine::engine_sizing::LZ4_STORED_LIMIT.0));
+    }
+    SIM_CODEC.with(|codec| codec.set(Codec::None));
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let limit = store.state.sizing.lz4_stored_limit.0 as usize;
+    let value = vec![b'z'; limit + 1];
+    let refused = |result: Result<(), reel_core::store_error::StoreError>| matches!(result, Err(reel_core::store_error::StoreError::ValueTooLarge { limit: refused_at, .. }) if refused_at.0 as usize == limit);
+    assert!(refused(store.put(COLUMN, &key(1), &value).map(|_| ())), "the limit doesn't hold with the shares in");
+    assert!(reel::engine::reserve_job::give_back_shares(&store.state) > 0, "no share went back");
+    assert!(refused(store.put(COLUMN, &key(2), &value).map(|_| ())), "the limit doesn't hold with the shares given back");
+    let mut read = Vec::new();
+    assert!(!store.get(COLUMN, &key(2), &mut read).expect("get"), "a refused value landed");
+    seal_all(&store, &io);
+    store.close().expect("close");
+}

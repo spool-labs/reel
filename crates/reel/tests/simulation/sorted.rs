@@ -5466,3 +5466,39 @@ fn a_seal_skips_the_rows_an_entering_put_in() {
     check(&store, &model, &written);
     check_entries(&store, &model);
 }
+
+const SWITCH_KEYS: u64 = 1_000;
+
+// a seal whose walk loaded rows stop_counting marked entered, with no entry behind them, puts them in even when a refill's end
+// starts the counting again before the rows reach the seal's run: a row reads as entered only while its column counts
+#[test]
+fn a_seal_across_a_counting_start_keeps_every_key() {
+    let io = SimulatedIo::new(Seed(63));
+    SIM_BUDGET.with(|budget| budget.set(HOLD_BUDGET));
+    let store = open(&io, RowCount(4 * SWITCH_KEYS));
+    SIM_BUDGET.with(|budget| budget.set(BUDGET));
+    let mut model = Model::new();
+    for number in 0..SWITCH_KEYS {
+        store.put(COLUMN, &key(number), b"open").expect("put");
+        model.insert(key(number), b"open".to_vec());
+    }
+    // the index marks, and its column's open rows leave the counts reading entered with no entry
+    let index = store.state.sorted_index(COLUMN).expect("an index");
+    index.mark_from(SegmentNumber(0));
+    store.state.index.stop_counting(COLUMN);
+    let (state, is_run) = (Arc::clone(&store.state), Arc::new(AtomicBool::new(false)));
+    let ran = Arc::clone(&is_run);
+    store.state.volumes[0].holds.set_between_walk_load_and_note(Some(reel::engine::volume::RunHook(Arc::new(move || {
+        // a refill ends here: the mark clears and the column counts again, after the walk copied its first runs
+        let index = state.sorted_index(COLUMN).expect("an index");
+        assert!(index.clear_mark(SegmentNumber(0), index.past_capacity()), "the mark stayed");
+        state.index.start_counting(COLUMN);
+        ran.store(true, Ordering::Release);
+    }))));
+    store.seal_now();
+    settle(&io);
+    assert!(is_run.load(Ordering::Acquire), "the seal never ran the hook");
+    let written: Vec<Vec<u8>> = (0..SWITCH_KEYS).map(key).collect();
+    check(&store, &model, &written);
+    check_entries(&store, &model);
+}

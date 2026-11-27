@@ -234,6 +234,8 @@ pub struct TestHolds {
     between_path_reads: Mutex<Option<RunHook>>,
     /// Work a walk's batch does between taking its point and seating its sources, run once and then cleared
     between_point_and_seat: Mutex<Option<RunHook>>,
+    /// Work a seal does between loading its walk's first runs and putting their rows in, run once and then cleared
+    between_walk_load_and_note: Mutex<Option<RunHook>>,
     /// Merges ask every row, to compare against the dead bits
     pub no_bits: AtomicBool,
     /// Merges ask one bit decision in so many, as a release build does, so a bench measures the bits and not the check
@@ -263,6 +265,11 @@ impl TestHolds {
     /// Install the work the next walk batch runs between taking its point and seating its sources
     pub fn set_between_point_and_seat(&self, hook: Option<RunHook>) {
         *hold(&self.between_point_and_seat) = hook;
+    }
+
+    /// Install the work the next seal runs between loading its walk's first runs and putting their rows in
+    pub fn set_between_walk_load_and_note(&self, hook: Option<RunHook>) {
+        *hold(&self.between_walk_load_and_note) = hook;
     }
 }
 
@@ -602,6 +609,19 @@ impl<Backend: Io> Volume<Backend> {
     /// Run nothing between a batch's point and its seat, in a build without the hooks
     #[cfg(not(feature = "test-hooks"))]
     pub const fn between_batch_point_and_seat(&self) {}
+
+    /// Run the work a test set between a seal's first walk load and its first rows, once
+    #[cfg(feature = "test-hooks")]
+    pub fn between_walk_load_and_note(&self) {
+        let hook = hold(&self.holds.between_walk_load_and_note).take();
+        if let Some(RunHook(work)) = hook {
+            work();
+        }
+    }
+
+    /// Run nothing between a seal's walk load and its rows, in a build without the hooks
+    #[cfg(not(feature = "test-hooks"))]
+    pub const fn between_walk_load_and_note(&self) {}
 
     /// Check a test holds compaction off
     #[cfg(feature = "test-hooks")]

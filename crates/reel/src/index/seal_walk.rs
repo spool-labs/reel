@@ -128,7 +128,9 @@ impl SealWalk {
                 key_end: run.keys.len(),
                 row: guard.slab.row(entry),
                 is_newest: guard.slab.newer(entry) == NO_ENTRY && !guard.slab.has_newer_sealed(entry),
-                is_entered: guard.slab.is_entered(entry),
+                // a row reads as entered only while its column counts: stop_counting marks every open row entered with no entry
+                // behind it, and the class and the bits change together under every shard's lock, which this read holds one of
+                is_entered: guard.slab.is_entered(entry) && index.is_sorted_counted(guard.slab.column(entry)),
             };
         }
     }

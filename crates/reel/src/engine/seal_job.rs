@@ -300,6 +300,7 @@ impl<Backend: Io> SealJob<Backend> {
         self.volume().handovers.fetch_add(1, Ordering::AcqRel);
         self.last_column = None;
         self.walk.start(&self.state.index, target.slot);
+        self.volume().between_walk_load_and_note();
         self.column = None;
         self.ranges.clear();
         self.is_in_table = false;

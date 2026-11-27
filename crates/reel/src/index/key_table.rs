@@ -34,6 +34,8 @@ pub struct KeyTable {
     first: usize,
     /// The most slots it can grow to
     most: usize,
+    /// Rehashes so far, each a pass over every key under the shard's write lock
+    rehashes: u64,
 }
 
 /// The most slots a table grows to: a grow into more rehashes enough keys to hold a shard's lock past a millisecond, so a larger
@@ -55,7 +57,7 @@ impl KeyTable {
         let first = if most > MOST_GROWN_SLOTS { most } else { first.clamp(1, most).next_power_of_two() };
         let mut buffers = [GrowingList::reserved(most)?, GrowingList::reserved(most)?];
         fill_empty(&mut buffers[0], first)?;
-        Ok(Self { buffers, live: 0, mask: first - 1, used: 0, first, most })
+        Ok(Self { buffers, live: 0, mask: first - 1, used: 0, first, most, rehashes: 0 })
     }
 
     #[inline]
@@ -65,6 +67,11 @@ impl KeyTable {
 
     fn slots_mut(&mut self) -> &mut [TableSlot] {
         &mut self.buffers[self.live]
+    }
+
+    /// Count the rehashes the table has run
+    pub fn rehashes(&self) -> u64 {
+        self.rehashes
     }
 
     /// Count the slots in force
@@ -85,10 +92,27 @@ impl KeyTable {
     /// Rehash every key into the other buffer at twice the size, and give the old buffer's pages back. The caller holds the shard's
     /// write lock, so no probe is under way
     pub fn grow(&mut self) -> Result<bool> {
-        if !self.can_grow() {
+        self.grow_to(self.size() * 2)
+    }
+
+    /// Rehash every key into the other buffer at the smallest size past this one that takes this many keys, up to the most, in
+    /// one pass. The caller holds the shard's write lock
+    pub fn grow_for(&mut self, rows: u64) -> Result<bool> {
+        let mut size = self.size() * 2;
+        while size < self.most && !Self::takes(size, self.used as u64 + rows) {
+            size *= 2;
+        }
+        self.grow_to(size.min(self.most))
+    }
+
+    fn takes(size: usize, keys: u64) -> bool {
+        keys.saturating_sub(1) * (LOAD_LIMIT_SCALE as u64) < (size * LOAD_LIMIT_EIGHTHS) as u64
+    }
+
+    fn grow_to(&mut self, size: usize) -> Result<bool> {
+        if !self.can_grow() || size <= self.size() {
             return Ok(false);
         }
-        let size = self.size() * 2;
         let other = 1 - self.live;
         fill_empty(&mut self.buffers[other], size)?;
         let mask = size - 1;
@@ -109,6 +133,7 @@ impl KeyTable {
         let old = self.live;
         self.live = other;
         self.mask = mask;
+        self.rehashes += 1;
         self.buffers[old].clear();
         self.buffers[old].give_back_past(0);
         Ok(true)
@@ -142,7 +167,7 @@ impl KeyTable {
 
     /// Check this many new keys can go in
     pub fn has_room_for(&self, rows: u64) -> bool {
-        (self.used as u64 + rows - 1) * (LOAD_LIMIT_SCALE as u64) < (self.size() * LOAD_LIMIT_EIGHTHS) as u64
+        Self::takes(self.size(), self.used as u64 + rows)
     }
 
     /// Count the keys an empty table takes once grown to its most

@@ -237,12 +237,8 @@ impl WriteShard {
         if !self.wants_table_grown() {
             return Ok(false);
         }
-        let mut is_grown = self.table.grow()?;
-        // a batch's rows past one doubling take more, all in this step
-        let rows = self.table_rows_wanted();
-        while self.table.can_grow() && !self.table.has_room_for(rows) {
-            is_grown |= self.table.grow()?;
-        }
+        // a batch's rows past one doubling take more, all in one rehash
+        let is_grown = self.table.grow_for(self.table_rows_wanted())?;
         if self.table.has_room_for(self.wanted_rows) || !self.table.can_grow() {
             self.wanted_rows = 0;
         }

@@ -822,3 +822,17 @@ fn a_cursor_stands_after_a_pool_reset() {
     assert_eq!(before.0, before.1);
     assert_eq!(after.0, after.1, "a cursor stood after the pool's hand-back reads as not standing, so every step descends");
 }
+
+// a batch that finds a shard's key table short by several doublings gets the size it wants in one rehash under the write lock
+#[test]
+fn a_table_short_by_several_doublings_grows_in_one_rehash() {
+    let mut shard = WriteShard::growing(&SIZING, PageCount(1)).expect("shard");
+    let first = shard.table.size();
+    let rows = (first * 16) as u64;
+    assert!(rows <= shard.table.most_rows(), "the table can't take the rows");
+    shard.wanted_rows = rows;
+    assert!(shard.grow_table().expect("grow"));
+    println!("from {first} slots to {} in {} rehashes", shard.table.size(), shard.table.rehashes());
+    assert!(shard.table.has_room_for(rows), "the table still lacks the batch's rows");
+    assert_eq!(shard.table.rehashes(), 1, "the grow took more than one rehash");
+}

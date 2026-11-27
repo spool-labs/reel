@@ -126,8 +126,10 @@ pub fn rebalance<Backend: Io>(state: &EngineState<Backend>) -> bool {
         planned_index_bytes(width, rows_for_bytes(width, ByteCount(bytes))).0 as usize
     };
     let mut is_moved = false;
+    // a pass that runs gives every index what the rule gives its keys now, not only the one that asked, as a reopen would: an index
+    // whose fill ran ahead of its use doesn't read as near full at the same look as one beside it with the same keys
     for place in places.clone() {
-        let Some(index) = index_at(place).filter(|index| wants_room(index)) else {
+        let Some(index) = index_at(place).filter(|index| wants_room(index) || (!index.is_dropped() && grant(place).min(index.room().reserved()) > index.room().ceiling())) else {
             continue;
         };
         // a room held to its share, or one whose reservation ends short of the grant, takes no more than it can hold
@@ -165,11 +167,11 @@ pub fn rebalance<Backend: Io>(state: &EngineState<Backend>) -> bool {
     is_moved
 }
 
-/// Lower other indexes' ceilings toward what the rule gives their keys, never under what each has in memory and a step past it,
-/// so a column that wakes later neither marks at once nor finds its room gone for good, and return the bytes they gave. A
-/// dropped index waits for its refill and gives nothing. The job reads committed() while the compact job's refill may grow that
-/// room, so a room can end one grow past its lowered ceiling: its cap holds it there, the step in the floor takes up the
-/// difference, and the next rebalance finds no spare in it
+/// Lower other indexes' ceilings toward what the rule gives their keys, never under the pages each has in use and a step past them,
+/// nor under what it still holds once its empty prefetch went back, so a column that wakes later neither marks at once nor finds
+/// its room gone for good, and return the bytes they gave. A dropped index waits for its refill and gives nothing. The job reads
+/// committed() while the compact job's refill may grow that room, so a room can end one grow past its lowered ceiling: its cap
+/// holds it there, the step in the floor takes up the difference, and the next rebalance finds no spare in it
 fn take_from_indexes<'index>(indexes: impl Iterator<Item = (usize, Option<&'index SortedKeys>)>, grant: &impl Fn(usize) -> usize, taker: usize, wanted: usize) -> usize {
     let mut taken = 0;
     for (place, index) in indexes {
@@ -180,7 +182,13 @@ fn take_from_indexes<'index>(indexes: impl Iterator<Item = (usize, Option<&'inde
             break;
         }
         let room = index.room();
-        let floor = grant(place).max(room.committed() + room.step());
+        // a lead's empty prefetch past a step above the pages in use goes back first, through the room's own release, so the rule's
+        // room for a busy index wins over it. An extent with a row in it never goes, and the ceiling stays over what the room holds
+        let in_use = room.used() + room.step();
+        if room.committed() > in_use && room.ceiling() > grant(place).max(in_use) {
+            let _given = room.release_spare();
+        }
+        let floor = grant(place).max(in_use).max(room.committed());
         let spare = room.ceiling().saturating_sub(floor).min(wanted - taken);
         if spare > 0 {
             room.set_ceiling(room.ceiling() - spare);

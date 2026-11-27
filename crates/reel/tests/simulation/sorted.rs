@@ -4597,13 +4597,24 @@ fn fill_split_beside(store: &Store, io: &SimulatedIo, busy: &[ColumnId], times: 
         keys += 4_096;
         {
             seal_all(store, io);
+            // a rebalance never lowers another index's ceiling under its pages in use and a step, and gives back only empty prefetch:
+            // no page in use leaves memory
+            let before: Vec<usize> = store.state.sorted.iter().flatten().map(|index| index.room().ceiling()).collect();
             job.grow_pools();
+            for (index, ceiling) in store.state.sorted.iter().flatten().zip(&before) {
+                let room = index.room();
+                assert!(room.ceiling() >= *ceiling || room.ceiling() >= room.used() + room.step(), "a rebalance lowered a ceiling under the pages in use and a step");
+                assert!(room.committed() >= room.used(), "a rebalance gave back an extent with a row in it");
+            }
             let indexes: Vec<_> = store.state.sorted.iter().flatten().collect();
             let ceilings: u64 = indexes.iter().map(|index| index.room().ceiling() as u64).sum();
             assert!(ceilings <= plan.cap, "the indexes' ceilings {ceilings} passed the cap {}", plan.cap);
             for index in &indexes {
                 let room = index.room();
-                assert!(room.ceiling() >= room.committed() + room.step() || room.ceiling() >= room.reserved(), "a ceiling fell under what its index holds and a step");
+                // a rate-led room brings pages in ahead of its use, so the room for a step of rows counts from the pages in use: the
+                // free pages already in memory and the growth left under the ceiling together hold a step
+                assert!(room.ceiling() >= room.used() + room.step() || room.ceiling() >= room.reserved(), "an index lost its room for a step of rows");
+                assert!(room.committed() <= room.ceiling(), "a room held memory past its ceiling");
             }
             let memory = store.memory_report();
             if is_caches_fixed {
@@ -4674,6 +4685,19 @@ fn two_busy_indexes_share_the_idle_room_by_their_keys() {
     for id in busy {
         let reading = report(&store).sorted_columns.iter().find(|reading| reading.column == id).copied().expect("a reading");
         assert!(!reading.is_marked, "column {id:?} stayed marked: {reading:?}");
+    }
+    // the extents a rebalance took back stay out: with no more fill the lead is gone, and more looks bring nothing back
+    let job = reel::engine::reserve_job::ReserveJob::new(Arc::clone(&store.state));
+    let held: Vec<(usize, usize)> = busy.iter().map(|id| store.state.sorted_index(*id).expect("an index").room()).map(|room| (room.committed(), room.ceiling())).collect();
+    for _look in 0..4 {
+        io.advance_clock(Nanoseconds(reel::pool_room::LEAD_NANOS));
+        job.grow_pools();
+    }
+    for (id, (committed, ceiling)) in busy.iter().zip(&held) {
+        let room = store.state.sorted_index(*id).expect("an index").room();
+        assert!(room.committed() <= (*committed).max(room.used() + room.step()), "column {id:?} brought released extents back: {} against {committed}", room.committed());
+        assert!(room.ceiling() >= room.used() + room.step() || room.ceiling() >= room.reserved(), "column {id:?} lost its room for a step of rows");
+        assert!(room.ceiling() <= *ceiling || room.committed() <= *ceiling, "column {id:?} grew past its ceiling");
     }
     let (ceilings, shares, extent) = reopen_shares(store, &io, &busy);
     for (place, id) in busy.iter().enumerate() {

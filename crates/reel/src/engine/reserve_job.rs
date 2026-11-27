@@ -183,6 +183,9 @@ impl<Backend: Io> ReserveJob<Backend> {
             let _given = room.release_idle(now);
         }
         let target = self.hold_to_target(now);
+        for room in &self.state.pool_rooms {
+            room.note_rate(now);
+        }
         self.grow_pool_steps(target);
         // a segment the filter arena had no room for gets it after the pools, which writers wait on, on this thread, and the planner
         // loads it on its next step

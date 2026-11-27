@@ -27,6 +27,8 @@ use crate::region::{MapInFlight, note_populate, page_bytes, thread_faults, touch
 
 /// A pool grows by this share of its room at a time, and asks for the next extent when less than one is free
 pub const EXTENT_DIVISOR: usize = 16;
+/// A room led by its fill keeps ready what its fill takes in this long, measured over the job's last look
+pub const LEAD_NANOS: u64 = 100_000_000;
 /// The least room that starts on a huge page and grows in whole ones
 pub const HUGE_ROOM_BYTES: usize = 4 * HUGE_PAGE_BYTES;
 
@@ -257,6 +259,11 @@ pub struct PoolRoom {
     idle_used: AtomicUsize,
     /// Set by an idle trim, and cleared by the next grow. A trimmed room grows a step once fill comes, and not before
     is_trimmed: AtomicBool,
+    /// Set for a room whose fill can outrun a step between the job's looks, a sorted index's pages, which grows by its fill rate
+    is_rate_led: AtomicBool,
+    /// The bytes its fill took in LEAD_NANOS at the job's last look, and the look before: when, and the bytes used then
+    rate_lead: AtomicUsize,
+    sample: Mutex<(u64, usize)>,
     /// The part the data on disk asks for, which open brings in when the host has room
     first_part: AtomicUsize,
     /// Bytes the room has given back to the kernel, for the report
@@ -382,6 +389,9 @@ impl PoolRoom {
             over_since: AtomicU64::new(0),
             idle_used: AtomicUsize::new(0),
             is_trimmed: AtomicBool::new(false),
+            is_rate_led: AtomicBool::new(false),
+            rate_lead: AtomicUsize::new(0),
+            sample: Mutex::new((0, 0)),
             first_part: AtomicUsize::new(0),
             given_back: AtomicU64::new(0),
             growing: Mutex::new(()),
@@ -571,18 +581,48 @@ impl PoolRoom {
     }
 
     /// Read where the pool grows next with this many bytes used, up to the room. A pool grows a step when less than one is free,
-    /// and a pool an idle trim left grows a step once fill comes
+    /// and a pool an idle trim left grows a step once fill comes. A room led by its fill keeps what its fill takes in LEAD_NANOS
+    /// free, and grows by twice that when it passes a step, so a fast fill finds its pages in memory
     pub fn next_step(&self, used: usize) -> Option<usize> {
         let committed = self.committed();
         if committed >= self.cap() {
             return None;
         }
+        // the lead's part stops a step and an extent under the ceiling, since a grow brings in whole extents, so a rebalance still
+        // sees the room a step from full and raises it first
+        let lead = self.rate_lead.load(Ordering::Relaxed);
+        let lead_limit = self.ceiling().saturating_sub(self.step() + self.extent);
+        let free = committed.saturating_sub(used);
         let wants = if self.is_trimmed.load(Ordering::Acquire) {
             used > self.idle_used.load(Ordering::Relaxed)
         } else {
-            committed.saturating_sub(used) < self.step()
+            free < self.step() || (committed < lead_limit && free < lead)
         };
-        wants.then(|| (committed + self.step()).min(self.cap()))
+        let led = (committed + 2 * lead).min(lead_limit);
+        wants.then(|| (committed + self.step()).max(led).min(self.cap()))
+    }
+
+    /// Lead the room by its fill rate from here on
+    pub fn lead_by_rate(&self) {
+        self.is_rate_led.store(true, Ordering::Release);
+    }
+
+    /// Measure a rate-led room's fill since the job's last look, as the bytes it takes in LEAD_NANOS. A room that emptied or
+    /// held still leads by nothing, and grows by steps
+    pub fn note_rate(&self, now: u64) {
+        if !self.is_rate_led.load(Ordering::Acquire) {
+            return;
+        }
+        let used = self.used();
+        let mut sample = hold(&self.sample);
+        let (then, used_then) = *sample;
+        *sample = (now, used);
+        let elapsed = now.saturating_sub(then);
+        if then == 0 || elapsed == 0 {
+            return;
+        }
+        let lead = (used.saturating_sub(used_then) as u128 * u128::from(LEAD_NANOS) / u128::from(elapsed)) as usize;
+        self.rate_lead.store(lead.next_multiple_of(self.extent), Ordering::Relaxed);
     }
 
     /// Grow until the pool wants no more or the room is whole, taking no step past the room the host has left, and say whether it
@@ -1208,6 +1248,36 @@ mod tests {
         // past the burst the room grows by its free room again
         assert_eq!(room.next_step(32 * page + 1), None);
         assert_eq!(room.next_step(room.committed() - step + 1), Some(room.committed() + step));
+    }
+
+    // a room led by its rate grows by twice what its fill took between the job's looks. A simulation can't show the marks this
+    // saves: a sim's index marks at its exact page count, and the growth lag a fast fill on a real host meets shows in the box's rows
+    #[test]
+    fn a_rate_led_room_grows_by_twice_its_fill() {
+        let page = page_bytes();
+        let room = PoolRoom::reserve_paged(ByteCount(1024 * page as u64), ByteCount(0), page).expect("reserve");
+        room.lead_by_rate();
+        let step = room.step();
+        room.note_used(room.committed());
+        room.note_rate(1);
+        // the fill took four steps between the job's looks LEAD_NANOS apart
+        let fill = 4 * step;
+        room.note_used(room.committed() + fill);
+        room.note_rate(1 + LEAD_NANOS);
+        let committed = room.committed();
+        let led = (committed + 2 * fill).min(room.ceiling() - step - room.extent()).max(committed + step);
+        assert!(led > committed + step, "the room has no space for a lead past a step");
+        assert_eq!(room.next_step(room.used()), Some(led.min(room.cap())), "a rate-led room grew by a step");
+        // a room that held still leads by nothing again, and grows by its steps
+        room.note_rate(1 + 2 * LEAD_NANOS);
+        assert_eq!(room.next_step(committed), Some(committed + step));
+        // a room not led by its rate grows by its steps whatever its fill
+        let plain = PoolRoom::reserve_paged(ByteCount(1024 * page as u64), ByteCount(0), page).expect("reserve");
+        plain.note_used(plain.committed());
+        plain.note_rate(1);
+        plain.note_used(plain.committed() + fill);
+        plain.note_rate(1 + LEAD_NANOS);
+        assert_eq!(plain.next_step(plain.used()), Some(plain.committed() + plain.step()));
     }
 
     #[test]

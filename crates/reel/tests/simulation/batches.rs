@@ -1254,9 +1254,16 @@ fn an_alone_claim_that_ends_wakes_the_slot_waiters() {
     let store = open(&io);
     let volume = &store.state.volumes[0];
     let long = ClaimRequest { bytes: ByteCount(1), rows: RowCount(1), is_alone: true, has_records: true, covers: 0, mark: None, has_deletes: false };
+    // a landed long batch gives no bytes back, so only its segment going back to taking claims moves the line
     let alone = store.state.claim(volume, &long).expect("claim");
     let seen = store.state.slot_line.seen();
-    drop(alone);
+    alone.land();
     assert!(store.state.slot_line.seen() > seen, "a segment back to taking claims woke no writer waiting for one");
+    // a short claim that never landed gives its bytes back, which moves the line on their own
+    let short = ClaimRequest { is_alone: false, ..long };
+    let unlanded = store.state.claim(volume, &short).expect("claim");
+    let seen = store.state.slot_line.seen();
+    drop(unlanded);
+    assert!(store.state.slot_line.seen() > seen, "bytes a claim gave back woke no writer waiting for a segment");
     store.close().expect("close");
 }

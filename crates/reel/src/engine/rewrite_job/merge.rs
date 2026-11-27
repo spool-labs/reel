@@ -784,6 +784,11 @@ impl<Backend: Io> RewriteJob<Backend> {
         let Some(newer) = self.state.newest_place(self.volume, column, &self.key).filter(|newer| *newer > row.place) else {
             return false;
         };
+        // only a sealed replacement outlives a power cut: an open row over a rotten record leaves it to the check, which damages it
+        let volume = &self.state.volumes[self.volume];
+        if !self.state.has_newer_sealed(volume, column, &self.key, row.place, &[]).unwrap_or(false) {
+            return false;
+        }
         self.lowest_dropped = self.lowest_dropped.min(row.place);
         self.highest_replacement = self.highest_replacement.max(newer);
         self.dropped_rows += 1;

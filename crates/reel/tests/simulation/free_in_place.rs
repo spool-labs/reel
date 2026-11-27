@@ -886,3 +886,86 @@ fn a_power_cut_before_the_replacement_syncs_loses_no_value() {
         store.close().expect("close");
     }
 }
+
+// a large record rots with no free behind it, and its key's only newer row is open and unsynced. The merge keeps the record, so
+// after a power cut takes the open row the key never reads as unwritten
+#[test]
+fn a_rotten_record_under_an_unsynced_replacement_never_reads_as_unwritten() {
+    let io = SimulatedIo::new(Seed(48));
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    volume.holds.compaction.store(true, Ordering::Release);
+    keep_live(&store);
+    store.put(COLUMN, b"key", &large(1)).expect("put");
+    store.put(COLUMN, b"twice", b"first").expect("put");
+    store.put(COLUMN, b"twice", b"second").expect("put");
+    let older = seal(&store, &io);
+    store.flush().expect("flush");
+    let read_at = store.state.key_read(COLUMN, b"key", store.state.read_point(volume), false).expect("read");
+    let row = in_place(store.state.search_sealed(&InPlace, volume, &read_at)).expect("search").expect("a sealed row");
+    assert_eq!(row.segment, older);
+    io.rot(&data_path(&volume.roots[0], older), FileOffset(row.row.offset.0 + SMALL_HEAD_BYTES as u64 + 9_000), BitMask(1)).expect("rot");
+    // the replacement lands in the open segment and nothing syncs it
+    store.put(COLUMN, b"key", &large(2)).expect("put");
+    assert_eq!(volume.bytes_freed.load(Ordering::Acquire), 0, "a free punched the record, so this is no rot");
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    job.rewrite.forced = Some(older);
+    assert!(job.rewrite.start(), "the merge never started");
+    while job.rewrite.is_running() {
+        job.rewrite.step();
+    }
+    println!("drop: merge_freed_drops {}, merge_check_failures {}, damaged {:?}, older still held {}", store.state.merge_freed_drops.load(Ordering::Relaxed), store.state.merge_check_failures.load(Ordering::Relaxed), hold(&volume.damaged).len(), volume.table.holds(older));
+    io.power_cut();
+    drop(store);
+
+    let store = open(&io);
+    settle(&io);
+    let mut buf = Vec::new();
+    let got = store.get(COLUMN, b"key", &mut buf);
+    println!("drop: after the power cut the key reads {:?}, damaged segments {}", got.as_ref().map(|found| found.then(|| buf.first().copied())), store.damaged_segments());
+    let is_silent_loss = matches!(got, Ok(false)) && store.damaged_segments() == 0;
+    assert!(!is_silent_loss, "the key reads as never written and nothing is damaged: its synced value rotted, and the merge dropped it under a row the power cut took");
+    store.close().expect("close");
+}
+
+// the same with an older version of the key in another sealed segment: after the power cut a get never answers the oldest value
+#[test]
+fn a_rotten_record_under_an_unsynced_replacement_never_brings_back_an_older_value() {
+    let io = SimulatedIo::new(Seed(49));
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    volume.holds.compaction.store(true, Ordering::Release);
+    keep_live(&store);
+    store.put(COLUMN, b"key", b"oldest").expect("put");
+    seal(&store, &io);
+    store.put(COLUMN, b"key", &large(1)).expect("put");
+    store.put(COLUMN, b"keep-5", &large(7)).expect("put");
+    store.put(COLUMN, b"twice", b"first").expect("put");
+    store.put(COLUMN, b"twice", b"second").expect("put");
+    let older = seal(&store, &io);
+    store.flush().expect("flush");
+    assert_eq!(read(&store, b"key"), Some(large(1)));
+    let read_at = store.state.key_read(COLUMN, b"key", store.state.read_point(volume), false).expect("read");
+    let row = in_place(store.state.search_sealed(&InPlace, volume, &read_at)).expect("search").expect("a sealed row");
+    assert_eq!(row.segment, older);
+    io.rot(&data_path(&volume.roots[0], older), FileOffset(row.row.offset.0 + SMALL_HEAD_BYTES as u64 + 9_000), BitMask(1)).expect("rot");
+    store.put(COLUMN, b"key", &large(2)).expect("put");
+    assert_eq!(volume.bytes_freed.load(Ordering::Acquire), 0, "a free punched the record, so this is no rot");
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    job.rewrite.forced = Some(older);
+    assert!(job.rewrite.start(), "the merge never started");
+    while job.rewrite.is_running() {
+        job.rewrite.step();
+    }
+    println!("stale: merge_freed_drops {}, merge_check_failures {}, damaged {:?}, older still held {}", store.state.merge_freed_drops.load(Ordering::Relaxed), store.state.merge_check_failures.load(Ordering::Relaxed), hold(&volume.damaged).len(), volume.table.holds(older));
+    io.power_cut();
+    drop(store);
+
+    let store = open(&io);
+    settle(&io);
+    let mut buf = Vec::new();
+    let got = store.get(COLUMN, b"key", &mut buf);
+    println!("stale: after the power cut the key reads {:?} with {} bytes {:?}, damaged segments {}", got, buf.len(), String::from_utf8_lossy(&buf[..buf.len().min(8)]), store.damaged_segments());
+    assert!(!(matches!(got, Ok(true)) && buf == b"oldest"), "a get answered the key's oldest value: the synced value over it rotted and the merge dropped it under a row the power cut took");
+    store.close().expect("close");
+}

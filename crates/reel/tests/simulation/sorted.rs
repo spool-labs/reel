@@ -4390,6 +4390,9 @@ fn a_reopen_after_a_rebalance_shares_as_the_rebalance_did() {
 #[test]
 fn the_ladder_after_a_rebalance_brings_nothing_back_past_a_ceiling() {
     let (io, store, _model, _keys) = rebalanced_store(56, 3, BUDGET);
+    // the store holds its filter arena's whole plan, as one whose filters filled it does, so it stands above its least and the
+    // ladder has shards to give
+    store.state.filter_arena.bring_in_plan().expect("arena");
     let memory = store.memory_report();
     assert!(memory.rebalances > 0, "no rebalance ran");
     let ceilings = memory.cache_ceilings;
@@ -5501,4 +5504,46 @@ fn a_seal_across_a_counting_start_keeps_every_key() {
     let written: Vec<Vec<u8>> = (0..SWITCH_KEYS).map(key).collect();
     check(&store, &model, &written);
     check_entries(&store, &model);
+}
+
+const UNDER_KEYS: u64 = 100;
+
+// a store that already holds less than its least budget, as a small one with its filter arena at its floor does, isn't pressed past
+// it: the host's pressure gives no cache shard back, the report shows the store under its least, and reads and writes go on
+#[test]
+fn a_store_under_its_least_is_not_pressed_past_it() {
+    let io = SimulatedIo::new(Seed(64));
+    let store = open(&io, CAPACITY);
+    let mut model = Model::new();
+    for number in 0..UNDER_KEYS {
+        store.put(COLUMN, &key(number), b"under").expect("put");
+        model.insert(key(number), b"under".to_vec());
+    }
+    let memory = store.memory_report();
+    assert!(memory.memory_held < memory.least_budget, "the store held {} past its least {}", memory.memory_held.0, memory.least_budget.0);
+    let given = memory.cache_shards_given;
+    let job = reel::engine::reserve_job::ReserveJob::new(Arc::clone(&store.state));
+    io.set_host_memory(reel::io::host_memory::HostMemory {
+        total: ByteCount(1 << 30),
+        available: ByteCount(0),
+        group_room: Some(ByteCount(0)),
+        group_limit: Some(ByteCount(1 << 30)),
+        group_anon_room: Some(ByteCount(0)),
+    });
+    let mut now = io.now().0 + 1;
+    for _step in 0..64 {
+        now += 100_000_000;
+        let target = job.hold_to_target(now);
+        assert!(target >= store.memory_report().least_budget.0, "pressure took the target under the least");
+    }
+    let memory = store.memory_report();
+    assert!(memory.is_under_pressure, "the host's pressure went unreported");
+    assert_eq!(memory.cache_shards_given, given, "a store under its least gave cache shards back");
+    assert!(memory.memory_held < memory.least_budget, "the report lost the store under its least");
+    store.put(COLUMN, &key(UNDER_KEYS), b"pressed").expect("put under pressure");
+    model.insert(key(UNDER_KEYS), b"pressed".to_vec());
+    let written: Vec<Vec<u8>> = (0..=UNDER_KEYS).map(key).collect();
+    check(&store, &model, &written);
+    io.set_host_memory(reel_sim::simulated_disk::SIMULATED_HOST);
+    store.close().expect("close");
 }

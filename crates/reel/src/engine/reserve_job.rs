@@ -183,7 +183,9 @@ impl<Backend: Io> ReserveJob<Backend> {
             let _given = room.release_idle(now);
         }
         let target = self.hold_to_target(now);
-        // a segment the filter arena had no room for gets it here, on this thread, and the planner loads it on its next step
+        self.grow_pool_steps(target);
+        // a segment the filter arena had no room for gets it after the pools, which writers wait on, on this thread, and the planner
+        // loads it on its next step
         if let Some(step) = self.state.filter_arena.next_grow()
             && room_for_arena(&self.state, step) >= step
         {
@@ -194,6 +196,10 @@ impl<Backend: Io> ReserveJob<Backend> {
                 task.wake();
             }
         }
+    }
+
+    /// Grow every pool that wants its next step, inside the target, taking it from the record cache when the target leaves none
+    fn grow_pool_steps(&self, target: u64) {
         if !self.state.pool_rooms.iter().any(|room| room.next_step(room.used()).is_some()) {
             return;
         }

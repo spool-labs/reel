@@ -5584,3 +5584,25 @@ fn a_store_under_its_least_is_not_pressed_past_it() {
     io.set_host_memory(reel_sim::simulated_disk::SIMULATED_HOST);
     store.close().expect("close");
 }
+
+// with room under the target for one pool step, the reserve job gives it to the pool a writer waits on before the filter arena
+// grows for a segment it left out, which waits for the next step
+#[test]
+fn a_pool_step_comes_before_an_arena_grow() {
+    let io = SimulatedIo::new(Seed(65));
+    let store = open(&io, CAPACITY);
+    let room = Arc::clone(&store.state.index.rooms()[0]);
+    room.note_wanted();
+    let step = (room.next_step(room.used()).expect("a pool step") - room.committed()) as u64;
+    let arena = &store.state.filter_arena;
+    assert!(!arena.begin(SegmentNumber(1 << 40), 1, 64), "the arena had room for the segment");
+    let grow = arena.next_grow().expect("an arena grow");
+    assert!(grow < step, "the arena's grow of {grow} would not fit beside the pool's step of {step}");
+    let job = reel::engine::reserve_job::ReserveJob::new(Arc::clone(&store.state));
+    store.state.memory_target.store(job.held_bytes() + step, Ordering::Release);
+    let (committed, ready) = (room.committed(), arena.ready_bytes());
+    job.grow_pools();
+    assert!(room.committed() > committed, "the pool's step waited behind the arena's grow");
+    assert_eq!(arena.ready_bytes(), ready, "the arena grew into the pool's room");
+    assert!(arena.is_short(), "the left-out segment stopped asking");
+}

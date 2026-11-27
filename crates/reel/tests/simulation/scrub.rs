@@ -1204,13 +1204,26 @@ fn a_rebuild_keeps_the_damage_a_lost_range_delete_left() {
         let mut keys = Vec::new();
         store.damaged_keys(*volume, *segment, |column, key| keys.push((column, key.to_vec()))).expect("damaged keys");
         println!("cover: damaged_keys of {segment:?}: {} keys", keys.len());
-        if store.rebuild_damaged(*volume, *segment).is_ok() {
-            compact_until(&store, &io, |store| !store.damaged_segment_list().contains(&(*volume, *segment)));
-        }
+        let asked = store.rebuild_damaged(*volume, *segment);
+        assert!(matches!(asked, Err(StoreError::LostCover { .. })), "a rebuild of a lost cover's segment wasn't refused: {asked:?}");
     }
     println!("cover: damaged after the rebuilds {:?}", store.damaged_segment_list());
     let after = store.get(COLUMN, &key(150), &mut buf);
     println!("cover: get of a hidden key after the rebuild: {after:?}");
     assert!(!matches!(after, Ok(true)), "a key under a range delete reads again once the rebuild cleared its lost cover's damage");
+    // the walk settles every cover it can, and a reopen still knows the cover is lost
+    let damaged = store.damaged_segment_list();
+    compact_until(&store, &io, |store| store.state.volumes[0].covers.are_all_applied() && hold(&store.state.volumes[0].summary).get(second).is_some_and(|row| row.facts.is_walked()));
+    for _round in 0..4 {
+        compact_until(&store, &io, |_store| false);
+    }
+    store.close().expect("close");
+    drop(store);
+    let store = open(&io, 0);
+    for (volume, segment) in &damaged {
+        let asked = store.rebuild_damaged(*volume, *segment);
+        assert!(matches!(asked, Err(StoreError::LostCover { .. })), "after a settle and a reopen the rebuild wasn't refused: {asked:?}");
+    }
+    assert!(!matches!(store.get(COLUMN, &key(150), &mut buf), Ok(true)), "a key under the lost range delete reads after a reopen");
     store.close().expect("close");
 }

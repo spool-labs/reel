@@ -796,11 +796,16 @@ impl<Backend: Io> CompactJob<Backend> {
         let mut rows = self.state.hold_for_pick(self.volume, PickKind::Cover);
         let mut last = SegmentNumber(0);
         loop {
-            let is_settled = |row: &SummaryRow<'_>| {
-                row.facts.has_covers && row.facts.is_walked() && !volume.covers.holds_any(row.facts.segment)
+            // a segment whose range delete block didn't read keeps its flag, so every open reads the block again and finds it lost
+            let next = {
+                let lost = hold(&volume.lost_covers);
+                let is_settled = |row: &SummaryRow<'_>| {
+                    row.facts.has_covers && row.facts.is_walked() && !volume.covers.holds_any(row.facts.segment) && !lost.contains(&row.facts.segment)
+                };
+                let after = rows.orders().after(last).iter().filter_map(|segment| rows.get(*segment));
+                after.filter(is_settled).map(|row| row.facts.segment).next()
             };
-            let after = rows.orders().after(last).iter().filter_map(|segment| rows.get(*segment));
-            let Some(segment) = after.filter(is_settled).map(|row| row.facts.segment).next() else {
+            let Some(segment) = next else {
                 return;
             };
             rows.clear_covers(segment);

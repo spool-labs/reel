@@ -23,7 +23,7 @@ use crate::index::open_slots::OpenSlot;
 use crate::index::write_index::{SHARD_COUNT, shard_of};
 use crate::index::write_row::WriteRow;
 use crate::index::write_shard::ShardNeed;
-use crate::io::{Io, IoFile};
+use crate::io::{Io, IoFile, IoTask};
 use crate::record::codec::Codec;
 use crate::record::record_check::RecordIdentity;
 use crate::record::record_encoder::{PlainRecord, RecordEncoder};
@@ -284,6 +284,10 @@ impl<Backend: Io> EngineState<Backend> {
         let deadline = started.0.saturating_add(INDEX_WAIT.0);
         let own = &self.volumes[plan.volume.0 as usize];
         loop {
+            // the job grows what the batch found short on its own thread
+            if let Some(task) = self.reserve_task.get() {
+                task.wake();
+            }
             // a batch short only of nodes the job is bringing in waits for them, and seals early only when sealing is what frees room
             if !self.index.waits_for_nodes(&plan.needs) {
                 for volume in &self.volumes {

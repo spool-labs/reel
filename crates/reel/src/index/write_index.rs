@@ -89,8 +89,7 @@ impl WriteIndex {
         for index in 0..SHARD_COUNT {
             // a look under the read lock first, so a step that grows nothing takes no write lock
             let wants = {
-                let shard = self.shards.read(index);
-                shard.table.wants_to_grow() || (shard.table.can_grow() && !shard.table.has_room_for(shard.held.rows + 1))
+                self.shards.read(index).wants_table_grown()
             };
             if wants {
                 is_grown |= self.shards.write(index).grow_table().unwrap_or(false);

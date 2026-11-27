@@ -105,6 +105,8 @@ pub struct WriteShard {
     pub table: KeyTable,
     pub trees: Vec<WriteTree>,
     pub held: ShardHold,
+    /// The rows a batch found the key table short of, which the reserve job grows the table to fit
+    pub wanted_rows: u64,
 }
 
 impl WriteShard {
@@ -125,6 +127,7 @@ impl WriteShard {
             table: KeyTable::growing(sizing.table_slots, (sizing.table_slots * first_pages.0 as usize).div_ceil(sizing.pages.0.max(1) as usize))?,
             trees: vec![WriteTree::empty(); sizing.open_slots],
             held: ShardHold::default(),
+            wanted_rows: 0,
         })
     }
 
@@ -199,7 +202,12 @@ impl WriteShard {
         }
         let rows = self.held.rows + need.rows;
         let pages = PageCount(self.held.pages.0 + need.pages().0);
-        if !self.table.has_room_for(rows) || !self.slab.has_free_pages(pages) || !self.rows_fit_nodes(rows) {
+        if !self.table.has_room_for(rows) {
+            // a batch that fails holds nothing, so the job learns its rows here
+            self.wanted_rows = self.wanted_rows.max(rows);
+            return false;
+        }
+        if !self.slab.has_free_pages(pages) || !self.rows_fit_nodes(rows) {
             return false;
         }
         self.held = ShardHold { rows, pages };
@@ -226,10 +234,28 @@ impl WriteShard {
     /// Grow the key table when it is past half the keys its size takes or a writer found it short, and say whether it grew. The
     /// reserve job runs this under the shard's write lock
     pub fn grow_table(&mut self) -> Result<bool> {
-        if self.table.wants_to_grow() || (self.table.can_grow() && !self.table.has_room_for(self.held.rows + 1)) {
-            return self.table.grow();
+        if !self.wants_table_grown() {
+            return Ok(false);
         }
-        Ok(false)
+        let mut is_grown = self.table.grow()?;
+        // a batch's rows past one doubling take more, all in this step
+        let rows = self.table_rows_wanted();
+        while self.table.can_grow() && !self.table.has_room_for(rows) {
+            is_grown |= self.table.grow()?;
+        }
+        if self.table.has_room_for(self.wanted_rows) || !self.table.can_grow() {
+            self.wanted_rows = 0;
+        }
+        Ok(is_grown)
+    }
+
+    /// Check the key table is past half the keys its size takes, or a writer or a batch found it short
+    pub fn wants_table_grown(&self) -> bool {
+        self.table.wants_to_grow() || (self.table.can_grow() && !self.table.has_room_for(self.table_rows_wanted()))
+    }
+
+    fn table_rows_wanted(&self) -> u64 {
+        self.wanted_rows.max(self.held.rows + 1)
     }
 
     /// Give back what a batch held

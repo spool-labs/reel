@@ -1185,3 +1185,42 @@ fn short_batch_across_codecs() {
     ];
     reopen_and_check(&io, store, &expect);
 }
+
+// one batch on a fresh store whose rows in a shard pass the shard's first key table lands, the job growing the table for it
+#[test]
+fn a_batch_past_the_first_key_table_lands() {
+    for (budget, rows) in [(2_u64 << 30, 60_000_u64), (2 << 30, 130_000)] {
+        let io = SimulatedIo::new(Seed(1));
+        let store = ReelStore::open(io.clone(), &StoreConfig { memory_budget: ByteCount(budget), ..config() }).expect("open");
+        let size_of = |shard: usize| store.state.index.shards.read(shard).table.size();
+        let sizes: Vec<usize> = (0..16).map(size_of).collect();
+        let most = store.state.index.shards.read(0).table.most_rows();
+        let mut batch = WriteBatch::new();
+        for number in 0..rows {
+            batch.put(PLAIN, &key_of(number), b"v");
+        }
+        let started = io.now();
+        let outcome = store.write_batch(&batch);
+        let waited = io.now().0.saturating_sub(started.0) / 1_000_000;
+        let after: Vec<usize> = (0..16).map(size_of).collect();
+        if outcome.is_err() {
+            let plan = store.state.plan_batch(&batch).expect("plan").expect("rows");
+            for shard in 0..2 {
+                let guard = store.state.index.shards.read(shard);
+                let need = &plan.needs[shard];
+                println!(
+                    "shard {shard}: needs {} rows; table has room {}, table can grow {}, table wants to grow {}, slab has pages {}, nodes fit {}, waits {:?}",
+                    need.rows,
+                    guard.table.has_room_for(need.rows),
+                    guard.table.can_grow(),
+                    guard.table.wants_to_grow(),
+                    guard.slab.has_free_pages(need.pages()),
+                    guard.rows_fit_nodes(need.rows),
+                    guard.waits_for_nodes(need),
+                );
+            }
+        }
+        println!("budget {} MiB, rows {rows}: first table sizes {:?} (most rows {most}), outcome {outcome:?}, {waited} ms of sim time, sizes after {:?}", budget >> 20, &sizes[..4], &after[..4]);
+        assert!(outcome.is_ok(), "a batch of {rows} rows on a fresh store: {outcome:?} after {waited} ms");
+    }
+}

@@ -47,6 +47,9 @@ pub struct WriteIndex {
     /// Work a test runs each time an entering lets a shard go partway through a slot's rows
     #[cfg(feature = "test-hooks")]
     pub between_enter_holds: std::sync::Mutex<Option<EnterHook>>,
+    /// Shard locks batches took to add their rows, for a test that a batch takes a few and not one a row
+    #[cfg(feature = "test-hooks")]
+    pub batch_locks: AtomicU64,
 }
 
 /// A test's work between an entering's holds of a shard, given the shard
@@ -74,6 +77,8 @@ impl WriteIndex {
         Ok(Self { shards: Shards(shards), wanted_raises: AtomicU64::new(0), counts, classes, class_changes: std::array::from_fn(|_column| AtomicU32::new(0)), column_open, changes: Default::default(),
             #[cfg(feature = "test-hooks")]
             between_enter_holds: std::sync::Mutex::new(None),
+            #[cfg(feature = "test-hooks")]
+            batch_locks: AtomicU64::new(0),
         })
     }
 
@@ -233,6 +238,8 @@ impl WriteIndex {
         let hash = hash_key(column, key);
         let shard = shard_of(hash);
         let mut guard = self.shards.write(shard);
+        #[cfg(feature = "test-hooks")]
+        self.batch_locks.fetch_add(1, Ordering::Relaxed);
         let counts = self.shard_counts(shard);
         let is_in = guard.insert_held(hash, column, key, row, counts.of(column).is_some());
         if is_in {
@@ -240,6 +247,48 @@ impl WriteIndex {
         }
         self.count_change(shard, is_in);
         is_in
+    }
+
+    /// Add a batch's rows that hold their room, a chunk at a time, taking each shard's lock once for the chunk's rows in it, so
+    /// a batch takes a few locks and not one a row. A key's rows stay in batch order, since a key keeps to one shard
+    pub fn insert_held_rows<'rows>(&self, rows: impl Iterator<Item = (ColumnId, &'rows [u8], WriteRow)>) {
+        let mut rows = rows.peekable();
+        let mut hashes = [KeyHash::default(); HELD_CHUNK_ROWS];
+        let mut keys: [(ColumnId, &[u8]); HELD_CHUNK_ROWS] = [(ColumnId(0), &[]); HELD_CHUNK_ROWS];
+        let mut held: [Option<WriteRow>; HELD_CHUNK_ROWS] = [None; HELD_CHUNK_ROWS];
+        while rows.peek().is_some() {
+            let mut count = 0;
+            let mut shards = 0_u32;
+            for (column, key, row) in rows.by_ref().take(HELD_CHUNK_ROWS) {
+                let hash = hash_key(column, key);
+                hashes[count] = hash;
+                keys[count] = (column, key);
+                held[count] = Some(row);
+                shards |= 1 << shard_of(hash);
+                count += 1;
+            }
+            while shards != 0 {
+                let shard = shards.trailing_zeros() as usize;
+                shards &= shards - 1;
+                let mut guard = self.shards.write(shard);
+                #[cfg(feature = "test-hooks")]
+                self.batch_locks.fetch_add(1, Ordering::Relaxed);
+                let counts = self.shard_counts(shard);
+                let mut is_changed = false;
+                for at in (0..count).filter(|&at| shard_of(hashes[at]) == shard) {
+                    let ((column, key), Some(row)) = (keys[at], held[at].as_ref()) else {
+                        continue;
+                    };
+                    let is_in = guard.insert_held(hashes[at], column, key, row, counts.of(column).is_some());
+                    debug_assert!(is_in, "a batch's row found no room its batch held");
+                    if is_in {
+                        counts.add(column, key);
+                    }
+                    is_changed |= is_in;
+                }
+                self.count_change(shard, is_changed);
+            }
+        }
     }
 
     /// Hold room for a batch in every shard it touches, or hold nothing
@@ -373,6 +422,8 @@ pub fn shard_of(hash: KeyHash) -> usize {
 
 /// Most rows one run of entering puts into a sorted index under a shard's write lock
 pub const ENTER_RUN_ROWS: usize = 256;
+/// Rows of a batch grouped by shard at a time, so each shard's lock is taken once for them
+pub const HELD_CHUNK_ROWS: usize = 128;
 /// Rows an entering walks under one hold of a shard's lock, so the shard's writers and a seal's walk wait no longer than that
 pub const ENTER_HOLD_ROWS: usize = 4096;
 

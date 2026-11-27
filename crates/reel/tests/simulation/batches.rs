@@ -1245,3 +1245,35 @@ fn a_batch_waiting_on_a_seal_leaves_the_reserve_job_at_its_pace() {
     assert!(steps * 100_000_000 <= waited * 2 + 1_000_000_000, "{steps} reserve steps in {} ms of waiting", waited / 1_000_000);
     store.close().expect("close");
 }
+
+const LOCKED_ROWS: u64 = 1_000;
+
+// a batch adds its rows to the write index a chunk at a time with one lock per shard, and not one per row, so a seal's walk and
+// the other writers wait on few holds. Its rows land in batch order: a key put twice reads its second value, and one put then
+// deleted reads as gone
+#[test]
+fn a_batch_takes_a_shard_lock_per_chunk() {
+    let io = SimulatedIo::new(Seed(91));
+    let store = open(&io);
+    let mut batch = WriteBatch::new();
+    for number in 0..LOCKED_ROWS {
+        batch.put(PLAIN, &key_of(number), b"first");
+    }
+    batch.put(PLAIN, &key_of(7), b"second");
+    batch.delete(PLAIN, &key_of(9));
+    let before = store.state.index.batch_locks.load(std::sync::atomic::Ordering::Relaxed);
+    store.write_batch(&batch).expect("batch");
+    let locks = store.state.index.batch_locks.load(std::sync::atomic::Ordering::Relaxed) - before;
+    let chunks = (LOCKED_ROWS + 2).div_ceil(reel::index::write_index::HELD_CHUNK_ROWS as u64);
+    let most = chunks * reel::index::write_index::SHARD_COUNT as u64;
+    assert!(locks <= most, "a batch of {} rows took {locks} shard locks, past {most}", LOCKED_ROWS + 2);
+    for number in 0..LOCKED_ROWS {
+        let expected = match number {
+            7 => Some(b"second".to_vec()),
+            9 => None,
+            _other => Some(b"first".to_vec()),
+        };
+        assert_eq!(read(&store, PLAIN, &key_of(number)).expect("get"), expected, "key {number}");
+    }
+    store.close().expect("close");
+}

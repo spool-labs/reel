@@ -1031,6 +1031,14 @@ pub fn start_jobs<Backend: Io>(state: &Arc<EngineState<Backend>>) -> Result<(), 
     for room in &state.pool_rooms {
         room.set_wake(Arc::clone(&wake));
     }
+    // every job's stack counts in the report: the read threads and the ring reaper start below, the scrub only with a rate
+    let jobs = SHARED_JOBS
+        + state.read_tasks.len() as u64
+        + state.volumes.len() as u64
+        + workers
+        + u64::from(state.scrub_task.get().is_some())
+        + u64::from(state.ring.is_some());
+    state.job_count.store(jobs, Ordering::Release);
     // the heap and stacks outside the rooms barely move after open, so the ladder counts them once beside the rooms it can shrink
     let report = state.memory_report();
     // the pools and the growing lists count apart, by what they hold whenever held is read
@@ -1070,7 +1078,6 @@ pub fn start_jobs<Backend: Io>(state: &Arc<EngineState<Backend>>) -> Result<(), 
         let task = state.io.spawn_job("reel-ring", reaper).map_err(open_error("starting a job"))?;
         let _set = state.ring_task.set(task);
     }
-    state.job_count.store(SHARED_JOBS + state.read_tasks.len() as u64 + state.volumes.len() as u64 + workers, Ordering::Release);
     state.prefault_time.fetch_add(state.io.now().0.saturating_sub(jobs_from.0), Ordering::AcqRel);
     state.note_graves_at_open();
     Ok(())

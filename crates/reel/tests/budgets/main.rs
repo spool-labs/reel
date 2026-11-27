@@ -109,6 +109,14 @@ fn main() {
             println!("budget {} MiB fails", budget.0 / MIB);
             failures += 1;
         }
+        // held is what the ladder steers by, so it counts every job's stack, the scrub's and the ring reaper's included
+        let jobs = 3 + store.state.read_tasks.len() + store.state.volumes.len() + store.state.workers.len()
+            + usize::from(store.state.scrub_task.get().is_some()) + usize::from(store.state.ring_task.get().is_some());
+        let ladder_held = reel::engine::reserve_job::ReserveJob::new(std::sync::Arc::clone(&store.state)).held_bytes();
+        if report.thread_stacks.0 != jobs as u64 * PlainIo::for_tests().job_stack_bytes().0 || ladder_held != held {
+            println!("held leaves stacks out: {} B of stacks for {jobs} jobs, the ladder holds {ladder_held} B against {held} B", report.thread_stacks.0);
+            failures += 1;
+        }
         println!("open {} us, of which the pools {} us", report.open_time.0 / 1_000, report.prefault_time.0 / 1_000);
         if report.prefault_time.0 == 0 || report.prefault_time > report.open_time {
             println!("the pools' time at open is missing or past the open's");

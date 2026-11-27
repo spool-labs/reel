@@ -29,6 +29,8 @@ use crate::region::{MapInFlight, note_populate, page_bytes, thread_faults, touch
 pub const EXTENT_DIVISOR: usize = 16;
 /// A room led by its fill keeps ready what its fill takes in this long, measured over the job's last look
 pub const LEAD_NANOS: u64 = 100_000_000;
+/// The least time a fill rate is measured over, so looks a few microseconds apart don't turn a page into a rate
+pub const RATE_WINDOW_NANOS: u64 = LEAD_NANOS / 10;
 /// The least room that starts on a huge page and grows in whole ones
 pub const HUGE_ROOM_BYTES: usize = 4 * HUGE_PAGE_BYTES;
 
@@ -598,7 +600,7 @@ impl PoolRoom {
         } else {
             free < self.step() || (committed < lead_limit && free < lead)
         };
-        let led = (committed + 2 * lead).min(lead_limit);
+        let led = committed.saturating_add(lead.saturating_mul(2)).min(lead_limit);
         wants.then(|| (committed + self.step()).max(led).min(self.cap()))
     }
 
@@ -616,13 +618,18 @@ impl PoolRoom {
         let used = self.used();
         let mut sample = hold(&self.sample);
         let (then, used_then) = *sample;
-        *sample = (now, used);
         let elapsed = now.saturating_sub(then);
-        if then == 0 || elapsed == 0 {
+        // looks closer than a tenth of LEAD_NANOS keep the old sample, so a page taken in a few microseconds doesn't read as a rate
+        if then != 0 && elapsed < RATE_WINDOW_NANOS {
             return;
         }
-        let lead = (used.saturating_sub(used_then) as u128 * u128::from(LEAD_NANOS) / u128::from(elapsed)) as usize;
-        self.rate_lead.store(lead.next_multiple_of(self.extent), Ordering::Relaxed);
+        *sample = (now, used);
+        if then == 0 {
+            return;
+        }
+        let lead = u128::from(used.saturating_sub(used_then) as u64) * u128::from(LEAD_NANOS) / u128::from(elapsed);
+        let lead = usize::try_from(lead).unwrap_or(usize::MAX);
+        self.rate_lead.store(lead.saturating_add(self.extent - 1) / self.extent * self.extent, Ordering::Relaxed);
     }
 
     /// Grow until the pool wants no more or the room is whole, taking no step past the room the host has left, and say whether it
@@ -1305,6 +1312,23 @@ mod tests {
         assert!(room.grow_step(&mut host_left).expect("grow"), "a room with a step of room left didn't grow");
         assert!(room.committed() > committed && room.committed() <= committed + 2 * step);
         assert!(!room.is_short(), "a room that grew a step read as short");
+    }
+
+    // two looks microseconds apart keep the old sample, so one page taken between them leads by nothing past a step; a look past
+    // the least window measures the fill over the whole time since
+    #[test]
+    fn a_rate_needs_its_least_window() {
+        let page = page_bytes();
+        let room = PoolRoom::reserve_paged(ByteCount(1024 * page as u64), ByteCount(0), page).expect("reserve");
+        room.lead_by_rate();
+        room.note_used(room.committed());
+        room.note_rate(1);
+        room.note_used(room.committed() + page);
+        room.note_rate(1 + 1_000);
+        let committed = room.committed();
+        assert_eq!(room.next_step(room.used()), Some(committed + room.step()), "a page in a microsecond read as a rate");
+        room.note_rate(1 + LEAD_NANOS);
+        assert!(room.next_step(room.used()).is_some_and(|target| target <= committed + room.step().max(2 * room.extent())));
     }
 
     #[test]

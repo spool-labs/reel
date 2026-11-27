@@ -1203,25 +1203,10 @@ fn a_batch_past_the_first_key_table_lands() {
         let outcome = store.write_batch(&batch);
         let waited = io.now().0.saturating_sub(started.0) / 1_000_000;
         let after: Vec<usize> = (0..16).map(size_of).collect();
-        if outcome.is_err() {
-            let plan = store.state.plan_batch(&batch).expect("plan").expect("rows");
-            for shard in 0..2 {
-                let guard = store.state.index.shards.read(shard);
-                let need = &plan.needs[shard];
-                println!(
-                    "shard {shard}: needs {} rows; table has room {}, table can grow {}, table wants to grow {}, slab has pages {}, nodes fit {}, waits {:?}",
-                    need.rows,
-                    guard.table.has_room_for(need.rows),
-                    guard.table.can_grow(),
-                    guard.table.wants_to_grow(),
-                    guard.slab.has_free_pages(need.pages()),
-                    guard.rows_fit_nodes(need.rows),
-                    guard.waits_for_nodes(need),
-                );
-            }
-        }
         println!("budget {} MiB, rows {rows}: first table sizes {:?} (most rows {most}), outcome {outcome:?}, {waited} ms of sim time, sizes after {:?}", budget >> 20, &sizes[..4], &after[..4]);
         assert!(outcome.is_ok(), "a batch of {rows} rows on a fresh store: {outcome:?} after {waited} ms");
+        // the job grows the tables on its next step, well inside a second
+        assert!(waited < 1_000, "a batch of {rows} rows waited {waited} ms for its tables");
     }
 }
 

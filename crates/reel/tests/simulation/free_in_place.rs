@@ -915,6 +915,9 @@ fn a_rotten_record_under_an_unsynced_replacement_never_reads_as_unwritten() {
         job.rewrite.step();
     }
     println!("drop: merge_freed_drops {}, merge_check_failures {}, damaged {:?}, older still held {}", store.state.merge_freed_drops.load(Ordering::Relaxed), store.state.merge_check_failures.load(Ordering::Relaxed), hold(&volume.damaged).len(), volume.table.holds(older));
+    assert_eq!(store.state.merge_freed_drops.load(Ordering::Relaxed), 0, "the merge dropped the rotten record under an open row");
+    assert!(!hold(&volume.damaged).is_empty(), "the merge kept the rotten record and damaged nothing");
+    assert_eq!(read(&store, b"key"), Some(large(2)), "a get before the cut misses the replacement");
     io.power_cut();
     drop(store);
 
@@ -958,6 +961,9 @@ fn a_rotten_record_under_an_unsynced_replacement_never_brings_back_an_older_valu
         job.rewrite.step();
     }
     println!("stale: merge_freed_drops {}, merge_check_failures {}, damaged {:?}, older still held {}", store.state.merge_freed_drops.load(Ordering::Relaxed), store.state.merge_check_failures.load(Ordering::Relaxed), hold(&volume.damaged).len(), volume.table.holds(older));
+    assert_eq!(store.state.merge_freed_drops.load(Ordering::Relaxed), 0, "the merge dropped the rotten record under an open row");
+    assert!(!hold(&volume.damaged).is_empty(), "the merge kept the rotten record and damaged nothing");
+    assert_eq!(read(&store, b"key"), Some(large(2)), "a get before the cut misses the replacement");
     io.power_cut();
     drop(store);
 

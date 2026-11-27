@@ -775,8 +775,8 @@ impl<Backend: Io> RewriteJob<Backend> {
 
     /// Drop a large record that failed its check because the walk freed it in place as dead, and say whether it went. A crash can
     /// take the walk's count of its death from the dead bits the merge decided by, and then the merge keeps it and finds its
-    /// blocks punched. A key with a newer row than the record, as a get finds it, says it was superseded, and it drops as any
-    /// superseded row does. A record still the newest stays a failure, which damages its segment
+    /// blocks punched. A key with a newer row than the record says it was superseded, and it drops as any superseded row does when that newer row is sealed, since an open one can go with a power cut. A record with no sealed newer row
+    /// stays a failure, which damages its segment
     pub fn drop_freed(&mut self, column: ColumnId, row: &FooterRow) -> bool {
         if row.kind != RowKind::Value || row.length < FREE_IN_PLACE_BYTES {
             return false;

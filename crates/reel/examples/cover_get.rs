@@ -28,7 +28,7 @@ fn add(covers: &RangeCovers, number: u64) {
         end: &end,
         place: WritePlace(number + 1),
         segment: SegmentNumber(1),
-    }, false);
+    }, false, false);
 }
 
 fn time(covers: &RangeCovers, name: &str) {
@@ -62,7 +62,7 @@ fn main() {
             end: &end,
             place: WritePlace(depth + 1),
             segment: SegmentNumber(1),
-        }, false);
+        }, false, false);
     }
     let key = key_of(MOST_RANGE_COVERS as u64);
     let start = Instant::now();

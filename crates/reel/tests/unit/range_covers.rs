@@ -41,8 +41,8 @@ fn older_lands_late() {
 fn found_twice() {
     let covers = RangeCovers::new(KEY_BYTES);
 
-    assert!(covers.add(&cover(b"a", b"b", 5), false));
-    assert!(covers.add(&cover(b"a", b"b", 5), false));
+    assert!(covers.add(&cover(b"a", b"b", 5), false, false));
+    assert!(covers.add(&cover(b"a", b"b", 5), false, false));
 
     assert_eq!(covers.len(), 1);
 }
@@ -53,7 +53,7 @@ fn wide_keys() {
     let covers = RangeCovers::new(KEY_BYTES);
     let wide = [b'k'; KEY_BYTES + 1];
 
-    assert!(!covers.add(&cover(&wide, b"z", 5), false));
+    assert!(!covers.add(&cover(&wide, b"z", 5), false, false));
 
     assert!(covers.is_empty());
 }
@@ -62,7 +62,7 @@ fn wide_keys() {
 #[test]
 fn prefix_keys() {
     let covers = RangeCovers::new(KEY_BYTES);
-    assert!(covers.add(&cover(b"ab", b"abc", 5), false));
+    assert!(covers.add(&cover(b"ab", b"abc", 5), false, false));
 
     let point = WritePlace(9);
     assert_eq!(covers.newest_over(COLUMN, b"a", point), None);
@@ -76,10 +76,10 @@ fn prefix_keys() {
 fn nested_cost() {
     let covers = RangeCovers::new(KEY_BYTES);
     let (first, last) = (number(0), number(100_000));
-    assert!(covers.add(&cover(&first, &last, 1), false));
+    assert!(covers.add(&cover(&first, &last, 1), false, false));
     for inner in 0..NESTED {
         let (start, end) = (number(10 * inner + 1), number(10 * inner + 2));
-        assert!(covers.add(&cover(&start, &end, inner as u64 + 2), false));
+        assert!(covers.add(&cover(&start, &end, inner as u64 + 2), false, false));
     }
 
     let steps = covers.search_steps(COLUMN, &number(10 * NESTED));

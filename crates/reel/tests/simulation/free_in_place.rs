@@ -848,6 +848,94 @@ fn a_merge_that_keeps_a_freed_record_drops_it() {
     store.close().expect("close");
 }
 
+// a cover's apply frees a large record it hides before the cover counts as applied, and a merge between the two that asks outside
+// keeps the record and finds its blocks punched: the sealed cover replaces it as a newer row does, so the merge drops it and damages nothing
+#[test]
+fn a_merge_inside_a_cover_apply_drops_the_freed_record() {
+    let io = SimulatedIo::new(Seed(50));
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    volume.holds.compaction.store(true, Ordering::Release);
+    keep_live(&store);
+    store.put(COLUMN, b"key", &large(1)).expect("put");
+    store.put(COLUMN, b"twice", b"first").expect("put");
+    store.put(COLUMN, b"twice", b"second").expect("put");
+    let older = seal(&store, &io);
+    // a range that starts below the key, so no row of the cover's own segment carries the key
+    store.delete_range(COLUMN, b"kex", b"kez").expect("delete");
+    store.seal_now();
+    // run the jobs only until the apply frees the record, while its cover still counts
+    for _step in 0..STEPS {
+        if volume.bytes_freed.load(Ordering::Acquire) > 0 {
+            break;
+        }
+        if io.step_any().is_none() {
+            io.advance_clock(TICK);
+        }
+    }
+    assert!(volume.bytes_freed.load(Ordering::Acquire) > 0, "the apply freed nothing");
+    assert_eq!(volume.covers.newest_applied(COLUMN, b"key"), None, "the cover applied before the merge could run inside it");
+    // bits a crash or a damage left inexact make the merge ask the segments outside it, which hold no newer row for the key
+    volume.dead_bits.spoil_all();
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    job.rewrite.forced = Some(older);
+    assert!(job.rewrite.start(), "the merge never started");
+    while job.rewrite.is_running() {
+        job.rewrite.step();
+    }
+    assert!(hold(&volume.damaged).is_empty(), "the merge damaged a segment over a record its cover freed");
+    assert_eq!(store.state.merge_check_failures.load(Ordering::Relaxed), 0);
+    assert_eq!(read(&store, b"key"), None);
+    assert_eq!(read(&store, b"keep-1"), Some(large(3)));
+    store.close().expect("close");
+}
+
+// the same across a crash: the apply freed the record and the process died before the cover counted as applied. Open brings the
+// cover back from its footer with its apply still to run, and a merge before that apply finds the record punched and drops it
+#[test]
+fn a_merge_after_a_crash_inside_a_cover_apply_drops_the_freed_record() {
+    let io = SimulatedIo::new(Seed(51));
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    volume.holds.compaction.store(true, Ordering::Release);
+    keep_live(&store);
+    store.put(COLUMN, b"key", &large(1)).expect("put");
+    store.put(COLUMN, b"twice", b"first").expect("put");
+    store.put(COLUMN, b"twice", b"second").expect("put");
+    let older = seal(&store, &io);
+    store.delete_range(COLUMN, b"kex", b"kez").expect("delete");
+    store.seal_now();
+    for _step in 0..STEPS {
+        if volume.bytes_freed.load(Ordering::Acquire) > 0 {
+            break;
+        }
+        if io.step_any().is_none() {
+            io.advance_clock(TICK);
+        }
+    }
+    assert!(volume.bytes_freed.load(Ordering::Acquire) > 0, "the apply freed nothing");
+    assert_eq!(volume.covers.newest_applied(COLUMN, b"key"), None, "the cover applied before the crash");
+    io.kill();
+    drop(store);
+
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    volume.holds.compaction.store(true, Ordering::Release);
+    assert!(volume.covers.newest_over(COLUMN, b"key", WritePlace(u64::MAX)).is_some(), "open lost the cover");
+    assert_eq!(volume.covers.newest_applied(COLUMN, b"key"), None, "open counted the cover as applied");
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    job.rewrite.forced = Some(older);
+    assert!(job.rewrite.start(), "the merge never started");
+    while job.rewrite.is_running() {
+        job.rewrite.step();
+    }
+    assert!(hold(&volume.damaged).is_empty(), "the merge damaged a segment over a record its cover freed before the crash");
+    assert_eq!(store.state.merge_check_failures.load(Ordering::Relaxed), 0);
+    assert_eq!(read(&store, b"key"), None);
+    assert_eq!(read(&store, b"keep-1"), Some(large(3)));
+    store.close().expect("close");
+}
+
 // a power cut before any sync, while seals and the walk free the old value under an unsynced replacement: the old value or the new
 // one reads whole, and nothing is damaged, since a free names only a replacement a seal has synced
 #[test]

@@ -775,20 +775,22 @@ impl<Backend: Io> RewriteJob<Backend> {
 
     /// Drop a large record that failed its check because the walk freed it in place as dead, and say whether it went. A crash can
     /// take the walk's count of its death from the dead bits the merge decided by, and then the merge keeps it and finds its
-    /// blocks punched. A key with a newer row than the record says it was superseded, and it drops as any superseded row does when that newer row is sealed, since an open one can go with a power cut. A record with no sealed newer row
-    /// stays a failure, which damages its segment
+    /// blocks punched. A key with a newer row than the record says it was superseded, and it drops as any superseded row does when that newer row is sealed, since an open one can go with a power cut. A sealed cover over the key
+    /// replaces it the same way. A record with neither stays a failure, which damages its segment
     pub fn drop_freed(&mut self, column: ColumnId, row: &FooterRow) -> bool {
         if row.kind != RowKind::Value || row.length < FREE_IN_PLACE_BYTES {
             return false;
         }
-        let Some(newer) = self.state.newest_place(self.volume, column, &self.key).filter(|newer| *newer > row.place) else {
+        let volume = &self.state.volumes[self.volume];
+        // a cover's apply frees what it hides before the cover counts as applied, and a crash can come in between. A sealed cover
+        // outlives a power cut as a sealed row does
+        let covered = volume.covers.newest_sealed(column, &self.key).filter(|cover| *cover > row.place);
+        // only a sealed replacement outlives a power cut: an open row over a rotten record leaves it to the check, which damages it
+        let newer = self.state.newest_place(self.volume, column, &self.key).filter(|newer| *newer > row.place)
+            .filter(|_newer| self.state.has_newer_sealed(volume, column, &self.key, row.place, &[]).unwrap_or(false));
+        let Some(newer) = newer.max(covered) else {
             return false;
         };
-        // only a sealed replacement outlives a power cut: an open row over a rotten record leaves it to the check, which damages it
-        let volume = &self.state.volumes[self.volume];
-        if !self.state.has_newer_sealed(volume, column, &self.key, row.place, &[]).unwrap_or(false) {
-            return false;
-        }
         self.lowest_dropped = self.lowest_dropped.min(row.place);
         self.highest_replacement = self.highest_replacement.max(newer);
         self.dropped_rows += 1;

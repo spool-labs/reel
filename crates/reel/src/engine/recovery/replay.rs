@@ -327,7 +327,7 @@ impl<Backend: Io> EngineState<Backend> {
             place: row.place,
             segment: target.segment,
         };
-        let has_room = target.volume.covers.add(&cover, false);
+        let has_room = target.volume.covers.add(&cover, false, false);
         if !has_room {
             recovered.lost_region = lost;
         }
@@ -392,7 +392,8 @@ pub fn rewrite_range<File: IoFile>(file: &File, start: FileOffset, length: ByteC
 /// Add the covers of a footer to the pool, or return false when it fails or the pool has no slot left
 pub fn read_block(bytes: &[u8], segment: SegmentNumber, covers: &RangeCovers, is_applied: bool) -> bool {
     let mut has_room = true;
-    let is_whole = read_covers(bytes, segment, |cover| has_room &= covers.add(cover, is_applied));
+    // a footer is synced before anything reads it back, so its covers are sealed
+    let is_whole = read_covers(bytes, segment, |cover| has_room &= covers.add(cover, is_applied, true));
     is_whole && has_room
 }
 
@@ -713,7 +714,7 @@ pub fn copy_row<Backend: Io>(
                         place: row.place,
                         segment: copied.segment,
                     };
-                    let has_room = target.covers.add(&cover, false);
+                    let has_room = target.covers.add(&cover, false, false);
                     if !has_room {
                         // the cover's row stays in the copy, so this holds for this open and the next open decides again
                         for range in whole_columns(state, volume, copied.segment, state.places.last_given()) {

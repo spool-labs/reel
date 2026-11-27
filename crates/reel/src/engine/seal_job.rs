@@ -452,6 +452,8 @@ impl<Backend: Io> SealJob<Backend> {
             self.has_unsaved_damage = false;
         }
         let totals = self.writer.finish(&target.data, target.number, target.data_end, &self.ranges, state.record_key, &[])?;
+        // the footer is synced, so a reopen finds its covers whatever happens next
+        state.volumes[self.volume].covers.mark_segment_sealed(target.number);
         self.totals = Some(totals);
         self.end_step(|steps| &steps.footer);
         self.phase = SealPhase::Installing;

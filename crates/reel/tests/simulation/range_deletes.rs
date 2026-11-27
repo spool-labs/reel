@@ -887,7 +887,7 @@ fn copied_cover_full() {
             place: WritePlace(1),
             segment: number,
         };
-        if !volume.covers.add(&cover, false) {
+        if !volume.covers.add(&cover, false, false) {
             break;
         }
     }

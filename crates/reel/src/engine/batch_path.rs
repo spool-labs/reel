@@ -433,7 +433,19 @@ impl<Backend: Io> EngineState<Backend> {
         }
 
         let (slot, segment) = (claim.slot, claim.segment);
-        self.index.insert_held_rows(stage.walk().map(|row| (row.column, row.key, held_row(&row, slot, segment))));
+        for row in stage.walk() {
+            let write_row = WriteRow {
+                place: row.place,
+                offset: row.offset,
+                length: row.length,
+                kind: row.kind,
+                slot,
+                segment,
+                has_newer_sealed: false,
+            };
+            let is_held = self.index.insert_held(row.column, row.key, &write_row);
+            debug_assert!(is_held);
+        }
         {
             let mut queue = hold(&self.queues[slot.0 as usize]);
             // the reservation holds this room, whichever group is filling by now
@@ -500,7 +512,19 @@ impl<Backend: Io> EngineState<Backend> {
             staged?;
 
             let segment = claim.segment;
-            self.index.insert_held_rows(stage.walk().map(|row| (row.column, row.key, held_row(&row, slot, segment))));
+            for row in stage.walk() {
+                let write_row = WriteRow {
+                    place: row.place,
+                    offset: row.offset,
+                    length: row.length,
+                    kind: row.kind,
+                    slot,
+                    segment,
+                    has_newer_sealed: false,
+                };
+                let is_held = self.index.insert_held(row.column, row.key, &write_row);
+                debug_assert!(is_held);
+            }
             {
                 let mut queue = hold(&self.queues[index]);
                 queue.reserved -= plan.row_bytes;
@@ -594,7 +618,19 @@ impl<Backend: Io> EngineState<Backend> {
             return Err(store_error(claim.volume, "writing rows", source));
         }
 
-        self.index.insert_held_rows(rows_of_batch.map(|row| (row.column, row.key, held_row(&row, slot, segment))));
+        for row in rows_of_batch {
+            let write_row = WriteRow {
+                place: row.place,
+                offset: row.offset,
+                length: row.length,
+                kind: row.kind,
+                slot,
+                segment,
+                has_newer_sealed: false,
+            };
+            let is_held = self.index.insert_held(row.column, row.key, &write_row);
+            debug_assert!(is_held);
+        }
         self.add_covers(batch, plan, first_place, segment);
         self.deletes.fetch_add(plan.deletes, Ordering::Relaxed);
         claim.land();
@@ -863,17 +899,4 @@ pub fn batch_mark(batch: &WriteBatch, plan: &BatchPlan) -> Option<DeathMark> {
 /// Add up the bytes a batch's rows take as they're written
 pub fn written_bytes<'batch>(rows: impl Iterator<Item = RowEntry<'batch>>) -> usize {
     rows.map(|row| encoded_size(&row)).sum()
-}
-
-/// Make a batch row's write index row in its slot and segment
-fn held_row(row: &RowEntry<'_>, slot: OpenSlot, segment: SegmentNumber) -> WriteRow {
-    WriteRow {
-        place: row.place,
-        offset: row.offset,
-        length: row.length,
-        kind: row.kind,
-        slot,
-        segment,
-        has_newer_sealed: false,
-    }
 }

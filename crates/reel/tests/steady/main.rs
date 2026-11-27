@@ -690,6 +690,12 @@ fn put_fresh(store: &Store, value: &[u8], round: u64) {
     }
 }
 
+// read what the pools and the filter arena hold in memory, with atomic loads only, so a read inside the window allocates nothing
+// and touches no page
+fn in_memory(store: &Store) -> usize {
+    store.state.pool_rooms.iter().map(|room| room.committed()).sum::<usize>() + store.state.filter_arena.ready_bytes() as usize
+}
+
 // the sorted index grows inside the window, and every populate lands on the reserve job with none on a caller
 fn growth_arm() -> u64 {
     let program = env::current_exe().expect("path");
@@ -843,8 +849,9 @@ fn main() {
     let rewritten_before = store.state.volumes[0].segments_rewritten.load(Ordering::Acquire);
     let sorted_before = sorted_counts(&store);
     let is_growing = env::var_os(GROWTH_VARIABLE).is_some();
-    let committed_before = store.memory_report().pool_committed;
+    let in_memory_before = in_memory(&store);
     let given_before = store.memory_report().pool_given_back;
+    let mut in_memory_peak = in_memory_before;
     touch_stack();
     let mut faults = FaultCounter::new();
     let _first_read = faults.read();
@@ -865,11 +872,12 @@ fn main() {
         if is_growing && rounds % GROWTH_STRETCH < GROWTH_STRETCH / 3 {
             put_fresh(&store, &inputs.small, rounds as u64);
         }
+        in_memory_peak = in_memory_peak.max(in_memory(&store));
     }
     IS_WINDOW.store(false, Ordering::Release);
     let main_after = main_thread_faults();
     let after = counts(&mut faults);
-    let committed_after = store.memory_report().pool_committed;
+    let in_memory_after = in_memory(&store);
     let given_after = store.memory_report().pool_given_back;
     let unlinked = store.state.volumes[0].segments_unlinked.load(Ordering::Acquire) - unlinked_before;
     let freed = store.state.volumes[0].bytes_freed.load(Ordering::Acquire) - freed_before;
@@ -911,11 +919,20 @@ fn main() {
     if inputs.is_indexed {
         failures += check_sorted(sorted_before, sorted_after);
     }
-    if is_growing && (committed_after <= committed_before || given_after <= given_before) {
+    if is_growing {
+        // a give-back can undo a growth before the window ends, so growth reads from the peak the rounds saw
+        let (has_grown, has_given) = (in_memory_peak > in_memory_before, given_after > given_before);
         println!(
-            "the pools never both gave back and grew in the window: {committed_before:?} to {committed_after:?} in memory, {given_before:?} to {given_after:?} given back"
+            "in the window: {in_memory_before} B in memory at the start, {in_memory_peak} B at the peak, {in_memory_after} B at the end, {given_before:?} to {given_after:?} given back"
         );
-        failures += 1;
+        if !has_grown {
+            println!("the pools never grew in the window");
+            failures += 1;
+        }
+        if !has_given {
+            println!("the pools never gave back in the window");
+            failures += 1;
+        }
     }
     if env::var_os(INDEXED_VARIABLE).is_none() {
         failures += indexed_arm();

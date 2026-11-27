@@ -256,3 +256,21 @@ fn grows_stop_at_the_ceiling() {
     assert!(!arena.grow_step(&mut u64::MAX.clone()).expect("grow"), "an arena grew past its ceiling");
     assert!(!arena.is_short(), "an arena at its ceiling kept asking");
 }
+
+const CAP_HELD_BYTES: u64 = 32 * 1024 * 1024;
+
+// an arena that holds a lot grows by what a refused segment lacked and at most ARENA_STEP_BYTES past it, so one grow on the reserve
+// job never doubles a large arena at once
+#[test]
+fn a_grow_takes_at_most_a_step() {
+    let arena = FilterArena::new(ByteCount(4 * CAP_HELD_BYTES), ByteCount(CAP_HELD_BYTES), SEGMENTS).expect("arena");
+    let held = arena.ready_bytes();
+    assert!(held >= CAP_HELD_BYTES - 4096);
+    // one segment takes nearly all the floor, and the next small one finds no room
+    assert!(arena.begin(FIRST, 1, (held - 64) as u32));
+    assert!(!arena.begin(SECOND, 1, 64));
+    let grow = arena.next_grow().expect("a grow");
+    assert!(grow <= (ARENA_STEP_BYTES + 4 * 4096) as u64, "one grow of {grow} bytes passed the step");
+    assert!(arena.grow_step(&mut u64::MAX.clone()).expect("grow"));
+    assert!(arena.begin(SECOND, 1, 64), "the segment didn't fit after a grow");
+}

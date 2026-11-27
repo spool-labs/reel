@@ -29,6 +29,8 @@ use crate::segment::segment_tail::SegmentNumber;
 pub const FILTER_LINE_WORDS: usize = 3;
 /// Bytes of one block's line in an extent
 pub const FILTER_LINE_BYTES: usize = FILTER_LINE_WORDS * WORD_BYTES;
+/// The most one grow of the arena brings in past what a refused segment lacked
+pub const ARENA_STEP_BYTES: usize = 16 * 1024 * 1024;
 /// Bytes of one word of the arena
 pub const WORD_BYTES: usize = size_of::<u32>();
 /// The most a block's bits can waste, since each starts on a word
@@ -259,7 +261,9 @@ impl FilterArena {
             self.short_by.store(0, Ordering::Release);
             return None;
         }
-        let target = (ready + short.max(ready).max(page)).next_multiple_of(page).min(ceiling);
+        // a grow takes what the segment lacked and up to what the arena holds, but no more than ARENA_STEP_BYTES at once, so one grow
+        // never holds the job long and a pool waits behind none
+        let target = (ready + short.max(ready.min(ARENA_STEP_BYTES)).max(page)).next_multiple_of(page).min(ceiling);
         Some((target - ready) as u64)
     }
 

@@ -76,6 +76,8 @@ impl<Backend: Io> Claim<'_, Backend> {
                     let is_taking = matches!(segment.phase, SegmentPhase::Taking | SegmentPhase::Alone);
                     if is_taking && segment.write_end.0 == self.offset.0 + self.bytes.0 {
                         segment.write_end = self.offset;
+                        // the bytes back can give a writer waiting for a segment room on this one
+                        self.state.slot_line.wake();
                     } else {
                         self.volume.unlanded_bytes.fetch_add(self.bytes.0, Ordering::Relaxed);
                     }
@@ -83,6 +85,8 @@ impl<Backend: Io> Claim<'_, Backend> {
                 self.volume.progress.wake();
                 if self.is_alone && segment.phase == SegmentPhase::Alone {
                     segment.phase = SegmentPhase::Taking;
+                    // a writer that found no segment beside the long batch can take this one now
+                    self.state.slot_line.wake();
                 }
                 break;
             }

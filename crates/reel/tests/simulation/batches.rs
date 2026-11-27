@@ -1245,3 +1245,18 @@ fn a_batch_waiting_on_a_seal_leaves_the_reserve_job_at_its_pace() {
     assert!(steps * 100_000_000 <= waited * 2 + 1_000_000_000, "{steps} reserve steps in {} ms of waiting", waited / 1_000_000);
     store.close().expect("close");
 }
+
+// a long batch that ends hands its segment back to the others, and a writer asleep for a segment wakes with it: the release moves
+// the slot line, as a slot that frees does
+#[test]
+fn an_alone_claim_that_ends_wakes_the_slot_waiters() {
+    let io = SimulatedIo::new(Seed(92));
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    let long = ClaimRequest { bytes: ByteCount(1), rows: RowCount(1), is_alone: true, has_records: true, covers: 0, mark: None, has_deletes: false };
+    let alone = store.state.claim(volume, &long).expect("claim");
+    let seen = store.state.slot_line.seen();
+    drop(alone);
+    assert!(store.state.slot_line.seen() > seen, "a segment back to taking claims woke no writer waiting for one");
+    store.close().expect("close");
+}

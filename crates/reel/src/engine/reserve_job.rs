@@ -276,8 +276,9 @@ impl<Backend: Io> ReserveJob<Backend> {
                 // the whole caches come back first, empty, and fill from reads, and the compress shares after them
                 let room = room.saturating_sub(bring_back_caches(state, room));
                 let room = room.saturating_sub(bring_back_shares(state, room));
-                // a cache still away brings the next step on soon
-                state.is_bringing_back.store(whole_caches(state).any(|cache| cache.absent_shards() > 0), Ordering::Release);
+                // a cache or a share still away brings the next step on soon
+                let is_away = whole_caches(state).any(|cache| cache.absent_shards() > 0) || state.are_shares_given.load(Ordering::Acquire);
+                state.is_bringing_back.store(is_away, Ordering::Release);
                 for index in state.sorted.iter().flatten().filter(|index| index.mark().is_some()) {
                     let rows = RowCount(index.past_capacity().0 + index.entry_count().0);
                     let plan = planned_index_bytes(index.width(), rows).0 as usize;
@@ -517,13 +518,15 @@ pub fn give_back_shares<Backend: Io>(state: &EngineState<Backend>) -> usize {
 }
 
 /// Bring every given-back compress share's pages in again on this thread, while the room holds them, and lower the flag once all
-/// are back. Return the bytes brought back
+/// are back. A share a put holds through this step stays given back, the flag with it, and a later step brings it in. Return the
+/// bytes brought back
 pub fn bring_back_shares<Backend: Io>(state: &EngineState<Backend>, room: u64) -> u64 {
     let given = state.shares_given_bytes.load(Ordering::Acquire);
     if !state.are_shares_given.load(Ordering::Acquire) || given > room {
         return 0;
     }
     let page = crate::region::page_bytes();
+    let mut brought = 0;
     state.stored_shares.visit_free(|share| {
         if !share.is_empty() {
             return;
@@ -532,13 +535,19 @@ pub fn bring_back_shares<Backend: Io>(state: &EngineState<Backend>, room: u64) -
         let (first, end) = (base.next_multiple_of(page), (base + share.capacity()) / page * page);
         if end > first {
             crate::pool_room::take_pages_back(first as *mut u8, end - first);
+            // the same whole pages the give-back counted
+            brought += end - first;
         }
         // a write of every byte brings the pages in here, on the job, and gives the share its length back
         share.resize(share.capacity(), 0);
     });
-    state.shares_given_bytes.store(0, Ordering::Release);
-    state.are_shares_given.store(false, Ordering::Release);
-    given
+    // the bytes still given back belong to shares that were out with a put, so a share in use with its length keeps nothing up
+    let rest = given.saturating_sub(brought as u64);
+    state.shares_given_bytes.store(rest, Ordering::Release);
+    if rest == 0 {
+        state.are_shares_given.store(false, Ordering::Release);
+    }
+    brought as u64
 }
 
 /// Give the whole caches' shards back, the highest first, until this many bytes are given or none is left, and return the bytes

@@ -5342,3 +5342,32 @@ fn encoders_are_sized_for_the_largest_value_a_column_stores() {
     assert!(lz4_bytes < 300 * 1024, "an all-lz4 store's encoder holds {lz4_bytes} B");
     assert!(plain_bytes > lz4_bytes, "a plain column's encoder isn't sized past the lz4 limit");
 }
+
+// a share a put holds while the job brings the shares back comes back on a later step: the flag stays up until every share has
+// its length again
+#[test]
+fn a_share_held_across_the_bring_back_comes_back_on_a_later_step() {
+    let io = SimulatedIo::new(Seed(78));
+    SIM_CODEC.with(|codec| codec.set(Codec::Lz4));
+    let store_config = config(CAPACITY);
+    SIM_CODEC.with(|codec| codec.set(Codec::None));
+    let store = ReelStore::open(io.clone(), &store_config).expect("open");
+    let state = &store.state;
+    assert!(reel::engine::reserve_job::give_back_shares(state) > 0, "no share went back");
+    // a put that read the flag down took a given-back share and holds it across the job's bring-back
+    let held = state.stored_shares.take();
+    assert!(held.is_empty(), "the share wasn't given back");
+    let _brought = reel::engine::reserve_job::bring_back_shares(state, u64::MAX);
+    state.stored_shares.put(held);
+    let mut empty = 0;
+    state.stored_shares.visit_free(|share| empty += usize::from(share.is_empty()));
+    println!("after one bring-back: {empty} empty shares, flag up {}", state.are_shares_given.load(Ordering::Acquire));
+    assert!(empty == 0 || state.are_shares_given.load(Ordering::Acquire), "a share stays given back with the flag down");
+    let _brought = reel::engine::reserve_job::bring_back_shares(state, u64::MAX);
+    let mut empty = 0;
+    state.stored_shares.visit_free(|share| empty += usize::from(share.is_empty()));
+    assert_eq!(empty, 0, "a later step left a share given back");
+    assert!(!state.are_shares_given.load(Ordering::Acquire), "the flag stayed up with every share back");
+    assert_eq!(state.shares_given_bytes.load(Ordering::Acquire), 0);
+    store.close().expect("close");
+}

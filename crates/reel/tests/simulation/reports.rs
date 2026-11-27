@@ -752,3 +752,28 @@ fn a_volume_reports_covers_a_cue_holds() {
     assert_eq!(gone.pending_covers, 0, "{gone:?}");
     store.close().expect("close");
 }
+
+const STUCK_PUTS: u64 = 200_000;
+
+// a writer short only of a pool step the reserve job brings in waits for it, even while the seal stands stopped on a full table:
+// only a wait that no step of the job can end gives up with TableFull
+#[test]
+fn a_stopped_seal_lets_a_writer_wait_for_a_pool_step() {
+    let io = SimulatedIo::new(Seed(7));
+    let store = open_at(&io, BUDGET);
+    store.state.volumes[0].holds.compaction.store(true, Ordering::Release);
+    store.state.volumes[0].is_seal_stuck.store(true, Ordering::Release);
+    let waits_before = store.index_waits().0;
+    let mut number = 0;
+    // the write index starts on its first part, so a run of puts meets a pool the job has yet to grow
+    while store.index_waits().0 == waits_before && number < STUCK_PUTS {
+        store.put(COLUMN, format!("stuck-{number:06}").as_bytes(), VALUE).expect("put past a stopped seal");
+        number += 1;
+    }
+    assert!(store.index_waits().0 > waits_before, "no put waited for a pool step in {number} puts");
+    let mut value = Vec::new();
+    assert!(store.get(COLUMN, b"stuck-000000", &mut value).expect("get"));
+    store.state.volumes[0].is_seal_stuck.store(false, Ordering::Release);
+    store.state.volumes[0].holds.compaction.store(false, Ordering::Release);
+    store.close().expect("close");
+}

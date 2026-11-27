@@ -197,7 +197,8 @@ impl<Backend: Io> EngineState<Backend> {
         }
         loop {
             // a slab that can still grow fills from its next part, and an early seal would only cut segments short
-            if !self.index.waits_for_slab(column, key) {
+            let is_growing = self.index.waits_for_slab(column, key);
+            if !is_growing {
                 for volume in &self.volumes {
                     self.seal_fullest(volume);
                 }
@@ -206,7 +207,10 @@ impl<Backend: Io> EngineState<Backend> {
                 self.longest_index_wait.fetch_max(self.io.now().0.saturating_sub(started.0), Ordering::Relaxed);
                 return Ok(());
             }
-            check_seal_room(own)?;
+            // a seal stopped on a full table frees no room, but the job's next step does, so only a wait no step can end gives up
+            if !is_growing {
+                check_seal_room(own)?;
+            }
             if self.io.now().0 > deadline {
                 return Err(StoreError::Io {
                     action: "waiting for the write index",

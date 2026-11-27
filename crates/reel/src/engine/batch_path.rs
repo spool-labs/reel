@@ -297,13 +297,15 @@ impl<Backend: Io> EngineState<Backend> {
                     task.wake();
                 }
             }
-            // a batch short only of nodes the job is bringing in waits for them, and seals early only when sealing is what frees room
-            if !self.index.waits_for_nodes(&plan.needs) {
+            // a batch short only of nodes the job is bringing in waits for them, and seals early only when sealing is what frees room.
+            // A seal stopped on a full table frees nothing, so only a wait no step of the job can end gives up on it
+            let is_growing = self.index.waits_for_nodes(&plan.needs);
+            if !is_growing {
                 for volume in &self.volumes {
                     self.seal_fullest(volume);
                 }
+                check_seal_room(own)?;
             }
-            check_seal_room(own)?;
             if self.io.now().0 > deadline {
                 return Err(StoreError::Io {
                     action: "waiting for the write index",

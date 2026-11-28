@@ -732,7 +732,12 @@ impl PoolRoom {
         let since = self.over_since.load(Ordering::Relaxed);
         if since == 0 || used > self.idle_used.load(Ordering::Relaxed) {
             self.over_since.store(now, Ordering::Relaxed);
-            self.idle_used.store(used, Ordering::Relaxed);
+            // a trimmed room keeps the use its trim left, so the fill since reads as fill when next_step looks after this
+            if self.is_trimmed.load(Ordering::Acquire) {
+                self.idle_used.fetch_min(used, Ordering::Relaxed);
+            } else {
+                self.idle_used.store(used, Ordering::Relaxed);
+            }
             return 0;
         }
         self.idle_used.store(used, Ordering::Relaxed);
@@ -1329,6 +1334,32 @@ mod tests {
         assert_eq!(room.next_step(room.used()), Some(committed + room.step()), "a page in a microsecond read as a rate");
         room.note_rate(1 + LEAD_NANOS);
         assert!(room.next_step(room.used()).is_some_and(|target| target <= committed + room.step().max(2 * room.extent())));
+    }
+
+    // an idle trim that pages left in every other extent stop short of the use and an extent leaves the room trimmed. Fill into it
+    // reads as fill on the job's next pass, which grows a step for it
+    #[test]
+    fn a_fill_after_a_short_trim_grows_on_the_next_pass() {
+        let page = page_bytes();
+        let room = PoolRoom::reserve_paged(ByteCount(256 * page as u64), ByteCount(256 * page as u64), page).expect("reserve");
+        let extent_pages = room.extent() / page;
+        let taken: Vec<u32> = (0..64).map(|_page| room.take_page().expect("take")).collect();
+        for &number in &taken {
+            let extent = number as usize / extent_pages;
+            let is_kept = (number as usize).is_multiple_of(extent_pages) && extent.is_multiple_of(2) && extent < 10;
+            if !is_kept {
+                room.give_page(number);
+            }
+        }
+        assert_eq!(room.release_idle(1), 0);
+        assert!(room.release_idle(1 + DECAY_NANOS) > 0, "the idle room gave nothing back");
+        assert!(room.committed() > room.used() + room.extent(), "the trim went down to the use and an extent");
+        let _first = room.take_page().expect("take");
+        // the job's pass: finish the releases, look for idle, then grow
+        let _finished = room.finish_releases();
+        assert_eq!(room.release_idle(2 + DECAY_NANOS), 0);
+        assert!(room.next_step(room.used()).is_some(), "the pass read the fill as no fill");
+        assert!(room.grow_step(&mut u64::MAX.clone()).expect("grow"), "the pass grew nothing for the fill");
     }
 
     #[test]

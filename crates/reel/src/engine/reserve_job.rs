@@ -17,7 +17,7 @@ use crate::guard::hold;
 use crate::io::job::{Job, JobStep};
 use crate::io::{Io, IoFile, IoTask};
 use crate::pool::touched_filled;
-use crate::pool_room::decay_nanos;
+use crate::pool_room::{PoolRoom, decay_nanos};
 use crate::io::host_memory::{HostMemory, PRESSURE_READ_MARK};
 use crate::index::value_pages::VALUE_PAGE_BYTES;
 use crate::index::spot_index::SpotIndex;
@@ -216,9 +216,7 @@ impl<Backend: Io> ReserveJob<Backend> {
         // a step takes no more than the host has left past its margin, and no more than the store's target leaves
         let target_left = target.saturating_sub(self.held_bytes());
         let mut room_left = host_left(&self.state.io.host_memory()).min(target_left);
-        for room in &self.state.pool_rooms {
-            let _grew = room.grow_step(&mut room_left);
-        }
+        PoolRoom::grow_rooms(&self.state.pool_rooms, &mut room_left);
     }
 
     /// Read the memory the store holds now: what lies outside its rooms, measured at open, and every room's bytes in memory

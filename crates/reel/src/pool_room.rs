@@ -91,6 +91,14 @@ impl Drop for RoomRead<'_> {
 /// Wakes the job that grows the rooms
 pub type GrowWake = Arc<dyn Fn() + Send + Sync>;
 
+/// How far one grow goes: the whole way, a plain step alone, or the leads after every room's plain step
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Growth {
+    Whole,
+    PlainStep,
+    Lead,
+}
+
 
 /// Extents a room's share splits into, one bit each of its ready set
 pub const EXTENTS: usize = 64;
@@ -636,15 +644,38 @@ impl PoolRoom {
     /// grew. A lead past the room left grows a plain step instead. A pool the host has no room for even a step of stays as it is
     /// and reads as short until a step fits
     pub fn grow_step(&self, host_left: &mut u64) -> Result<bool> {
+        self.grow_by(host_left, Growth::Whole)
+    }
+
+    /// Grow the room's plain step alone when it wants one, so every room's step comes before any room's lead
+    pub fn grow_plain_step(&self, host_left: &mut u64) -> Result<bool> {
+        self.grow_by(host_left, Growth::PlainStep)
+    }
+
+    /// Grow every room that wants its next step, in the room the host has left: each room's plain step first, then the leads and
+    /// any further steps in what is left. A room that got its step reads as short of no lead the rest can't hold
+    pub fn grow_rooms(rooms: &[Arc<Self>], host_left: &mut u64) {
+        for room in rooms {
+            let _grew = room.grow_plain_step(host_left);
+        }
+        for room in rooms {
+            let _grew = room.grow_by(host_left, Growth::Lead);
+        }
+    }
+
+    fn grow_by(&self, host_left: &mut u64, growth: Growth) -> Result<bool> {
         let mut grew = false;
         while let Some(led) = self.next_step(self.used()) {
             // a lead the host has no room for falls back to a plain step, which may still fit, so the room grows and isn't short
             let plain = self.committed().saturating_add(self.step()).min(self.cap());
             let is_led_past = led.saturating_sub(self.committed()) as u64 > *host_left;
-            let target = if is_led_past && led > plain { plain } else { led };
+            let target = if growth == Growth::PlainStep || (is_led_past && led > plain) { plain } else { led };
             let step = target.saturating_sub(self.committed()) as u64;
             if step > *host_left {
-                self.is_short.store(true, Ordering::Release);
+                // the lead pass comes after every room's plain step, which already says whether this room is short
+                if growth != Growth::Lead {
+                    self.is_short.store(true, Ordering::Release);
+                }
                 break;
             }
             self.grow_to(target)?;
@@ -653,7 +684,7 @@ impl PoolRoom {
             self.is_short.store(false, Ordering::Release);
             grew = true;
             // the lead is prefetch: once the host's room cut it to a step, the room has what it needs and isn't short of the rest
-            if target < led {
+            if target < led || growth == Growth::PlainStep {
                 break;
             }
         }
@@ -1317,6 +1348,27 @@ mod tests {
         assert!(room.grow_step(&mut host_left).expect("grow"), "a room with a step of room left didn't grow");
         assert!(room.committed() > committed && room.committed() <= committed + 2 * step);
         assert!(!room.is_short(), "a room that grew a step read as short");
+    }
+
+    // two rooms each a step short, with room for two plain steps: the led room's lead waits for the plain room's step, so neither is
+    // short and the plain room grows on this pass
+    #[test]
+    fn a_lead_comes_after_every_plain_step() {
+        let page = page_bytes();
+        let led = Arc::new(PoolRoom::reserve_paged(ByteCount(1024 * page as u64), ByteCount(0), page).expect("reserve"));
+        led.lead_by_rate();
+        let plain = Arc::new(PoolRoom::reserve_paged(ByteCount(1024 * page as u64), ByteCount(0), page).expect("reserve"));
+        let step = led.step();
+        led.note_used(led.committed());
+        led.note_rate(1);
+        led.note_used(led.committed() + 3 * step / 4);
+        led.note_rate(1 + LEAD_NANOS);
+        plain.note_used(plain.committed());
+        let (led_before, plain_before) = (led.committed(), plain.committed());
+        let mut host_left = (led.step() + plain.step()) as u64;
+        PoolRoom::grow_rooms(&[Arc::clone(&led), Arc::clone(&plain)], &mut host_left);
+        assert!(led.committed() > led_before && !led.is_short(), "the led room got no step");
+        assert!(plain.committed() > plain_before && !plain.is_short(), "the led room's lead took the plain room's step");
     }
 
     // two looks microseconds apart keep the old sample, so one page taken between them leads by nothing past a step; a look past

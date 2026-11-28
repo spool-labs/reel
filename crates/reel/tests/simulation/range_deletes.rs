@@ -11,7 +11,7 @@ use reel::engine::write_path::ClaimRequest;
 use reel::guard::hold;
 use reel::io::{Io, IoFile};
 use reel::record::codec::Codec;
-use reel::record::record_head::plain_length;
+use reel::record::record_head::{SMALL_HEAD_BYTES, plain_length};
 use reel::row_kind::RowKind;
 use reel::rows::row_group::RowEntry;
 use reel::segment::range_covers::{Cover, MOST_RANGE_COVERS};
@@ -788,6 +788,29 @@ fn spare_crash() {
         }
         store.close().expect("close");
     }
+}
+
+// a cover whose record rots before its seal stays out of the footer, so the seal leaves it unsealed in the pool: no merge may drop
+// a freed record on it, since a power cut takes it
+#[test]
+fn a_cover_left_out_of_its_footer_stays_unsealed() {
+    let io = SimulatedIo::new(Seed(32));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"older").expect("put");
+    store.flush().expect("flush");
+    seal(&store, &io);
+    store.put(COLUMN, b"aaa", b"beside").expect("put");
+    store.delete_range(COLUMN, b"key", b"kez").expect("delete");
+    store.flush().expect("flush");
+    let volume = &store.state.volumes[0];
+    let row = store.state.index.lookup(COLUMN, b"key", store.state.read_point(volume), volume.view()).row.expect("the cover's row");
+    let path = data_path(&volume.roots[0], row.segment).to_path_buf();
+    io.rot(&path, FileOffset(row.offset.0 + SMALL_HEAD_BYTES as u64), BitMask(1)).expect("rot");
+    seal(&store, &io);
+    assert!(!hold(&volume.damaged).is_empty(), "the seal read the rotten cover");
+    assert!(volume.covers.newest_over(COLUMN, b"key", WritePlace(u64::MAX)).is_some(), "the seal took the cover out of the pool");
+    assert_eq!(volume.covers.newest_sealed(COLUMN, b"key"), None, "the seal marked sealed a cover its footer left out");
+    store.close().expect("close");
 }
 
 // a cover that rots before its seal can't go quietly: at every crash point the older value stays hidden or the read

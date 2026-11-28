@@ -1174,7 +1174,7 @@ pub fn is_under_applied_cover<Backend: Io>(volume: &Volume<Backend>, segment: Se
         cursor.column().is_some_and(|facts| {
             let place = row.facts.places.highest;
             let cover = Cover { column: facts.column, start: facts.lowest, end: facts.bound, place, segment };
-            !facts.bound.is_empty() && covers.is_inside_newer(&cover, true)
+            !facts.bound.is_empty() && covers.is_inside_newer(&cover, true, false)
         })
     })
 }

@@ -848,23 +848,19 @@ fn a_merge_that_keeps_a_freed_record_drops_it() {
     store.close().expect("close");
 }
 
-// a cover's apply frees a large record it hides before the cover counts as applied, and a merge between the two that asks outside
-// keeps the record and finds its blocks punched: the sealed cover replaces it as a newer row does, so the merge drops it and damages nothing
-#[test]
-fn a_merge_inside_a_cover_apply_drops_the_freed_record() {
-    let io = SimulatedIo::new(Seed(50));
-    let store = open(&io);
+// put a large record in a segment of its own, then a range delete over its key, and run the jobs only until the cover's apply frees
+// the record, while the cover still counts and isn't applied. The range starts below the key, so no row of the cover's own segment
+// carries the key
+fn free_under_a_cover(store: &Store, io: &SimulatedIo) -> SegmentNumber {
     let volume = &store.state.volumes[0];
     volume.holds.compaction.store(true, Ordering::Release);
-    keep_live(&store);
+    keep_live(store);
     store.put(COLUMN, b"key", &large(1)).expect("put");
     store.put(COLUMN, b"twice", b"first").expect("put");
     store.put(COLUMN, b"twice", b"second").expect("put");
-    let older = seal(&store, &io);
-    // a range that starts below the key, so no row of the cover's own segment carries the key
+    let older = seal(store, io);
     store.delete_range(COLUMN, b"kex", b"kez").expect("delete");
     store.seal_now();
-    // run the jobs only until the apply frees the record, while its cover still counts
     for _step in 0..STEPS {
         if volume.bytes_freed.load(Ordering::Acquire) > 0 {
             break;
@@ -875,8 +871,12 @@ fn a_merge_inside_a_cover_apply_drops_the_freed_record() {
     }
     assert!(volume.bytes_freed.load(Ordering::Acquire) > 0, "the apply freed nothing");
     assert_eq!(volume.covers.newest_applied(COLUMN, b"key"), None, "the cover applied before the merge could run inside it");
-    // bits a crash or a damage left inexact make the merge ask the segments outside it, which hold no newer row for the key
-    volume.dead_bits.spoil_all();
+    older
+}
+
+// merge the segment that held the freed record on its own, and check it dropped the record with no damage
+fn merge_drops_the_freed_record(store: &Store, older: SegmentNumber) {
+    let volume = &store.state.volumes[0];
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
     job.rewrite.forced = Some(older);
     assert!(job.rewrite.start(), "the merge never started");
@@ -885,8 +885,20 @@ fn a_merge_inside_a_cover_apply_drops_the_freed_record() {
     }
     assert!(hold(&volume.damaged).is_empty(), "the merge damaged a segment over a record its cover freed");
     assert_eq!(store.state.merge_check_failures.load(Ordering::Relaxed), 0);
-    assert_eq!(read(&store, b"key"), None);
-    assert_eq!(read(&store, b"keep-1"), Some(large(3)));
+    assert_eq!(read(store, b"key"), None);
+    assert_eq!(read(store, b"keep-1"), Some(large(3)));
+}
+
+// a cover's apply frees a large record it hides before the cover counts as applied, and a merge between the two that asks outside
+// keeps the record and finds its blocks punched: the sealed cover replaces it as a newer row does, so the merge drops it and damages nothing
+#[test]
+fn a_merge_inside_a_cover_apply_drops_the_freed_record() {
+    let io = SimulatedIo::new(Seed(50));
+    let store = open(&io);
+    let older = free_under_a_cover(&store, &io);
+    // bits a crash or a damage left inexact make the merge ask the segments outside it, which hold no newer row for the key
+    store.state.volumes[0].dead_bits.spoil_all();
+    merge_drops_the_freed_record(&store, older);
     store.close().expect("close");
 }
 
@@ -896,25 +908,7 @@ fn a_merge_inside_a_cover_apply_drops_the_freed_record() {
 fn a_merge_after_a_crash_inside_a_cover_apply_drops_the_freed_record() {
     let io = SimulatedIo::new(Seed(51));
     let store = open(&io);
-    let volume = &store.state.volumes[0];
-    volume.holds.compaction.store(true, Ordering::Release);
-    keep_live(&store);
-    store.put(COLUMN, b"key", &large(1)).expect("put");
-    store.put(COLUMN, b"twice", b"first").expect("put");
-    store.put(COLUMN, b"twice", b"second").expect("put");
-    let older = seal(&store, &io);
-    store.delete_range(COLUMN, b"kex", b"kez").expect("delete");
-    store.seal_now();
-    for _step in 0..STEPS {
-        if volume.bytes_freed.load(Ordering::Acquire) > 0 {
-            break;
-        }
-        if io.step_any().is_none() {
-            io.advance_clock(TICK);
-        }
-    }
-    assert!(volume.bytes_freed.load(Ordering::Acquire) > 0, "the apply freed nothing");
-    assert_eq!(volume.covers.newest_applied(COLUMN, b"key"), None, "the cover applied before the crash");
+    let older = free_under_a_cover(&store, &io);
     io.kill();
     drop(store);
 
@@ -923,16 +917,46 @@ fn a_merge_after_a_crash_inside_a_cover_apply_drops_the_freed_record() {
     volume.holds.compaction.store(true, Ordering::Release);
     assert!(volume.covers.newest_over(COLUMN, b"key", WritePlace(u64::MAX)).is_some(), "open lost the cover");
     assert_eq!(volume.covers.newest_applied(COLUMN, b"key"), None, "open counted the cover as applied");
-    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
-    job.rewrite.forced = Some(older);
-    assert!(job.rewrite.start(), "the merge never started");
-    while job.rewrite.is_running() {
-        job.rewrite.step();
-    }
-    assert!(hold(&volume.damaged).is_empty(), "the merge damaged a segment over a record its cover freed before the crash");
-    assert_eq!(store.state.merge_check_failures.load(Ordering::Relaxed), 0);
-    assert_eq!(read(&store, b"key"), None);
-    assert_eq!(read(&store, b"keep-1"), Some(large(3)));
+    merge_drops_the_freed_record(&store, older);
+    store.close().expect("close");
+}
+
+// the same, with a second range delete over the range after the reopen: the newer open cover keeps the sealed one beside it, since
+// only the sealed one outlives a power cut
+#[test]
+fn a_range_delete_after_a_crash_inside_an_apply_keeps_the_sealed_cover() {
+    let io = SimulatedIo::new(Seed(51));
+    let store = open(&io);
+    let older = free_under_a_cover(&store, &io);
+    io.kill();
+    drop(store);
+
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    volume.holds.compaction.store(true, Ordering::Release);
+    store.delete_range(COLUMN, b"kex", b"kez").expect("second delete");
+    assert!(volume.covers.newest_sealed(COLUMN, b"key").is_some(), "the open cover dropped the sealed one");
+    merge_drops_the_freed_record(&store, older);
+    store.close().expect("close");
+}
+
+// the same, with the second range delete flushed before the crash: open finds the sealed cover inside a newer one from an open
+// segment's rows, and keeps both
+#[test]
+fn a_range_delete_before_a_crash_inside_an_apply_keeps_the_sealed_cover() {
+    let io = SimulatedIo::new(Seed(51));
+    let store = open(&io);
+    let older = free_under_a_cover(&store, &io);
+    store.delete_range(COLUMN, b"kex", b"kez").expect("second delete");
+    store.flush().expect("flush");
+    io.kill();
+    drop(store);
+
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    volume.holds.compaction.store(true, Ordering::Release);
+    assert!(volume.covers.newest_sealed(COLUMN, b"key").is_some(), "open folded the sealed cover into the open one");
+    merge_drops_the_freed_record(&store, older);
     store.close().expect("close");
 }
 

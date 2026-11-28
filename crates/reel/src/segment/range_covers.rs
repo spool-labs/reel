@@ -45,14 +45,46 @@ pub struct CoverSlot {
     pub end_length: u16,
     pub place: WritePlace,
     pub segment: SegmentNumber,
-    /// The walk of the cover's segment has counted what it hides, so a row's count can stand on it
-    pub is_applied: bool,
-    /// Its apply has begun, and the rows it counted need it in the pool from here on
-    pub is_counting: bool,
-    /// Rows it hides are left only in its own segment, and they leave with the cover at that segment's rewrite
-    pub is_clear: bool,
-    /// Its segment's footer is synced, so the cover outlives a power cut
-    pub is_sealed: bool,
+    /// The cover's states, one bit each, so the slot keeps to the width its other fields pack to
+    pub flags: u8,
+}
+
+/// The walk of the cover's segment has counted what it hides, so a row's count can stand on it
+pub const COVER_APPLIED: u8 = 1;
+/// Its apply has begun, and the rows it counted need it in the pool from here on
+pub const COVER_COUNTING: u8 = 2;
+/// Rows it hides are left only in its own segment, and they leave with the cover at that segment's rewrite
+pub const COVER_CLEAR: u8 = 4;
+/// A synced footer holds it, so the cover outlives a power cut
+pub const COVER_SEALED: u8 = 8;
+
+impl CoverSlot {
+    /// Check the walk of the cover's segment has counted what it hides
+    pub fn is_applied(&self) -> bool {
+        self.flags & COVER_APPLIED != 0
+    }
+
+    /// Check the cover's apply has begun
+    pub fn is_counting(&self) -> bool {
+        self.flags & COVER_COUNTING != 0
+    }
+
+    /// Check the rows the cover hides are left only in its own segment
+    pub fn is_clear(&self) -> bool {
+        self.flags & COVER_CLEAR != 0
+    }
+
+    /// Check a synced footer holds the cover
+    pub fn is_sealed(&self) -> bool {
+        self.flags & COVER_SEALED != 0
+    }
+
+    /// Set states on the cover when a test holds
+    pub fn set_when(&mut self, flags: u8, is_set: bool) {
+        if is_set {
+            self.flags |= flags;
+        }
+    }
 }
 
 /// The pool behind the lock
@@ -216,8 +248,9 @@ impl CoverPool {
         oldest
     }
 
-    /// Check a cover at this place or newer already holds this one, as one found again at open can be
-    pub fn is_inside_newer(&self, cover: &Cover, is_applied: bool) -> bool {
+    /// Check a cover at this place or newer already holds this one, as one found again at open can be. An unsealed cover can't hold
+    /// a sealed one, since only the sealed one outlives a power cut
+    pub fn is_inside_newer(&self, cover: &Cover, is_applied: bool, is_sealed: bool) -> bool {
         let mut position = self.past_start(cover.column, cover.start);
         while position > 0 {
             position -= 1;
@@ -226,7 +259,7 @@ impl CoverPool {
                 return false;
             }
             let fields = &self.slots[slot as usize];
-            if fields.place >= cover.place && cover.end <= self.end(slot) && (fields.is_applied || !is_applied) {
+            if fields.place >= cover.place && cover.end <= self.end(slot) && (fields.is_applied() || !is_applied) && (fields.is_sealed() || !is_sealed) {
                 return true;
             }
         }
@@ -260,7 +293,7 @@ impl CoverPool {
             }
             // an applied cover has counted its rows, so it stays until one that knows those rows are counted can take over
             let fields = &self.slots[slot as usize];
-            if self.end(slot) <= cover.end && fields.place < cover.place && (is_applied || !fields.is_counting) {
+            if self.end(slot) <= cover.end && fields.place < cover.place && (is_applied || !fields.is_counting()) {
                 return true;
             }
             position += 1;
@@ -280,7 +313,7 @@ impl CoverPool {
             }
             // an applied cover has counted its rows, so it stays until one that knows those rows are counted can take over
             let fields = &self.slots[slot as usize];
-            if self.end(slot) <= cover.end && fields.place < cover.place && (is_applied || !fields.is_counting) {
+            if self.end(slot) <= cover.end && fields.place < cover.place && (is_applied || !fields.is_counting()) {
                 self.order.remove(position);
                 self.reach.remove(position);
                 self.free.push(slot);
@@ -304,7 +337,7 @@ impl CoverPool {
                 return false;
             }
             if fields.place == cover.place {
-                return fields.is_applied;
+                return fields.is_applied();
             }
             position += 1;
         }
@@ -379,11 +412,13 @@ impl CoverPool {
             end_length: cover.end.len() as u16,
             place: cover.place,
             segment: cover.segment,
-            is_applied,
-            is_counting: is_applied,
-            is_clear: false,
-            is_sealed,
+            flags: 0,
         };
+        let fields = &mut self.slots[slot as usize];
+        fields.set_when(COVER_APPLIED, is_applied);
+        // a sealed cover found at open may have begun its apply before a crash, and freed in place what it hides
+        fields.set_when(COVER_COUNTING, is_applied || is_sealed);
+        fields.set_when(COVER_SEALED, is_sealed);
         let start_at = slot as usize * 2 * self.widest_key;
         self.keys[start_at..start_at + cover.start.len()].copy_from_slice(cover.start);
         let end_at = start_at + self.widest_key;
@@ -473,7 +508,7 @@ impl RangeCovers {
             return None;
         }
         let mut steps = 0;
-        let newest = self.read().newest_where(column, key, &mut steps, |slot| slot.is_applied);
+        let newest = self.read().newest_where(column, key, &mut steps, |slot| slot.is_applied());
         self.note_walk(steps);
         newest
     }
@@ -485,7 +520,7 @@ impl RangeCovers {
             return None;
         }
         let mut steps = 0;
-        let newest = self.read().newest_where(column, key, &mut steps, |slot| slot.is_sealed);
+        let newest = self.read().newest_where(column, key, &mut steps, |slot| slot.is_sealed());
         self.note_walk(steps);
         newest
     }
@@ -497,7 +532,7 @@ impl RangeCovers {
             return None;
         }
         let mut steps = 0;
-        let lowest = self.read().oldest_where(column, key, &mut steps, |slot| slot.is_applied && slot.place > place);
+        let lowest = self.read().oldest_where(column, key, &mut steps, |slot| slot.is_applied() && slot.place > place);
         self.note_walk(steps);
         lowest
     }
@@ -510,7 +545,7 @@ impl RangeCovers {
         for slot in &order {
             let fields = &mut pool.slots[*slot as usize];
             is_here |= fields.place == place;
-            fields.is_counting |= fields.place == place;
+            fields.set_when(COVER_COUNTING, fields.place == place);
         }
         pool.order = order;
         is_here
@@ -522,8 +557,8 @@ impl RangeCovers {
         let order = mem::take(&mut pool.order);
         for slot in &order {
             let fields = &mut pool.slots[*slot as usize];
-            fields.is_applied |= fields.place == place;
-            fields.is_counting |= fields.place == place;
+            fields.set_when(COVER_APPLIED, fields.place == place);
+            fields.set_when(COVER_COUNTING, fields.place == place);
         }
         pool.order = order;
     }
@@ -532,7 +567,7 @@ impl RangeCovers {
     #[cfg(feature = "test-hooks")]
     pub fn mark_all_unapplied(&self) {
         for slot in self.write().slots.iter_mut() {
-            slot.is_applied = false;
+            slot.flags &= !COVER_APPLIED;
         }
     }
 
@@ -542,19 +577,19 @@ impl RangeCovers {
         let order = mem::take(&mut pool.order);
         for slot in &order {
             let fields = &mut pool.slots[*slot as usize];
-            fields.is_applied |= fields.segment == segment;
-            fields.is_counting |= fields.segment == segment;
+            fields.set_when(COVER_APPLIED, fields.segment == segment);
+            fields.set_when(COVER_COUNTING, fields.segment == segment);
         }
         pool.order = order;
     }
 
-    /// Note every cover of a segment as sealed, once its footer is synced
-    pub fn mark_segment_sealed(&self, segment: SegmentNumber) {
+    /// Note one cover as sealed, found by its place, once a synced footer holds it
+    pub fn mark_sealed(&self, place: WritePlace) {
         let mut pool = self.write();
         let order = mem::take(&mut pool.order);
         for slot in &order {
             let fields = &mut pool.slots[*slot as usize];
-            fields.is_sealed |= fields.segment == segment;
+            fields.set_when(COVER_SEALED, fields.place == place);
         }
         pool.order = order;
     }
@@ -566,8 +601,8 @@ impl RangeCovers {
         let order = mem::take(&mut pool.order);
         for slot in &order {
             let fields = &mut pool.slots[*slot as usize];
-            is_new |= fields.place == place && !fields.is_clear;
-            fields.is_clear |= fields.place == place;
+            is_new |= fields.place == place && !fields.is_clear();
+            fields.set_when(COVER_CLEAR, fields.place == place);
         }
         pool.order = order;
         is_new
@@ -607,13 +642,13 @@ impl RangeCovers {
     /// Check a segment has a cover that still has rows to wait for outside it
     pub fn holds_segment(&self, segment: SegmentNumber) -> bool {
         let pool = self.read();
-        pool.order.iter().any(|slot| pool.slots[*slot as usize].segment == segment && !pool.slots[*slot as usize].is_clear)
+        pool.order.iter().any(|slot| pool.slots[*slot as usize].segment == segment && !pool.slots[*slot as usize].is_clear())
     }
 
     /// Copy out the oldest applied cover
     pub fn oldest_applied(&self, start: &mut impl ListOut<u8>, end: &mut impl ListOut<u8>) -> Option<(ColumnId, WritePlace, SegmentNumber)> {
         let pool = self.read();
-        let is_ready = |slot: &&u16| pool.slots[**slot as usize].is_applied;
+        let is_ready = |slot: &&u16| pool.slots[**slot as usize].is_applied();
         let slot = *pool.order.iter().filter(is_ready).min_by_key(|slot| pool.slots[**slot as usize].place)?;
         start.clear();
         start.extend_from_slice(pool.start(slot)).ok()?;
@@ -626,13 +661,13 @@ impl RangeCovers {
     /// Check every cover in the pool is applied, so each one's row is in a sealed segment and can't be lost at a crash
     pub fn are_all_applied(&self) -> bool {
         let pool = self.read();
-        pool.order.iter().all(|slot| pool.slots[*slot as usize].is_applied)
+        pool.order.iter().all(|slot| pool.slots[*slot as usize].is_applied())
     }
 
     /// Read whether the cover at a position is applied
     pub fn is_applied_at(&self, position: usize) -> bool {
         let pool = self.read();
-        pool.order.get(position).is_some_and(|slot| pool.slots[*slot as usize].is_applied)
+        pool.order.get(position).is_some_and(|slot| pool.slots[*slot as usize].is_applied())
     }
 
     /// Take a settled cover out of the pool
@@ -732,7 +767,7 @@ impl RangeCovers {
         let mut pool = self.write();
         pool.drop_inside(cover, is_applied);
         // no writer runs at open, so nothing above this cover can still be unpublished
-        let has_room = pool.is_inside_newer(cover, is_applied) || pool.insert(cover, is_applied, is_sealed);
+        let has_room = pool.is_inside_newer(cover, is_applied, is_sealed) || pool.insert(cover, is_applied, is_sealed);
         let count = pool.order.len();
         drop(pool);
         self.count.store(count, Ordering::Release);

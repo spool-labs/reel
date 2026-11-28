@@ -31,7 +31,7 @@ use crate::record::record_reader::{RecordLocation, RecordRead};
 use crate::row_kind::RowKind;
 use crate::segment::column_directory::Listing;
 use crate::segment::footer_writer::{ColumnStart, FooterTotals, FooterWriter};
-use crate::segment::range_covers::{Cover, put_cover};
+use crate::segment::range_covers::{Cover, put_cover, read_covers};
 use crate::segment::row_block::FooterRow;
 use crate::segment::segment_table::{NO_SHARD, shard_of};
 use crate::segment::segment_tail::{BlockCount, SegmentNumber};
@@ -452,8 +452,10 @@ impl<Backend: Io> SealJob<Backend> {
             self.has_unsaved_damage = false;
         }
         let totals = self.writer.finish(&target.data, target.number, target.data_end, &self.ranges, state.record_key, &[])?;
-        // the footer is synced, so a reopen finds its covers whatever happens next
-        state.volumes[self.volume].covers.mark_segment_sealed(target.number);
+        // the footer is synced, so a reopen finds the covers it holds whatever happens next. One whose record failed to read stays
+        // out of it, and stays unsealed
+        let covers = &state.volumes[self.volume].covers;
+        let _is_whole = read_covers(&self.ranges, target.number, |cover| covers.mark_sealed(cover.place));
         self.totals = Some(totals);
         self.end_step(|steps| &steps.footer);
         self.phase = SealPhase::Installing;

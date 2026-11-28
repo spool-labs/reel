@@ -593,6 +593,9 @@ fn bursts_between_batches_show() {
     let _removed = fs::remove_dir_all(&root);
 }
 
+// tries a timed slot wake gets before the test gives up on a host too loaded to time it
+const SLOT_WAKE_TRIES: usize = 20;
+
 // a writer that waits for an open slot sleeps until a slot frees or another writer makes a segment, up to SLOT_WAIT, and not the
 // hundred microseconds a wait on the store's progress takes; a slot that freed after the writer read the line ends the wait at once
 #[test]
@@ -606,17 +609,33 @@ fn a_slot_wait_sleeps_until_a_slot_frees() {
     let started = std::time::Instant::now();
     state.pause_for_slot(PauseCause::NoSegment, seen);
     assert!(started.elapsed() >= reel::engine::reports::SLOT_WAIT / 2, "a slot wait woke after {:?} with no slot", started.elapsed());
-    // a slot frees from another thread partway through: the waiter wakes with it
-    let seen = state.slot_line.seen();
-    let started = std::time::Instant::now();
-    thread::scope(|scope| {
-        scope.spawn(|| {
-            thread::sleep(reel::engine::reports::SLOT_WAIT / 4);
-            state.slot_line.wake();
+    // a slot frees from another thread partway through: the waiter wakes with it, timed from the wake, since a loaded host can
+    // oversleep the waker. A wake that came too late in the wait to tell the two apart goes again
+    let wait = reel::engine::reports::SLOT_WAIT;
+    let mut is_told = false;
+    for _try in 0..SLOT_WAKE_TRIES {
+        let seen = state.slot_line.seen();
+        let started = std::time::Instant::now();
+        let woke_at = thread::scope(|scope| {
+            let waker = scope.spawn(|| {
+                thread::sleep(wait / 4);
+                let woke_at = std::time::Instant::now();
+                state.slot_line.wake();
+                woke_at
+            });
+            state.pause_for_slot(PauseCause::NoSegment, seen);
+            let ended = std::time::Instant::now();
+            (waker.join().expect("waker"), ended)
         });
-        state.pause_for_slot(PauseCause::NoSegment, seen);
-    });
-    assert!(started.elapsed() < reel::engine::reports::SLOT_WAIT, "a slot wait slept past the slot's wake: {:?}", started.elapsed());
+        let (woke_at, ended) = woke_at;
+        if woke_at.duration_since(started) > wait / 2 {
+            continue;
+        }
+        assert!(ended.saturating_duration_since(woke_at) < wait / 2, "a slot wait slept past the slot's wake: {:?} after it", ended.saturating_duration_since(woke_at));
+        is_told = true;
+        break;
+    }
+    assert!(is_told, "the waker never woke inside the first half of a wait");
     // a slot that freed after the read ends the wait at once
     let seen = state.slot_line.seen();
     let slot = state.take_slot(0).expect("a free slot");

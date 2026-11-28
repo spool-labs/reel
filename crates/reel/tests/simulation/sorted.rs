@@ -34,6 +34,8 @@ const WIDTH: u16 = 16;
 const BUDGET: ByteCount = ByteCount(128 * 1024 * 1024);
 const HELD_BUDGET: ByteCount = ByteCount(1024 * 1024 * 1024);
 const TICK: Nanoseconds = Nanoseconds(1_000_000);
+// time between the reserve job's looks in a test that steps it by hand
+const LOOK_APART: Nanoseconds = Nanoseconds(100_000_000);
 const STEPS: u64 = 400_000;
 const KEYS: u64 = 2_000;
 const CAPACITY: RowCount = RowCount(100_000);
@@ -4686,11 +4688,11 @@ fn two_busy_indexes_share_the_idle_room_by_their_keys() {
         let reading = report(&store).sorted_columns.iter().find(|reading| reading.column == id).copied().expect("a reading");
         assert!(!reading.is_marked, "column {id:?} stayed marked: {reading:?}");
     }
-    // the extents a rebalance took back stay out: with no more fill the lead is gone, and more looks bring nothing back
+    // the extents a rebalance took back stay out: with no more fill, more looks bring nothing back
     let job = reel::engine::reserve_job::ReserveJob::new(Arc::clone(&store.state));
     let held: Vec<(usize, usize)> = busy.iter().map(|id| store.state.sorted_index(*id).expect("an index").room()).map(|room| (room.committed(), room.ceiling())).collect();
     for _look in 0..4 {
-        io.advance_clock(Nanoseconds(reel::pool_room::LEAD_NANOS));
+        io.advance_clock(LOOK_APART);
         job.grow_pools();
     }
     for (id, (committed, ceiling)) in busy.iter().zip(&held) {

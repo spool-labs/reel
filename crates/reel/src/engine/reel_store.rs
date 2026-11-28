@@ -173,10 +173,6 @@ impl<Backend: Io> ReelStore<Backend> {
         state.complete = complete_tables(config);
         state.sorted = sorted_indexes(config, &sorted_sizes, false).map_err(open_error("reserving a sorted index"))?;
         let sorted_rooms: Vec<_> = state.sorted.iter().flatten().map(|index| index.room().clone()).collect();
-        // a sorted index's pages fill as fast as the seals and the entering put keys in, which a step can't keep up with
-        for room in &sorted_rooms {
-            room.lead_by_rate();
-        }
         state.pool_rooms.extend(sorted_rooms);
         // the sorted indexes share one value pool, which grows once
         if let Some(index) = state.sorted.iter().flatten().next() {

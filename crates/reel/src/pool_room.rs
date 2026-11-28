@@ -27,10 +27,6 @@ use crate::region::{MapInFlight, note_populate, page_bytes, thread_faults, touch
 
 /// A pool grows by this share of its room at a time, and asks for the next extent when less than one is free
 pub const EXTENT_DIVISOR: usize = 16;
-/// A room led by its fill keeps ready what its fill takes in this long, measured over the job's last look
-pub const LEAD_NANOS: u64 = 100_000_000;
-/// The least time a fill rate is measured over, so looks a few microseconds apart don't turn a page into a rate
-pub const RATE_WINDOW_NANOS: u64 = LEAD_NANOS / 10;
 /// The least room that starts on a huge page and grows in whole ones
 pub const HUGE_ROOM_BYTES: usize = 4 * HUGE_PAGE_BYTES;
 
@@ -91,12 +87,12 @@ impl Drop for RoomRead<'_> {
 /// Wakes the job that grows the rooms
 pub type GrowWake = Arc<dyn Fn() + Send + Sync>;
 
-/// How far one grow goes: the whole way, a plain step alone, or the leads after every room's plain step
+/// How far one grow goes: the whole way, one step alone, or the steps past it once every room had its first
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Growth {
     Whole,
-    PlainStep,
-    Lead,
+    OneStep,
+    Rest,
 }
 
 
@@ -269,11 +265,6 @@ pub struct PoolRoom {
     idle_used: AtomicUsize,
     /// Set by an idle trim, and cleared by the next grow. A trimmed room grows a step once fill comes, and not before
     is_trimmed: AtomicBool,
-    /// Set for a room whose fill can outrun a step between the job's looks, a sorted index's pages, which grows by its fill rate
-    is_rate_led: AtomicBool,
-    /// The bytes its fill took in LEAD_NANOS at the job's last look, and the look before: when, and the bytes used then
-    rate_lead: AtomicUsize,
-    sample: Mutex<(u64, usize)>,
     /// The part the data on disk asks for, which open brings in when the host has room
     first_part: AtomicUsize,
     /// Bytes the room has given back to the kernel, for the report
@@ -399,9 +390,6 @@ impl PoolRoom {
             over_since: AtomicU64::new(0),
             idle_used: AtomicUsize::new(0),
             is_trimmed: AtomicBool::new(false),
-            is_rate_led: AtomicBool::new(false),
-            rate_lead: AtomicUsize::new(0),
-            sample: Mutex::new((0, 0)),
             first_part: AtomicUsize::new(0),
             given_back: AtomicU64::new(0),
             growing: Mutex::new(()),
@@ -591,89 +579,45 @@ impl PoolRoom {
     }
 
     /// Read where the pool grows next with this many bytes used, up to the room. A pool grows a step when less than one is free,
-    /// and a pool an idle trim left grows a step once fill comes. A room led by its fill keeps what its fill takes in LEAD_NANOS
-    /// free, and grows by twice that when it passes a step, so a fast fill finds its pages in memory
+    /// and a pool an idle trim left grows a step once fill comes
     pub fn next_step(&self, used: usize) -> Option<usize> {
         let committed = self.committed();
         if committed >= self.cap() {
             return None;
         }
-        // the lead's part stops a step and an extent under the ceiling, since a grow brings in whole extents, so a rebalance still
-        // sees the room a step from full and raises it first
-        let lead = self.rate_lead.load(Ordering::Relaxed);
-        let lead_limit = self.ceiling().saturating_sub(self.step() + self.extent);
         let free = committed.saturating_sub(used);
         let wants = if self.is_trimmed.load(Ordering::Acquire) {
             used > self.idle_used.load(Ordering::Relaxed)
         } else {
-            free < self.step() || (committed < lead_limit && free < lead)
+            free < self.step()
         };
-        let led = committed.saturating_add(lead.saturating_mul(2)).min(lead_limit);
-        wants.then(|| (committed + self.step()).max(led).min(self.cap()))
-    }
-
-    /// Lead the room by its fill rate from here on
-    pub fn lead_by_rate(&self) {
-        self.is_rate_led.store(true, Ordering::Release);
-    }
-
-    /// Measure a rate-led room's fill since the job's last look, as the bytes it takes in LEAD_NANOS. A room that emptied or
-    /// held still leads by nothing, and grows by steps
-    pub fn note_rate(&self, now: u64) {
-        if !self.is_rate_led.load(Ordering::Acquire) {
-            return;
-        }
-        let used = self.used();
-        let mut sample = hold(&self.sample);
-        let (then, used_then) = *sample;
-        let elapsed = now.saturating_sub(then);
-        // looks closer than a tenth of LEAD_NANOS keep the old sample, so a page taken in a few microseconds doesn't read as a rate
-        if then != 0 && elapsed < RATE_WINDOW_NANOS {
-            return;
-        }
-        *sample = (now, used);
-        if then == 0 {
-            return;
-        }
-        let lead = u128::from(used.saturating_sub(used_then) as u64) * u128::from(LEAD_NANOS) / u128::from(elapsed);
-        let lead = usize::try_from(lead).unwrap_or(usize::MAX);
-        self.rate_lead.store(lead.saturating_add(self.extent - 1) / self.extent * self.extent, Ordering::Relaxed);
+        wants.then(|| (committed + self.step()).min(self.cap()))
     }
 
     /// Grow until the pool wants no more or the room is whole, taking no step past the room the host has left, and say whether it
-    /// grew. A lead past the room left grows a plain step instead. A pool the host has no room for even a step of stays as it is
-    /// and reads as short until a step fits
+    /// grew. A pool the host has no room for even a step of stays as it is and reads as short until a step fits
     pub fn grow_step(&self, host_left: &mut u64) -> Result<bool> {
         self.grow_by(host_left, Growth::Whole)
     }
 
-    /// Grow the room's plain step alone when it wants one, so every room's step comes before any room's lead
-    pub fn grow_plain_step(&self, host_left: &mut u64) -> Result<bool> {
-        self.grow_by(host_left, Growth::PlainStep)
-    }
-
-    /// Grow every room that wants its next step, in the room the host has left: each room's plain step first, then the leads and
-    /// any further steps in what is left. A room that got its step reads as short of no lead the rest can't hold
+    /// Grow every room that wants its next step, in the room the host has left: each room's first step, then any further steps
+    /// in what is left. A room that got its step reads as short of no further one the rest can't hold
     pub fn grow_rooms(rooms: &[Arc<Self>], host_left: &mut u64) {
         for room in rooms {
-            let _grew = room.grow_plain_step(host_left);
+            let _grew = room.grow_by(host_left, Growth::OneStep);
         }
         for room in rooms {
-            let _grew = room.grow_by(host_left, Growth::Lead);
+            let _grew = room.grow_by(host_left, Growth::Rest);
         }
     }
 
     fn grow_by(&self, host_left: &mut u64, growth: Growth) -> Result<bool> {
         let mut grew = false;
-        while let Some(led) = self.next_step(self.used()) {
-            // a lead the host has no room for falls back to a plain step, which may still fit, so the room grows and isn't short
-            let plain = self.committed().saturating_add(self.step()).min(self.cap());
-            let is_led_past = led.saturating_sub(self.committed()) as u64 > *host_left;
-            let target = if growth == Growth::PlainStep || (is_led_past && led > plain) { plain } else { led };
+        while let Some(target) = self.next_step(self.used()) {
             let step = target.saturating_sub(self.committed()) as u64;
             if step > *host_left {
-                // the lead pass comes after every room's plain step, which already says whether this room is short
-                if growth != Growth::Lead {
+                // the pass for further steps comes after every room's first step, which already says whether this room is short
+                if growth != Growth::Rest {
                     self.is_short.store(true, Ordering::Release);
                 }
                 break;
@@ -683,8 +627,7 @@ impl PoolRoom {
             *host_left -= step;
             self.is_short.store(false, Ordering::Release);
             grew = true;
-            // the lead is prefetch: once the host's room cut it to a step, the room has what it needs and isn't short of the rest
-            if target < led || growth == Growth::PlainStep {
+            if growth == Growth::OneStep {
                 break;
             }
         }
@@ -1302,90 +1245,21 @@ mod tests {
         assert_eq!(room.next_step(room.committed() - step + 1), Some(room.committed() + step));
     }
 
-    // a room led by its rate grows by twice what its fill took between the job's looks. A simulation can't show the marks this
-    // saves: a sim's index marks at its exact page count, and the growth lag a fast fill on a real host meets shows in the box's rows
+    // a room two steps short and a room one step short, with room for two steps: each gets its first step before either gets a
+    // second, so the second room grows on this pass and neither reads as short
     #[test]
-    fn a_rate_led_room_grows_by_twice_its_fill() {
+    fn every_room_gets_its_first_step_before_any_gets_a_second() {
         let page = page_bytes();
-        let room = PoolRoom::reserve_paged(ByteCount(1024 * page as u64), ByteCount(0), page).expect("reserve");
-        room.lead_by_rate();
-        let step = room.step();
-        room.note_used(room.committed());
-        room.note_rate(1);
-        // the fill took four steps between the job's looks LEAD_NANOS apart
-        let fill = 4 * step;
-        room.note_used(room.committed() + fill);
-        room.note_rate(1 + LEAD_NANOS);
-        let committed = room.committed();
-        let led = (committed + 2 * fill).min(room.ceiling() - step - room.extent()).max(committed + step);
-        assert!(led > committed + step, "the room has no space for a lead past a step");
-        assert_eq!(room.next_step(room.used()), Some(led.min(room.cap())), "a rate-led room grew by a step");
-        // a room that held still leads by nothing again, and grows by its steps
-        room.note_rate(1 + 2 * LEAD_NANOS);
-        assert_eq!(room.next_step(committed), Some(committed + step));
-        // a room not led by its rate grows by its steps whatever its fill
-        let plain = PoolRoom::reserve_paged(ByteCount(1024 * page as u64), ByteCount(0), page).expect("reserve");
-        plain.note_used(plain.committed());
-        plain.note_rate(1);
-        plain.note_used(plain.committed() + fill);
-        plain.note_rate(1 + LEAD_NANOS);
-        assert_eq!(plain.next_step(plain.used()), Some(plain.committed() + plain.step()));
-    }
-
-    // a lead the host has no room for grows the room by a plain step, and the room doesn't read as short while a step still fits
-    #[test]
-    fn a_lead_past_the_room_left_grows_a_step() {
-        let page = page_bytes();
-        let room = PoolRoom::reserve_paged(ByteCount(1024 * page as u64), ByteCount(0), page).expect("reserve");
-        room.lead_by_rate();
-        let step = room.step();
-        room.note_used(room.committed());
-        room.note_rate(1);
-        room.note_used(room.committed() + 4 * step);
-        room.note_rate(1 + LEAD_NANOS);
-        let committed = room.committed();
-        let mut host_left = (2 * step) as u64;
-        assert!(room.grow_step(&mut host_left).expect("grow"), "a room with a step of room left didn't grow");
-        assert!(room.committed() > committed && room.committed() <= committed + 2 * step);
-        assert!(!room.is_short(), "a room that grew a step read as short");
-    }
-
-    // two rooms each a step short, with room for two plain steps: the led room's lead waits for the plain room's step, so neither is
-    // short and the plain room grows on this pass
-    #[test]
-    fn a_lead_comes_after_every_plain_step() {
-        let page = page_bytes();
-        let led = Arc::new(PoolRoom::reserve_paged(ByteCount(1024 * page as u64), ByteCount(0), page).expect("reserve"));
-        led.lead_by_rate();
-        let plain = Arc::new(PoolRoom::reserve_paged(ByteCount(1024 * page as u64), ByteCount(0), page).expect("reserve"));
-        let step = led.step();
-        led.note_used(led.committed());
-        led.note_rate(1);
-        led.note_used(led.committed() + 3 * step / 4);
-        led.note_rate(1 + LEAD_NANOS);
-        plain.note_used(plain.committed());
-        let (led_before, plain_before) = (led.committed(), plain.committed());
-        let mut host_left = (led.step() + plain.step()) as u64;
-        PoolRoom::grow_rooms(&[Arc::clone(&led), Arc::clone(&plain)], &mut host_left);
-        assert!(led.committed() > led_before && !led.is_short(), "the led room got no step");
-        assert!(plain.committed() > plain_before && !plain.is_short(), "the led room's lead took the plain room's step");
-    }
-
-    // two looks microseconds apart keep the old sample, so one page taken between them leads by nothing past a step; a look past
-    // the least window measures the fill over the whole time since
-    #[test]
-    fn a_rate_needs_its_least_window() {
-        let page = page_bytes();
-        let room = PoolRoom::reserve_paged(ByteCount(1024 * page as u64), ByteCount(0), page).expect("reserve");
-        room.lead_by_rate();
-        room.note_used(room.committed());
-        room.note_rate(1);
-        room.note_used(room.committed() + page);
-        room.note_rate(1 + 1_000);
-        let committed = room.committed();
-        assert_eq!(room.next_step(room.used()), Some(committed + room.step()), "a page in a microsecond read as a rate");
-        room.note_rate(1 + LEAD_NANOS);
-        assert!(room.next_step(room.used()).is_some_and(|target| target <= committed + room.step().max(2 * room.extent())));
+        let hungry = Arc::new(PoolRoom::reserve_paged(ByteCount(1024 * page as u64), ByteCount(0), page).expect("reserve"));
+        let other = Arc::new(PoolRoom::reserve_paged(ByteCount(1024 * page as u64), ByteCount(0), page).expect("reserve"));
+        let step = hungry.step();
+        hungry.note_used(hungry.committed() + step + step / 2);
+        other.note_used(other.committed());
+        let (hungry_before, other_before) = (hungry.committed(), other.committed());
+        let mut host_left = (hungry.step() + other.step()) as u64;
+        PoolRoom::grow_rooms(&[Arc::clone(&hungry), Arc::clone(&other)], &mut host_left);
+        assert!(hungry.committed() > hungry_before && !hungry.is_short(), "the first room got no step");
+        assert!(other.committed() > other_before && !other.is_short(), "the first room's second step took the other room's first");
     }
 
     // an idle trim that pages left in every other extent stop short of the use and an extent leaves the room trimmed. Fill into it

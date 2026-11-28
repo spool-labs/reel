@@ -182,7 +182,7 @@ fn take_from_indexes<'index>(indexes: impl Iterator<Item = (usize, Option<&'inde
             break;
         }
         let room = index.room();
-        // a lead's empty prefetch past a step above the pages in use goes back first, through the room's own release, so the rule's
+        // empty prefetch past a step above the pages in use goes back first, through the room's own release, so the rule's
         // room for a busy index wins over it. An extent with a row in it never goes, and the ceiling stays over what the room holds
         let in_use = room.used() + room.step();
         if room.committed() > in_use && room.ceiling() > grant(place).max(in_use) {

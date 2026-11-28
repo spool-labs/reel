@@ -122,14 +122,17 @@ fn walks_beside_seals_and(with_values: bool, gives_back: bool) {
     let written = AtomicU64::new(0);
     let done = AtomicBool::new(false);
     let runs = AtomicU64::new(0);
+    // with `gives_back` the writer goes on until a give-back has happened beside the walks, however slow a loaded host makes it
+    let has_given = AtomicBool::new(!gives_back);
     let walks = std::thread::scope(|scope| {
-        let (store, written, done, runs) = (&store, &written, &done, &runs);
+        let (store, written, done, runs, has_given) = (&store, &written, &done, &runs, &has_given);
         scope.spawn(move || {
             // a writer that panics still stops the counter, so the test fails and doesn't hang
             let _stops = StopOnDrop(done);
             let mut number = 0;
-            // the writer goes on past KEYS until the reader has run enough rounds to have raced it
-            while number < KEYS || (runs.load(Ordering::Acquire) < LEAST_RUNS && number < MOST_KEYS) {
+            // the writer goes on past KEYS until the reader has run enough rounds to have raced it, and the give-back has come
+            let is_racing = || runs.load(Ordering::Acquire) < LEAST_RUNS || !has_given.load(Ordering::Acquire);
+            while number < KEYS || (is_racing() && number < MOST_KEYS) {
                 store.put(COLUMN, &key(number), &[5_u8; 100]).expect("put");
                 written.store(number + 1, Ordering::Release);
                 if number % 5_000 == 4_999 {
@@ -148,7 +151,11 @@ fn walks_beside_seals_and(with_values: bool, gives_back: bool) {
                     if let Some(task) = store.state.reserve_task.get() {
                         reel::io::IoTask::wake(task);
                     }
-                    given += u64::from(store.memory_report().pool_given_back.0 > 0);
+                    let is_given = store.memory_report().pool_given_back.0 > 0;
+                    given += u64::from(is_given);
+                    if is_given {
+                        has_given.store(true, Ordering::Release);
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
                 assert!(given > 0, "no node page went back beside the walks");

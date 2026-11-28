@@ -316,6 +316,7 @@ impl<Backend: Io> SealJob<Backend> {
             self.volume().seal_blocks.0
         );
         self.phase = SealPhase::Writing;
+        self.end_step(|steps| &steps.start);
         Ok(())
     }
 
@@ -441,8 +442,9 @@ impl<Backend: Io> SealJob<Backend> {
 
     /// Finish the footer, which syncs it, then discard the rows file
     pub fn finish_footer(&mut self, target: &SealTarget<Backend::File>) -> Result<()> {
-        self.sorted_run.flush(&self.state, self.volume, target.slot);
         self.end_step(|steps| &steps.walk_step);
+        self.sorted_run.flush(&self.state, self.volume, target.slot);
+        self.end_step(|steps| &steps.sorted_flush);
         self.volume().ration.note_walk_end(self.step_started);
         let state = &self.state;
         // the tail ends the segment's rows, so what they can no longer say has to be on disk first, and a failed save

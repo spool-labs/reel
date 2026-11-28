@@ -877,8 +877,12 @@ impl Default for MaintenanceReport {
 pub struct SealSteps {
     /// Waiting for the segment's writers to land
     pub drain: Nanoseconds,
+    /// Sending the segment's last rows out and starting its footer, before the walk's first step
+    pub start: Nanoseconds,
     /// One step of the walk
     pub walk_step: Nanoseconds,
+    /// The sorted run's last flush, after the walk's last step
+    pub sorted_flush: Nanoseconds,
     /// Writing and syncing the footer
     pub footer: Nanoseconds,
     /// Listing the segment and saving its summary

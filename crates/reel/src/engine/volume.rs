@@ -1001,7 +1001,9 @@ impl<Backend: Io> Volume<Backend> {
 #[derive(Debug, Default)]
 pub struct SealStepTimes {
     pub drain: AtomicU64,
+    pub start: AtomicU64,
     pub walk_step: AtomicU64,
+    pub sorted_flush: AtomicU64,
     pub footer: AtomicU64,
     pub install: AtomicU64,
     pub clean_step: AtomicU64,
@@ -1013,7 +1015,9 @@ impl SealStepTimes {
         let read = |step: &AtomicU64| Nanoseconds(step.load(Ordering::Relaxed));
         SealSteps {
             drain: read(&self.drain),
+            start: read(&self.start),
             walk_step: read(&self.walk_step),
+            sorted_flush: read(&self.sorted_flush),
             footer: read(&self.footer),
             install: read(&self.install),
             clean_step: read(&self.clean_step),
